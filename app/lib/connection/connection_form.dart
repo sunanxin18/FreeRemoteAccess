@@ -3,9 +3,14 @@ import 'package:flutter/material.dart';
 import 'connection_model.dart';
 
 class ConnectionForm extends StatefulWidget {
-  const ConnectionForm({super.key, required this.onConnect});
+  const ConnectionForm({
+    super.key,
+    required this.onConnect,
+    this.connecting = false,
+  });
 
   final ValueChanged<ConnectionDraft> onConnect;
+  final bool connecting;
 
   @override
   State<ConnectionForm> createState() => _ConnectionFormState();
@@ -172,9 +177,9 @@ class _ConnectionFormState extends State<ConnectionForm> {
                 const SizedBox(height: 24),
                 FilledButton.icon(
                   key: const Key('connect-button'),
-                  onPressed: _connect,
+                  onPressed: widget.connecting ? null : _connect,
                   icon: const Icon(Icons.login),
-                  label: const Text('连接'),
+                  label: Text(widget.connecting ? '连接中…' : '连接'),
                 ),
                 const SizedBox(height: 12),
                 const Text('密码仅用于本次连接，不会保存。', textAlign: TextAlign.center),

@@ -49,6 +49,29 @@ endfunction()
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
+# Windows builds the Rust FFI bridge directly instead of relying on Flutter's
+# plugin symlink. This keeps release builds working without Developer Mode.
+get_filename_component(FRD_REPOSITORY_ROOT
+  "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(FRD_NATIVE_TARGET_DIR "${CMAKE_BINARY_DIR}/freeremote_native_cargo")
+set(FRD_NATIVE_LIBRARY
+  "${FRD_NATIVE_TARGET_DIR}/release/freeremote_native.dll")
+add_custom_command(
+  OUTPUT "${FRD_NATIVE_LIBRARY}"
+  COMMAND cargo build -p freeremote_ffi --release
+          --target-dir "${FRD_NATIVE_TARGET_DIR}"
+  WORKING_DIRECTORY "${FRD_REPOSITORY_ROOT}"
+  DEPENDS
+    "${FRD_REPOSITORY_ROOT}/Cargo.toml"
+    "${FRD_REPOSITORY_ROOT}/Cargo.lock"
+    "${FRD_REPOSITORY_ROOT}/src/app/connection.rs"
+    "${FRD_REPOSITORY_ROOT}/native/freeremote_ffi/Cargo.toml"
+    "${FRD_REPOSITORY_ROOT}/native/freeremote_ffi/src/lib.rs"
+  COMMENT "Building FreeRemoteAccess Rust bridge"
+  VERBATIM
+)
+add_custom_target(freeremote_native_build ALL DEPENDS "${FRD_NATIVE_LIBRARY}")
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
@@ -79,6 +102,9 @@ install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime)
+
+install(FILES "${FRD_NATIVE_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
 if(PLUGIN_BUNDLED_LIBRARIES)

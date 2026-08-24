@@ -4,15 +4,17 @@ import 'bridge/connection_bridge.dart';
 import 'bridge/native_connection_bridge.dart';
 import 'connection/connection_form.dart';
 import 'connection/connection_model.dart';
+import 'session/desktop_session_launcher.dart';
 
 void main() {
   runApp(FreeRemoteAccessApp());
 }
 
 class FreeRemoteAccessApp extends StatelessWidget {
-  const FreeRemoteAccessApp({super.key, this.bridge});
+  const FreeRemoteAccessApp({super.key, this.bridge, this.sessionLauncher});
 
   final ConnectionBridge? bridge;
+  final DesktopSessionLauncher? sessionLauncher;
 
   @override
   Widget build(BuildContext context) {
@@ -32,28 +34,62 @@ class FreeRemoteAccessApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: ConnectionHomePage(bridge: bridge),
+      home: ConnectionHomePage(
+        bridge: bridge,
+        sessionLauncher: sessionLauncher,
+      ),
     );
   }
 }
 
-class ConnectionHomePage extends StatelessWidget {
-  const ConnectionHomePage({super.key, this.bridge});
+class ConnectionHomePage extends StatefulWidget {
+  const ConnectionHomePage({super.key, this.bridge, this.sessionLauncher});
 
   final ConnectionBridge? bridge;
+  final DesktopSessionLauncher? sessionLauncher;
 
-  void _connect(BuildContext context, ConnectionDraft draft) {
+  @override
+  State<ConnectionHomePage> createState() => _ConnectionHomePageState();
+}
+
+class _ConnectionHomePageState extends State<ConnectionHomePage> {
+  bool _connecting = false;
+  String? _sessionStatus;
+
+  Future<void> _connect(ConnectionDraft draft) async {
+    if (_connecting) return;
     try {
-      final result = (bridge ?? NativeConnectionBridge()).validate(draft);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('已选择 ${result.protocol.label}，会话端口 ${result.port}'),
-        ),
+      final validation = (widget.bridge ?? NativeConnectionBridge()).validate(
+        draft,
       );
+      if (validation.protocol != ConnectionProtocol.appleRfb) {
+        throw const DesktopSessionLaunchException('当前构建优先完成 Mac OS 原生屏幕共享');
+      }
+      setState(() {
+        _connecting = true;
+        _sessionStatus = '正在建立 Apple 高性能屏幕共享…';
+      });
+      final result =
+          await (widget.sessionLauncher ??
+                  const ProcessDesktopSessionLauncher())
+              .launch(draft);
+      if (!mounted) return;
+      setState(() {
+        _connecting = false;
+        _sessionStatus = '远程会话已启动（${result.width}×${result.height}）';
+      });
     } on ConnectionBridgeException catch (error) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.message)));
+      if (!mounted) return;
+      setState(() {
+        _connecting = false;
+        _sessionStatus = error.message;
+      });
+    } on DesktopSessionLaunchException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _connecting = false;
+        _sessionStatus = error.message;
+      });
     }
   }
 
@@ -65,7 +101,8 @@ class ConnectionHomePage extends StatelessWidget {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final form = ConnectionForm(
-              onConnect: (draft) => _connect(context, draft),
+              connecting: _connecting,
+              onConnect: _connect,
             );
             if (constraints.maxWidth >= 720) {
               return Row(
@@ -96,6 +133,11 @@ class ConnectionHomePage extends StatelessWidget {
           },
         ),
       ),
+      bottomNavigationBar: _sessionStatus == null
+          ? null
+          : BottomAppBar(
+              child: Text(_sessionStatus!, key: const Key('session-status')),
+            ),
     );
   }
 }

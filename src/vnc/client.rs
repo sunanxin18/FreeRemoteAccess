@@ -516,6 +516,19 @@ pub fn authenticate_security(
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<AuthenticatedSecurity> {
+    authenticate_security_with_policy(neg, username, password, SecurityPolicy::PreferAppleThenVnc)
+}
+
+/// 按产品认证策略选择安全类型并完成凭据交互。
+///
+/// `AppleNativeOnly` 用于 Mac OS 客户端入口，禁止把 Mac 本地账号密码静默降级为
+/// 独立的 VNC 兼容密码。
+pub fn authenticate_security_with_policy(
+    neg: Negotiated,
+    username: Option<&str>,
+    password: Option<&str>,
+    policy: SecurityPolicy,
+) -> Result<AuthenticatedSecurity> {
     let Negotiated {
         mut conn,
         version,
@@ -523,7 +536,7 @@ pub fn authenticate_security(
         ..
     } = neg;
 
-    let choice = pick_security(&security_types, username, password)?;
+    let choice = pick_security_with_policy(&security_types, username, password, policy)?;
     // 类型 33 的选型字节与 v0 公钥请求必须同帧发送（见 rsa_srp.rs），这里跳过
     if version.1 != protocol::RFB_VERSION_3_3.1 && choice != protocol::security::APPLE_RSA_SRP {
         conn.write_all(&[choice])?;
@@ -638,8 +651,39 @@ pub fn finish_authenticated_session(
     })
 }
 
-fn pick_security(types: &[u8], username: Option<&str>, password: Option<&str>) -> Result<u8> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecurityPolicy {
+    /// 兼容旧 CLI：优先 Apple 原生认证，服务端不提供时才允许 VNC Auth。
+    PreferAppleThenVnc,
+    /// Mac OS 产品路径：只接受 Mac 本地账号对应的 Apple 原生认证。
+    AppleNativeOnly,
+}
+
+fn pick_security_with_policy(
+    types: &[u8],
+    username: Option<&str>,
+    password: Option<&str>,
+    policy: SecurityPolicy,
+) -> Result<u8> {
     let has = |t: u8| types.contains(&t);
+    if policy == SecurityPolicy::AppleNativeOnly {
+        return match (username, password) {
+            (Some(_), Some(_)) if has(protocol::security::APPLE_SRP) => {
+                Ok(protocol::security::APPLE_SRP)
+            }
+            (Some(_), Some(_)) if has(protocol::security::APPLE_RSA_SRP) => {
+                Ok(protocol::security::APPLE_RSA_SRP)
+            }
+            (Some(_), Some(_)) if has(protocol::security::APPLE_ARD) => {
+                Ok(protocol::security::APPLE_ARD)
+            }
+            (Some(_), Some(_)) => {
+                bail!("服务器不提供可用的 Apple 原生认证方式，可用类型: {types:?}")
+            }
+            _ => bail!("Apple 原生认证需要 Mac 本地用户名和密码"),
+        };
+    }
+
     let has_apple_account_security = || {
         types
             .iter()
@@ -693,6 +737,15 @@ fn pick_security(types: &[u8], username: Option<&str>, password: Option<&str>) -
             }
         }
     }
+}
+
+fn pick_security(types: &[u8], username: Option<&str>, password: Option<&str>) -> Result<u8> {
+    pick_security_with_policy(
+        types,
+        username,
+        password,
+        SecurityPolicy::PreferAppleThenVnc,
+    )
 }
 
 // ---------- 会话 ----------
@@ -1196,6 +1249,104 @@ mod tests {
             assert!(error.to_string().contains("FRD_USERNAME"), "{error:#}");
             assert!(error.to_string().contains("FRD_PASSWORD"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn mac_native_policy_never_downgrades_local_account_to_vnc_auth() {
+        let error = pick_security_with_policy(
+            &[protocol::security::VNC_AUTH],
+            Some("local-user"),
+            Some("local-password"),
+            SecurityPolicy::AppleNativeOnly,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Apple 原生认证"), "{error:#}");
+    }
+
+    #[test]
+    fn mac_native_policy_prefers_srp_then_rsa_srp_then_ard_before_vnc() {
+        let credentials = (Some("local-user"), Some("local-password"));
+        for (types, expected) in [
+            (
+                vec![
+                    protocol::security::VNC_AUTH,
+                    protocol::security::APPLE_ARD,
+                    protocol::security::APPLE_RSA_SRP,
+                    protocol::security::APPLE_SRP,
+                ],
+                protocol::security::APPLE_SRP,
+            ),
+            (
+                vec![
+                    protocol::security::VNC_AUTH,
+                    protocol::security::APPLE_ARD,
+                    protocol::security::APPLE_RSA_SRP,
+                ],
+                protocol::security::APPLE_RSA_SRP,
+            ),
+            (
+                vec![protocol::security::VNC_AUTH, protocol::security::APPLE_ARD],
+                protocol::security::APPLE_ARD,
+            ),
+        ] {
+            assert_eq!(
+                pick_security_with_policy(
+                    &types,
+                    credentials.0,
+                    credentials.1,
+                    SecurityPolicy::AppleNativeOnly,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mac_native_authentication_rejects_vnc_only_before_selecting_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut client_banner = [0u8; 12];
+            stream.read_exact(&mut client_banner).unwrap();
+            stream
+                .write_all(&[1, protocol::security::VNC_AUTH])
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut selection = [0u8; 1];
+            match stream.read(&mut selection) {
+                Ok(0) => None,
+                Ok(1) => Some(selection[0]),
+                Ok(count) => panic!("unexpected selection byte count: {count}"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    None
+                }
+                Err(error) => panic!("unexpected server read error: {error}"),
+            }
+        });
+
+        let negotiated = negotiate(&address, Duration::from_secs(1)).unwrap();
+        let error = authenticate_security_with_policy(
+            negotiated,
+            Some("local-user"),
+            Some("local-password"),
+            SecurityPolicy::AppleNativeOnly,
+        )
+        .err()
+        .expect("VNC-only server must be rejected");
+
+        assert!(error.to_string().contains("Apple 原生认证"), "{error:#}");
+        assert_eq!(server.join().unwrap(), None);
     }
 
     #[test]

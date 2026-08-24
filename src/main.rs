@@ -258,6 +258,9 @@ enum Cmd {
         /// 已禁用：stock Apple Audio Chat 需要 IDS/Apple ID，用户名/密码 HPSS 不支持
         #[arg(long, requires = "udp_media")]
         udp_audio_input: bool,
+        /// 向桌面父进程标准输出发送稳定的 FRDSESSION1 已连接状态
+        #[arg(long)]
+        parent_status_stdout_v1: bool,
     },
     /// HPSS 高性能屏幕共享：虚拟显示器协商 + MVS 媒体流接收（流可落盘）
     Hpss {
@@ -411,6 +414,7 @@ fn run(cli: Cli) -> Result<()> {
             dynamic_resolution,
             udp_media,
             udp_audio_input,
+            parent_status_stdout_v1,
         } => match (host.as_deref(), credentials_stdin_v1) {
             (Some(host), false) => {
                 let credentials = load_credentials(&username_env, &password_env)?;
@@ -425,6 +429,7 @@ fn run(cli: Cli) -> Result<()> {
                     dynamic_resolution,
                     udp_media,
                     udp_audio_input,
+                    parent_status_stdout_v1,
                 )
             }
             (None, true) => {
@@ -448,6 +453,7 @@ fn run(cli: Cli) -> Result<()> {
                     dynamic_resolution,
                     audio_flow,
                     true,
+                    parent_status_stdout_v1,
                 )
                 .map_err(|_| anyhow::anyhow!("安全凭据 HPSS 会话失败"))
             }
@@ -1328,6 +1334,11 @@ fn format_hpssview_connection_notice(
 }
 
 #[cfg(feature = "viewer")]
+fn format_parent_session_status(width: u16, height: u16) -> String {
+    format!("FRDSESSION1 CONNECTED {width} {height}")
+}
+
+#[cfg(feature = "viewer")]
 struct PendingHpssviewConnection {
     addr: std::net::SocketAddr,
     authenticated: client::AuthenticatedSecurity,
@@ -1349,7 +1360,12 @@ fn authenticate_hpssview(
         vnc::session::SessionEncodingProfile::AppleTcpMvs
     };
     let negotiated = client::negotiate(&addr, Duration::from_secs(5))?;
-    let authenticated = client::authenticate_security(negotiated, Some(username), Some(password))?;
+    let authenticated = client::authenticate_security_with_policy(
+        negotiated,
+        Some(username),
+        Some(password),
+        client::SecurityPolicy::AppleNativeOnly,
+    )?;
     Ok(PendingHpssviewConnection {
         addr,
         authenticated,
@@ -1387,6 +1403,7 @@ fn run_connected_hpssview(
     dynamic_resolution: bool,
     audio_flow: vnc::media_negotiation::AudioMediaFlow,
     redact_connection_notice: bool,
+    parent_status_stdout_v1: bool,
 ) -> Result<()> {
     use crate::vnc::hpss_viewer;
 
@@ -1405,6 +1422,17 @@ fn run_connected_hpssview(
     );
     if !client.conn.is_encrypted() {
         anyhow::bail!("加密会话未建立");
+    }
+    if parent_status_stdout_v1 {
+        use std::io::Write as _;
+
+        println!(
+            "{}",
+            format_parent_session_status(client.width, client.height)
+        );
+        std::io::stdout()
+            .flush()
+            .context("刷新父进程会话状态失败")?;
     }
     hpss_viewer::run_viewer(
         client.conn,
@@ -1433,6 +1461,7 @@ fn cmd_hpssview(
     dynamic_resolution: bool,
     udp_media: bool,
     udp_audio_input: bool,
+    parent_status_stdout_v1: bool,
 ) -> Result<()> {
     let audio_flow = hpssview_audio_flow(udp_audio_input)?;
     let connected = connect_hpssview(host, port, username, password, udp_media)?;
@@ -1443,6 +1472,7 @@ fn cmd_hpssview(
         dynamic_resolution,
         audio_flow,
         false,
+        parent_status_stdout_v1,
     )
 }
 
@@ -1456,8 +1486,8 @@ mod tests {
     };
     #[cfg(feature = "viewer")]
     use super::{
-        connect_hpssview_from_stdin, format_hpssview_connection_notice, hpssview_audio_flow,
-        HpssviewConnectionNotice,
+        connect_hpssview_from_stdin, format_hpssview_connection_notice,
+        format_parent_session_status, hpssview_audio_flow, HpssviewConnectionNotice,
     };
     use crate::vnc::hpss::MvsCaptureWriter;
     #[cfg(feature = "viewer")]
@@ -2385,6 +2415,31 @@ mod tests {
         };
         assert_eq!(host, None);
         assert!(credentials_stdin_v1);
+    }
+
+    #[test]
+    fn hpssview_parent_status_flag_is_accepted_only_as_an_explicit_option() {
+        let cli = Cli::try_parse_from([
+            "freeremotedesk",
+            "hpssview",
+            "--credentials-stdin-v1",
+            "--parent-status-stdout-v1",
+        ])
+        .unwrap();
+
+        let Cmd::Hpssview {
+            parent_status_stdout_v1,
+            ..
+        } = cli.cmd
+        else {
+            panic!("应解析为 hpssview 子命令");
+        };
+        assert!(parent_status_stdout_v1);
+
+        assert_eq!(
+            format_parent_session_status(1920, 1080),
+            "FRDSESSION1 CONNECTED 1920 1080"
+        );
     }
 
     #[test]

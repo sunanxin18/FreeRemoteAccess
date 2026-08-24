@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:freeremote_access/connection/connection_model.dart';
 import 'package:freeremote_access/bridge/connection_bridge.dart';
 import 'package:freeremote_access/main.dart';
+import 'package:freeremote_access/session/desktop_session_launcher.dart';
 
 class _RecordingBridge implements ConnectionBridge {
   ConnectionDraft? lastRequest;
@@ -14,6 +15,13 @@ class _RecordingBridge implements ConnectionBridge {
       protocol: ConnectionProtocol.appleRfb,
       port: 5900,
     );
+  }
+}
+
+class _SuccessfulLauncher implements DesktopSessionLauncher {
+  @override
+  Future<DesktopSessionLaunch> launch(ConnectionDraft request) async {
+    return const DesktopSessionLaunch(processId: 42, width: 1920, height: 1080);
   }
 }
 
@@ -103,7 +111,12 @@ void main() {
     tester,
   ) async {
     final bridge = _RecordingBridge();
-    await tester.pumpWidget(FreeRemoteAccessApp(bridge: bridge));
+    await tester.pumpWidget(
+      FreeRemoteAccessApp(
+        bridge: bridge,
+        sessionLauncher: _SuccessfulLauncher(),
+      ),
+    );
 
     await tester.tap(find.byKey(const Key('service-selector')));
     await tester.pumpAndSettle();
@@ -118,11 +131,11 @@ void main() {
       'one-session-secret',
     );
     await tester.tap(find.byKey(const Key('connect-button')));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     expect(bridge.lastRequest?.service, ServiceKind.macOs);
     expect(bridge.lastRequest?.port, 5900);
-    expect(find.text('已选择 Apple RFB，会话端口 5900'), findsOneWidget);
+    expect(find.text('远程会话已启动（1920×1080）'), findsOneWidget);
     expect(
       find.descendant(
         of: find.byType(SnackBar),

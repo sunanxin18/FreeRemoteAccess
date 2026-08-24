@@ -49,9 +49,16 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
+      - name: Build Windows desktop session backend
+        run: cargo build --release --locked --bin freeremotedesk
       - name: Build Windows release
         working-directory: app
         run: flutter build windows --release
+      - name: Bundle Windows desktop session backend
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath target\release\freeremotedesk.exe `
+            -Destination app\build\windows\x64\runner\Release\freeremotedesk.exe
       - name: Package Windows bundle
         shell: pwsh
         run: |
