@@ -313,6 +313,21 @@ enum Cmd {
 }
 
 fn main() {
+    if std::env::args_os().len() == 1 {
+        #[cfg(feature = "gui")]
+        {
+            if let Err(error) = freeremotedesk::ui::run_desktop() {
+                eprintln!("错误: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("错误: 当前构建未启用图形客户端；请传入 --help 查看命令行功能");
+            std::process::exit(2);
+        }
+    }
     if let Err(e) = run(Cli::parse()) {
         eprintln!("错误: {e:#}");
         std::process::exit(1);

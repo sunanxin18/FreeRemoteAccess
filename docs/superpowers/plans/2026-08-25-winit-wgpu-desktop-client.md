@@ -269,7 +269,7 @@ feat(ui): add secret-safe Rust application model
 - Consumes: `RenderUpdate` and `UiAction`.
 - Produces: a single desktop `WinitHost`, persistent `wgpu::Texture`, and `run_desktop()`.
 
-- [ ] **Step 1: Write failing remote-texture state tests**
+- [x] **Step 1: Write failing remote-texture state tests**
 
 ```rust
 #[test]
@@ -288,27 +288,27 @@ fn surface_loss_does_not_change_remote_generation() {
 }
 ```
 
-- [ ] **Step 2: Run RED renderer tests**
+- [x] **Step 2: Run RED renderer tests**
 
 Run: `cargo test --locked ui::remote_texture --lib`
 
 Expected: compilation fails because the texture state is missing.
 
-- [ ] **Step 3: Add exact GUI dependency versions**
+- [x] **Step 3: Add exact GUI dependency versions**
 
 Add `winit = 0.30.13`, `wgpu = 30.0.1`, `egui = 0.36.1`, `egui-winit = 0.36.1`, `egui-wgpu = 0.36.1`, `pollster = 0.4`, `bytemuck = 1.25`, `zeroize = 1`, and `crossbeam-channel = 0.5` behind a `gui` feature. Disable default link/clipboard/web/GL features and select DX12, Metal, or Vulkan through target-specific dependency tables.
 
-- [ ] **Step 4: Implement renderer and one-window entry**
+- [x] **Step 4: Implement renderer and one-window entry**
 
 Create one surface, one egui renderer, and one remote texture pipeline. Drain bounded updates before redraw, call `Queue::write_texture` for the validated rectangle only, and render aspect-fit geometry in WGSL. Use `ControlFlow::Wait`; request redraw only for input, UI animation, a new present, or surface recovery.
 
-- [ ] **Step 5: Verify local GUI and release build**
+- [x] **Step 5: Verify local GUI and release build**
 
 Run: `cargo test --locked ui:: --lib`, `cargo build --locked --release --features gui`, then launch the no-argument release binary and verify the single connection window renders and exits normally.
 
 Expected: tests/build pass and exactly one product window appears.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```text
 feat(render): add single-window winit wgpu client

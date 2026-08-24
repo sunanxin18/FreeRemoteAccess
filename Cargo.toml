@@ -33,6 +33,11 @@ crossbeam-channel = "0.5"
 raw-window-handle = "0.6"
 zeroize = "1"
 egui = { version = "=0.36.1", default-features = false, features = ["default_fonts"], optional = true }
+egui-winit = { version = "=0.36.1", default-features = false, optional = true }
+egui-wgpu = { version = "=0.36.1", default-features = false, optional = true }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"], optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1.25", features = ["derive"], optional = true }
 getrandom = { version = "0.2", optional = true }
 minifb = { version = "0.28", optional = true }
 cpal = { version = "0.18.2", optional = true }
@@ -69,7 +74,25 @@ cli = [
     "dep:windows-sys",
 ]
 viewer = ["cli", "dep:minifb", "dep:cpal"]
-gui = ["dep:egui"]
+gui = [
+    "dep:bytemuck",
+    "dep:egui",
+    "dep:egui-wgpu",
+    "dep:egui-winit",
+    "dep:pollster",
+    "dep:wgpu",
+    "dep:winit",
+]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "wgsl"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["metal", "wgsl"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan", "wgsl"], optional = true }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland"], optional = true }
 
 [profile.release]
 lto = "thin"
