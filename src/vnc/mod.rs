@@ -13,6 +13,7 @@ pub mod dynamic_resolution;
 pub mod hpss;
 #[cfg(feature = "media")]
 pub mod hpss_session;
+pub mod local_username;
 pub mod media_negotiation;
 pub mod media_protocol;
 pub mod media_transport;

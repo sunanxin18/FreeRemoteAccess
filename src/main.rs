@@ -162,6 +162,11 @@ fn parse_cold_capture_record_limit(value: &str) -> std::result::Result<u32, Stri
         .ok_or_else(|| "cold capture record limit 无效".to_owned())
 }
 
+fn parse_local_username(value: &str) -> std::result::Result<String, String> {
+    vnc::local_username::validate_local_username(value).map_err(|error| error.to_string())?;
+    Ok(value.to_owned())
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "freeremotedesk",
@@ -221,7 +226,7 @@ enum Cmd {
         #[arg(long, default_value_t = 5900)]
         port: u16,
         /// Mac 本地用户名；提供时优先走 Apple 原生认证
-        #[arg(long, value_name = "USER")]
+        #[arg(long, value_name = "USER", value_parser = parse_local_username)]
         username: Option<String>,
     },
     /// 连接并截取一帧远程屏幕，保存为 PNG
@@ -230,7 +235,7 @@ enum Cmd {
         #[arg(long, default_value_t = 5900)]
         port: u16,
         /// Mac 本地用户名；提供时优先走 Apple 原生认证
-        #[arg(long, value_name = "USER")]
+        #[arg(long, value_name = "USER", value_parser = parse_local_username)]
         username: Option<String>,
         /// 输出 PNG 路径
         #[arg(short, long, default_value = "screen.png")]
@@ -258,7 +263,7 @@ enum Cmd {
         #[arg(long, default_value_t = 5900)]
         port: u16,
         /// Mac 本地用户名
-        #[arg(long, value_name = "USER", required = true)]
+        #[arg(long, value_name = "USER", required = true, value_parser = parse_local_username)]
         username: String,
         /// 接收媒体流的秒数
         #[arg(long, default_value_t = 10)]
@@ -288,7 +293,7 @@ enum Cmd {
         #[arg(long, default_value_t = 5900)]
         port: u16,
         /// Mac 本地用户名
-        #[arg(long, value_name = "USER", required = true)]
+        #[arg(long, value_name = "USER", required = true, value_parser = parse_local_username)]
         username: String,
         /// 持续接收解密帧的秒数
         #[arg(long, default_value_t = 8)]
@@ -2194,6 +2199,66 @@ mod tests {
                     assert_eq!(username, "local-user")
                 }
                 _ => panic!("应解析为需要用户名的 Apple 子命令"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_rejects_invalid_local_usernames_for_every_protocol_command() {
+        let invalid = vec![
+            String::new(),
+            " ".to_owned(),
+            " local-user".to_owned(),
+            "local-user ".to_owned(),
+            "\u{2003}local-user".to_owned(),
+            "local-user\u{2003}".to_owned(),
+            "local\0user".to_owned(),
+            "local\u{85}user".to_owned(),
+            "u".repeat(256),
+        ];
+        for command in ["info", "shot", "hpss", "esess"] {
+            for username in &invalid {
+                let result = Cli::try_parse_from([
+                    "freeremotedesk",
+                    command,
+                    "127.0.0.1",
+                    "--username",
+                    username,
+                ]);
+                assert!(
+                    result.is_err(),
+                    "{command} accepted invalid username with {} bytes",
+                    username.len()
+                );
+                let inline = format!("--username={username}");
+                assert!(
+                    Cli::try_parse_from(["freeremotedesk", command, "127.0.0.1", &inline]).is_err(),
+                    "{command} accepted invalid inline username with {} bytes",
+                    username.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_preserves_trimmed_unicode_local_username_within_byte_limit() {
+        for command in ["info", "shot", "hpss", "esess"] {
+            let parsed = Cli::try_parse_from([
+                "freeremotedesk",
+                command,
+                "127.0.0.1",
+                "--username",
+                "本地用户",
+            ])
+            .expect("trimmed Unicode local username");
+            match parsed.cmd {
+                Cmd::Info { username, .. } | Cmd::Shot { username, .. } => {
+                    assert_eq!(username.as_deref(), Some("本地用户"));
+                }
+                Cmd::Hpss { username, .. } | Cmd::Esess { username, .. } => {
+                    assert_eq!(username, "本地用户");
+                }
+                _ => panic!("unexpected CLI command"),
             }
         }
     }

@@ -658,11 +658,20 @@ pub enum SecurityCredentialRequirement {
     Password,
 }
 
+fn validate_supplied_local_username(username: Option<&str>) -> Result<()> {
+    if let Some(username) = username {
+        crate::vnc::local_username::validate_local_username(username)
+            .map_err(|_| anyhow::anyhow!("Mac 本地用户名无效"))?;
+    }
+    Ok(())
+}
+
 pub fn credential_requirement_for_types(
     types: &[u8],
     username: Option<&str>,
     policy: SecurityPolicy,
 ) -> Result<SecurityCredentialRequirement> {
+    validate_supplied_local_username(username)?;
     let has = |security_type| types.contains(&security_type);
     let has_supported_apple = types
         .iter()
@@ -717,6 +726,7 @@ fn pick_security_with_policy(
     password: Option<&str>,
     policy: SecurityPolicy,
 ) -> Result<u8> {
+    validate_supplied_local_username(username)?;
     let has = |t: u8| types.contains(&t);
     if policy == SecurityPolicy::StandardVncOnly {
         return match password {
@@ -848,6 +858,7 @@ pub fn authenticate_deadline_security(
     username: &str,
     password: &str,
 ) -> Result<AuthenticatedSecurity> {
+    validate_supplied_local_username(Some(username)).map_err(sanitize_cold_authentication_error)?;
     let negotiated = negotiate_deadline(addr, deadline).map_err(sanitize_cold_connect_error)?;
     authenticate_security_with_policy(
         negotiated,
@@ -891,6 +902,7 @@ impl VncClient {
         encoding_profile: session::SessionEncodingProfile,
         security_policy: SecurityPolicy,
     ) -> Result<VncClient> {
+        validate_supplied_local_username(username)?;
         let negotiated = negotiate(addr, timeout)?;
         let authenticated =
             authenticate_security_with_policy(negotiated, username, password, security_policy)?;
@@ -904,8 +916,14 @@ impl VncClient {
         password: Option<&str>,
         encoding_profile: session::SessionEncodingProfile,
     ) -> Result<VncClient> {
-        let neg = negotiate(addr, timeout)?;
-        authenticate_opts(neg, username, password, encoding_profile)
+        Self::connect_timeout_with_policy(
+            addr,
+            timeout,
+            username,
+            password,
+            encoding_profile,
+            SecurityPolicy::PreferAppleThenVnc,
+        )
     }
 
     pub fn connect_timeout(
@@ -914,7 +932,14 @@ impl VncClient {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self> {
-        authenticate(negotiate(addr, timeout)?, username, password)
+        Self::connect_timeout_with_policy(
+            addr,
+            timeout,
+            username,
+            password,
+            session::SessionEncodingProfile::Raw,
+            SecurityPolicy::PreferAppleThenVnc,
+        )
     }
 
     /// 设置客户端像素格式与帧编码，必须在第一次 UpdateRequest 之前调用
@@ -1446,6 +1471,83 @@ mod tests {
         )
         .unwrap_err();
         assert!(unsupported.to_string().contains("不支持"));
+    }
+
+    #[test]
+    fn credential_requirement_rejects_invalid_local_username_before_authentication() {
+        for username in [
+            "",
+            " ",
+            " local-user",
+            "local-user ",
+            "local\0user",
+            "local\u{85}user",
+        ] {
+            assert!(credential_requirement_for_types(
+                &[protocol::security::APPLE_SRP],
+                Some(username),
+                SecurityPolicy::AppleNativeOnly,
+            )
+            .is_err());
+        }
+        let overlong = "u".repeat(256);
+        assert!(credential_requirement_for_types(
+            &[protocol::security::APPLE_SRP],
+            Some(&overlong),
+            SecurityPolicy::AppleNativeOnly,
+        )
+        .is_err());
+        assert_eq!(
+            credential_requirement_for_types(
+                &[protocol::security::APPLE_SRP],
+                Some("本地用户"),
+                SecurityPolicy::AppleNativeOnly,
+            )
+            .unwrap(),
+            SecurityCredentialRequirement::Password
+        );
+    }
+
+    #[test]
+    fn invalid_local_username_is_rejected_before_opening_a_socket() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connected = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&connected);
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        observed.store(true, Ordering::SeqCst);
+                        let _ = stream.write_all(b"not-an-rfb!!");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("listener failed: {error}"),
+                }
+            }
+        });
+
+        let result = VncClient::connect_timeout_with_policy(
+            &address,
+            std::time::Duration::from_millis(100),
+            Some(" invalid-user"),
+            Some("unused-password"),
+            session::SessionEncodingProfile::Raw,
+            SecurityPolicy::AppleNativeOnly,
+        );
+
+        assert!(result.is_err());
+        server.join().unwrap();
+        assert!(!connected.load(Ordering::SeqCst));
     }
 
     #[test]

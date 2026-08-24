@@ -199,7 +199,11 @@ adapters over the same core. The desktop application uses one
 - Never add real credentials to source control; store local test credentials in `CREDENTIALS.local.md` (gitignored).
 - Do not hardcode IPs/passwords in code or examples.
 - The authorized Mac target and login details are local test secrets. Read them
-  only from `CREDENTIALS.local.md` or a non-echoing environment/credential
-  provider; never copy them into `AGENTS.md`, source, reverse notes, tool command
-  lines, captures, or test output.
+  only from `CREDENTIALS.local.md` for operator reference. Production protocol
+  CLI accepts the local username through `--username` and reads its password
+  only from the non-echoing interactive terminal prompt; password environment
+  variables are prohibited. The sole automation exception is the explicit,
+  bounded `hpss-capture-v2 --credentials-stdin-v1` frame. Never copy secrets
+  into `AGENTS.md`, source, reverse notes, tool command lines, captures, or test
+  output.
 - Favor conservative defaults for timeout/retry/probe settings; LAN capture behavior can affect network load.

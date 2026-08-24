@@ -143,10 +143,11 @@ impl GuardedCredentialFrame {
 
         let host = std::str::from_utf8(&self.bytes[HEADER_LEN..host_end])
             .map_err(|_| category_error("stdin frame host"))?;
-        validate_identity(host, "stdin frame host")?;
+        validate_host_identity(host, "stdin frame host")?;
         let username = std::str::from_utf8(&self.bytes[host_end..username_end])
             .map_err(|_| category_error("stdin frame username"))?;
-        validate_identity(username, "stdin frame username")?;
+        crate::vnc::local_username::validate_local_username(username)
+            .map_err(|_| category_error("stdin frame username"))?;
         let password = std::str::from_utf8(&self.bytes[username_end..password_end])
             .map_err(|_| category_error("stdin frame password"))?;
         if password.as_bytes().contains(&0) {
@@ -349,7 +350,7 @@ impl Drop for GuardedCredentialFrame {
     }
 }
 
-fn validate_identity(value: &str, category: &'static str) -> Result<()> {
+fn validate_host_identity(value: &str, category: &'static str) -> Result<()> {
     if value
         .as_bytes()
         .iter()
@@ -573,6 +574,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_ascii_control_inside_local_username() {
+        expect_rejected(&frame(
+            b"host",
+            "local\u{85}user".as_bytes(),
+            b"password",
+            1,
+        ));
+    }
+
+    #[test]
     fn rejects_password_nul_but_preserves_other_password_bytes() {
         expect_rejected(&frame(b"host", b"user", b"pass\0word", 1));
         let password = "  canary\t\n\u{2003} ";
@@ -776,6 +787,25 @@ mod tests {
             guarded.with_slices_then_clear(|_| Err("stable-authentication-error"));
 
         assert_eq!(result, Err("stable-authentication-error"));
+        assert_observed_zero(length);
+        set_clear_observer(None);
+    }
+
+    #[test]
+    fn authentication_callback_panic_clears_before_resuming_unwind() {
+        let _serial = OBSERVER_TEST_LOCK.lock().expect("observer test lock");
+        install_observer();
+        let length = valid_frame().len();
+        let mut guarded = parse(&valid_frame()).expect("valid fake frame");
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            guarded.with_slices_then_clear(|slices| {
+                assert_eq!(slices.password, "canary-pass");
+                panic!("authentication callback panic");
+            });
+        }));
+
+        assert!(panic_result.is_err());
         assert_observed_zero(length);
         set_clear_observer(None);
     }
