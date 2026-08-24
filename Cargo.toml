@@ -29,6 +29,8 @@ cbc = { version = "0.1", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", optional = true }
 secrecy = "0.10"
+crossbeam-channel = "0.5"
+raw-window-handle = "0.6"
 getrandom = { version = "0.2", optional = true }
 minifb = { version = "0.28", optional = true }
 cpal = { version = "0.18.2", optional = true }

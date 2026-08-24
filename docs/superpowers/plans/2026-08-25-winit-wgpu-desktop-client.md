@@ -103,7 +103,7 @@ Run: `cargo test --locked core --lib`
 
 Expected: all core frame and viewport tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```text
 feat(core): add validated render and viewport contracts
@@ -126,7 +126,7 @@ feat(core): add validated render and viewport contracts
 - Consumes: `ValidatedConnection`, `SessionCommand`, protocol events, and `RenderUpdate`.
 - Produces: `ProtocolAdapter::run`, `SessionEngine`, `SessionSnapshot`, `UiWakeHandle`, `WindowHost`, and `PlatformServices`.
 
-- [ ] **Step 1: Write failing bounded-queue tests**
+- [x] **Step 1: Write failing bounded-queue tests**
 
 ```rust
 #[test]
@@ -146,13 +146,13 @@ fn reset_discards_queued_updates_from_older_generations() {
 }
 ```
 
-- [ ] **Step 2: Run RED queue tests**
+- [x] **Step 2: Run RED queue tests**
 
 Run: `cargo test --locked session::backpressure --lib`
 
 Expected: compilation fails because the session queue is missing.
 
-- [ ] **Step 3: Implement the queue and adapter traits**
+- [x] **Step 3: Implement the queue and adapter traits**
 
 ```rust
 pub trait ProtocolAdapter: Send + 'static {
@@ -173,7 +173,7 @@ pub trait WindowHost {
 
 Use bounded crossbeam channels. Coalesce duplicate presents, reject updates larger than the byte budget, and evict only stale/coalescible entries; never silently drop the sole current-generation reset.
 
-- [ ] **Step 4: Write state-transition tests and verify RED/GREEN**
+- [x] **Step 4: Write state-transition tests and verify RED/GREEN**
 
 ```rust
 #[test]
@@ -187,7 +187,7 @@ fn session_rejects_connected_before_surface_reset() {
 
 Run before implementation and confirm expected failure, then implement `Idle -> Connecting -> SurfaceReady -> Connected -> Disconnecting -> Idle` plus terminal `Failed` transitions and rerun `cargo test --locked session --lib`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 feat(session): add bounded protocol and platform boundaries
