@@ -9,6 +9,7 @@ CREDENTIALS.local.md
 /.codex-target/
 /.superpowers/
 /.mcp.json
+/.worktrees/
 
 # Apple 安装镜像、逆向输出与授权会话材料不得进入公开仓库
 /*.dmg
