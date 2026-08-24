@@ -1,14 +1,18 @@
 import 'package:flutter/material.dart';
 
+import 'bridge/connection_bridge.dart';
+import 'bridge/native_connection_bridge.dart';
 import 'connection/connection_form.dart';
 import 'connection/connection_model.dart';
 
 void main() {
-  runApp(const FreeRemoteAccessApp());
+  runApp(FreeRemoteAccessApp());
 }
 
 class FreeRemoteAccessApp extends StatelessWidget {
-  const FreeRemoteAccessApp({super.key});
+  const FreeRemoteAccessApp({super.key, this.bridge});
+
+  final ConnectionBridge? bridge;
 
   @override
   Widget build(BuildContext context) {
@@ -28,18 +32,29 @@ class FreeRemoteAccessApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const ConnectionHomePage(),
+      home: ConnectionHomePage(bridge: bridge),
     );
   }
 }
 
 class ConnectionHomePage extends StatelessWidget {
-  const ConnectionHomePage({super.key});
+  const ConnectionHomePage({super.key, this.bridge});
 
-  void _showPendingBridge(BuildContext context, ConnectionDraft draft) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('连接参数已验证，正在初始化协议会话')));
+  final ConnectionBridge? bridge;
+
+  void _connect(BuildContext context, ConnectionDraft draft) {
+    try {
+      final result = (bridge ?? NativeConnectionBridge()).validate(draft);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已选择 ${result.protocol.label}，会话端口 ${result.port}'),
+        ),
+      );
+    } on ConnectionBridgeException catch (error) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    }
   }
 
   @override
@@ -50,7 +65,7 @@ class ConnectionHomePage extends StatelessWidget {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final form = ConnectionForm(
-              onConnect: (draft) => _showPendingBridge(context, draft),
+              onConnect: (draft) => _connect(context, draft),
             );
             if (constraints.maxWidth >= 720) {
               return Row(

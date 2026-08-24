@@ -35,9 +35,11 @@ The application source targets the common API surface of Flutter 3.41:
 Flutter owns application navigation, forms, accessibility, adaptive layout,
 and low-frequency session controls. Rust owns authentication, protocol state,
 network I/O, framebuffer state, capability negotiation, and input translation.
-Decoded frames do not cross a serialized Dart bridge. Each platform renderer
-consumes a native texture or shared pixel surface. The bridge carries only
-commands, session state, errors, geometry, and texture handles.
+The bridge is a Flutter `plugin_ffi` package backed by a stable C ABI; this is
+also supported by the CPF-Flutter OpenHarmony toolchain. Decoded frames do not
+cross a serialized Dart bridge. Each platform renderer consumes a native
+texture or shared pixel surface. The bridge carries only commands, session
+state, errors, geometry, and texture handles.
 
 ## Connection screen
 

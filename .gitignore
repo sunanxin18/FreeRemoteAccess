@@ -11,6 +11,13 @@ CREDENTIALS.local.md
 /.mcp.json
 /.worktrees/
 
+# 内部 FFI 包不提交 Flutter 模板生成的独立示例应用。
+/app/packages/freeremote_native/example/
+/app/packages/freeremote_native/pubspec.lock
+/app/packages/freeremote_native/src/
+/app/packages/freeremote_native/ffigen.yaml
+/app/packages/freeremote_native/CHANGELOG.md
+
 # Apple 安装镜像、逆向输出与授权会话材料不得进入公开仓库
 /*.dmg
 /ard_capture_ours/

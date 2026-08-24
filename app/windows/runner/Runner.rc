@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "io.freeremote" "\0"
-            VALUE "FileDescription", "freeremote_access" "\0"
+            VALUE "FileDescription", "FreeRemoteAccess" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "freeremote_access" "\0"
+            VALUE "InternalName", "FreeRemoteAccess" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 io.freeremote. All rights reserved." "\0"
-            VALUE "OriginalFilename", "freeremote_access.exe" "\0"
-            VALUE "ProductName", "freeremote_access" "\0"
+            VALUE "OriginalFilename", "FreeRemoteAccess.exe" "\0"
+            VALUE "ProductName", "FreeRemoteAccess" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

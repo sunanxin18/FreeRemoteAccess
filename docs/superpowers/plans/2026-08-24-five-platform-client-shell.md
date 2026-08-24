@@ -6,7 +6,7 @@
 
 **Architecture:** Flutter 3.41 owns forms and navigation while Rust owns validation, credentials, protocol sessions, and framebuffer generations. A narrow FFI bridge carries commands and state; decoded pixels stay on a native texture path. Native-host GitHub Actions jobs package each supported platform, with iOS intentionally unsigned.
 
-**Tech Stack:** Flutter 3.41.9, Dart 3.11.5, Rust 1.96, flutter_rust_bridge 2.13, IronRDP 0.17 / ironrdp-client 0.1, GitHub Actions
+**Tech Stack:** Flutter 3.41.9, Dart 3.11.5, Rust 1.96, Flutter `plugin_ffi`, stable C ABI, IronRDP 0.17 / ironrdp-client 0.1, GitHub Actions
 
 **Spec:** `docs/superpowers/specs/2026-08-24-five-platform-client-shell-design.md`
 
@@ -168,61 +168,62 @@ Expected: all widget tests pass and analyzer exits without errors.
 feat(ui): add adaptive five-platform connection screen
 ```
 
-### Task 3: Rust bridge and secret-safe validation
+### Task 3: Rust C ABI bridge and secret-safe validation
 
 **Files:**
-- Create: `native/freeremote_bridge/Cargo.toml`
-- Create: `native/freeremote_bridge/src/lib.rs`
-- Create: `native/freeremote_bridge/src/api.rs`
-- Create: `app/lib/bridge/bridge.dart`
-- Create: generated bridge bindings under `app/lib/bridge/generated`
+- Create: `native/freeremote_ffi/Cargo.toml`
+- Create: `native/freeremote_ffi/src/lib.rs`
+- Create: `app/packages/freeremote_native/pubspec.yaml`
+- Create: generated `plugin_ffi` platform folders under `app/packages/freeremote_native`
+- Create: `app/lib/bridge/native_bridge.dart`
 - Modify: `app/pubspec.yaml`
 - Test: `native/freeremote_bridge/src/api.rs`
 - Test: `app/test/connection_submission_test.dart`
 
 **Interfaces:**
 - Consumes: `ConnectionDraft` from Task 2.
-- Produces: `validateConnection(BridgeConnectionRequest) -> BridgeValidationResult`; passwords are passed only for the call lifetime.
+- Produces: `validateConnection(ConnectionDraft) -> NativeValidationResult`; passwords are passed only for the call lifetime and are never returned.
 
 - [ ] **Step 1: Write a failing Rust bridge mapping test**
 
 ```rust
 #[test]
 fn maps_mac_os_to_apple_rfb_without_returning_password() {
-    let result = validate_connection_bridge(BridgeConnectionRequest::fixture("mac_os")).unwrap();
-    assert_eq!(result.protocol, "apple_rfb");
+    let result = validate_ffi_request(FfiConnectionRequest::fixture(2)).unwrap();
+    assert_eq!(result.protocol, FfiProtocol::AppleRfb);
     assert_eq!(result.port, 5900);
-    assert!(!serde_json::to_string(&result).unwrap().contains("secret-value"));
+    assert!(!format!("{result:?}").contains("secret-value"));
 }
 ```
 
 - [ ] **Step 2: Verify RED, then implement the bridge DTO mapping**
 
-Run: `cargo test --manifest-path native/freeremote_bridge/Cargo.toml`
+Run: `cargo test --manifest-path native/freeremote_ffi/Cargo.toml`
 
-Expected before implementation: missing bridge symbols. Expected after minimal implementation: test passes.
+Expected before implementation: missing ABI mapping symbols. Expected after minimal implementation: test passes.
 
 - [ ] **Step 3: Write and run a failing Flutter submission test**
 
 The test enters all form fields, presses `connect-button`, and asserts the
-bridge receives `mac_os`, host, port, and username while recent-connection
-storage receives no password field.
+bridge receives service code `2`, host, port, and username while
+recent-connection storage receives no password field.
 
 Run: `cd app && flutter test test/connection_submission_test.dart`
 
 Expected: FAIL before the controller exists and PASS after it delegates to the
 bridge and clears the password controller on terminal failure.
 
-- [ ] **Step 4: Generate bindings and verify both languages**
+- [ ] **Step 4: Generate the FFI plugin and verify both languages**
 
-Run: `flutter_rust_bridge_codegen generate && cargo test --workspace && cd app && flutter test && flutter analyze`
+Run: `flutter create --template=plugin_ffi --platforms=android,ios,linux,macos,windows --org io.freeremote app/packages/freeremote_native`, then `cargo test --manifest-path native/freeremote_ffi/Cargo.toml && cd app && flutter test && flutter analyze`
 
-Expected: generated bindings are current and every command exits zero.
+Expected: the plugin exposes the stable C ABI loader on all five platform
+folders and every verification command exits zero.
 
 - [ ] **Step 5: Commit**
 
 ```text
-feat(bridge): connect Flutter form to Rust validation
+feat(bridge): connect Flutter form to Rust C ABI validation
 ```
 
 ### Task 4: Normalized RFB/ARD session events
@@ -450,4 +451,3 @@ as non-installable without external provisioning.
 ```text
 docs: record five-platform build and interoperability evidence
 ```
-

@@ -1,0 +1,153 @@
+name: build-five-platforms
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - feat/five-platform-client
+  pull_request:
+
+env:
+  FLUTTER_VERSION: 3.41.9
+  RUST_TOOLCHAIN: 1.96.0
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Verify Rust
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --no-default-features
+      - name: Verify Flutter
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Build Windows release
+        working-directory: app
+        run: flutter build windows --release
+      - name: Package Windows bundle
+        shell: pwsh
+        run: |
+          Compress-Archive -Path app\build\windows\x64\runner\Release\* -DestinationPath FreeRemoteAccess-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreeRemoteAccess-windows-x64
+          path: FreeRemoteAccess-windows-x64.zip
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build libgtk-3-dev liblzma-dev
+      - name: Build Linux release
+        working-directory: app
+        run: flutter build linux --release
+      - name: Package Linux bundle
+        run: tar -C app/build/linux/x64/release/bundle -czf FreeRemoteAccess-linux-x64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreeRemoteAccess-linux-x64
+          path: FreeRemoteAccess-linux-x64.tar.gz
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android native toolchain
+        run: |
+          sdkmanager "platforms;android-36" "ndk;28.2.13676358"
+          cargo install cargo-ndk --locked
+      - name: Build Android APK and app bundle
+        working-directory: app
+        run: |
+          flutter build apk --release --split-per-abi
+          flutter build appbundle --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreeRemoteAccess-android
+          path: |
+            app/build/app/outputs/flutter-apk/*-release.apk
+            app/build/app/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+  apple:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Build macOS release
+        working-directory: app
+        run: flutter build macos --release
+      - name: Package macOS disk image
+        run: hdiutil create -volname FreeRemoteAccess -srcfolder app/build/macos/Build/Products/Release/FreeRemoteAccess.app -ov -format UDZO FreeRemoteAccess-macos.dmg
+      - name: Build unsigned iOS application
+        working-directory: app
+        run: flutter build ios --release --no-codesign
+      - name: Package unsigned iOS application
+        run: ditto -c -k --sequesterRsrc --keepParent app/build/ios/iphoneos/Runner.app FreeRemoteAccess-ios-unsigned.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreeRemoteAccess-apple
+          path: |
+            FreeRemoteAccess-macos.dmg
+            FreeRemoteAccess-ios-unsigned.zip
+          if-no-files-found: error
