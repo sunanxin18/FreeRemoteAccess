@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.14)
 project(freeremote_native LANGUAGES NONE)
 
 get_filename_component(FRD_REPOSITORY_ROOT
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
+  "${CMAKE_CURRENT_LIST_DIR}/../../../.." REALPATH)
 set(FRD_CARGO_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargo")
 set(FRD_RUST_LIBRARY
   "${FRD_CARGO_TARGET_DIR}/release/libfreeremote_native.so")
