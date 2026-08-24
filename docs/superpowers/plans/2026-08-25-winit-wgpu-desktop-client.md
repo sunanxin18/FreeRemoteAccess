@@ -38,7 +38,7 @@
 - Consumes: decoded BGRA/RGBA byte rectangles and physical host/remote dimensions.
 - Produces: `RemotePixelFormat`, `FrameRect`, `RenderUpdate`, `RemoteViewportTransform`, and stable validation errors.
 
-- [ ] **Step 1: Write failing frame-contract tests**
+- [x] **Step 1: Write failing frame-contract tests**
 
 ```rust
 #[test]
@@ -61,13 +61,13 @@ fn stale_generation_is_classified_before_upload() {
 }
 ```
 
-- [ ] **Step 2: Run RED frame tests**
+- [x] **Step 2: Run RED frame tests**
 
 Run: `cargo test --locked core::frame --lib`
 
 Expected: compilation fails because `core::frame` and the listed types do not exist.
 
-- [ ] **Step 3: Implement exact frame validation**
+- [x] **Step 3: Implement exact frame validation**
 
 ```rust
 pub enum RenderUpdate {
@@ -80,7 +80,7 @@ pub enum RenderUpdate {
 
 Limit surfaces to 64 million pixels, reject zero dimensions and arithmetic overflow, require every rectangle to fit the current surface, and require `pixels.len() == bytes_per_row * rect.height` with `bytes_per_row >= rect.width * 4`.
 
-- [ ] **Step 4: Write and verify RED viewport tests**
+- [x] **Step 4: Write and verify RED viewport tests**
 
 ```rust
 #[test]
@@ -95,7 +95,7 @@ Run: `cargo test --locked core::viewport --lib`
 
 Expected: FAIL because `RemoteViewportTransform` is missing.
 
-- [ ] **Step 5: Implement viewport mapping and verify GREEN**
+- [x] **Step 5: Implement viewport mapping and verify GREEN**
 
 Calculate one aspect-fit physical-pixel rectangle; reject non-finite/non-positive scale factors and zero dimensions; return `None` for letterbox coordinates and clamp in-surface coordinates to the current remote bounds.
 
