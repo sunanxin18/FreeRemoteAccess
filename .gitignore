@@ -1,5 +1,8 @@
 /target
 *.png
+!/app/android/app/src/main/res/mipmap-*/ic_launcher.png
+!/app/ios/Runner/Assets.xcassets/**/*.png
+!/app/macos/Runner/Assets.xcassets/**/*.png
 CREDENTIALS.local.md
 /ard_capture
 /ard_re
