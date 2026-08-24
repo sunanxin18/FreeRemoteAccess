@@ -34,6 +34,8 @@ const desktopSessionArguments = <String>[
   'hpssview',
   '--credentials-stdin-v1',
   '--parent-status-stdout-v1',
+  '--scale',
+  '0.25',
 ];
 
 bool isAppleDesktopRequest(ConnectionDraft request) {

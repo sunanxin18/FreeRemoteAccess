@@ -3,15 +3,14 @@ import 'package:freeremote_access/connection/connection_model.dart';
 import 'package:freeremote_access/session/desktop_session_launcher.dart';
 
 void main() {
-  test('Windows Apple desktop launch defaults to rendered TCP MVS', () {
-    expect(
-      desktopSessionArguments,
-      containsAllInOrder(<String>[
-        'hpssview',
-        '--credentials-stdin-v1',
-        '--parent-status-stdout-v1',
-      ]),
-    );
+  test('Windows Apple desktop launch uses a visible initial portrait size', () {
+    expect(desktopSessionArguments, <String>[
+      'hpssview',
+      '--credentials-stdin-v1',
+      '--parent-status-stdout-v1',
+      '--scale',
+      '0.25',
+    ]);
     expect(desktopSessionArguments, isNot(contains('--udp-media')));
   });
 

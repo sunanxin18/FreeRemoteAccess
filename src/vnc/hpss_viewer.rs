@@ -1414,6 +1414,11 @@ where
         return Ok(MvsRecordOutcome::RecoveryRequested);
     }
     let complete_surface = is_complete_surface_frame(record.rect, display_size);
+    if receiver.awaiting_full() && !complete_surface {
+        eprintln!("[hpss-view] 等待完整 surface 时拒绝发布 MVS 子矩形，继续请求全量重同步");
+        receiver.request_full()?;
+        return Ok(MvsRecordOutcome::RecoveryRequested);
+    }
     let prepared = match receiver.prepare_rect(&record.payload, record.rect, display_size) {
         Ok(mvs::MvsDecodeDecision::Prepared(prepared)) => prepared,
         Ok(mvs::MvsDecodeDecision::PreparedOpaque(prepared)) => {
@@ -3753,11 +3758,17 @@ mod tests {
         }
     }
 
-    fn native_mode_zero_payload() -> Vec<u8> {
+    fn native_mode_zero_payload_for_tiles(tile_count: u32) -> Vec<u8> {
+        assert!((1..=16).contains(&tile_count));
         let mut mode = TestBitWriter::new();
         mode.write_bits(1, 1);
         mode.write_bits(0, 3);
-        mode.write_bits(0, 1);
+        if tile_count == 1 {
+            mode.write_bits(0, 1);
+        } else {
+            mode.write_bits(1, 1);
+            mode.write_bits(tile_count - 2, 4);
+        }
         mode.write_bits(0x6d, 8);
         let mode = mode.finish();
 
@@ -3776,6 +3787,10 @@ mod tests {
         payload.extend_from_slice(&mode);
         payload.extend_from_slice(&data);
         payload
+    }
+
+    fn native_mode_zero_payload() -> Vec<u8> {
+        native_mode_zero_payload_for_tiles(1)
     }
 
     fn native_opcode_zero_partial_payload() -> Vec<u8> {
@@ -3819,7 +3834,7 @@ mod tests {
     }
 
     #[test]
-    fn native_subrectangle_applies_without_complete_surface_evidence() {
+    fn native_subrectangle_while_awaiting_full_requests_recovery_without_surface_mutation() {
         let surface = native_surface(16, 8);
         let dynamic = native_runtime(16, 8);
         let mut receiver = MvsReceiveState::new(0);
@@ -3840,28 +3855,75 @@ mod tests {
                 apply_rgb_rect,
             )
             .unwrap(),
-            MvsRecordOutcome::FullApplied
+            MvsRecordOutcome::RecoveryRequested
         );
         let surface = surface.lock().unwrap();
-        assert!(surface.framebuffer.pixels()[..8]
-            .iter()
-            .all(|pixel| *pixel == 0));
-        assert!(surface.framebuffer.pixels()[8..16]
-            .iter()
-            .all(|pixel| *pixel == 0x00ff_ffff));
+        assert!(surface.framebuffer.pixels().iter().all(|pixel| *pixel == 0));
         drop(surface);
         assert!(!dynamic.lock().unwrap().evidence.current_full_media_applied);
-        assert!(!receiver.awaiting_full());
+        assert!(receiver.awaiting_full());
     }
 
     #[test]
-    fn native_type_zero_reaches_render_and_malformed_type_one_preserves_visible_pixels() {
+    fn native_subrectangle_applies_after_current_generation_full_state_exists() {
         let surface = native_surface(16, 8);
         let dynamic = native_runtime(16, 8);
         let mut receiver = MvsReceiveState::new(0);
         receiver.install_tables(&type_two_tables_fixture()).unwrap();
-        let type_zero = native_record(MvsRect {
+        let initial = MvsRecord {
+            rect: MvsRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 8,
+            },
+            payload: native_mode_zero_payload_for_tiles(2),
+        };
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &initial,
+                &surface,
+                &dynamic,
+                apply_rgb_rect,
+            )
+            .unwrap(),
+            MvsRecordOutcome::FullApplied
+        );
+        surface.lock().unwrap().framebuffer.pixels_mut().fill(0);
+        let record = native_record(MvsRect {
             x: 8,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                apply_rgb_rect,
+            )
+            .unwrap(),
+            MvsRecordOutcome::FullApplied
+        );
+        let surface = surface.lock().unwrap();
+        for row in surface.framebuffer.pixels().chunks_exact(16) {
+            assert!(row[..8].iter().all(|pixel| *pixel == 0));
+            assert!(row[8..].iter().all(|pixel| *pixel == 0x00ff_ffff));
+        }
+    }
+
+    #[test]
+    fn native_type_zero_reaches_render_and_malformed_type_one_preserves_visible_pixels() {
+        let surface = native_surface(8, 8);
+        let dynamic = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(0);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let type_zero = native_record(MvsRect {
+            x: 0,
             y: 0,
             width: 8,
             height: 8,
@@ -3879,9 +3941,9 @@ mod tests {
             MvsRecordOutcome::FullApplied
         );
 
-        let mut first_render = vec![0; 16 * 8];
+        let mut first_render = vec![0; 8 * 8];
         let first_snapshot =
-            render_surface_frame_with(&surface, (16, 8), &mut first_render, |pixels, _, _| {
+            render_surface_frame_with(&surface, (8, 8), &mut first_render, |pixels, _, _| {
                 assert!(pixels.iter().any(|pixel| *pixel != 0));
                 Ok(())
             })
@@ -3911,9 +3973,9 @@ mod tests {
             MvsRecordOutcome::RecoveryRequested
         );
 
-        let mut second_render = vec![0; 16 * 8];
+        let mut second_render = vec![0; 8 * 8];
         let second_snapshot =
-            render_surface_frame_with(&surface, (16, 8), &mut second_render, |pixels, _, _| {
+            render_surface_frame_with(&surface, (8, 8), &mut second_render, |pixels, _, _| {
                 assert!(pixels.iter().any(|pixel| *pixel != 0));
                 Ok(())
             })
