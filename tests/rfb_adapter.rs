@@ -1,9 +1,11 @@
 #![cfg(feature = "cli")]
 
 use freeremotedesk::core::{RemotePixelFormat, RenderUpdate};
+use freeremotedesk::protocols::apple_ard::AppleArdAdapter;
 use freeremotedesk::protocols::rfb::normalize_rect_ops;
 use freeremotedesk::vnc::client::RectOp;
 use freeremotedesk::vnc::protocol;
+use freeremotedesk::vnc::session::SessionEncodingProfile;
 
 #[test]
 fn full_raw_frame_emits_reset_rect_and_present_for_one_generation() {
@@ -72,4 +74,12 @@ fn client_cut_text_uses_type_six_and_exact_big_endian_length() {
     assert_eq!(&message[1..4], &[0, 0, 0]);
     assert_eq!(&message[4..8], &6u32.to_be_bytes());
     assert_eq!(&message[8..], "桌面".as_bytes());
+}
+
+#[test]
+fn apple_adapter_selects_native_hpss_udp_media_instead_of_raw_vnc() {
+    assert_eq!(
+        AppleArdAdapter::session_profile(),
+        SessionEncodingProfile::AppleUdpMedia
+    );
 }

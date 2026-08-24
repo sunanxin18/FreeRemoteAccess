@@ -44,7 +44,8 @@ fn cold_deadline_error() -> anyhow::Error {
     ColdDeadlineError.into()
 }
 
-pub(crate) fn is_cold_deadline_error(error: &anyhow::Error) -> bool {
+#[doc(hidden)]
+pub fn is_cold_deadline_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<ColdDeadlineError>())
 }
 

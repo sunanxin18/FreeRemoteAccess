@@ -75,6 +75,7 @@ cli = [
 ]
 viewer = ["cli", "dep:minifb", "dep:cpal"]
 gui = [
+    "viewer",
     "dep:bytemuck",
     "dep:egui",
     "dep:egui-wgpu",

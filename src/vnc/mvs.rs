@@ -157,7 +157,8 @@ impl MvsDecodeState {
         )
     }
 
-    pub(crate) fn prepare_rect(
+    #[doc(hidden)]
+    pub fn prepare_rect(
         &mut self,
         generation: u64,
         payload: &[u8],

@@ -2,21 +2,15 @@
 //! 目标场景：在 Windows 上发现并连接局域网内 macOS 的“屏幕共享”
 //!（系统内置的 VNC 服务端，TCP 5900）。
 
-mod arp;
-mod framebuffer;
-#[cfg(feature = "viewer")]
-mod keysym;
-mod proxy;
-#[cfg(feature = "viewer")]
-mod viewer;
-mod vnc;
-
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "viewer")]
+use freeremotedesk::viewer;
+use freeremotedesk::{arp, framebuffer, proxy, vnc};
 
 use framebuffer::{Framebuffer, PNG_ALPHA_OPAQUE, PNG_CHANNEL_BYTES};
 use vnc::client::{self, VncClient};

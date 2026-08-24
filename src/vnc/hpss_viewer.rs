@@ -15,10 +15,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
+use crate::core::{FrameRect, RemotePixelFormat, RenderUpdate};
 use crate::framebuffer::{Framebuffer, PIXEL_BLUE_SHIFT, PIXEL_GREEN_SHIFT, PIXEL_RED_SHIFT};
 use crate::keysym;
+use crate::session::{SessionCommand, SessionEvent, SessionEventSink};
 use crate::vnc::audio_codec::{
     AacEldEncoder, ArdAudioReceiver, AudioReceiveOutcome, DecodedAudioPacket,
 };
@@ -497,6 +500,7 @@ struct DisplaySurface {
     generation: u64,
     framebuffer: Framebuffer,
     native_mvs_observability: NativeMvsRenderObservability,
+    pending_damage: Option<MvsRect>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -512,10 +516,11 @@ impl DisplaySurface {
             generation,
             framebuffer,
             native_mvs_observability: NativeMvsRenderObservability::default(),
+            pending_damage: None,
         }
     }
 
-    fn record_native_type_zero_applied(&mut self) -> NativeMvsRenderObservability {
+    fn record_native_type_zero_applied(&mut self, rect: MvsRect) -> NativeMvsRenderObservability {
         self.native_mvs_observability.type_zero_applied_count = self
             .native_mvs_observability
             .type_zero_applied_count
@@ -524,8 +529,99 @@ impl DisplaySurface {
             .native_mvs_observability
             .content_revision
             .saturating_add(1);
+        self.pending_damage = Some(match self.pending_damage {
+            None => rect,
+            Some(previous) => union_mvs_rect(previous, rect),
+        });
         self.native_mvs_observability
     }
+}
+
+fn union_mvs_rect(left: MvsRect, right: MvsRect) -> MvsRect {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    let right_edge = left
+        .x
+        .saturating_add(left.width)
+        .max(right.x.saturating_add(right.width));
+    let bottom_edge = left
+        .y
+        .saturating_add(left.height)
+        .max(right.y.saturating_add(right.height));
+    MvsRect {
+        x,
+        y,
+        width: right_edge.saturating_sub(x),
+        height: bottom_edge.saturating_sub(y),
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HpssRenderCursor {
+    generation: Option<u64>,
+    content_revision: u64,
+}
+
+fn take_protocol_render_updates(
+    surface: &Arc<Mutex<DisplaySurface>>,
+    cursor: &mut HpssRenderCursor,
+) -> Result<Vec<RenderUpdate>> {
+    let mut surface = surface.lock().unwrap();
+    let mut updates = Vec::with_capacity(3);
+    let generation_changed = cursor.generation != Some(surface.generation);
+    if generation_changed {
+        let width = u32::try_from(surface.framebuffer.width).context("HPSS surface 宽度溢出")?;
+        let height = u32::try_from(surface.framebuffer.height).context("HPSS surface 高度溢出")?;
+        updates.push(RenderUpdate::reset(
+            surface.generation,
+            width,
+            height,
+            RemotePixelFormat::Bgra8Srgb,
+        )?);
+        cursor.generation = Some(surface.generation);
+        cursor.content_revision = 0;
+    }
+
+    let revision = surface.native_mvs_observability.content_revision;
+    if revision != cursor.content_revision {
+        let rect = surface
+            .pending_damage
+            .take()
+            .context("HPSS surface revision 缺少 damage")?;
+        let frame_rect = FrameRect::new(
+            u32::from(rect.x),
+            u32::from(rect.y),
+            u32::from(rect.width),
+            u32::from(rect.height),
+        )?;
+        let pixels = extract_surface_bgra(&surface.framebuffer, rect);
+        updates.push(RenderUpdate::dirty_rect(
+            surface.generation,
+            frame_rect,
+            RemotePixelFormat::Bgra8Srgb,
+            u32::from(rect.width) * RemotePixelFormat::Bgra8Srgb.bytes_per_pixel(),
+            pixels.into_boxed_slice(),
+        )?);
+        updates.push(RenderUpdate::present(surface.generation));
+        cursor.content_revision = revision;
+    }
+    Ok(updates)
+}
+
+fn extract_surface_bgra(framebuffer: &Framebuffer, rect: MvsRect) -> Vec<u8> {
+    let x = usize::from(rect.x);
+    let y = usize::from(rect.y);
+    let width = usize::from(rect.width);
+    let height = usize::from(rect.height);
+    let mut output = Vec::with_capacity(width.saturating_mul(height).saturating_mul(4));
+    for row in 0..height {
+        let offset = (y + row) * framebuffer.width + x;
+        for pixel in &framebuffer.pixels()[offset..offset + width] {
+            let [blue, green, red, _] = pixel.to_le_bytes();
+            output.extend_from_slice(&[blue, green, red, 0xff]);
+        }
+    }
+    output
 }
 
 struct DynamicResolutionRuntime {
@@ -1454,7 +1550,7 @@ where
             Err(anyhow::anyhow!("MVS surface generation 在应用前发生变化"))
         } else {
             apply_prepared_mvs_to_surface_with(receiver, &mut surface, prepared, record.rect, apply)
-                .map(|()| surface.record_native_type_zero_applied())
+                .map(|()| surface.record_native_type_zero_applied(record.rect))
         }
     };
     let observability = match applied {
@@ -1738,13 +1834,64 @@ fn scaled_drawable_size(surface: DisplaySize, scale: f32) -> Result<(usize, usiz
 
 /// HPSS 实时视图主循环
 pub fn run_viewer(
-    mut conn: RfbConn,
+    conn: RfbConn,
     display_name: &str,
     init_w: u16,
     init_h: u16,
     scale: f32,
     dynamic_resolution_enabled: bool,
     audio_flow: AudioMediaFlow,
+) -> Result<()> {
+    run_hpss_session(
+        conn,
+        display_name,
+        init_w,
+        init_h,
+        dynamic_resolution_enabled,
+        audio_flow,
+        HpssFrontend::Minifb { scale },
+    )
+}
+
+pub fn run_protocol_session(
+    conn: RfbConn,
+    display_name: &str,
+    init_w: u16,
+    init_h: u16,
+    dynamic_resolution_enabled: bool,
+    audio_flow: AudioMediaFlow,
+    commands: Receiver<SessionCommand>,
+    events: SessionEventSink,
+) -> Result<()> {
+    run_hpss_session(
+        conn,
+        display_name,
+        init_w,
+        init_h,
+        dynamic_resolution_enabled,
+        audio_flow,
+        HpssFrontend::Protocol { commands, events },
+    )
+}
+
+enum HpssFrontend {
+    Minifb {
+        scale: f32,
+    },
+    Protocol {
+        commands: Receiver<SessionCommand>,
+        events: SessionEventSink,
+    },
+}
+
+fn run_hpss_session(
+    mut conn: RfbConn,
+    display_name: &str,
+    init_w: u16,
+    init_h: u16,
+    dynamic_resolution_enabled: bool,
+    audio_flow: AudioMediaFlow,
+    frontend: HpssFrontend,
 ) -> Result<()> {
     validate_hpss_audio_flow(audio_flow, REVIEWED_AUDIO_INPUT_SOURCE_MODE)?;
     let media_server_address = conn.peer_addr()?.ip();
@@ -2214,123 +2361,28 @@ pub fn run_viewer(
         })
     };
 
-    // ── 主线程：minifb 窗口 + 输入 ──
-    let main_result = (|| -> Result<()> {
-        let (vw, vh) = scaled_drawable_size(initial_size, scale)?;
-        let mut window = Window::new(
-            &format!("FreeRemoteDesk HPSS — [{w}x{h}  Ctrl+Q 退出]"),
-            vw,
-            vh,
-            WindowOptions {
-                resize: true,
-                ..Default::default()
-            },
-        )?;
-        window.set_target_fps(60);
-
-        let mut scaled: Vec<u32> = Vec::new();
-        let mut pressed: HashSet<Key> = HashSet::new();
-        let mut last_pointer: Option<(u16, u16, u8)> = None;
-        let mut last_window_size = window.get_size();
-
-        loop {
-            let window_size = window.get_size();
-            let drawable_size = (window_size.0.max(1), window_size.1.max(1));
-            scaled.resize(drawable_size.0.saturating_mul(drawable_size.1), 0);
-
-            render_surface_frame_with(
-                &surface,
-                drawable_size,
-                &mut scaled,
-                |pixels, width, height| {
-                    window.update_with_buffer(pixels, width, height)?;
-                    Ok(())
-                },
-            )?;
-
-            if dynamic_resolution_enabled && window_size != last_window_size {
-                last_window_size = window_size;
-                if let Some(target) = DisplaySize::from_viewport(window_size.0, window_size.1) {
-                    viewport_requests
-                        .lock()
-                        .unwrap()
-                        .observe(target, Instant::now());
-                } else {
-                    viewport_requests.lock().unwrap().drop_latest();
-                }
-            }
-
-            let quit_hotkey = {
-                let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
-                ctrl && window.is_key_pressed(Key::Q, minifb::KeyRepeat::No)
-            };
-            if !window.is_open() || quit_hotkey {
-                break;
-            }
-            if let Some(err) = error_slot.lock().unwrap().take() {
-                bail!("远程连接中断: {err}");
-            }
-
-            // 键盘（差分）
-            let now: HashSet<Key> = window.get_keys().into_iter().collect();
-            let shift = now.contains(&Key::LeftShift) || now.contains(&Key::RightShift);
-            let mut key_msgs = Vec::new();
-            for k in &now {
-                if !pressed.contains(k) {
-                    if let Some(ks) = keysym::to_keysym(*k, shift) {
-                        key_msgs.push(protocol::msg_key_event(true, ks));
-                    }
-                }
-            }
-            for k in &pressed {
-                if !now.contains(k) {
-                    if let Some(ks) = keysym::to_keysym(*k, false) {
-                        key_msgs.push(protocol::msg_key_event(false, ks));
-                    }
-                }
-            }
-            pressed = now;
-            for m in &key_msgs {
-                send_encrypted(&write_stream, &crypto, m)?;
-            }
-
-            // 鼠标
-            let mut mask = 0u8;
-            if window.get_mouse_down(MouseButton::Left) {
-                mask |= protocol::pointer::PRIMARY;
-            }
-            if window.get_mouse_down(MouseButton::Middle) {
-                mask |= protocol::pointer::MIDDLE;
-            }
-            if window.get_mouse_down(MouseButton::Right) {
-                mask |= protocol::pointer::SECONDARY;
-            }
-            if let Some((wx, wy)) = window.get_scroll_wheel() {
-                if wy > 0.0 {
-                    mask |= protocol::pointer::WHEEL_UP;
-                } else if wy < 0.0 {
-                    mask |= protocol::pointer::WHEEL_DOWN;
-                }
-                if wx > 0.0 {
-                    mask |= protocol::pointer::WHEEL_RIGHT;
-                } else if wx < 0.0 {
-                    mask |= protocol::pointer::WHEEL_LEFT;
-                }
-            }
-            if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
-                let display_size = current_surface_size(&surface);
-                let (x, y) = map_pointer(mx, my, window_size, display_size);
-                let cur = (x, y, mask);
-                if last_pointer != Some(cur) {
-                    let msg = protocol::msg_pointer_event(mask, x, y);
-                    send_encrypted(&write_stream, &crypto, &msg)?;
-                    last_pointer = Some(cur);
-                }
-            }
-        }
-
-        Ok(())
-    })();
+    let main_result = match frontend {
+        HpssFrontend::Minifb { scale } => run_minifb_frontend(
+            initial_size,
+            scale,
+            dynamic_resolution_enabled,
+            &surface,
+            &viewport_requests,
+            &write_stream,
+            &crypto,
+            &error_slot,
+        ),
+        HpssFrontend::Protocol { commands, events } => run_protocol_frontend(
+            dynamic_resolution_enabled,
+            &surface,
+            &viewport_requests,
+            &write_stream,
+            &crypto,
+            &error_slot,
+            &commands,
+            &events,
+        ),
+    };
 
     let cleanup_result = shutdown_reader(&closing, &write_stream, reader);
     match (main_result, cleanup_result) {
@@ -2338,6 +2390,242 @@ pub fn run_viewer(
         (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "旧 minifb 入口在迁移期显式复用同一 HPSS 协议运行时"
+)]
+fn run_minifb_frontend(
+    initial_size: DisplaySize,
+    scale: f32,
+    dynamic_resolution_enabled: bool,
+    surface: &Arc<Mutex<DisplaySurface>>,
+    viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
+    write_stream: &Arc<Mutex<std::net::TcpStream>>,
+    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
+    error_slot: &Arc<Mutex<Option<String>>>,
+) -> Result<()> {
+    let (vw, vh) = scaled_drawable_size(initial_size, scale)?;
+    let mut window = Window::new(
+        &format!(
+            "FreeRemoteDesk HPSS — [{}x{}  Ctrl+Q 退出]",
+            initial_size.width, initial_size.height
+        ),
+        vw,
+        vh,
+        WindowOptions {
+            resize: true,
+            ..Default::default()
+        },
+    )?;
+    window.set_target_fps(60);
+
+    let mut scaled: Vec<u32> = Vec::new();
+    let mut pressed: HashSet<Key> = HashSet::new();
+    let mut last_pointer: Option<(u16, u16, u8)> = None;
+    let mut last_window_size = window.get_size();
+
+    loop {
+        let window_size = window.get_size();
+        let drawable_size = (window_size.0.max(1), window_size.1.max(1));
+        scaled.resize(drawable_size.0.saturating_mul(drawable_size.1), 0);
+        render_surface_frame_with(
+            surface,
+            drawable_size,
+            &mut scaled,
+            |pixels, width, height| {
+                window.update_with_buffer(pixels, width, height)?;
+                Ok(())
+            },
+        )?;
+
+        if dynamic_resolution_enabled && window_size != last_window_size {
+            last_window_size = window_size;
+            if let Some(target) = DisplaySize::from_viewport(window_size.0, window_size.1) {
+                viewport_requests
+                    .lock()
+                    .unwrap()
+                    .observe(target, Instant::now());
+            } else {
+                viewport_requests.lock().unwrap().drop_latest();
+            }
+        }
+
+        let quit_hotkey = {
+            let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+            ctrl && window.is_key_pressed(Key::Q, minifb::KeyRepeat::No)
+        };
+        if !window.is_open() || quit_hotkey {
+            break;
+        }
+        if let Some(err) = error_slot.lock().unwrap().take() {
+            bail!("远程连接中断: {err}");
+        }
+
+        let now: HashSet<Key> = window.get_keys().into_iter().collect();
+        let shift = now.contains(&Key::LeftShift) || now.contains(&Key::RightShift);
+        let mut key_msgs = Vec::new();
+        for k in &now {
+            if !pressed.contains(k) {
+                if let Some(ks) = keysym::to_keysym(*k, shift) {
+                    key_msgs.push(protocol::msg_key_event(true, ks));
+                }
+            }
+        }
+        for k in &pressed {
+            if !now.contains(k) {
+                if let Some(ks) = keysym::to_keysym(*k, false) {
+                    key_msgs.push(protocol::msg_key_event(false, ks));
+                }
+            }
+        }
+        pressed = now;
+        for message in &key_msgs {
+            send_encrypted(write_stream, crypto, message)?;
+        }
+
+        let mut mask = 0u8;
+        if window.get_mouse_down(MouseButton::Left) {
+            mask |= protocol::pointer::PRIMARY;
+        }
+        if window.get_mouse_down(MouseButton::Middle) {
+            mask |= protocol::pointer::MIDDLE;
+        }
+        if window.get_mouse_down(MouseButton::Right) {
+            mask |= protocol::pointer::SECONDARY;
+        }
+        if let Some((wx, wy)) = window.get_scroll_wheel() {
+            if wy > 0.0 {
+                mask |= protocol::pointer::WHEEL_UP;
+            } else if wy < 0.0 {
+                mask |= protocol::pointer::WHEEL_DOWN;
+            }
+            if wx > 0.0 {
+                mask |= protocol::pointer::WHEEL_RIGHT;
+            } else if wx < 0.0 {
+                mask |= protocol::pointer::WHEEL_LEFT;
+            }
+        }
+        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+            let display_size = current_surface_size(surface);
+            let (x, y) = map_pointer(mx, my, window_size, display_size);
+            let current = (x, y, mask);
+            if last_pointer != Some(current) {
+                send_encrypted(
+                    write_stream,
+                    crypto,
+                    &protocol::msg_pointer_event(mask, x, y),
+                )?;
+                last_pointer = Some(current);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "协议前端显式持有 HPSS 共享边界，便于审计线程和锁顺序"
+)]
+fn run_protocol_frontend(
+    dynamic_resolution_enabled: bool,
+    surface: &Arc<Mutex<DisplaySurface>>,
+    viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
+    write_stream: &Arc<Mutex<std::net::TcpStream>>,
+    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
+    error_slot: &Arc<Mutex<Option<String>>>,
+    commands: &Receiver<SessionCommand>,
+    events: &SessionEventSink,
+) -> Result<()> {
+    let mut render_cursor = HpssRenderCursor::default();
+    publish_protocol_render_updates(surface, &mut render_cursor, events)?;
+
+    loop {
+        if let Some(error) = error_slot.lock().unwrap().take() {
+            bail!("远程连接中断: {error}");
+        }
+        publish_protocol_render_updates(surface, &mut render_cursor, events)?;
+        match commands.recv_timeout(Duration::from_millis(8)) {
+            Ok(SessionCommand::Pointer { x, y, buttons }) => {
+                let x = u16::try_from(x).context("HPSS pointer x 超出范围")?;
+                let y = u16::try_from(y).context("HPSS pointer y 超出范围")?;
+                send_encrypted(
+                    write_stream,
+                    crypto,
+                    &protocol::msg_pointer_event(buttons, x, y),
+                )?;
+            }
+            Ok(SessionCommand::Key { scan_code, pressed }) => {
+                send_encrypted(
+                    write_stream,
+                    crypto,
+                    &protocol::msg_key_event(pressed, scan_code),
+                )?;
+            }
+            Ok(SessionCommand::Resize { width, height }) if dynamic_resolution_enabled => {
+                if let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) {
+                    if let Some(target) = DisplaySize::from_viewport(width, height) {
+                        viewport_requests
+                            .lock()
+                            .unwrap()
+                            .observe(target, Instant::now());
+                    }
+                }
+            }
+            Ok(SessionCommand::Resize { .. }) => {}
+            Ok(SessionCommand::ClipboardText(text)) => {
+                send_encrypted(write_stream, crypto, &protocol::msg_client_cut_text(&text)?)?;
+            }
+            Ok(SessionCommand::RequestFullFrame) => {
+                let size = current_surface_size(surface);
+                send_encrypted(
+                    write_stream,
+                    crypto,
+                    &protocol::msg_fb_update_request(false, 0, 0, size.width, size.height),
+                )?;
+            }
+            Ok(SessionCommand::Disconnect) | Err(RecvTimeoutError::Disconnected) => {
+                events.emit(SessionEvent::Disconnecting)?;
+                events.emit(SessionEvent::Disconnected)?;
+                return Ok(());
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn publish_protocol_render_updates(
+    surface: &Arc<Mutex<DisplaySurface>>,
+    cursor: &mut HpssRenderCursor,
+    events: &SessionEventSink,
+) -> Result<()> {
+    for update in take_protocol_render_updates(surface, cursor)? {
+        if let RenderUpdate::Reset {
+            generation,
+            width,
+            height,
+            format,
+        } = update
+        {
+            events.emit(SessionEvent::SurfaceReset {
+                generation,
+                width,
+                height,
+                format,
+            })?;
+            events.emit(SessionEvent::Render(RenderUpdate::Reset {
+                generation,
+                width,
+                height,
+                format,
+            }))?;
+            events.emit(SessionEvent::Connected { generation })?;
+        } else {
+            events.emit(SessionEvent::Render(update))?;
+        }
+    }
+    Ok(())
 }
 
 /// RGB u8 → 帧缓冲像素（0x00RRGGBB）
@@ -2526,11 +2814,12 @@ mod tests {
         process_complete_mvs_record, read_viewer_app_frame_step, reader_frame_class,
         render_surface_frame_with, request_full_update_at, scaled_drawable_size,
         select_initial_display_size, service_reader_tick_at, should_log_audio_input_probe_progress,
-        should_log_audio_resynchronization, shutdown_reader, validate_hpss_audio_flow,
-        AudioOutputPhase, ContentViewport, DisplaySurface, DynamicResolutionRuntime,
-        MediaAcceptOutcome, MvsReceiveState, MvsRecordOutcome, NativeMvsRenderObservability,
-        ReaderFrameClass, ReaderRequestState, TableFollowupState, TableScheduleStatus,
-        ViewerMediaState, ViewportRequestQueue, REVIEWED_AUDIO_INPUT_SOURCE_MODE,
+        should_log_audio_resynchronization, shutdown_reader, take_protocol_render_updates,
+        validate_hpss_audio_flow, AudioOutputPhase, ContentViewport, DisplaySurface,
+        DynamicResolutionRuntime, HpssRenderCursor, MediaAcceptOutcome, MvsReceiveState,
+        MvsRecordOutcome, NativeMvsRenderObservability, ReaderFrameClass, ReaderRequestState,
+        TableFollowupState, TableScheduleStatus, ViewerMediaState, ViewportRequestQueue,
+        REVIEWED_AUDIO_INPUT_SOURCE_MODE,
     };
     use crate::framebuffer::Framebuffer;
     use crate::vnc::audio_codec::{
@@ -5198,5 +5487,79 @@ mod tests {
             );
             assert!(receiver.awaiting_full());
         }
+    }
+
+    #[test]
+    fn protocol_render_updates_publish_reset_and_only_new_damage() {
+        use crate::core::{FrameRect, RemotePixelFormat, RenderUpdate};
+
+        let surface = Arc::new(Mutex::new(DisplaySurface::new(
+            4,
+            Framebuffer::new(4, 3).unwrap(),
+        )));
+        let mut cursor = HpssRenderCursor::default();
+
+        assert_eq!(
+            take_protocol_render_updates(&surface, &mut cursor).unwrap(),
+            vec![RenderUpdate::reset(4, 4, 3, RemotePixelFormat::Bgra8Srgb).unwrap()]
+        );
+        assert!(take_protocol_render_updates(&surface, &mut cursor)
+            .unwrap()
+            .is_empty());
+
+        {
+            let mut locked = surface.lock().unwrap();
+            apply_rgb_rect(
+                &mut locked.framebuffer,
+                &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+                1,
+                1,
+                2,
+                1,
+            )
+            .unwrap();
+            locked.record_native_type_zero_applied(MvsRect {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1,
+            });
+        }
+
+        let updates = take_protocol_render_updates(&surface, &mut cursor).unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[0],
+            RenderUpdate::dirty_rect(
+                4,
+                FrameRect::new(1, 1, 2, 1).unwrap(),
+                RemotePixelFormat::Bgra8Srgb,
+                8,
+                vec![0x33, 0x22, 0x11, 0xff, 0x66, 0x55, 0x44, 0xff].into_boxed_slice(),
+            )
+            .unwrap()
+        );
+        assert_eq!(updates[1], RenderUpdate::present(4));
+        assert!(take_protocol_render_updates(&surface, &mut cursor)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn protocol_render_updates_reset_atomically_on_generation_change() {
+        use crate::core::{RemotePixelFormat, RenderUpdate};
+
+        let surface = Arc::new(Mutex::new(DisplaySurface::new(
+            8,
+            Framebuffer::new(2, 2).unwrap(),
+        )));
+        let mut cursor = HpssRenderCursor::default();
+        take_protocol_render_updates(&surface, &mut cursor).unwrap();
+        *surface.lock().unwrap() = DisplaySurface::new(9, Framebuffer::new(3, 1).unwrap());
+
+        assert_eq!(
+            take_protocol_render_updates(&surface, &mut cursor).unwrap(),
+            vec![RenderUpdate::reset(9, 3, 1, RemotePixelFormat::Bgra8Srgb).unwrap()]
+        );
     }
 }
