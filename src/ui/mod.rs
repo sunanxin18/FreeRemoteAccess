@@ -16,11 +16,12 @@ pub use application::{
     ConnectionFormState, FreeRemoteApplication, SubmissionOutcome, UiAction, UiPage,
 };
 pub use remote_texture::{
-    RemoteTextureAction, RemoteTextureState, RendererRuntimePolicy, RendererSurfaceIssue,
-    ResetDisposition, SurfaceAcquireAction, TextureStateError, TextureUpdateDisposition,
+    GpuFailureLatch, QueuedSessionProgress, RemoteTextureAction, RemoteTextureState,
+    RendererRuntimePolicy, ResetDisposition, SurfaceAcquireOutcome, SurfaceRecoveryPlan,
+    SurfaceRecoveryStep, TextureStateError, TextureUpdateDisposition,
 };
 #[cfg(feature = "gui")]
-pub use renderer::{RenderError, Renderer};
+pub use renderer::{RenderError, RenderOutcome, Renderer};
 pub use secret_buffer::SecretBuffer;
 #[cfg(feature = "gui")]
 pub use winit_host::{run_desktop, DesktopError, WinitHost};

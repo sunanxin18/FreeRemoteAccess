@@ -11,8 +11,8 @@ use winit::window::Window;
 use crate::core::{RemotePixelFormat, RenderUpdate};
 
 use super::{
-    RemoteTextureAction, RendererRuntimePolicy, RendererSurfaceIssue, ResetDisposition,
-    SurfaceAcquireAction, TextureUpdateDisposition,
+    RemoteTextureAction, RendererRuntimePolicy, ResetDisposition, SurfaceAcquireOutcome,
+    SurfaceRecoveryPlan, SurfaceRecoveryStep, TextureUpdateDisposition,
 };
 
 #[repr(C)]
@@ -29,10 +29,14 @@ struct RemoteTexture {
 }
 
 pub struct Renderer {
+    instance: wgpu::Instance,
+    window: Arc<Window>,
+    adapter: wgpu::Adapter,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    surface_format: wgpu::TextureFormat,
     size: PhysicalSize<u32>,
     remote_pipeline: wgpu::RenderPipeline,
     remote_bind_group_layout: wgpu::BindGroupLayout,
@@ -50,7 +54,7 @@ impl Renderer {
             Box::new(window.clone()),
         ));
         let surface = instance
-            .create_surface(window)
+            .create_surface(window.clone())
             .map_err(|_| RenderError::new("surface_create_failed"))?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -72,31 +76,9 @@ impl Renderer {
             })
             .await
             .map_err(|_| RenderError::new("gpu_device_create_failed"))?;
-        let capabilities = surface.get_capabilities(&adapter);
-        let surface_format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .or_else(|| capabilities.formats.first().copied())
-            .ok_or_else(|| RenderError::new("surface_format_unavailable"))?;
-        let width = size.width.max(1);
-        let height = size.height.max(1);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 1,
-            alpha_mode: capabilities
-                .alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-            view_formats: vec![],
-        };
+        let (config, surface_format) = Self::surface_configuration(&surface, &adapter, size)?;
+        let width = config.width;
+        let height = config.height;
         surface.configure(&device, &config);
 
         let remote_bind_group_layout =
@@ -149,47 +131,19 @@ impl Renderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("remote surface shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/remote_surface.wgsl").into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("remote surface pipeline layout"),
-            bind_group_layouts: &[Some(&remote_bind_group_layout)],
-            immediate_size: 0,
-        });
-        let remote_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("remote surface pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let remote_pipeline =
+            Self::create_remote_pipeline(&device, &remote_bind_group_layout, surface_format);
         let egui_renderer = EguiRenderer::new(&device, surface_format, RendererOptions::default());
 
         Ok(Self {
+            instance,
+            window,
+            adapter,
             surface,
             device,
             queue,
             config,
+            surface_format,
             size,
             remote_pipeline,
             remote_bind_group_layout,
@@ -324,9 +278,9 @@ impl Renderer {
         &mut self,
         context: &egui::Context,
         output: egui::FullOutput,
-    ) -> Result<(), RenderError> {
+    ) -> Result<RenderOutcome, RenderError> {
         if self.size.width == 0 || self.size.height == 0 {
-            return Ok(());
+            return Ok(RenderOutcome::Deferred);
         }
         for (texture_id, deltas) in &output.textures_delta.set {
             for delta in deltas {
@@ -339,31 +293,27 @@ impl Renderer {
             size_in_pixels: [self.size.width, self.size.height],
             pixels_per_point: output.pixels_per_point,
         };
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+        let (frame, post_present_plan) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => {
+                self.acquire_frame(SurfaceAcquireOutcome::Success, frame)?
+            }
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                self.handle_surface_issue(RendererSurfaceIssue::Suboptimal)?;
-                frame
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.handle_surface_issue(RendererSurfaceIssue::Outdated)?;
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.handle_surface_issue(RendererSurfaceIssue::Lost)?;
-                return Ok(());
+                self.acquire_frame(SurfaceAcquireOutcome::Suboptimal, frame)?
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
-                self.handle_surface_issue(RendererSurfaceIssue::Timeout)?;
-                return Ok(());
+                return self.handle_acquire_without_frame(SurfaceAcquireOutcome::Timeout);
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
-                self.handle_surface_issue(RendererSurfaceIssue::Occluded)?;
-                return Ok(());
+                return self.handle_acquire_without_frame(SurfaceAcquireOutcome::Occluded);
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                return self.handle_acquire_without_frame(SurfaceAcquireOutcome::Outdated);
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return self.handle_acquire_without_frame(SurfaceAcquireOutcome::Lost);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                self.handle_surface_issue(RendererSurfaceIssue::Validation)?;
-                unreachable!("validation surface error must fail the session")
+                return self.handle_acquire_without_frame(SurfaceAcquireOutcome::Validation);
             }
         };
         let view = frame.texture.create_view(&Default::default());
@@ -419,7 +369,10 @@ impl Renderer {
         for texture_id in &output.textures_delta.free {
             self.egui_renderer.free_texture(texture_id);
         }
-        Ok(())
+        match post_present_plan {
+            Some(plan) => self.apply_surface_recovery_plan(plan),
+            None => Ok(RenderOutcome::Rendered),
+        }
     }
 
     fn create_remote_texture(&mut self, width: u32, height: u32, format: RemotePixelFormat) {
@@ -473,17 +426,159 @@ impl Renderer {
         }
     }
 
-    fn handle_surface_issue(&mut self, issue: RendererSurfaceIssue) -> Result<(), RenderError> {
-        match self.runtime_policy.on_surface_issue(issue) {
-            SurfaceAcquireAction::ReconfigureAndRender
-            | SurfaceAcquireAction::ReconfigureAndSkip => {
-                self.surface.configure(&self.device, &self.config);
-                self.update_viewport_uniform();
-                Ok(())
+    fn acquire_frame(
+        &self,
+        outcome: SurfaceAcquireOutcome,
+        frame: wgpu::SurfaceTexture,
+    ) -> Result<(wgpu::SurfaceTexture, Option<SurfaceRecoveryPlan>), RenderError> {
+        match self.runtime_policy.on_surface_acquire(outcome) {
+            SurfaceRecoveryPlan::Render => Ok((frame, None)),
+            plan @ SurfaceRecoveryPlan::RenderThen(_) => Ok((frame, Some(plan))),
+            SurfaceRecoveryPlan::FailSession => Err(RenderError::new("surface_validation_failed")),
+            SurfaceRecoveryPlan::Recover(_)
+            | SurfaceRecoveryPlan::SkipUntilNextWake
+            | SurfaceRecoveryPlan::WaitForVisibility => {
+                Err(RenderError::new("surface_acquire_plan_without_frame"))
             }
-            SurfaceAcquireAction::Skip => Ok(()),
-            SurfaceAcquireAction::FailSession => Err(RenderError::new("surface_validation_failed")),
         }
+    }
+
+    fn handle_acquire_without_frame(
+        &mut self,
+        outcome: SurfaceAcquireOutcome,
+    ) -> Result<RenderOutcome, RenderError> {
+        match self.runtime_policy.on_surface_acquire(outcome) {
+            plan @ SurfaceRecoveryPlan::Recover(_) => {
+                self.runtime_policy.mark_surface_unavailable();
+                self.apply_surface_recovery_plan(plan)
+            }
+            SurfaceRecoveryPlan::SkipUntilNextWake | SurfaceRecoveryPlan::WaitForVisibility => {
+                Ok(RenderOutcome::Deferred)
+            }
+            SurfaceRecoveryPlan::FailSession => Err(RenderError::new("surface_validation_failed")),
+            SurfaceRecoveryPlan::Render | SurfaceRecoveryPlan::RenderThen(_) => {
+                Err(RenderError::new("surface_acquire_plan_requires_frame"))
+            }
+        }
+    }
+
+    fn apply_surface_recovery_plan(
+        &mut self,
+        plan: SurfaceRecoveryPlan,
+    ) -> Result<RenderOutcome, RenderError> {
+        let steps = match plan {
+            SurfaceRecoveryPlan::RenderThen(steps) | SurfaceRecoveryPlan::Recover(steps) => steps,
+            _ => return Err(RenderError::new("surface_recovery_plan_invalid")),
+        };
+        for step in steps {
+            match step {
+                SurfaceRecoveryStep::PresentFrame => {}
+                SurfaceRecoveryStep::RecreateSurface => self.recreate_surface()?,
+                SurfaceRecoveryStep::ReconfigureExistingSurface => self.reconfigure_surface(),
+                SurfaceRecoveryStep::RequestRedraw => {}
+            }
+        }
+        Ok(RenderOutcome::RequestRedraw)
+    }
+
+    fn recreate_surface(&mut self) -> Result<(), RenderError> {
+        let surface = self
+            .instance
+            .create_surface(self.window.clone())
+            .map_err(|_| RenderError::new("surface_recreate_failed"))?;
+        let (config, surface_format) =
+            Self::surface_configuration(&surface, &self.adapter, self.size)?;
+        self.surface = surface;
+        self.config = config;
+        if self.surface_format != surface_format {
+            self.remote_pipeline = Self::create_remote_pipeline(
+                &self.device,
+                &self.remote_bind_group_layout,
+                surface_format,
+            );
+            self.egui_renderer =
+                EguiRenderer::new(&self.device, surface_format, RendererOptions::default());
+            self.surface_format = surface_format;
+        }
+        Ok(())
+    }
+
+    fn reconfigure_surface(&mut self) {
+        self.surface.configure(&self.device, &self.config);
+        self.runtime_policy.mark_surface_available();
+        self.update_viewport_uniform();
+    }
+
+    fn surface_configuration(
+        surface: &wgpu::Surface<'_>,
+        adapter: &wgpu::Adapter,
+        size: PhysicalSize<u32>,
+    ) -> Result<(wgpu::SurfaceConfiguration, wgpu::TextureFormat), RenderError> {
+        let capabilities = surface.get_capabilities(adapter);
+        let surface_format = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .or_else(|| capabilities.formats.first().copied())
+            .ok_or_else(|| RenderError::new("surface_format_unavailable"))?;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 1,
+            alpha_mode: capabilities
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            view_formats: vec![],
+        };
+        Ok((config, surface_format))
+    }
+
+    fn create_remote_pipeline(
+        device: &wgpu::Device,
+        remote_bind_group_layout: &wgpu::BindGroupLayout,
+        surface_format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("remote surface shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/remote_surface.wgsl").into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("remote surface pipeline layout"),
+            bind_group_layouts: &[Some(remote_bind_group_layout)],
+            immediate_size: 0,
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("remote surface pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
     }
 
     fn update_viewport_uniform(&self) {
@@ -501,6 +596,13 @@ impl Renderer {
             }),
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderOutcome {
+    Rendered,
+    RequestRedraw,
+    Deferred,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

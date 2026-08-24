@@ -112,12 +112,16 @@ impl Default for RemoteTextureState {
 #[derive(Debug, Default)]
 pub struct RendererRuntimePolicy {
     remote_state: RemoteTextureState,
+    remote_texture_identity: Option<u64>,
+    next_remote_texture_identity: u64,
 }
 
 impl RendererRuntimePolicy {
     pub const fn new() -> Self {
         Self {
             remote_state: RemoteTextureState::empty(),
+            remote_texture_identity: None,
+            next_remote_texture_identity: 1,
         }
     }
 
@@ -139,7 +143,15 @@ impl RendererRuntimePolicy {
         width: u32,
         height: u32,
     ) -> Result<ResetDisposition, TextureStateError> {
-        self.remote_state.apply_reset(generation, width, height)
+        let disposition = self.remote_state.apply_reset(generation, width, height)?;
+        if matches!(
+            disposition,
+            ResetDisposition::Created | ResetDisposition::Recreated
+        ) {
+            self.remote_texture_identity = Some(self.next_remote_texture_identity);
+            self.next_remote_texture_identity = self.next_remote_texture_identity.saturating_add(1);
+        }
+        Ok(disposition)
     }
 
     pub fn classify(
@@ -157,20 +169,26 @@ impl RendererRuntimePolicy {
         self.remote_state.on_surface_available();
     }
 
-    pub fn on_surface_issue(&mut self, issue: RendererSurfaceIssue) -> SurfaceAcquireAction {
-        match issue {
-            RendererSurfaceIssue::Suboptimal => {
-                self.remote_state.on_surface_available();
-                SurfaceAcquireAction::ReconfigureAndRender
-            }
-            RendererSurfaceIssue::Lost | RendererSurfaceIssue::Outdated => {
-                self.remote_state.on_surface_available();
-                SurfaceAcquireAction::ReconfigureAndSkip
-            }
-            RendererSurfaceIssue::Timeout | RendererSurfaceIssue::Occluded => {
-                SurfaceAcquireAction::Skip
-            }
-            RendererSurfaceIssue::Validation => SurfaceAcquireAction::FailSession,
+    pub fn on_surface_acquire(&self, outcome: SurfaceAcquireOutcome) -> SurfaceRecoveryPlan {
+        match outcome {
+            SurfaceAcquireOutcome::Success => SurfaceRecoveryPlan::Render,
+            SurfaceAcquireOutcome::Suboptimal => SurfaceRecoveryPlan::RenderThen(&[
+                SurfaceRecoveryStep::PresentFrame,
+                SurfaceRecoveryStep::ReconfigureExistingSurface,
+                SurfaceRecoveryStep::RequestRedraw,
+            ]),
+            SurfaceAcquireOutcome::Timeout => SurfaceRecoveryPlan::SkipUntilNextWake,
+            SurfaceAcquireOutcome::Occluded => SurfaceRecoveryPlan::WaitForVisibility,
+            SurfaceAcquireOutcome::Outdated => SurfaceRecoveryPlan::Recover(&[
+                SurfaceRecoveryStep::ReconfigureExistingSurface,
+                SurfaceRecoveryStep::RequestRedraw,
+            ]),
+            SurfaceAcquireOutcome::Lost => SurfaceRecoveryPlan::Recover(&[
+                SurfaceRecoveryStep::RecreateSurface,
+                SurfaceRecoveryStep::ReconfigureExistingSurface,
+                SurfaceRecoveryStep::RequestRedraw,
+            ]),
+            SurfaceAcquireOutcome::Validation => SurfaceRecoveryPlan::FailSession,
         }
     }
 
@@ -186,8 +204,13 @@ impl RendererRuntimePolicy {
         self.remote_state.surface_available()
     }
 
+    pub const fn remote_texture_identity(&self) -> Option<u64> {
+        self.remote_texture_identity
+    }
+
     fn clear_remote_texture(&mut self) -> RemoteTextureAction {
         self.remote_state.clear_remote_surface();
+        self.remote_texture_identity = None;
         RemoteTextureAction::Clear
     }
 }
@@ -198,21 +221,74 @@ pub enum RemoteTextureAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RendererSurfaceIssue {
+pub enum SurfaceAcquireOutcome {
+    Success,
     Suboptimal,
-    Lost,
-    Outdated,
     Timeout,
     Occluded,
+    Outdated,
+    Lost,
     Validation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceAcquireAction {
-    ReconfigureAndRender,
-    ReconfigureAndSkip,
-    Skip,
+pub enum SurfaceRecoveryPlan {
+    Render,
+    RenderThen(&'static [SurfaceRecoveryStep]),
+    Recover(&'static [SurfaceRecoveryStep]),
+    SkipUntilNextWake,
+    WaitForVisibility,
     FailSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceRecoveryStep {
+    PresentFrame,
+    ReconfigureExistingSurface,
+    RecreateSurface,
+    RequestRedraw,
+}
+
+#[derive(Debug, Default)]
+pub struct GpuFailureLatch {
+    first_error_code: Option<&'static str>,
+}
+
+impl GpuFailureLatch {
+    pub fn latch(&mut self, error_code: &'static str) -> bool {
+        if self.first_error_code.is_some() {
+            return false;
+        }
+        self.first_error_code = Some(error_code);
+        true
+    }
+
+    pub const fn first_error_code(&self) -> Option<&'static str> {
+        self.first_error_code
+    }
+
+    pub const fn blocks_session_progress(&self) -> bool {
+        self.first_error_code.is_some()
+    }
+
+    pub const fn blocks_remote_input(&self) -> bool {
+        self.first_error_code.is_some()
+    }
+
+    pub const fn admits_queued_progress(&self, _progress: QueuedSessionProgress) -> bool {
+        self.first_error_code.is_none()
+    }
+
+    pub fn release_after_worker_completion(&mut self) -> Option<&'static str> {
+        self.first_error_code.take()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedSessionProgress {
+    Render,
+    SurfaceReset,
+    Connected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
