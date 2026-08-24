@@ -9,9 +9,11 @@ FreeRemoteAccess 只实现远程登录客户端，直接连接未经修改的系
 
 | 目标系统 | 客户端协议 | 服务端边界 |
 | --- | --- | --- |
-| Windows | RDP | Windows 原生远程桌面服务 |
-| Mac OS | Apple Screen Sharing / ARD，VNC 最低优先级 | macOS 原生屏幕共享 |
-| Linux | RFB/VNC | Linux 已安装并运行的 VNC 服务 |
+| Windows（Phase 1） | RDP | Windows 原生远程桌面服务 |
+| Mac OS（Phase 1） | Apple Screen Sharing / ARD，VNC 最低优先级 | macOS 原生屏幕共享 |
+| Linux（Phase 1） | RFB/VNC | Linux 已安装并运行的 VNC 服务 |
+| Android（Phase 2） | 待原生远程入口验证 | 不预设私有服务端协议 |
+| HarmonyOS（Phase 2） | 待原生远程入口验证 | 不预设私有服务端协议 |
 
 项目不会在远端安装伴随程序、代理、驱动或守护进程。Mac 路径只使用本地账户的
 用户名和密码，不接受 Apple ID/IDS 凭据。
@@ -22,16 +24,18 @@ FreeRemoteAccess 只实现远程登录客户端，直接连接未经修改的系
 
 ```text
 PlatformServices                      ProtocolAdapter
-Windows  ─┐                         ┌─ RDP -> Windows 原生服务
-macOS    ─┤                         ├─ Apple ARD -> macOS Screen Sharing
-Linux    ─┼─ SessionEngine/Core ────┤
-Android  ─┤                         └─ RFB -> 标准 VNC 服务
-iOS      ─┘
+Windows       ─┐                   ┌─ RDP -> Windows 原生服务
+macOS         ─┤                   ├─ Apple ARD -> macOS Screen Sharing
+Linux         ─┼─ SessionEngine ───┼─ RFB -> 标准 VNC 服务
+Android       ─┤       / Core      ├─ Android target adapter (Phase 2)
+iOS           ─┤                   └─ Harmony target adapter (Phase 2)
+Harmony phone ─┤
+Harmony PC    ─┘
 ```
 
-因此 Windows 客户端可以连接 Mac 或 Linux，iOS 客户端也可以连接 Windows；平台
-adapter 只处理本地窗口、音频、输入法、权限和生命周期，protocol adapter 只处理远端
-握手、认证、wire message 和会话事件。
+因此 Windows 客户端可以连接 Mac 或 Linux，未来 HarmonyOS 客户端也可以连接
+Windows；平台 adapter 只处理本地窗口、音频、输入法、权限和生命周期，protocol
+adapter 只处理远端握手、认证、wire message 和会话事件。
 
 ## 分层
 
@@ -44,7 +48,7 @@ adapter 只处理本地窗口、音频、输入法、权限和生命周期，pro
           |                 |
    RenderUpdate         SessionCommand
           |                 |
-   wgpu RemoteTexture   winit 输入与生命周期
+   wgpu RemoteTexture   WindowHost / PlatformServices
           \                 /
           单窗口 Rust 应用
          egui 连接页/工具栏
@@ -53,7 +57,7 @@ adapter 只处理本地窗口、音频、输入法、权限和生命周期，pro
 - `src/core/`：平台和协议都无关的连接、会话、画面与错误类型。
 - `src/protocols/`：RDP、Apple ARD、标准 RFB 服务端协议适配器。
 - `src/session/`：协议线程、背压和事件分发。
-- `src/platform/`：五个客户端平台的本地设备与生命周期适配器。
+- `src/platform/`：客户端平台的本地设备、窗口 host 与生命周期适配器。
 - `src/ui/`：目标 `winit + egui + wgpu` 单窗口客户端。
 - `src/vnc/`：迁移期间保留的已验证 Apple ARD、RFB、MVS、UDP/SRTP 实现。
 - `src/framebuffer.rs`：受限 CPU framebuffer 与协议矩形应用。
@@ -76,9 +80,13 @@ generation 更新不会写入新纹理。没有新帧或 UI 动画时，事件�
 
 ## 平台路线
 
-第一阶段完成 Windows、macOS、Linux、Android、iOS 的原生构建与安装包；各平台只
-保留必要的包元数据和启动胶水。HarmonyOS 在五平台完成后通过独立 OHOS window /
-Vulkan surface 适配进入，不假设 `winit` 已经原生支持鸿蒙。
+第一阶段只完成 Windows、macOS、Linux 客户端和安装包，并优先验证连接 Windows、
+Mac OS、Linux 原生服务。第二阶段再增加 Android、iOS、HarmonyOS 手机/平板/PC
+客户端，以及 Android/HarmonyOS 被控目标的协议适配。
+
+官方支持的平台使用 `WinitHost`；HarmonyOS 使用 ArkUI XComponent / NativeWindow
+实现 `OhosHost`，与其他平台共享 Rust UI 状态、`wgpu` renderer 和 SessionEngine。
+这表示架构可支持鸿蒙，不表示 upstream `winit` 已经提供 OHOS backend。
 
 当前网络环境不能连接授权 Mac，因此本地编译、单测和 renderer 验证与 Mac 实时
 互操作是两个独立门禁。离线通过不代表 ARD 实时画面已经验证。

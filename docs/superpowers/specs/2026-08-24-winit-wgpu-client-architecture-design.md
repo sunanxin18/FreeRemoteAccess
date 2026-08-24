@@ -1,8 +1,8 @@
 # FreeRemoteAccess `winit + wgpu` 客户端架构设计
 
-**Status:** Proposed; the user selected the `winit + wgpu` direction, pending review of this written specification  
-**Date:** 2026-08-24  
-**Scope:** Windows、macOS、Linux、Android、iOS；五个平台完成后再单独适配 HarmonyOS
+**Status:** Proposed; revised after platform-priority review, pending final user approval
+**Date:** 2026-08-25
+**Scope:** Phase 1 Windows、macOS、Linux；Phase 2 Android、iOS、HarmonyOS 手机/平板/PC
 
 ## 1. 目标与边界
 
@@ -12,6 +12,8 @@ FreeRemoteAccess 是只连接操作系统原生远程服务的客户端：
 - Mac OS 目标优先使用 Apple 原生 Screen Sharing / ARD 高性能路径，标准 VNC
   仅作为最低优先级兼容路径，默认 TCP 5900。
 - Linux 目标使用目标系统已经运行的标准 RFB/VNC 服务，默认 TCP 5900。
+- Android 与 HarmonyOS 被控目标属于后续阶段。架构为它们保留协议 adapter，但在
+  找到满足产品边界的原生远程入口并完成互操作验证前，不宣称已经支持任意 stock 设备。
 - 自动识别只执行有界的标准握手，不启动自定义代理、转发或服务端组件。
 
 客户端不得要求、安装或运行远端守护进程、插件、驱动、代理或伴随程序。
@@ -29,21 +31,29 @@ QuickRelay 凭据始终不属于产品范围。
 
 ## 2. 选型
 
-正式依赖基线固定为：
+Phase 1 正式依赖基线固定为：
 
 - Rust `1.96.0`。
-- `winit 0.30.13`：窗口、事件循环、键鼠、触控、DPI 和移动端生命周期入口。
-- `wgpu 30.0.1`：Windows/DX12、macOS+iOS/Metal、Linux+Android/Vulkan。
+- `winit 0.30.13`：Windows、macOS、Linux 的窗口、事件循环、键鼠和 DPI。
+- `wgpu 30.0.1`：Windows/DX12、macOS/Metal、Linux/Vulkan。
 - `egui 0.36.1`、`egui-winit 0.36.1`、`egui-wgpu 0.36.1`：连接表单和
   会话工具栏。禁用默认链接和通用剪贴板特性，只按产品需求逐项启用。
 - `zeroize`：可清零的密码编辑缓冲和临时认证材料。
 
-不使用 `winit 0.31` beta。依赖关闭不需要的默认特性，并按目标平台启用图形后端：
+不使用 `winit 0.31` beta。依赖关闭不需要的默认特性，并按 Phase 1 目标启用图形后端：
 
 - Windows：`wgpu/dx12`。
-- macOS、iOS：`wgpu/metal`。
+- macOS：`wgpu/metal`。
 - Linux：`wgpu/vulkan`，X11 与 Wayland 都由 `winit` 构建。
+
+Phase 2 在不改变 core/protocol/UI 接口的前提下增加：
+
 - Android：`wgpu/vulkan` 与 `winit/android-game-activity`。
+- iOS：`wgpu/metal` 与 `winit` UIKit backend。
+- HarmonyOS 手机、平板和 PC：`OhosHost` 通过 ArkUI XComponent / NativeWindow
+  提供 surface 与输入生命周期，再交给同一 `wgpu` renderer。由于 upstream `winit`
+  没有 OHOS backend，鸿蒙不伪装成受支持的 `winit` target，也不 fork 整个 winit；
+  `WindowHost` 抽象使 `WinitHost` 与 `OhosHost` 复用相同应用状态机。
 
 `winit` 和 `wgpu` 是底层窗口/图形库，不承担远程协议决策。`egui` 只绘制低频
 控件；远程桌面纹理由专用 `wgpu` pipeline 绘制，不能转换成 `egui::ColorImage`
@@ -55,8 +65,9 @@ QuickRelay 凭据始终不属于产品范围。
 诊断 CLI 子命令继续由同一 Rust workspace 提供，但不再启动第二个 `minifb` 窗口。
 `view` 与 `hpssview` 最终复用同一个 GUI/session runtime。
 
-Android 和 iOS 使用最薄的平台工程负责安装包元数据、权限和启动入口；业务、页面、
-事件循环、渲染和协议仍在 Rust。存在 Gradle/Xcode 文件不等于增加第二套 UI。
+Phase 2 的 Android、iOS、HarmonyOS 使用最薄的平台工程负责安装包元数据、权限和
+启动入口；业务、页面、渲染和协议仍在 Rust。存在 Gradle、Xcode 或 ArkTS 启动胶水
+不等于增加第二套产品 UI。
 
 应用可见状态为：
 
@@ -71,19 +82,22 @@ ConnectionForm -> Connecting -> SessionView -> Disconnecting -> ConnectionForm
 - `SessionView`：远程纹理、断开、全屏、缩放、键盘、剪贴板、音频和网络状态。
 - `Failed`：稳定错误码映射为简体中文；密码字段清空，主机和用户名可保留。
 
-连接与远程桌面在同一个 `winit::Window` 中切换，不创建第二个产品窗口。
+连接与远程桌面在同一个 `WindowHost` 中切换，不创建第二个产品窗口。Phase 1 的
+`WindowHost` 是一个 `winit::Window`，Phase 2 的鸿蒙实现是一个 `OhosHost` surface。
 
 ## 4. 两个正交适配维度
 
-客户端运行平台和服务端协议是两个独立维度，任何组合都通过同一个 core 连接：
+客户端运行平台和服务端协议是两个独立维度，任何组合都通过同一个 core 连接。平台
+阶段只决定交付顺序，不改变组合模型：
 
 | 客户端平台适配器 | 可选择的服务端协议适配器 |
 | --- | --- |
-| Windows | RDP、Apple ARD、标准 RFB |
-| macOS | RDP、Apple ARD、标准 RFB |
-| Linux | RDP、Apple ARD、标准 RFB |
-| Android | RDP、Apple ARD、标准 RFB |
-| iOS | RDP、Apple ARD、标准 RFB |
+| Windows（Phase 1） | RDP、Apple ARD、标准 RFB |
+| macOS（Phase 1） | RDP、Apple ARD、标准 RFB |
+| Linux（Phase 1） | RDP、Apple ARD、标准 RFB |
+| Android（Phase 2） | RDP、Apple ARD、标准 RFB；后续 Android target adapter |
+| iOS（Phase 2） | RDP、Apple ARD、标准 RFB；后续 Android/Harmony target adapter |
+| HarmonyOS 手机/平板/PC（Phase 2） | RDP、Apple ARD、标准 RFB；后续 Android/Harmony target adapter |
 
 “客户端是 Windows”不能自动推导服务端也是 Windows；服务类型只由连接配置和有界
 协议探测决定。两组适配器通过平台无关类型交互：
@@ -98,6 +112,12 @@ pub trait ProtocolAdapter: Send + 'static {
     ) -> Result<(), SessionError>;
 }
 
+pub trait WindowHost {
+    fn request_redraw(&self) -> Result<(), PlatformError>;
+    fn surface_handle(&self) -> Result<SurfaceHandle, PlatformError>;
+    fn set_fullscreen(&self, enabled: bool) -> Result<(), PlatformError>;
+}
+
 pub trait PlatformServices: Send + Sync {
     fn create_audio_output(&self, config: AudioOutputConfig)
         -> Result<Box<dyn AudioOutput>, PlatformError>;
@@ -107,7 +127,10 @@ pub trait PlatformServices: Send + Sync {
 ```
 
 - `ProtocolAdapter` 的实现包括 `RdpAdapter`、`AppleArdAdapter`、`StandardRfbAdapter`。
-- `PlatformServices` 的实现包括 Windows、macOS、Linux、Android、iOS。
+- `WindowHost` 的 Phase 1 实现是 `WinitHost`；Phase 2 增加 Android/iOS 的
+  `WinitHost` target 与 HarmonyOS 的 `OhosHost`。
+- `PlatformServices` 的实现包括 Windows、macOS、Linux，并在 Phase 2 增加
+  Android、iOS、HarmonyOS 手机/平板/PC。
 - `SessionEngine` 独占一个 adapter，在协议线程中调用 `run`；UI 与 adapter 之间只有
   有界 command/event channel，adapter 不持有 `winit::Window`。
 - 协议层不得 import 平台窗口、安装包、Gradle、Xcode、Win32 或 Android Activity 类型。
@@ -142,10 +165,12 @@ src/
 │   ├── macos.rs                  macOS 权限、音频和 bundle 入口
 │   ├── linux.rs                  X11/Wayland 环境和音频入口
 │   ├── android.rs                GameActivity、权限和软键盘
-│   └── ios.rs                    UIKit 生命周期、权限和软键盘
+│   ├── ios.rs                    UIKit 生命周期、权限和软键盘
+│   └── ohos.rs                   XComponent/NativeWindow、权限和输入
 ├── ui/
 │   ├── mod.rs                    GUI 公共入口
-│   ├── application.rs            winit ApplicationHandler 与页面状态机
+│   ├── application.rs            平台无关的页面和会话状态机
+│   ├── winit_host.rs             Phase 1 winit ApplicationHandler
 │   ├── connection_view.rs        egui 连接表单
 │   ├── session_view.rs           会话工具栏和远程区域布局
 │   ├── renderer.rs               surface、pipeline、帧调度、错误恢复
@@ -170,7 +195,8 @@ src/
 
 ## 6. 会话与渲染数据流
 
-协议线程和 UI/渲染线程之间使用有界通道和 `EventLoopProxy` 唤醒：
+协议线程和 UI/渲染线程之间使用有界通道和 `UiWakeHandle` 唤醒。Phase 1 将其映射到
+`winit::EventLoopProxy`，HarmonyOS 后续映射到 OHOS UI dispatcher：
 
 ```rust
 pub enum RenderUpdate {
@@ -255,22 +281,26 @@ JPEG 路径或用猜测字段更新 GPU。
 Flutter toolchain pin 或 Flutter CI action。新架构文档可以说明迁移事实，但不能保留一套
 可被误认为仍有效的 Flutter 设计或构建方法。
 
-## 10. 五平台构建与安装包
+## 10. 分阶段构建与安装包
 
-CI 使用原生 runner：
+Phase 1 CI 使用原生 runner，必须先完成：
 
 - Windows x64：release 可执行文件、便携 ZIP、MSI。
 - macOS arm64+x64：`.app` 与 DMG；无签名产物明确标记为 unsigned。
 - Linux x64：AppDir、`.deb` 与 AppImage。
+
+Phase 2 在桌面三平台验收后增加：
+
 - Android arm64：基于 GameActivity 的 release APK 与 AAB。
 - iOS arm64：无签名 `.app` archive；可安装 IPA 仍由外部签名所有者处理。
+- HarmonyOS 手机/平板/PC：HAP/App Pack；签名和上架凭据由外部签名所有者处理。
 
 平台工程只包含权限、图标、bundle metadata 和 Rust library/executable 启动胶水。
-Windows/macOS/Linux 的产品入口相同；Android/iOS 的页面与 renderer 仍调用同一
-`FreeRemoteApplication` 状态机。
+Windows/macOS/Linux 的产品入口相同；Android、iOS、HarmonyOS 的页面与 renderer
+仍调用同一 `FreeRemoteApplication` 状态机。
 
-HarmonyOS 不属于本轮实现。完成五平台后增加 `platform/ohos`，适配 OHOS 生命周期、
-输入和 Vulkan surface；在实际构建和设备运行前不得声称 `winit` 原生支持鸿蒙。
+Android、iOS、HarmonyOS 不属于 Phase 1 实现。桌面三平台完成后增加移动端和 OHOS
+生命周期、输入、权限与 surface；在实际构建和设备运行前不得声称对应平台已支持。
 
 ## 11. 迁移顺序
 
@@ -280,9 +310,11 @@ HarmonyOS 不属于本轮实现。完成五平台后增加 `platform/ohos`，适
 2. 接入 `winit + egui + wgpu`，在本地显示连接页和确定性测试纹理。
 3. 将 HPSS/RFB viewer 的画面、输入和动态分辨率接到新 session/renderer 契约。
 4. 让无参数桌面入口启动单窗口 GUI，CLI viewer 复用同一 runtime。
-5. 重写五平台 CI/打包，完成原生 host 的 compile/package gate。
+5. 重写 Windows、macOS、Linux CI/打包，完成原生 host 的 compile/package gate。
 6. 本地和 CI 全绿后删除 Flutter/FFI/minifb，更新 README 和架构文档。
 7. 网络恢复后执行 Mac 实时认证、非黑帧、输入、动态分辨率和 Mac→PC 音频门禁。
+8. 桌面三平台验收后再分别启动 Android/iOS、HarmonyOS 客户端和
+   Android/HarmonyOS target adapter 的后续设计与实现。
 
 不能先删除当前可运行入口再开始 renderer；新 GUI 至少能在本地显示连接页和测试纹理后
 才能删除 Flutter。删除提交本身必须证明仓库中不存在 Flutter/Dart/minifb 产品引用。
@@ -298,7 +330,8 @@ HarmonyOS 不属于本轮实现。完成五平台后增加 `platform/ohos`，适
 - `cargo fmt --all -- --check`、全 workspace 测试、无默认 feature 测试和 release build 通过。
 - `rg --files` 门禁确认不存在 `.dart`、`pubspec.yaml`、Flutter runner、
   `freeremote_ffi` 或 Flutter toolchain 文件；源码、依赖和 CI 不再引用 `minifb`。
-- 五平台 workflow 语法有效；不能把非本机交叉编译等同于完整安装包验证。
+- Windows、macOS、Linux workflow 语法有效并由原生 runner 构建；不能把非本机
+  交叉编译等同于完整安装包验证。
 
 ### 网络恢复后的 Mac 实时门禁
 
