@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use hickory_resolver::lookup::Lookup;
+use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::TokioResolver;
 
 use crate::app::connection::ProtocolKind;
@@ -23,6 +25,7 @@ const PRODUCTION_TOTAL_TIMEOUT: Duration = Duration::from_millis(1_750);
 const PRODUCTION_MAX_RESPONSE_BYTES: usize = 64;
 const MAX_RESOLVED_ADDRESSES: usize = 8;
 const MAX_RESOLVER_SCAN_ADDRESSES: usize = 32;
+const MAX_RESOLVER_SCAN_PER_FAMILY: usize = MAX_RESOLVER_SCAN_ADDRESSES / 2;
 const MAX_CONNECT_ATTEMPTS: usize = 4;
 const MAX_RFB_SECURITY_TYPES: usize = 64;
 
@@ -114,6 +117,7 @@ enum RdpNegotiationEvidence {
 enum ProbeOutcome {
     Positive(DetectedEndpoint),
     CrossProtocolRfbBanner,
+    PassiveRfbWait,
     Negative,
     Timeout,
     Malformed,
@@ -142,11 +146,29 @@ impl CancellableResolver {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
-        let lookup = self.runtime.block_on(resolve_future_until(
-            self.resolver.lookup_ip(host.to_owned()),
+        let host = host.to_owned();
+        let resolver = &self.resolver;
+        let (ipv4, ipv6) = self.runtime.block_on(resolve_future_until(
+            async move {
+                Ok::<_, ()>(tokio::join!(
+                    resolver.lookup(host.clone(), RecordType::A),
+                    resolver.lookup(host, RecordType::AAAA),
+                ))
+            },
             deadline,
         ))?;
-        let addresses = bound_resolved_addresses(collect_resolved_ips_bounded(lookup.iter()));
+        if ipv4.is_err() && ipv6.is_err() {
+            return Err(SessionError::new("auto_probe_resolution_failed"));
+        }
+        let ipv4 = ipv4
+            .as_ref()
+            .map(collect_lookup_ipv4_bounded)
+            .unwrap_or_default();
+        let ipv6 = ipv6
+            .as_ref()
+            .map(collect_lookup_ipv6_bounded)
+            .unwrap_or_default();
+        let addresses = merge_resolved_families_bounded(ipv4, ipv6);
         if addresses.is_empty() {
             return Err(SessionError::new("auto_probe_resolution_failed"));
         }
@@ -291,7 +313,7 @@ fn merge_probe_outcomes(
         (ProbeOutcome::Positive(_), ProbeOutcome::Positive(_)) => {
             Err(SessionError::new("auto_protocol_ambiguous"))
         }
-        (ProbeOutcome::Positive(endpoint), ProbeOutcome::Timeout)
+        (ProbeOutcome::Positive(endpoint), ProbeOutcome::PassiveRfbWait)
             if shared_explicit_port && endpoint.protocol == ProtocolKind::Rdp =>
         {
             Ok(endpoint)
@@ -309,6 +331,9 @@ fn merge_probe_outcomes(
             Err(SessionError::new("auto_probe_malformed"))
         }
         (ProbeOutcome::Timeout, _) | (_, ProbeOutcome::Timeout) => {
+            Err(SessionError::new("auto_probe_timeout"))
+        }
+        (ProbeOutcome::PassiveRfbWait, _) | (_, ProbeOutcome::PassiveRfbWait) => {
             Err(SessionError::new("auto_probe_timeout"))
         }
         (ProbeOutcome::CrossProtocolRfbBanner, _) => Err(SessionError::new("auto_probe_malformed")),
@@ -389,7 +414,13 @@ fn probe_rfb(
     };
     let mut banner = [0u8; RFB_BANNER_BYTES];
     if let Err((error, received)) = read_exact_until(&mut stream, &mut banner, attempt_deadline) {
-        return classify_read_progress_error(&error, received);
+        return if is_timeout(&error) && received == 0 {
+            ProbeOutcome::PassiveRfbWait
+        } else if is_timeout(&error) {
+            ProbeOutcome::Malformed
+        } else {
+            classify_read_progress_error(&error, received)
+        };
     }
     let parsed = match parse_rfb_banner(&banner) {
         Ok(parsed) => parsed,
@@ -606,11 +637,45 @@ fn bound_resolved_addresses(addresses: Vec<IpAddr>) -> Vec<IpAddr> {
     bounded
 }
 
-fn collect_resolved_ips_bounded(addresses: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
-    addresses
-        .into_iter()
-        .take(MAX_RESOLVER_SCAN_ADDRESSES)
+fn collect_lookup_ipv4_bounded(lookup: &Lookup) -> Vec<IpAddr> {
+    lookup
+        .answers()
+        .iter()
+        .take(MAX_RESOLVER_SCAN_PER_FAMILY)
+        .filter_map(|record| match &record.data {
+            RData::A(address) => Some(IpAddr::V4(address.0)),
+            _ => None,
+        })
         .collect()
+}
+
+fn collect_lookup_ipv6_bounded(lookup: &Lookup) -> Vec<IpAddr> {
+    lookup
+        .answers()
+        .iter()
+        .take(MAX_RESOLVER_SCAN_PER_FAMILY)
+        .filter_map(|record| match &record.data {
+            RData::AAAA(address) => Some(IpAddr::V6(address.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn merge_resolved_families_bounded(
+    ipv4: impl IntoIterator<Item = IpAddr>,
+    ipv6: impl IntoIterator<Item = IpAddr>,
+) -> Vec<IpAddr> {
+    let addresses = ipv4
+        .into_iter()
+        .take(MAX_RESOLVER_SCAN_PER_FAMILY)
+        .filter(IpAddr::is_ipv4)
+        .chain(
+            ipv6.into_iter()
+                .take(MAX_RESOLVER_SCAN_PER_FAMILY)
+                .filter(IpAddr::is_ipv6),
+        )
+        .collect();
+    bound_resolved_addresses(addresses)
 }
 
 fn connection_candidates(addresses: &[IpAddr]) -> &[IpAddr] {
@@ -1002,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_auto_port_selects_a_real_client_first_rdp_listener() {
+    fn explicit_auto_port_accepts_zero_byte_passive_rfb_wait_for_real_rdp_listener() {
         let (port, server) = spawn_parallel_server(2, |mut stream, _| {
             stream
                 .set_read_timeout(Some(Duration::from_millis(40)))
@@ -1032,6 +1097,40 @@ mod tests {
 
         assert_eq!(selected.protocol, ProtocolKind::Rdp);
         assert_eq!(selected.address.port(), port);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_auto_port_rejects_partial_rfb_garbage_timeout_beside_positive_rdp() {
+        let (port, server) = spawn_parallel_server(2, |mut stream, _| {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(30)))
+                .unwrap();
+            let mut request = [0u8; RDP_NEGOTIATION_REQUEST.len()];
+            match stream.read_exact(&mut request) {
+                Ok(()) => {
+                    assert_eq!(request, RDP_NEGOTIATION_REQUEST);
+                    stream.write_all(&RDP_NEGOTIATION_RESPONSE).unwrap();
+                }
+                Err(error) if is_timeout(&error) => {
+                    stream.write_all(b"RFB 003.").unwrap();
+                    thread::sleep(Duration::from_millis(140));
+                }
+                Err(error) => panic!("unexpected RDP listener read error: {error}"),
+            }
+        });
+        let explicit_limits =
+            AutoProbeLimits::new(Duration::from_millis(90), Duration::from_millis(180), 64)
+                .unwrap();
+
+        let error = detect_on_ips(
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ProbePlan::from_explicit_port(Some(port)),
+            explicit_limits,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "auto_probe_malformed");
         server.join().unwrap();
     }
 
@@ -1303,6 +1402,25 @@ mod tests {
     }
 
     #[test]
+    fn shared_port_connection_timeout_is_not_a_passive_rfb_wait() {
+        let endpoint = DetectedEndpoint {
+            protocol: ProtocolKind::Rdp,
+            address: SocketAddr::from((Ipv4Addr::LOCALHOST, 3389)),
+        };
+
+        assert_eq!(
+            merge_probe_outcomes(
+                ProbeOutcome::Positive(endpoint),
+                ProbeOutcome::Timeout,
+                true,
+            )
+            .unwrap_err()
+            .code(),
+            "auto_probe_timeout"
+        );
+    }
+
+    #[test]
     fn exhausted_total_budget_fails_before_starting_probe_workers() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1396,10 +1514,37 @@ mod tests {
             }
         });
 
-        let addresses = collect_resolved_ips_bounded(iterator);
+        let addresses = merge_resolved_families_bounded(iterator, std::iter::empty());
 
-        assert_eq!(addresses.len(), MAX_RESOLVER_SCAN_ADDRESSES);
-        assert_eq!(scanned.load(Ordering::SeqCst), MAX_RESOLVER_SCAN_ADDRESSES);
+        assert_eq!(addresses.len(), MAX_RESOLVED_ADDRESSES);
+        assert_eq!(scanned.load(Ordering::SeqCst), MAX_RESOLVER_SCAN_PER_FAMILY);
+    }
+
+    #[test]
+    fn family_batched_dns_results_keep_reachable_ipv4_in_connect_candidates() {
+        let scanned_v4 = Arc::new(AtomicUsize::new(0));
+        let scanned_v6 = Arc::new(AtomicUsize::new(0));
+        let ipv4 = std::iter::once(IpAddr::V4(Ipv4Addr::LOCALHOST)).inspect({
+            let scanned_v4 = Arc::clone(&scanned_v4);
+            move |_| {
+                scanned_v4.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let ipv6 = (1u16..=u16::MAX).map({
+            let scanned_v6 = Arc::clone(&scanned_v6);
+            move |suffix| {
+                scanned_v6.fetch_add(1, Ordering::SeqCst);
+                IpAddr::V6(std::net::Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 0, 0, 0, 0, suffix,
+                ))
+            }
+        });
+
+        let addresses = merge_resolved_families_bounded(ipv4, ipv6);
+
+        assert!(connection_candidates(&addresses).contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(scanned_v4.load(Ordering::SeqCst), 1);
+        assert!(scanned_v6.load(Ordering::SeqCst) <= MAX_RESOLVER_SCAN_PER_FAMILY);
     }
 
     #[test]
