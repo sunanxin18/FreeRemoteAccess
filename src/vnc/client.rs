@@ -416,39 +416,29 @@ fn negotiate_connected(
         }
     };
 
-    // 2. 安全类型列表。3.3 没有选择机制（服务器直接指定），
-    //    3.7 用 u16 计数、3.8 用 u8 计数；计数为 0 表示失败并附带原因。
-    let security_types = match version.1 {
-        minor if minor == protocol::RFB_VERSION_3_3.1 => {
-            let t = conn.read_u32()?;
-            if t == 0 {
-                bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
+    // 2. 安全类型列表。3.3 没有选择机制（服务器直接指定 u32），
+    //    3.7/3.8 都使用 u8 计数；计数为 0 表示失败并附带原因。
+    let security_types =
+        match crate::protocols::rfb_security::security_list_framing(u16::from(version.1)) {
+            crate::protocols::rfb_security::SecurityListFraming::ServerSelectedU32 => {
+                let t = conn.read_u32()?;
+                if t == 0 {
+                    bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
+                }
+                vec![u8::try_from(t).context("RFB 3.3 security type 超出 u8 表示范围")?]
             }
-            vec![u8::try_from(t).context("RFB 3.3 security type 超出 u8 表示范围")?]
-        }
-        minor if minor == protocol::RFB_VERSION_3_7.1 => {
-            let n = conn.read_u16()?;
-            if n == 0 {
-                bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
+            crate::protocols::rfb_security::SecurityListFraming::CountedU8 => {
+                let n = conn.read_u8()?;
+                if n == 0 {
+                    bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
+                }
+                let mut v = Vec::with_capacity(usize::from(n));
+                for _ in 0..n {
+                    v.push(conn.read_u8()?);
+                }
+                v
             }
-            let mut v = Vec::with_capacity(usize::from(n));
-            for _ in 0..n {
-                v.push(conn.read_u8()?);
-            }
-            v
-        }
-        _ => {
-            let n = conn.read_u8()?;
-            if n == 0 {
-                bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
-            }
-            let mut v = Vec::with_capacity(usize::from(n));
-            for _ in 0..n {
-                v.push(conn.read_u8()?);
-            }
-            v
-        }
-    };
+        };
 
     Ok(Negotiated {
         conn,
@@ -680,7 +670,14 @@ fn pick_security_with_policy(
         };
     }
     if policy == SecurityPolicy::AppleNativeOnly {
+        let supports_apple_native = types
+            .iter()
+            .copied()
+            .any(crate::protocols::rfb_security::is_supported_apple_native);
         return match (username, password) {
+            (Some(_), Some(_)) if !supports_apple_native => {
+                bail!("服务器不提供可用的 Apple 原生认证方式，可用类型: {types:?}")
+            }
             (Some(_), Some(_)) if has(protocol::security::APPLE_SRP) => {
                 Ok(protocol::security::APPLE_SRP)
             }
@@ -1271,6 +1268,48 @@ mod tests {
     }
 
     #[test]
+    fn rfb_37_standard_security_count_completes_the_actual_adapter_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"RFB 003.007\n").unwrap();
+            let mut client_banner = [0u8; 12];
+            stream.read_exact(&mut client_banner).unwrap();
+            assert_eq!(&client_banner, b"RFB 003.007\n");
+            stream.write_all(&[1, protocol::security::NONE]).unwrap();
+            let mut selection = [0u8; 1];
+            stream.read_exact(&mut selection).unwrap();
+            assert_eq!(selection, [protocol::security::NONE]);
+            let mut client_init = [0u8; 1];
+            stream.read_exact(&mut client_init).unwrap();
+            assert_eq!(client_init, [protocol::apple_session::SHARED_CLIENT_INIT]);
+
+            let mut server_init = Vec::new();
+            server_init.extend_from_slice(&2u16.to_be_bytes());
+            server_init.extend_from_slice(&1u16.to_be_bytes());
+            server_init
+                .extend_from_slice(&[32, 24, 1, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
+            server_init.extend_from_slice(&0u32.to_be_bytes());
+            stream.write_all(&server_init).unwrap();
+        });
+
+        let client = VncClient::connect_timeout_with_policy(
+            &address,
+            Duration::from_millis(250),
+            None,
+            None,
+            session::SessionEncodingProfile::Raw,
+            SecurityPolicy::StandardVncOnly,
+        )
+        .unwrap();
+
+        assert_eq!(client.used_security, protocol::security::NONE);
+        assert_eq!((client.width, client.height), (2, 1));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn every_apple_account_security_type_requires_credentials() {
         for security_type in [30u8, 33, 35, 36] {
             let error = pick_security(&[security_type], None, None).unwrap_err();
@@ -1322,6 +1361,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("标准 VNC"), "{error:#}");
+    }
+
+    #[test]
+    fn shared_detector_capability_matches_actual_mac_native_selection() {
+        let credentials = (Some("local-user"), Some("local-password"));
+        for security_type in [30u8, 33, 35, 36] {
+            let detector_supports =
+                crate::protocols::rfb_security::is_supported_apple_native(security_type);
+            let adapter_supports = pick_security_with_policy(
+                &[security_type],
+                credentials.0,
+                credentials.1,
+                SecurityPolicy::AppleNativeOnly,
+            )
+            .is_ok();
+            assert_eq!(detector_supports, adapter_supports, "type {security_type}");
+        }
+
+        let mixed = [
+            protocol::security::APPLE_ARD_39,
+            protocol::security::VNC_AUTH,
+        ];
+        assert!(!mixed
+            .iter()
+            .copied()
+            .any(crate::protocols::rfb_security::is_supported_apple_native));
+        assert!(mixed
+            .iter()
+            .copied()
+            .any(crate::protocols::rfb_security::is_supported_standard));
+        assert_eq!(
+            pick_security_with_policy(
+                &mixed,
+                credentials.0,
+                credentials.1,
+                SecurityPolicy::StandardVncOnly,
+            )
+            .unwrap(),
+            protocol::security::VNC_AUTH
+        );
     }
 
     #[test]

@@ -235,22 +235,15 @@ pub mod apple_session {
 }
 
 pub mod security {
+    pub use crate::protocols::rfb_security::{
+        APPLE_ARD, APPLE_ARD_39, APPLE_RSA_SRP, APPLE_SRP, NONE, VNC_AUTH,
+    };
+
     pub const INVALID: u8 = 0;
-    pub const NONE: u8 = 1;
-    pub const VNC_AUTH: u8 = 2;
     pub const TIGHT: u8 = 16;
     pub const ULTRA: u8 = 17;
     pub const VENCRYPT: u8 = 19;
     pub const TLS: u8 = 22;
-    /// macOS 屏幕共享私有的 Diffie-Hellman 认证（Apple Remote Desktop）
-    pub const APPLE_ARD: u8 = 30;
-    /// Apple SRP-6a（RFC 5054 4096 组 + SHA-512 + PBKDF2，macOS 10.10+）
-    pub const APPLE_SRP: u8 = 36;
-    /// Apple RSA-SRP 混合（RSA-2048 PKCS#1 v1.5 包裹的 SRP，Apple 客户端默认路径）
-    pub const APPLE_RSA_SRP: u8 = 33;
-    /// Apple Remote Desktop v3.9 私有认证。
-    pub const APPLE_ARD_39: u8 = 35;
-
     pub const fn requires_apple_account_credentials(value: u8) -> bool {
         matches!(value, APPLE_ARD | APPLE_RSA_SRP | APPLE_ARD_39 | APPLE_SRP)
     }

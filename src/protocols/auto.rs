@@ -1,14 +1,16 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, OnceLock};
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use hickory_resolver::TokioResolver;
 
 use crate::app::connection::ProtocolKind;
+use crate::protocols::rfb_security::{self, SecurityListFraming};
 use crate::protocols::ProtocolAdapter;
 use crate::session::{ProtocolContext, SessionCommand, SessionError, SessionEventSink};
 
@@ -19,8 +21,8 @@ const MIN_RDP_RESPONSE_BYTES: usize = 19;
 const PRODUCTION_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(750);
 const PRODUCTION_TOTAL_TIMEOUT: Duration = Duration::from_millis(1_750);
 const PRODUCTION_MAX_RESPONSE_BYTES: usize = 64;
-const RESOLVER_QUEUE_CAPACITY: usize = 8;
 const MAX_RESOLVED_ADDRESSES: usize = 8;
+const MAX_RESOLVER_SCAN_ADDRESSES: usize = 32;
 const MAX_CONNECT_ATTEMPTS: usize = 4;
 const MAX_RFB_SECURITY_TYPES: usize = 64;
 
@@ -111,115 +113,71 @@ enum RdpNegotiationEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeOutcome {
     Positive(DetectedEndpoint),
+    CrossProtocolRfbBanner,
     Negative,
     Timeout,
     Malformed,
     Unreachable,
 }
 
-struct ResolveRequest {
-    host: String,
-    response: std_mpsc::SyncSender<io::Result<Vec<IpAddr>>>,
+struct CancellableResolver {
+    runtime: tokio::runtime::Runtime,
+    resolver: TokioResolver,
 }
 
-struct BoundedResolver {
-    requests: Option<std_mpsc::SyncSender<ResolveRequest>>,
-    worker: Option<thread::JoinHandle<()>>,
-    _worker_count: Arc<AtomicUsize>,
-}
-
-impl BoundedResolver {
-    fn new(
-        queue_capacity: usize,
-        mut backend: impl FnMut(&str) -> io::Result<Vec<IpAddr>> + Send + 'static,
-    ) -> Result<Self, SessionError> {
-        if queue_capacity == 0 {
-            return Err(SessionError::new("auto_probe_resolver_capacity_invalid"));
-        }
-        let (sender, receiver) = std_mpsc::sync_channel::<ResolveRequest>(queue_capacity);
-        let worker_count = Arc::new(AtomicUsize::new(0));
-        let worker_counter = Arc::clone(&worker_count);
-        let worker = thread::Builder::new()
-            .name("freeremote-auto-resolver".to_owned())
-            .spawn(move || {
-                worker_counter.fetch_add(1, Ordering::SeqCst);
-                while let Ok(request) = receiver.recv() {
-                    let result = backend(&request.host);
-                    let _ = request.response.send(result);
-                }
-            })
-            .map_err(|_| SessionError::new("auto_probe_resolution_failed"))?;
-        Ok(Self {
-            requests: Some(sender),
-            worker: Some(worker),
-            _worker_count: worker_count,
-        })
-    }
-
+impl CancellableResolver {
     fn production() -> Result<Self, SessionError> {
-        Self::new(RESOLVER_QUEUE_CAPACITY, |host| {
-            (host, 0)
-                .to_socket_addrs()
-                .map(|addresses| addresses.map(|address| address.ip()).collect())
-        })
+        let runtime = build_resolver_runtime()?;
+        let resolver = {
+            let _runtime_guard = runtime.enter();
+            TokioResolver::builder_tokio()
+                .map_err(|_| SessionError::new("auto_probe_resolution_failed"))?
+                .build()
+                .map_err(|_| SessionError::new("auto_probe_resolution_failed"))?
+        };
+        Ok(Self { runtime, resolver })
     }
 
     fn resolve(&self, host: &str, deadline: Instant) -> Result<Vec<IpAddr>, SessionError> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
-        remaining_until(deadline).map_err(|_| SessionError::new("auto_probe_timeout"))?;
-        let (response_sender, response_receiver) = std_mpsc::sync_channel(1);
-        let request = ResolveRequest {
-            host: host.to_owned(),
-            response: response_sender,
-        };
-        self.requests
-            .as_ref()
-            .ok_or_else(|| SessionError::new("auto_probe_resolution_failed"))?
-            .try_send(request)
-            .map_err(|error| match error {
-                std_mpsc::TrySendError::Full(_) => SessionError::new("auto_probe_resolution_busy"),
-                std_mpsc::TrySendError::Disconnected(_) => {
-                    SessionError::new("auto_probe_resolution_failed")
-                }
-            })?;
-        let remaining =
-            remaining_until(deadline).map_err(|_| SessionError::new("auto_probe_timeout"))?;
-        let addresses = response_receiver
-            .recv_timeout(remaining)
-            .map_err(|error| match error {
-                std_mpsc::RecvTimeoutError::Timeout => SessionError::new("auto_probe_timeout"),
-                std_mpsc::RecvTimeoutError::Disconnected => {
-                    SessionError::new("auto_probe_resolution_failed")
-                }
-            })?
-            .map_err(|_| SessionError::new("auto_probe_resolution_failed"))?;
-        let addresses = bound_resolved_addresses(addresses);
+        let lookup = self.runtime.block_on(resolve_future_until(
+            self.resolver.lookup_ip(host.to_owned()),
+            deadline,
+        ))?;
+        let addresses = bound_resolved_addresses(collect_resolved_ips_bounded(lookup.iter()));
         if addresses.is_empty() {
             return Err(SessionError::new("auto_probe_resolution_failed"));
         }
         Ok(addresses)
     }
-
-    #[cfg(test)]
-    fn worker_count(&self) -> usize {
-        self._worker_count.load(Ordering::SeqCst)
-    }
 }
 
-impl Drop for BoundedResolver {
-    fn drop(&mut self) {
-        self.requests.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
+fn build_resolver_runtime() -> Result<tokio::runtime::Runtime, SessionError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name("freeremote-auto-dns")
+        .build()
+        .map_err(|_| SessionError::new("auto_probe_resolution_failed"))
 }
 
-fn global_resolver() -> Result<&'static BoundedResolver, SessionError> {
-    static RESOLVER: OnceLock<Result<BoundedResolver, SessionError>> = OnceLock::new();
-    match RESOLVER.get_or_init(BoundedResolver::production) {
+async fn resolve_future_until<F, T, E>(future: F, deadline: Instant) -> Result<T, SessionError>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let remaining =
+        remaining_until(deadline).map_err(|_| SessionError::new("auto_probe_timeout"))?;
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| SessionError::new("auto_probe_timeout"))?
+        .map_err(|_| SessionError::new("auto_probe_resolution_failed"))
+}
+
+fn global_resolver() -> Result<&'static CancellableResolver, SessionError> {
+    static RESOLVER: OnceLock<Result<CancellableResolver, SessionError>> = OnceLock::new();
+    match RESOLVER.get_or_init(CancellableResolver::production) {
         Ok(resolver) => Ok(resolver),
         Err(error) => Err(*error),
     }
@@ -300,24 +258,52 @@ fn detect_on_ips_until(
     if Instant::now() >= total_deadline {
         return Err(SessionError::new("auto_probe_timeout"));
     }
-    let (rdp, rfb) = thread::scope(|scope| {
-        let rdp = scope.spawn(|| probe_rdp(ips, plan.rdp_port, limits, total_deadline));
-        let rfb = scope.spawn(|| probe_rfb(ips, plan.rfb_port, limits, total_deadline));
-        (
+    let (rdp, rfb) = thread::scope(|scope| -> Result<_, SessionError> {
+        let rdp = thread::Builder::new()
+            .name("freeremote-auto-rdp".to_owned())
+            .spawn_scoped(scope, || {
+                probe_rdp(ips, plan.rdp_port, limits, total_deadline)
+            })
+            .map_err(|_| SessionError::new("auto_probe_worker_spawn_failed"))?;
+        let rfb = thread::Builder::new()
+            .name("freeremote-auto-rfb".to_owned())
+            .spawn_scoped(scope, || {
+                probe_rfb(ips, plan.rfb_port, limits, total_deadline)
+            })
+            .map_err(|_| SessionError::new("auto_probe_worker_spawn_failed"))?;
+        Ok((
             rdp.join().unwrap_or(ProbeOutcome::Malformed),
             rfb.join().unwrap_or(ProbeOutcome::Malformed),
-        )
-    });
-    merge_probe_outcomes(rdp, rfb)
+        ))
+    })?;
+    merge_probe_outcomes(rdp, rfb, plan.rdp_port == plan.rfb_port)
 }
 
 fn merge_probe_outcomes(
     rdp: ProbeOutcome,
     rfb: ProbeOutcome,
+    shared_explicit_port: bool,
 ) -> Result<DetectedEndpoint, SessionError> {
+    if !shared_explicit_port && matches!(rdp, ProbeOutcome::CrossProtocolRfbBanner) {
+        return Err(SessionError::new("auto_probe_malformed"));
+    }
     match (rdp, rfb) {
         (ProbeOutcome::Positive(_), ProbeOutcome::Positive(_)) => {
             Err(SessionError::new("auto_protocol_ambiguous"))
+        }
+        (ProbeOutcome::Positive(endpoint), ProbeOutcome::Timeout)
+            if shared_explicit_port && endpoint.protocol == ProtocolKind::Rdp =>
+        {
+            Ok(endpoint)
+        }
+        (ProbeOutcome::CrossProtocolRfbBanner, ProbeOutcome::Positive(endpoint))
+            if shared_explicit_port
+                && matches!(
+                    endpoint.protocol,
+                    ProtocolKind::AppleRfb | ProtocolKind::StandardRfb
+                ) =>
+        {
+            Ok(endpoint)
         }
         (ProbeOutcome::Malformed, _) | (_, ProbeOutcome::Malformed) => {
             Err(SessionError::new("auto_probe_malformed"))
@@ -325,6 +311,7 @@ fn merge_probe_outcomes(
         (ProbeOutcome::Timeout, _) | (_, ProbeOutcome::Timeout) => {
             Err(SessionError::new("auto_probe_timeout"))
         }
+        (ProbeOutcome::CrossProtocolRfbBanner, _) => Err(SessionError::new("auto_probe_malformed")),
         (ProbeOutcome::Positive(endpoint), ProbeOutcome::Unreachable | ProbeOutcome::Negative)
         | (ProbeOutcome::Unreachable | ProbeOutcome::Negative, ProbeOutcome::Positive(endpoint)) => {
             Ok(endpoint)
@@ -350,6 +337,17 @@ fn probe_rdp(
     let mut header = [0u8; 4];
     if let Err((error, received)) = read_exact_until(&mut stream, &mut header, attempt_deadline) {
         return classify_read_progress_error(&error, received);
+    }
+    if &header == b"RFB " {
+        let mut banner = [0u8; RFB_BANNER_BYTES];
+        banner[..header.len()].copy_from_slice(&header);
+        return match read_exact_until(&mut stream, &mut banner[header.len()..], attempt_deadline) {
+            Ok(()) if parse_rfb_banner(&banner).is_ok() => ProbeOutcome::CrossProtocolRfbBanner,
+            Ok(()) => ProbeOutcome::Malformed,
+            Err((error, received)) => {
+                classify_read_progress_error(&error, received.saturating_add(header.len()))
+            }
+        };
     }
     if header[0] != 3 || header[1] != 0 {
         return ProbeOutcome::Malformed;
@@ -428,8 +426,8 @@ fn read_rfb_security_types(
     deadline: Instant,
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, ProbeOutcome> {
-    let count = match version_minor {
-        3 => {
+    let count = match rfb_security::security_list_framing(version_minor) {
+        SecurityListFraming::ServerSelectedU32 => {
             let mut bytes = [0u8; 4];
             read_exact_until(stream, &mut bytes, deadline)
                 .map_err(|(error, received)| classify_read_progress_error(&error, received))?;
@@ -440,13 +438,7 @@ fn read_rfb_security_types(
             let security = u8::try_from(security).map_err(|_| ProbeOutcome::Malformed)?;
             return Ok(vec![security]);
         }
-        7 => {
-            let mut bytes = [0u8; 2];
-            read_exact_until(stream, &mut bytes, deadline)
-                .map_err(|(error, received)| classify_read_progress_error(&error, received))?;
-            usize::from(u16::from_be_bytes(bytes))
-        }
-        _ => {
+        SecurityListFraming::CountedU8 => {
             let mut byte = [0u8; 1];
             read_exact_until(stream, &mut byte, deadline)
                 .map_err(|(error, received)| classify_read_progress_error(&error, received))?;
@@ -469,11 +461,15 @@ fn classify_rfb_security_types(types: &[u8]) -> Result<ProtocolKind, SessionErro
     let apple = types
         .iter()
         .copied()
-        .any(|security| matches!(security, 30 | 33 | 35 | 36));
+        .any(rfb_security::is_supported_apple_native);
     if apple {
         return Ok(ProtocolKind::AppleRfb);
     }
-    if types.iter().any(|security| matches!(security, 1 | 2)) {
+    if types
+        .iter()
+        .copied()
+        .any(rfb_security::is_supported_standard)
+    {
         return Ok(ProtocolKind::StandardRfb);
     }
     Err(SessionError::new("auto_protocol_not_supported"))
@@ -580,7 +576,10 @@ fn classify_read_progress_error(error: &io::Error, received: usize) -> ProbeOutc
 }
 
 fn bound_resolved_addresses(addresses: Vec<IpAddr>) -> Vec<IpAddr> {
-    let unique = addresses.into_iter().collect::<BTreeSet<_>>();
+    let unique = addresses
+        .into_iter()
+        .take(MAX_RESOLVER_SCAN_ADDRESSES)
+        .collect::<BTreeSet<_>>();
     let mut v4 = unique.iter().filter_map(|ip| match ip {
         IpAddr::V4(value) => Some(IpAddr::V4(*value)),
         IpAddr::V6(_) => None,
@@ -605,6 +604,13 @@ fn bound_resolved_addresses(addresses: Vec<IpAddr>) -> Vec<IpAddr> {
         }
     }
     bounded
+}
+
+fn collect_resolved_ips_bounded(addresses: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    addresses
+        .into_iter()
+        .take(MAX_RESOLVER_SCAN_ADDRESSES)
+        .collect()
 }
 
 fn connection_candidates(addresses: &[IpAddr]) -> &[IpAddr] {
@@ -713,6 +719,27 @@ mod tests {
             for index in 0..connections {
                 let (stream, _) = listener.accept().unwrap();
                 handler(stream, index);
+            }
+        });
+        (port, worker)
+    }
+
+    fn spawn_parallel_server(
+        connections: usize,
+        handler: impl Fn(TcpStream, usize) + Send + Sync + 'static,
+    ) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = Arc::new(handler);
+        let worker = thread::spawn(move || {
+            let mut handlers = Vec::with_capacity(connections);
+            for index in 0..connections {
+                let (stream, _) = listener.accept().unwrap();
+                let handler = Arc::clone(&handler);
+                handlers.push(thread::spawn(move || handler(stream, index)));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
             }
         });
         (port, worker)
@@ -975,6 +1002,65 @@ mod tests {
     }
 
     #[test]
+    fn explicit_auto_port_selects_a_real_client_first_rdp_listener() {
+        let (port, server) = spawn_parallel_server(2, |mut stream, _| {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(40)))
+                .unwrap();
+            let mut request = [0u8; RDP_NEGOTIATION_REQUEST.len()];
+            match stream.read_exact(&mut request) {
+                Ok(()) => {
+                    assert_eq!(request, RDP_NEGOTIATION_REQUEST);
+                    stream.write_all(&RDP_NEGOTIATION_RESPONSE).unwrap();
+                }
+                Err(error) if is_timeout(&error) => {
+                    thread::sleep(Duration::from_millis(140));
+                }
+                Err(error) => panic!("unexpected RDP listener read error: {error}"),
+            }
+        });
+        let explicit_limits =
+            AutoProbeLimits::new(Duration::from_millis(90), Duration::from_millis(180), 64)
+                .unwrap();
+
+        let selected = detect_on_ips(
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ProbePlan::from_explicit_port(Some(port)),
+            explicit_limits,
+        )
+        .unwrap();
+
+        assert_eq!(selected.protocol, ProtocolKind::Rdp);
+        assert_eq!(selected.address.port(), port);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_auto_port_selects_a_real_server_first_rfb_listener() {
+        let (port, server) = spawn_parallel_server(2, |mut stream, _| {
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut client_first = [0u8; 12];
+            stream.read_exact(&mut client_first).unwrap();
+            if &client_first == b"RFB 003.008\n" {
+                stream.write_all(&[1, 2]).unwrap();
+            } else {
+                assert_eq!(&client_first, &RDP_NEGOTIATION_REQUEST[..12]);
+            }
+        });
+
+        let selected = detect_on_ips(
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            ProbePlan::from_explicit_port(Some(port)),
+            limits(),
+        )
+        .unwrap();
+
+        assert_eq!(selected.protocol, ProtocolKind::StandardRfb);
+        assert_eq!(selected.address.port(), port);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn absolute_read_deadline_rejects_a_slowloris_that_drips_bytes() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -1083,6 +1169,41 @@ mod tests {
             classify_rfb_security_types(&[16, 19]).unwrap_err().code(),
             "auto_protocol_not_supported"
         );
+        assert_eq!(
+            classify_rfb_security_types(&[35]).unwrap_err().code(),
+            "auto_protocol_not_supported"
+        );
+        assert_eq!(
+            classify_rfb_security_types(&[35, 2]).unwrap(),
+            ProtocolKind::StandardRfb
+        );
+    }
+
+    #[test]
+    fn rfb_37_probe_reads_the_standard_u8_security_count() {
+        let (port, server) = spawn_server(1, |mut stream, _| {
+            stream.write_all(b"RFB 003.007\n").unwrap();
+            let mut reply = [0u8; 12];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"RFB 003.007\n");
+            stream.write_all(&[1, 2]).unwrap();
+        });
+
+        let outcome = probe_rfb(
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            port,
+            limits(),
+            Instant::now() + Duration::from_millis(350),
+        );
+
+        assert!(matches!(
+            outcome,
+            ProbeOutcome::Positive(DetectedEndpoint {
+                protocol: ProtocolKind::StandardRfb,
+                ..
+            })
+        ));
+        server.join().unwrap();
     }
 
     #[test]
@@ -1164,15 +1285,19 @@ mod tests {
             (ProbeOutcome::Malformed, "auto_probe_malformed"),
         ] {
             assert_eq!(
-                merge_probe_outcomes(ProbeOutcome::Positive(endpoint), other)
+                merge_probe_outcomes(ProbeOutcome::Positive(endpoint), other, false)
                     .unwrap_err()
                     .code(),
                 code
             );
         }
         assert_eq!(
-            merge_probe_outcomes(ProbeOutcome::Positive(endpoint), ProbeOutcome::Unreachable,)
-                .unwrap(),
+            merge_probe_outcomes(
+                ProbeOutcome::Positive(endpoint),
+                ProbeOutcome::Unreachable,
+                false,
+            )
+            .unwrap(),
             endpoint
         );
     }
@@ -1261,6 +1386,23 @@ mod tests {
     }
 
     #[test]
+    fn resolver_acquisition_stops_scanning_an_excessive_address_iterator() {
+        let scanned = Arc::new(AtomicUsize::new(0));
+        let iterator = (0u16..=u16::MAX).map({
+            let scanned = Arc::clone(&scanned);
+            move |value| {
+                scanned.fetch_add(1, Ordering::SeqCst);
+                IpAddr::V4(Ipv4Addr::new(10, (value >> 8) as u8, value as u8, 1))
+            }
+        });
+
+        let addresses = collect_resolved_ips_bounded(iterator);
+
+        assert_eq!(addresses.len(), MAX_RESOLVER_SCAN_ADDRESSES);
+        assert_eq!(scanned.load(Ordering::SeqCst), MAX_RESOLVER_SCAN_ADDRESSES);
+    }
+
+    #[test]
     fn multi_address_connect_pins_the_exact_successful_candidate() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let expected = listener.local_addr().unwrap();
@@ -1284,45 +1426,38 @@ mod tests {
     }
 
     #[test]
-    fn bounded_resolver_uses_one_worker_and_rejects_a_full_queue() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(Barrier::new(2));
-        let resolver = BoundedResolver::new(1, {
-            let calls = Arc::clone(&calls);
-            let release = Arc::clone(&release);
-            move |_host| {
-                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    release.wait();
-                }
-                Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            }
-        })
-        .unwrap();
+    fn cancellable_resolver_timeout_does_not_poison_the_next_lookup() {
+        let runtime = build_resolver_runtime().unwrap();
+        let timed_out = runtime.block_on(resolve_future_until(
+            std::future::pending::<Result<Vec<IpAddr>, SessionError>>(),
+            Instant::now() + Duration::from_millis(20),
+        ));
+        assert_eq!(timed_out.unwrap_err().code(), "auto_probe_timeout");
 
-        assert_eq!(
-            resolver
-                .resolve("blocked", Instant::now() + Duration::from_millis(20))
-                .unwrap_err()
-                .code(),
-            "auto_probe_timeout"
-        );
-        assert_eq!(resolver.worker_count(), 1);
-        assert_eq!(
-            resolver
-                .resolve("queued", Instant::now() + Duration::from_millis(5))
-                .unwrap_err()
-                .code(),
-            "auto_probe_timeout"
-        );
-        assert_eq!(
-            resolver
-                .resolve("full", Instant::now() + Duration::from_millis(5))
-                .unwrap_err()
-                .code(),
-            "auto_probe_resolution_busy"
-        );
-        assert_eq!(resolver.worker_count(), 1);
-        release.wait();
+        let recovered = runtime.block_on(resolve_future_until(
+            std::future::ready(Ok::<_, SessionError>(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])),
+            Instant::now() + Duration::from_millis(100),
+        ));
+        assert_eq!(recovered.unwrap(), vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    }
+
+    #[test]
+    fn expired_resolver_deadline_does_not_poll_the_backend_future() {
+        let runtime = build_resolver_runtime().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let result = runtime.block_on(resolve_future_until(
+            {
+                let polls = Arc::clone(&polls);
+                async move {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, SessionError>(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+                }
+            },
+            Instant::now() - Duration::from_millis(1),
+        ));
+
+        assert_eq!(result.unwrap_err().code(), "auto_probe_timeout");
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "cli")]

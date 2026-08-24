@@ -9,6 +9,7 @@ pub mod auto;
 pub mod rdp;
 #[cfg(feature = "cli")]
 pub mod rfb;
+pub mod rfb_security;
 
 use crate::app::connection::ProtocolKind;
 #[cfg(feature = "cli")]

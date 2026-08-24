@@ -55,7 +55,8 @@ rsa = { version = "0.9", optional = true }
 secrecy = "0.10"
 crossbeam-channel = "0.5"
 smallvec = { version = "1.15", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+hickory-resolver = { version = "=0.26.1", default-features = false, features = ["system-config", "tokio"] }
 raw-window-handle = "0.6"
 zeroize = "1"
 egui = { version = "=0.36.1", default-features = false, features = ["default_fonts"], optional = true }
@@ -99,7 +100,7 @@ cli = [
     "dep:windows-sys",
 ]
 media = ["cli", "dep:cpal"]
-rdp = ["dep:ironrdp", "dep:smallvec", "dep:tokio"]
+rdp = ["dep:ironrdp", "dep:smallvec"]
 gui = [
     "cli",
     "media",
