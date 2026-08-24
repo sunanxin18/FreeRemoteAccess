@@ -1,4 +1,3 @@
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -7,7 +6,7 @@ use secrecy::ExposeSecret;
 use crate::app::connection::ProtocolKind;
 use crate::core::{FrameRect, RemotePixelFormat, RenderUpdate};
 use crate::framebuffer::Framebuffer;
-use crate::protocols::ProtocolAdapter;
+use crate::protocols::{resolve_connection_endpoint, ProtocolAdapter};
 use crate::session::{
     ProtocolContext, SessionCommand, SessionError, SessionEvent, SessionEventSink,
 };
@@ -49,7 +48,7 @@ impl RfbAdapter {
         if connection.protocol != expected_protocol {
             return Err(SessionError::new("rfb_protocol_mismatch"));
         }
-        let address = resolve_endpoint(connection.endpoint.host(), connection.endpoint.port())?;
+        let address = resolve_connection_endpoint(&connection)?;
         let policy = match self.authentication_mode {
             RfbAuthenticationMode::StandardCompatible => SecurityPolicy::StandardVncOnly,
             RfbAuthenticationMode::AppleNativeAccount => SecurityPolicy::AppleNativeOnly,
@@ -177,14 +176,6 @@ fn drain_commands(
             }
         }
     }
-}
-
-fn resolve_endpoint(host: &str, port: u16) -> Result<SocketAddr, SessionError> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|_| SessionError::new("endpoint_resolution_failed"))?
-        .next()
-        .ok_or_else(|| SessionError::new("endpoint_resolution_empty"))
 }
 
 pub struct RfbFrameNormalizer {
@@ -324,4 +315,35 @@ fn extract_bgra(
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::app::connection::{validate_connection, ConnectionRequest, ServiceKind};
+
+    #[test]
+    fn auto_rfb_connection_uses_the_pinned_probe_address() {
+        let connection = validate_connection(ConnectionRequest {
+            service: ServiceKind::Auto,
+            host: "desktop.example".to_owned(),
+            port: None,
+            username: "user".to_owned(),
+            password: SecretString::from("secret".to_owned()),
+            domain: None,
+        })
+        .unwrap()
+        .select_auto_protocol(
+            ProtocolKind::StandardRfb,
+            "192.0.2.40:5900".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_connection_endpoint(&connection).unwrap(),
+            "192.0.2.40:5900".parse().unwrap()
+        );
+    }
 }

@@ -1,11 +1,10 @@
-use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use secrecy::ExposeSecret;
 
 use crate::app::connection::ProtocolKind;
-use crate::protocols::ProtocolAdapter;
+use crate::protocols::{resolve_connection_endpoint, ProtocolAdapter};
 use crate::session::{
     ProtocolContext, SessionCommand, SessionError, SessionEvent, SessionEventSink,
 };
@@ -48,11 +47,7 @@ impl ProtocolAdapter for AppleArdAdapter {
         if connection.protocol != ProtocolKind::AppleRfb {
             return Err(SessionError::new("apple_protocol_mismatch"));
         }
-        let address = (connection.endpoint.host(), connection.endpoint.port())
-            .to_socket_addrs()
-            .map_err(|_| SessionError::new("endpoint_resolution_failed"))?
-            .next()
-            .ok_or_else(|| SessionError::new("endpoint_resolution_empty"))?;
+        let address = resolve_connection_endpoint(&connection)?;
         let client = VncClient::connect_timeout_with_policy(
             &address,
             CONNECT_TIMEOUT,
@@ -85,5 +80,33 @@ impl ProtocolAdapter for AppleArdAdapter {
             let _ = (client, commands, events);
             Err(SessionError::new("apple_hpss_feature_unavailable"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::app::connection::{validate_connection, ConnectionRequest, ServiceKind};
+
+    #[test]
+    fn auto_apple_connection_uses_the_pinned_probe_address() {
+        let connection = validate_connection(ConnectionRequest {
+            service: ServiceKind::Auto,
+            host: "mac.example".to_owned(),
+            port: None,
+            username: "local-user".to_owned(),
+            password: SecretString::from("secret".to_owned()),
+            domain: None,
+        })
+        .unwrap()
+        .select_auto_protocol(ProtocolKind::AppleRfb, "192.0.2.41:5900".parse().unwrap())
+        .unwrap();
+
+        assert_eq!(
+            resolve_connection_endpoint(&connection).unwrap(),
+            "192.0.2.41:5900".parse().unwrap()
+        );
     }
 }

@@ -36,6 +36,10 @@ impl RdpRuntimeConfig {
         self.0.connector()
     }
 
+    pub fn connect_addr(&self) -> Option<std::net::SocketAddr> {
+        self.0.connect_addr()
+    }
+
     fn into_inner(self) -> Config {
         self.0
     }
@@ -104,6 +108,9 @@ pub fn build_rdp_config(
         .with_client_dir("C:\\Windows\\System32\\mstscax.dll")
         .with_client_name("FreeRemoteAccess")
         .with_platform(current_platform());
+    if let Some(address) = connection.endpoint.pinned_addr() {
+        builder = builder.with_connect_addr(address);
+    }
     if let Some(domain) = connection.domain {
         builder = builder.with_domain(domain);
     }
@@ -400,5 +407,79 @@ const fn current_platform() -> MajorPlatformType {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         MajorPlatformType::UNSPECIFIED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::app::connection::{validate_connection, ConnectionRequest, ServiceKind};
+
+    #[test]
+    fn auto_rdp_config_separates_pinned_tcp_address_from_tls_identity() {
+        let connection = validate_connection(ConnectionRequest {
+            service: ServiceKind::Auto,
+            host: "rdp.example".to_owned(),
+            port: None,
+            username: "desktop-user".to_owned(),
+            password: SecretString::from("secret".to_owned()),
+            domain: None,
+        })
+        .unwrap()
+        .select_auto_protocol(ProtocolKind::Rdp, "192.0.2.55:3389".parse().unwrap())
+        .unwrap();
+
+        let config = build_rdp_config(connection, RdpDesktopConfig::default()).unwrap();
+
+        assert_eq!(config.destination().name(), "rdp.example");
+        assert_eq!(
+            config.connect_addr(),
+            Some("192.0.2.55:3389".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn ironrdp_direct_transport_connects_only_to_the_pinned_socket() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let pinned = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 64];
+            let count = stream.read(&mut request).unwrap();
+            request[..count].to_vec()
+        });
+        let connection = validate_connection(ConnectionRequest {
+            service: ServiceKind::Auto,
+            host: "must-not-resolve.invalid".to_owned(),
+            port: None,
+            username: "desktop-user".to_owned(),
+            password: SecretString::from("secret".to_owned()),
+            domain: None,
+        })
+        .unwrap()
+        .select_auto_protocol(ProtocolKind::Rdp, pinned)
+        .unwrap();
+        let config = build_rdp_config(connection, RdpDesktopConfig::default())
+            .unwrap()
+            .into_inner();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (output, _receiver) = mpsc::channel(4);
+            tokio::time::timeout(Duration::from_secs(1), RdpClient::new(config, output).run())
+                .await
+                .unwrap();
+        });
+
+        let request = server.join().unwrap();
+        assert!(request.starts_with(&[0x03, 0x00]));
     }
 }

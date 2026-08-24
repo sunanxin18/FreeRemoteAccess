@@ -1,4 +1,6 @@
 use crossbeam_channel::Receiver;
+#[cfg(feature = "cli")]
+use std::net::{SocketAddr, ToSocketAddrs};
 
 #[cfg(feature = "cli")]
 pub mod apple_ard;
@@ -9,6 +11,8 @@ pub mod rdp;
 pub mod rfb;
 
 use crate::app::connection::ProtocolKind;
+#[cfg(feature = "cli")]
+use crate::app::connection::ValidatedConnection;
 use crate::session::{ProtocolContext, SessionCommand, SessionError, SessionEventSink};
 
 pub trait ProtocolAdapter: Send + 'static {
@@ -19,6 +23,20 @@ pub trait ProtocolAdapter: Send + 'static {
         commands: Receiver<SessionCommand>,
         events: SessionEventSink,
     ) -> Result<(), SessionError>;
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn resolve_connection_endpoint(
+    connection: &ValidatedConnection,
+) -> Result<SocketAddr, SessionError> {
+    if let Some(address) = connection.endpoint.pinned_addr() {
+        return Ok(address);
+    }
+    (connection.endpoint.host(), connection.endpoint.port())
+        .to_socket_addrs()
+        .map_err(|_| SessionError::new("endpoint_resolution_failed"))?
+        .next()
+        .ok_or_else(|| SessionError::new("endpoint_resolution_empty"))
 }
 
 pub fn adapter_for(protocol: ProtocolKind) -> Result<Box<dyn ProtocolAdapter>, SessionError> {

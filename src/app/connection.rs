@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::net::SocketAddr;
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -34,6 +35,7 @@ pub struct Endpoint {
     host: String,
     port: u16,
     port_was_explicit: bool,
+    pinned_addr: Option<SocketAddr>,
 }
 
 impl Endpoint {
@@ -56,6 +58,10 @@ impl Endpoint {
             None
         }
     }
+
+    pub const fn pinned_addr(&self) -> Option<SocketAddr> {
+        self.pinned_addr
+    }
 }
 
 #[derive(Debug)]
@@ -71,16 +77,20 @@ impl ValidatedConnection {
     pub(crate) fn select_auto_protocol(
         mut self,
         protocol: ProtocolKind,
-        port: u16,
+        address: SocketAddr,
     ) -> Option<Self> {
         if self.protocol != ProtocolKind::Auto
-            || !matches!(protocol, ProtocolKind::Rdp | ProtocolKind::AppleRfb)
-            || port == 0
+            || !matches!(
+                protocol,
+                ProtocolKind::Rdp | ProtocolKind::AppleRfb | ProtocolKind::StandardRfb
+            )
+            || address.port() == 0
         {
             return None;
         }
         self.protocol = protocol;
-        self.endpoint.port = port;
+        self.endpoint.port = address.port();
+        self.endpoint.pinned_addr = Some(address);
         Some(self)
     }
 }
@@ -171,6 +181,7 @@ pub fn validate_connection(
             host: host.to_owned(),
             port,
             port_was_explicit,
+            pinned_addr: None,
         },
         username: username.to_owned(),
         password: request.password,
@@ -292,5 +303,23 @@ mod tests {
             assert_eq!(connection.endpoint.port(), port);
             assert!(connection.endpoint.port_was_explicit());
         }
+    }
+
+    #[test]
+    fn auto_selection_preserves_identity_host_and_pins_the_detected_socket() {
+        let connection = validate_connection(request(ServiceKind::Auto, "desktop.example", None))
+            .unwrap()
+            .select_auto_protocol(
+                ProtocolKind::StandardRfb,
+                "192.0.2.10:5900".parse().unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(connection.endpoint.host(), "desktop.example");
+        assert_eq!(connection.endpoint.port(), 5900);
+        assert_eq!(
+            connection.endpoint.pinned_addr(),
+            Some("192.0.2.10:5900".parse().unwrap())
+        );
     }
 }
