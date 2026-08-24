@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
@@ -30,6 +30,42 @@ struct RemoteTexture {
     format: RemotePixelFormat,
 }
 
+/// `egui::Context::run_ui` transfers its texture delta to the integration. A
+/// recoverable surface acquisition failure must therefore retain that delta;
+/// egui will not submit the same font/image upload again on its own.
+#[derive(Default)]
+struct PendingEguiTextureDeltas {
+    delta: egui::TexturesDelta,
+}
+
+impl PendingEguiTextureDeltas {
+    fn append(&mut self, newer: egui::TexturesDelta) {
+        self.delta.append(newer);
+    }
+
+    fn take_sets(&mut self) -> egui::TexturesDelta {
+        let mut sets = std::mem::take(&mut self.delta);
+        self.delta.free.extend(std::mem::take(&mut sets.free));
+        sets
+    }
+
+    fn free_after_present(&mut self, mut free: impl FnMut(egui::TextureId)) {
+        for texture_id in std::mem::take(&mut self.delta.free) {
+            free(texture_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_set_count(&self) -> usize {
+        self.delta.set.len()
+    }
+
+    #[cfg(test)]
+    fn pending_free_is_empty(&self) -> bool {
+        self.delta.free.is_empty()
+    }
+}
+
 pub struct Renderer {
     instance: wgpu::Instance,
     window: Arc<Window>,
@@ -48,6 +84,7 @@ pub struct Renderer {
     runtime_policy: RendererRuntimePolicy,
     recovery_controller: SurfaceRecoveryController,
     recovery_executor: SurfaceRecoveryExecutor,
+    pending_egui_deltas: PendingEguiTextureDeltas,
     egui_renderer: EguiRenderer,
 }
 
@@ -166,6 +203,7 @@ impl Renderer {
             runtime_policy: RendererRuntimePolicy::new(),
             recovery_controller: SurfaceRecoveryController::default(),
             recovery_executor: SurfaceRecoveryExecutor,
+            pending_egui_deltas: PendingEguiTextureDeltas::default(),
             egui_renderer,
         })
     }
@@ -292,10 +330,22 @@ impl Renderer {
     pub fn render_egui(
         &mut self,
         context: &egui::Context,
-        output: egui::FullOutput,
+        mut output: egui::FullOutput,
     ) -> Result<RenderOutcome, RenderError> {
+        self.pending_egui_deltas
+            .append(std::mem::take(&mut output.textures_delta));
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(RenderOutcome::WaitForVisibility);
+        }
+        // The egui renderer remains valid across recoverable surface work, so
+        // uploads are safe before acquisition. This ensures a Timeout/Lost does
+        // not drop the already-taken delta from `run_ui`.
+        let mut deltas_to_apply = self.pending_egui_deltas.take_sets();
+        for (texture_id, deltas) in std::mem::take(&mut deltas_to_apply.set) {
+            for delta in deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, texture_id, &delta);
+            }
         }
         let (frame, post_present_recovery) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => {
@@ -320,15 +370,6 @@ impl Renderer {
                 return self.handle_acquire_without_frame(SurfaceAcquireOutcome::Validation);
             }
         };
-        // Do not mutate egui's texture cache until a frame is actually owned.
-        // Recovery errors before acquisition therefore cannot write resources we
-        // would immediately abandon.
-        for (texture_id, deltas) in &output.textures_delta.set {
-            for delta in deltas {
-                self.egui_renderer
-                    .update_texture(&self.device, &self.queue, *texture_id, delta);
-            }
-        }
         let paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
         let screen = ScreenDescriptor {
             size_in_pixels: [self.size.width, self.size.height],
@@ -383,22 +424,24 @@ impl Renderer {
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
-        for texture_id in &output.textures_delta.free {
-            self.egui_renderer.free_texture(texture_id);
-        }
-        match post_present_recovery {
+        let recovery_result = match post_present_recovery {
             Some(decision) => {
                 let queue = self.queue.clone();
                 let executor = self.recovery_executor;
-                let execution = executor
-                    .execute_post_present(decision, move || queue.present(frame), self)
-                    .map_err(|error: RenderError| error)?;
-                Ok(Self::outcome_from_recovery(execution))
+                executor.execute_post_present(decision, move || queue.present(frame), self)
             }
             None => {
                 self.queue.present(frame);
-                Ok(RenderOutcome::Rendered)
+                Ok(super::RecoveryExecution::RetryAfter(Duration::ZERO))
             }
+        };
+        self.pending_egui_deltas
+            .free_after_present(|texture_id| self.egui_renderer.free_texture(&texture_id));
+        let execution = recovery_result.map_err(|error: RenderError| error)?;
+        if post_present_recovery.is_some() {
+            Ok(Self::outcome_from_recovery(execution))
+        } else {
+            Ok(RenderOutcome::Rendered)
         }
     }
 
@@ -510,15 +553,7 @@ impl Renderer {
             return Err(RenderError::new("surface_config_dimensions_invalid"));
         }
         let capabilities = self.surface.get_capabilities(&self.adapter);
-        if !capabilities.formats.contains(&self.config.format) {
-            return Err(RenderError::new("surface_format_changed"));
-        }
-        if !capabilities
-            .present_modes
-            .contains(&self.config.present_mode)
-        {
-            return Err(RenderError::new("surface_present_mode_unavailable"));
-        }
+        self.config = Self::refreshed_surface_configuration(&self.config, &capabilities)?;
         self.surface.configure(&self.device, &self.config);
         self.runtime_policy.mark_surface_available();
         self.update_viewport_uniform();
@@ -552,7 +587,32 @@ impl Renderer {
                 .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
         };
+        let config = Self::refreshed_surface_configuration(&config, &capabilities)?;
         Ok((config, surface_format))
+    }
+
+    fn refreshed_surface_configuration(
+        current: &wgpu::SurfaceConfiguration,
+        capabilities: &wgpu::SurfaceCapabilities,
+    ) -> Result<wgpu::SurfaceConfiguration, RenderError> {
+        if !capabilities.formats.contains(&current.format) {
+            return Err(RenderError::new("surface_format_changed"));
+        }
+        if !capabilities.usages.contains(current.usage) {
+            return Err(RenderError::new("surface_usage_unavailable"));
+        }
+        if !capabilities.present_modes.contains(&current.present_mode) {
+            return Err(RenderError::new("surface_present_mode_unavailable"));
+        }
+        let mut config = current.clone();
+        if !capabilities.alpha_modes.contains(&config.alpha_mode) {
+            config.alpha_mode = capabilities
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+        }
+        Ok(config)
     }
 
     fn create_remote_pipeline(
@@ -654,3 +714,100 @@ impl fmt::Display for RenderError {
 }
 
 impl Error for RenderError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_egui_deltas_survive_timeout_and_release_only_after_present() {
+        let mut pending = PendingEguiTextureDeltas::default();
+        let context = egui::Context::default();
+        let first = context.run_ui(Default::default(), |ui| {
+            ui.label("font texture must be uploaded once");
+        });
+        let texture_id = *first
+            .textures_delta
+            .set
+            .keys()
+            .next()
+            .expect("first egui frame publishes a font texture delta");
+        pending.append(first.textures_delta);
+
+        // `run_ui` has already transferred the font upload to the integration.
+        // The production renderer applies it before acquire, so a subsequent
+        // Timeout/Lost cannot make the next successful frame miss the font.
+        assert_eq!(pending.pending_set_count(), 1);
+        assert!(pending.pending_free_is_empty());
+
+        let mut operations = Vec::new();
+        let mut sets = pending.take_sets();
+        for (id, deltas) in std::mem::take(&mut sets.set) {
+            for _ in deltas {
+                operations.push(("set", id));
+            }
+        }
+        assert_eq!(operations, [("set", texture_id)]);
+        assert!(pending.pending_free_is_empty());
+
+        operations.push(("timeout", texture_id));
+        operations.push(("lost", texture_id));
+        operations.push(("present", texture_id));
+        let mut second = egui::TexturesDelta::default();
+        second.free.insert(texture_id);
+        pending.append(second);
+        let second_sets = pending.take_sets();
+        assert!(second_sets.set.is_empty());
+        operations.push(("present", texture_id));
+        assert!(!pending.pending_free_is_empty());
+        pending.free_after_present(|id| operations.push(("free", id)));
+        assert_eq!(
+            operations,
+            [
+                ("set", texture_id),
+                ("timeout", texture_id),
+                ("lost", texture_id),
+                ("present", texture_id),
+                ("present", texture_id),
+                ("free", texture_id)
+            ]
+        );
+        assert!(pending.pending_free_is_empty());
+    }
+
+    #[test]
+    fn refreshed_capabilities_preserve_format_and_refresh_alpha() {
+        let mut config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: 16,
+            height: 16,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 1,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+        let capabilities = wgpu::SurfaceCapabilities {
+            formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
+            format_capabilities: vec![],
+            present_modes: vec![wgpu::PresentMode::Fifo],
+            alpha_modes: vec![wgpu::CompositeAlphaMode::PreMultiplied],
+            usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        };
+        config = Renderer::refreshed_surface_configuration(&config, &capabilities).unwrap();
+        assert_eq!(config.format, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(config.alpha_mode, wgpu::CompositeAlphaMode::PreMultiplied);
+
+        let changed_format = wgpu::SurfaceCapabilities {
+            formats: vec![wgpu::TextureFormat::Rgba8UnormSrgb],
+            ..capabilities
+        };
+        assert_eq!(
+            Renderer::refreshed_surface_configuration(&config, &changed_format)
+                .unwrap_err()
+                .code(),
+            "surface_format_changed"
+        );
+    }
+}

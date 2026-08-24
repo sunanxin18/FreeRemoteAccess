@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
@@ -73,6 +74,90 @@ enum DesktopEvent {
     Repaint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceAcquireSchedule {
+    Acquire,
+    WaitUntil(Instant),
+    WaitForVisibility,
+}
+
+/// This is the production gate in front of `Renderer::render_egui`, not merely
+/// an event-loop hint. It prevents unrelated session, input, or egui wakes from
+/// acquiring a surface before the recovery deadline.
+#[derive(Debug, Default)]
+struct SurfaceAcquireScheduler {
+    retry_not_before: Option<Instant>,
+    pending_repaint: bool,
+    waiting_for_visibility: bool,
+}
+
+impl SurfaceAcquireScheduler {
+    fn schedule_retry(&mut self, deadline: Instant) {
+        self.retry_not_before = Some(deadline);
+        self.pending_repaint = true;
+    }
+
+    fn wait_for_visibility(&mut self) {
+        self.waiting_for_visibility = true;
+        self.pending_repaint = true;
+    }
+
+    fn on_successful_render(&mut self) {
+        self.retry_not_before = None;
+        self.pending_repaint = false;
+        self.waiting_for_visibility = false;
+    }
+
+    fn on_external_wake(&mut self) -> SurfaceAcquireSchedule {
+        self.pending_repaint = true;
+        self.current_schedule()
+    }
+
+    fn on_redraw_requested(&mut self, _now: Instant) -> SurfaceAcquireSchedule {
+        if let Some(deadline) = self.retry_not_before {
+            self.pending_repaint = true;
+            return SurfaceAcquireSchedule::WaitUntil(deadline);
+        }
+        if self.waiting_for_visibility {
+            self.pending_repaint = true;
+            return SurfaceAcquireSchedule::WaitForVisibility;
+        }
+        self.pending_repaint = false;
+        SurfaceAcquireSchedule::Acquire
+    }
+
+    fn on_resume_time_reached(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.retry_not_before else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.retry_not_before = None;
+        if self.waiting_for_visibility || !self.pending_repaint {
+            return false;
+        }
+        self.pending_repaint = false;
+        true
+    }
+
+    fn on_visibility_restored(&mut self) -> SurfaceAcquireSchedule {
+        self.waiting_for_visibility = false;
+        self.pending_repaint = true;
+        self.current_schedule()
+    }
+
+    fn current_schedule(&self) -> SurfaceAcquireSchedule {
+        if let Some(deadline) = self.retry_not_before {
+            SurfaceAcquireSchedule::WaitUntil(deadline)
+        } else if self.waiting_for_visibility {
+            SurfaceAcquireSchedule::WaitForVisibility
+        } else {
+            SurfaceAcquireSchedule::Acquire
+        }
+    }
+}
+
 struct EventLoopWake {
     proxy: winit::event_loop::EventLoopProxy<DesktopEvent>,
 }
@@ -100,6 +185,7 @@ struct DesktopApplication {
     cursor_position: Option<(f64, f64)>,
     disconnect_requested: bool,
     gpu_failure_latch: GpuFailureGate,
+    surface_scheduler: SurfaceAcquireScheduler,
 }
 
 impl DesktopApplication {
@@ -119,6 +205,7 @@ impl DesktopApplication {
             cursor_position: None,
             disconnect_requested: false,
             gpu_failure_latch: GpuFailureGate::default(),
+            surface_scheduler: SurfaceAcquireScheduler::default(),
         }
     }
 
@@ -150,6 +237,13 @@ impl DesktopApplication {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_session_events(event_loop);
+        match self.surface_scheduler.on_redraw_requested(Instant::now()) {
+            SurfaceAcquireSchedule::Acquire => {}
+            schedule => {
+                self.apply_surface_schedule(event_loop, schedule);
+                return;
+            }
+        }
         let Some(host) = self.host.as_ref() else {
             return;
         };
@@ -216,9 +310,18 @@ impl DesktopApplication {
         if let Some(result) = render_result {
             match result {
                 Ok(RenderOutcome::RetryAt(deadline)) => {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    self.surface_scheduler.schedule_retry(deadline);
+                    self.apply_surface_schedule(
+                        event_loop,
+                        SurfaceAcquireSchedule::WaitUntil(deadline),
+                    );
                 }
-                Ok(RenderOutcome::Rendered | RenderOutcome::WaitForVisibility) => {
+                Ok(RenderOutcome::Rendered) => {
+                    self.surface_scheduler.on_successful_render();
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
+                Ok(RenderOutcome::WaitForVisibility) => {
+                    self.surface_scheduler.wait_for_visibility();
                     event_loop.set_control_flow(ControlFlow::Wait);
                 }
                 Err(_) if self.gpu_failure_latch.blocks_session_progress() => {}
@@ -260,6 +363,31 @@ impl DesktopApplication {
                 width: size.width,
                 height: size.height,
             });
+        }
+    }
+
+    fn schedule_repaint(&mut self, event_loop: &ActiveEventLoop) {
+        let schedule = self.surface_scheduler.on_external_wake();
+        self.apply_surface_schedule(event_loop, schedule);
+    }
+
+    fn apply_surface_schedule(
+        &self,
+        event_loop: &ActiveEventLoop,
+        schedule: SurfaceAcquireSchedule,
+    ) {
+        match schedule {
+            SurfaceAcquireSchedule::Acquire => {
+                if let Some(host) = &self.host {
+                    host.window().request_redraw();
+                }
+            }
+            SurfaceAcquireSchedule::WaitUntil(deadline) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            }
+            SurfaceAcquireSchedule::WaitForVisibility => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         }
     }
 
@@ -531,10 +659,16 @@ fn command_failure_requires_disconnect(error: SessionError) -> bool {
 }
 
 impl ApplicationHandler<DesktopEvent> for DesktopApplication {
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            if let Some(host) = &self.host {
-                host.window().request_redraw();
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached {
+            requested_resume, ..
+        } = cause
+        {
+            if self
+                .surface_scheduler
+                .on_resume_time_reached(requested_resume)
+            {
+                self.apply_surface_schedule(event_loop, SurfaceAcquireSchedule::Acquire);
             }
         }
     }
@@ -548,9 +682,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApplication {
             }
         }
         event_loop.set_control_flow(ControlFlow::Wait);
-        if let Some(host) = &self.host {
-            host.window().request_redraw();
-        }
+        self.schedule_repaint(event_loop);
     }
 
     fn window_event(
@@ -571,7 +703,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApplication {
             let response = state.on_window_event(host.window(), &event);
             consumed = response.consumed;
             if response.repaint {
-                host.window().request_redraw();
+                self.schedule_repaint(event_loop);
             }
         }
         self.handle_remote_input(&window, &event, consumed);
@@ -579,22 +711,23 @@ impl ApplicationHandler<DesktopEvent> for DesktopApplication {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.resize(size);
-                window.request_redraw();
+                self.schedule_repaint(event_loop);
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 self.resize(window.inner_size());
-                window.request_redraw();
+                self.schedule_repaint(event_loop);
             }
-            WindowEvent::Occluded(false) => window.request_redraw(),
+            WindowEvent::Occluded(false) => {
+                let schedule = self.surface_scheduler.on_visibility_restored();
+                self.apply_surface_schedule(event_loop, schedule);
+            }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: DesktopEvent) {
-        if let Some(host) = &self.host {
-            host.window().request_redraw();
-        }
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: DesktopEvent) {
+        self.schedule_repaint(event_loop);
     }
 }
 
@@ -689,7 +822,11 @@ impl Error for DesktopError {}
 
 #[cfg(test)]
 mod tests {
-    use super::command_failure_requires_disconnect;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        command_failure_requires_disconnect, SurfaceAcquireSchedule, SurfaceAcquireScheduler,
+    };
     use crate::session::SessionError;
 
     #[test]
@@ -703,5 +840,36 @@ mod tests {
         assert!(!command_failure_requires_disconnect(SessionError::new(
             "session_not_running"
         )));
+    }
+
+    #[test]
+    fn recovery_deadline_blocks_early_wakes_and_retries_once_at_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(50);
+        let mut scheduler = SurfaceAcquireScheduler::default();
+        scheduler.schedule_retry(deadline);
+
+        assert_eq!(
+            scheduler.on_external_wake(),
+            SurfaceAcquireSchedule::WaitUntil(deadline)
+        );
+        assert_eq!(
+            scheduler.on_redraw_requested(now),
+            SurfaceAcquireSchedule::WaitUntil(deadline)
+        );
+        assert!(!scheduler.on_resume_time_reached(now));
+        assert!(scheduler.on_resume_time_reached(deadline));
+        assert!(!scheduler.on_resume_time_reached(deadline));
+        assert_eq!(
+            scheduler.on_redraw_requested(deadline),
+            SurfaceAcquireSchedule::Acquire
+        );
+
+        scheduler.schedule_retry(deadline);
+        scheduler.on_successful_render();
+        assert_eq!(
+            scheduler.on_redraw_requested(now),
+            SurfaceAcquireSchedule::Acquire
+        );
     }
 }
