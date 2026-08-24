@@ -156,6 +156,14 @@ struct GuaranteedDisconnectAdapter {
     received: Sender<SessionCommand>,
 }
 
+struct TerminalThenBlockAdapter {
+    terminal: SessionEvent,
+    emitted: Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+struct ReturnImmediatelyAdapter;
+
 impl ProtocolAdapter for GuaranteedDisconnectAdapter {
     fn run(
         self: Box<Self>,
@@ -174,6 +182,35 @@ impl ProtocolAdapter for GuaranteedDisconnectAdapter {
                 freeremotedesk::session::SessionError::new("test_command_channel_closed")
             })?)
             .map_err(|_| freeremotedesk::session::SessionError::new("test_received_closed"))
+    }
+}
+
+impl ProtocolAdapter for TerminalThenBlockAdapter {
+    fn run(
+        self: Box<Self>,
+        _context: ProtocolContext,
+        _commands: Receiver<SessionCommand>,
+        events: freeremotedesk::session::SessionEventSink,
+    ) -> Result<(), freeremotedesk::session::SessionError> {
+        events.emit(self.terminal)?;
+        self.emitted.send(()).map_err(|_| {
+            freeremotedesk::session::SessionError::new("test_adapter_signal_closed")
+        })?;
+        self.release.recv().map_err(|_| {
+            freeremotedesk::session::SessionError::new("test_adapter_release_closed")
+        })?;
+        Ok(())
+    }
+}
+
+impl ProtocolAdapter for ReturnImmediatelyAdapter {
+    fn run(
+        self: Box<Self>,
+        _context: ProtocolContext,
+        _commands: Receiver<SessionCommand>,
+        _events: freeremotedesk::session::SessionEventSink,
+    ) -> Result<(), freeremotedesk::session::SessionError> {
+        Ok(())
     }
 }
 
@@ -595,6 +632,82 @@ fn disconnect_evicts_queued_input_and_closes_command_admission() {
             .recv_timeout(Duration::from_secs(1))
             .unwrap(),
         SessionCommand::Disconnect
+    );
+    engine.join().unwrap();
+}
+
+#[test]
+fn terminal_event_closes_all_normal_command_admission_before_worker_return() {
+    for terminal in [
+        SessionEvent::Failed {
+            code: "adapter_failed",
+        },
+        SessionEvent::Disconnected,
+    ] {
+        let (wake_sender, _wake_receiver) = crossbeam_channel::unbounded();
+        let (emitted_sender, emitted_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = mpsc::channel();
+        let engine = SessionEngine::spawn_with_mailbox_limits(
+            Box::new(TerminalThenBlockAdapter {
+                terminal,
+                emitted: emitted_sender,
+                release: release_receiver,
+            }),
+            ProtocolContext::new(test_connection()),
+            Arc::new(TestWake {
+                notifications: wake_sender,
+            }),
+            SessionMailboxLimits::new(8, 8, 8, 64).unwrap(),
+        )
+        .unwrap();
+
+        emitted_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        for command in [
+            SessionCommand::Pointer {
+                x: 1,
+                y: 1,
+                buttons: 0,
+            },
+            SessionCommand::Key {
+                physical_code: Some(1),
+                keysym: None,
+                pressed: false,
+            },
+            SessionCommand::Resize {
+                width: 2,
+                height: 2,
+            },
+        ] {
+            assert_eq!(
+                engine.send(command).unwrap_err().code(),
+                "session_command_closing"
+            );
+        }
+
+        release_sender.send(()).unwrap();
+        engine.join().unwrap();
+    }
+}
+
+#[test]
+fn worker_completion_wakes_waiting_ui_after_clean_return() {
+    let (wake_sender, wake_receiver) = crossbeam_channel::bounded(1);
+    let engine = SessionEngine::spawn_with_mailbox_limits(
+        Box::new(ReturnImmediatelyAdapter),
+        ProtocolContext::new(test_connection()),
+        Arc::new(TestWake {
+            notifications: wake_sender,
+        }),
+        SessionMailboxLimits::new(8, 8, 8, 64).unwrap(),
+    )
+    .unwrap();
+
+    wake_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        engine.try_next_event().unwrap_err().code(),
+        "session_event_channel_closed"
     );
     engine.join().unwrap();
 }

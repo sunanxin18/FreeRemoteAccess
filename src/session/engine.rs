@@ -124,20 +124,41 @@ impl SessionMailboxLimits {
     }
 }
 
+#[derive(Default)]
+struct CommandMailboxState {
+    closing: bool,
+}
+
 #[derive(Clone)]
 pub struct SessionEventSink {
     mailbox: Arc<Mutex<SessionEventMailbox>>,
+    command_state: Arc<Mutex<CommandMailboxState>>,
     wake: Arc<dyn UiWakeHandle>,
 }
 
 impl SessionEventSink {
     pub fn emit(&self, event: SessionEvent) -> Result<(), SessionError> {
-        let outcome = self
-            .mailbox
-            .lock()
-            .map_err(|_| SessionError::new("session_mailbox_poisoned"))?
-            .push(event)
-            .map_err(|error| SessionError::new(error.code()))?;
+        let outcome = if is_terminal_event(&event) {
+            // Lock order is command_state -> mailbox. SessionEngine::send never locks mailbox.
+            let mut command_state = self
+                .command_state
+                .lock()
+                .map_err(|_| SessionError::new("session_command_mailbox_poisoned"))?;
+            let outcome = self
+                .mailbox
+                .lock()
+                .map_err(|_| SessionError::new("session_mailbox_poisoned"))?
+                .push(event)
+                .map_err(|error| SessionError::new(error.code()))?;
+            command_state.closing = true;
+            outcome
+        } else {
+            self.mailbox
+                .lock()
+                .map_err(|_| SessionError::new("session_mailbox_poisoned"))?
+                .push(event)
+                .map_err(|error| SessionError::new(error.code()))?
+        };
         if outcome == QueuePushOutcome::Queued {
             self.wake.wake()?;
         }
@@ -145,23 +166,29 @@ impl SessionEventSink {
     }
 }
 
-struct WorkerCompletion(Arc<AtomicBool>);
+fn is_terminal_event(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::Disconnected | SessionEvent::Failed { .. }
+    )
+}
+
+struct WorkerCompletion {
+    finished: Arc<AtomicBool>,
+    wake: Arc<dyn UiWakeHandle>,
+}
 
 impl Drop for WorkerCompletion {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.finished.store(true, Ordering::Release);
+        let _ = self.wake.wake();
     }
-}
-
-#[derive(Default)]
-struct CommandMailboxState {
-    closing: bool,
 }
 
 pub struct SessionEngine {
     commands: Sender<SessionCommand>,
     command_receiver: Receiver<SessionCommand>,
-    command_state: Mutex<CommandMailboxState>,
+    command_state: Arc<Mutex<CommandMailboxState>>,
     mailbox: Arc<Mutex<SessionEventMailbox>>,
     worker_finished: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -193,17 +220,22 @@ impl SessionEngine {
             SessionEventMailbox::with_limits(limits.event_capacity, limits.render_byte_budget)
                 .map_err(|error| SessionError::new(error.code()))?,
         ));
+        let command_state = Arc::new(Mutex::new(CommandMailboxState::default()));
         let sink = SessionEventSink {
             mailbox: Arc::clone(&mailbox),
-            wake,
+            command_state: Arc::clone(&command_state),
+            wake: Arc::clone(&wake),
         };
         let failure_sink = sink.clone();
         let worker_finished = Arc::new(AtomicBool::new(false));
-        let completion = Arc::clone(&worker_finished);
+        let completion = WorkerCompletion {
+            finished: Arc::clone(&worker_finished),
+            wake,
+        };
         let worker = thread::Builder::new()
             .name("freeremote-protocol".to_owned())
             .spawn(move || {
-                let _completion = WorkerCompletion(completion);
+                let _completion = completion;
                 if let Err(error) = adapter.run(context, command_receiver, sink) {
                     let _ = failure_sink.emit(SessionEvent::Failed { code: error.code() });
                 }
@@ -213,7 +245,7 @@ impl SessionEngine {
         Ok(Self {
             commands: command_sender,
             command_receiver: engine_command_receiver,
-            command_state: Mutex::new(CommandMailboxState::default()),
+            command_state,
             mailbox,
             worker_finished,
             worker: Some(worker),

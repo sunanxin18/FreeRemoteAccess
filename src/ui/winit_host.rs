@@ -241,6 +241,10 @@ impl DesktopApplication {
     }
 
     fn start_session(&mut self, connection: crate::app::connection::ValidatedConnection) {
+        if self.session_engine.is_some() {
+            self.message = Some("现有会话尚未结束".to_owned());
+            return;
+        }
         let protocol = connection.protocol;
         let result = adapter_for(protocol).and_then(|adapter| {
             SessionEngine::spawn(adapter, ProtocolContext::new(connection), self.wake.clone())
