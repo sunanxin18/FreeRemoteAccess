@@ -1,8 +1,20 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, Sender};
+use freeremotedesk::app::connection::{
+    validate_connection, ConnectionRequest, ServiceKind, ValidatedConnection,
+};
 use freeremotedesk::core::{FrameRect, RemotePixelFormat, RenderUpdate};
+use freeremotedesk::protocols::ProtocolAdapter;
 use freeremotedesk::session::{
     backpressure::RenderUpdateQueue,
-    engine::{SessionEvent, SessionModel, SessionPhase},
+    engine::{
+        ProtocolContext, SessionCommand, SessionEngine, SessionEvent, SessionMailboxLimits,
+        SessionModel, SessionPhase, UiWakeHandle,
+    },
 };
+use secrecy::SecretString;
 
 fn rect_update(generation: u64, byte_len: usize) -> RenderUpdate {
     assert_eq!(byte_len % 4, 0);
@@ -15,6 +27,126 @@ fn rect_update(generation: u64, byte_len: usize) -> RenderUpdate {
         vec![0; byte_len].into_boxed_slice(),
     )
     .unwrap()
+}
+
+fn test_connection() -> ValidatedConnection {
+    validate_connection(ConnectionRequest {
+        service: ServiceKind::LinuxVnc,
+        host: "render-budget.example".to_owned(),
+        port: None,
+        username: "desktop-user".to_owned(),
+        password: SecretString::from("test-secret".to_owned()),
+        domain: None,
+    })
+    .unwrap()
+}
+
+#[derive(Debug)]
+struct TestWake {
+    notifications: Sender<()>,
+}
+
+impl UiWakeHandle for TestWake {
+    fn wake(&self) -> Result<(), freeremotedesk::session::SessionError> {
+        self.notifications
+            .send(())
+            .map_err(|_| freeremotedesk::session::SessionError::new("test_wake_closed"))?;
+        Ok(())
+    }
+}
+
+struct ByteBudgetAdapter {
+    render_burst_finished: Sender<()>,
+}
+
+impl ProtocolAdapter for ByteBudgetAdapter {
+    fn run(
+        self: Box<Self>,
+        _context: ProtocolContext,
+        _commands: Receiver<SessionCommand>,
+        events: freeremotedesk::session::SessionEventSink,
+    ) -> Result<(), freeremotedesk::session::SessionError> {
+        events.emit(SessionEvent::Connecting)?;
+        events.emit(SessionEvent::SurfaceReset {
+            generation: 1,
+            width: 4,
+            height: 1,
+            format: RemotePixelFormat::Bgra8Srgb,
+        })?;
+        events.emit(SessionEvent::Render(
+            RenderUpdate::reset(1, 4, 1, RemotePixelFormat::Bgra8Srgb).unwrap(),
+        ))?;
+        events.emit(SessionEvent::Connected { generation: 1 })?;
+        events.emit(SessionEvent::Render(rect_update(1, 8)))?;
+        events.emit(SessionEvent::Render(rect_update(1, 8)))?;
+        let error = events
+            .emit(SessionEvent::Render(rect_update(1, 4)))
+            .unwrap_err();
+        self.render_burst_finished.send(()).map_err(|_| {
+            freeremotedesk::session::SessionError::new("test_adapter_signal_closed")
+        })?;
+        Err(error)
+    }
+}
+
+#[test]
+fn engine_fails_closed_when_adapter_render_bytes_exceed_aggregate_budget() {
+    let (wake_sender, wake_receiver) = crossbeam_channel::unbounded();
+    let (burst_sender, burst_receiver) = crossbeam_channel::bounded(1);
+    let engine = SessionEngine::spawn_with_mailbox_limits(
+        Box::new(ByteBudgetAdapter {
+            render_burst_finished: burst_sender,
+        }),
+        ProtocolContext::new(test_connection()),
+        Arc::new(TestWake {
+            notifications: wake_sender,
+        }),
+        SessionMailboxLimits::new(8, 8, 8, 16).unwrap(),
+    )
+    .unwrap();
+
+    burst_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let mut received = Vec::new();
+    loop {
+        match engine.try_next_event() {
+            Ok(Some(event)) => received.push(event),
+            Ok(None) => wake_receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(error) if error.code() == "session_event_channel_closed" => break,
+            Err(error) => panic!("unexpected session error: {error}"),
+        }
+    }
+
+    assert!(matches!(received[0], SessionEvent::Connecting));
+    assert!(matches!(
+        received[1],
+        SessionEvent::SurfaceReset { generation: 1, .. }
+    ));
+    assert!(matches!(
+        received[2],
+        SessionEvent::Render(RenderUpdate::Reset { generation: 1, .. })
+    ));
+    assert!(matches!(
+        received[3],
+        SessionEvent::Connected { generation: 1 }
+    ));
+    assert!(matches!(
+        received[4],
+        SessionEvent::Render(RenderUpdate::DirtyRect { ref pixels, .. }) if pixels.len() == 8
+    ));
+    assert!(matches!(
+        received[5],
+        SessionEvent::Render(RenderUpdate::DirtyRect { ref pixels, .. }) if pixels.len() == 8
+    ));
+    assert!(matches!(
+        received[6],
+        SessionEvent::Failed {
+            code: "render_queue_full"
+        }
+    ));
+    assert_eq!(received.len(), 7);
+
+    engine.join().unwrap();
 }
 
 #[test]

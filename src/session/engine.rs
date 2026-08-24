@@ -1,16 +1,25 @@
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::app::connection::ValidatedConnection;
 use crate::core::{FrameRect, RemotePixelFormat, RemoteSurfaceState, RenderUpdate};
 use crate::protocols::ProtocolAdapter;
+use crate::session::backpressure::{QueuePushOutcome, RenderUpdateQueue};
 
 const DEFAULT_COMMAND_CAPACITY: usize = 256;
-const DEFAULT_EVENT_CAPACITY: usize = 256;
+const DEFAULT_CONTROL_EVENT_CAPACITY: usize = 256;
+const DEFAULT_RENDER_EVENT_CAPACITY: usize = 256;
+const DEFAULT_RENDER_BYTE_BUDGET: usize = 64 * 1024 * 1024 * 4;
+
+#[derive(Debug)]
+enum MailboxEvent {
+    Control(SessionEvent),
+    RenderReady,
+}
 
 #[derive(Debug)]
 pub struct ProtocolContext {
@@ -78,24 +87,106 @@ pub trait UiWakeHandle: Send + Sync + 'static {
     fn wake(&self) -> Result<(), SessionError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionMailboxLimits {
+    command_capacity: usize,
+    control_event_capacity: usize,
+    render_event_capacity: usize,
+    render_byte_budget: usize,
+}
+
+impl SessionMailboxLimits {
+    pub fn new(
+        command_capacity: usize,
+        control_event_capacity: usize,
+        render_event_capacity: usize,
+        render_byte_budget: usize,
+    ) -> Result<Self, SessionError> {
+        if command_capacity == 0 {
+            return Err(SessionError::new("session_command_capacity_invalid"));
+        }
+        if control_event_capacity == 0 {
+            return Err(SessionError::new("session_control_event_capacity_invalid"));
+        }
+        RenderUpdateQueue::with_limits(render_event_capacity, render_byte_budget)
+            .map_err(|error| SessionError::new(error.code()))?;
+        Ok(Self {
+            command_capacity,
+            control_event_capacity,
+            render_event_capacity,
+            render_byte_budget,
+        })
+    }
+
+    fn production_defaults() -> Self {
+        Self::new(
+            DEFAULT_COMMAND_CAPACITY,
+            DEFAULT_CONTROL_EVENT_CAPACITY,
+            DEFAULT_RENDER_EVENT_CAPACITY,
+            DEFAULT_RENDER_BYTE_BUDGET,
+        )
+        .expect("production mailbox limits are valid")
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionEventSink {
-    sender: Sender<SessionEvent>,
+    sender: Sender<MailboxEvent>,
+    render_queue: Arc<Mutex<RenderUpdateQueue>>,
     wake: Arc<dyn UiWakeHandle>,
 }
 
 impl SessionEventSink {
     pub fn emit(&self, event: SessionEvent) -> Result<(), SessionError> {
+        match event {
+            SessionEvent::Render(update) => self.emit_render(update),
+            control_event => self.emit_control(control_event),
+        }
+    }
+
+    fn emit_control(&self, event: SessionEvent) -> Result<(), SessionError> {
         self.sender
-            .send(event)
-            .map_err(|_| SessionError::new("session_event_channel_closed"))?;
+            .try_send(MailboxEvent::Control(event))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SessionError::new("session_event_channel_full"),
+                TrySendError::Disconnected(_) => SessionError::new("session_event_channel_closed"),
+            })?;
         self.wake.wake()
+    }
+
+    fn emit_render(&self, update: RenderUpdate) -> Result<(), SessionError> {
+        let mut queue = self.render_queue.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => SessionError::new("render_queue_busy"),
+            TryLockError::Poisoned(_) => SessionError::new("render_queue_poisoned"),
+        })?;
+        let outcome = queue
+            .push(update)
+            .map_err(|error| SessionError::new(error.code()))?;
+        if outcome == QueuePushOutcome::Queued {
+            self.sender
+                .try_send(MailboxEvent::RenderReady)
+                .map_err(|error| {
+                    let _ = queue.pop_back();
+                    match error {
+                        TrySendError::Full(_) => SessionError::new("session_event_channel_full"),
+                        TrySendError::Disconnected(_) => {
+                            SessionError::new("session_event_channel_closed")
+                        }
+                    }
+                })?;
+        }
+        drop(queue);
+        if outcome == QueuePushOutcome::Queued {
+            self.wake.wake()?;
+        }
+        Ok(())
     }
 }
 
 pub struct SessionEngine {
     commands: Sender<SessionCommand>,
-    events: Receiver<SessionEvent>,
+    events: Receiver<MailboxEvent>,
+    render_queue: Arc<Mutex<RenderUpdateQueue>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -105,10 +196,29 @@ impl SessionEngine {
         context: ProtocolContext,
         wake: Arc<dyn UiWakeHandle>,
     ) -> Result<Self, SessionError> {
-        let (command_sender, command_receiver) = bounded(DEFAULT_COMMAND_CAPACITY);
-        let (event_sender, event_receiver) = bounded(DEFAULT_EVENT_CAPACITY);
+        Self::spawn_with_mailbox_limits(
+            adapter,
+            context,
+            wake,
+            SessionMailboxLimits::production_defaults(),
+        )
+    }
+
+    pub fn spawn_with_mailbox_limits(
+        adapter: Box<dyn ProtocolAdapter>,
+        context: ProtocolContext,
+        wake: Arc<dyn UiWakeHandle>,
+        limits: SessionMailboxLimits,
+    ) -> Result<Self, SessionError> {
+        let (command_sender, command_receiver) = bounded(limits.command_capacity);
+        let (event_sender, event_receiver) = bounded(limits.control_event_capacity);
+        let render_queue = Arc::new(Mutex::new(
+            RenderUpdateQueue::with_limits(limits.render_event_capacity, limits.render_byte_budget)
+                .map_err(|error| SessionError::new(error.code()))?,
+        ));
         let sink = SessionEventSink {
             sender: event_sender,
+            render_queue: Arc::clone(&render_queue),
             wake,
         };
         let failure_sink = sink.clone();
@@ -124,6 +234,7 @@ impl SessionEngine {
         Ok(Self {
             commands: command_sender,
             events: event_receiver,
+            render_queue,
             worker: Some(worker),
         })
     }
@@ -136,12 +247,24 @@ impl SessionEngine {
 
     pub fn try_next_event(&self) -> Result<Option<SessionEvent>, SessionError> {
         match self.events.try_recv() {
-            Ok(event) => Ok(Some(event)),
+            Ok(MailboxEvent::Control(event)) => Ok(Some(event)),
+            Ok(MailboxEvent::RenderReady) => self.take_ready_render(),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 Err(SessionError::new("session_event_channel_closed"))
             }
         }
+    }
+
+    fn take_ready_render(&self) -> Result<Option<SessionEvent>, SessionError> {
+        let mut render_queue = self
+            .render_queue
+            .lock()
+            .map_err(|_| SessionError::new("render_queue_poisoned"))?;
+        let update = render_queue
+            .pop_front()
+            .ok_or_else(|| SessionError::new("render_queue_signal_missing"))?;
+        Ok(Some(SessionEvent::Render(update)))
     }
 
     pub fn join(mut self) -> Result<(), SessionError> {

@@ -34,19 +34,29 @@ impl RenderUpdateQueue {
             return Err(QueueError::new("render_update_exceeds_budget"));
         }
 
-        if matches!(update, RenderUpdate::Present { .. })
-            && self.entries.iter().any(|queued| {
-                matches!(queued, RenderUpdate::Present { .. })
-                    && queued.generation() == update.generation()
-            })
-        {
-            return Ok(QueuePushOutcome::Coalesced);
-        }
-
         if matches!(update, RenderUpdate::Reset { .. }) {
             self.retain_generation_at_least(update.generation());
         } else {
             self.evict_stale_updates(update.generation());
+        }
+
+        if self.entries.iter().any(|queued| match (&update, queued) {
+            (
+                RenderUpdate::Reset { generation, .. },
+                RenderUpdate::Reset {
+                    generation: queued_generation,
+                    ..
+                },
+            )
+            | (
+                RenderUpdate::Present { generation },
+                RenderUpdate::Present {
+                    generation: queued_generation,
+                },
+            ) => generation == queued_generation,
+            _ => false,
+        }) {
+            return Ok(QueuePushOutcome::Coalesced);
         }
 
         if self.entries.len() >= self.max_entries
@@ -62,6 +72,12 @@ impl RenderUpdateQueue {
 
     pub fn pop_front(&mut self) -> Option<RenderUpdate> {
         let update = self.entries.pop_front()?;
+        self.queued_bytes -= update_byte_len(&update);
+        Some(update)
+    }
+
+    pub(crate) fn pop_back(&mut self) -> Option<RenderUpdate> {
+        let update = self.entries.pop_back()?;
         self.queued_bytes -= update_byte_len(&update);
         Some(update)
     }
