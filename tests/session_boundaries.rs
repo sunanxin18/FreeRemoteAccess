@@ -150,6 +150,33 @@ struct CommandBackpressureAdapter {
     release: mpsc::Receiver<()>,
 }
 
+struct GuaranteedDisconnectAdapter {
+    ready: Sender<()>,
+    release: mpsc::Receiver<()>,
+    received: Sender<SessionCommand>,
+}
+
+impl ProtocolAdapter for GuaranteedDisconnectAdapter {
+    fn run(
+        self: Box<Self>,
+        _context: ProtocolContext,
+        commands: Receiver<SessionCommand>,
+        _events: freeremotedesk::session::SessionEventSink,
+    ) -> Result<(), freeremotedesk::session::SessionError> {
+        self.ready.send(()).map_err(|_| {
+            freeremotedesk::session::SessionError::new("test_adapter_signal_closed")
+        })?;
+        self.release.recv().map_err(|_| {
+            freeremotedesk::session::SessionError::new("test_adapter_release_closed")
+        })?;
+        self.received
+            .send(commands.recv().map_err(|_| {
+                freeremotedesk::session::SessionError::new("test_command_channel_closed")
+            })?)
+            .map_err(|_| freeremotedesk::session::SessionError::new("test_received_closed"))
+    }
+}
+
 impl ProtocolAdapter for CommandBackpressureAdapter {
     fn run(
         self: Box<Self>,
@@ -518,6 +545,57 @@ fn full_command_mailbox_returns_without_blocking_high_frequency_input() {
         assert_eq!(error.code(), "session_command_channel_full");
     });
 
+    engine.join().unwrap();
+}
+
+#[test]
+fn disconnect_evicts_queued_input_and_closes_command_admission() {
+    let (wake_sender, _wake_receiver) = crossbeam_channel::unbounded();
+    let (ready_sender, ready_receiver) = crossbeam_channel::bounded(1);
+    let (release_sender, release_receiver) = mpsc::channel();
+    let (received_sender, received_receiver) = crossbeam_channel::bounded(1);
+    let engine = SessionEngine::spawn_with_mailbox_limits(
+        Box::new(GuaranteedDisconnectAdapter {
+            ready: ready_sender,
+            release: release_receiver,
+            received: received_sender,
+        }),
+        ProtocolContext::new(test_connection()),
+        Arc::new(TestWake {
+            notifications: wake_sender,
+        }),
+        SessionMailboxLimits::new(1, 8, 8, 64).unwrap(),
+    )
+    .unwrap();
+    ready_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    engine
+        .send(SessionCommand::Pointer {
+            x: 1,
+            y: 1,
+            buttons: 1,
+        })
+        .unwrap();
+    engine.send(SessionCommand::Disconnect).unwrap();
+    assert_eq!(
+        engine
+            .send(SessionCommand::Key {
+                physical_code: Some(1),
+                keysym: None,
+                pressed: false,
+            })
+            .unwrap_err()
+            .code(),
+        "session_command_closing"
+    );
+
+    release_sender.send(()).unwrap();
+    assert_eq!(
+        received_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap(),
+        SessionCommand::Disconnect
+    );
     engine.join().unwrap();
 }
 

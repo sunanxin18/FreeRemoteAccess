@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{bounded, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::app::connection::ValidatedConnection;
 use crate::core::{FrameRect, RemotePixelFormat, RemoteSurfaceState, RenderUpdate};
@@ -153,8 +153,15 @@ impl Drop for WorkerCompletion {
     }
 }
 
+#[derive(Default)]
+struct CommandMailboxState {
+    closing: bool,
+}
+
 pub struct SessionEngine {
     commands: Sender<SessionCommand>,
+    command_receiver: Receiver<SessionCommand>,
+    command_state: Mutex<CommandMailboxState>,
     mailbox: Arc<Mutex<SessionEventMailbox>>,
     worker_finished: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -181,6 +188,7 @@ impl SessionEngine {
         limits: SessionMailboxLimits,
     ) -> Result<Self, SessionError> {
         let (command_sender, command_receiver) = bounded(limits.command_capacity);
+        let engine_command_receiver = command_receiver.clone();
         let mailbox = Arc::new(Mutex::new(
             SessionEventMailbox::with_limits(limits.event_capacity, limits.render_byte_budget)
                 .map_err(|error| SessionError::new(error.code()))?,
@@ -204,6 +212,8 @@ impl SessionEngine {
 
         Ok(Self {
             commands: command_sender,
+            command_receiver: engine_command_receiver,
+            command_state: Mutex::new(CommandMailboxState::default()),
             mailbox,
             worker_finished,
             worker: Some(worker),
@@ -211,14 +221,44 @@ impl SessionEngine {
     }
 
     pub fn send(&self, command: SessionCommand) -> Result<(), SessionError> {
-        self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => SessionError::new("session_command_channel_full"),
-                TrySendError::Disconnected(_) => {
-                    SessionError::new("session_command_channel_closed")
+        if self.worker_finished.load(Ordering::Acquire) {
+            return Err(SessionError::new("session_command_channel_closed"));
+        }
+        let mut state = self
+            .command_state
+            .lock()
+            .map_err(|_| SessionError::new("session_command_mailbox_poisoned"))?;
+        if !matches!(command, SessionCommand::Disconnect) {
+            if state.closing {
+                return Err(SessionError::new("session_command_closing"));
+            }
+            return self
+                .commands
+                .try_send(command)
+                .map_err(|error| match error {
+                    TrySendError::Full(_) => SessionError::new("session_command_channel_full"),
+                    TrySendError::Disconnected(_) => {
+                        SessionError::new("session_command_channel_closed")
+                    }
+                });
+        }
+
+        state.closing = true;
+        loop {
+            match self.commands.try_send(SessionCommand::Disconnect) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(SessionError::new("session_command_channel_closed"));
                 }
-            })
+                Err(TrySendError::Full(_)) => match self.command_receiver.try_recv() {
+                    Ok(_) => continue,
+                    Err(TryRecvError::Empty) => std::thread::yield_now(),
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(SessionError::new("session_command_channel_closed"));
+                    }
+                },
+            }
+        }
     }
 
     pub fn try_next_event(&self) -> Result<Option<SessionEvent>, SessionError> {

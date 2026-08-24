@@ -11,6 +11,7 @@ use crate::app::connection::ProtocolKind;
 use crate::session::{ProtocolContext, SessionCommand, SessionError, SessionEventSink};
 
 pub trait ProtocolAdapter: Send + 'static {
+    /// `run` 返回前必须停止并丢弃全部 `SessionEventSink` 克隆，避免会话完成后继续生产事件。
     fn run(
         self: Box<Self>,
         context: ProtocolContext,

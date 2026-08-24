@@ -36,9 +36,9 @@ impl RenderUpdateQueue {
         }
 
         if matches!(update, RenderUpdate::Reset { .. }) {
-            self.retain_generation_at_least(update.generation());
+            self.retain_generation_at_least(update.generation())?;
         } else {
-            self.evict_stale_updates(update.generation());
+            self.evict_stale_updates(update.generation())?;
         }
 
         if self.entries.iter().any(|queued| match (&update, queued) {
@@ -60,13 +60,16 @@ impl RenderUpdateQueue {
             return Ok(QueuePushOutcome::Coalesced);
         }
 
-        if self.entries.len() >= self.max_entries
-            || self.queued_bytes.saturating_add(update_bytes) > self.max_bytes
-        {
+        let queued_after = checked_byte_add(
+            self.queued_bytes,
+            update_bytes,
+            "render_queue_byte_accounting_overflow",
+        )?;
+        if self.entries.len() >= self.max_entries || queued_after > self.max_bytes {
             return Err(QueueError::new("render_queue_full"));
         }
 
-        self.queued_bytes += update_bytes;
+        self.queued_bytes = queued_after;
         self.entries.push_back(update);
         Ok(QueuePushOutcome::Queued)
     }
@@ -93,21 +96,38 @@ impl RenderUpdateQueue {
         self.queued_bytes
     }
 
-    fn retain_generation_at_least(&mut self, generation: u64) {
+    fn retain_generation_at_least(&mut self, generation: u64) -> Result<(), QueueError> {
         self.entries
             .retain(|queued| queued.generation() >= generation);
-        self.recalculate_bytes();
+        self.recalculate_bytes()
     }
 
-    fn evict_stale_updates(&mut self, generation: u64) {
+    fn evict_stale_updates(&mut self, generation: u64) -> Result<(), QueueError> {
         self.entries
             .retain(|queued| queued.generation() >= generation);
-        self.recalculate_bytes();
+        self.recalculate_bytes()
     }
 
-    fn recalculate_bytes(&mut self) {
-        self.queued_bytes = self.entries.iter().map(update_byte_len).sum();
+    fn recalculate_bytes(&mut self) -> Result<(), QueueError> {
+        self.queued_bytes = self.entries.iter().try_fold(0usize, |total, update| {
+            checked_byte_add(
+                total,
+                update_byte_len(update),
+                "render_queue_byte_accounting_overflow",
+            )
+        })?;
+        Ok(())
     }
+}
+
+fn checked_byte_add(
+    total: usize,
+    additional: usize,
+    overflow_code: &'static str,
+) -> Result<usize, QueueError> {
+    total
+        .checked_add(additional)
+        .ok_or_else(|| QueueError::new(overflow_code))
 }
 
 #[derive(Debug)]
@@ -173,13 +193,23 @@ impl SessionEventMailbox {
             .entries
             .iter()
             .filter(|queued| !is_stale_render(queued, stale_generation))
-            .map(event_byte_len)
-            .sum::<usize>();
+            .try_fold(0usize, |total, queued| {
+                checked_byte_add(
+                    total,
+                    event_byte_len(queued),
+                    "session_event_byte_accounting_overflow",
+                )
+            })?;
 
         if !coalesces && retained_count >= self.max_entries {
             return Err(QueueError::new("session_event_channel_full"));
         }
-        if !coalesces && retained_bytes.saturating_add(event_bytes) > self.max_bytes {
+        let queued_after = checked_byte_add(
+            retained_bytes,
+            event_bytes,
+            "session_event_byte_accounting_overflow",
+        )?;
+        if !coalesces && queued_after > self.max_bytes {
             return Err(QueueError::new("render_queue_full"));
         }
 
@@ -192,7 +222,7 @@ impl SessionEventMailbox {
             return Ok(QueuePushOutcome::Coalesced);
         }
 
-        self.queued_bytes += event_bytes;
+        self.queued_bytes = queued_after;
         self.entries.push_back(event);
         Ok(QueuePushOutcome::Queued)
     }
@@ -280,3 +310,18 @@ impl fmt::Display for QueueError {
 }
 
 impl Error for QueueError {}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_byte_add;
+
+    #[test]
+    fn byte_budget_accounting_rejects_usize_overflow() {
+        assert_eq!(
+            checked_byte_add(usize::MAX, 1, "session_event_byte_accounting_overflow")
+                .unwrap_err()
+                .code(),
+            "session_event_byte_accounting_overflow"
+        );
+    }
+}

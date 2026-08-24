@@ -95,6 +95,7 @@ struct DesktopApplication {
     startup_error: Option<DesktopError>,
     pointer_buttons: u8,
     cursor_position: Option<(f64, f64)>,
+    disconnect_requested: bool,
 }
 
 impl DesktopApplication {
@@ -112,6 +113,7 @@ impl DesktopApplication {
             startup_error: None,
             pointer_buttons: 0,
             cursor_position: None,
+            disconnect_requested: false,
         }
     }
 
@@ -217,11 +219,8 @@ impl DesktopApplication {
             }
         }
         if back_clicked {
-            if let Some(engine) = &self.session_engine {
-                if let Err(error) = engine.send(SessionCommand::Disconnect) {
-                    self.message = Some(error.to_string());
-                    self.model.show_connection();
-                }
+            if self.session_engine.is_some() {
+                self.request_disconnect();
             } else {
                 self.model.show_connection();
                 self.message = None;
@@ -234,7 +233,7 @@ impl DesktopApplication {
             renderer.resize(size);
         }
         if self.session_model.snapshot().phase() == SessionPhase::Connected {
-            let _ = self.send_session_command(SessionCommand::Resize {
+            self.send_session_command(SessionCommand::Resize {
                 width: size.width,
                 height: size.height,
             });
@@ -251,6 +250,7 @@ impl DesktopApplication {
                 self.session_engine = Some(engine);
                 self.session_model = SessionModel::default();
                 self.message = None;
+                self.disconnect_requested = false;
             }
             Err(error) => {
                 self.model.show_connection();
@@ -299,9 +299,11 @@ impl DesktopApplication {
             } else if disconnected {
                 self.model.show_connection();
                 self.message = None;
+                self.disconnect_requested = false;
             } else if let Some(code) = failed_code {
                 self.model.show_connection();
                 self.message = Some(format!("连接失败 ({code})"));
+                self.disconnect_requested = false;
             }
         }
 
@@ -313,6 +315,7 @@ impl DesktopApplication {
             if let Some(engine) = self.session_engine.take() {
                 let _ = engine.join();
             }
+            self.disconnect_requested = false;
             if !expected_terminal {
                 self.model.show_connection();
                 self.message = Some("连接线程意外结束".to_owned());
@@ -323,11 +326,32 @@ impl DesktopApplication {
         }
     }
 
-    fn send_session_command(&self, command: SessionCommand) -> Result<(), SessionError> {
-        self.session_engine
+    fn send_session_command(&mut self, command: SessionCommand) {
+        let result = match self.session_engine.as_ref() {
+            Some(engine) => engine.send(command),
+            None => Err(SessionError::new("session_not_running")),
+        };
+        if let Err(error) = result {
+            self.message = Some(error.to_string());
+            if command_failure_requires_disconnect(error) {
+                self.request_disconnect();
+            }
+        }
+    }
+
+    fn request_disconnect(&mut self) {
+        if self.disconnect_requested {
+            return;
+        }
+        self.disconnect_requested = true;
+        let result = self
+            .session_engine
             .as_ref()
-            .ok_or_else(|| SessionError::new("session_not_running"))?
-            .send(command)
+            .ok_or_else(|| SessionError::new("session_not_running"))
+            .and_then(|engine| engine.send(SessionCommand::Disconnect));
+        if let Err(error) = result {
+            self.message = Some(error.to_string());
+        }
     }
 
     fn remote_cursor_position(&self, window: &Window) -> Option<(u32, u32)> {
@@ -339,9 +363,9 @@ impl DesktopApplication {
         transform.remote_point(self.cursor_position?)
     }
 
-    fn send_pointer(&self, window: &Window, buttons: u8) {
+    fn send_pointer(&mut self, window: &Window, buttons: u8) {
         if let Some((x, y)) = self.remote_cursor_position(window) {
-            let _ = self.send_session_command(SessionCommand::Pointer { x, y, buttons });
+            self.send_session_command(SessionCommand::Pointer { x, y, buttons });
         }
     }
 
@@ -393,7 +417,7 @@ impl DesktopApplication {
                 let physical_code = event.physical_key.to_scancode();
                 let keysym = winit_key_to_keysym(&event.logical_key);
                 if physical_code.is_some() || keysym.is_some() {
-                    let _ = self.send_session_command(SessionCommand::Key {
+                    self.send_session_command(SessionCommand::Key {
                         physical_code,
                         keysym,
                         pressed: event.state == ElementState::Pressed,
@@ -403,6 +427,16 @@ impl DesktopApplication {
             _ => {}
         }
     }
+}
+
+fn command_failure_requires_disconnect(error: SessionError) -> bool {
+    matches!(
+        error.code(),
+        "session_command_channel_full"
+            | "session_command_channel_closed"
+            | "session_command_closing"
+            | "session_command_mailbox_poisoned"
+    )
 }
 
 impl ApplicationHandler<DesktopEvent> for DesktopApplication {
@@ -552,3 +586,22 @@ impl fmt::Display for DesktopError {
 }
 
 impl Error for DesktopError {}
+
+#[cfg(test)]
+mod tests {
+    use super::command_failure_requires_disconnect;
+    use crate::session::SessionError;
+
+    #[test]
+    fn key_or_pointer_send_failure_keeps_the_session_until_disconnect() {
+        assert!(command_failure_requires_disconnect(SessionError::new(
+            "session_command_channel_full"
+        )));
+        assert!(command_failure_requires_disconnect(SessionError::new(
+            "session_command_channel_closed"
+        )));
+        assert!(!command_failure_requires_disconnect(SessionError::new(
+            "session_not_running"
+        )));
+    }
+}
