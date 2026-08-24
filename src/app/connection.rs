@@ -33,6 +33,7 @@ pub struct ConnectionRequest {
 pub struct Endpoint {
     host: String,
     port: u16,
+    port_was_explicit: bool,
 }
 
 impl Endpoint {
@@ -43,6 +44,18 @@ impl Endpoint {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    pub const fn port_was_explicit(&self) -> bool {
+        self.port_was_explicit
+    }
+
+    pub(crate) const fn explicit_port(&self) -> Option<u16> {
+        if self.port_was_explicit {
+            Some(self.port)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -52,6 +65,24 @@ pub struct ValidatedConnection {
     pub username: String,
     pub password: SecretString,
     pub domain: Option<String>,
+}
+
+impl ValidatedConnection {
+    pub(crate) fn select_auto_protocol(
+        mut self,
+        protocol: ProtocolKind,
+        port: u16,
+    ) -> Option<Self> {
+        if self.protocol != ProtocolKind::Auto
+            || !matches!(protocol, ProtocolKind::Rdp | ProtocolKind::AppleRfb)
+            || port == 0
+        {
+            return None;
+        }
+        self.protocol = protocol;
+        self.endpoint.port = port;
+        Some(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +153,7 @@ pub fn validate_connection(
         ));
     }
 
+    let port_was_explicit = request.port.is_some();
     let port = request.port.unwrap_or(match request.service {
         ServiceKind::WindowsRdp => 3389,
         ServiceKind::Auto | ServiceKind::MacOsArd | ServiceKind::LinuxVnc => 5900,
@@ -130,10 +162,6 @@ pub fn validate_connection(
         ServiceKind::WindowsRdp => ProtocolKind::Rdp,
         ServiceKind::MacOsArd => ProtocolKind::AppleRfb,
         ServiceKind::LinuxVnc => ProtocolKind::StandardRfb,
-        ServiceKind::Auto if port == 3389 => ProtocolKind::Rdp,
-        // 5900 同时承载 Apple 原生屏幕共享和标准 VNC。产品策略要求自动模式
-        // 先尝试 Apple 本地账号认证；标准 VNC 只作为显式的最低优先级入口。
-        ServiceKind::Auto if port == 5900 => ProtocolKind::AppleRfb,
         ServiceKind::Auto => ProtocolKind::Auto,
     };
 
@@ -142,6 +170,7 @@ pub fn validate_connection(
         endpoint: Endpoint {
             host: host.to_owned(),
             port,
+            port_was_explicit,
         },
         username: username.to_owned(),
         password: request.password,
@@ -238,11 +267,30 @@ mod tests {
     }
 
     #[test]
-    fn auto_selects_protocol_from_well_known_ports() {
+    fn auto_preserves_detection_until_the_protocol_worker() {
         let rdp = validate_connection(request(ServiceKind::Auto, "host", Some(3389))).unwrap();
         let rfb = validate_connection(request(ServiceKind::Auto, "host", Some(5900))).unwrap();
+        let no_port = validate_connection(request(ServiceKind::Auto, "host", None)).unwrap();
 
-        assert_eq!(rdp.protocol, ProtocolKind::Rdp);
-        assert_eq!(rfb.protocol, ProtocolKind::AppleRfb);
+        assert_eq!(rdp.protocol, ProtocolKind::Auto);
+        assert_eq!(rfb.protocol, ProtocolKind::Auto);
+        assert_eq!(no_port.protocol, ProtocolKind::Auto);
+        assert!(rdp.endpoint.port_was_explicit());
+        assert!(rfb.endpoint.port_was_explicit());
+        assert!(!no_port.endpoint.port_was_explicit());
+    }
+
+    #[test]
+    fn explicit_services_bypass_auto_and_preserve_the_validated_port() {
+        for (service, port, protocol) in [
+            (ServiceKind::WindowsRdp, 13389, ProtocolKind::Rdp),
+            (ServiceKind::MacOsArd, 15900, ProtocolKind::AppleRfb),
+            (ServiceKind::LinuxVnc, 15901, ProtocolKind::StandardRfb),
+        ] {
+            let connection = validate_connection(request(service, "host", Some(port))).unwrap();
+            assert_eq!(connection.protocol, protocol);
+            assert_eq!(connection.endpoint.port(), port);
+            assert!(connection.endpoint.port_was_explicit());
+        }
     }
 }

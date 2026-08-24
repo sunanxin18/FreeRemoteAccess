@@ -51,7 +51,7 @@ impl RfbAdapter {
         }
         let address = resolve_endpoint(connection.endpoint.host(), connection.endpoint.port())?;
         let policy = match self.authentication_mode {
-            RfbAuthenticationMode::StandardCompatible => SecurityPolicy::PreferAppleThenVnc,
+            RfbAuthenticationMode::StandardCompatible => SecurityPolicy::StandardVncOnly,
             RfbAuthenticationMode::AppleNativeAccount => SecurityPolicy::AppleNativeOnly,
         };
         VncClient::connect_timeout_with_policy(

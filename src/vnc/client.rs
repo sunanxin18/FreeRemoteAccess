@@ -658,6 +658,8 @@ pub enum SecurityPolicy {
     PreferAppleThenVnc,
     /// Mac OS 产品路径：只接受 Mac 本地账号对应的 Apple 原生认证。
     AppleNativeOnly,
+    /// Linux/VNC 产品路径：只接受标准 RFB 的 None 或 VNC Authentication。
+    StandardVncOnly,
 }
 
 fn pick_security_with_policy(
@@ -667,6 +669,16 @@ fn pick_security_with_policy(
     policy: SecurityPolicy,
 ) -> Result<u8> {
     let has = |t: u8| types.contains(&t);
+    if policy == SecurityPolicy::StandardVncOnly {
+        return match password {
+            Some(_) if has(protocol::security::VNC_AUTH) => Ok(protocol::security::VNC_AUTH),
+            _ if has(protocol::security::NONE) => Ok(protocol::security::NONE),
+            None if has(protocol::security::VNC_AUTH) => {
+                bail!("标准 VNC 认证需要 VNC 密码")
+            }
+            _ => bail!("服务器不提供可用的标准 VNC 认证方式，可用类型: {types:?}"),
+        };
+    }
     if policy == SecurityPolicy::AppleNativeOnly {
         return match (username, password) {
             (Some(_), Some(_)) if has(protocol::security::APPLE_SRP) => {
@@ -1278,6 +1290,38 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("Apple 原生认证"), "{error:#}");
+    }
+
+    #[test]
+    fn standard_vnc_policy_rejects_apple_types_and_selects_vnc_auth() {
+        let credentials = (Some("linux-user"), Some("vnc-password"));
+        assert_eq!(
+            pick_security_with_policy(
+                &[
+                    protocol::security::APPLE_SRP,
+                    protocol::security::APPLE_RSA_SRP,
+                    protocol::security::APPLE_ARD,
+                    protocol::security::VNC_AUTH,
+                ],
+                credentials.0,
+                credentials.1,
+                SecurityPolicy::StandardVncOnly,
+            )
+            .unwrap(),
+            protocol::security::VNC_AUTH
+        );
+        let error = pick_security_with_policy(
+            &[
+                protocol::security::APPLE_SRP,
+                protocol::security::APPLE_RSA_SRP,
+                protocol::security::APPLE_ARD,
+            ],
+            credentials.0,
+            credentials.1,
+            SecurityPolicy::StandardVncOnly,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("标准 VNC"), "{error:#}");
     }
 
     #[test]
