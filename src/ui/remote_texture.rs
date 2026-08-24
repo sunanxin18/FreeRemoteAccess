@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 use crate::core::{GenerationDisposition, RemoteSurfaceState, RenderUpdate};
 
@@ -112,16 +113,12 @@ impl Default for RemoteTextureState {
 #[derive(Debug, Default)]
 pub struct RendererRuntimePolicy {
     remote_state: RemoteTextureState,
-    remote_texture_identity: Option<u64>,
-    next_remote_texture_identity: u64,
 }
 
 impl RendererRuntimePolicy {
     pub const fn new() -> Self {
         Self {
             remote_state: RemoteTextureState::empty(),
-            remote_texture_identity: None,
-            next_remote_texture_identity: 1,
         }
     }
 
@@ -144,13 +141,6 @@ impl RendererRuntimePolicy {
         height: u32,
     ) -> Result<ResetDisposition, TextureStateError> {
         let disposition = self.remote_state.apply_reset(generation, width, height)?;
-        if matches!(
-            disposition,
-            ResetDisposition::Created | ResetDisposition::Recreated
-        ) {
-            self.remote_texture_identity = Some(self.next_remote_texture_identity);
-            self.next_remote_texture_identity = self.next_remote_texture_identity.saturating_add(1);
-        }
         Ok(disposition)
     }
 
@@ -169,29 +159,6 @@ impl RendererRuntimePolicy {
         self.remote_state.on_surface_available();
     }
 
-    pub fn on_surface_acquire(&self, outcome: SurfaceAcquireOutcome) -> SurfaceRecoveryPlan {
-        match outcome {
-            SurfaceAcquireOutcome::Success => SurfaceRecoveryPlan::Render,
-            SurfaceAcquireOutcome::Suboptimal => SurfaceRecoveryPlan::RenderThen(&[
-                SurfaceRecoveryStep::PresentFrame,
-                SurfaceRecoveryStep::ReconfigureExistingSurface,
-                SurfaceRecoveryStep::RequestRedraw,
-            ]),
-            SurfaceAcquireOutcome::Timeout => SurfaceRecoveryPlan::SkipUntilNextWake,
-            SurfaceAcquireOutcome::Occluded => SurfaceRecoveryPlan::WaitForVisibility,
-            SurfaceAcquireOutcome::Outdated => SurfaceRecoveryPlan::Recover(&[
-                SurfaceRecoveryStep::ReconfigureExistingSurface,
-                SurfaceRecoveryStep::RequestRedraw,
-            ]),
-            SurfaceAcquireOutcome::Lost => SurfaceRecoveryPlan::Recover(&[
-                SurfaceRecoveryStep::RecreateSurface,
-                SurfaceRecoveryStep::ReconfigureExistingSurface,
-                SurfaceRecoveryStep::RequestRedraw,
-            ]),
-            SurfaceAcquireOutcome::Validation => SurfaceRecoveryPlan::FailSession,
-        }
-    }
-
     pub fn generation(&self) -> Option<u64> {
         self.remote_state.generation()
     }
@@ -204,13 +171,8 @@ impl RendererRuntimePolicy {
         self.remote_state.surface_available()
     }
 
-    pub const fn remote_texture_identity(&self) -> Option<u64> {
-        self.remote_texture_identity
-    }
-
     fn clear_remote_texture(&mut self) -> RemoteTextureAction {
         self.remote_state.clear_remote_surface();
-        self.remote_texture_identity = None;
         RemoteTextureAction::Clear
     }
 }
@@ -231,36 +193,183 @@ pub enum SurfaceAcquireOutcome {
     Validation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceRecoveryPlan {
-    Render,
-    RenderThen(&'static [SurfaceRecoveryStep]),
-    Recover(&'static [SurfaceRecoveryStep]),
-    SkipUntilNextWake,
-    WaitForVisibility,
-    FailSession,
+/// Bounded production policy for wgpu's current-surface outcomes. The executor
+/// only owns local swapchain resources; remote pixels and their generation stay
+/// in `RendererRuntimePolicy` until the session lifecycle explicitly clears them.
+#[derive(Debug, Default)]
+pub struct SurfaceRecoveryController {
+    attempts: u8,
+    accumulated_delay: Duration,
+}
+
+impl SurfaceRecoveryController {
+    const MAX_ATTEMPTS: u8 = 4;
+    const MAX_TOTAL_DELAY: Duration = Duration::from_millis(500);
+
+    pub fn on_acquire(&mut self, outcome: SurfaceAcquireOutcome) -> SurfaceRecoveryDecision {
+        match outcome {
+            SurfaceAcquireOutcome::Success => {
+                self.attempts = 0;
+                self.accumulated_delay = Duration::ZERO;
+                SurfaceRecoveryDecision::Render
+            }
+            SurfaceAcquireOutcome::Suboptimal => self.next_recovery(false, true),
+            SurfaceAcquireOutcome::Timeout => self.next_timeout(),
+            SurfaceAcquireOutcome::Occluded => SurfaceRecoveryDecision::WaitForVisibility,
+            SurfaceAcquireOutcome::Outdated => self.next_recovery(false, false),
+            SurfaceAcquireOutcome::Lost => self.next_recovery(true, false),
+            SurfaceAcquireOutcome::Validation => {
+                SurfaceRecoveryDecision::Terminal("surface_validation_failed")
+            }
+        }
+    }
+
+    fn next_timeout(&mut self) -> SurfaceRecoveryDecision {
+        match self.next_delay(true) {
+            Some(delay) => SurfaceRecoveryDecision::RetryAfter(delay),
+            None => SurfaceRecoveryDecision::Terminal("surface_recovery_exhausted"),
+        }
+    }
+
+    fn next_recovery(&mut self, recreate: bool, post_present: bool) -> SurfaceRecoveryDecision {
+        let Some(delay) = self.next_delay(false) else {
+            return SurfaceRecoveryDecision::Terminal("surface_recovery_exhausted");
+        };
+        if post_present {
+            SurfaceRecoveryDecision::RenderThenReconfigure(delay)
+        } else if recreate {
+            SurfaceRecoveryDecision::RecreateThenConfigureThenRetry(delay)
+        } else {
+            SurfaceRecoveryDecision::ReconfigureThenRetry(delay)
+        }
+    }
+
+    fn next_delay(&mut self, force_delayed: bool) -> Option<Duration> {
+        if self.attempts >= Self::MAX_ATTEMPTS {
+            return None;
+        }
+        self.attempts += 1;
+        let delay = if self.attempts == 1 && !force_delayed {
+            Duration::ZERO
+        } else {
+            let exponent = u32::from(self.attempts.saturating_sub(1)).min(3);
+            Duration::from_millis(25 * (1_u64 << exponent))
+        };
+        let total = self.accumulated_delay.saturating_add(delay);
+        if total > Self::MAX_TOTAL_DELAY {
+            return None;
+        }
+        self.accumulated_delay = total;
+        Some(delay)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceRecoveryStep {
-    PresentFrame,
-    ReconfigureExistingSurface,
-    RecreateSurface,
-    RequestRedraw,
+pub enum SurfaceRecoveryDecision {
+    Render,
+    RenderThenReconfigure(Duration),
+    RetryAfter(Duration),
+    WaitForVisibility,
+    ReconfigureThenRetry(Duration),
+    RecreateThenConfigureThenRetry(Duration),
+    Terminal(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryExecution {
+    RetryAfter(Duration),
+    WaitForVisibility,
+}
+
+/// Port implemented by the production renderer and by deterministic tests. It
+/// deliberately exposes only local surface work: it cannot replace remote GPU
+/// texture ownership or alter its generation.
+pub trait SurfaceRecoveryPort {
+    type Error;
+
+    fn recreate_surface(&mut self) -> Result<(), Self::Error>;
+    fn configure_surface(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SurfaceRecoveryExecutor;
+
+impl SurfaceRecoveryExecutor {
+    pub fn execute_post_present<P, F>(
+        &self,
+        decision: SurfaceRecoveryDecision,
+        present: F,
+        port: &mut P,
+    ) -> Result<RecoveryExecution, P::Error>
+    where
+        P: SurfaceRecoveryPort,
+        F: FnOnce(),
+    {
+        let SurfaceRecoveryDecision::RenderThenReconfigure(delay) = decision else {
+            unreachable!("post-present recovery requires a suboptimal frame decision");
+        };
+        present();
+        port.configure_surface()?;
+        Ok(RecoveryExecution::RetryAfter(delay))
+    }
+
+    pub fn execute_without_frame<P>(
+        &self,
+        decision: SurfaceRecoveryDecision,
+        port: &mut P,
+    ) -> Result<RecoveryExecution, P::Error>
+    where
+        P: SurfaceRecoveryPort,
+    {
+        match decision {
+            SurfaceRecoveryDecision::RetryAfter(delay) => Ok(RecoveryExecution::RetryAfter(delay)),
+            SurfaceRecoveryDecision::WaitForVisibility => Ok(RecoveryExecution::WaitForVisibility),
+            SurfaceRecoveryDecision::ReconfigureThenRetry(delay) => {
+                port.configure_surface()?;
+                Ok(RecoveryExecution::RetryAfter(delay))
+            }
+            SurfaceRecoveryDecision::RecreateThenConfigureThenRetry(delay) => {
+                port.recreate_surface()?;
+                port.configure_surface()?;
+                Ok(RecoveryExecution::RetryAfter(delay))
+            }
+            SurfaceRecoveryDecision::Render
+            | SurfaceRecoveryDecision::RenderThenReconfigure(_)
+            | SurfaceRecoveryDecision::Terminal(_) => {
+                unreachable!("surface recovery executor received an invalid no-frame decision")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
-pub struct GpuFailureLatch {
+pub struct GpuFailureGate {
     first_error_code: Option<&'static str>,
 }
 
-impl GpuFailureLatch {
+impl GpuFailureGate {
     pub fn latch(&mut self, error_code: &'static str) -> bool {
         if self.first_error_code.is_some() {
             return false;
         }
         self.first_error_code = Some(error_code);
         true
+    }
+
+    /// Production host decision for every terminal renderer error. A renderer
+    /// that fails before a session exists is still latched and must exit rather
+    /// than accepting a same-frame connection click.
+    pub fn on_terminal_renderer_error(
+        &mut self,
+        error_code: &'static str,
+        has_active_session: bool,
+    ) -> RendererFailureAction {
+        self.latch(error_code);
+        if has_active_session {
+            RendererFailureAction::OrderlyDisconnect
+        } else {
+            RendererFailureAction::ExitFailClosed
+        }
     }
 
     pub const fn first_error_code(&self) -> Option<&'static str> {
@@ -275,20 +384,25 @@ impl GpuFailureLatch {
         self.first_error_code.is_some()
     }
 
-    pub const fn admits_queued_progress(&self, _progress: QueuedSessionProgress) -> bool {
+    pub const fn permits_new_session(&self) -> bool {
         self.first_error_code.is_none()
     }
 
-    pub fn release_after_worker_completion(&mut self) -> Option<&'static str> {
-        self.first_error_code.take()
+    /// The only release point after a GPU terminal failure. A failed join must
+    /// retain the latch so queued session progress cannot revive the UI.
+    pub fn release_after_worker_completion(&mut self, joined: bool) -> bool {
+        if joined {
+            self.first_error_code.take().is_some()
+        } else {
+            false
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueuedSessionProgress {
-    Render,
-    SurfaceReset,
-    Connected,
+pub enum RendererFailureAction {
+    OrderlyDisconnect,
+    ExitFailClosed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,9 +1,12 @@
 use freeremotedesk::core::{FrameRect, RemotePixelFormat, RenderUpdate};
 use freeremotedesk::ui::{
-    GpuFailureLatch, QueuedSessionProgress, RemoteTextureAction, RemoteTextureState,
-    RendererRuntimePolicy, ResetDisposition, SurfaceAcquireOutcome, SurfaceRecoveryPlan,
-    SurfaceRecoveryStep, TextureUpdateDisposition,
+    GpuFailureGate, RecoveryExecution, RemoteTextureAction, RemoteTextureState,
+    RendererFailureAction, RendererRuntimePolicy, ResetDisposition, SurfaceAcquireOutcome,
+    SurfaceRecoveryController, SurfaceRecoveryExecutor, SurfaceRecoveryPort,
+    TextureUpdateDisposition,
 };
+use std::time::Duration;
+use std::{cell::RefCell, rc::Rc};
 
 #[test]
 fn reset_changes_texture_only_for_a_newer_generation() {
@@ -66,25 +69,10 @@ fn runtime_surface_recovery_preserves_generation_bound_remote_texture() {
         ResetDisposition::Created
     );
 
-    assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Lost),
-        SurfaceRecoveryPlan::Recover(&[
-            SurfaceRecoveryStep::RecreateSurface,
-            SurfaceRecoveryStep::ReconfigureExistingSurface,
-            SurfaceRecoveryStep::RequestRedraw,
-        ])
-    );
     assert_eq!(policy.generation(), Some(7));
     assert_eq!(policy.dimensions(), Some((1280, 720)));
     assert!(!policy.surface_available());
 
-    assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Outdated),
-        SurfaceRecoveryPlan::Recover(&[
-            SurfaceRecoveryStep::ReconfigureExistingSurface,
-            SurfaceRecoveryStep::RequestRedraw,
-        ])
-    );
     assert_eq!(policy.generation(), Some(7));
     assert_eq!(policy.dimensions(), Some((1280, 720)));
     assert!(!policy.surface_available());
@@ -120,82 +108,181 @@ fn authenticated_session_lifecycle_clears_remote_texture_before_generation_one_r
 
     assert_eq!(policy.finish_failed_session(), RemoteTextureAction::Clear);
     assert_eq!(policy.generation(), None);
+}
+
+#[test]
+fn production_recovery_executor_presents_before_reconfigure_and_preserves_remote_slot() {
+    #[derive(Default)]
+    struct FakePort {
+        operations: Rc<RefCell<Vec<&'static str>>>,
+        remote_slot: u64,
+    }
+
+    impl SurfaceRecoveryPort for FakePort {
+        type Error = &'static str;
+
+        fn recreate_surface(&mut self) -> Result<(), &'static str> {
+            self.operations.borrow_mut().push("recreate");
+            Ok(())
+        }
+
+        fn configure_surface(&mut self) -> Result<(), &'static str> {
+            self.operations.borrow_mut().push("configure");
+            Ok(())
+        }
+    }
+
+    let mut controller = SurfaceRecoveryController::default();
+    let executor = SurfaceRecoveryExecutor;
+    let mut port = FakePort {
+        remote_slot: 41,
+        ..Default::default()
+    };
+    let remote_slot = port.remote_slot;
+    let operations = port.operations.clone();
+
+    let decision = controller.on_acquire(SurfaceAcquireOutcome::Suboptimal);
     assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Validation),
-        SurfaceRecoveryPlan::FailSession
+        executor
+            .execute_post_present(
+                decision,
+                || operations.borrow_mut().push("present"),
+                &mut port
+            )
+            .unwrap(),
+        RecoveryExecution::RetryAfter(Duration::ZERO)
+    );
+    assert_eq!(*port.operations.borrow(), ["present", "configure"]);
+    assert_eq!(port.remote_slot, remote_slot);
+
+    let decision = controller.on_acquire(SurfaceAcquireOutcome::Lost);
+    assert_eq!(
+        executor.execute_without_frame(decision, &mut port).unwrap(),
+        RecoveryExecution::RetryAfter(Duration::from_millis(50))
+    );
+    assert_eq!(
+        *port.operations.borrow(),
+        ["present", "configure", "recreate", "configure"]
+    );
+    assert_eq!(port.remote_slot, remote_slot);
+}
+
+#[test]
+fn production_recovery_executor_propagates_local_surface_failures() {
+    struct FailingPort;
+
+    impl SurfaceRecoveryPort for FailingPort {
+        type Error = &'static str;
+
+        fn recreate_surface(&mut self) -> Result<(), Self::Error> {
+            Err("surface_recreate_failed")
+        }
+
+        fn configure_surface(&mut self) -> Result<(), Self::Error> {
+            Err("surface_config_failed")
+        }
+    }
+
+    let executor = SurfaceRecoveryExecutor;
+    let mut port = FailingPort;
+    assert_eq!(
+        executor.execute_without_frame(
+            freeremotedesk::ui::SurfaceRecoveryDecision::RecreateThenConfigureThenRetry(
+                Duration::ZERO
+            ),
+            &mut port
+        ),
+        Err("surface_recreate_failed")
+    );
+    assert_eq!(
+        executor.execute_post_present(
+            freeremotedesk::ui::SurfaceRecoveryDecision::RenderThenReconfigure(Duration::ZERO),
+            || {},
+            &mut port
+        ),
+        Err("surface_config_failed")
     );
 }
 
 #[test]
-fn production_surface_recovery_plan_orders_every_wgpu_acquire_outcome() {
-    let mut policy = RendererRuntimePolicy::new();
+fn recovery_backoff_and_failure_gate_are_bounded_and_fail_closed() {
+    let mut controller = SurfaceRecoveryController::default();
     assert_eq!(
-        policy.apply_reset(7, 1280, 720).unwrap(),
-        ResetDisposition::Created
+        controller.on_acquire(SurfaceAcquireOutcome::Success),
+        freeremotedesk::ui::SurfaceRecoveryDecision::Render
     );
-    let texture_identity = policy.remote_texture_identity();
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Suboptimal),
+        freeremotedesk::ui::SurfaceRecoveryDecision::RenderThenReconfigure(Duration::ZERO)
+    );
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Success),
+        freeremotedesk::ui::SurfaceRecoveryDecision::Render
+    );
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Occluded),
+        freeremotedesk::ui::SurfaceRecoveryDecision::WaitForVisibility
+    );
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Validation),
+        freeremotedesk::ui::SurfaceRecoveryDecision::Terminal("surface_validation_failed")
+    );
+
+    let mut controller = SurfaceRecoveryController::default();
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Timeout),
+        freeremotedesk::ui::SurfaceRecoveryDecision::RetryAfter(Duration::from_millis(25))
+    );
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Outdated),
+        freeremotedesk::ui::SurfaceRecoveryDecision::ReconfigureThenRetry(Duration::from_millis(
+            50
+        ))
+    );
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Lost),
+        freeremotedesk::ui::SurfaceRecoveryDecision::RecreateThenConfigureThenRetry(
+            Duration::from_millis(100)
+        )
+    );
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Lost),
+        freeremotedesk::ui::SurfaceRecoveryDecision::RecreateThenConfigureThenRetry(
+            Duration::from_millis(200)
+        )
+    );
+    assert_eq!(
+        controller.on_acquire(SurfaceAcquireOutcome::Lost),
+        freeremotedesk::ui::SurfaceRecoveryDecision::Terminal("surface_recovery_exhausted")
+    );
+
+    let mut gate = GpuFailureGate::default();
+    assert!(gate.latch("surface_recreate_failed"));
+    assert!(!gate.latch("surface_format_changed"));
+    assert!(!gate.permits_new_session());
+    assert!(gate.blocks_remote_input());
+    assert_eq!(gate.first_error_code(), Some("surface_recreate_failed"));
+    assert!(!gate.release_after_worker_completion(false));
+    assert!(!gate.permits_new_session());
+    assert!(gate.release_after_worker_completion(true));
+    assert!(gate.permits_new_session());
 
     assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Success),
-        SurfaceRecoveryPlan::Render
+        gate.on_terminal_renderer_error("surface_config_failed", true),
+        RendererFailureAction::OrderlyDisconnect
     );
     assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Suboptimal),
-        SurfaceRecoveryPlan::RenderThen(&[
-            SurfaceRecoveryStep::PresentFrame,
-            SurfaceRecoveryStep::ReconfigureExistingSurface,
-            SurfaceRecoveryStep::RequestRedraw,
-        ])
+        gate.on_terminal_renderer_error("surface_recreate_failed", true),
+        RendererFailureAction::OrderlyDisconnect
     );
-    assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Timeout),
-        SurfaceRecoveryPlan::SkipUntilNextWake
-    );
-    assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Occluded),
-        SurfaceRecoveryPlan::WaitForVisibility
-    );
-    assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Outdated),
-        SurfaceRecoveryPlan::Recover(&[
-            SurfaceRecoveryStep::ReconfigureExistingSurface,
-            SurfaceRecoveryStep::RequestRedraw,
-        ])
-    );
-    assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Lost),
-        SurfaceRecoveryPlan::Recover(&[
-            SurfaceRecoveryStep::RecreateSurface,
-            SurfaceRecoveryStep::ReconfigureExistingSurface,
-            SurfaceRecoveryStep::RequestRedraw,
-        ])
-    );
-    assert_eq!(
-        policy.on_surface_acquire(SurfaceAcquireOutcome::Validation),
-        SurfaceRecoveryPlan::FailSession
-    );
-    assert_eq!(policy.generation(), Some(7));
-    assert_eq!(policy.remote_texture_identity(), texture_identity);
-}
-
-#[test]
-fn gpu_failure_latch_blocks_queued_session_progress_and_input_until_worker_completion() {
-    let mut latch = GpuFailureLatch::default();
-
-    assert!(latch.latch("surface_validation_failed"));
-    assert!(!latch.latch("different_gpu_failure"));
-    assert!(latch.blocks_session_progress());
-    assert!(latch.blocks_remote_input());
-    assert!(!latch.admits_queued_progress(QueuedSessionProgress::Render));
-    assert!(!latch.admits_queued_progress(QueuedSessionProgress::SurfaceReset));
-    assert!(!latch.admits_queued_progress(QueuedSessionProgress::Connected));
-    assert_eq!(latch.first_error_code(), Some("surface_validation_failed"));
+    assert_eq!(gate.first_error_code(), Some("surface_config_failed"));
+    assert!(!gate.release_after_worker_completion(false));
+    assert!(gate.release_after_worker_completion(true));
 
     assert_eq!(
-        latch.release_after_worker_completion(),
-        Some("surface_validation_failed")
+        gate.on_terminal_renderer_error("surface_capabilities_failed", false),
+        RendererFailureAction::ExitFailClosed
     );
-    assert!(!latch.blocks_session_progress());
-    assert!(!latch.blocks_remote_input());
-    assert!(latch.admits_queued_progress(QueuedSessionProgress::Render));
+    assert!(!gate.permits_new_session());
+    assert_eq!(gate.first_error_code(), Some("surface_capabilities_failed"));
 }

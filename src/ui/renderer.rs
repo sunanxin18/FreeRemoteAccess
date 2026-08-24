@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
@@ -12,7 +13,8 @@ use crate::core::{RemotePixelFormat, RenderUpdate};
 
 use super::{
     RemoteTextureAction, RendererRuntimePolicy, ResetDisposition, SurfaceAcquireOutcome,
-    SurfaceRecoveryPlan, SurfaceRecoveryStep, TextureUpdateDisposition,
+    SurfaceRecoveryController, SurfaceRecoveryDecision, SurfaceRecoveryExecutor,
+    SurfaceRecoveryPort, TextureUpdateDisposition,
 };
 
 #[repr(C)]
@@ -44,6 +46,8 @@ pub struct Renderer {
     viewport_uniform: wgpu::Buffer,
     remote_texture: Option<RemoteTexture>,
     runtime_policy: RendererRuntimePolicy,
+    recovery_controller: SurfaceRecoveryController,
+    recovery_executor: SurfaceRecoveryExecutor,
     egui_renderer: EguiRenderer,
 }
 
@@ -76,7 +80,16 @@ impl Renderer {
             })
             .await
             .map_err(|_| RenderError::new("gpu_device_create_failed"))?;
-        let (config, surface_format) = Self::surface_configuration(&surface, &adapter, size)?;
+        let initial_format = surface
+            .get_capabilities(&adapter)
+            .formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .or_else(|| surface.get_capabilities(&adapter).formats.first().copied())
+            .ok_or_else(|| RenderError::new("surface_format_unavailable"))?;
+        let (config, surface_format) =
+            Self::surface_configuration(&surface, &adapter, size, initial_format)?;
         let width = config.width;
         let height = config.height;
         surface.configure(&device, &config);
@@ -151,6 +164,8 @@ impl Renderer {
             viewport_uniform,
             remote_texture: None,
             runtime_policy: RendererRuntimePolicy::new(),
+            recovery_controller: SurfaceRecoveryController::default(),
+            recovery_executor: SurfaceRecoveryExecutor,
             egui_renderer,
         })
     }
@@ -280,20 +295,9 @@ impl Renderer {
         output: egui::FullOutput,
     ) -> Result<RenderOutcome, RenderError> {
         if self.size.width == 0 || self.size.height == 0 {
-            return Ok(RenderOutcome::Deferred);
+            return Ok(RenderOutcome::WaitForVisibility);
         }
-        for (texture_id, deltas) in &output.textures_delta.set {
-            for delta in deltas {
-                self.egui_renderer
-                    .update_texture(&self.device, &self.queue, *texture_id, delta);
-            }
-        }
-        let paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
-        let screen = ScreenDescriptor {
-            size_in_pixels: [self.size.width, self.size.height],
-            pixels_per_point: output.pixels_per_point,
-        };
-        let (frame, post_present_plan) = match self.surface.get_current_texture() {
+        let (frame, post_present_recovery) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => {
                 self.acquire_frame(SurfaceAcquireOutcome::Success, frame)?
             }
@@ -315,6 +319,20 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => {
                 return self.handle_acquire_without_frame(SurfaceAcquireOutcome::Validation);
             }
+        };
+        // Do not mutate egui's texture cache until a frame is actually owned.
+        // Recovery errors before acquisition therefore cannot write resources we
+        // would immediately abandon.
+        for (texture_id, deltas) in &output.textures_delta.set {
+            for delta in deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *texture_id, delta);
+            }
+        }
+        let paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
+        let screen = ScreenDescriptor {
+            size_in_pixels: [self.size.width, self.size.height],
+            pixels_per_point: output.pixels_per_point,
         };
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
@@ -365,13 +383,22 @@ impl Renderer {
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
-        self.queue.present(frame);
         for texture_id in &output.textures_delta.free {
             self.egui_renderer.free_texture(texture_id);
         }
-        match post_present_plan {
-            Some(plan) => self.apply_surface_recovery_plan(plan),
-            None => Ok(RenderOutcome::Rendered),
+        match post_present_recovery {
+            Some(decision) => {
+                let queue = self.queue.clone();
+                let executor = self.recovery_executor;
+                let execution = executor
+                    .execute_post_present(decision, move || queue.present(frame), self)
+                    .map_err(|error: RenderError| error)?;
+                Ok(Self::outcome_from_recovery(execution))
+            }
+            None => {
+                self.queue.present(frame);
+                Ok(RenderOutcome::Rendered)
+            }
         }
     }
 
@@ -427,19 +454,17 @@ impl Renderer {
     }
 
     fn acquire_frame(
-        &self,
+        &mut self,
         outcome: SurfaceAcquireOutcome,
         frame: wgpu::SurfaceTexture,
-    ) -> Result<(wgpu::SurfaceTexture, Option<SurfaceRecoveryPlan>), RenderError> {
-        match self.runtime_policy.on_surface_acquire(outcome) {
-            SurfaceRecoveryPlan::Render => Ok((frame, None)),
-            plan @ SurfaceRecoveryPlan::RenderThen(_) => Ok((frame, Some(plan))),
-            SurfaceRecoveryPlan::FailSession => Err(RenderError::new("surface_validation_failed")),
-            SurfaceRecoveryPlan::Recover(_)
-            | SurfaceRecoveryPlan::SkipUntilNextWake
-            | SurfaceRecoveryPlan::WaitForVisibility => {
-                Err(RenderError::new("surface_acquire_plan_without_frame"))
+    ) -> Result<(wgpu::SurfaceTexture, Option<SurfaceRecoveryDecision>), RenderError> {
+        match self.recovery_controller.on_acquire(outcome) {
+            SurfaceRecoveryDecision::Render => Ok((frame, None)),
+            decision @ SurfaceRecoveryDecision::RenderThenReconfigure(_) => {
+                Ok((frame, Some(decision)))
             }
+            SurfaceRecoveryDecision::Terminal(code) => Err(RenderError::new(code)),
+            _ => Err(RenderError::new("surface_acquire_decision_without_frame")),
         }
     }
 
@@ -447,81 +472,71 @@ impl Renderer {
         &mut self,
         outcome: SurfaceAcquireOutcome,
     ) -> Result<RenderOutcome, RenderError> {
-        match self.runtime_policy.on_surface_acquire(outcome) {
-            plan @ SurfaceRecoveryPlan::Recover(_) => {
-                self.runtime_policy.mark_surface_unavailable();
-                self.apply_surface_recovery_plan(plan)
+        let decision = self.recovery_controller.on_acquire(outcome);
+        if let SurfaceRecoveryDecision::Terminal(code) = decision {
+            return Err(RenderError::new(code));
+        }
+        self.runtime_policy.mark_surface_unavailable();
+        let executor = self.recovery_executor;
+        let execution = executor
+            .execute_without_frame(decision, self)
+            .map_err(|error: RenderError| error)?;
+        Ok(Self::outcome_from_recovery(execution))
+    }
+
+    fn outcome_from_recovery(execution: super::RecoveryExecution) -> RenderOutcome {
+        match execution {
+            super::RecoveryExecution::RetryAfter(delay) => {
+                RenderOutcome::RetryAt(Instant::now() + delay)
             }
-            SurfaceRecoveryPlan::SkipUntilNextWake | SurfaceRecoveryPlan::WaitForVisibility => {
-                Ok(RenderOutcome::Deferred)
-            }
-            SurfaceRecoveryPlan::FailSession => Err(RenderError::new("surface_validation_failed")),
-            SurfaceRecoveryPlan::Render | SurfaceRecoveryPlan::RenderThen(_) => {
-                Err(RenderError::new("surface_acquire_plan_requires_frame"))
-            }
+            super::RecoveryExecution::WaitForVisibility => RenderOutcome::WaitForVisibility,
         }
     }
 
-    fn apply_surface_recovery_plan(
-        &mut self,
-        plan: SurfaceRecoveryPlan,
-    ) -> Result<RenderOutcome, RenderError> {
-        let steps = match plan {
-            SurfaceRecoveryPlan::RenderThen(steps) | SurfaceRecoveryPlan::Recover(steps) => steps,
-            _ => return Err(RenderError::new("surface_recovery_plan_invalid")),
-        };
-        for step in steps {
-            match step {
-                SurfaceRecoveryStep::PresentFrame => {}
-                SurfaceRecoveryStep::RecreateSurface => self.recreate_surface()?,
-                SurfaceRecoveryStep::ReconfigureExistingSurface => self.reconfigure_surface(),
-                SurfaceRecoveryStep::RequestRedraw => {}
-            }
-        }
-        Ok(RenderOutcome::RequestRedraw)
-    }
-
-    fn recreate_surface(&mut self) -> Result<(), RenderError> {
+    fn recreate_surface_local(&mut self) -> Result<(), RenderError> {
         let surface = self
             .instance
             .create_surface(self.window.clone())
             .map_err(|_| RenderError::new("surface_recreate_failed"))?;
-        let (config, surface_format) =
-            Self::surface_configuration(&surface, &self.adapter, self.size)?;
+        let (config, _) =
+            Self::surface_configuration(&surface, &self.adapter, self.size, self.surface_format)?;
         self.surface = surface;
         self.config = config;
-        if self.surface_format != surface_format {
-            self.remote_pipeline = Self::create_remote_pipeline(
-                &self.device,
-                &self.remote_bind_group_layout,
-                surface_format,
-            );
-            self.egui_renderer =
-                EguiRenderer::new(&self.device, surface_format, RendererOptions::default());
-            self.surface_format = surface_format;
-        }
         Ok(())
     }
 
-    fn reconfigure_surface(&mut self) {
+    fn configure_surface_local(&mut self) -> Result<(), RenderError> {
+        if self.config.width == 0 || self.config.height == 0 {
+            return Err(RenderError::new("surface_config_dimensions_invalid"));
+        }
+        let capabilities = self.surface.get_capabilities(&self.adapter);
+        if !capabilities.formats.contains(&self.config.format) {
+            return Err(RenderError::new("surface_format_changed"));
+        }
+        if !capabilities
+            .present_modes
+            .contains(&self.config.present_mode)
+        {
+            return Err(RenderError::new("surface_present_mode_unavailable"));
+        }
         self.surface.configure(&self.device, &self.config);
         self.runtime_policy.mark_surface_available();
         self.update_viewport_uniform();
+        Ok(())
     }
 
     fn surface_configuration(
         surface: &wgpu::Surface<'_>,
         adapter: &wgpu::Adapter,
         size: PhysicalSize<u32>,
+        preferred_format: wgpu::TextureFormat,
     ) -> Result<(wgpu::SurfaceConfiguration, wgpu::TextureFormat), RenderError> {
         let capabilities = surface.get_capabilities(adapter);
-        let surface_format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .or_else(|| capabilities.formats.first().copied())
-            .ok_or_else(|| RenderError::new("surface_format_unavailable"))?;
+        let surface_format = if capabilities.formats.contains(&preferred_format) {
+            preferred_format
+        } else {
+            return Err(RenderError::new("surface_format_changed"));
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -598,11 +613,23 @@ impl Renderer {
     }
 }
 
+impl SurfaceRecoveryPort for Renderer {
+    type Error = RenderError;
+
+    fn recreate_surface(&mut self) -> Result<(), Self::Error> {
+        self.recreate_surface_local()
+    }
+
+    fn configure_surface(&mut self) -> Result<(), Self::Error> {
+        self.configure_surface_local()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderOutcome {
     Rendered,
-    RequestRedraw,
-    Deferred,
+    RetryAt(Instant),
+    WaitForVisibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

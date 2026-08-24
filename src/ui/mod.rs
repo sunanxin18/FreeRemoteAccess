@@ -16,9 +16,10 @@ pub use application::{
     ConnectionFormState, FreeRemoteApplication, SubmissionOutcome, UiAction, UiPage,
 };
 pub use remote_texture::{
-    GpuFailureLatch, QueuedSessionProgress, RemoteTextureAction, RemoteTextureState,
-    RendererRuntimePolicy, ResetDisposition, SurfaceAcquireOutcome, SurfaceRecoveryPlan,
-    SurfaceRecoveryStep, TextureStateError, TextureUpdateDisposition,
+    GpuFailureGate, RecoveryExecution, RemoteTextureAction, RemoteTextureState,
+    RendererFailureAction, RendererRuntimePolicy, ResetDisposition, SurfaceAcquireOutcome,
+    SurfaceRecoveryController, SurfaceRecoveryDecision, SurfaceRecoveryExecutor,
+    SurfaceRecoveryPort, TextureStateError, TextureUpdateDisposition,
 };
 #[cfg(feature = "gui")]
 pub use renderer::{RenderError, RenderOutcome, Renderer};

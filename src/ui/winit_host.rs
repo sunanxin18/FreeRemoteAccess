@@ -5,7 +5,7 @@ use std::sync::Arc;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::scancode::PhysicalKeyExtScancode as _;
@@ -20,8 +20,8 @@ use crate::session::{
 };
 
 use super::{
-    connection_view, system_fonts, FreeRemoteApplication, GpuFailureLatch, RenderOutcome, Renderer,
-    UiAction, UiPage,
+    connection_view, system_fonts, FreeRemoteApplication, GpuFailureGate, RenderOutcome, Renderer,
+    RendererFailureAction, UiAction, UiPage,
 };
 
 const INITIAL_WIDTH: f64 = 1080.0;
@@ -99,7 +99,7 @@ struct DesktopApplication {
     pointer_buttons: u8,
     cursor_position: Option<(f64, f64)>,
     disconnect_requested: bool,
-    gpu_failure_latch: GpuFailureLatch,
+    gpu_failure_latch: GpuFailureGate,
 }
 
 impl DesktopApplication {
@@ -118,7 +118,7 @@ impl DesktopApplication {
             pointer_buttons: 0,
             cursor_position: None,
             disconnect_requested: false,
-            gpu_failure_latch: GpuFailureLatch::default(),
+            gpu_failure_latch: GpuFailureGate::default(),
         }
     }
 
@@ -215,19 +215,22 @@ impl DesktopApplication {
             .map(|renderer| renderer.render_egui(&self.egui_context, output));
         if let Some(result) = render_result {
             match result {
-                Ok(RenderOutcome::RequestRedraw) => host.window().request_redraw(),
-                Ok(RenderOutcome::Rendered | RenderOutcome::Deferred) => {}
+                Ok(RenderOutcome::RetryAt(deadline)) => {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
+                Ok(RenderOutcome::Rendered | RenderOutcome::WaitForVisibility) => {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
                 Err(_) if self.gpu_failure_latch.blocks_session_progress() => {}
                 Err(error) => {
-                    if error.code() == "surface_validation_failed" {
-                        if self.fail_renderer_session(error) {
-                            recovery_window.request_redraw();
-                        }
-                    } else {
-                        self.message = Some(error.to_string());
-                    }
+                    self.fail_renderer_session(error, event_loop);
+                    recovery_window.request_redraw();
+                    return;
                 }
             }
+        }
+        if self.gpu_failure_latch.blocks_session_progress() {
+            return;
         }
         if connect_clicked {
             match self.model.submit_connection() {
@@ -261,6 +264,10 @@ impl DesktopApplication {
     }
 
     fn start_session(&mut self, connection: crate::app::connection::ValidatedConnection) {
+        if !self.gpu_failure_latch.permits_new_session() {
+            self.message = Some("图形会话仍在安全关闭中".to_owned());
+            return;
+        }
         if self.session_engine.is_some() {
             self.message = Some("现有会话尚未结束".to_owned());
             return;
@@ -344,16 +351,27 @@ impl DesktopApplication {
         }
 
         if channel_closed {
-            let gpu_failure = self.gpu_failure_latch.release_after_worker_completion();
             let expected_terminal = matches!(
                 self.session_model.snapshot().phase(),
                 SessionPhase::Idle | SessionPhase::Failed
             );
-            if let Some(engine) = self.session_engine.take() {
-                let _ = engine.join();
-            }
+            let joined = self
+                .session_engine
+                .take()
+                .map(SessionEngine::join)
+                .transpose()
+                .is_ok();
             self.disconnect_requested = false;
-            if gpu_failure.is_some() {
+            if !joined {
+                self.message = Some("图形会话线程清理失败，客户端已安全停止".to_owned());
+                self.startup_error = Some(DesktopError::new("session_worker_join_failed"));
+                event_loop.exit();
+                return;
+            }
+            let gpu_failure = self
+                .gpu_failure_latch
+                .release_after_worker_completion(joined);
+            if gpu_failure {
                 self.model.show_connection();
             } else if !expected_terminal {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -398,24 +416,30 @@ impl DesktopApplication {
         }
     }
 
-    fn fail_renderer_session(&mut self, error: super::RenderError) -> bool {
-        if self.session_engine.is_none() {
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.finish_failed_session();
-            }
-            self.message = Some(error.to_string());
-            self.model.show_connection();
-            return false;
+    fn fail_renderer_session(&mut self, error: super::RenderError, event_loop: &ActiveEventLoop) {
+        if self.gpu_failure_latch.blocks_session_progress() {
+            return;
         }
-        if !self.gpu_failure_latch.latch(error.code()) {
-            return false;
+        match self
+            .gpu_failure_latch
+            .on_terminal_renderer_error(error.code(), self.session_engine.is_some())
+        {
+            RendererFailureAction::ExitFailClosed => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.finish_failed_session();
+                }
+                self.message = Some(error.to_string());
+                self.startup_error = Some(DesktopError::new("renderer_terminal_failure"));
+                event_loop.exit();
+                return;
+            }
+            RendererFailureAction::OrderlyDisconnect => {}
         }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.finish_failed_session();
         }
         self.message = Some(error.to_string());
         self.request_disconnect();
-        true
     }
 
     fn remote_cursor_position(&self, window: &Window) -> Option<(u32, u32)> {
@@ -507,6 +531,14 @@ fn command_failure_requires_disconnect(error: SessionError) -> bool {
 }
 
 impl ApplicationHandler<DesktopEvent> for DesktopApplication {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            if let Some(host) = &self.host {
+                host.window().request_redraw();
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.host.is_none() {
             if let Err(error) = self.create_window(event_loop) {
