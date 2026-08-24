@@ -2556,13 +2556,16 @@ fn run_protocol_frontend(
                     &protocol::msg_pointer_event(buttons, x, y),
                 )?;
             }
-            Ok(SessionCommand::Key { scan_code, pressed }) => {
-                send_encrypted(
-                    write_stream,
-                    crypto,
-                    &protocol::msg_key_event(pressed, scan_code),
-                )?;
-            }
+            Ok(SessionCommand::Key {
+                keysym: Some(keysym),
+                pressed,
+                ..
+            }) => send_encrypted(
+                write_stream,
+                crypto,
+                &protocol::msg_key_event(pressed, keysym),
+            )?,
+            Ok(SessionCommand::Key { keysym: None, .. }) => {}
             Ok(SessionCommand::Resize { width, height }) if dynamic_resolution_enabled => {
                 if let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) {
                     if let Some(target) = DisplaySize::from_viewport(width, height) {

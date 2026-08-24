@@ -2,6 +2,8 @@ use crossbeam_channel::Receiver;
 
 #[cfg(feature = "cli")]
 pub mod apple_ard;
+#[cfg(feature = "rdp")]
+pub mod rdp;
 #[cfg(feature = "cli")]
 pub mod rfb;
 
@@ -23,6 +25,9 @@ pub fn adapter_for(protocol: ProtocolKind) -> Result<Box<dyn ProtocolAdapter>, S
         ProtocolKind::AppleRfb => Ok(Box::new(apple_ard::AppleArdAdapter::new())),
         #[cfg(feature = "cli")]
         ProtocolKind::StandardRfb => Ok(Box::new(rfb::RfbAdapter::standard())),
+        #[cfg(feature = "rdp")]
+        ProtocolKind::Rdp => Ok(Box::new(rdp::RdpAdapter::new())),
+        #[cfg(not(feature = "rdp"))]
         ProtocolKind::Rdp => Err(SessionError::new("rdp_adapter_not_available")),
         ProtocolKind::Auto => Err(SessionError::new("protocol_selection_incomplete")),
         #[cfg(not(feature = "cli"))]

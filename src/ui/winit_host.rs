@@ -8,6 +8,7 @@ use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
+use winit::platform::scancode::PhysicalKeyExtScancode as _;
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::core::RemoteViewportTransform;
@@ -389,9 +390,12 @@ impl DesktopApplication {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(keysym) = winit_key_to_keysym(&event.logical_key) {
+                let physical_code = event.physical_key.to_scancode();
+                let keysym = winit_key_to_keysym(&event.logical_key);
+                if physical_code.is_some() || keysym.is_some() {
                     let _ = self.send_session_command(SessionCommand::Key {
-                        scan_code: keysym,
+                        physical_code,
+                        keysym,
                         pressed: event.state == ElementState::Pressed,
                     });
                 }

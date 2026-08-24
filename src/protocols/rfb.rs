@@ -146,12 +146,17 @@ fn drain_commands(
                     .write_all(&protocol::msg_pointer_event(buttons, x, y))
                     .map_err(|_| SessionError::new("rfb_pointer_send_failed"))?;
             }
-            SessionCommand::Key { scan_code, pressed } => {
+            SessionCommand::Key {
+                keysym: Some(keysym),
+                pressed,
+                ..
+            } => {
                 client
                     .conn
-                    .write_all(&protocol::msg_key_event(pressed, scan_code))
+                    .write_all(&protocol::msg_key_event(pressed, keysym))
                     .map_err(|_| SessionError::new("rfb_key_send_failed"))?;
             }
+            SessionCommand::Key { keysym: None, .. } => {}
             SessionCommand::ClipboardText(text) => {
                 let message = protocol::msg_client_cut_text(&text)
                     .map_err(|_| SessionError::new("rfb_clipboard_invalid"))?;

@@ -33,9 +33,20 @@ impl ProtocolContext {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionCommand {
-    Pointer { x: u32, y: u32, buttons: u8 },
-    Key { scan_code: u32, pressed: bool },
-    Resize { width: u32, height: u32 },
+    Pointer {
+        x: u32,
+        y: u32,
+        buttons: u8,
+    },
+    Key {
+        physical_code: Option<u32>,
+        keysym: Option<u32>,
+        pressed: bool,
+    },
+    Resize {
+        width: u32,
+        height: u32,
+    },
     ClipboardText(String),
     RequestFullFrame,
     Disconnect,
