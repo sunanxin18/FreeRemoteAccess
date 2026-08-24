@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceKind {
@@ -25,7 +25,7 @@ pub struct ConnectionRequest {
     pub host: String,
     pub port: Option<u16>,
     pub username: String,
-    pub password: String,
+    pub password: SecretString,
     pub domain: Option<String>,
 }
 
@@ -104,7 +104,7 @@ pub fn validate_connection(
             "username_required",
         ));
     }
-    if request.password.is_empty() {
+    if request.password.expose_secret().is_empty() {
         return Err(ConnectionValidationError::new(
             "password",
             "password_required",
@@ -144,7 +144,7 @@ pub fn validate_connection(
             port,
         },
         username: username.to_owned(),
-        password: SecretString::from(request.password),
+        password: request.password,
         domain,
     })
 }
@@ -159,7 +159,7 @@ mod tests {
             host: host.to_owned(),
             port,
             username: "sun".to_owned(),
-            password: "secret-value".to_owned(),
+            password: SecretString::from("secret-value".to_owned()),
             domain: None,
         }
     }
@@ -217,7 +217,7 @@ mod tests {
                 "password",
                 "password_required",
                 ConnectionRequest {
-                    password: String::new(),
+                    password: SecretString::from(String::new()),
                     ..request(ServiceKind::MacOsArd, "mac.local", None)
                 },
             ),

@@ -31,6 +31,8 @@ rsa = { version = "0.9", optional = true }
 secrecy = "0.10"
 crossbeam-channel = "0.5"
 raw-window-handle = "0.6"
+zeroize = "1"
+egui = { version = "=0.36.1", default-features = false, features = ["default_fonts"], optional = true }
 getrandom = { version = "0.2", optional = true }
 minifb = { version = "0.28", optional = true }
 cpal = { version = "0.18.2", optional = true }
@@ -67,6 +69,7 @@ cli = [
     "dep:windows-sys",
 ]
 viewer = ["cli", "dep:minifb", "dep:cpal"]
+gui = ["dep:egui"]
 
 [profile.release]
 lto = "thin"

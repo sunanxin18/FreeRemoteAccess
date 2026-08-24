@@ -210,7 +210,7 @@ feat(session): add bounded protocol and platform boundaries
 - Consumes: user connection fields and `SessionSnapshot`.
 - Produces: `FreeRemoteApplication`, `ConnectionFormState`, `UiAction`, and a zeroizing password buffer.
 
-- [ ] **Step 1: Write failing secret and form tests**
+- [x] **Step 1: Write failing secret and form tests**
 
 ```rust
 #[test]
@@ -229,23 +229,23 @@ fn debug_output_never_contains_password() {
 }
 ```
 
-- [ ] **Step 2: Run RED UI model tests**
+- [x] **Step 2: Run RED UI model tests**
 
 Run: `cargo test --locked ui:: --lib`
 
 Expected: compilation fails because the UI model does not exist.
 
-- [ ] **Step 3: Implement minimal model and egui views**
+- [x] **Step 3: Implement minimal model and egui views**
 
 Use `Zeroizing<String>` for the editable password, move a copied secret directly into the existing `validate_connection` boundary at submission, immediately clear the edit buffer, and disable recent-password persistence. Render service choices `自动识别`, `Windows`, `Mac OS`, and `Linux / VNC`; show the domain field only for Windows.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `cargo test --locked ui:: --lib`
 
 Expected: UI model, field visibility, redaction, and transition tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 feat(ui): add secret-safe Rust application model
