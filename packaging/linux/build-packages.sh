@@ -16,9 +16,10 @@ cp target/generate-rpm/*.rpm "$dist_dir/$artifact_prefix.rpm"
 
 install -m 755 target/release/freeremotedesk "$appdir/usr/bin/freeremoteaccess"
 install -m 644 packaging/linux/freeremoteaccess.desktop "$appdir/freeremoteaccess.desktop"
+install -m 644 packaging/linux/freeremoteaccess.desktop "$appdir/usr/share/applications/freeremoteaccess.desktop"
 install -m 644 packaging/linux/freeremoteaccess.svg "$appdir/freeremoteaccess.svg"
 install -m 644 packaging/linux/freeremoteaccess.svg "$appdir/usr/share/icons/hicolor/scalable/apps/freeremoteaccess.svg"
-install -m 644 packaging/linux/freeremoteaccess.metainfo.xml "$appdir/usr/share/metainfo/freeremoteaccess.appdata.xml"
+install -m 644 packaging/linux/io.freeremote.access.metainfo.xml "$appdir/usr/share/metainfo/io.freeremote.access.metainfo.xml"
 ln -sf usr/bin/freeremoteaccess "$appdir/AppRun"
 curl --fail --location --retry 3 \
   --output "$dist_dir/appimagetool.AppImage" \

@@ -19,7 +19,7 @@ assets = [
     ["target/release/freeremotedesk", "usr/bin/freeremoteaccess", "755"],
     ["packaging/linux/freeremoteaccess.desktop", "usr/share/applications/freeremoteaccess.desktop", "644"],
     ["packaging/linux/freeremoteaccess.svg", "usr/share/icons/hicolor/scalable/apps/freeremoteaccess.svg", "644"],
-    ["packaging/linux/freeremoteaccess.metainfo.xml", "usr/share/metainfo/io.freeremote.access.metainfo.xml", "644"],
+    ["packaging/linux/io.freeremote.access.metainfo.xml", "usr/share/metainfo/io.freeremote.access.metainfo.xml", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -28,7 +28,7 @@ assets = [
     { source = "target/release/freeremotedesk", dest = "/usr/bin/freeremoteaccess", mode = "755" },
     { source = "packaging/linux/freeremoteaccess.desktop", dest = "/usr/share/applications/freeremoteaccess.desktop", mode = "644" },
     { source = "packaging/linux/freeremoteaccess.svg", dest = "/usr/share/icons/hicolor/scalable/apps/freeremoteaccess.svg", mode = "644" },
-    { source = "packaging/linux/freeremoteaccess.metainfo.xml", dest = "/usr/share/metainfo/io.freeremote.access.metainfo.xml", mode = "644" },
+    { source = "packaging/linux/io.freeremote.access.metainfo.xml", dest = "/usr/share/metainfo/io.freeremote.access.metainfo.xml", mode = "644" },
 ]
 
 [[bin]]

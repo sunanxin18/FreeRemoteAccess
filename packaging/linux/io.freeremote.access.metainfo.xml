@@ -5,6 +5,7 @@
   <summary>连接系统原生 RDP、ARD 和 VNC 服务</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>LicenseRef-Proprietary</project_license>
+  <url type="homepage">https://github.com/sunanxin18/FreeRemoteAccess</url>
   <launchable type="desktop-id">freeremoteaccess.desktop</launchable>
   <description>
     <p>FreeRemoteAccess 是纯 Rust 远程登录客户端，直接连接未经修改的系统原生远程服务。</p>
@@ -12,4 +13,5 @@
   <releases>
     <release version="0.1.0" date="2026-08-25"/>
   </releases>
+  <content_rating type="oars-1.1"/>
 </component>
