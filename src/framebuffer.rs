@@ -32,7 +32,6 @@ impl Framebuffer {
         })
     }
 
-    #[cfg(any(feature = "viewer", test))]
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
     }

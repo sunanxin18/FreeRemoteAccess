@@ -788,6 +788,20 @@ fn sanitize_cold_authentication_error(error: anyhow::Error) -> anyhow::Error {
 }
 
 impl VncClient {
+    pub fn connect_timeout_with_policy(
+        addr: &SocketAddr,
+        timeout: Duration,
+        username: Option<&str>,
+        password: Option<&str>,
+        encoding_profile: session::SessionEncodingProfile,
+        security_policy: SecurityPolicy,
+    ) -> Result<VncClient> {
+        let negotiated = negotiate(addr, timeout)?;
+        let authenticated =
+            authenticate_security_with_policy(negotiated, username, password, security_policy)?;
+        finish_authenticated_session(authenticated, encoding_profile)
+    }
+
     pub fn connect_timeout_opts(
         addr: &SocketAddr,
         timeout: Duration,

@@ -1,6 +1,12 @@
 pub mod app;
 pub mod core;
+#[cfg(feature = "cli")]
+pub mod framebuffer;
+#[cfg(feature = "viewer")]
+pub mod keysym;
 pub mod platform;
 pub mod protocols;
 pub mod session;
 pub mod ui;
+#[cfg(feature = "cli")]
+pub mod vnc;

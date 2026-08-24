@@ -119,6 +119,7 @@ pub enum RfbClientMessageType {
     FramebufferUpdateRequest = 3,
     KeyEvent = 4,
     PointerEvent = 5,
+    ClientCutText = 6,
 }
 
 /// 标准 RFB 服务器消息类型。
@@ -190,6 +191,7 @@ pub const POINTER_EVENT_BUTTON_MASK_OFFSET: usize = RFB_CLIENT_MESSAGE_TYPE_WIDT
 pub const POINTER_EVENT_X_OFFSET: usize = POINTER_EVENT_BUTTON_MASK_OFFSET + size_of::<u8>();
 #[cfg_attr(not(feature = "viewer"), allow(dead_code))]
 pub const POINTER_EVENT_Y_OFFSET: usize = POINTER_EVENT_X_OFFSET + size_of::<u16>();
+pub const CLIENT_CUT_TEXT_PADDING_BYTES: usize = 3;
 
 /// 帧编码：原始像素
 pub const RAW: i32 = 0;
@@ -211,7 +213,6 @@ pub mod limits {
 }
 
 /// 标准 RFB PointerEvent 按键与滚轮位掩码。
-#[cfg(feature = "viewer")]
 pub mod pointer {
     pub const PRIMARY: u8 = 1;
     pub const MIDDLE: u8 = 2;
@@ -387,7 +388,6 @@ pub fn msg_fb_update_request(
 }
 
 /// KeyEvent（客户端消息 4）。keysym 为 X11 键码（如 'a'=0x61, Return=0xff0d）
-#[cfg(feature = "viewer")]
 pub fn msg_key_event(down: bool, keysym: u32) -> [u8; KEY_EVENT_MESSAGE_BYTES] {
     let mut m = [0u8; KEY_EVENT_MESSAGE_BYTES];
     m[RFB_CLIENT_MESSAGE_TYPE_OFFSET] = RfbClientMessageType::KeyEvent as u8;
@@ -399,7 +399,6 @@ pub fn msg_key_event(down: bool, keysym: u32) -> [u8; KEY_EVENT_MESSAGE_BYTES] {
 /// PointerEvent（客户端消息 5）。
 /// 按键位定义：bit0 左键、bit1 中键、bit2 右键、bit3 滚轮上、
 /// bit4 滚轮下、bit5 滚轮右、bit6 滚轮左。
-#[cfg(feature = "viewer")]
 pub fn msg_pointer_event(button_mask: u8, x: u16, y: u16) -> [u8; POINTER_EVENT_MESSAGE_BYTES] {
     let mut m = [0u8; POINTER_EVENT_MESSAGE_BYTES];
     m[RFB_CLIENT_MESSAGE_TYPE_OFFSET] = RfbClientMessageType::PointerEvent as u8;
@@ -407,6 +406,26 @@ pub fn msg_pointer_event(button_mask: u8, x: u16, y: u16) -> [u8; POINTER_EVENT_
     m[POINTER_EVENT_X_OFFSET..POINTER_EVENT_Y_OFFSET].copy_from_slice(&x.to_be_bytes());
     m[POINTER_EVENT_Y_OFFSET..].copy_from_slice(&y.to_be_bytes());
     m
+}
+
+pub fn msg_client_cut_text(text: &str) -> Result<Vec<u8>> {
+    let bytes = text.as_bytes();
+    ensure!(
+        bytes.len() <= SERVER_CUT_TEXT_MAX_BYTES,
+        "ClientCutText 长度超过资源预算"
+    );
+    let length = u32::try_from(bytes.len()).context("ClientCutText 长度超出 u32")?;
+    let mut message = Vec::with_capacity(
+        RFB_CLIENT_MESSAGE_TYPE_WIDTH_BYTES
+            + CLIENT_CUT_TEXT_PADDING_BYTES
+            + size_of::<u32>()
+            + bytes.len(),
+    );
+    message.push(RfbClientMessageType::ClientCutText as u8);
+    message.extend(std::iter::repeat_n(0, CLIENT_CUT_TEXT_PADDING_BYTES));
+    message.extend_from_slice(&length.to_be_bytes());
+    message.extend_from_slice(bytes);
+    Ok(message)
 }
 
 #[cfg(test)]

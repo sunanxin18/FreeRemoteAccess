@@ -25,6 +25,10 @@ impl ProtocolContext {
     pub fn connection(&self) -> &ValidatedConnection {
         &self.connection
     }
+
+    pub fn into_connection(self) -> ValidatedConnection {
+        self.connection
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +51,8 @@ pub enum SessionEvent {
         format: RemotePixelFormat,
     },
     Render(RenderUpdate),
+    ClipboardText(String),
+    Bell,
     Connected {
         generation: u64,
     },
@@ -218,6 +224,7 @@ impl SessionModel {
                 self.phase = SessionPhase::Connected;
             }
             SessionEvent::Render(update) => self.validate_render_update(&update)?,
+            SessionEvent::ClipboardText(_) | SessionEvent::Bell => {}
             SessionEvent::Disconnecting
                 if matches!(
                     self.phase,
