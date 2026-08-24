@@ -114,7 +114,7 @@ impl RfbConn {
         Ok(())
     }
 
-    #[cfg(feature = "viewer")]
+    #[cfg(feature = "media")]
     pub fn try_clone(&self) -> std::io::Result<TcpStream> {
         self.stream.try_clone()
     }
@@ -144,7 +144,7 @@ impl RfbConn {
     }
 
     /// 加密句柄（viewer 等跨线程写侧共享发送状态用）
-    #[cfg(feature = "viewer")]
+    #[cfg(feature = "media")]
     pub fn crypto_handle(
         &self,
     ) -> Option<std::sync::Arc<std::sync::Mutex<session::SessionCrypto>>> {
@@ -740,6 +740,7 @@ fn pick_security_with_policy(
     }
 }
 
+#[cfg(test)]
 fn pick_security(types: &[u8], username: Option<&str>, password: Option<&str>) -> Result<u8> {
     pick_security_with_policy(
         types,

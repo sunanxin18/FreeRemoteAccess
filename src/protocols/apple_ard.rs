@@ -10,10 +10,12 @@ use crate::session::{
     ProtocolContext, SessionCommand, SessionError, SessionEvent, SessionEventSink,
 };
 use crate::vnc::client::{SecurityPolicy, VncClient};
+#[cfg(feature = "media")]
 use crate::vnc::media_negotiation::AudioMediaFlow;
 use crate::vnc::session::SessionEncodingProfile;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "media")]
 const DISPLAY_NAME: &str = "FreeRemoteAccess 虚拟显示器";
 
 pub struct AppleArdAdapter;
@@ -64,9 +66,9 @@ impl ProtocolAdapter for AppleArdAdapter {
             return Err(SessionError::new("apple_native_encryption_required"));
         }
 
-        #[cfg(feature = "viewer")]
+        #[cfg(feature = "media")]
         {
-            crate::vnc::hpss_viewer::run_protocol_session(
+            crate::vnc::hpss_session::run_protocol_session(
                 client.conn,
                 DISPLAY_NAME,
                 client.width,
@@ -78,7 +80,7 @@ impl ProtocolAdapter for AppleArdAdapter {
             )
             .map_err(|_| SessionError::new("apple_hpss_session_failed"))
         }
-        #[cfg(not(feature = "viewer"))]
+        #[cfg(not(feature = "media"))]
         {
             let _ = (client, commands, events);
             Err(SessionError::new("apple_hpss_feature_unavailable"))

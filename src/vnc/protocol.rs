@@ -111,7 +111,7 @@ pub fn parse_rfb_banner(bytes: &[u8]) -> Result<ParsedRfbBanner> {
 
 /// 标准 RFB 客户端消息类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 #[repr(u8)]
 pub enum RfbClientMessageType {
     SetPixelFormat = 0,
@@ -177,19 +177,19 @@ pub const FRAMEBUFFER_UPDATE_REQUEST_WIDTH_OFFSET: usize =
     FRAMEBUFFER_UPDATE_REQUEST_Y_OFFSET + size_of::<u16>();
 pub const FRAMEBUFFER_UPDATE_REQUEST_HEIGHT_OFFSET: usize =
     FRAMEBUFFER_UPDATE_REQUEST_WIDTH_OFFSET + size_of::<u16>();
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub const KEY_EVENT_MESSAGE_BYTES: usize = 8;
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub const KEY_EVENT_DOWN_OFFSET: usize = RFB_CLIENT_MESSAGE_TYPE_WIDTH_BYTES;
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub const KEY_EVENT_KEYSYM_OFFSET: usize = RFB_CLIENT_MESSAGE_TYPE_WIDTH_BYTES + 3;
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub const POINTER_EVENT_MESSAGE_BYTES: usize = 6;
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub const POINTER_EVENT_BUTTON_MASK_OFFSET: usize = RFB_CLIENT_MESSAGE_TYPE_WIDTH_BYTES;
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub const POINTER_EVENT_X_OFFSET: usize = POINTER_EVENT_BUTTON_MASK_OFFSET + size_of::<u8>();
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 pub const POINTER_EVENT_Y_OFFSET: usize = POINTER_EVENT_X_OFFSET + size_of::<u16>();
 pub const CLIENT_CUT_TEXT_PADDING_BYTES: usize = 3;
 
@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
+    #[cfg(feature = "media")]
     fn pointer_mask_owners_match_independent_boundary_and_combined_fixtures() {
         assert_eq!(
             [

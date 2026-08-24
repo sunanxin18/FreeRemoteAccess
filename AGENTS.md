@@ -73,20 +73,27 @@
   a production implementation path.
 
 ## Project Structure & Module Organization
-FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
+FreeRemoteDesk is a pure-Rust native remote-login client. Windows, macOS, and
+Linux desktop delivery is Phase 1; Android and HarmonyOS are Phase 2 platform
+adapters over the same core. The desktop application uses one
+`winit + egui + wgpu` window.
 
-- `src/main.rs`: CLI entrypoint and subcommand dispatch (`scan`, `info`, `shot`,
-  `view`, `proxy`, `esess`, `hpss`, `hpssview`).
+- `src/main.rs`: native GUI launch plus protocol/reverse-engineering CLI tools.
+- `src/core/`, `src/session/`: platform/protocol-neutral contracts and bounded
+  session engine.
+- `src/protocols/`: RDP, Apple ARD, and standard RFB adapters.
+- `src/platform/`, `src/ui/`: native platform boundary and the single Rust GUI.
 - `src/arp.rs`: ARP discovery via Windows `SendARP` and LAN host probing.
 - `src/vnc/`: protocol stack and security logic. `session.rs`, `srp.rs`, and
   `rsa_srp.rs` cover Apple session/auth experiments; `hpss.rs` covers HPSS
   negotiation/media records/capture; `mvs.rs`, `mvs_stream.rs`,
-  `dynamic_resolution.rs`, and `hpss_viewer.rs` implement the evidence-bounded
+  `dynamic_resolution.rs`, and `hpss_session.rs` implement the evidence-bounded
   P1/P2 state machines; `media_protocol.rs`, `media_negotiation.rs`,
   `media_transport.rs`, `srtp.rs`, `audio_codec.rs`, and `audio_io.rs` contain
   the verified P3/P4 control, transport, cryptographic, codec, and device paths.
-- `src/framebuffer.rs`, `src/viewer.rs`, `src/keysym.rs`: frame rendering/input path.
+- `src/framebuffer.rs`: bounded CPU framebuffer used by protocol decoders.
 - `src/proxy.rs`: local capture proxy for protocol capture.
+- `packaging/`: native Windows MSI, macOS app/pkg/dmg, and Linux deb/rpm/AppImage.
 - `docs/ARD_PROTOCOL.md`: ARD protocol notes and reverse notes.
 - `ard_re/`: local Apple ARD/Screen Sharing reverse-engineering evidence,
   extracted binaries, Ghidra scripts/projects, disassembly, and prior probes.
@@ -147,25 +154,29 @@ FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
   inferred field layout.
 
 ## Build, Test, and Development Commands
-- `cargo build --release` — build optimized Windows executable at `target\release\freeremotedesk.exe`.
-- `cargo build --no-default-features` — headless build without viewer/minifb dependencies.
-- `cargo test` — run unit tests and mock-server integration tests.
+- `cargo build --locked --release` — build the native GUI client for the host platform.
+- `cargo build --locked --no-default-features --features cli` — protocol CLI only.
+- `cargo test --locked --all-targets --features gui` — full desktop test matrix.
 - `cargo test key_derivation_vector` — run a focused cryptography regression test.
-- `cargo fmt` — format source before PR.
+- `cargo fmt --all -- --check` — verify formatting before PR.
 - `cargo run -- --help` — print CLI usage.
-- `.\target\release\freeremotedesk.exe scan` and `.\target\release\freeremotedesk.exe view <host>`; credentials come from the non-echoing `FRD_USERNAME`/`FRD_PASSWORD` environment provider, never argv.
+- Running `.\target\release\freeremotedesk.exe` without arguments opens the GUI.
+- Protocol CLI credentials come from the non-echoing
+  `FRD_USERNAME`/`FRD_PASSWORD` environment provider, never argv.
 - Before changing P1/P2, add focused tests for generation transitions, exact
   MVS record reassembly, full-frame reset, partial update rejection/resync, and
   stale-frame handling. The current expected verification matrix is
-  `cargo fmt -- --check`, both test configurations, both build configurations,
-  and the top-level plus `hpssview` help output. Treat live target validation as
+  `cargo fmt --all -- --check`, the GUI test matrix, GUI and CLI-only builds,
+  and the top-level help output. Treat live target validation as
   a separate evidence step; do not imply it from unit tests.
 
 ## Coding Style & Naming Conventions
 - Rust 2021, prefer idiomatic Rust style and module boundaries.
 - Use 4-space indentation and `snake_case` for functions/variables, `PascalCase` for types, `SCREAMING_SNAKE_CASE` for constants.
 - Keep user-facing CLI text and comments in Simplified Chinese.
-- Keep protocol changes consistent across modules when touching the pixel contract (`protocol.rs`, `client.rs`, `framebuffer.rs`, `viewer.rs`).
+- Keep protocol changes consistent across modules when touching the pixel contract
+  (`protocol.rs`, `client.rs`, `framebuffer.rs`, `core/frame.rs`, and
+  `ui/remote_texture.rs`).
 
 ## Testing Guidelines
 - Primary framework: Rust built-in test harness via `cargo test`.

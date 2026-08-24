@@ -106,7 +106,7 @@ impl MvsDecodeState {
         }
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn reset(&mut self, generation: u64) {
         self.generation = generation;
         self.decoder = None;
@@ -281,7 +281,7 @@ impl MvsDecodeState {
         Ok(())
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn awaiting_full(&self) -> bool {
         self.awaiting_full
     }

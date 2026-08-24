@@ -66,34 +66,34 @@ const RTCP_SOURCE_DESCRIPTION_CNAME_ITEM: u8 = 1;
 const RTCP_SOURCE_DESCRIPTION_END_ITEM: u8 = 0;
 const RTCP_WORD_LEN: usize = 4;
 const RTCP_COMMON_HEADER_LEN: usize = 4;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_REPORT_COUNT_MASK: u8 = 0x1f;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_PACKET_TYPE_OFFSET: usize = 1;
 const RTCP_LENGTH_OFFSET: usize = 2;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_SENDER_REPORT_PREFIX_LEN: usize = 28;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_RECEIVER_REPORT_PREFIX_LEN: usize = 8;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_RECEPTION_REPORT_LEN: usize = 24;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_REPORT_SOURCE_SSRC_OFFSET: usize = 0;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_REPORT_FRACTION_LOST_OFFSET: usize = 4;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_REPORT_CUMULATIVE_LOST_OFFSET: usize = 5;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_CUMULATIVE_LOSS_BYTES: usize = 3;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_CUMULATIVE_LOSS_SIGN_BIT: u32 = 1 << 23;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_CUMULATIVE_LOSS_SIGN_EXTENSION_MASK: u32 = 0xff00_0000;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_REPORT_EXTENDED_HIGHEST_SEQUENCE_OFFSET: usize = 8;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_REPORT_INTERARRIVAL_JITTER_OFFSET: usize = 12;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const RTCP_SENDER_REPORT_PACKET_TYPE: u8 = 200;
 const SCREEN_SHARING_CNAME_PREFIX: &str = "freeremotedesk-";
 
@@ -136,14 +136,14 @@ pub struct RtpHeader {
     pub payload_offset: usize,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtpPacket<'a> {
     pub header: RtpHeader,
     pub payload: &'a [u8],
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtcpReceptionReport {
     pub reporter_ssrc: u32,
@@ -172,7 +172,7 @@ pub fn classify_rtp_mux_packet(packet: &[u8]) -> Result<RtpMuxPacketKind> {
     }
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 fn decode_signed_24_be(bytes: [u8; RTCP_CUMULATIVE_LOSS_BYTES]) -> i32 {
     let raw = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]);
     if raw & RTCP_CUMULATIVE_LOSS_SIGN_BIT != 0 {
@@ -202,7 +202,7 @@ pub fn parse_rtp_header(packet: &[u8]) -> Result<RtpHeader> {
     })
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 pub fn parse_rtp_packet(packet: &[u8]) -> Result<RtpPacket<'_>> {
     validate_rtp_packet(packet)?;
     let header = parse_rtp_header(packet)?;
@@ -222,7 +222,7 @@ pub fn parse_rtp_packet(packet: &[u8]) -> Result<RtpPacket<'_>> {
     })
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 pub fn parse_rtcp_reception_reports(compound: &[u8]) -> Result<Vec<RtcpReceptionReport>> {
     let mut reports = Vec::new();
     let mut packet_offset = 0usize;
@@ -349,7 +349,7 @@ pub fn crypt_rtp_packet_in_place(
     Ok(())
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 pub fn protect_rtp_packet(
     packet: &[u8],
     keys: &SrtpSessionKeys,

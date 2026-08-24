@@ -11,7 +11,7 @@ impl DisplaySize {
     }
 
     /// 将查看器视口转换为当前支持的请求尺寸。
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn from_viewport(width: usize, height: usize) -> Option<Self> {
         const MINIMUM: usize = 64;
         const ALIGNMENT: usize = 8;
@@ -27,7 +27,7 @@ impl DisplaySize {
 }
 
 /// Apple 客户端中动态分辨率可用前必须满足的证据门槛。
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DynamicResolutionCapability {
     pub avc_stream: bool,
@@ -36,7 +36,7 @@ pub struct DynamicResolutionCapability {
     pub paused: bool,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 impl DynamicResolutionCapability {
     pub const fn new(
         avc_stream: bool,
@@ -57,7 +57,7 @@ impl DynamicResolutionCapability {
     }
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DynamicResolutionState {
     Unavailable,
@@ -80,21 +80,21 @@ pub enum DynamicResolutionState {
     },
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionRequest {
     pub generation: u64,
     pub target: DisplaySize,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeometryCommit {
     pub generation: u64,
     pub size: DisplaySize,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StableDisplay {
     generation: u64,
@@ -102,13 +102,13 @@ struct StableDisplay {
 }
 
 /// 纯粹的、由确认驱动的动态分辨率状态机。
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 pub struct DynamicResolutionController {
     stable: StableDisplay,
     state: DynamicResolutionState,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 impl DynamicResolutionController {
     pub fn new(
         initial_size: DisplaySize,

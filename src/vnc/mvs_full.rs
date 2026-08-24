@@ -23,7 +23,9 @@ const MVS_CACHE_SLOT_COUNT: usize = 65_000;
 const MVS_CACHE_ENTRY_BYTES: usize = 99;
 const MVS_CACHE_LAST_USABLE_INDEX: u16 = 64_999;
 
+#[cfg(test)]
 const APPLE_LUMA_AC_BITS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125];
+#[cfg(test)]
 const APPLE_LUMA_AC_VALUES: [u8; 162] = [
     0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
     0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
@@ -58,6 +60,7 @@ struct AppleHuffmanTable {
     values: &'static [u8; 162],
 }
 
+#[cfg(test)]
 const APPLE_LUMA_AC_HUFFMAN: AppleHuffmanTable = AppleHuffmanTable {
     bits: &APPLE_LUMA_AC_BITS,
     values: &APPLE_LUMA_AC_VALUES,

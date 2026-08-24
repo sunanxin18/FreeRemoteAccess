@@ -9,12 +9,12 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-#[cfg(all(debug_assertions, feature = "viewer"))]
+#[cfg(all(debug_assertions, feature = "media"))]
 use sha2::{Digest as _, Sha256};
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 use crate::vnc::audio_codec::{ARD_AUDIO_RTP_PAYLOAD_TYPE, ARD_AUDIO_SAMPLES_PER_ACCESS_UNIT};
-#[cfg(feature = "viewer")]
+#[cfg(feature = "media")]
 use crate::vnc::media_negotiation::MediaNegotiatorMode;
 use crate::vnc::media_negotiation::{
     encode_client_media_stream_configuration, AudioMediaFlow, ClientMediaStreamConfiguration,
@@ -26,7 +26,7 @@ use crate::vnc::srtp::{
     secure_packet_discard_kind, RtpMuxPacketKind, SecurePacketDiscardKind, SrtcpReceiver,
     SrtcpSender, SrtpPacketKind, SrtpReceiver,
 };
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 use crate::vnc::srtp::{
     parse_rtcp_reception_reports, protect_rtp_packet, RtcpReceptionReport, SrtpSessionKeys,
     RTP_FIXED_HEADER_LEN, RTP_MARKER_MASK, RTP_VERSION, RTP_VERSION_SHIFT,
@@ -35,7 +35,7 @@ use crate::vnc::srtp::{
 pub const MAX_MEDIA_DATAGRAM_BYTES: usize = 65_507;
 pub const MAX_MEDIA_DATAGRAMS_PER_ROLE_PER_POLL: usize = 256;
 const MEDIA_CONTROL_REPORT_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 const SRTP_UNAMBIGUOUS_INITIAL_SEQUENCE_MASK: u16 = u16::MAX >> 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -62,7 +62,7 @@ struct BoundMediaSocket {
     socket: UdpSocket,
     remote: SocketAddr,
     outbound_control: Option<OutboundControlStream>,
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     outbound_rtp: Option<OutboundRtpStream>,
     inbound_crypto: Option<InboundCryptoStream>,
 }
@@ -72,7 +72,7 @@ struct OutboundControlStream {
     sender: SrtcpSender,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 struct OutboundRtpStream {
     local_ssrc: u32,
     keys: SrtpSessionKeys,
@@ -82,7 +82,7 @@ struct OutboundRtpStream {
     marker_pending: bool,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutboundRtpPacketMetadata {
     pub sequence: u16,
@@ -91,7 +91,7 @@ pub struct OutboundRtpPacketMetadata {
     pub ssrc: u32,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutboundAudioSentRange {
     pub ssrc: u32,
@@ -100,7 +100,7 @@ pub struct OutboundAudioSentRange {
     pub packets_sent: u32,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioReceptionEvidence {
     NotObserved,
@@ -114,21 +114,21 @@ pub enum AudioReceptionEvidence {
     },
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 impl Default for AudioReceptionEvidence {
     fn default() -> Self {
         Self::NotObserved
     }
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 #[derive(Debug, Default)]
 struct OutboundAudioEvidenceTracker {
     sent_range: Option<OutboundAudioSentRange>,
     evidence: AudioReceptionEvidence,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 impl OutboundAudioEvidenceTracker {
     fn record_sent(&mut self, metadata: OutboundRtpPacketMetadata) -> Result<()> {
         match self.sent_range.as_mut() {
@@ -188,7 +188,7 @@ impl OutboundAudioEvidenceTracker {
     }
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 impl OutboundRtpStream {
     fn new(local_ssrc: u32, keys: SrtpSessionKeys) -> Result<Self> {
         let mut sequence = [0u8; size_of::<u16>()];
@@ -359,7 +359,7 @@ pub struct MediaTransport {
     audio_flow: AudioMediaFlow,
     discard_counters: MediaDiscardCounters,
     next_poll_role_index: usize,
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     outbound_audio_evidence: OutboundAudioEvidenceTracker,
 }
 
@@ -377,7 +377,7 @@ impl MediaTransport {
             audio_flow: AudioMediaFlow::MacToPc,
             discard_counters: MediaDiscardCounters::default(),
             next_poll_role_index: 0,
-            #[cfg(any(feature = "viewer", test))]
+            #[cfg(any(feature = "media", test))]
             outbound_audio_evidence: OutboundAudioEvidenceTracker::default(),
         }
     }
@@ -387,7 +387,7 @@ impl MediaTransport {
     }
 
     /// 仅当当前 generation 的 mode-4 Audio 数据面完整激活时允许启动 P5 探针。
-    #[cfg(feature = "viewer")]
+    #[cfg(feature = "media")]
     pub fn pc_to_mac_audio_probe_ready(&self, generation: u64) -> bool {
         self.validate_generation(generation).is_ok()
             && self.phase == MediaTransportPhase::Active
@@ -402,24 +402,24 @@ impl MediaTransport {
             && self.answer.is_some()
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn outbound_audio_sent_range(&self) -> Option<OutboundAudioSentRange> {
         self.outbound_audio_evidence.sent_range
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn audio_reception_evidence(&self) -> AudioReceptionEvidence {
         self.outbound_audio_evidence.evidence
     }
 
     fn reset_outbound_audio_evidence(&mut self) {
-        #[cfg(any(feature = "viewer", test))]
+        #[cfg(any(feature = "media", test))]
         {
             self.outbound_audio_evidence = OutboundAudioEvidenceTracker::default();
         }
     }
 
-    #[cfg(all(debug_assertions, feature = "viewer"))]
+    #[cfg(all(debug_assertions, feature = "media"))]
     pub fn diagnostic_audio_material_fingerprints(&self) -> Option<(String, String)> {
         fn fingerprint(material: &crate::vnc::media_negotiation::SrtpMasterMaterial) -> String {
             // Apple 的统一日志只显示 NSData 的前 16 字节和末 8 字节。复现同一
@@ -448,7 +448,7 @@ impl MediaTransport {
         })
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn set_audio_flow(&mut self, audio_flow: AudioMediaFlow) -> Result<()> {
         ensure!(
             self.phase == MediaTransportPhase::Idle,
@@ -540,7 +540,7 @@ impl MediaTransport {
                     socket,
                     remote: SocketAddr::new(self.server_address, descriptor.port),
                     outbound_control: None,
-                    #[cfg(any(feature = "viewer", test))]
+                    #[cfg(any(feature = "media", test))]
                     outbound_rtp: None,
                     inbound_crypto: None,
                 });
@@ -637,7 +637,7 @@ impl MediaTransport {
                 local_ssrc: entry.offer.local_ssrc,
                 sender: SrtcpSender::new(rtcp_keys),
             });
-            #[cfg(any(feature = "viewer", test))]
+            #[cfg(any(feature = "media", test))]
             {
                 bound.outbound_rtp = Some(OutboundRtpStream::new(
                     entry.offer.local_ssrc,
@@ -708,7 +708,7 @@ impl MediaTransport {
             .with_context(|| format!("媒体角色 {role:?} 没有已绑定 socket"))
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     fn socket_mut(&mut self, generation: u64, role: MediaRole) -> Result<&mut BoundMediaSocket> {
         self.validate_generation(generation)?;
         self.sockets
@@ -818,7 +818,7 @@ impl MediaTransport {
         Ok(())
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn send_audio_access_unit(
         &mut self,
         generation: u64,
@@ -917,7 +917,7 @@ impl MediaTransport {
         };
         match crypto_result {
             Ok(Some(plaintext)) => {
-                #[cfg(any(feature = "viewer", test))]
+                #[cfg(any(feature = "media", test))]
                 if role == MediaRole::Audio && packet_kind == RtpMuxPacketKind::Rtcp {
                     let reports = match parse_rtcp_reception_reports(&plaintext) {
                         Ok(reports) => reports,

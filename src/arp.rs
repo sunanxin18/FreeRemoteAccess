@@ -12,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::NetworkManagement::IpHelper::SendARP;
 
 use crate::vnc::protocol;
@@ -39,6 +40,7 @@ impl Host {
 
 /// 常见 Apple OUI（MAC 地址前 3 字节）。非完整数据库，仅作提示；
 /// 判断一台设备是否为可连接的 macOS，以 5900 端口的 RFB banner 为准。
+#[cfg(target_os = "windows")]
 const APPLE_OUIS: &[&str] = &[
     "00:03:93", "00:05:02", "00:0A:27", "00:10:FA", "00:14:51", "00:16:CB", "00:17:F2", "00:19:E3",
     "00:1B:63", "00:1C:B3", "00:1D:4F", "00:1E:52", "00:1F:5B", "00:1F:F3", "00:22:41", "00:23:12",
@@ -54,6 +56,7 @@ const APPLE_OUIS: &[&str] = &[
     "D8:00:4D", "DC:2B:61", "E0:F8:47", "E4:CE:8F", "E8:80:2E", "F0:18:98", "F8:1E:DF",
 ];
 
+#[cfg(target_os = "windows")]
 fn vendor_of(mac: &[u8; 6]) -> &'static str {
     let key = format!("{:02X}:{:02X}:{:02X}", mac[0], mac[1], mac[2]);
     if APPLE_OUIS.contains(&key.as_str()) {
@@ -66,17 +69,26 @@ fn vendor_of(mac: &[u8; 6]) -> &'static str {
 /// 对目标 IP 发送真实 ARP 请求并等待应答（"ARP ping"）。
 /// 在线主机返回 MAC；离线主机在内核内部超时后返回 None。
 pub fn arp_lookup(ip: Ipv4Addr) -> Option<[u8; 6]> {
-    // SendARP 要求以网络字节序传递 IPv4：u32 的内存布局即 4 个地址字节
-    let dest = u32::from_le_bytes(ip.octets());
-    let mut mac_words = [0u32; 2];
-    let mut len: u32 = 8;
-    let rc = unsafe { SendARP(dest, 0, mac_words.as_mut_ptr().cast(), &mut len) };
-    if rc == 0 && len >= 6 {
-        let b0 = mac_words[0].to_le_bytes();
-        let b1 = mac_words[1].to_le_bytes();
-        Some([b0[0], b0[1], b0[2], b0[3], b1[0], b1[1]])
-    } else {
-        None
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ip;
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // SendARP 要求以网络字节序传递 IPv4：u32 的内存布局即 4 个地址字节
+        let dest = u32::from_le_bytes(ip.octets());
+        let mut mac_words = [0u32; 2];
+        let mut len: u32 = 8;
+        let rc = unsafe { SendARP(dest, 0, mac_words.as_mut_ptr().cast(), &mut len) };
+        if rc == 0 && len >= 6 {
+            let b0 = mac_words[0].to_le_bytes();
+            let b1 = mac_words[1].to_le_bytes();
+            Some([b0[0], b0[1], b0[2], b0[3], b1[0], b1[1]])
+        } else {
+            None
+        }
     }
 }
 
@@ -169,39 +181,48 @@ pub fn local_ipv4() -> Result<Ipv4Addr> {
 /// 多线程 ARP 扫描一个网段。SendARP 对离线主机会阻塞到内核超时，
 /// 因此用线程池并发探测来摊平延迟。
 pub fn sweep(net: Ipv4Net, threads: usize) -> Result<Vec<Host>> {
-    let ips = net.hosts()?;
-    let threads = threads.clamp(1, ips.len().max(1)).min(256);
-    eprintln!(
-        "ARP 扫描 {}（{} 个地址，{} 线程）…",
-        net,
-        ips.len(),
-        threads
-    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (net, threads);
+        bail!("当前平台不提供主动 ARP 扫描；请在连接页直接输入主机地址")
+    }
 
-    let found: std::sync::Mutex<Vec<Host>> = std::sync::Mutex::new(Vec::new());
-    let chunk = ips.len().div_ceil(threads);
-    thread::scope(|s| {
-        for group in ips.chunks(chunk.max(1)) {
-            let found = &found;
-            s.spawn(move || {
-                for ip in group {
-                    let ip = *ip;
-                    if let Some(mac) = arp_lookup(ip) {
-                        found.lock().unwrap().push(Host {
-                            ip,
-                            mac,
-                            vendor: vendor_of(&mac),
-                            vnc_banner: None,
-                        });
+    #[cfg(target_os = "windows")]
+    {
+        let ips = net.hosts()?;
+        let threads = threads.clamp(1, ips.len().max(1)).min(256);
+        eprintln!(
+            "ARP 扫描 {}（{} 个地址，{} 线程）…",
+            net,
+            ips.len(),
+            threads
+        );
+
+        let found: std::sync::Mutex<Vec<Host>> = std::sync::Mutex::new(Vec::new());
+        let chunk = ips.len().div_ceil(threads);
+        thread::scope(|s| {
+            for group in ips.chunks(chunk.max(1)) {
+                let found = &found;
+                s.spawn(move || {
+                    for ip in group {
+                        let ip = *ip;
+                        if let Some(mac) = arp_lookup(ip) {
+                            found.lock().unwrap().push(Host {
+                                ip,
+                                mac,
+                                vendor: vendor_of(&mac),
+                                vnc_banner: None,
+                            });
+                        }
                     }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
 
-    let mut hosts = found.into_inner().unwrap();
-    hosts.sort_by_key(|h| u32::from(h.ip));
-    Ok(hosts)
+        let mut hosts = found.into_inner().unwrap();
+        hosts.sort_by_key(|h| u32::from(h.ip));
+        Ok(hosts)
+    }
 }
 
 /// 对已发现主机并发探测 5900 端口，读取 RFB banner（"RFB 003.008"）
@@ -299,5 +320,12 @@ mod tests {
             net.hosts().unwrap(),
             vec![Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)]
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn active_arp_scan_fails_explicitly_on_unsupported_hosts() {
+        let error = sweep(Ipv4Net::from_str("192.0.2.0/30").unwrap(), 4).unwrap_err();
+        assert!(error.to_string().contains("当前平台不提供主动 ARP 扫描"));
     }
 }

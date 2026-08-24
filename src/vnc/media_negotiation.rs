@@ -248,7 +248,7 @@ pub enum MediaNegotiatorMode {
 pub enum AudioMediaFlow {
     MacToPc,
     #[cfg_attr(
-        not(any(feature = "viewer", test)),
+        not(any(feature = "media", test)),
         allow(
             dead_code,
             reason = "headless HPSS 仅接收远端音频，不公开远程麦克风入口"

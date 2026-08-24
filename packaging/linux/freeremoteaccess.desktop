@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FreeRemoteAccess
+Comment=连接系统原生 RDP、ARD 和 VNC 服务
+Exec=freeremoteaccess
+Icon=freeremoteaccess
+Terminal=false
+Categories=Network;RemoteAccess;

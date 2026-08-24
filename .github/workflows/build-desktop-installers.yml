@@ -1,0 +1,85 @@
+name: build-desktop-installers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, feat/five-platform-client]
+  pull_request:
+
+env:
+  RUST_TOOLCHAIN: 1.96.0
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libwayland-dev libxkbcommon-dev
+      - name: Verify Rust workspace
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --all-targets --features gui
+          cargo build --locked --release --no-default-features --features gui
+      - name: Verify artifact contracts
+        shell: pwsh
+        run: ./packaging/check-artifact.tests.ps1
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install WiX v4
+        run: dotnet tool install --global wix --version 4.*
+      - name: Build executable and MSI
+        shell: pwsh
+        run: ./packaging/windows/build-msi.ps1
+      - uses: actions/upload-artifact@v5
+        with:
+          name: FreeRemoteAccess-windows-x64
+          path: dist/windows/*
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build app, pkg and dmg
+        run: ./packaging/macos/build-packages.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: FreeRemoteAccess-macos-universal
+          path: dist/macos/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libwayland-dev libxkbcommon-dev libfuse2 rpm
+      - name: Install packaging tools
+        run: |
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+      - name: Build deb, rpm and AppImage
+        run: ./packaging/linux/build-packages.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: FreeRemoteAccess-linux-x86_64
+          path: dist/linux/*
+          if-no-files-found: error

@@ -13,7 +13,7 @@
 //!     首条 w=h=0 为表初始化；大帧按 0x8000 分块（总长跨块，需拼接）
 //!   - 0x450(1104) 光标：[u32 0x3e8][u32 zlib 长][zlib 数据]
 //!
-//! 实时交互视图见 hpss_viewer.rs（minifb 渲染 + 键鼠输入）。
+//! 实时交互会话见 hpss_session.rs（统一 SessionEngine + wgpu 渲染）。
 
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
@@ -364,7 +364,7 @@ impl HpssMvsCollector {
 
 /// True only when the fixed media header identifies MVS but its declared-total
 /// field is truncated.
-#[cfg(feature = "viewer")]
+#[cfg(feature = "media")]
 pub fn is_truncated_mvs_envelope(m: &[u8]) -> bool {
     MediaRectangle::parse(m).is_ok_and(|rectangle| {
         rectangle.encoding == encoding::MVS && rectangle.payload.len() < MVS_DECLARED_TOTAL_BYTES

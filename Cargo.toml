@@ -2,11 +2,34 @@
 name = "freeremotedesk"
 version = "0.1.0"
 edition = "2021"
-description = "ARP 局域网发现 + VNC(RFB) 客户端，用于连接 macOS 屏幕共享（Screen Sharing）"
+description = "纯 Rust 原生远程登录客户端，支持 RDP、Apple ARD 与 RFB/VNC"
+license = "LicenseRef-Proprietary"
 
 [workspace]
-members = ["native/freeremote_ffi"]
 resolver = "2"
+
+[package.metadata.deb]
+name = "freeremoteaccess"
+maintainer = "FreeRemoteAccess contributors"
+copyright = "2026 FreeRemoteAccess contributors"
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/freeremotedesk", "usr/bin/freeremoteaccess", "755"],
+    ["packaging/linux/freeremoteaccess.desktop", "usr/share/applications/freeremoteaccess.desktop", "644"],
+    ["packaging/linux/freeremoteaccess.svg", "usr/share/icons/hicolor/scalable/apps/freeremoteaccess.svg", "644"],
+    ["packaging/linux/freeremoteaccess.metainfo.xml", "usr/share/metainfo/io.freeremote.access.metainfo.xml", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "freeremoteaccess"
+assets = [
+    { source = "target/release/freeremotedesk", dest = "/usr/bin/freeremoteaccess", mode = "755" },
+    { source = "packaging/linux/freeremoteaccess.desktop", dest = "/usr/share/applications/freeremoteaccess.desktop", mode = "644" },
+    { source = "packaging/linux/freeremoteaccess.svg", dest = "/usr/share/icons/hicolor/scalable/apps/freeremoteaccess.svg", mode = "644" },
+    { source = "packaging/linux/freeremoteaccess.metainfo.xml", dest = "/usr/share/metainfo/io.freeremote.access.metainfo.xml", mode = "644" },
+]
 
 [[bin]]
 name = "freeremotedesk"
@@ -42,7 +65,6 @@ winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"],
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1.25", features = ["derive"], optional = true }
 getrandom = { version = "0.2", optional = true }
-minifb = { version = "0.28", optional = true }
 cpal = { version = "0.18.2", optional = true }
 flate2 = { version = "1", optional = true }
 fdk-aac = { version = "0.8", optional = true }
@@ -54,7 +76,7 @@ optional = true
 features = ["Win32_NetworkManagement_IpHelper"]
 
 [features]
-default = ["cli", "viewer"]
+default = ["cli", "gui"]
 cli = [
     "dep:aes",
     "dep:anyhow",
@@ -76,10 +98,11 @@ cli = [
     "dep:sha2",
     "dep:windows-sys",
 ]
-viewer = ["cli", "dep:minifb", "dep:cpal"]
+media = ["cli", "dep:cpal"]
 rdp = ["dep:ironrdp", "dep:smallvec", "dep:tokio"]
 gui = [
-    "viewer",
+    "cli",
+    "media",
     "rdp",
     "dep:bytemuck",
     "dep:egui",

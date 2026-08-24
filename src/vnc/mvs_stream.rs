@@ -1,6 +1,6 @@
 //! MVS 记录的精确传输层重组。
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 use anyhow::ensure;
 use anyhow::{anyhow, Result};
 
@@ -14,7 +14,7 @@ pub struct MvsRect {
     pub height: u16,
 }
 
-#[cfg(any(feature = "viewer", test))]
+#[cfg(any(feature = "media", test))]
 pub fn validate_mvs_rect_against_surface(
     rect: MvsRect,
     surface_width: u16,
@@ -114,7 +114,7 @@ impl MvsRecordAssembler {
         self.pending.is_some()
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(any(feature = "media", test))]
     pub fn abort(&mut self) {
         self.pending = None;
     }

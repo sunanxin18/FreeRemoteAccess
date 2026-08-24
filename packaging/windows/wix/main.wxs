@@ -1,0 +1,29 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="FreeRemoteAccess"
+           Manufacturer="FreeRemoteAccess contributors"
+           Version="0.1.0"
+           UpgradeCode="94803D29-B9FA-47D7-9C43-C9665ABAC5B4"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 FreeRemoteAccess。" />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="FreeRemoteAccess">
+        <Component Id="MainExecutable" Guid="*">
+          <File Id="FreeRemoteAccessExe"
+                Source="$(SourceDir)\freeremotedesk.exe"
+                Name="FreeRemoteAccess.exe"
+                KeyPath="yes">
+            <Shortcut Id="StartMenuShortcut"
+                      Directory="ProgramMenuFolder"
+                      Name="FreeRemoteAccess"
+                      WorkingDirectory="INSTALLFOLDER"
+                      Advertise="yes" />
+          </File>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="MainFeature" Title="FreeRemoteAccess" Level="1">
+      <ComponentRef Id="MainExecutable" />
+    </Feature>
+  </Package>
+</Wix>

@@ -1,5 +1,5 @@
-//! 帧缓冲。内部每像素一个 u32（0x00RRGGBB，小端），与 minifb 窗口
-//! 缓冲格式一致，渲染时可直接整块提交。
+//! 帧缓冲。内部每像素一个 u32（0x00RRGGBB，小端），协议适配层按需
+//! 转换为统一的 BGRA GPU 上传格式。
 
 use anyhow::{ensure, Context, Result};
 
@@ -36,7 +36,7 @@ impl Framebuffer {
         &self.pixels
     }
 
-    #[cfg(feature = "viewer")]
+    #[cfg(feature = "media")]
     pub fn pixels_mut(&mut self) -> &mut [u32] {
         &mut self.pixels
     }
