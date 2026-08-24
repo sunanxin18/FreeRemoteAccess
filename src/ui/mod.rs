@@ -16,7 +16,8 @@ pub use application::{
     ConnectionFormState, FreeRemoteApplication, SubmissionOutcome, UiAction, UiPage,
 };
 pub use remote_texture::{
-    RemoteTextureState, ResetDisposition, TextureStateError, TextureUpdateDisposition,
+    RemoteTextureAction, RemoteTextureState, RendererRuntimePolicy, RendererSurfaceIssue,
+    ResetDisposition, SurfaceAcquireAction, TextureStateError, TextureUpdateDisposition,
 };
 #[cfg(feature = "gui")]
 pub use renderer::{RenderError, Renderer};

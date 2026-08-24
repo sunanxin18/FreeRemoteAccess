@@ -1,5 +1,8 @@
 use freeremotedesk::core::{FrameRect, RemotePixelFormat, RenderUpdate};
-use freeremotedesk::ui::{RemoteTextureState, ResetDisposition, TextureUpdateDisposition};
+use freeremotedesk::ui::{
+    RemoteTextureAction, RemoteTextureState, RendererRuntimePolicy, RendererSurfaceIssue,
+    ResetDisposition, SurfaceAcquireAction, TextureUpdateDisposition,
+};
 
 #[test]
 fn reset_changes_texture_only_for_a_newer_generation() {
@@ -51,5 +54,66 @@ fn stale_present_is_ignored_before_gpu_submission() {
     assert_eq!(
         state.classify(&RenderUpdate::present(4)).unwrap(),
         TextureUpdateDisposition::Stale
+    );
+}
+
+#[test]
+fn runtime_surface_recovery_preserves_generation_bound_remote_texture() {
+    let mut policy = RendererRuntimePolicy::new();
+    assert_eq!(
+        policy.apply_reset(7, 1280, 720).unwrap(),
+        ResetDisposition::Created
+    );
+
+    assert_eq!(
+        policy.on_surface_issue(RendererSurfaceIssue::Lost),
+        SurfaceAcquireAction::ReconfigureAndSkip
+    );
+    assert_eq!(policy.generation(), Some(7));
+    assert_eq!(policy.dimensions(), Some((1280, 720)));
+    assert!(policy.surface_available());
+
+    assert_eq!(
+        policy.on_surface_issue(RendererSurfaceIssue::Outdated),
+        SurfaceAcquireAction::ReconfigureAndSkip
+    );
+    assert_eq!(policy.generation(), Some(7));
+    assert_eq!(policy.dimensions(), Some((1280, 720)));
+    assert!(policy.surface_available());
+}
+
+#[test]
+fn authenticated_session_lifecycle_clears_remote_texture_before_generation_one_reconnect() {
+    let mut policy = RendererRuntimePolicy::new();
+
+    assert_eq!(
+        policy.begin_authenticated_session(),
+        RemoteTextureAction::Clear
+    );
+    assert_eq!(
+        policy.apply_reset(7, 1280, 720).unwrap(),
+        ResetDisposition::Created
+    );
+    assert_eq!(
+        policy.finish_disconnected_session(),
+        RemoteTextureAction::Clear
+    );
+    assert_eq!(policy.generation(), None);
+
+    assert_eq!(
+        policy.begin_authenticated_session(),
+        RemoteTextureAction::Clear
+    );
+    assert_eq!(
+        policy.apply_reset(1, 1024, 768).unwrap(),
+        ResetDisposition::Created
+    );
+    assert_eq!(policy.generation(), Some(1));
+
+    assert_eq!(policy.finish_failed_session(), RemoteTextureAction::Clear);
+    assert_eq!(policy.generation(), None);
+    assert_eq!(
+        policy.on_surface_issue(RendererSurfaceIssue::Validation),
+        SurfaceAcquireAction::FailSession
     );
 }

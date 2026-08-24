@@ -10,7 +10,10 @@ use winit::window::Window;
 
 use crate::core::{RemotePixelFormat, RenderUpdate};
 
-use super::{RemoteTextureState, ResetDisposition, TextureUpdateDisposition};
+use super::{
+    RemoteTextureAction, RendererRuntimePolicy, RendererSurfaceIssue, ResetDisposition,
+    SurfaceAcquireAction, TextureUpdateDisposition,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -36,7 +39,7 @@ pub struct Renderer {
     remote_sampler: wgpu::Sampler,
     viewport_uniform: wgpu::Buffer,
     remote_texture: Option<RemoteTexture>,
-    remote_state: RemoteTextureState,
+    runtime_policy: RendererRuntimePolicy,
     egui_renderer: EguiRenderer,
 }
 
@@ -193,7 +196,7 @@ impl Renderer {
             remote_sampler,
             viewport_uniform,
             remote_texture: None,
-            remote_state: RemoteTextureState::empty(),
+            runtime_policy: RendererRuntimePolicy::new(),
             egui_renderer,
         })
     }
@@ -201,13 +204,31 @@ impl Renderer {
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         self.size = size;
         if size.width == 0 || size.height == 0 {
-            self.remote_state.on_surface_lost();
+            self.runtime_policy.mark_surface_unavailable();
             return;
         }
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.remote_state.on_surface_available();
+        self.runtime_policy.mark_surface_available();
+        self.update_viewport_uniform();
+    }
+
+    pub fn begin_authenticated_session(&mut self) {
+        let action = self.runtime_policy.begin_authenticated_session();
+        self.apply_remote_texture_action(action);
+        self.update_viewport_uniform();
+    }
+
+    pub fn finish_disconnected_session(&mut self) {
+        let action = self.runtime_policy.finish_disconnected_session();
+        self.apply_remote_texture_action(action);
+        self.update_viewport_uniform();
+    }
+
+    pub fn finish_failed_session(&mut self) {
+        let action = self.runtime_policy.finish_failed_session();
+        self.apply_remote_texture_action(action);
         self.update_viewport_uniform();
     }
 
@@ -219,7 +240,7 @@ impl Renderer {
                 height,
                 format,
             } => match self
-                .remote_state
+                .runtime_policy
                 .apply_reset(generation, width, height)
                 .map_err(|_| RenderError::new("texture_reset_invalid"))?
             {
@@ -242,7 +263,7 @@ impl Renderer {
             },
             update @ RenderUpdate::DirtyRect { .. } => {
                 if self
-                    .remote_state
+                    .runtime_policy
                     .classify(&update)
                     .map_err(|_| RenderError::new("texture_update_invalid"))?
                     == TextureUpdateDisposition::Stale
@@ -292,7 +313,7 @@ impl Renderer {
                 Ok(false)
             }
             update @ RenderUpdate::Present { .. } => Ok(self
-                .remote_state
+                .runtime_policy
                 .classify(&update)
                 .map_err(|_| RenderError::new("texture_present_invalid"))?
                 == TextureUpdateDisposition::Current),
@@ -321,19 +342,28 @@ impl Renderer {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                self.surface.configure(&self.device, &self.config);
+                self.handle_surface_issue(RendererSurfaceIssue::Suboptimal)?;
                 frame
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
+                self.handle_surface_issue(RendererSurfaceIssue::Outdated)?;
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.handle_surface_issue(RendererSurfaceIssue::Lost)?;
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Lost => return Err(RenderError::new("surface_lost")),
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.handle_surface_issue(RendererSurfaceIssue::Timeout)?;
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.handle_surface_issue(RendererSurfaceIssue::Occluded)?;
+                return Ok(());
+            }
             wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(RenderError::new("surface_validation_failed"));
+                self.handle_surface_issue(RendererSurfaceIssue::Validation)?;
+                unreachable!("validation surface error must fail the session")
             }
         };
         let view = frame.texture.create_view(&Default::default());
@@ -437,9 +467,28 @@ impl Renderer {
         });
     }
 
+    fn apply_remote_texture_action(&mut self, action: RemoteTextureAction) {
+        match action {
+            RemoteTextureAction::Clear => self.remote_texture = None,
+        }
+    }
+
+    fn handle_surface_issue(&mut self, issue: RendererSurfaceIssue) -> Result<(), RenderError> {
+        match self.runtime_policy.on_surface_issue(issue) {
+            SurfaceAcquireAction::ReconfigureAndRender
+            | SurfaceAcquireAction::ReconfigureAndSkip => {
+                self.surface.configure(&self.device, &self.config);
+                self.update_viewport_uniform();
+                Ok(())
+            }
+            SurfaceAcquireAction::Skip => Ok(()),
+            SurfaceAcquireAction::FailSession => Err(RenderError::new("surface_validation_failed")),
+        }
+    }
+
     fn update_viewport_uniform(&self) {
         let remote_size = self
-            .remote_state
+            .runtime_policy
             .dimensions()
             .map(|(width, height)| [width as f32, height as f32])
             .unwrap_or([1.0, 1.0]);

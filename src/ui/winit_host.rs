@@ -96,6 +96,7 @@ struct DesktopApplication {
     pointer_buttons: u8,
     cursor_position: Option<(f64, f64)>,
     disconnect_requested: bool,
+    terminal_renderer_failure: Option<String>,
 }
 
 impl DesktopApplication {
@@ -114,6 +115,7 @@ impl DesktopApplication {
             pointer_buttons: 0,
             cursor_position: None,
             disconnect_requested: false,
+            terminal_renderer_failure: None,
         }
     }
 
@@ -199,15 +201,10 @@ impl DesktopApplication {
         );
         if let Some(renderer) = self.renderer.as_mut() {
             if let Err(error) = renderer.render_egui(&self.egui_context, output) {
-                self.message = Some(error.to_string());
-                if error.code() == "surface_lost" {
-                    match pollster::block_on(Renderer::new(host.window().clone())) {
-                        Ok(renderer) => self.renderer = Some(renderer),
-                        Err(_) => {
-                            self.startup_error = Some(DesktopError::new("surface_recovery_failed"));
-                            event_loop.exit();
-                        }
-                    }
+                if error.code() == "surface_validation_failed" {
+                    self.fail_renderer_session(error);
+                } else {
+                    self.message = Some(error.to_string());
                 }
             }
         }
@@ -245,6 +242,10 @@ impl DesktopApplication {
             self.message = Some("现有会话尚未结束".to_owned());
             return;
         }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.begin_authenticated_session();
+        }
+        self.terminal_renderer_failure = None;
         let protocol = connection.protocol;
         let result = adapter_for(protocol).and_then(|adapter| {
             SessionEngine::spawn(adapter, ProtocolContext::new(connection), self.wake.clone())
@@ -301,12 +302,20 @@ impl DesktopApplication {
                 self.model.show_session();
                 self.message = None;
             } else if disconnected {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.finish_disconnected_session();
+                }
                 self.model.show_connection();
-                self.message = None;
+                self.message = self.terminal_renderer_failure.take();
                 self.disconnect_requested = false;
             } else if let Some(code) = failed_code {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.finish_failed_session();
+                }
                 self.model.show_connection();
-                self.message = Some(format!("连接失败 ({code})"));
+                if self.terminal_renderer_failure.is_none() {
+                    self.message = Some(format!("连接失败 ({code})"));
+                }
                 self.disconnect_requested = false;
             }
         }
@@ -321,6 +330,9 @@ impl DesktopApplication {
             }
             self.disconnect_requested = false;
             if !expected_terminal {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.finish_failed_session();
+                }
                 self.model.show_connection();
                 self.message = Some("连接线程意外结束".to_owned());
             }
@@ -354,8 +366,21 @@ impl DesktopApplication {
             .ok_or_else(|| SessionError::new("session_not_running"))
             .and_then(|engine| engine.send(SessionCommand::Disconnect));
         if let Err(error) = result {
-            self.message = Some(error.to_string());
+            if self.terminal_renderer_failure.is_none() {
+                self.message = Some(error.to_string());
+            }
         }
+    }
+
+    fn fail_renderer_session(&mut self, error: super::RenderError) {
+        let message = error.to_string();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.finish_failed_session();
+        }
+        self.terminal_renderer_failure = Some(message.clone());
+        self.model.show_connection();
+        self.message = Some(message);
+        self.request_disconnect();
     }
 
     fn remote_cursor_position(&self, window: &Window) -> Option<(u32, u32)> {

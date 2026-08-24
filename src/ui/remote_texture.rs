@@ -84,6 +84,10 @@ impl RemoteTextureState {
         self.surface_available = false;
     }
 
+    pub fn clear_remote_surface(&mut self) {
+        self.remote_surface = None;
+    }
+
     pub const fn surface_available(self) -> bool {
         self.surface_available
     }
@@ -101,6 +105,114 @@ impl Default for RemoteTextureState {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// GPU-free policy consumed by the renderer so swapchain recovery and remote
+/// texture lifetime can be validated independently of a platform GPU.
+#[derive(Debug, Default)]
+pub struct RendererRuntimePolicy {
+    remote_state: RemoteTextureState,
+}
+
+impl RendererRuntimePolicy {
+    pub const fn new() -> Self {
+        Self {
+            remote_state: RemoteTextureState::empty(),
+        }
+    }
+
+    pub fn begin_authenticated_session(&mut self) -> RemoteTextureAction {
+        self.clear_remote_texture()
+    }
+
+    pub fn finish_disconnected_session(&mut self) -> RemoteTextureAction {
+        self.clear_remote_texture()
+    }
+
+    pub fn finish_failed_session(&mut self) -> RemoteTextureAction {
+        self.clear_remote_texture()
+    }
+
+    pub fn apply_reset(
+        &mut self,
+        generation: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<ResetDisposition, TextureStateError> {
+        self.remote_state.apply_reset(generation, width, height)
+    }
+
+    pub fn classify(
+        &self,
+        update: &RenderUpdate,
+    ) -> Result<TextureUpdateDisposition, TextureStateError> {
+        self.remote_state.classify(update)
+    }
+
+    pub fn mark_surface_unavailable(&mut self) {
+        self.remote_state.on_surface_lost();
+    }
+
+    pub fn mark_surface_available(&mut self) {
+        self.remote_state.on_surface_available();
+    }
+
+    pub fn on_surface_issue(&mut self, issue: RendererSurfaceIssue) -> SurfaceAcquireAction {
+        match issue {
+            RendererSurfaceIssue::Suboptimal => {
+                self.remote_state.on_surface_available();
+                SurfaceAcquireAction::ReconfigureAndRender
+            }
+            RendererSurfaceIssue::Lost | RendererSurfaceIssue::Outdated => {
+                self.remote_state.on_surface_available();
+                SurfaceAcquireAction::ReconfigureAndSkip
+            }
+            RendererSurfaceIssue::Timeout | RendererSurfaceIssue::Occluded => {
+                SurfaceAcquireAction::Skip
+            }
+            RendererSurfaceIssue::Validation => SurfaceAcquireAction::FailSession,
+        }
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        self.remote_state.generation()
+    }
+
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.remote_state.dimensions()
+    }
+
+    pub const fn surface_available(&self) -> bool {
+        self.remote_state.surface_available()
+    }
+
+    fn clear_remote_texture(&mut self) -> RemoteTextureAction {
+        self.remote_state.clear_remote_surface();
+        RemoteTextureAction::Clear
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTextureAction {
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererSurfaceIssue {
+    Suboptimal,
+    Lost,
+    Outdated,
+    Timeout,
+    Occluded,
+    Validation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceAcquireAction {
+    ReconfigureAndRender,
+    ReconfigureAndSkip,
+    Skip,
+    FailSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
