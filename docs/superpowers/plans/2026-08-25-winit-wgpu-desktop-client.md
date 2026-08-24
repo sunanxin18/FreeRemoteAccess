@@ -331,7 +331,7 @@ feat(render): add single-window winit wgpu client
 - Consumes: existing RFB/ARD authentication, HPSS/MVS generation state, and `SessionCommand`.
 - Produces: normalized `SessionEvent`/`RenderUpdate` without owning a local window.
 
-- [ ] **Step 1: Write failing adapter fixture tests**
+- [x] **Step 1: Write failing adapter fixture tests**
 
 ```rust
 #[test]
@@ -350,27 +350,27 @@ fn malformed_partial_requests_resync_without_emitting_pixels() {
 }
 ```
 
-- [ ] **Step 2: Run RED adapter tests**
+- [x] **Step 2: Run RED adapter tests**
 
 Run: `cargo test --locked protocols::apple_ard --lib`
 
 Expected: compilation fails because the adapter layer is missing.
 
-- [ ] **Step 3: Separate HPSS networking from local presentation**
+- [x] **Step 3: Separate HPSS networking from local presentation**
 
 Move the existing reader/media loop behind `AppleArdAdapter::run`. Replace shared-minifb presentation calls with bounded `RenderUpdate` emission; preserve current SRTP/audio teardown, dynamic-resolution acknowledgement, full-frame completeness, and stale-generation handling unchanged.
 
-- [ ] **Step 4: Map input commands**
+- [x] **Step 4: Map input commands**
 
 Map `SessionCommand::Pointer`, `Key`, `Resize`, `Clipboard`, and `Disconnect` to the existing encrypted RFB/HPSS send functions. Use the current `RemoteViewportTransform`; do not retain startup dimensions after a generation commit.
 
-- [ ] **Step 5: Verify adapters and existing protocol suite**
+- [x] **Step 5: Verify adapters and existing protocol suite**
 
 Run: `cargo test --locked protocols:: --lib`, `cargo test --locked vnc:: --lib`, and `cargo test --locked --quiet`.
 
 Expected: adapter fixtures and all existing cryptography/protocol tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```text
 refactor(ard): emit normalized session and render events
@@ -389,7 +389,7 @@ refactor(ard): emit normalized session and render events
 - Consumes: `ValidatedConnection` with `ProtocolKind::Rdp` and normalized commands.
 - Produces: normalized state, resize, cursor, framebuffer, and terminal events.
 
-- [ ] **Step 1: Write failing RDP configuration tests**
+- [x] **Step 1: Write failing RDP configuration tests**
 
 ```rust
 #[test]
@@ -401,23 +401,23 @@ fn rdp_config_requires_credssp_and_preserves_domain() {
 }
 ```
 
-- [ ] **Step 2: Run RED RDP tests**
+- [x] **Step 2: Run RED RDP tests**
 
 Run: `cargo test --locked protocols::rdp --lib`
 
 Expected: compilation fails because the RDP adapter/configuration is absent.
 
-- [ ] **Step 3: Add minimal IronRDP client features and adapter**
+- [x] **Step 3: Add minimal IronRDP client features and adapter**
 
 Enable only client, TLS/rustls, CredSSP, graphics decode, input, and display-control dependencies; do not enable gateway, server, relay, device redirection, or custom DVC proxy features. Map image rectangles to the same BGRA/RGBA render contract and map server resize to a new generation.
 
-- [ ] **Step 4: Verify GREEN and full Rust suite**
+- [x] **Step 4: Verify GREEN and full Rust suite**
 
 Run: `cargo test --locked protocols::rdp --lib` and `cargo test --locked --quiet`.
 
 Expected: RDP config/event tests and all existing tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 feat(rdp): add native Windows service adapter
@@ -439,7 +439,7 @@ feat(rdp): add native Windows service adapter
 - Consumes: one Rust release binary and platform metadata.
 - Produces: Windows ZIP/MSI, macOS app/DMG, and Linux AppDir/DEB/AppImage artifacts with SHA-256 manifests.
 
-- [ ] **Step 1: Write failing package-contract tests**
+- [x] **Step 1: Write failing package-contract tests**
 
 Test that zero-byte artifacts fail, valid artifacts generate lowercase SHA-256 sidecars, and artifact names exactly match `FreeRemoteAccess-{version}-{platform}-{arch}`.
 
@@ -447,19 +447,19 @@ Run: `pwsh -File packaging/check-artifact.tests.ps1`
 
 Expected: FAIL because the verifier does not exist.
 
-- [ ] **Step 2: Implement verifier and native packaging scripts**
+- [x] **Step 2: Implement verifier and native packaging scripts**
 
 Use explicit staging directories under `target/package/<platform>` and never recursively delete outside that resolved path. Bundle only the release binary, licenses, icons, and platform metadata.
 
-- [ ] **Step 3: Replace CI with desktop native-host jobs**
+- [x] **Step 3: Replace CI with desktop native-host jobs**
 
 Use Windows Server, macOS, and Ubuntu runners. Each job runs Rust format/tests/release build, produces its native packages, runs the artifact verifier, and uploads packages plus checksums. Remove Flutter setup and all `app/build` artifact paths.
 
-- [ ] **Step 4: Verify workflow and Windows package locally**
+- [x] **Step 4: Verify workflow and Windows package locally**
 
 Run the package tests and Windows packaging script; parse the workflow as YAML and confirm the three platform jobs reference only Rust/native tools.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 build: package Rust desktop clients
@@ -485,23 +485,23 @@ build: package Rust desktop clients
 - Consumes: verified Rust GUI/adapters/packages from Tasks 1-7.
 - Produces: one Rust-only product and no stale alternate UI/build path.
 
-- [ ] **Step 1: Run the pre-delete replacement gate**
+- [x] **Step 1: Run the pre-delete replacement gate**
 
 Run all Rust tests, release build, local GUI smoke, and Windows package build. Do not delete legacy code unless these replacements pass.
 
-- [ ] **Step 2: Delete exact legacy paths**
+- [x] **Step 2: Delete exact legacy paths**
 
 Remove only the three exact roots/files listed above, remove the FFI workspace member, remove `minifb`, and rename the Cargo `viewer` feature to `gui` while preserving CLI diagnostics through the new runtime.
 
-- [ ] **Step 3: Add and run the absence gate**
+- [x] **Step 3: Add and run the absence gate**
 
 Run an `rg --files`/content verifier that fails if tracked product files contain `.dart`, `pubspec.yaml`, Flutter runner/plugin/toolchain paths, `freeremote_ffi`, `minifb`, `update_with_buffer`, or the deleted Flutter workflow commands.
 
-- [ ] **Step 4: Run the complete offline matrix**
+- [x] **Step 4: Run the complete offline matrix**
 
 Run `cargo fmt --all -- --check`, `cargo test --locked --workspace`, `cargo test --locked --workspace --no-default-features`, `cargo build --locked --release`, `cargo build --locked --release --no-default-features`, help output, package tests, and the absence gate.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 refactor: remove legacy Flutter and minifb clients
