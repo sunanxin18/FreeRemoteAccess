@@ -30,6 +30,17 @@ abstract interface class DesktopSessionLauncher {
   Future<DesktopSessionLaunch> launch(ConnectionDraft request);
 }
 
+const desktopSessionArguments = <String>[
+  'hpssview',
+  '--credentials-stdin-v1',
+  '--parent-status-stdout-v1',
+];
+
+bool isAppleDesktopRequest(ConnectionDraft request) {
+  return request.service == ServiceKind.macOs ||
+      (request.service == ServiceKind.automatic && request.port == 5900);
+}
+
 class ProcessDesktopSessionLauncher implements DesktopSessionLauncher {
   const ProcessDesktopSessionLauncher({
     this.connectionTimeout = const Duration(seconds: 20),
@@ -39,7 +50,7 @@ class ProcessDesktopSessionLauncher implements DesktopSessionLauncher {
 
   @override
   Future<DesktopSessionLaunch> launch(ConnectionDraft request) async {
-    if (request.service != ServiceKind.macOs) {
+    if (!isAppleDesktopRequest(request)) {
       throw const DesktopSessionLaunchException('当前构建尚未接入所选服务的会话后端');
     }
     if (!Platform.isWindows) {
@@ -56,12 +67,11 @@ class ProcessDesktopSessionLauncher implements DesktopSessionLauncher {
       throw const DesktopSessionLaunchException('Windows 发行包缺少 Rust 远程会话后端');
     }
 
-    final process = await Process.start(executable.path, const <String>[
-      'hpssview',
-      '--credentials-stdin-v1',
-      '--udp-media',
-      '--parent-status-stdout-v1',
-    ], workingDirectory: executable.parent.path);
+    final process = await Process.start(
+      executable.path,
+      desktopSessionArguments,
+      workingDirectory: executable.parent.path,
+    );
 
     final frame = encodeCredentialFrame(request);
     try {

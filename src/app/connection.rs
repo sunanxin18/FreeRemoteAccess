@@ -131,7 +131,9 @@ pub fn validate_connection(
         ServiceKind::MacOsArd => ProtocolKind::AppleRfb,
         ServiceKind::LinuxVnc => ProtocolKind::StandardRfb,
         ServiceKind::Auto if port == 3389 => ProtocolKind::Rdp,
-        ServiceKind::Auto if port == 5900 => ProtocolKind::StandardRfb,
+        // 5900 同时承载 Apple 原生屏幕共享和标准 VNC。产品策略要求自动模式
+        // 先尝试 Apple 本地账号认证；标准 VNC 只作为显式的最低优先级入口。
+        ServiceKind::Auto if port == 5900 => ProtocolKind::AppleRfb,
         ServiceKind::Auto => ProtocolKind::Auto,
     };
 
@@ -241,6 +243,6 @@ mod tests {
         let rfb = validate_connection(request(ServiceKind::Auto, "host", Some(5900))).unwrap();
 
         assert_eq!(rdp.protocol, ProtocolKind::Rdp);
-        assert_eq!(rfb.protocol, ProtocolKind::StandardRfb);
+        assert_eq!(rfb.protocol, ProtocolKind::AppleRfb);
     }
 }

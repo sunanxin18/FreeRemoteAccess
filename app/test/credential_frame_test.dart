@@ -3,6 +3,33 @@ import 'package:freeremote_access/connection/connection_model.dart';
 import 'package:freeremote_access/session/desktop_session_launcher.dart';
 
 void main() {
+  test('Windows Apple desktop launch defaults to rendered TCP MVS', () {
+    expect(
+      desktopSessionArguments,
+      containsAllInOrder(<String>[
+        'hpssview',
+        '--credentials-stdin-v1',
+        '--parent-status-stdout-v1',
+      ]),
+    );
+    expect(desktopSessionArguments, isNot(contains('--udp-media')));
+  });
+
+  test('automatic port 5900 is eligible for the Apple desktop launcher', () {
+    expect(
+      isAppleDesktopRequest(
+        const ConnectionDraft(
+          service: ServiceKind.automatic,
+          host: 'host',
+          port: 5900,
+          username: 'u',
+          password: 'p',
+        ),
+      ),
+      isTrue,
+    );
+  });
+
   test('credential frame matches the FRDSTD01 big-endian wire format', () {
     final frame = encodeCredentialFrame(
       const ConnectionDraft(
