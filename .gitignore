@@ -1,0 +1,28 @@
+/target
+*.png
+CREDENTIALS.local.md
+/ard_capture
+/ard_re
+
+# 本地代理、IDE 与任务运行产物
+/.claude/
+/.codex-target/
+/.superpowers/
+/.mcp.json
+
+# Apple 安装镜像、逆向输出与授权会话材料不得进入公开仓库
+/*.dmg
+/ard_capture_ours/
+/decomp/
+/disasm/
+*.mvs
+*.rec
+*.frdrtp
+*.pcap
+*.pcapng
+
+# 平台与编辑器临时文件
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

@@ -1,0 +1,38 @@
+[package]
+name = "freeremotedesk"
+version = "0.1.0"
+edition = "2021"
+description = "ARP 局域网发现 + VNC(RFB) 客户端，用于连接 macOS 屏幕共享（Screen Sharing）"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+des = "0.8"
+png = "0.17"
+num-bigint = "0.4"
+md-5 = "0.10"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+hmac = "0.12"
+aes = "0.8"
+ecb = "0.1"
+cbc = "0.1"
+sha1 = "0.10"
+rsa = "0.9"
+getrandom = "0.2"
+minifb = { version = "0.28", optional = true }
+cpal = { version = "0.18.2", optional = true }
+flate2 = "1"
+fdk-aac = "0.8"
+fdk-aac-sys = "0.5"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = ["Win32_NetworkManagement_IpHelper"]
+
+[features]
+default = ["viewer"]
+viewer = ["dep:minifb", "dep:cpal"]
+
+[profile.release]
+lto = "thin"
