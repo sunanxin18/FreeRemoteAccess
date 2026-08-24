@@ -52,6 +52,7 @@ ecb = { version = "0.1", optional = true }
 cbc = { version = "0.1", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", optional = true }
+rpassword = { version = "=7.5.4", optional = true }
 secrecy = "0.10"
 crossbeam-channel = "0.5"
 smallvec = { version = "1.15", optional = true }
@@ -95,6 +96,7 @@ cli = [
     "dep:pbkdf2",
     "dep:png",
     "dep:rsa",
+    "dep:rpassword",
     "dep:sha1",
     "dep:sha2",
     "dep:windows-sys",

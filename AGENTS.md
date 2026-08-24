@@ -161,8 +161,10 @@ adapters over the same core. The desktop application uses one
 - `cargo fmt --all -- --check` — verify formatting before PR.
 - `cargo run -- --help` — print CLI usage.
 - Running `.\target\release\freeremotedesk.exe` without arguments opens the GUI.
-- Protocol CLI credentials come from the non-echoing
-  `FRD_USERNAME`/`FRD_PASSWORD` environment provider, never argv.
+- Protocol CLI accepts a non-secret local account name through `--username`.
+  Passwords come only from the interactive non-echoing terminal prompt, except
+  for the explicit bounded `hpss-capture-v2 --credentials-stdin-v1` frame; they
+  never come from argv or environment variables.
 - Before changing P1/P2, add focused tests for generation transitions, exact
   MVS record reassembly, full-frame reset, partial update rejection/resync, and
   stale-frame handling. The current expected verification matrix is

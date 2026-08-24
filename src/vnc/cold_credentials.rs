@@ -176,6 +176,17 @@ impl GuardedCredentialFrame {
         })
     }
 
+    /// 仅在凭据认证阶段借出切片，并在把拥有型认证结果交还调用方前清零整帧。
+    /// 即使认证闭包 unwind，恢复 unwind 前也会先执行同一清零路径。
+    pub fn with_slices_then_clear<T>(&mut self, f: impl FnOnce(CredentialSlices<'_>) -> T) -> T {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.with_slices(f)));
+        self.clear();
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     pub fn clear(&mut self) {
         if self.cleared {
             return;
@@ -733,6 +744,38 @@ mod tests {
         assert!(accepted);
         replace_all_guarded_bytes_with_fake_nonzero_canary(&mut guarded);
         guarded.clear();
+        assert_observed_zero(length);
+        set_clear_observer(None);
+    }
+
+    #[test]
+    fn authentication_callback_success_clears_before_returning_owned_state() {
+        let _serial = OBSERVER_TEST_LOCK.lock().expect("observer test lock");
+        install_observer();
+        let length = valid_frame().len();
+        let mut guarded = parse(&valid_frame()).expect("valid fake frame");
+
+        let authenticated = guarded.with_slices_then_clear(|slices| {
+            assert_eq!(slices.password, "canary-pass");
+            "owned-authenticated-state"
+        });
+
+        assert_eq!(authenticated, "owned-authenticated-state");
+        assert_observed_zero(length);
+        set_clear_observer(None);
+    }
+
+    #[test]
+    fn authentication_callback_error_clears_before_returning_error() {
+        let _serial = OBSERVER_TEST_LOCK.lock().expect("observer test lock");
+        install_observer();
+        let length = valid_frame().len();
+        let mut guarded = parse(&valid_frame()).expect("valid fake frame");
+
+        let result: Result<(), &str> =
+            guarded.with_slices_then_clear(|_| Err("stable-authentication-error"));
+
+        assert_eq!(result, Err("stable-authentication-error"));
         assert_observed_zero(length);
         set_clear_observer(None);
     }

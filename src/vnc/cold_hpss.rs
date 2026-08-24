@@ -37,7 +37,26 @@ pub fn connect_deadline_opts(
     password: &str,
     profile: SessionEncodingProfile,
 ) -> Result<VncClient> {
-    let client = client::connect_deadline_opts(addr, deadline, username, password, profile)?;
+    finish_authenticated_connection(
+        authenticate_deadline_opts(addr, deadline, username, password)?,
+        profile,
+    )
+}
+
+pub fn authenticate_deadline_opts(
+    addr: &SocketAddr,
+    deadline: Instant,
+    username: &str,
+    password: &str,
+) -> Result<client::AuthenticatedSecurity> {
+    client::authenticate_deadline_security(addr, deadline, username, password)
+}
+
+pub fn finish_authenticated_connection(
+    authenticated: client::AuthenticatedSecurity,
+    profile: SessionEncodingProfile,
+) -> Result<VncClient> {
+    let client = client::finish_deadline_authenticated_session(authenticated, profile)?;
     if !client.conn.is_encrypted() {
         bail!("cold authentication");
     }
@@ -255,7 +274,8 @@ pub(crate) fn classify_cold_frame(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_cold_frame, connect_deadline_opts, run_authenticated_cold_session,
+        authenticate_deadline_opts, classify_cold_frame, connect_deadline_opts,
+        finish_authenticated_connection, run_authenticated_cold_session,
         run_authenticated_cold_session_io, CaptureGeometry, ColdFrameClass, ColdSessionIo,
     };
     use crate::vnc::mvs::{MvsDecodeDecision, MvsDecodeState};
@@ -287,6 +307,8 @@ mod tests {
 
     #[test]
     fn cold_hpss_public_integration_entry_points_exist() {
+        let _ = authenticate_deadline_opts;
+        let _ = finish_authenticated_connection;
         let _ = connect_deadline_opts;
         let _ = run_authenticated_cold_session;
     }

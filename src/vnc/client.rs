@@ -652,6 +652,65 @@ pub enum SecurityPolicy {
     StandardVncOnly,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecurityCredentialRequirement {
+    None,
+    Password,
+}
+
+pub fn credential_requirement_for_types(
+    types: &[u8],
+    username: Option<&str>,
+    policy: SecurityPolicy,
+) -> Result<SecurityCredentialRequirement> {
+    let has = |security_type| types.contains(&security_type);
+    let has_supported_apple = types
+        .iter()
+        .copied()
+        .any(crate::protocols::rfb_security::is_supported_apple_native);
+    let has_known_unsupported_apple = has(protocol::security::APPLE_ARD_39);
+
+    if policy == SecurityPolicy::StandardVncOnly {
+        if has(protocol::security::NONE) {
+            return Ok(SecurityCredentialRequirement::None);
+        }
+        if has(protocol::security::VNC_AUTH) {
+            return Ok(SecurityCredentialRequirement::Password);
+        }
+        bail!("服务器不提供可用的标准 VNC 认证方式，可用类型: {types:?}");
+    }
+
+    if policy == SecurityPolicy::AppleNativeOnly {
+        if !has_supported_apple {
+            if has_known_unsupported_apple {
+                bail!("服务器仅提供当前客户端不支持的 Apple 认证类型 35");
+            }
+            bail!("服务器不提供可用的 Apple 原生认证方式，可用类型: {types:?}");
+        }
+        if username.is_none() {
+            bail!("Apple 原生认证需要通过 --username 提供 Mac 本地用户名");
+        }
+        return Ok(SecurityCredentialRequirement::Password);
+    }
+
+    if username.is_some() && has_supported_apple {
+        return Ok(SecurityCredentialRequirement::Password);
+    }
+    if has(protocol::security::NONE) {
+        return Ok(SecurityCredentialRequirement::None);
+    }
+    if has(protocol::security::VNC_AUTH) {
+        return Ok(SecurityCredentialRequirement::Password);
+    }
+    if has_supported_apple {
+        bail!("Apple 原生认证需要通过 --username 提供 Mac 本地用户名");
+    }
+    if has_known_unsupported_apple {
+        bail!("服务器仅提供当前客户端不支持的 Apple 认证类型 35");
+    }
+    bail!("没有可用的认证方式，可用类型: {types:?}")
+}
+
 fn pick_security_with_policy(
     types: &[u8],
     username: Option<&str>,
@@ -694,16 +753,14 @@ fn pick_security_with_policy(
         };
     }
 
-    let has_apple_account_security = || {
+    let has_apple_native_security = || {
         types
             .iter()
             .copied()
             .any(protocol::security::requires_apple_account_credentials)
     };
-    let ard_hint =
-        "服务器提供 Apple 账号认证：请通过 FRD_USERNAME 和 FRD_PASSWORD 环境变量提供凭据。";
-    let vnc_hint = "服务器支持标准 VNC 密码：请通过 FRD_PASSWORD 环境变量提供；\
-同时设置 FRD_USERNAME 时会优先尝试 Apple 账号认证。";
+    let ard_hint = "服务器提供 Apple 原生认证：请通过 --username 提供 Mac 本地用户名，密码将由交互终端无回显读取。";
+    let vnc_hint = "服务器支持标准 VNC 密码：密码将由交互终端无回显读取；提供 --username 时会优先尝试 Apple 原生认证。";
     match (username, password) {
         (Some(_), Some(_)) => {
             if has(protocol::security::APPLE_SRP) {
@@ -726,8 +783,8 @@ fn pick_security_with_policy(
         (None, Some(_)) => {
             if has(protocol::security::VNC_AUTH) {
                 Ok(protocol::security::VNC_AUTH)
-            } else if has_apple_account_security() {
-                bail!("服务器只提供 Apple 账号认证。{ard_hint}")
+            } else if has_apple_native_security() {
+                bail!("服务器只提供 Apple 原生认证。{ard_hint}")
             } else if has(protocol::security::NONE) {
                 eprintln!("提示: 服务器无需认证，提供的密码被忽略");
                 Ok(protocol::security::NONE)
@@ -740,8 +797,8 @@ fn pick_security_with_policy(
                 Ok(protocol::security::NONE)
             } else if has(protocol::security::VNC_AUTH) {
                 bail!("服务器需要认证。{vnc_hint}")
-            } else if has_apple_account_security() {
-                bail!("服务器需要 Apple 账号认证。{ard_hint}")
+            } else if has_apple_native_security() {
+                bail!("服务器需要 Apple 原生认证。{ard_hint}")
             } else {
                 bail!("没有可用的认证方式，可用类型: {types:?}")
             }
@@ -777,9 +834,36 @@ pub fn connect_deadline_opts(
     password: &str,
     profile: session::SessionEncodingProfile,
 ) -> Result<VncClient> {
+    finish_deadline_authenticated_session(
+        authenticate_deadline_security(addr, deadline, username, password)?,
+        profile,
+    )
+}
+
+/// Cold FRDSTD01 专用认证阶段：返回的拥有型状态已经完成所有凭据交互，尚未发送
+/// ClientInit，调用方必须先清零输入帧再进入会话初始化。
+pub fn authenticate_deadline_security(
+    addr: &SocketAddr,
+    deadline: Instant,
+    username: &str,
+    password: &str,
+) -> Result<AuthenticatedSecurity> {
     let negotiated = negotiate_deadline(addr, deadline).map_err(sanitize_cold_connect_error)?;
-    authenticate_opts(negotiated, Some(username), Some(password), profile)
-        .map_err(sanitize_cold_authentication_error)
+    authenticate_security_with_policy(
+        negotiated,
+        Some(username),
+        Some(password),
+        SecurityPolicy::AppleNativeOnly,
+    )
+    .map_err(sanitize_cold_authentication_error)
+}
+
+/// 在 FRDSTD01 已清零后完成 ClientInit / ServerInit 与 Apple 会话建立。
+pub fn finish_deadline_authenticated_session(
+    authenticated: AuthenticatedSecurity,
+    profile: session::SessionEncodingProfile,
+) -> Result<VncClient> {
+    finish_authenticated_session(authenticated, profile).map_err(sanitize_cold_authentication_error)
 }
 
 fn sanitize_cold_connect_error(error: anyhow::Error) -> anyhow::Error {
@@ -1313,9 +1397,55 @@ mod tests {
     fn every_apple_account_security_type_requires_credentials() {
         for security_type in [30u8, 33, 35, 36] {
             let error = pick_security(&[security_type], None, None).unwrap_err();
-            assert!(error.to_string().contains("FRD_USERNAME"), "{error:#}");
-            assert!(error.to_string().contains("FRD_PASSWORD"), "{error:#}");
+            assert!(error.to_string().contains("--username"), "{error:#}");
+            assert!(error.to_string().contains("无回显"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn cli_credential_requirement_avoids_unnecessary_prompts_and_fails_closed() {
+        assert_eq!(
+            credential_requirement_for_types(
+                &[protocol::security::NONE, protocol::security::VNC_AUTH],
+                None,
+                SecurityPolicy::PreferAppleThenVnc,
+            )
+            .unwrap(),
+            SecurityCredentialRequirement::None
+        );
+        assert_eq!(
+            credential_requirement_for_types(
+                &[protocol::security::VNC_AUTH],
+                None,
+                SecurityPolicy::PreferAppleThenVnc,
+            )
+            .unwrap(),
+            SecurityCredentialRequirement::Password
+        );
+        assert_eq!(
+            credential_requirement_for_types(
+                &[protocol::security::APPLE_SRP],
+                Some("local-user"),
+                SecurityPolicy::AppleNativeOnly,
+            )
+            .unwrap(),
+            SecurityCredentialRequirement::Password
+        );
+
+        let missing_username = credential_requirement_for_types(
+            &[protocol::security::APPLE_SRP],
+            None,
+            SecurityPolicy::PreferAppleThenVnc,
+        )
+        .unwrap_err();
+        assert!(missing_username.to_string().contains("--username"));
+        let unsupported = credential_requirement_for_types(
+            &[protocol::security::APPLE_ARD_39],
+            Some("local-user"),
+            SecurityPolicy::AppleNativeOnly,
+        )
+        .unwrap_err();
+        assert!(unsupported.to_string().contains("不支持"));
     }
 
     #[test]

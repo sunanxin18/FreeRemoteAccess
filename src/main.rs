@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use std::{fmt, io::IsTerminal};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -15,52 +16,130 @@ use vnc::client::{self, VncClient};
 use vnc::mvs::{
     MVS_RGB_BLUE_OFFSET, MVS_RGB_CHANNEL_BYTES, MVS_RGB_GREEN_OFFSET, MVS_RGB_RED_OFFSET,
 };
+use zeroize::{Zeroize, Zeroizing};
 
-const DEFAULT_USERNAME_ENV: &str = "FRD_USERNAME";
-const DEFAULT_PASSWORD_ENV: &str = "FRD_PASSWORD";
-
-struct CredentialValues {
-    username: Option<String>,
-    password: Option<String>,
+trait PasswordPrompt {
+    fn is_interactive_terminal(&self) -> bool;
+    fn read_password_without_echo(&mut self) -> std::io::Result<String>;
 }
 
-fn read_credential_environment(name: &str, description: &str) -> Result<Option<String>> {
-    let mut chars = name.chars();
-    let valid_start = chars
-        .next()
-        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic());
-    let valid_rest = chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
-    if !valid_start || !valid_rest {
-        anyhow::bail!("{description}环境变量名无效");
+struct SystemPasswordPrompt;
+
+impl PasswordPrompt for SystemPasswordPrompt {
+    fn is_interactive_terminal(&self) -> bool {
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
     }
 
-    match std::env::var(name) {
-        Ok(value) if value.is_empty() => Ok(None),
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("{description}环境变量 {name} 不是有效 UTF-8")
+    fn read_password_without_echo(&mut self) -> std::io::Result<String> {
+        rpassword::prompt_password("密码: ")
+    }
+}
+
+struct CliPassword {
+    value: Zeroizing<String>,
+}
+
+impl CliPassword {
+    fn new(value: String) -> Self {
+        Self {
+            value: Zeroizing::new(value),
         }
     }
+
+    fn expose(&self) -> &str {
+        self.value.as_str()
+    }
+
+    fn clear(&mut self) {
+        self.value.zeroize();
+        notify_cli_password_cleared();
+    }
 }
 
-fn load_credentials(username_env: &str, password_env: &str) -> Result<CredentialValues> {
-    Ok(CredentialValues {
-        username: read_credential_environment(username_env, "用户名")?,
-        password: read_credential_environment(password_env, "密码")?,
-    })
+impl fmt::Debug for CliPassword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CliPassword([REDACTED])")
+    }
 }
 
-fn require_login(credentials: &CredentialValues) -> Result<(&str, &str)> {
-    let username = credentials
-        .username
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("缺少用户名：请通过 --username-env 指定的环境变量提供"))?;
-    let password = credentials
-        .password
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("缺少密码：请通过 --password-env 指定的环境变量提供"))?;
-    Ok((username, password))
+fn acquire_interactive_password(prompt: &mut impl PasswordPrompt) -> Result<CliPassword> {
+    if !prompt.is_interactive_terminal() {
+        anyhow::bail!("密码只能从交互终端无回显读取")
+    }
+    let mut password = CliPassword::new(
+        prompt
+            .read_password_without_echo()
+            .map_err(|_| anyhow::anyhow!("无法从交互终端读取密码"))?,
+    );
+    if password.expose().is_empty() {
+        password.clear();
+        anyhow::bail!("密码不能为空")
+    }
+    Ok(password)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLI_PASSWORD_CLEAR_OBSERVER: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::atomic::AtomicBool>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_cli_password_clear_observer(
+    observer: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
+    CLI_PASSWORD_CLEAR_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cli_password_cleared() {
+    CLI_PASSWORD_CLEAR_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn notify_cli_password_cleared() {}
+
+fn authenticate_cli_session(
+    negotiated: client::Negotiated,
+    username: Option<&str>,
+    encoding_profile: vnc::session::SessionEncodingProfile,
+    security_policy: client::SecurityPolicy,
+    prompt: &mut impl PasswordPrompt,
+) -> Result<VncClient> {
+    let requirement = client::credential_requirement_for_types(
+        &negotiated.security_types,
+        username,
+        security_policy,
+    )?;
+    match requirement {
+        client::SecurityCredentialRequirement::None => {
+            let authenticated = client::authenticate_security_with_policy(
+                negotiated,
+                username,
+                None,
+                security_policy,
+            )?;
+            client::finish_authenticated_session(authenticated, encoding_profile)
+        }
+        client::SecurityCredentialRequirement::Password => {
+            let mut password = acquire_interactive_password(prompt)?;
+            let authenticated = client::authenticate_security_with_policy(
+                negotiated,
+                username,
+                Some(password.expose()),
+                security_policy,
+            );
+            password.clear();
+            let authenticated = authenticated.map_err(|_| anyhow::anyhow!("认证失败"))?;
+            client::finish_authenticated_session(authenticated, encoding_profile)
+                .map_err(|_| anyhow::anyhow!("会话初始化失败"))
+        }
+    }
 }
 
 fn parse_cold_capture_seconds(value: &str) -> std::result::Result<u32, String> {
@@ -83,7 +162,7 @@ fn parse_cold_capture_record_limit(value: &str) -> std::result::Result<u32, Stri
         .ok_or_else(|| "cold capture record limit 无效".to_owned())
 }
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "freeremotedesk",
     version,
@@ -94,7 +173,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Cmd {
     /// 创建严格 cold provenance 的 FRDMVS02 TCP-MVS 捕获
     HpssCaptureV2 {
@@ -141,24 +220,18 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 5900)]
         port: u16,
-        /// 提供用户名的环境变量名；存在时优先走 Apple 账号认证
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_USERNAME_ENV)]
-        username_env: String,
-        /// 提供 Mac 登录密码或 VNC 密码的环境变量名
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_PASSWORD_ENV)]
-        password_env: String,
+        /// Mac 本地用户名；提供时优先走 Apple 原生认证
+        #[arg(long, value_name = "USER")]
+        username: Option<String>,
     },
     /// 连接并截取一帧远程屏幕，保存为 PNG
     Shot {
         host: String,
         #[arg(long, default_value_t = 5900)]
         port: u16,
-        /// 提供用户名的环境变量名；存在时优先走 Apple 账号认证
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_USERNAME_ENV)]
-        username_env: String,
-        /// 提供 Mac 登录密码或 VNC 密码的环境变量名
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_PASSWORD_ENV)]
-        password_env: String,
+        /// Mac 本地用户名；提供时优先走 Apple 原生认证
+        #[arg(long, value_name = "USER")]
+        username: Option<String>,
         /// 输出 PNG 路径
         #[arg(short, long, default_value = "screen.png")]
         out: PathBuf,
@@ -184,12 +257,9 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 5900)]
         port: u16,
-        /// 提供 Mac 用户名的环境变量名
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_USERNAME_ENV)]
-        username_env: String,
-        /// 提供 Mac 登录密码的环境变量名
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_PASSWORD_ENV)]
-        password_env: String,
+        /// Mac 本地用户名
+        #[arg(long, value_name = "USER", required = true)]
+        username: String,
         /// 接收媒体流的秒数
         #[arg(long, default_value_t = 10)]
         seconds: u64,
@@ -217,16 +287,55 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 5900)]
         port: u16,
-        /// 提供 Mac 用户名的环境变量名
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_USERNAME_ENV)]
-        username_env: String,
-        /// 提供 Mac 登录密码的环境变量名
-        #[arg(long, value_name = "ENV", default_value = DEFAULT_PASSWORD_ENV)]
-        password_env: String,
+        /// Mac 本地用户名
+        #[arg(long, value_name = "USER", required = true)]
+        username: String,
         /// 持续接收解密帧的秒数
         #[arg(long, default_value_t = 8)]
         seconds: u64,
     },
+}
+
+#[derive(Debug)]
+enum CliParseError {
+    ForbiddenCredentialArgument,
+    Clap(clap::Error),
+}
+
+impl std::fmt::Display for CliParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForbiddenCredentialArgument => {
+                formatter.write_str("密码不得通过命令行参数或环境变量提供")
+            }
+            Self::Clap(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+fn try_parse_cli_from<I, T>(arguments: I) -> std::result::Result<Cli, CliParseError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    const FORBIDDEN: [&str; 3] = [
+        concat!("--pass", "word"),
+        concat!("--pass", "word-env"),
+        concat!("--user", "name-env"),
+    ];
+    let mut approved = Vec::new();
+    for argument in arguments {
+        let argument = argument.into();
+        let text = argument.to_string_lossy();
+        if FORBIDDEN
+            .iter()
+            .any(|option| text == *option || text.starts_with(&format!("{option}=")))
+        {
+            return Err(CliParseError::ForbiddenCredentialArgument);
+        }
+        approved.push(argument);
+    }
+    Cli::try_parse_from(approved).map_err(CliParseError::Clap)
 }
 
 fn main() {
@@ -245,7 +354,15 @@ fn main() {
             std::process::exit(2);
         }
     }
-    if let Err(e) = run(Cli::parse()) {
+    let cli = match try_parse_cli_from(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(CliParseError::Clap(error)) => error.exit(),
+        Err(error) => {
+            eprintln!("错误: {error}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = run(cli) {
         eprintln!("错误: {e:#}");
         std::process::exit(1);
     }
@@ -271,35 +388,15 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Info {
             host,
             port,
-            username_env,
-            password_env,
-        } => {
-            let credentials = load_credentials(&username_env, &password_env)?;
-            cmd_info(
-                &host,
-                port,
-                credentials.username.as_deref(),
-                credentials.password.as_deref(),
-            )
-        }
+            username,
+        } => cmd_info(&host, port, username.as_deref()),
         Cmd::Shot {
             host,
             port,
-            username_env,
-            password_env,
+            username,
             out,
             wait_ms,
-        } => {
-            let credentials = load_credentials(&username_env, &password_env)?;
-            cmd_shot(
-                &host,
-                port,
-                credentials.username.as_deref(),
-                credentials.password.as_deref(),
-                &out,
-                wait_ms,
-            )
-        }
+        } => cmd_shot(&host, port, username.as_deref(), &out, wait_ms),
         Cmd::Proxy {
             target,
             port,
@@ -315,8 +412,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Hpss {
             host,
             port,
-            username_env,
-            password_env,
+            username,
             seconds,
             out,
             png,
@@ -324,34 +420,24 @@ fn run(cli: Cli) -> Result<()> {
             media_audio_rtp_out,
             display_name,
             udp_media,
-        } => {
-            let credentials = load_credentials(&username_env, &password_env)?;
-            let (username, password) = require_login(&credentials)?;
-            cmd_hpss(
-                &host,
-                port,
-                username,
-                password,
-                seconds,
-                out.as_deref(),
-                png.as_deref(),
-                media_answer_out.as_deref(),
-                media_audio_rtp_out.as_deref(),
-                &display_name,
-                udp_media,
-            )
-        }
+        } => cmd_hpss(
+            &host,
+            port,
+            &username,
+            seconds,
+            out.as_deref(),
+            png.as_deref(),
+            media_answer_out.as_deref(),
+            media_audio_rtp_out.as_deref(),
+            &display_name,
+            udp_media,
+        ),
         Cmd::Esess {
             host,
             port,
-            username_env,
-            password_env,
+            username,
             seconds,
-        } => {
-            let credentials = load_credentials(&username_env, &password_env)?;
-            let (username, password) = require_login(&credentials)?;
-            cmd_esess(&host, port, username, password, seconds)
-        }
+        } => cmd_esess(&host, port, &username, seconds),
     }
 }
 
@@ -451,23 +537,29 @@ fn cmd_hpss_capture_v2(
         anyhow::bail!("cold capture deadline");
     }
 
-    let connected = guarded.with_slices(|credentials| {
+    let authenticated = guarded.with_slices_then_clear(|credentials| {
         let ip = credentials
             .host
             .parse::<std::net::IpAddr>()
             .map_err(|_| ColdConnectionFailure::Input)?;
         let address = std::net::SocketAddr::new(ip, credentials.port);
-        vnc::cold_hpss::connect_deadline_opts(
+        vnc::cold_hpss::authenticate_deadline_opts(
             &address,
             deadline,
             credentials.username,
             credentials.password,
-            vnc::session::SessionEncodingProfile::AppleTcpMvs,
         )
         .map_err(|error| classify_cold_connection_error(&error))
     });
-    guarded.clear();
-
+    let authenticated = match authenticated {
+        Ok(authenticated) => authenticated,
+        Err(failure) => return finish_cold_connection_failure(&mut writer, failure),
+    };
+    let connected = vnc::cold_hpss::finish_authenticated_connection(
+        authenticated,
+        vnc::session::SessionEncodingProfile::AppleTcpMvs,
+    )
+    .map_err(|error| classify_cold_connection_error(&error));
     let mut client = match connected {
         Ok(client) => client,
         Err(failure) => return finish_cold_connection_failure(&mut writer, failure),
@@ -599,14 +691,14 @@ fn cmd_scan(cidr: Option<String>, threads: usize, probe_ms: u64, no_probe: bool)
     if let Some(t) = hosts.iter().find(|h| h.vnc_banner.is_some()) {
         println!("\n检测到 VNC 服务器 {}，下一步：", t.ip);
         println!("  freeremotedesk.exe info {}", t.ip);
-        println!("  先在进程环境中设置 FRD_PASSWORD；Apple 账号认证还需 FRD_USERNAME");
+        println!("  需要认证时，程序会在交互终端中无回显读取密码");
         println!("  freeremotedesk.exe shot {} -o mac.png", t.ip);
         println!("  freeremotedesk.exe view {}", t.ip);
     }
     Ok(())
 }
 
-fn cmd_info(host: &str, port: u16, username: Option<&str>, password: Option<&str>) -> Result<()> {
+fn cmd_info(host: &str, port: u16, username: Option<&str>) -> Result<()> {
     let addr = arp::parse_target(host, port)?;
     let neg = client::negotiate(&addr, Duration::from_secs(5))?;
 
@@ -620,30 +712,38 @@ fn cmd_info(host: &str, port: u16, username: Option<&str>, password: Option<&str
         println!("  [{}] {}", t, vnc::protocol::security_type_name(*t));
     }
 
-    match (username, password) {
-        (u, Some(p)) => {
-            let c = client::authenticate(neg, u, Some(p))?;
-            println!(
-                "认证: 成功（类型 {} {}）",
-                c.used_security,
-                vnc::protocol::security_type_name(c.used_security)
-            );
-            println!("桌面名称: {}", c.name);
-            println!("分辨率: {}x{}", c.width, c.height);
-            println!(
-                "服务器像素格式: bpp={} depth={} {} 大端, 真彩色={}, RGB max={}/{}/{} shift={}/{}/{}",
-                c.server_pf.bits_per_pixel,
-                c.server_pf.depth,
-                if c.server_pf.big_endian != 0 { "是" } else { "否" },
-                c.server_pf.true_colour != 0,
-                c.server_pf.red_max, c.server_pf.green_max, c.server_pf.blue_max,
-                c.server_pf.red_shift, c.server_pf.green_shift, c.server_pf.blue_shift
-            );
-        }
-        (_, None) => println!(
-            "\n提示: 通过 FRD_USERNAME/FRD_PASSWORD 环境变量提供 Apple 登录凭据，或仅通过 FRD_PASSWORD 提供 VNC 密码"
-        ),
-    }
+    let mut prompt = SystemPasswordPrompt;
+    let c = authenticate_cli_session(
+        neg,
+        username,
+        vnc::session::SessionEncodingProfile::Raw,
+        client::SecurityPolicy::PreferAppleThenVnc,
+        &mut prompt,
+    )?;
+    println!(
+        "认证: 成功（类型 {} {}）",
+        c.used_security,
+        vnc::protocol::security_type_name(c.used_security)
+    );
+    println!("桌面名称: {}", c.name);
+    println!("分辨率: {}x{}", c.width, c.height);
+    println!(
+        "服务器像素格式: bpp={} depth={} {} 大端, 真彩色={}, RGB max={}/{}/{} shift={}/{}/{}",
+        c.server_pf.bits_per_pixel,
+        c.server_pf.depth,
+        if c.server_pf.big_endian != 0 {
+            "是"
+        } else {
+            "否"
+        },
+        c.server_pf.true_colour != 0,
+        c.server_pf.red_max,
+        c.server_pf.green_max,
+        c.server_pf.blue_max,
+        c.server_pf.red_shift,
+        c.server_pf.green_shift,
+        c.server_pf.blue_shift
+    );
     Ok(())
 }
 
@@ -651,12 +751,19 @@ fn cmd_shot(
     host: &str,
     port: u16,
     username: Option<&str>,
-    password: Option<&str>,
     out: &std::path::Path,
     wait_ms: u64,
 ) -> Result<()> {
     let addr = arp::parse_target(host, port)?;
-    let mut c = VncClient::connect_timeout(&addr, Duration::from_secs(5), username, password)?;
+    let negotiated = client::negotiate(&addr, Duration::from_secs(5))?;
+    let mut prompt = SystemPasswordPrompt;
+    let mut c = authenticate_cli_session(
+        negotiated,
+        username,
+        vnc::session::SessionEncodingProfile::Raw,
+        client::SecurityPolicy::PreferAppleThenVnc,
+        &mut prompt,
+    )?;
     println!("已连接 {addr} — {}（{}x{}）", c.name, c.width, c.height);
 
     c.init_session()?;
@@ -704,13 +811,16 @@ fn cmd_shot(
 /// esess：加密会话端到端验证。
 /// 建立 SRP-36 + Apple 会话加密层后，在加密帧内跑标准 RFB 消息，
 /// 逐帧校验 SHA1 并统计消息类型，最后汇总解密结果。
-fn cmd_esess(host: &str, port: u16, username: &str, password: &str, seconds: u64) -> Result<()> {
+fn cmd_esess(host: &str, port: u16, username: &str, seconds: u64) -> Result<()> {
     let addr = arp::parse_target(host, port)?;
-    let mut c = VncClient::connect_timeout(
-        &addr,
-        Duration::from_secs(5),
+    let negotiated = client::negotiate(&addr, Duration::from_secs(5))?;
+    let mut prompt = SystemPasswordPrompt;
+    let mut c = authenticate_cli_session(
+        negotiated,
         Some(username),
-        Some(password),
+        vnc::session::SessionEncodingProfile::Raw,
+        client::SecurityPolicy::AppleNativeOnly,
+        &mut prompt,
     )?;
     println!(
         "已连接 {addr} — {}（{}x{}，认证类型 {}）",
@@ -952,7 +1062,6 @@ fn cmd_hpss(
     host: &str,
     port: u16,
     username: &str,
-    password: &str,
     seconds: u64,
     out: Option<&std::path::Path>,
     png_out: Option<&std::path::Path>,
@@ -967,12 +1076,14 @@ fn cmd_hpss(
     } else {
         vnc::session::SessionEncodingProfile::AppleTcpMvs
     };
-    let mut c = client::VncClient::connect_timeout_opts(
-        &addr,
-        Duration::from_secs(5),
+    let negotiated = client::negotiate(&addr, Duration::from_secs(5))?;
+    let mut prompt = SystemPasswordPrompt;
+    let mut c = authenticate_cli_session(
+        negotiated,
         Some(username),
-        Some(password),
         encoding_profile,
+        client::SecurityPolicy::AppleNativeOnly,
+        &mut prompt,
     )?;
     println!(
         "已连接 {addr} — {}（{}x{}，认证类型 {}）",
@@ -1116,14 +1227,41 @@ fn rgb_to_png_rgba(rgb: &[u8], width: u16, height: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_cold_connection_error, cmd_hpss_capture_v2, cmd_mvs_capture_v2_verify,
-        create_cold_writer_then, finish_cold_connection_failure, format_cold_verify_json,
-        read_cold_capture_structural_then_strict, replay_offline_mvs_records, rgb_to_png_rgba, Cli,
-        Cmd, ColdConnectionFailure, DEFAULT_PASSWORD_ENV, DEFAULT_USERNAME_ENV,
+        authenticate_cli_session, classify_cold_connection_error, cmd_hpss_capture_v2,
+        cmd_mvs_capture_v2_verify, create_cold_writer_then, finish_cold_connection_failure,
+        format_cold_verify_json, read_cold_capture_structural_then_strict,
+        replay_offline_mvs_records, rgb_to_png_rgba, set_cli_password_clear_observer,
+        try_parse_cli_from, Cli, Cmd, ColdConnectionFailure, PasswordPrompt,
     };
     use crate::vnc::hpss::MvsCaptureWriter;
     use crate::vnc::mvs_stream::{MvsRecord, MvsRect};
     use clap::{CommandFactory, Parser};
+
+    struct InjectedPasswordTerminal {
+        interactive: bool,
+        value: String,
+        reads: usize,
+    }
+
+    impl PasswordPrompt for InjectedPasswordTerminal {
+        fn is_interactive_terminal(&self) -> bool {
+            self.interactive
+        }
+
+        fn read_password_without_echo(&mut self) -> std::io::Result<String> {
+            self.reads += 1;
+            Ok(std::mem::take(&mut self.value))
+        }
+    }
+
+    fn write_minimal_server_init(stream: &mut impl std::io::Write) {
+        let mut server_init = Vec::new();
+        server_init.extend_from_slice(&2u16.to_be_bytes());
+        server_init.extend_from_slice(&1u16.to_be_bytes());
+        server_init.extend_from_slice(&[32, 24, 1, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
+        server_init.extend_from_slice(&0u32.to_be_bytes());
+        stream.write_all(&server_init).unwrap();
+    }
 
     struct TestBitWriter {
         bytes: Vec<u8>,
@@ -1999,7 +2137,7 @@ mod tests {
     #[test]
     fn process_stdin_credential_dispatch_never_uses_the_global_buffered_reader() {
         let production = include_str!("main.rs")
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("production source prefix");
         let forbidden = ["stdin()", ".lock()"].concat();
@@ -2015,32 +2153,355 @@ mod tests {
         );
     }
     #[test]
-    fn cli_rejects_credentials_in_process_arguments() {
-        assert!(Cli::try_parse_from([
-            "freeremotedesk",
-            "hpss",
-            "example.invalid",
-            "--username",
-            "private-user",
-            "--password",
-            "private-password",
-        ])
-        .is_err());
+    fn cli_help_and_fields_expose_username_but_no_password_or_environment_source() {
+        let mut command = Cli::command();
+        let mut help = command.render_long_help().to_string();
+        for name in ["info", "shot", "hpss", "esess"] {
+            let subcommand = command.find_subcommand_mut(name).expect("CLI subcommand");
+            help.push_str(&subcommand.render_long_help().to_string());
+            let argument_ids = subcommand
+                .get_arguments()
+                .map(|argument| argument.get_id().as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(argument_ids.contains("username"), "{name} needs --username");
+            assert!(!argument_ids.iter().any(|id| id.contains("password")));
+            assert!(!argument_ids.iter().any(|id| id.ends_with("_env")));
+        }
+        for forbidden in [
+            "FRD_PASSWORD",
+            "FRD_USERNAME",
+            "password-env",
+            "username-env",
+        ] {
+            assert!(!help.contains(forbidden), "help leaked {forbidden}");
+        }
     }
 
     #[test]
-    fn hpss_defaults_to_named_credential_environment_sources() {
-        let cli = Cli::try_parse_from(["freeremotedesk", "hpss", "example.invalid"]).unwrap();
-        let Cmd::Hpss {
-            username_env,
-            password_env,
-            ..
-        } = cli.cmd
-        else {
-            panic!("应解析为 hpss 子命令");
+    fn cli_requires_username_for_hpss_and_esess_but_keeps_it_non_secret() {
+        for command in ["hpss", "esess"] {
+            assert!(Cli::try_parse_from(["freeremotedesk", command, "example.invalid"]).is_err());
+            let parsed = Cli::try_parse_from([
+                "freeremotedesk",
+                command,
+                "example.invalid",
+                "--username",
+                "local-user",
+            ])
+            .unwrap();
+            match parsed.cmd {
+                Cmd::Hpss { username, .. } | Cmd::Esess { username, .. } => {
+                    assert_eq!(username, "local-user")
+                }
+                _ => panic!("应解析为需要用户名的 Apple 子命令"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_rejects_secret_and_legacy_environment_flags_without_echoing_values() {
+        for forbidden in ["--password", "--password-env", "--username-env"] {
+            for arguments in [
+                vec![
+                    "freeremotedesk".to_owned(),
+                    "hpss".to_owned(),
+                    "example.invalid".to_owned(),
+                    "--username".to_owned(),
+                    "local-user".to_owned(),
+                    forbidden.to_owned(),
+                    "argument-secret-canary".to_owned(),
+                ],
+                vec![
+                    "freeremotedesk".to_owned(),
+                    "info".to_owned(),
+                    "example.invalid".to_owned(),
+                    format!("{forbidden}=embedded-secret-canary"),
+                ],
+            ] {
+                let error = try_parse_cli_from(arguments).unwrap_err();
+                let rendered = format!("{error:?} {error}");
+                assert!(!rendered.contains("argument-secret-canary"));
+                assert!(!rendered.contains("embedded-secret-canary"));
+            }
+        }
+    }
+
+    #[test]
+    fn production_main_uses_sanitized_parser_instead_of_clap_auto_exit() {
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source prefix");
+        assert!(!production.contains("Cli::parse()"));
+        assert!(production.contains("try_parse_cli_from(std::env::args_os())"));
+        assert!(production.contains("CliParseError::ForbiddenCredentialArgument"));
+    }
+
+    #[test]
+    fn production_guidance_never_mentions_environment_credential_sources() {
+        let main_production = include_str!("main.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let client_production = include_str!("vnc/client.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        for (name, content) in [
+            ("main", main_production),
+            ("client", client_production),
+            ("README", include_str!("../README.md")),
+            ("AGENTS", include_str!("../AGENTS.md")),
+        ] {
+            for forbidden in ["FRD_PASSWORD", "FRD_USERNAME"] {
+                assert!(!content.contains(forbidden), "{name} contains {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn interactive_password_rejects_redirected_input_without_reading_it() {
+        let mut terminal = InjectedPasswordTerminal {
+            interactive: false,
+            value: "redirected-secret-canary".to_owned(),
+            reads: 0,
         };
-        assert_eq!(username_env, DEFAULT_USERNAME_ENV);
-        assert_eq!(password_env, DEFAULT_PASSWORD_ENV);
+
+        let error = super::acquire_interactive_password(&mut terminal).unwrap_err();
+
+        assert_eq!(terminal.reads, 0);
+        assert!(!format!("{error:#}").contains("redirected-secret-canary"));
+    }
+
+    #[test]
+    fn interactive_password_owner_is_redacted_and_explicitly_clearable() {
+        let mut terminal = InjectedPasswordTerminal {
+            interactive: true,
+            value: "interactive-secret-canary".to_owned(),
+            reads: 0,
+        };
+
+        let mut password = super::acquire_interactive_password(&mut terminal).unwrap();
+
+        assert_eq!(terminal.reads, 1);
+        assert_eq!(password.expose(), "interactive-secret-canary");
+        assert!(!format!("{password:?}").contains("interactive-secret-canary"));
+        password.clear();
+        assert!(password.expose().is_empty());
+    }
+
+    #[test]
+    fn production_password_prompt_is_terminal_gated_and_non_echoing() {
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(production.contains("IsTerminal"));
+        assert!(production.contains("rpassword::prompt_password"));
+        assert!(!production.contains("read_line"));
+    }
+
+    #[test]
+    fn none_authentication_finishes_without_invoking_password_prompt() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut banner = [0u8; 12];
+            stream.read_exact(&mut banner).unwrap();
+            stream
+                .write_all(&[1, crate::vnc::protocol::security::NONE])
+                .unwrap();
+            let mut selection = [0u8; 1];
+            stream.read_exact(&mut selection).unwrap();
+            assert_eq!(selection, [crate::vnc::protocol::security::NONE]);
+            let mut client_init = [0u8; 1];
+            stream.read_exact(&mut client_init).unwrap();
+            assert_eq!(
+                client_init,
+                [crate::vnc::protocol::apple_session::SHARED_CLIENT_INIT]
+            );
+            write_minimal_server_init(&mut stream);
+        });
+        let negotiated =
+            crate::vnc::client::negotiate(&address, std::time::Duration::from_secs(1)).unwrap();
+        let mut prompt = InjectedPasswordTerminal {
+            interactive: true,
+            value: "unused-secret-canary".to_owned(),
+            reads: 0,
+        };
+
+        let client = authenticate_cli_session(
+            negotiated,
+            None,
+            crate::vnc::session::SessionEncodingProfile::Raw,
+            crate::vnc::client::SecurityPolicy::PreferAppleThenVnc,
+            &mut prompt,
+        )
+        .unwrap();
+
+        assert_eq!(client.used_security, crate::vnc::protocol::security::NONE);
+        assert_eq!(prompt.reads, 0);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn vnc_authentication_prompts_once_and_clears_before_client_init() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cleared = Arc::new(AtomicBool::new(false));
+        set_cli_password_clear_observer(Some(Arc::clone(&cleared)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let challenge = [0x5au8; crate::vnc::protocol::VNC_AUTH_CHALLENGE_BYTES];
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut banner = [0u8; 12];
+            stream.read_exact(&mut banner).unwrap();
+            stream
+                .write_all(&[1, crate::vnc::protocol::security::VNC_AUTH])
+                .unwrap();
+            let mut selection = [0u8; 1];
+            stream.read_exact(&mut selection).unwrap();
+            assert_eq!(selection, [crate::vnc::protocol::security::VNC_AUTH]);
+            stream.write_all(&challenge).unwrap();
+            let mut response = [0u8; crate::vnc::protocol::VNC_AUTH_CHALLENGE_BYTES];
+            stream.read_exact(&mut response).unwrap();
+            assert_eq!(
+                response,
+                crate::vnc::auth::vnc_des_challenge_response(
+                    &challenge,
+                    "interactive-secret-canary"
+                )
+            );
+            stream.write_all(&0u32.to_be_bytes()).unwrap();
+            let mut client_init = [0u8; 1];
+            stream.read_exact(&mut client_init).unwrap();
+            assert!(cleared.load(Ordering::SeqCst));
+            write_minimal_server_init(&mut stream);
+        });
+        let negotiated =
+            crate::vnc::client::negotiate(&address, std::time::Duration::from_secs(1)).unwrap();
+        let mut prompt = InjectedPasswordTerminal {
+            interactive: true,
+            value: "interactive-secret-canary".to_owned(),
+            reads: 0,
+        };
+
+        authenticate_cli_session(
+            negotiated,
+            None,
+            crate::vnc::session::SessionEncodingProfile::Raw,
+            crate::vnc::client::SecurityPolicy::PreferAppleThenVnc,
+            &mut prompt,
+        )
+        .unwrap();
+
+        assert_eq!(prompt.reads, 1);
+        set_cli_password_clear_observer(None);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn authentication_error_clears_interactive_password_owner() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cleared = Arc::new(AtomicBool::new(false));
+        set_cli_password_clear_observer(Some(Arc::clone(&cleared)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut banner = [0u8; 12];
+            stream.read_exact(&mut banner).unwrap();
+            stream
+                .write_all(&[1, crate::vnc::protocol::security::VNC_AUTH])
+                .unwrap();
+            let mut selection = [0u8; 1];
+            stream.read_exact(&mut selection).unwrap();
+            stream.write_all(&[0u8; 16]).unwrap();
+            let mut response = [0u8; 16];
+            stream.read_exact(&mut response).unwrap();
+            stream.write_all(&1u32.to_be_bytes()).unwrap();
+            let reflected = b"failure-secret-canary";
+            stream
+                .write_all(&(reflected.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(reflected).unwrap();
+        });
+        let negotiated =
+            crate::vnc::client::negotiate(&address, std::time::Duration::from_secs(1)).unwrap();
+        let mut prompt = InjectedPasswordTerminal {
+            interactive: true,
+            value: "failure-secret-canary".to_owned(),
+            reads: 0,
+        };
+
+        let error = authenticate_cli_session(
+            negotiated,
+            None,
+            crate::vnc::session::SessionEncodingProfile::Raw,
+            crate::vnc::client::SecurityPolicy::PreferAppleThenVnc,
+            &mut prompt,
+        )
+        .err()
+        .expect("authentication must fail");
+
+        assert!(cleared.load(Ordering::SeqCst));
+        assert_eq!(prompt.reads, 1);
+        assert!(!format!("{error:#}").contains("failure-secret-canary"));
+        set_cli_password_clear_observer(None);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn apple_native_without_username_fails_before_prompt_or_security_selection() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut banner = [0u8; 12];
+            stream.read_exact(&mut banner).unwrap();
+            stream
+                .write_all(&[1, crate::vnc::protocol::security::APPLE_SRP])
+                .unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+                .unwrap();
+            let mut selection = [0u8; 1];
+            assert_ne!(stream.read(&mut selection).unwrap_or(0), 1);
+        });
+        let negotiated =
+            crate::vnc::client::negotiate(&address, std::time::Duration::from_secs(1)).unwrap();
+        let mut prompt = InjectedPasswordTerminal {
+            interactive: true,
+            value: "unused-secret-canary".to_owned(),
+            reads: 0,
+        };
+
+        let error = authenticate_cli_session(
+            negotiated,
+            None,
+            crate::vnc::session::SessionEncodingProfile::Raw,
+            crate::vnc::client::SecurityPolicy::PreferAppleThenVnc,
+            &mut prompt,
+        )
+        .err()
+        .expect("missing username must fail");
+
+        assert!(error.to_string().contains("--username"));
+        assert_eq!(prompt.reads, 0);
+        server.join().unwrap();
     }
 
     #[test]
@@ -2084,6 +2545,25 @@ mod tests {
         };
         assert_eq!(input, std::path::PathBuf::from("capture.mvs"));
         assert!(strict_cold);
+    }
+
+    #[test]
+    fn cold_capture_clears_frdstd_frame_between_security_and_client_init() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source prefix");
+        let authenticate = source
+            .find("authenticate_deadline_opts(")
+            .expect("cold security phase must be explicit");
+        let clear = source
+            .find("with_slices_then_clear(")
+            .expect("cold credential owner must clear at callback boundary");
+        let finish = source
+            .find("finish_authenticated_connection(")
+            .expect("cold session finish phase must be explicit");
+        assert!(clear < authenticate);
+        assert!(authenticate < finish);
     }
 
     #[test]
