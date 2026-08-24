@@ -81,6 +81,8 @@ cargo build --locked --no-default-features --features cli
 
 GitHub Actions 工作流 `.github/workflows/build-desktop-installers.yml` 分别在原生 Windows、macOS、Linux runner 构建安装包，产物写入 `dist/<platform>/`。
 
+最新三平台安装包、SHA-256、签名和启动证据见 [桌面客户端验证矩阵](docs/validation/winit-wgpu-desktop-matrix.md)。
+
 ## 当前协议状态
 
 - Apple ARD：用户名/密码握手、HPSS、MVS、动态分辨率、UDP/SRTP 视频及 Mac→客户端音频接入统一会话层。实时兼容性仍需在目标 Mac 网络恢复后单独验证。

@@ -517,7 +517,7 @@ refactor: remove legacy Flutter and minifb clients
 - Consumes: native packages and authorized Windows/macOS/Linux targets.
 - Produces: evidence separating build success from protocol interoperability.
 
-- [ ] **Step 1: Record fresh package evidence**
+- [x] **Step 1: Record fresh package evidence**
 
 Record runner/OS, Rust version, artifact name, size, SHA-256, signing status, and local launch result for Windows, macOS, and Linux without secrets.
 
@@ -529,11 +529,11 @@ Authenticate with the Mac username/password path, require a complete non-empty n
 
 For RDP and RFB respectively, authenticate to stock services, render a non-empty frame, exercise pointer and keyboard, resize when supported, and disconnect cleanly.
 
-- [ ] **Step 4: Perform requirement-by-requirement completion audit**
+- [x] **Step 4: Perform requirement-by-requirement completion audit**
 
 Compare the current repository and artifacts against every section of the design spec and every task above. Mark Android/iOS/HarmonyOS explicitly as Phase 2, not as missing Phase 1 work; do not mark Phase 1 complete if any desktop build/package/protocol gate lacks evidence.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```text
 docs: record desktop client interoperability evidence
