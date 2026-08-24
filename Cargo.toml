@@ -19,6 +19,7 @@ ecb = "0.1"
 cbc = "0.1"
 sha1 = "0.10"
 rsa = "0.9"
+secrecy = "0.10"
 getrandom = "0.2"
 minifb = { version = "0.28", optional = true }
 cpal = { version = "0.18.2", optional = true }
