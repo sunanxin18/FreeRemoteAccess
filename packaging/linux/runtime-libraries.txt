@@ -1,0 +1,11 @@
+# Dynamically linked or loaded desktop runtime SONAME families.
+libX11.so.6
+libX11-xcb.so.1
+libXcursor.so.1
+libXi.so.6
+libXrandr.so.2
+libxkbcommon.so.0
+libxkbcommon-x11.so.0
+libwayland-client.so.0
+libvulkan.so.1
+libasound.so.2
