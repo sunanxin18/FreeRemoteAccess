@@ -1,3 +1,6 @@
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -31,6 +34,60 @@ class WindowsPackageSourceTests(unittest.TestCase):
         self.assertIn("StartMenuShortcut", wix)
         self.assertIn("aac\\NOTICE", wix)
         self.assertIn("$(FdkArchiveName)", wix)
+
+    def test_wix_tool_package_and_cli_versions_are_verified_separately(self):
+        workflow = self.read(".github/workflows/build-desktop-installers.yml")
+        verifier = REPO_ROOT / "packaging" / "windows" / "verify-wix-tool.ps1"
+        self.assertTrue(verifier.is_file(), "WiX tool version verifier is missing")
+        self.assertIn("./packaging/windows/verify-wix-tool.ps1", workflow)
+        self.assertNotIn("(wix --version).Trim() -ne '4.0.6'", workflow)
+
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable")
+
+        def verify(tool_version: str, cli_version: str):
+            with tempfile.TemporaryDirectory() as temporary:
+                fixture = Path(temporary)
+                tool_list = fixture / "tool-list.txt"
+                cli_output = fixture / "cli-version.txt"
+                tool_list.write_text(
+                    "Package Id      Version      Commands\n"
+                    "--------------------------------------\n"
+                    f"wix             {tool_version}        wix\n",
+                    encoding="utf-8",
+                )
+                cli_output.write_text(cli_version, encoding="utf-8")
+                return subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-File",
+                        str(verifier),
+                        "-ToolListFixture",
+                        str(tool_list),
+                        "-CliVersionFixture",
+                        str(cli_output),
+                    ],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+        for cli_version in ("4.0.6\n", "4.0.6+9f3f1f52\n"):
+            accepted = verify("4.0.6", cli_version)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        for tool_version, cli_version in (
+            ("4.0.60", "4.0.6\n"),
+            ("4.0.7", "4.0.6\n"),
+            ("4.0.6", "4.0.60\n"),
+            ("4.0.6", "4.0.7\n"),
+            ("4.0.6", "4.0.6\nunexpected\n"),
+        ):
+            rejected = verify(tool_version, cli_version)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("wix_version_mismatch", rejected.stderr)
 
     def test_windows_builder_uses_canonical_version_and_embeds_support_in_zip_and_msi(self):
         builder = self.read("packaging/windows/build-msi.ps1")

@@ -34,7 +34,7 @@ class NativePackageSourceTests(unittest.TestCase):
             "cargo-deny --version 0.20.2",
             "cargo-deb --version 3.7.0",
             "cargo-generate-rpm --version 0.21.0",
-            "wix --version).Trim() -ne '4.0.6'",
+            "dotnet tool install --global wix --version 4.0.6",
         ):
             self.assertIn(pinned_tool, workflow)
         self.assertIn("cargo audit", workflow)

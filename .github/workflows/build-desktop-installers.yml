@@ -67,7 +67,7 @@ jobs:
         shell: pwsh
         run: |
           dotnet tool install --global wix --version 4.0.6
-          if ((wix --version).Trim() -ne '4.0.6') { throw 'wix_version_mismatch' }
+          ./packaging/windows/verify-wix-tool.ps1
       - name: Build canonical executable, ZIP and MSI set
         shell: pwsh
         run: ./packaging/windows/build-msi.ps1 -SkipNativeVerification
