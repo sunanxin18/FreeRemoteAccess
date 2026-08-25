@@ -2966,7 +2966,7 @@ mod tests {
                 )
                 .is_ok()
             {
-                return Err(PlatformError::new("test_audio_enqueue_failed"));
+                return Err(PlatformError::new("audio_output_stream_failed"));
             }
             Ok(())
         }
@@ -3110,6 +3110,11 @@ mod tests {
         );
         assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(output.enqueues.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            state.audio_output_phase(),
+            AudioOutputPhase::Degraded { reason }
+                if reason.contains("audio_output_stream_failed")
+        ));
         assert_video_and_control_remain_serviceable(&mut state, Instant::now());
 
         state.reset_generation().unwrap();

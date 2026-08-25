@@ -72,11 +72,16 @@ pub struct AudioOutputSink {
 }
 
 impl AudioOutputSink {
+    pub const MAX_INTERLEAVED_I16_SAMPLES_PER_ENQUEUE: usize = 131_072;
+
     pub fn new(spec: AudioOutputSpec, backend: Box<dyn AudioOutputBackend>) -> Self {
         Self { spec, backend }
     }
 
     pub fn enqueue_interleaved_i16(&mut self, samples: &[i16]) -> Result<(), PlatformError> {
+        if samples.len() > Self::MAX_INTERLEAVED_I16_SAMPLES_PER_ENQUEUE {
+            return Err(PlatformError::new("audio_output_pcm_too_large"));
+        }
         if !samples
             .len()
             .is_multiple_of(usize::from(self.spec.channels()))
@@ -225,6 +230,30 @@ mod tests {
         assert_eq!(sink.device_description(), "测试输出设备");
     }
 
+    #[test]
+    fn sink_rejects_an_oversized_pcm_chunk_before_backend_enqueue() {
+        let enqueues = Arc::new(AtomicUsize::new(0));
+        let mut sink = AudioOutputSink::new(
+            AudioOutputSpec::normalized(),
+            Box::new(CountingBackend {
+                enqueues: Arc::clone(&enqueues),
+            }),
+        );
+        let oversized = vec![
+            0;
+            AudioOutputSink::MAX_INTERLEAVED_I16_SAMPLES_PER_ENQUEUE
+                .checked_add(2)
+                .unwrap()
+        ];
+
+        assert_eq!(
+            sink.enqueue_interleaved_i16(&oversized).unwrap_err().code(),
+            "audio_output_pcm_too_large"
+        );
+        assert_eq!(enqueues.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     #[test]
     fn production_factory_returns_current_desktop_services() {
         let services = production_platform_services();
