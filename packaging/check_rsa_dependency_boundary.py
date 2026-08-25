@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -49,15 +50,33 @@ EXPECTED_PATH_PACKAGES = {
     ("ironrdp-client", "0.1.0", "vendor/ironrdp-client/Cargo.toml"),
 }
 SOURCE_ESCAPE = re.compile(r"(?:\binclude\s*!\s*\(|#\s*\[\s*path\s*=)")
-PRIVATE_BOUNDARY_API = re.compile(
-    r"(?:Credentials\s*::\s*SmartCard|SmartCardIdentity|"
-    r"(?:\b|::)(?:sspi|picky|winscard|rsa)\s*::)"
+TRANSITIVE_PRIVATE_API = re.compile(
+    r"(?:\bSmartCard(?:Identity)?\b|(?:\b|::)(?:sspi|picky|winscard|rsa)\s*::)"
+)
+ANY_CREDENTIALS = re.compile(r"\bCredentials\b")
+USERNAME_PASSWORD_CONTEXT = re.compile(
+    r"\blet\s+connector\s*=\s*ironrdp_connector\s*::\s*Config\s*\{\s*"
+    r"credentials\s*:\s*ironrdp_connector\s*::\s*Credentials\s*::\s*"
+    r"UsernamePassword\s*\{\s*"
+    r"username\s*:\s*self\s*\.\s*username\s*\.\s*unwrap_or_default\s*\(\s*\)\s*,\s*"
+    r"password\s*:\s*self\s*\.\s*password\s*\.\s*unwrap_or_default\s*\(\s*\)\s*,\s*"
+    r"\}\s*,\s*domain\s*:\s*self\s*\.\s*domain\s*,"
+)
+MODULE_DECLARATION = re.compile(
+    r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;"
 )
 
 
 def load_metadata(repo: Path) -> dict[str, Any]:
     completed = subprocess.run(
-        ["cargo", "metadata", "--locked", "--format-version", "1"],
+        [
+            "cargo",
+            "metadata",
+            "--locked",
+            "--all-features",
+            "--format-version",
+            "1",
+        ],
         cwd=repo,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -71,11 +90,86 @@ def load_metadata(repo: Path) -> dict[str, Any]:
         raise ValueError("cargo_metadata_invalid") from error
 
 
-def _resolved_relative(path: str, repo: Path) -> str:
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
+def _canonical_repo_file(path: str | Path, repo: Path, error_code: str) -> tuple[Path, str]:
+    repo = repo.resolve(strict=True)
+    lexical = Path(path)
+    if not lexical.is_absolute():
+        lexical = repo / lexical
     try:
-        return Path(path).resolve(strict=False).relative_to(repo.resolve(strict=True)).as_posix()
-    except (OSError, ValueError) as error:
-        raise ValueError("path_dependency_outside_repository") from error
+        relative = lexical.relative_to(repo)
+    except ValueError as exception:
+        raise ValueError(f"{error_code}_outside_repository") from exception
+    current = repo
+    for component in relative.parts:
+        current /= component
+        if _is_link_or_junction(current):
+            raise ValueError(f"{error_code}_symlink_ancestor")
+    try:
+        resolved = lexical.resolve(strict=True)
+        resolved_relative = resolved.relative_to(repo).as_posix()
+    except (OSError, ValueError) as exception:
+        raise ValueError(f"{error_code}_outside_repository") from exception
+    if not resolved.is_file():
+        raise ValueError(f"{error_code}_not_file")
+    return resolved, resolved_relative
+
+
+def _mask_non_code(source: str) -> str:
+    masked = list(source)
+    index = 0
+    while index < len(source):
+        if source.startswith("//", index):
+            end = source.find("\n", index + 2)
+            end = len(source) if end < 0 else end
+            masked[index:end] = " " * (end - index)
+            index = end
+            continue
+        if source.startswith("/*", index):
+            end = index + 2
+            depth = 1
+            while end < len(source) and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            masked[index:end] = " " * (end - index)
+            index = end
+            continue
+        raw = re.match(r"(?:br|r)(?P<hashes>#{0,255})\"", source[index:])
+        if raw:
+            terminator = '"' + raw.group("hashes")
+            content_start = index + raw.end()
+            end_at = source.find(terminator, content_start)
+            end = len(source) if end_at < 0 else end_at + len(terminator)
+            masked[index:end] = " " * (end - index)
+            index = end
+            continue
+        prefix = 2 if source.startswith('b"', index) else 1
+        if source[index : index + prefix].endswith('"'):
+            end = index + prefix
+            escaped = False
+            while end < len(source):
+                character = source[end]
+                end += 1
+                if character == '"' and not escaped:
+                    break
+                if character == "\\" and not escaped:
+                    escaped = True
+                else:
+                    escaped = False
+            masked[index:end] = " " * (end - index)
+            index = end
+            continue
+        index += 1
+    return "".join(masked)
 
 
 def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
@@ -101,10 +195,22 @@ def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
         raise ValueError("workspace_member_set_changed")
 
     path_packages = set()
+    target_directory = Path(metadata.get("target_directory", "")).resolve(strict=False)
     for package in packages:
         if package.get("source") is None:
-            relative = _resolved_relative(package["manifest_path"], repo)
+            _, relative = _canonical_repo_file(
+                package["manifest_path"], repo, "path_dependency_manifest"
+            )
             path_packages.add((package["name"], package["version"], relative))
+            targets = package.get("targets")
+            if not isinstance(targets, list) or not targets:
+                raise ValueError("product_target_set_missing")
+            for target in targets:
+                source, _ = _canonical_repo_file(
+                    target["src_path"], repo, "product_target"
+                )
+                if source == target_directory or target_directory in source.parents:
+                    raise ValueError("product_target_generated_source")
     if path_packages != EXPECTED_PATH_PACKAGES:
         raise ValueError("path_dependency_set_changed")
 
@@ -149,30 +255,104 @@ def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
         raise ValueError("approved_root_rsa_dependency_missing")
 
 
-def validate_product_api(repo: Path) -> None:
-    source_roots = (repo / "src", repo / "vendor" / "ironrdp-client" / "src")
-    if any(not root.is_dir() for root in source_roots):
-        raise ValueError("product_source_root_missing")
-    for source_root in source_roots:
-        for path in sorted(source_root.rglob("*.rs")):
-            if path.is_symlink():
-                raise ValueError(f"product_rust_source_escape:{path.relative_to(repo).as_posix()}")
-            source = path.read_text(encoding="utf-8")
-            if SOURCE_ESCAPE.search(source):
-                raise ValueError(f"product_rust_source_escape:{path.relative_to(repo).as_posix()}")
-            if "vendor/ironrdp-client" in path.as_posix().replace("\\", "/"):
-                if PRIVATE_BOUNDARY_API.search(source):
-                    raise ValueError(
-                        f"transitive_private_api_reachable:{path.relative_to(repo).as_posix()}"
-                    )
-            elif re.search(r"Credentials\s*::\s*SmartCard|SmartCardIdentity", source):
-                raise ValueError(
-                    f"transitive_private_api_reachable:{path.relative_to(repo).as_posix()}"
+def _source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]:
+    source_files: set[Path] = set()
+    package_directories: set[Path] = set()
+    module_roots: set[Path] = set()
+    if metadata is not None:
+        for package in metadata["packages"]:
+            if package.get("source") is not None:
+                continue
+            manifest, _ = _canonical_repo_file(
+                package["manifest_path"], repo, "path_dependency_manifest"
+            )
+            package_directories.add(manifest.parent)
+            for target in package["targets"]:
+                source, _ = _canonical_repo_file(
+                    target["src_path"], repo, "product_target"
                 )
-    connector = repo / "vendor" / "ironrdp-client" / "src" / "config.rs"
-    connector_source = connector.read_text(encoding="utf-8")
-    if len(re.findall(r"Credentials\s*::\s*UsernamePassword", connector_source)) != 1:
-        raise ValueError("username_password_connector_fingerprint_changed")
+                source_files.add(source)
+                module_root = (
+                    source.parent
+                    if source.name in {"lib.rs", "main.rs", "mod.rs"}
+                    else source.parent / source.stem
+                )
+                if module_root.is_dir():
+                    module_roots.add(module_root)
+    else:
+        package_directories.update((repo, repo / "vendor" / "ironrdp-client"))
+
+    source_roots = set(module_roots)
+    for package_directory in package_directories:
+        source_roots.update(
+            package_directory / relative_directory
+            for relative_directory in ("src", "tests", "benches", "examples")
+        )
+    for source_root in source_roots:
+        if not source_root.exists():
+            continue
+        for directory, directory_names, file_names in os.walk(
+            source_root, followlinks=False
+        ):
+            directory_path = Path(directory)
+            for name in tuple(directory_names):
+                candidate = directory_path / name
+                if _is_link_or_junction(candidate):
+                    raise ValueError("product_source_symlink_ancestor")
+            for name in file_names:
+                if name.endswith(".rs"):
+                    source, _ = _canonical_repo_file(
+                        directory_path / name, repo, "product_source"
+                    )
+                    source_files.add(source)
+
+    pending = list(source_files)
+    while pending:
+        path = pending.pop()
+        code = _mask_non_code(path.read_text(encoding="utf-8"))
+        module_base = path.parent if path.name in {"lib.rs", "main.rs", "mod.rs"} else path.parent / path.stem
+        for module_name in MODULE_DECLARATION.findall(code):
+            candidates = (
+                module_base / f"{module_name}.rs",
+                module_base / module_name / "mod.rs",
+            )
+            for candidate in candidates:
+                if candidate.exists():
+                    module_source, _ = _canonical_repo_file(
+                        candidate, repo, "product_source"
+                    )
+                    if module_source not in source_files:
+                        source_files.add(module_source)
+                        pending.append(module_source)
+                    break
+    return source_files
+
+
+def validate_product_api(repo: Path, metadata: dict[str, Any] | None = None) -> None:
+    source_files = _source_files(repo, metadata)
+    if not source_files:
+        raise ValueError("product_source_root_missing")
+    connector = (repo / "vendor" / "ironrdp-client" / "src" / "config.rs").resolve(
+        strict=True
+    )
+    for path in sorted(source_files):
+        source = path.read_text(encoding="utf-8")
+        code = _mask_non_code(source)
+        relative = path.relative_to(repo.resolve(strict=True)).as_posix()
+        if SOURCE_ESCAPE.search(code):
+            raise ValueError(f"product_rust_source_escape:{relative}")
+        if re.search(r"\bSmartCard(?:Identity)?\b", code):
+            raise ValueError(f"transitive_private_api_reachable:{relative}")
+        if "vendor/ironrdp-client" in relative and TRANSITIVE_PRIVATE_API.search(code):
+            raise ValueError(f"transitive_private_api_reachable:{relative}")
+        if path == connector:
+            matches = list(USERNAME_PASSWORD_CONTEXT.finditer(code))
+            if len(matches) != 1:
+                raise ValueError("username_password_connector_fingerprint_changed")
+            match = matches[0]
+            code = code[: match.start()] + " " * (match.end() - match.start()) + code[match.end() :]
+        if ANY_CREDENTIALS.search(code):
+            raise ValueError(f"transitive_private_api_reachable:{relative}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -181,8 +361,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         repo = Path(args.repo).resolve(strict=True)
-        validate_metadata(load_metadata(repo), repo)
-        validate_product_api(repo)
+        metadata = load_metadata(repo)
+        validate_metadata(metadata, repo)
+        validate_product_api(repo, metadata)
     except (KeyError, OSError, UnicodeError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2

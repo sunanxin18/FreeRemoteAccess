@@ -7,6 +7,7 @@ snapshot=20260810T000000Z
 minimum_apt=2.4.11
 ca_bootstrap_deb=''
 ca_bootstrap_sha256=6e8cdcc8c86103acd4fc14649eac62ff2037108389074a7b167567af33c32245
+resolution_verifier="$repo_root/packaging/linux/verify-snapshot-resolution.sh"
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -77,6 +78,9 @@ deb [snapshot=$snapshot] http://archive.ubuntu.com/ubuntu jammy main universe re
 deb [snapshot=$snapshot] http://archive.ubuntu.com/ubuntu jammy-updates main universe restricted multiverse
 deb [snapshot=$snapshot] http://security.ubuntu.com/ubuntu jammy-security main universe restricted multiverse
 EOF
+grep -Fqx "deb [snapshot=$snapshot] http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse" "$snapshot_sources"
+grep -Fqx "deb [snapshot=$snapshot] http://archive.ubuntu.com/ubuntu jammy-updates main universe restricted multiverse" "$snapshot_sources"
+grep -Fqx "deb [snapshot=$snapshot] http://security.ubuntu.com/ubuntu jammy-security main universe restricted multiverse" "$snapshot_sources"
 
 apt_options=(
   -o "Dir::Etc::sourcelist=$snapshot_sources"
@@ -90,14 +94,16 @@ if [[ -n "$ca_bundle" ]]; then
 fi
 apt-get "${apt_options[@]}" update
 
-index_targets="$(apt-get "${apt_options[@]}" indextargets --format '$(SITE)|$(RELEASE)|$(COMPONENT)')"
-[[ -n "$index_targets" ]] || { echo 'ubuntu_snapshot_index_targets_empty' >&2; exit 2; }
-while IFS= read -r target; do
-  [[ "$target" =~ ^(archive\.ubuntu\.com|security\.ubuntu\.com)\|jammy(-updates|-security)?\| ]] || {
-    echo 'ubuntu_snapshot_index_origin_mismatch' >&2
-    exit 2
-  }
-done <<<"$index_targets"
+index_targets="$temporary_root/index-targets"
+install_plan="$temporary_root/install-plan"
+install_uris="$temporary_root/install-uris"
+apt-get "${apt_options[@]}" indextargets \
+  --format '$(SITE)|$(RELEASE)|$(COMPONENT)' >"$index_targets"
+LC_ALL=C apt-get "${apt_options[@]}" --simulate install \
+  --no-install-recommends --allow-downgrades "${locked_packages[@]}" >"$install_plan"
+LC_ALL=C apt-get "${apt_options[@]}" --print-uris --yes install \
+  --no-install-recommends --allow-downgrades "${locked_packages[@]}" >"$install_uris"
+bash "$resolution_verifier" "$snapshot" "$index_targets" "$install_plan" "$install_uris"
 
 for package in "${locked_packages[@]}"; do
   package_name="${package%%=*}"

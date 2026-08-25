@@ -2,6 +2,8 @@ import copy
 import datetime
 import importlib.util
 import inspect
+import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -143,6 +145,20 @@ class NativePackageSourceTests(unittest.TestCase):
         guard.validate_metadata(metadata, REPO_ROOT)
         guard.validate_product_api(REPO_ROOT)
 
+        original_run = guard.subprocess.run
+        metadata_command = []
+
+        def capture_metadata_command(command, **_kwargs):
+            metadata_command.extend(command)
+            return subprocess.CompletedProcess(command, 0, json.dumps(metadata).encode(), b"")
+
+        guard.subprocess.run = capture_metadata_command
+        try:
+            guard.load_metadata(REPO_ROOT)
+        finally:
+            guard.subprocess.run = original_run
+        self.assertIn("--all-features", metadata_command)
+
         def rejected(mutator, error):
             fixture = copy.deepcopy(metadata)
             mutator(fixture)
@@ -213,6 +229,52 @@ class NativePackageSourceTests(unittest.TestCase):
 
         rejected(add_boundary_feature, "rsa_boundary_feature_set_changed")
 
+        def add_external_target(value):
+            root = next(
+                package
+                for package in value["packages"]
+                if package["id"] == value["resolve"]["root"]
+            )
+            root["targets"].append(
+                {
+                    "name": "outside",
+                    "kind": ["bin"],
+                    "crate_types": ["bin"],
+                    "src_path": str(REPO_ROOT.parent / "outside.rs"),
+                }
+            )
+
+        rejected(add_external_target, "product_target_outside_repository")
+
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temporary_target:
+            hidden_root = Path(temporary_target)
+            hidden_target = hidden_root / "hidden.rs"
+            hidden_modules = hidden_root / "hidden"
+            hidden_modules.mkdir()
+            hidden_target.write_text("mod credential_alias;\n", encoding="utf-8")
+            (hidden_modules / "credential_alias.rs").write_text(
+                "use ironrdp_connector::Credentials as C;\n"
+                "fn hidden() { let _ = C::SmartCard; }\n",
+                encoding="utf-8",
+            )
+            hidden_metadata = copy.deepcopy(metadata)
+            hidden_root_package = next(
+                package
+                for package in hidden_metadata["packages"]
+                if package["id"] == hidden_metadata["resolve"]["root"]
+            )
+            hidden_root_package["targets"].append(
+                {
+                    "name": "hidden_feature_target",
+                    "kind": ["bin"],
+                    "crate_types": ["bin"],
+                    "src_path": str(hidden_target),
+                }
+            )
+            guard.validate_metadata(hidden_metadata, REPO_ROOT)
+            with self.assertRaisesRegex(ValueError, "transitive_private_api_reachable"):
+                guard.validate_product_api(REPO_ROOT, hidden_metadata)
+
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Path(temporary)
             controlled = fixture / "src" / "lib.rs"
@@ -221,7 +283,12 @@ class NativePackageSourceTests(unittest.TestCase):
             connector.parent.mkdir(parents=True)
             controlled.write_text('include!("outside.rs");\n', encoding="utf-8")
             connector.write_text(
-                "let credentials = Credentials::UsernamePassword(user, password);\n",
+                "let connector = ironrdp_connector::Config {\n"
+                "credentials: ironrdp_connector::Credentials::UsernamePassword {\n"
+                "username: self.username.unwrap_or_default(),\n"
+                "password: self.password.unwrap_or_default(),\n"
+                "},\n"
+                "domain: self.domain,\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "product_rust_source_escape"):
@@ -233,6 +300,63 @@ class NativePackageSourceTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "transitive_private_api_reachable"):
                 guard.validate_product_api(fixture)
+
+            credential_alias_bypasses = (
+                "use ironrdp_connector::Credentials as C;\nfn bypass() { let _ = C::SmartCard; }\n",
+                "use ironrdp_connector::Credentials::{SmartCard as Card};\nfn bypass() { let _ = Card; }\n",
+                "use ironrdp_connector::Credentials::*;\nfn bypass() {}\n",
+                "use ironrdp_connector::Credentials as C;\nfn bypass() { let _ = C::UsernamePassword; }\n",
+            )
+            exact = (
+                "let connector = ironrdp_connector::Config {\n"
+                "credentials: ironrdp_connector::Credentials::UsernamePassword {\n"
+                "username: self.username.unwrap_or_default(),\n"
+                "password: self.password.unwrap_or_default(),\n"
+                "},\n"
+                "domain: self.domain,\n"
+            )
+            for bypass in credential_alias_bypasses:
+                with self.subTest(bypass=bypass.splitlines()[0]):
+                    connector.write_text(exact + bypass, encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ValueError, "transitive_private_api_reachable"
+                    ):
+                        guard.validate_product_api(fixture)
+
+            controlled.write_text("mod child;\n", encoding="utf-8")
+            child = controlled.parent / "child.rs"
+            child.write_text("fn child() {}\n", encoding="utf-8")
+            connector.write_text(exact, encoding="utf-8")
+            guard.validate_product_api(fixture)
+
+            real_module = fixture / "real-module"
+            real_module.mkdir()
+            (real_module / "child.rs").write_text("fn child() {}\n", encoding="utf-8")
+            child.unlink()
+            try:
+                if os.name == "nt":
+                    linked = subprocess.run(
+                        [
+                            "cmd",
+                            "/c",
+                            "mklink",
+                            "/J",
+                            str(controlled.parent / "child"),
+                            str(real_module),
+                        ],
+                        capture_output=True,
+                        check=False,
+                    )
+                    if linked.returncode != 0:
+                        self.skipTest("directory junction unavailable")
+                    controlled.write_text("mod child { mod child; }\n", encoding="utf-8")
+                else:
+                    (controlled.parent / "child.rs").symlink_to(real_module / "child.rs")
+                with self.assertRaisesRegex(ValueError, "product_source_symlink_ancestor"):
+                    guard.validate_product_api(fixture)
+            finally:
+                if os.name == "nt" and (controlled.parent / "child").exists():
+                    os.rmdir(controlled.parent / "child")
 
     def test_ubuntu_dependencies_use_one_immutable_snapshot_and_exact_lock(self):
         workflow = self.read(".github/workflows/build-desktop-installers.yml")
@@ -256,6 +380,9 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertIn("Acquire::https::CaInfo", installer)
         self.assertIn("dpkg-deb", installer)
         self.assertIn("indextargets", installer)
+        self.assertIn("verify-snapshot-resolution.sh", installer)
+        self.assertIn("--simulate install", installer)
+        self.assertIn("--print-uris --yes install", installer)
         self.assertIn("snapshot_candidate_mismatch", installer)
         self.assertIn("ca-certificates_20260601~22.04.1_all.deb", fetcher)
         self.assertIn(
@@ -272,6 +399,80 @@ class NativePackageSourceTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(locked_lines), 20)
         self.assertTrue(all("=" in line for line in locked_lines))
+
+    def test_snapshot_resolution_verifier_uses_actual_snapshot_uris(self):
+        verifier_path = (
+            REPO_ROOT / "packaging" / "linux" / "verify-snapshot-resolution.sh"
+        )
+        self.assertTrue(verifier_path.is_file(), "snapshot resolution verifier missing")
+        snapshot = "20260810T000000Z"
+        index_lines = []
+        for release in ("jammy", "jammy-updates", "jammy-security"):
+            logical_site = (
+                "http://security.ubuntu.com/ubuntu"
+                if release == "jammy-security"
+                else "http://archive.ubuntu.com/ubuntu"
+            )
+            for component in ("main", "universe", "restricted", "multiverse"):
+                index_lines.append(f"{logical_site}|{release}|{component}")
+                index_lines.append(
+                    f"https://snapshot.ubuntu.com/ubuntu/{snapshot}|{release}|{component}"
+                )
+        indices = "\n".join(index_lines) + "\n"
+        plan = (
+            "Inst ca-certificates (20260601~22.04.1 Ubuntu:22.04/jammy-updates [all])\n"
+            "Inst libexample:amd64 (1.2-3 Ubuntu:22.04/jammy [amd64])\n"
+        )
+        uris = (
+            f"'https://snapshot.ubuntu.com/ubuntu/{snapshot}/pool/main/c/ca-certificates/"
+            "ca-certificates_20260601~22.04.1_all.deb' ca.deb 1 SHA256:00\n"
+            f"'https://snapshot.ubuntu.com/ubuntu/{snapshot}/pool/main/libe/libexample/"
+            "libexample_1.2-3_amd64.deb' libexample.deb 1 SHA256:00\n"
+        )
+        fixture_root = REPO_ROOT / "target" / "package"
+        fixture_root.mkdir(parents=True, exist_ok=True)
+
+        def verify(index_text, plan_text, uri_text):
+            with tempfile.TemporaryDirectory(dir=fixture_root) as temporary:
+                fixture = Path(temporary)
+                (fixture / "indices").write_text(
+                    index_text, encoding="utf-8", newline="\n"
+                )
+                (fixture / "plan").write_text(
+                    plan_text, encoding="utf-8", newline="\n"
+                )
+                (fixture / "uris").write_text(
+                    uri_text, encoding="utf-8", newline="\n"
+                )
+                relative = fixture.relative_to(REPO_ROOT)
+                return subprocess.run(
+                    [
+                        "bash",
+                        "packaging/linux/verify-snapshot-resolution.sh",
+                        snapshot,
+                        (relative / "indices").as_posix(),
+                        (relative / "plan").as_posix(),
+                        (relative / "uris").as_posix(),
+                    ],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+
+        accepted = verify(indices, plan, uris)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        rejected = verify(indices.replace(snapshot, "20260809T000000Z", 1), plan, uris)
+        self.assertIn("snapshot_index_pair_mismatch", rejected.stderr)
+        rejected = verify(indices, plan, uris.replace(snapshot, "20260809T000000Z", 1))
+        self.assertIn("snapshot_uri_mismatch", rejected.stderr)
+        rejected = verify(
+            indices,
+            plan.replace("libexample:amd64 (1.2-3", "libexample:amd64 (1.2-4"),
+            uris,
+        )
+        self.assertIn("snapshot_resolution_mismatch", rejected.stderr)
 
     def test_supply_chain_policy_and_locked_fetch_are_explicit(self):
         deny = self.read("deny.toml")
