@@ -49,6 +49,55 @@ EXPECTED_PATH_PACKAGES = {
     ("freeremotedesk", "0.1.0", "Cargo.toml"),
     ("ironrdp-client", "0.1.0", "vendor/ironrdp-client/Cargo.toml"),
 }
+ROOT_IDENTITY = ("freeremotedesk", "0.1.0", None)
+RSA_09_IDENTITY = ("rsa", "0.9.10", CRATES_IO)
+RSA_10_IDENTITY = ("rsa", "0.10.0-rc.18", CRATES_IO)
+PICKY_IDENTITY = ("picky", "7.0.0-rc.25", CRATES_IO)
+SSPI_IDENTITY = ("sspi", "0.21.3", CRATES_IO)
+WINSCARD_IDENTITY = ("winscard", "0.3.3", CRATES_IO)
+IRONRDP_IDENTITY = ("ironrdp", "0.17.0", CRATES_IO)
+IRONRDP_ASYNC_IDENTITY = ("ironrdp-async", "0.10.0", CRATES_IO)
+IRONRDP_CLIENT_IDENTITY = ("ironrdp-client", "0.1.0", None)
+IRONRDP_CONNECTOR_IDENTITY = ("ironrdp-connector", "0.10.0", CRATES_IO)
+IRONRDP_TOKIO_IDENTITY = ("ironrdp-tokio", "0.10.0", CRATES_IO)
+EXPECTED_RSA_REVERSE_CLOSURES = {
+    "0.9.10": {
+        "nodes": {ROOT_IDENTITY, RSA_09_IDENTITY},
+        "edges": {(ROOT_IDENTITY, "rsa", RSA_09_IDENTITY)},
+    },
+    "0.10.0-rc.18": {
+        "nodes": {
+            ROOT_IDENTITY,
+            IRONRDP_IDENTITY,
+            IRONRDP_ASYNC_IDENTITY,
+            IRONRDP_CLIENT_IDENTITY,
+            IRONRDP_CONNECTOR_IDENTITY,
+            IRONRDP_TOKIO_IDENTITY,
+            PICKY_IDENTITY,
+            RSA_10_IDENTITY,
+            SSPI_IDENTITY,
+            WINSCARD_IDENTITY,
+        },
+        "edges": {
+            (ROOT_IDENTITY, "ironrdp", IRONRDP_IDENTITY),
+            (IRONRDP_IDENTITY, "ironrdp_client", IRONRDP_CLIENT_IDENTITY),
+            (IRONRDP_IDENTITY, "ironrdp_connector", IRONRDP_CONNECTOR_IDENTITY),
+            (IRONRDP_ASYNC_IDENTITY, "ironrdp_connector", IRONRDP_CONNECTOR_IDENTITY),
+            (IRONRDP_CLIENT_IDENTITY, "ironrdp_connector", IRONRDP_CONNECTOR_IDENTITY),
+            (IRONRDP_CLIENT_IDENTITY, "ironrdp_tokio", IRONRDP_TOKIO_IDENTITY),
+            (IRONRDP_CONNECTOR_IDENTITY, "picky", PICKY_IDENTITY),
+            (IRONRDP_CONNECTOR_IDENTITY, "sspi", SSPI_IDENTITY),
+            (IRONRDP_TOKIO_IDENTITY, "ironrdp_async", IRONRDP_ASYNC_IDENTITY),
+            (IRONRDP_TOKIO_IDENTITY, "ironrdp_connector", IRONRDP_CONNECTOR_IDENTITY),
+            (PICKY_IDENTITY, "rsa", RSA_10_IDENTITY),
+            (SSPI_IDENTITY, "picky", PICKY_IDENTITY),
+            (SSPI_IDENTITY, "rsa", RSA_10_IDENTITY),
+            (SSPI_IDENTITY, "winscard", WINSCARD_IDENTITY),
+            (WINSCARD_IDENTITY, "picky", PICKY_IDENTITY),
+            (WINSCARD_IDENTITY, "rsa", RSA_10_IDENTITY),
+        },
+    },
+}
 SOURCE_ESCAPE = re.compile(r"(?:\binclude\s*!\s*\(|#\s*\[\s*path\s*=)")
 TRANSITIVE_PRIVATE_API = re.compile(
     r"(?:\bSmartCard(?:Identity)?\b|(?:\b|::)(?:sspi|picky|winscard|rsa)\s*::)"
@@ -94,7 +143,9 @@ def _is_link_or_junction(path: Path) -> bool:
     return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
 
 
-def _canonical_repo_file(path: str | Path, repo: Path, error_code: str) -> tuple[Path, str]:
+def _canonical_repo_file(
+    path: str | Path, repo: Path, error_code: str
+) -> tuple[Path, str]:
     repo = repo.resolve(strict=True)
     lexical = Path(path)
     if not lexical.is_absolute():
@@ -184,6 +235,10 @@ def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
         raise ValueError("cargo_metadata_shape_invalid")
     node_by_id = {node["id"]: node for node in nodes}
 
+    def identity(package_id: str) -> tuple[str, str, str | None]:
+        package = package_by_id[package_id]
+        return package["name"], package["version"], package.get("source")
+
     root_id = resolve.get("root")
     root = package_by_id.get(root_id)
     if root is None or (root.get("name"), root.get("version")) != (
@@ -232,6 +287,48 @@ def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
         if parents != EXPECTED_RSA[version]["parents"]:
             raise ValueError("rsa_reverse_dependency_set_changed")
 
+        reverse_parents: dict[
+            str, list[tuple[str, str, tuple[tuple[str, str], ...]]]
+        ] = {
+            package_id: [] for package_id in node_by_id
+        }
+        for parent in nodes:
+            for dependency in parent.get("deps", []):
+                dependency_kinds = tuple(
+                    sorted(
+                        (
+                            dependency_kind.get("kind") or "",
+                            dependency_kind.get("target") or "",
+                        )
+                        for dependency_kind in dependency.get("dep_kinds", [])
+                    )
+                )
+                reverse_parents.setdefault(dependency["pkg"], []).append(
+                    (parent["id"], dependency["name"], dependency_kinds)
+                )
+        closure_ids = {package["id"]}
+        closure_edges: set[tuple[str, str, str]] = set()
+        pending = [package["id"]]
+        while pending:
+            child = pending.pop()
+            for parent, dependency_name, dependency_kinds in reverse_parents.get(
+                child, []
+            ):
+                if dependency_kinds != (("", ""),):
+                    raise ValueError("rsa_reverse_closure_changed")
+                closure_edges.add((parent, dependency_name, child))
+                if parent not in closure_ids:
+                    closure_ids.add(parent)
+                    pending.append(parent)
+        closure = EXPECTED_RSA_REVERSE_CLOSURES[version]
+        if {identity(package_id) for package_id in closure_ids} != closure["nodes"]:
+            raise ValueError("rsa_reverse_closure_changed")
+        if {
+            (identity(parent), dependency_name, identity(child))
+            for parent, dependency_name, child in closure_edges
+        } != closure["edges"]:
+            raise ValueError("rsa_reverse_closure_changed")
+
     for identity, expected_features in EXPECTED_BOUNDARY_FEATURES.items():
         matching = [
             package
@@ -255,7 +352,7 @@ def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
         raise ValueError("approved_root_rsa_dependency_missing")
 
 
-def _source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]:
+def local_source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]:
     source_files: set[Path] = set()
     package_directories: set[Path] = set()
     module_roots: set[Path] = set()
@@ -310,7 +407,11 @@ def _source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]:
     while pending:
         path = pending.pop()
         code = _mask_non_code(path.read_text(encoding="utf-8"))
-        module_base = path.parent if path.name in {"lib.rs", "main.rs", "mod.rs"} else path.parent / path.stem
+        module_base = (
+            path.parent
+            if path.name in {"lib.rs", "main.rs", "mod.rs"}
+            else path.parent / path.stem
+        )
         for module_name in MODULE_DECLARATION.findall(code):
             candidates = (
                 module_base / f"{module_name}.rs",
@@ -329,7 +430,7 @@ def _source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]:
 
 
 def validate_product_api(repo: Path, metadata: dict[str, Any] | None = None) -> None:
-    source_files = _source_files(repo, metadata)
+    source_files = local_source_files(repo, metadata)
     if not source_files:
         raise ValueError("product_source_root_missing")
     connector = (repo / "vendor" / "ironrdp-client" / "src" / "config.rs").resolve(
@@ -350,7 +451,11 @@ def validate_product_api(repo: Path, metadata: dict[str, Any] | None = None) -> 
             if len(matches) != 1:
                 raise ValueError("username_password_connector_fingerprint_changed")
             match = matches[0]
-            code = code[: match.start()] + " " * (match.end() - match.start()) + code[match.end() :]
+            code = (
+                code[: match.start()]
+                + " " * (match.end() - match.start())
+                + code[match.end() :]
+            )
         if ANY_CREDENTIALS.search(code):
             raise ValueError(f"transitive_private_api_reachable:{relative}")
 

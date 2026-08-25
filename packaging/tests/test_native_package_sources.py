@@ -89,7 +89,7 @@ class NativePackageSourceTests(unittest.TestCase):
             source.parent.mkdir()
             source.write_text(
                 "#[cfg(test)]\nmod tests {\n"
-                "use rsa::RsaPrivateKey;\nfn mock(k: RsaPrivateKey) { let _ = k.decrypt(); }\n}\n",
+                "fn mock() {}\n}\n",
                 encoding="utf-8",
             )
             allowed = subprocess.run(
@@ -101,6 +101,7 @@ class NativePackageSourceTests(unittest.TestCase):
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
 
             bypasses = (
+                "#[cfg(test)]\nmod tests { use rsa::RsaPrivateKey; }\n",
                 "use rsa::RsaPrivateKey;\nfn production(k: RsaPrivateKey) { let _ = k.decrypt(); }\n",
                 "use rsa::pkcs1v15::DecryptingKey;\nfn production() {}\n",
                 "use rsa::traits::RandomizedDecryptor;\nfn production<T: RandomizedDecryptor>(k: T) { let _ = k.decrypt_with_rng(); }\n",
@@ -120,6 +121,42 @@ class NativePackageSourceTests(unittest.TestCase):
                     )
                     self.assertEqual(rejected.returncode, 2)
                     self.assertIn("production_rsa_api_not_allowlisted", rejected.stderr)
+
+            guard_spec = importlib.util.spec_from_file_location("rsa_all_units", guard)
+            self.assertIsNotNone(guard_spec)
+            self.assertIsNotNone(guard_spec.loader)
+            guard_module = importlib.util.module_from_spec(guard_spec)
+            guard_spec.loader.exec_module(guard_module)
+            manifest = fixture / "Cargo.toml"
+            manifest.write_text("[package]\nname='fixture'\nversion='0.1.0'\n", encoding="utf-8")
+            build_script = fixture / "build.rs"
+            outside_target = fixture / "outside.rs"
+            fixture_metadata = {
+                "packages": [
+                    {
+                        "source": None,
+                        "manifest_path": str(manifest),
+                        "targets": [
+                            {"src_path": str(source)},
+                            {"src_path": str(build_script)},
+                            {"src_path": str(outside_target)},
+                        ],
+                    }
+                ]
+            }
+            source.write_text("fn clean() {}\n", encoding="utf-8")
+            outside_target.write_text("fn clean() {}\n", encoding="utf-8")
+            build_script.write_text(
+                "use rsa::RsaPrivateKey;\nfn main() {}\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "production_rsa_api_not_allowlisted"):
+                guard_module.validate_repository(fixture, metadata=fixture_metadata)
+            build_script.write_text("fn main() {}\n", encoding="utf-8")
+            outside_target.write_text(
+                "use rsa::hazmat::rsa_decrypt;\nfn main() {}\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "production_rsa_api_not_allowlisted"):
+                guard_module.validate_repository(fixture, metadata=fixture_metadata)
 
     def test_rsa_advisory_guard_fails_closed_on_review_expiry(self):
         guard_path = REPO_ROOT / "packaging" / "check_rsa_usage.py"
@@ -216,6 +253,75 @@ class NativePackageSourceTests(unittest.TestCase):
             ].append({"name": "rsa", "pkg": rsa_id, "dep_kinds": []})
 
         rejected(add_rsa_parent, "rsa_reverse_dependency_set_changed")
+
+        def add_transitive_wrapper(value):
+            wrapper_id = (
+                "registry+https://github.com/rust-lang/crates.io-index#wrapper@1.0.0"
+            )
+            value["packages"].append(
+                {
+                    "id": wrapper_id,
+                    "name": "wrapper",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "manifest_path": "registry/wrapper/Cargo.toml",
+                    "targets": [],
+                }
+            )
+            picky_id = next(
+                package["id"]
+                for package in value["packages"]
+                if package["name"] == "picky" and package["version"] == "7.0.0-rc.25"
+            )
+            value["resolve"]["nodes"].append(
+                {
+                    "id": wrapper_id,
+                    "features": [],
+                    "deps": [{"name": "picky", "pkg": picky_id, "dep_kinds": []}],
+                }
+            )
+            root_id = value["resolve"]["root"]
+            next(node for node in value["resolve"]["nodes"] if node["id"] == root_id)[
+                "deps"
+            ].append({"name": "wrapper", "pkg": wrapper_id, "dep_kinds": []})
+
+        rejected(add_transitive_wrapper, "rsa_reverse_closure_changed")
+
+        def rename_root_rsa_edge(value):
+            rsa_id = next(
+                package["id"]
+                for package in value["packages"]
+                if package["name"] == "rsa" and package["version"] == "0.9.10"
+            )
+            root_id = value["resolve"]["root"]
+            dependency = next(
+                dependency
+                for dependency in next(
+                    node for node in value["resolve"]["nodes"] if node["id"] == root_id
+                )["deps"]
+                if dependency["pkg"] == rsa_id
+            )
+            dependency["name"] = "crypto"
+
+        rejected(rename_root_rsa_edge, "rsa_reverse_closure_changed")
+
+        def change_root_rsa_edge_kind(value):
+            rsa_id = next(
+                package["id"]
+                for package in value["packages"]
+                if package["name"] == "rsa" and package["version"] == "0.9.10"
+            )
+            root_id = value["resolve"]["root"]
+            dependency = next(
+                dependency
+                for dependency in next(
+                    node for node in value["resolve"]["nodes"] if node["id"] == root_id
+                )["deps"]
+                if dependency["pkg"] == rsa_id
+            )
+            dependency["dep_kinds"] = [{"kind": "dev", "target": None}]
+
+        rejected(change_root_rsa_edge_kind, "rsa_reverse_closure_changed")
 
         def add_boundary_feature(value):
             package_id = next(
@@ -421,13 +527,16 @@ class NativePackageSourceTests(unittest.TestCase):
         indices = "\n".join(index_lines) + "\n"
         plan = (
             "Inst ca-certificates (20260601~22.04.1 Ubuntu:22.04/jammy-updates [all])\n"
-            "Inst libexample:amd64 (1.2-3 Ubuntu:22.04/jammy [amd64])\n"
+            "Inst libx11-6 (2:1.7.5-1ubuntu0.3 Ubuntu:22.04/jammy-updates, "
+            "Ubuntu:22.04/jammy-security [amd64])\n"
         )
         uris = (
             f"'https://snapshot.ubuntu.com/ubuntu/{snapshot}/pool/main/c/ca-certificates/"
-            "ca-certificates_20260601~22.04.1_all.deb' ca.deb 1 SHA256:00\n"
-            f"'https://snapshot.ubuntu.com/ubuntu/{snapshot}/pool/main/libe/libexample/"
-            "libexample_1.2-3_amd64.deb' libexample.deb 1 SHA256:00\n"
+            "ca-certificates_20260601%7e22.04.1_all.deb' "
+            "ca-certificates_20260601~22.04.1_all.deb 1 SHA256:00\n"
+            f"'https://snapshot.ubuntu.com/ubuntu/{snapshot}/pool/main/libx/libx11/"
+            "libx11-6_1.7.5-1ubuntu0.3_amd64.deb' "
+            "libx11-6_2%3a1.7.5-1ubuntu0.3_amd64.deb 666946 MD5Sum:00\n"
         )
         fixture_root = REPO_ROOT / "target" / "package"
         fixture_root.mkdir(parents=True, exist_ok=True)
@@ -469,10 +578,19 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertIn("snapshot_uri_mismatch", rejected.stderr)
         rejected = verify(
             indices,
-            plan.replace("libexample:amd64 (1.2-3", "libexample:amd64 (1.2-4"),
+            plan.replace("libx11-6 (2:1.7.5", "libx11-6 (3:1.7.5"),
             uris,
         )
         self.assertIn("snapshot_resolution_mismatch", rejected.stderr)
+        rejected = verify(
+            indices,
+            plan,
+            uris.replace(
+                "libx11-6_1.7.5-1ubuntu0.3_amd64.deb'",
+                "libx11-6_1.7.5-1ubuntu0.2_amd64.deb'",
+            ),
+        )
+        self.assertIn("snapshot_uri_filename_mismatch", rejected.stderr)
 
     def test_supply_chain_policy_and_locked_fetch_are_explicit(self):
         deny = self.read("deny.toml")

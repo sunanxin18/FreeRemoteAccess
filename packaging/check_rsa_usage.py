@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -135,21 +136,42 @@ def _consume_approved_owner_api(code: str) -> str:
     return remaining
 
 
-def validate_repository(repo: Path, *, today: datetime.date | None = None) -> None:
+def _load_dependency_boundary():
+    boundary_path = Path(__file__).with_name("check_rsa_dependency_boundary.py")
+    spec = importlib.util.spec_from_file_location(
+        "rsa_dependency_boundary", boundary_path
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("rsa_dependency_boundary_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def validate_repository(
+    repo: Path,
+    *,
+    today: datetime.date | None = None,
+    metadata: dict | None = None,
+) -> None:
     current_utc_date = today or datetime.datetime.now(datetime.timezone.utc).date()
     if current_utc_date >= REVIEW_EXPIRES_UTC:
         raise ValueError("rsa_advisory_exception_review_expired")
-    source_root = repo / "src"
-    if not source_root.is_dir():
+    boundary = _load_dependency_boundary()
+    if metadata is None and (repo / "Cargo.toml").is_file():
+        metadata = boundary.load_metadata(repo)
+    source_paths = boundary.local_source_files(repo, metadata)
+    if not source_paths:
         raise ValueError("rsa_guard_source_root_missing")
-    for path in sorted(source_root.rglob("*.rs")):
-        production = _without_cfg_test_modules(path.read_text(encoding="utf-8"))
-        code = _mask_non_code(production)
+    for path in sorted(source_paths):
         relative = path.relative_to(repo).as_posix()
         if relative == APPROVED_OWNER:
+            production = _without_cfg_test_modules(path.read_text(encoding="utf-8"))
+            code = _mask_non_code(production)
             code = _consume_approved_owner_api(code)
             marker = APPROVED_OWNER_RESIDUAL_MARKER
         else:
+            code = _mask_non_code(path.read_text(encoding="utf-8"))
             marker = RSA_API_MARKER
         if marker.search(code):
             raise ValueError(f"production_rsa_api_not_allowlisted:{relative}")

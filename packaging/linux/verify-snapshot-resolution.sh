@@ -112,27 +112,53 @@ decode_percent_filename() {
 
 uri_count=0
 : >"$uri_resolutions"
+uri_line_pattern="^'([^']+)'[[:space:]]+([^[:space:]]+)[[:space:]]"
 while IFS= read -r line; do
   [[ "$line" == \'* ]] || continue
-  uri="${line#\'}"
-  uri="${uri%%\'*}"
+  [[ "$line" =~ $uri_line_pattern ]] || {
+    echo 'snapshot_uri_line_invalid' >&2
+    exit 2
+  }
+  uri="${BASH_REMATCH[1]}"
+  encoded_download_filename="${BASH_REMATCH[2]}"
   [[ "$uri" == "$snapshot_prefix"pool/* ]] || {
     echo 'snapshot_uri_mismatch' >&2
     exit 2
   }
-  encoded_filename="${uri##*/}"
-  filename="$(decode_percent_filename "$encoded_filename")" || {
+  encoded_pool_filename="${uri##*/}"
+  pool_filename="$(decode_percent_filename "$encoded_pool_filename")" || {
     echo 'snapshot_uri_filename_invalid' >&2
     exit 2
   }
-  [[ "$filename" =~ ^[a-z0-9][a-z0-9+.-]*_[A-Za-z0-9.+:~-]+_(all|amd64)\.deb$ ]] || {
+  download_filename="$(decode_percent_filename "$encoded_download_filename")" || {
     echo 'snapshot_uri_filename_invalid' >&2
     exit 2
   }
-  without_suffix="${filename%.deb}"
+  filename_pattern='^[a-z0-9][a-z0-9+.-]*_[A-Za-z0-9.+:~-]+_(all|amd64)\.deb$'
+  [[ "$pool_filename" =~ $filename_pattern && "$download_filename" =~ $filename_pattern ]] || {
+    echo 'snapshot_uri_filename_invalid' >&2
+    exit 2
+  }
+  without_suffix="${download_filename%.deb}"
   package_name="${without_suffix%%_*}"
   version_and_architecture="${without_suffix#*_}"
   version="${version_and_architecture%_*}"
+  architecture="${version_and_architecture##*_}"
+  pool_without_suffix="${pool_filename%.deb}"
+  pool_package_name="${pool_without_suffix%%_*}"
+  pool_version_and_architecture="${pool_without_suffix#*_}"
+  pool_version="${pool_version_and_architecture%_*}"
+  pool_architecture="${pool_version_and_architecture##*_}"
+  expected_pool_version="$version"
+  if [[ "$expected_pool_version" =~ ^[0-9]+:(.+)$ ]]; then
+    expected_pool_version="${BASH_REMATCH[1]}"
+  fi
+  [[ "$pool_package_name" == "$package_name" && \
+    "$pool_version" == "$expected_pool_version" && \
+    "$pool_architecture" == "$architecture" ]] || {
+    echo 'snapshot_uri_filename_mismatch' >&2
+    exit 2
+  }
   printf '%s=%s\n' "$package_name" "$version" >>"$uri_resolutions"
   uri_count=$((uri_count + 1))
 done <"$uris_file"
