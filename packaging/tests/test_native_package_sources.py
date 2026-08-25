@@ -157,8 +157,45 @@ class NativePackageSourceTests(unittest.TestCase):
             helper.write_text(
                 "use rsa::RsaPrivateKey;\nfn helper() {}\n", encoding="utf-8"
             )
-            with self.assertRaisesRegex(ValueError, "production_rsa_api_not_allowlisted"):
+            with self.assertRaisesRegex(
+                ValueError, "product_nonstandard_target_modules_unsupported"
+            ):
                 guard_module.validate_repository(fixture, metadata=fixture_metadata)
+            inline_secret = fixture / "inline" / "secret.rs"
+            inline_secret.parent.mkdir()
+            inline_secret.write_text(
+                "use rsa::RsaPrivateKey;\nfn secret() {}\n", encoding="utf-8"
+            )
+            build_script.write_text(
+                "mod inline { mod secret; }\nfn main() {}\n", encoding="utf-8"
+            )
+            outside_target.write_text("fn clean() {}\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "product_nonstandard_target_modules_unsupported"
+            ):
+                guard_module.validate_repository(fixture, metadata=fixture_metadata)
+
+            outer_secret = fixture / "outer" / "nested" / "secret.rs"
+            outer_secret.parent.mkdir(parents=True)
+            outer_secret.write_text(
+                "use rsa::RsaPrivateKey;\nfn secret() {}\n", encoding="utf-8"
+            )
+            (fixture / "outer.rs").write_text(
+                "mod nested { mod secret; }\n", encoding="utf-8"
+            )
+            build_script.write_text("mod outer;\nfn main() {}\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "product_nonstandard_target_modules_unsupported"
+            ):
+                guard_module.validate_repository(fixture, metadata=fixture_metadata)
+
+            build_script.write_text(
+                '// mod hidden;\nconst TEXT: &str = "mod hidden;";\nfn main() {}\n',
+                encoding="utf-8",
+            )
+            outside_target.write_text("fn clean() {}\n", encoding="utf-8")
+            guard_module.validate_repository(fixture, metadata=fixture_metadata)
+
             build_script.write_text("fn main() {}\n", encoding="utf-8")
             outside_target.write_text(
                 "use rsa::hazmat::rsa_decrypt;\nfn main() {}\n", encoding="utf-8"
@@ -385,7 +422,9 @@ class NativePackageSourceTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "product_target_set_changed"):
                 guard.validate_metadata(hidden_metadata, REPO_ROOT)
-            with self.assertRaisesRegex(ValueError, "transitive_private_api_reachable"):
+            with self.assertRaisesRegex(
+                ValueError, "product_nonstandard_target_modules_unsupported"
+            ):
                 guard.validate_product_api(REPO_ROOT, hidden_metadata)
 
         with tempfile.TemporaryDirectory() as temporary:

@@ -138,6 +138,7 @@ USERNAME_PASSWORD_CONTEXT = re.compile(
 MODULE_DECLARATION = re.compile(
     r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;"
 )
+MODULE_KEYWORD = re.compile(r"\bmod\b")
 
 
 def load_metadata(repo: Path) -> dict[str, Any]:
@@ -400,11 +401,25 @@ def local_source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]
             manifest, _ = _canonical_repo_file(
                 package["manifest_path"], repo, "path_dependency_manifest"
             )
-            package_directories.add(manifest.parent)
+            package_directory = manifest.parent
+            package_directories.add(package_directory)
             for target in package["targets"]:
                 source, _ = _canonical_repo_file(
                     target["src_path"], repo, "product_target"
                 )
+                try:
+                    package_relative = source.relative_to(package_directory)
+                except ValueError:
+                    package_relative = None
+                if (
+                    package_relative is None
+                    or not package_relative.parts
+                    or package_relative.parts[0]
+                    not in {"src", "tests", "benches", "examples"}
+                ) and MODULE_KEYWORD.search(
+                    _mask_non_code(source.read_text(encoding="utf-8"))
+                ):
+                    raise ValueError("product_nonstandard_target_modules_unsupported")
                 source_files.add(source)
                 crate_roots.add(source)
     else:
