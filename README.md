@@ -91,9 +91,9 @@ GitHub Actions 工作流 `.github/workflows/build-desktop-installers.yml` 分别
 
 Fraunhofer FDK AAC 的软件版权许可不授予 AAC 专利许可。即使 NOTICE 和完整对应源码已随包交付，也不代表获得任何专利实施许可；在法律审核和适用地区的专利许可结论完成前，发布门禁保持关闭。
 
-打包清单工具要求 Python 3.11 或更高版本（CI 固定 Python 3.13.14），供应链检查固定使用 `cargo-audit 0.22.2` 与 `cargo-deny 0.20.2`。Ubuntu 依赖来自官方 Snapshot Service 的 `20260810T000000Z` Jammy 快照，并按仓库 lock 文件指定精确版本；构建脚本只接受 `Cargo.lock` 锁定依赖。AppImage 工具及 runtime 使用固定版本和 SHA-256，校验失败立即停止。
+打包清单工具要求 Python 3.11 或更高版本（CI 固定 Python 3.13.14），供应链检查固定使用 `cargo-audit 0.22.2` 与 `cargo-deny 0.20.2`。Ubuntu 依赖来自官方 Snapshot Service 的 `20260810T000000Z` Jammy 快照，并按仓库 lock 文件指定精确版本；无 CA 的固定运行时镜像先使用同一快照中按 SHA-256 固定的 `ca-certificates` 包建立临时信任束，更新失败或来源/候选版本不符立即停止。构建脚本只接受 `Cargo.lock` 锁定依赖。AppImage 工具及 runtime 使用固定版本和 SHA-256，校验失败立即停止。
 
-`RUSTSEC-2023-0071` 目前没有 patched version。生产路径只使用 `RsaPublicKey` 执行服务端公钥加密，不持有 RSA 私钥，也不执行私钥解密；私钥解密仅存在于 `#[cfg(test)]` 的本地 mock server。CI 在运行审计前执行源码 guard，并且只对该 advisory 作精确临时忽略。该例外最迟于 **2026-11-30** 复审；一旦上游提供 patched version，必须立即升级并移除 ignore，不能顺延或扩大范围。
+`RUSTSEC-2023-0071` 目前没有 patched version。FreeRemoteAccess 自有生产路径只使用 `rsa 0.9.10` 的 `RsaPublicKey` 执行服务端公钥加密，不持有 RSA 私钥，也不执行私钥解密；私钥解密仅存在于 `#[cfg(test)]` 的本地 mock server。IronRDP 的 CredSSP/NLA 依赖图还会编译 `rsa 0.10.0-rc.18` 以及 `sspi`/`picky`/`winscard` 中的私钥能力，但产品受控连接器只构造 `Credentials::UsernamePassword`，不向产品 API 暴露 Smart Card 或这些 transitive 私钥入口。CI 在运行审计前用两个 fail-closed guard 锁定自有源码的精确公钥 API，以及完整 RSA 版本、来源、feature、反向依赖、workspace/path package 和连接器凭据边界；任何依赖图漂移或新增 transitive API 入口都会阻断构建。审计只对该 advisory 作精确临时忽略。该例外最迟于 **2026-11-30** 复审；一旦上游提供 patched version，必须立即升级并移除 ignore，不能顺延或扩大范围。
 
 最新三平台安装包、SHA-256、签名和启动证据见 [桌面客户端验证矩阵](docs/validation/winit-wgpu-desktop-matrix.md)。
 

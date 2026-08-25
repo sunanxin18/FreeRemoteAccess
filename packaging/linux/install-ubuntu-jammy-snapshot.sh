@@ -5,6 +5,22 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 package_lock="$repo_root/packaging/linux/ubuntu-jammy-packages.lock"
 snapshot=20260810T000000Z
 minimum_apt=2.4.11
+ca_bootstrap_deb=''
+ca_bootstrap_sha256=6e8cdcc8c86103acd4fc14649eac62ff2037108389074a7b167567af33c32245
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --ca-bootstrap-deb)
+      [[ "$#" -ge 2 ]] || { echo 'ubuntu_snapshot_ca_argument_missing' >&2; exit 2; }
+      ca_bootstrap_deb="$2"
+      shift 2
+      ;;
+    *)
+      echo 'ubuntu_snapshot_unknown_argument' >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo 'ubuntu_snapshot_installer_requires_root' >&2
@@ -30,8 +46,32 @@ for package in "${locked_packages[@]}"; do
   fi
 done
 
-snapshot_sources="$(mktemp)"
-trap 'rm -f -- "$snapshot_sources"' EXIT
+temporary_root="$(mktemp -d)"
+snapshot_sources="$temporary_root/sources.list"
+ca_bundle=''
+trap 'rm -rf -- "$temporary_root"' EXIT
+
+if [[ -n "$ca_bootstrap_deb" ]]; then
+  [[ -f "$ca_bootstrap_deb" ]] || { echo 'ubuntu_snapshot_ca_package_missing' >&2; exit 2; }
+  actual_ca_sha256="$(sha256sum "$ca_bootstrap_deb" | cut -d' ' -f1)"
+  [[ "$actual_ca_sha256" == "$ca_bootstrap_sha256" ]] || {
+    echo 'ubuntu_snapshot_ca_package_sha256_mismatch' >&2
+    exit 2
+  }
+  ca_root="$temporary_root/ca-root"
+  dpkg-deb -x "$ca_bootstrap_deb" "$ca_root"
+  ca_bundle="$temporary_root/ca-certificates.crt"
+  mapfile -d '' -t ca_files < <(
+    find "$ca_root/usr/share/ca-certificates" -type f -name '*.crt' -print0 | sort -z
+  )
+  [[ "${#ca_files[@]}" -gt 0 ]] || { echo 'ubuntu_snapshot_ca_bundle_empty' >&2; exit 2; }
+  : >"$ca_bundle"
+  for certificate in "${ca_files[@]}"; do
+    cat -- "$certificate" >>"$ca_bundle"
+    printf '\n' >>"$ca_bundle"
+  done
+fi
+
 cat >"$snapshot_sources" <<EOF
 deb [snapshot=$snapshot] http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse
 deb [snapshot=$snapshot] http://archive.ubuntu.com/ubuntu jammy-updates main universe restricted multiverse
@@ -43,7 +83,31 @@ apt_options=(
   -o "Dir::Etc::sourceparts=-"
   -o "APT::Get::List-Cleanup=0"
   -o "Acquire::Retries=3"
+  -o "APT::Update::Error-Mode=any"
 )
+if [[ -n "$ca_bundle" ]]; then
+  apt_options+=( -o "Acquire::https::CaInfo=$ca_bundle" )
+fi
 apt-get "${apt_options[@]}" update
+
+index_targets="$(apt-get "${apt_options[@]}" indextargets --format '$(SITE)|$(RELEASE)|$(COMPONENT)')"
+[[ -n "$index_targets" ]] || { echo 'ubuntu_snapshot_index_targets_empty' >&2; exit 2; }
+while IFS= read -r target; do
+  [[ "$target" =~ ^(archive\.ubuntu\.com|security\.ubuntu\.com)\|jammy(-updates|-security)?\| ]] || {
+    echo 'ubuntu_snapshot_index_origin_mismatch' >&2
+    exit 2
+  }
+done <<<"$index_targets"
+
+for package in "${locked_packages[@]}"; do
+  package_name="${package%%=*}"
+  locked_version="${package#*=}"
+  candidate="$(apt-cache "${apt_options[@]}" policy "$package_name" | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p')"
+  [[ "$candidate" == "$locked_version" ]] || {
+    echo 'ubuntu_snapshot_candidate_mismatch' >&2
+    exit 2
+  }
+done
+
 DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install \
   --yes --no-install-recommends --allow-downgrades "${locked_packages[@]}"

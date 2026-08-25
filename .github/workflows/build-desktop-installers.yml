@@ -35,6 +35,7 @@ jobs:
       - name: Verify supply chain policy
         run: |
           python packaging/check_rsa_usage.py --repo .
+          python packaging/check_rsa_dependency_boundary.py --repo .
           cargo audit --deny yanked --ignore RUSTSEC-2023-0071
           cargo deny check
       - name: Verify Rust workspace
@@ -136,10 +137,15 @@ jobs:
       - name: Verify GUI in clean Ubuntu 22.04 X11 and Wayland runtimes
         run: |
           mkdir -p target/package/linux/clean-runtime-logs
+          python packaging/linux/fetch-ca-bootstrap.py --output-directory target/package/linux/bootstrap
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace ubuntu@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc \
             bash -euxo pipefail -c '
-              bash packaging/linux/install-ubuntu-jammy-snapshot.sh
+              test ! -s /etc/ssl/certs/ca-certificates.crt
+              ca_deb="$(find target/package/linux/bootstrap -maxdepth 1 -type f -name "ca-certificates_*.deb" -print -quit)"
+              test -n "$ca_deb"
+              bash packaging/linux/install-ubuntu-jammy-snapshot.sh --ca-bootstrap-deb "$ca_deb"
+              test -s /etc/ssl/certs/ca-certificates.crt
               deb_path="$(find dist/linux -maxdepth 1 -type f -name "*.deb" -print -quit)"
               test -n "$deb_path"
               test "$(find dist/linux -maxdepth 1 -type f -name "*.deb" | wc -l)" -eq 1

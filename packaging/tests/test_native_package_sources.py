@@ -1,3 +1,4 @@
+import copy
 import datetime
 import importlib.util
 import inspect
@@ -64,6 +65,7 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertEqual(workflow.count("--ignore RUSTSEC-2023-0071"), 1)
         self.assertEqual(deny.count('"RUSTSEC-2023-0071"'), 1)
         self.assertIn("packaging/check_rsa_usage.py --repo .", workflow)
+        self.assertIn("packaging/check_rsa_dependency_boundary.py --repo .", workflow)
         self.assertIn("RUSTSEC-2023-0071", readme)
         self.assertIn("RsaPublicKey", readme)
         self.assertIn("2026-11-30", readme)
@@ -128,6 +130,110 @@ class NativePackageSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rsa_advisory_exception_review_expired"):
             guard.validate_repository(REPO_ROOT, today=datetime.date(2026, 11, 30))
 
+    def test_rsa_dependency_boundary_locks_graph_and_product_api(self):
+        guard_path = REPO_ROOT / "packaging" / "check_rsa_dependency_boundary.py"
+        self.assertTrue(guard_path.is_file(), "RSA dependency boundary guard is missing")
+        spec = importlib.util.spec_from_file_location("check_rsa_dependency_boundary", guard_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+
+        metadata = guard.load_metadata(REPO_ROOT)
+        guard.validate_metadata(metadata, REPO_ROOT)
+        guard.validate_product_api(REPO_ROOT)
+
+        def rejected(mutator, error):
+            fixture = copy.deepcopy(metadata)
+            mutator(fixture)
+            with self.assertRaisesRegex(ValueError, error):
+                guard.validate_metadata(fixture, REPO_ROOT)
+
+        rejected(
+            lambda value: value["packages"].append(
+                {
+                    "id": "registry+https://github.com/rust-lang/crates.io-index#rsa@9.9.9",
+                    "name": "rsa",
+                    "version": "9.9.9",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "manifest_path": "registry/rsa/Cargo.toml",
+                }
+            ),
+            "rsa_dependency_set_changed",
+        )
+
+        def add_workspace_member(value):
+            value["workspace_members"].append("path+file:///outside#rogue@1.0.0")
+
+        rejected(add_workspace_member, "workspace_member_set_changed")
+
+        def add_rsa_feature(value):
+            rsa_id = next(
+                package["id"]
+                for package in value["packages"]
+                if package["name"] == "rsa" and package["version"] == "0.10.0-rc.18"
+            )
+            next(node for node in value["resolve"]["nodes"] if node["id"] == rsa_id)[
+                "features"
+            ].append("new-private-api")
+
+        rejected(add_rsa_feature, "rsa_feature_set_changed")
+
+        def change_rsa_source(value):
+            next(
+                package
+                for package in value["packages"]
+                if package["name"] == "rsa" and package["version"] == "0.9.10"
+            )["source"] = "git+https://example.invalid/rsa"
+
+        rejected(change_rsa_source, "rsa_dependency_source_changed")
+
+        def add_rsa_parent(value):
+            rsa_id = next(
+                package["id"]
+                for package in value["packages"]
+                if package["name"] == "rsa" and package["version"] == "0.10.0-rc.18"
+            )
+            root_id = value["resolve"]["root"]
+            next(node for node in value["resolve"]["nodes"] if node["id"] == root_id)[
+                "deps"
+            ].append({"name": "rsa", "pkg": rsa_id, "dep_kinds": []})
+
+        rejected(add_rsa_parent, "rsa_reverse_dependency_set_changed")
+
+        def add_boundary_feature(value):
+            package_id = next(
+                package["id"]
+                for package in value["packages"]
+                if package["name"] == "sspi" and package["version"] == "0.21.3"
+            )
+            next(node for node in value["resolve"]["nodes"] if node["id"] == package_id)[
+                "features"
+            ].append("new-credential-kind")
+
+        rejected(add_boundary_feature, "rsa_boundary_feature_set_changed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            controlled = fixture / "src" / "lib.rs"
+            connector = fixture / "vendor" / "ironrdp-client" / "src" / "config.rs"
+            controlled.parent.mkdir(parents=True)
+            connector.parent.mkdir(parents=True)
+            controlled.write_text('include!("outside.rs");\n', encoding="utf-8")
+            connector.write_text(
+                "let credentials = Credentials::UsernamePassword(user, password);\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "product_rust_source_escape"):
+                guard.validate_product_api(fixture)
+            controlled.write_text("fn ok() {}\n", encoding="utf-8")
+            connector.write_text(
+                "let credentials = Credentials::SmartCard(identity);\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "transitive_private_api_reachable"):
+                guard.validate_product_api(fixture)
+
     def test_ubuntu_dependencies_use_one_immutable_snapshot_and_exact_lock(self):
         workflow = self.read(".github/workflows/build-desktop-installers.yml")
         installer_path = REPO_ROOT / "packaging/linux/install-ubuntu-jammy-snapshot.sh"
@@ -135,6 +241,7 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertTrue(installer_path.is_file(), "snapshot installer is missing")
         self.assertTrue(package_lock_path.is_file(), "snapshot package lock is missing")
         installer = installer_path.read_text(encoding="utf-8")
+        fetcher = self.read("packaging/linux/fetch-ca-bootstrap.py")
         package_lock = package_lock_path.read_text(encoding="utf-8")
         self.assertNotIn("apt-get update", workflow)
         self.assertNotIn("apt-get install", workflow)
@@ -145,6 +252,20 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertIn("apt-get --version", installer)
         self.assertIn("2.4.11", installer)
         self.assertIn("--no-install-recommends", installer)
+        self.assertIn("APT::Update::Error-Mode=any", installer)
+        self.assertIn("Acquire::https::CaInfo", installer)
+        self.assertIn("dpkg-deb", installer)
+        self.assertIn("indextargets", installer)
+        self.assertIn("snapshot_candidate_mismatch", installer)
+        self.assertIn("ca-certificates_20260601~22.04.1_all.deb", fetcher)
+        self.assertIn(
+            "6e8cdcc8c86103acd4fc14649eac62ff2037108389074a7b167567af33c32245",
+            fetcher,
+        )
+        self.assertIn("fetch-ca-bootstrap.py", workflow)
+        self.assertIn("--ca-bootstrap-deb", workflow)
+        self.assertIn("test ! -s /etc/ssl/certs/ca-certificates.crt", workflow)
+        self.assertIn("test -s /etc/ssl/certs/ca-certificates.crt", workflow)
         self.assertNotIn("latest", installer.lower())
         locked_lines = [
             line for line in package_lock.splitlines() if line and not line.startswith("#")
