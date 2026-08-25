@@ -98,7 +98,9 @@ index_targets="$temporary_root/index-targets"
 install_plan="$temporary_root/install-plan"
 install_uris="$temporary_root/install-uris"
 apt-get "${apt_options[@]}" indextargets \
-  --format '$(SITE)|$(RELEASE)|$(COMPONENT)' >"$index_targets"
+  'Identifier: Packages' \
+  --format '$(IDENTIFIER)|$(CREATED_BY)|$(SITE)|$(RELEASE)|$(COMPONENT)' \
+  >"$index_targets"
 LC_ALL=C apt-get "${apt_options[@]}" --simulate install \
   --no-install-recommends --allow-downgrades "${locked_packages[@]}" >"$install_plan"
 LC_ALL=C apt-get "${apt_options[@]}" --print-uris --yes install \

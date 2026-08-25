@@ -540,6 +540,8 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertIn("Acquire::https::CaInfo", installer)
         self.assertIn("dpkg-deb", installer)
         self.assertIn("indextargets", installer)
+        self.assertIn("'Identifier: Packages'", installer)
+        self.assertIn("$(IDENTIFIER)|$(CREATED_BY)|$(SITE)", installer)
         self.assertIn("verify-snapshot-resolution.sh", installer)
         self.assertIn("--simulate install", installer)
         self.assertIn("--print-uris --yes install", installer)
@@ -566,7 +568,7 @@ class NativePackageSourceTests(unittest.TestCase):
         )
         self.assertTrue(verifier_path.is_file(), "snapshot resolution verifier missing")
         snapshot = "20260810T000000Z"
-        index_lines = []
+        github_runner_index_lines = []
         for release in ("jammy", "jammy-updates", "jammy-security"):
             logical_site = (
                 "http://security.ubuntu.com/ubuntu"
@@ -574,11 +576,25 @@ class NativePackageSourceTests(unittest.TestCase):
                 else "http://archive.ubuntu.com/ubuntu"
             )
             for component in ("main", "universe", "restricted", "multiverse"):
-                index_lines.append(f"{logical_site}|{release}|{component}")
-                index_lines.append(
-                    f"https://snapshot.ubuntu.com/ubuntu/{snapshot}|{release}|{component}"
-                )
-        indices = "\n".join(index_lines) + "\n"
+                for site in (
+                    logical_site,
+                    f"https://snapshot.ubuntu.com/ubuntu/{snapshot}",
+                ):
+                    github_runner_index_lines.extend(
+                        (
+                            f"Packages|Packages|{site}|{release}|{component}",
+                            f"Translations|Translations|{site}|{release}|{component}",
+                            f"CNF|CNF|{site}|{release}|{component}",
+                        )
+                    )
+        package_index_lines = [
+            line
+            for line in github_runner_index_lines
+            if line.startswith("Packages|Packages|")
+        ]
+        self.assertEqual(len(package_index_lines), 24)
+        indices = "\n".join(package_index_lines) + "\n"
+        unfiltered_indices = "\n".join(github_runner_index_lines) + "\n"
         plan = (
             "Inst ca-certificates (20260601~22.04.1 Ubuntu:22.04/jammy-updates [all])\n"
             "Inst libx11-6 (2:1.7.5-1ubuntu0.3 Ubuntu:22.04/jammy-updates, "
@@ -626,6 +642,8 @@ class NativePackageSourceTests(unittest.TestCase):
 
         accepted = verify(indices, plan, uris)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        rejected = verify(unfiltered_indices, plan, uris)
+        self.assertIn("snapshot_index_target_kind_mismatch", rejected.stderr)
         rejected = verify(indices.replace(snapshot, "20260809T000000Z", 1), plan, uris)
         self.assertIn("snapshot_index_pair_mismatch", rejected.stderr)
         rejected = verify(indices, plan, uris.replace(snapshot, "20260809T000000Z", 1))

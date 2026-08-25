@@ -24,9 +24,13 @@ done
 declare -A logical_seen=()
 declare -A snapshot_seen=()
 index_count=0
-while IFS='|' read -r site release component extra; do
-  [[ -n "$site$release$component$extra" ]] || continue
+while IFS='|' read -r identifier created_by site release component extra; do
+  [[ -n "$identifier$created_by$site$release$component$extra" ]] || continue
   [[ -z "$extra" ]] || { echo 'snapshot_index_shape_invalid' >&2; exit 2; }
+  [[ "$identifier" == Packages && "$created_by" == Packages ]] || {
+    echo 'snapshot_index_target_kind_mismatch' >&2
+    exit 2
+  }
   [[ "$release" =~ ^jammy(-updates|-security)?$ ]] || {
     echo 'snapshot_index_release_mismatch' >&2
     exit 2
