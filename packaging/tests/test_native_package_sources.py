@@ -1,3 +1,6 @@
+import datetime
+import importlib.util
+import inspect
 import subprocess
 import sys
 import tempfile
@@ -66,15 +69,22 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertIn("2026-11-30", readme)
         self.assertIn("一旦上游提供 patched version", readme)
 
-    def test_rsa_usage_guard_allows_test_mock_but_rejects_production_private_key(self):
+    def test_rsa_usage_guard_is_strict_allowlist_and_excludes_test_mock(self):
         guard = REPO_ROOT / "packaging" / "check_rsa_usage.py"
         self.assertTrue(guard.is_file(), "production RSA usage guard is missing")
+        repository = subprocess.run(
+            [sys.executable, str(guard), "--repo", str(REPO_ROOT)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(repository.returncode, 0, repository.stderr)
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Path(temporary)
             source = fixture / "src" / "lib.rs"
             source.parent.mkdir()
             source.write_text(
-                "use rsa::RsaPublicKey;\n#[cfg(test)]\nmod tests {\n"
+                "#[cfg(test)]\nmod tests {\n"
                 "use rsa::RsaPrivateKey;\nfn mock(k: RsaPrivateKey) { let _ = k.decrypt(); }\n}\n",
                 encoding="utf-8",
             )
@@ -86,18 +96,37 @@ class NativePackageSourceTests(unittest.TestCase):
             )
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
 
-            source.write_text(
+            bypasses = (
                 "use rsa::RsaPrivateKey;\nfn production(k: RsaPrivateKey) { let _ = k.decrypt(); }\n",
-                encoding="utf-8",
+                "use rsa::pkcs1v15::DecryptingKey;\nfn production() {}\n",
+                "use rsa::traits::RandomizedDecryptor;\nfn production<T: RandomizedDecryptor>(k: T) { let _ = k.decrypt_with_rng(); }\n",
+                "fn production<T>(k: T) { let _ = rsa::traits::Decryptor::decrypt(&k); }\n",
+                "use ::rsa as x;\nfn production() { let _ = x::hazmat::rsa_decrypt(); }\n",
+                # Even a new public-only use outside the single approved owner must fail.
+                "use rsa::RsaPublicKey;\nfn production(_: RsaPublicKey) {}\n",
             )
-            rejected = subprocess.run(
-                [sys.executable, str(guard), "--repo", str(fixture)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(rejected.returncode, 2)
-            self.assertIn("production_rsa_private_operation_rejected", rejected.stderr)
+            for bypass in bypasses:
+                with self.subTest(bypass=bypass.splitlines()[0]):
+                    source.write_text(bypass, encoding="utf-8")
+                    rejected = subprocess.run(
+                        [sys.executable, str(guard), "--repo", str(fixture)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(rejected.returncode, 2)
+                    self.assertIn("production_rsa_api_not_allowlisted", rejected.stderr)
+
+    def test_rsa_advisory_guard_fails_closed_on_review_expiry(self):
+        guard_path = REPO_ROOT / "packaging" / "check_rsa_usage.py"
+        spec = importlib.util.spec_from_file_location("check_rsa_usage", guard_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        self.assertIn("today", inspect.signature(guard.validate_repository).parameters)
+        with self.assertRaisesRegex(ValueError, "rsa_advisory_exception_review_expired"):
+            guard.validate_repository(REPO_ROOT, today=datetime.date(2026, 11, 30))
 
     def test_ubuntu_dependencies_use_one_immutable_snapshot_and_exact_lock(self):
         workflow = self.read(".github/workflows/build-desktop-installers.yml")

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import re
 import sys
 from pathlib import Path
@@ -11,8 +12,30 @@ from typing import Sequence
 
 
 CFG_TEST_MODULE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+\w+\s*\{")
-PRIVATE_RSA_TOKEN = re.compile(r"\b(?:RsaPrivateKey|PrivateKeyParts)\b")
-PRIVATE_DECRYPT_CALL = re.compile(r"\.\s*decrypt(?:_blinded)?\s*\(")
+APPROVED_OWNER = "src/vnc/rsa_srp.rs"
+REVIEW_EXPIRES_UTC = datetime.date(2026, 11, 30)
+APPROVED_RSA_API = (
+    (r"\buse\s+rsa\s*::\s*pkcs1v15\s*::\s*Pkcs1v15Encrypt\s*;", 1),
+    (r"\buse\s+rsa\s*::\s*pkcs8\s*::\s*DecodePublicKey\s*;", 1),
+    (r"\buse\s+rsa\s*::\s*traits\s*::\s*PublicKeyParts\s*;", 1),
+    (r"\buse\s+rsa\s*::\s*RsaPublicKey\s*;", 1),
+    (r"\bRsaPublicKey\s*::\s*from_public_key_der\s*\(", 1),
+    (r"\brsa\s*::\s*rand_core\s*::\s*OsRng\b", 1),
+    (r"\.\s*encrypt\s*\(", 1),
+    (r"\bPkcs1v15Encrypt\b", 1),
+    (r"\.\s*n\s*\(", 2),
+)
+RSA_API_MARKER = re.compile(
+    r"(?:\buse\s+(?:::)?\s*rsa\b|\bextern\s+crate\s+rsa\b|\brsa\s*::|"
+    r"\b(?:RsaPublicKey|RsaPrivateKey|"
+    r"Pkcs1v15Encrypt|DecryptingKey|EncryptingKey|DecodePublicKey|PublicKeyParts|"
+    r"PrivateKeyParts|RandomizedDecryptor|decrypt_with_rng|decrypt_blinded|hazmat|"
+    r"rsa_decrypt|rsa_decrypt_and_check)\b)"
+)
+APPROVED_OWNER_RESIDUAL_MARKER = re.compile(
+    RSA_API_MARKER.pattern
+    + r"|\.\s*(?:encrypt|decrypt)\s*\(|::\s*(?:encrypt|decrypt)\s*\("
+)
 
 
 def _mask_non_code(source: str) -> str:
@@ -101,19 +124,35 @@ def _without_cfg_test_modules(source: str) -> str:
     return "".join(output)
 
 
-def validate_repository(repo: Path) -> None:
+def _consume_approved_owner_api(code: str) -> str:
+    remaining = code
+    for pattern, expected_count in APPROVED_RSA_API:
+        compiled = re.compile(pattern)
+        matches = list(compiled.finditer(remaining))
+        if len(matches) != expected_count:
+            raise ValueError("production_rsa_approved_api_fingerprint_changed")
+        remaining = compiled.sub(lambda match: " " * len(match.group(0)), remaining)
+    return remaining
+
+
+def validate_repository(repo: Path, *, today: datetime.date | None = None) -> None:
+    current_utc_date = today or datetime.datetime.now(datetime.timezone.utc).date()
+    if current_utc_date >= REVIEW_EXPIRES_UTC:
+        raise ValueError("rsa_advisory_exception_review_expired")
     source_root = repo / "src"
     if not source_root.is_dir():
         raise ValueError("rsa_guard_source_root_missing")
     for path in sorted(source_root.rglob("*.rs")):
         production = _without_cfg_test_modules(path.read_text(encoding="utf-8"))
         code = _mask_non_code(production)
-        has_rsa_context = "rsa::" in code or "use rsa" in code
-        if PRIVATE_RSA_TOKEN.search(code) or (
-            has_rsa_context and PRIVATE_DECRYPT_CALL.search(code)
-        ):
-            relative = path.relative_to(repo).as_posix()
-            raise ValueError(f"production_rsa_private_operation_rejected:{relative}")
+        relative = path.relative_to(repo).as_posix()
+        if relative == APPROVED_OWNER:
+            code = _consume_approved_owner_api(code)
+            marker = APPROVED_OWNER_RESIDUAL_MARKER
+        else:
+            marker = RSA_API_MARKER
+        if marker.search(code):
+            raise ValueError(f"production_rsa_api_not_allowlisted:{relative}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
