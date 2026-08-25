@@ -49,6 +49,28 @@ EXPECTED_PATH_PACKAGES = {
     ("freeremotedesk", "0.1.0", "Cargo.toml"),
     ("ironrdp-client", "0.1.0", "vendor/ironrdp-client/Cargo.toml"),
 }
+EXPECTED_LOCAL_TARGETS = {
+    ("freeremotedesk", "0.1.0"): {
+        ("freeremotedesk", ("lib",), ("lib",), "src/lib.rs"),
+        ("freeremoteaccess-gui", ("bin",), ("bin",), "src/bin/freeremoteaccess-gui.rs"),
+        ("freeremotedesk", ("bin",), ("bin",), "src/main.rs"),
+        ("core_render_contracts", ("test",), ("bin",), "tests/core_render_contracts.rs"),
+        ("rdp_adapter", ("test",), ("bin",), "tests/rdp_adapter.rs"),
+        ("remote_texture_state", ("test",), ("bin",), "tests/remote_texture_state.rs"),
+        ("rfb_adapter", ("test",), ("bin",), "tests/rfb_adapter.rs"),
+        ("session_boundaries", ("test",), ("bin",), "tests/session_boundaries.rs"),
+        ("ui_model", ("test",), ("bin",), "tests/ui_model.rs"),
+        ("build-script-build", ("custom-build",), ("bin",), "build.rs"),
+    },
+    ("ironrdp-client", "0.1.0"): {
+        (
+            "ironrdp_client",
+            ("lib",),
+            ("lib",),
+            "vendor/ironrdp-client/src/lib.rs",
+        ),
+    },
+}
 ROOT_IDENTITY = ("freeremotedesk", "0.1.0", None)
 RSA_09_IDENTITY = ("rsa", "0.9.10", CRATES_IO)
 RSA_10_IDENTITY = ("rsa", "0.10.0-rc.18", CRATES_IO)
@@ -98,7 +120,9 @@ EXPECTED_RSA_REVERSE_CLOSURES = {
         },
     },
 }
-SOURCE_ESCAPE = re.compile(r"(?:\binclude\s*!\s*\(|#\s*\[\s*path\s*=)")
+SOURCE_ESCAPE = re.compile(
+    r"(?:\binclude\s*!\s*\(|#\s*!?\s*\[[^\]]*\bpath\s*=)"
+)
 TRANSITIVE_PRIVATE_API = re.compile(
     r"(?:\bSmartCard(?:Identity)?\b|(?:\b|::)(?:sspi|picky|winscard|rsa)\s*::)"
 )
@@ -260,12 +284,25 @@ def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
             targets = package.get("targets")
             if not isinstance(targets, list) or not targets:
                 raise ValueError("product_target_set_missing")
+            target_identities = set()
             for target in targets:
-                source, _ = _canonical_repo_file(
+                source, source_relative = _canonical_repo_file(
                     target["src_path"], repo, "product_target"
                 )
                 if source == target_directory or target_directory in source.parents:
                     raise ValueError("product_target_generated_source")
+                target_identities.add(
+                    (
+                        target["name"],
+                        tuple(target.get("kind", [])),
+                        tuple(target.get("crate_types", [])),
+                        source_relative,
+                    )
+                )
+            if target_identities != EXPECTED_LOCAL_TARGETS.get(
+                (package["name"], package["version"])
+            ):
+                raise ValueError("product_target_set_changed")
     if path_packages != EXPECTED_PATH_PACKAGES:
         raise ValueError("path_dependency_set_changed")
 
@@ -355,7 +392,7 @@ def validate_metadata(metadata: dict[str, Any], repo: Path) -> None:
 def local_source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]:
     source_files: set[Path] = set()
     package_directories: set[Path] = set()
-    module_roots: set[Path] = set()
+    crate_roots: set[Path] = set()
     if metadata is not None:
         for package in metadata["packages"]:
             if package.get("source") is not None:
@@ -369,17 +406,11 @@ def local_source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]
                     target["src_path"], repo, "product_target"
                 )
                 source_files.add(source)
-                module_root = (
-                    source.parent
-                    if source.name in {"lib.rs", "main.rs", "mod.rs"}
-                    else source.parent / source.stem
-                )
-                if module_root.is_dir():
-                    module_roots.add(module_root)
+                crate_roots.add(source)
     else:
         package_directories.update((repo, repo / "vendor" / "ironrdp-client"))
 
-    source_roots = set(module_roots)
+    source_roots = set()
     for package_directory in package_directories:
         source_roots.update(
             package_directory / relative_directory
@@ -409,7 +440,7 @@ def local_source_files(repo: Path, metadata: dict[str, Any] | None) -> set[Path]
         code = _mask_non_code(path.read_text(encoding="utf-8"))
         module_base = (
             path.parent
-            if path.name in {"lib.rs", "main.rs", "mod.rs"}
+            if path in crate_roots or path.name in {"lib.rs", "main.rs", "mod.rs"}
             else path.parent / path.stem
         )
         for module_name in MODULE_DECLARATION.findall(code):

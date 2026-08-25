@@ -151,6 +151,14 @@ class NativePackageSourceTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "production_rsa_api_not_allowlisted"):
                 guard_module.validate_repository(fixture, metadata=fixture_metadata)
+            helper = fixture / "helper.rs"
+            build_script.write_text("mod helper;\nfn main() {}\n", encoding="utf-8")
+            outside_target.write_text("mod helper;\nfn main() {}\n", encoding="utf-8")
+            helper.write_text(
+                "use rsa::RsaPrivateKey;\nfn helper() {}\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "production_rsa_api_not_allowlisted"):
+                guard_module.validate_repository(fixture, metadata=fixture_metadata)
             build_script.write_text("fn main() {}\n", encoding="utf-8")
             outside_target.write_text(
                 "use rsa::hazmat::rsa_decrypt;\nfn main() {}\n", encoding="utf-8"
@@ -355,10 +363,8 @@ class NativePackageSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temporary_target:
             hidden_root = Path(temporary_target)
             hidden_target = hidden_root / "hidden.rs"
-            hidden_modules = hidden_root / "hidden"
-            hidden_modules.mkdir()
             hidden_target.write_text("mod credential_alias;\n", encoding="utf-8")
-            (hidden_modules / "credential_alias.rs").write_text(
+            (hidden_root / "credential_alias.rs").write_text(
                 "use ironrdp_connector::Credentials as C;\n"
                 "fn hidden() { let _ = C::SmartCard; }\n",
                 encoding="utf-8",
@@ -377,7 +383,8 @@ class NativePackageSourceTests(unittest.TestCase):
                     "src_path": str(hidden_target),
                 }
             )
-            guard.validate_metadata(hidden_metadata, REPO_ROOT)
+            with self.assertRaisesRegex(ValueError, "product_target_set_changed"):
+                guard.validate_metadata(hidden_metadata, REPO_ROOT)
             with self.assertRaisesRegex(ValueError, "transitive_private_api_reachable"):
                 guard.validate_product_api(REPO_ROOT, hidden_metadata)
 
@@ -434,6 +441,14 @@ class NativePackageSourceTests(unittest.TestCase):
             child.write_text("fn child() {}\n", encoding="utf-8")
             connector.write_text(exact, encoding="utf-8")
             guard.validate_product_api(fixture)
+
+            controlled.write_text(
+                '#[cfg_attr(feature = "escape", path = "../outside.rs")]\n'
+                "mod escaped;\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "product_rust_source_escape"):
+                guard.validate_product_api(fixture)
 
             real_module = fixture / "real-module"
             real_module.mkdir()
