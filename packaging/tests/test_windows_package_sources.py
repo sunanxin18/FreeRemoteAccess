@@ -76,6 +76,7 @@ class WindowsPackageSourceTests(unittest.TestCase):
             "Start-Process -FilePath $Shortcut",
             "msi_reboot_required_not_allowed",
             "Assert-LifecycleRemoved",
+            "CleanupMsiCandidates",
         ):
             self.assertIn(required, verifier)
         self.assertNotIn("Win32_Product", verifier)

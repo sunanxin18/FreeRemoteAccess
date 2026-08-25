@@ -31,6 +31,16 @@ function Invoke-Msi([string]$Operation, [string]$Msi, [string[]]$Extra, [string]
     }
 }
 
+function Invoke-MsiCleanup([string]$Msi, [string]$LogName) {
+    $log = Join-Path $LogDir $LogName
+    $arguments = "/x `"$Msi`" /qn /norestart /L*v `"$log`""
+    $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+    if ($process.ExitCode -eq 3010) { throw "msi_reboot_required_not_allowed_$LogName" }
+    if ($process.ExitCode -notin @(0, 1605, 1614)) {
+        throw "msi_cleanup_failed_$($process.ExitCode)_$LogName"
+    }
+}
+
 function Assert-SafeCleanupRoot([string]$Path, [string]$ExpectedRelative) {
     $FullPath = [IO.Path]::GetFullPath($Path)
     $Separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
@@ -159,7 +169,7 @@ $ExpectedCliHash = (Get-FileHash -LiteralPath $cliArtifact -Algorithm SHA256).Ha
 $ExtractRoot = Assert-SafeCleanupRoot (Join-Path $RepoRoot 'target\package\windows\verify') 'target\package\windows\verify'
 if (Test-Path -LiteralPath $ExtractRoot) { Remove-Item -LiteralPath $ExtractRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $ExtractRoot | Out-Null
-$InstalledMsi = $null
+$CleanupMsiCandidates = [Collections.Generic.List[string]]::new()
 $Gui = $null
 $InstallRoot = Join-Path $env:ProgramFiles 'FreeRemoteAccess'
 $Shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\FreeRemoteAccess.lnk'
@@ -210,9 +220,9 @@ try {
         $existing = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
             Where-Object DisplayName -eq 'FreeRemoteAccess'
         if ($existing) { throw 'msi_lifecycle_requires_clean_runner' }
-        $InstalledMsi = $PreviousMsi
+        $CleanupMsiCandidates.Add($PreviousMsi)
         Invoke-Msi '/i' $PreviousMsi @() 'install-previous.log'
-        $InstalledMsi = $MsiArtifact
+        $CleanupMsiCandidates.Add($MsiArtifact)
         Invoke-Msi '/i' $MsiArtifact @() 'upgrade-current.log'
         $product = @(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
             Where-Object DisplayName -eq 'FreeRemoteAccess')
@@ -241,7 +251,7 @@ try {
 
         Invoke-Msi '/x' $MsiArtifact @() 'uninstall-current.log'
         Assert-LifecycleRemoved
-        $InstalledMsi = $null
+        $CleanupMsiCandidates.Clear()
     }
 } catch {
     $PrimaryError = $_
@@ -254,9 +264,16 @@ try {
             $CleanupErrors.Add("gui_cleanup_failed:$($_.Exception.Message)")
         }
     }
-    if ($null -ne $InstalledMsi) {
+    if ($CleanupMsiCandidates.Count -gt 0) {
         try {
-            Invoke-Msi '/x' $InstalledMsi @() 'cleanup-after-failure.log'
+            for ($index = $CleanupMsiCandidates.Count - 1; $index -ge 0; $index--) {
+                $CleanupLog = if ($index -eq $CleanupMsiCandidates.Count - 1) {
+                    'cleanup-after-failure.log'
+                } else {
+                    "cleanup-previous-after-failure-$index.log"
+                }
+                Invoke-MsiCleanup $CleanupMsiCandidates[$index] $CleanupLog
+            }
             Assert-LifecycleRemoved
         } catch {
             $CleanupErrors.Add("msi_cleanup_failed:$($_.Exception.Message)")
