@@ -405,7 +405,14 @@ impl DesktopApplication {
         }
         let protocol = connection.protocol;
         let result = adapter_for(protocol).and_then(|adapter| {
-            SessionEngine::spawn(adapter, ProtocolContext::new(connection), self.wake.clone())
+            SessionEngine::spawn(
+                adapter,
+                ProtocolContext::with_platform_services(
+                    connection,
+                    crate::platform::production_platform_services(),
+                ),
+                self.wake.clone(),
+            )
         });
         match result {
             Ok(engine) => {

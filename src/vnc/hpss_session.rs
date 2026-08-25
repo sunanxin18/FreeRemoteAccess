@@ -18,6 +18,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use crate::core::{FrameRect, RemotePixelFormat, RenderUpdate};
 use crate::framebuffer::{Framebuffer, PIXEL_BLUE_SHIFT, PIXEL_GREEN_SHIFT, PIXEL_RED_SHIFT};
+#[cfg(test)]
+use crate::platform::production_platform_services;
+use crate::platform::{AudioOutputSink, AudioOutputSpec, PlatformServices};
 use crate::session::{SessionCommand, SessionEvent, SessionEventSink};
 use crate::vnc::audio_codec::{
     AacEldEncoder, ArdAudioReceiver, AudioReceiveOutcome, DecodedAudioPacket,
@@ -26,7 +29,6 @@ use crate::vnc::audio_input::{
     AudioInputPhase, AudioInputRuntime, AudioInputSourceMode, P5_PROBE_FRAME_COUNT,
     P5_PROBE_SAMPLE_RATE_HZ,
 };
-use crate::vnc::audio_io::AudioPlayback;
 use crate::vnc::client::{is_timeout, RfbConn};
 use crate::vnc::dynamic_resolution::{
     DisplaySize, DynamicResolutionCapability, DynamicResolutionController, GeometryCommit,
@@ -113,7 +115,8 @@ fn audio_input_probe_progress_diagnostic(
 struct ViewerMediaState {
     audio_flow: AudioMediaFlow,
     audio_receiver: ArdAudioReceiver,
-    audio_playback: Option<AudioPlayback>,
+    platform_services: Arc<dyn PlatformServices>,
+    audio_output: Option<AudioOutputSink>,
     audio_output_phase: AudioOutputPhase,
     audio_input_runtime: AudioInputRuntime,
     audio_encoder: Option<AacEldEncoder>,
@@ -129,11 +132,20 @@ struct ViewerMediaState {
 }
 
 impl ViewerMediaState {
+    #[cfg(test)]
     fn new(audio_flow: AudioMediaFlow) -> Result<Self> {
+        Self::new_with_platform_services(audio_flow, production_platform_services())
+    }
+
+    fn new_with_platform_services(
+        audio_flow: AudioMediaFlow,
+        platform_services: Arc<dyn PlatformServices>,
+    ) -> Result<Self> {
         Ok(Self {
             audio_flow,
             audio_receiver: ArdAudioReceiver::new()?,
-            audio_playback: None,
+            platform_services,
+            audio_output: None,
             audio_output_phase: AudioOutputPhase::ReadyToStart,
             audio_input_runtime: AudioInputRuntime::new(REVIEWED_AUDIO_INPUT_SOURCE_MODE),
             audio_encoder: None,
@@ -346,7 +358,7 @@ impl ViewerMediaState {
             return MediaAcceptOutcome::Discarded;
         }
         let reason = format!("{error:#}");
-        self.audio_playback = None;
+        self.audio_output = None;
         self.audio_output_phase = AudioOutputPhase::Degraded {
             reason: reason.clone(),
         };
@@ -358,24 +370,27 @@ impl ViewerMediaState {
         self.teardown_audio_input();
         let receiver = ArdAudioReceiver::new().context("重建 Mac→PC AAC-ELD 接收器失败")?;
         self.audio_receiver = receiver;
-        self.audio_playback = None;
+        self.audio_output = None;
         self.audio_output_phase = AudioOutputPhase::ReadyToStart;
         Ok(())
     }
 
     fn output_decoded_audio(&mut self, decoded: &DecodedAudioPacket) -> Result<()> {
-        if self.audio_playback.is_none() {
-            let playback = AudioPlayback::open_default().context("打开 Mac→PC 音频输出设备失败")?;
+        if self.audio_output.is_none() {
+            let output = self
+                .platform_services
+                .create_audio_output(AudioOutputSpec::normalized())
+                .context("打开 Mac→PC 音频输出设备失败")?;
             eprintln!(
                 "[audio-out] 已启用 48 kHz 双声道 AAC-ELD 播放: {}",
-                playback.device_description()
+                output.device_description()
             );
-            self.audio_playback = Some(playback);
+            self.audio_output = Some(output);
         }
-        self.audio_playback
-            .as_ref()
+        self.audio_output
+            .as_mut()
             .context("Mac→PC 音频输出状态为 Active 但播放设备缺失")?
-            .enqueue_interleaved_stereo(&decoded.pcm)
+            .enqueue_interleaved_i16(&decoded.pcm)
             .context("Mac→PC 音频 PCM 入队失败")?;
         Ok(())
     }
@@ -394,7 +409,7 @@ impl ViewerMediaState {
             self.non_silent_audio_access_units =
                 self.non_silent_audio_access_units.saturating_add(1);
             if self.non_silent_audio_access_units == 1 {
-                eprintln!("[audio-out] 首个非静音 AAC-ELD access unit 已输出到 Windows 音频设备");
+                eprintln!("[audio-out] 首个非静音 AAC-ELD access unit 已输出到本地音频设备");
             }
         }
         self.authenticated_audio_packets = self.authenticated_audio_packets.saturating_add(1);
@@ -445,6 +460,9 @@ impl ViewerMediaState {
     }
 
     fn accept_audio_outcome(&mut self, outcome: AudioReceiveOutcome) -> MediaAcceptOutcome {
+        if matches!(self.audio_output_phase(), AudioOutputPhase::Degraded { .. }) {
+            return MediaAcceptOutcome::Discarded;
+        }
         self.accept_audio_outcome_with_output(outcome, |state, decoded| {
             state.output_decoded_audio(decoded)
         })
@@ -1842,6 +1860,7 @@ pub fn run_protocol_session(
     init_h: u16,
     dynamic_resolution_enabled: bool,
     audio_flow: AudioMediaFlow,
+    platform_services: Arc<dyn PlatformServices>,
     commands: Receiver<SessionCommand>,
     events: SessionEventSink,
 ) -> Result<()> {
@@ -1852,6 +1871,7 @@ pub fn run_protocol_session(
         init_h,
         dynamic_resolution_enabled,
         audio_flow,
+        platform_services,
         commands,
         events,
     )
@@ -1864,6 +1884,7 @@ fn run_hpss_session(
     init_h: u16,
     dynamic_resolution_enabled: bool,
     audio_flow: AudioMediaFlow,
+    platform_services: Arc<dyn PlatformServices>,
     commands: Receiver<SessionCommand>,
     events: SessionEventSink,
 ) -> Result<()> {
@@ -1915,18 +1936,20 @@ fn run_hpss_session(
         let crypto = crypto.clone();
         let closing = closing.clone();
         let error_slot = error_slot.clone();
+        let platform_services = Arc::clone(&platform_services);
         thread::spawn(move || {
             let mut receiver = MvsReceiveState::new(0);
             let mut requests = ReaderRequestState::after_startup(startup_fb_sent_at);
             let mut pending_media_answer_frame_diagnostics = 0usize;
-            let mut viewer_media_state = match ViewerMediaState::new(audio_flow) {
-                Ok(state) => state,
-                Err(error) => {
-                    *error_slot.lock().unwrap() =
-                        Some(format!("初始化 UDP 音频状态失败: {error:#}"));
-                    return;
-                }
-            };
+            let mut viewer_media_state =
+                match ViewerMediaState::new_with_platform_services(audio_flow, platform_services) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        *error_slot.lock().unwrap() =
+                            Some(format!("初始化 UDP 音频状态失败: {error:#}"));
+                        return;
+                    }
+                };
 
             loop {
                 if closing.load(Ordering::Relaxed) {
@@ -2659,6 +2682,9 @@ mod tests {
         REVIEWED_AUDIO_INPUT_SOURCE_MODE,
     };
     use crate::framebuffer::Framebuffer;
+    use crate::platform::{
+        AudioOutputBackend, AudioOutputSink, AudioOutputSpec, PlatformError, PlatformServices,
+    };
     use crate::vnc::audio_codec::{
         AudioReceiveOutcome, DecodedAudioPacket, ARD_AUDIO_PCM_SAMPLES_PER_ACCESS_UNIT,
     };
@@ -2680,6 +2706,7 @@ mod tests {
     use crate::vnc::protocol;
     use crate::vnc::srtp::{derive_session_keys, protect_rtp_packet, SrtcpSender, SrtpPacketKind};
     use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -2914,6 +2941,198 @@ mod tests {
         .unwrap();
     }
 
+    #[derive(Default)]
+    struct TestAudioOutputState {
+        opens: AtomicUsize,
+        enqueues: AtomicUsize,
+        open_failures_remaining: AtomicUsize,
+        enqueue_failures_remaining: AtomicUsize,
+    }
+
+    struct TestAudioOutputBackend {
+        state: Arc<TestAudioOutputState>,
+    }
+
+    impl AudioOutputBackend for TestAudioOutputBackend {
+        fn enqueue_interleaved_i16(&mut self, _samples: &[i16]) -> Result<(), PlatformError> {
+            self.state.enqueues.fetch_add(1, AtomicOrdering::SeqCst);
+            if self
+                .state
+                .enqueue_failures_remaining
+                .fetch_update(
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(PlatformError::new("test_audio_enqueue_failed"));
+            }
+            Ok(())
+        }
+
+        fn device_description(&self) -> &str {
+            "测试音频输出"
+        }
+    }
+
+    struct TestPlatformServices {
+        state: Arc<TestAudioOutputState>,
+    }
+
+    impl PlatformServices for TestPlatformServices {
+        fn create_audio_output(
+            &self,
+            spec: AudioOutputSpec,
+        ) -> Result<AudioOutputSink, PlatformError> {
+            assert_eq!(spec, AudioOutputSpec::normalized());
+            self.state.opens.fetch_add(1, AtomicOrdering::SeqCst);
+            if self
+                .state
+                .open_failures_remaining
+                .fetch_update(
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(PlatformError::new("test_audio_open_failed"));
+            }
+            Ok(AudioOutputSink::new(
+                spec,
+                Box::new(TestAudioOutputBackend {
+                    state: Arc::clone(&self.state),
+                }),
+            ))
+        }
+
+        fn set_clipboard_text(&self, _text: &str) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn open_external_url(&self, _url: &str) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    fn viewer_with_test_audio_output() -> (ViewerMediaState, Arc<TestAudioOutputState>) {
+        let state = Arc::new(TestAudioOutputState::default());
+        let services: Arc<dyn PlatformServices> = Arc::new(TestPlatformServices {
+            state: Arc::clone(&state),
+        });
+        (
+            ViewerMediaState::new_with_platform_services(AudioMediaFlow::MacToPc, services)
+                .unwrap(),
+            state,
+        )
+    }
+
+    fn decoded_audio(pcm: Vec<i16>) -> AudioReceiveOutcome {
+        AudioReceiveOutcome::Decoded(DecodedAudioPacket {
+            pcm,
+            concealed_access_units: 0,
+            sequence: 218,
+            timestamp: 9_000_000,
+            ssrc: 0x1020_3040,
+        })
+    }
+
+    #[test]
+    fn video_and_state_construction_do_not_open_audio_output() {
+        let (mut state, output) = viewer_with_test_audio_output();
+
+        assert_eq!(
+            state
+                .accept(MediaRole::VideoStream1, MediaDatagram::Rtp(vec![1]))
+                .unwrap(),
+            MediaAcceptOutcome::AuthenticatedNotRendered
+        );
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn first_decoded_audio_opens_once_and_reuses_the_generation_sink() {
+        let (mut state, output) = viewer_with_test_audio_output();
+
+        for _ in 0..2 {
+            assert_eq!(
+                state.accept_audio_outcome(decoded_audio(vec![1, -1, 2, -2])),
+                MediaAcceptOutcome::Applied
+            );
+        }
+
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(output.enqueues.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn audio_open_failure_degrades_once_and_generation_reset_retries() {
+        let (mut state, output) = viewer_with_test_audio_output();
+        output
+            .open_failures_remaining
+            .store(1, AtomicOrdering::SeqCst);
+
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![1, -1])),
+            MediaAcceptOutcome::AudioDegraded
+        );
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![2, -2])),
+            MediaAcceptOutcome::Discarded
+        );
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 1);
+        assert_video_and_control_remain_serviceable(&mut state, Instant::now());
+
+        state.reset_generation().unwrap();
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![3, -3])),
+            MediaAcceptOutcome::Applied
+        );
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(output.enqueues.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn audio_enqueue_failure_degrades_once_and_generation_reset_reopens() {
+        let (mut state, output) = viewer_with_test_audio_output();
+        output
+            .enqueue_failures_remaining
+            .store(1, AtomicOrdering::SeqCst);
+
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![1, -1])),
+            MediaAcceptOutcome::AudioDegraded
+        );
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![2, -2])),
+            MediaAcceptOutcome::Discarded
+        );
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(output.enqueues.load(AtomicOrdering::SeqCst), 1);
+        assert_video_and_control_remain_serviceable(&mut state, Instant::now());
+
+        state.reset_generation().unwrap();
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![3, -3])),
+            MediaAcceptOutcome::Applied
+        );
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(output.enqueues.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn decoded_pcm_alignment_is_rejected_before_backend_enqueue() {
+        let (mut state, output) = viewer_with_test_audio_output();
+
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![1, 2, 3])),
+            MediaAcceptOutcome::AudioDegraded
+        );
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(output.enqueues.load(AtomicOrdering::SeqCst), 0);
+    }
+
     #[test]
     fn landscape_initial_geometry_keeps_the_trusted_connection_size() {
         let size = select_initial_display_size(1920, 1080).unwrap();
@@ -2953,7 +3172,7 @@ mod tests {
         assert_eq!(accepted, 1);
         assert_eq!(media_state.authenticated_video_packets, 1);
         assert_eq!(media_state.authenticated_audio_packets, 0);
-        assert!(media_state.audio_playback.is_none());
+        assert!(media_state.audio_output.is_none());
         let counters = loopback.transport.discard_counters();
         assert_eq!(counters.unexpected_source, 1);
         assert_eq!(counters.empty_datagram, 1);
@@ -3005,7 +3224,7 @@ mod tests {
             media_state.audio_output_phase(),
             AudioOutputPhase::Degraded { reason } if reason.contains("ARD audio RTP payload 为空")
         ));
-        assert!(media_state.audio_playback.is_none());
+        assert!(media_state.audio_output.is_none());
     }
 
     #[test]

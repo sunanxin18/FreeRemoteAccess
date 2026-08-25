@@ -43,7 +43,7 @@ impl ProtocolAdapter for AppleArdAdapter {
         events: SessionEventSink,
     ) -> Result<(), SessionError> {
         events.emit(SessionEvent::Connecting)?;
-        let connection = context.into_connection();
+        let (connection, platform_services) = context.into_parts();
         if connection.protocol != ProtocolKind::AppleRfb {
             return Err(SessionError::new("apple_protocol_mismatch"));
         }
@@ -70,6 +70,7 @@ impl ProtocolAdapter for AppleArdAdapter {
                 client.height,
                 true,
                 AudioMediaFlow::MacToPc,
+                platform_services,
                 commands,
                 events,
             )
@@ -77,7 +78,7 @@ impl ProtocolAdapter for AppleArdAdapter {
         }
         #[cfg(not(feature = "media"))]
         {
-            let _ = (client, commands, events);
+            let _ = (client, platform_services, commands, events);
             Err(SessionError::new("apple_hpss_feature_unavailable"))
         }
     }
@@ -108,5 +109,20 @@ mod tests {
             resolve_connection_endpoint(&connection).unwrap(),
             "192.0.2.41:5900".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn apple_protocol_delegates_audio_without_owning_platform_device_apis() {
+        let adapter_source = include_str!("apple_ard.rs");
+        let session_source = include_str!("../vnc/hpss_session.rs");
+
+        for source in [adapter_source, session_source] {
+            assert!(!source.contains(concat!("cpal", "::")));
+            assert!(!source.contains(concat!("default_", "output_device")));
+            assert!(!source.contains(concat!("AudioPlayback", "::open_default")));
+        }
+        assert!(adapter_source.contains("context.into_parts()"));
+        assert!(adapter_source.contains("platform_services,"));
+        assert!(session_source.contains("AudioOutputSpec::normalized()"));
     }
 }

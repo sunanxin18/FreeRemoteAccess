@@ -226,7 +226,7 @@ impl ProtocolAdapter for AutoAdapter {
         commands: Receiver<SessionCommand>,
         events: SessionEventSink,
     ) -> Result<(), SessionError> {
-        let connection = context.into_connection();
+        let connection = context.connection();
         if connection.protocol != ProtocolKind::Auto {
             return Err(SessionError::new("auto_protocol_mismatch"));
         }
@@ -235,12 +235,27 @@ impl ProtocolAdapter for AutoAdapter {
             connection.endpoint.explicit_port(),
             AutoProbeLimits::production(),
         )?;
-        let connection = connection
-            .select_auto_protocol(selected.protocol, selected.address)
-            .ok_or_else(|| SessionError::new("auto_protocol_selection_invalid"))?;
         let adapter = super::adapter_for(selected.protocol)?;
-        adapter.run(ProtocolContext::new(connection), commands, events)
+        adapter.run(
+            prepare_selected_context(context, selected)?,
+            commands,
+            events,
+        )
     }
+}
+
+fn prepare_selected_context(
+    context: ProtocolContext,
+    selected: DetectedEndpoint,
+) -> Result<ProtocolContext, SessionError> {
+    let (connection, platform_services) = context.into_parts();
+    let connection = connection
+        .select_auto_protocol(selected.protocol, selected.address)
+        .ok_or_else(|| SessionError::new("auto_protocol_selection_invalid"))?;
+    Ok(ProtocolContext::with_platform_services(
+        connection,
+        platform_services,
+    ))
 }
 
 fn detect_host(
@@ -758,6 +773,28 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::app::connection::{validate_connection, ConnectionRequest, ServiceKind};
+    use crate::platform::{AudioOutputSink, AudioOutputSpec, PlatformError, PlatformServices};
+    use secrecy::SecretString;
+
+    struct TestPlatformServices;
+
+    impl PlatformServices for TestPlatformServices {
+        fn create_audio_output(
+            &self,
+            _spec: AudioOutputSpec,
+        ) -> Result<AudioOutputSink, PlatformError> {
+            Err(PlatformError::new("test_audio_unavailable"))
+        }
+
+        fn set_clipboard_text(&self, _text: &str) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn open_external_url(&self, _url: &str) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
 
     const CREDENTIAL_CANARY: &[u8] = b"canary";
     const RDP_NEGOTIATION_RESPONSE: [u8; 19] = [
@@ -771,6 +808,37 @@ mod tests {
 
     fn limits() -> AutoProbeLimits {
         AutoProbeLimits::new(Duration::from_millis(150), Duration::from_millis(350), 64).unwrap()
+    }
+
+    #[test]
+    fn auto_selection_preserves_the_exact_injected_platform_service_object() {
+        let connection = validate_connection(ConnectionRequest {
+            service: ServiceKind::Auto,
+            host: "example.invalid".to_owned(),
+            port: None,
+            username: "local-user".to_owned(),
+            password: SecretString::from("secret".to_owned()),
+            domain: None,
+        })
+        .unwrap();
+        let services: Arc<dyn PlatformServices> = Arc::new(TestPlatformServices);
+        let context = ProtocolContext::with_platform_services(connection, Arc::clone(&services));
+
+        let selected = prepare_selected_context(
+            context,
+            DetectedEndpoint {
+                protocol: ProtocolKind::AppleRfb,
+                address: "192.0.2.41:5900".parse().unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(selected.platform_services(), &services));
+        assert_eq!(selected.connection().protocol, ProtocolKind::AppleRfb);
+        assert_eq!(
+            selected.connection().endpoint.pinned_addr(),
+            Some("192.0.2.41:5900".parse().unwrap())
+        );
     }
 
     fn spawn_server(

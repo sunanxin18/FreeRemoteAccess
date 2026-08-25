@@ -8,6 +8,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::app::connection::ValidatedConnection;
 use crate::core::{FrameRect, RemotePixelFormat, RemoteSurfaceState, RenderUpdate};
+use crate::platform::{production_platform_services, PlatformServices};
 use crate::protocols::ProtocolAdapter;
 use crate::session::backpressure::{QueuePushOutcome, SessionEventMailbox};
 
@@ -15,22 +16,100 @@ const DEFAULT_COMMAND_CAPACITY: usize = 256;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 const DEFAULT_RENDER_BYTE_BUDGET: usize = 64 * 1024 * 1024 * 4;
 
-#[derive(Debug)]
 pub struct ProtocolContext {
     connection: ValidatedConnection,
+    platform_services: Arc<dyn PlatformServices>,
+}
+
+impl fmt::Debug for ProtocolContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtocolContext")
+            .field("connection", &self.connection)
+            .field("platform_services", &"<injected>")
+            .finish()
+    }
 }
 
 impl ProtocolContext {
     pub fn new(connection: ValidatedConnection) -> Self {
-        Self { connection }
+        Self::with_platform_services(connection, production_platform_services())
+    }
+
+    pub fn with_platform_services(
+        connection: ValidatedConnection,
+        platform_services: Arc<dyn PlatformServices>,
+    ) -> Self {
+        Self {
+            connection,
+            platform_services,
+        }
     }
 
     pub fn connection(&self) -> &ValidatedConnection {
         &self.connection
     }
 
+    pub fn platform_services(&self) -> &Arc<dyn PlatformServices> {
+        &self.platform_services
+    }
+
     pub fn into_connection(self) -> ValidatedConnection {
         self.connection
+    }
+
+    pub fn into_parts(self) -> (ValidatedConnection, Arc<dyn PlatformServices>) {
+        (self.connection, self.platform_services)
+    }
+}
+
+#[cfg(test)]
+mod protocol_context_tests {
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::app::connection::{validate_connection, ConnectionRequest, ServiceKind};
+    use crate::platform::{AudioOutputSink, AudioOutputSpec, PlatformError, PlatformServices};
+
+    struct TestPlatformServices;
+
+    impl PlatformServices for TestPlatformServices {
+        fn create_audio_output(
+            &self,
+            _spec: AudioOutputSpec,
+        ) -> Result<AudioOutputSink, PlatformError> {
+            Err(PlatformError::new("test_audio_unavailable"))
+        }
+
+        fn set_clipboard_text(&self, _text: &str) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn open_external_url(&self, _url: &str) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    fn connection() -> ValidatedConnection {
+        validate_connection(ConnectionRequest {
+            service: ServiceKind::Auto,
+            host: "example.invalid".to_owned(),
+            port: None,
+            username: "local-user".to_owned(),
+            password: SecretString::from("secret".to_owned()),
+            domain: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn context_owns_the_injected_platform_service_object() {
+        let services: Arc<dyn PlatformServices> = Arc::new(TestPlatformServices);
+        let context = ProtocolContext::with_platform_services(connection(), Arc::clone(&services));
+
+        assert!(Arc::ptr_eq(context.platform_services(), &services));
+        let (_, extracted) = context.into_parts();
+        assert!(Arc::ptr_eq(&extracted, &services));
     }
 }
 
