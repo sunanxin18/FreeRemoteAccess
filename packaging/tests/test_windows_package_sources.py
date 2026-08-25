@@ -47,7 +47,10 @@ class WindowsPackageSourceTests(unittest.TestCase):
     def test_windows_cleanup_is_exact_and_reparse_safe(self):
         builder = self.read("packaging/windows/build-msi.ps1")
         verifier = self.read("packaging/windows/verify-package.ps1")
-        self.assertIn("GetRelativePath", builder)
+        self.assertNotIn("GetRelativePath", builder)
+        self.assertNotIn("GetRelativePath", verifier)
+        self.assertIn("DirectorySeparatorChar", builder)
+        self.assertIn("Substring($RootPrefix.Length)", builder)
         self.assertIn("ReparsePoint", builder)
         self.assertNotIn("StartsWith($RepoRoot", builder)
         self.assertIn("Assert-SafeCleanupRoot", verifier)

@@ -20,7 +20,12 @@ $ArtifactPrefix = "FreeRemoteAccess-$Version-windows-x64"
 
 function Assert-SafeCleanupRoot([string]$Path, [string]$ExpectedRelative) {
     $FullPath = [IO.Path]::GetFullPath($Path)
-    $Relative = [IO.Path]::GetRelativePath($RepoRoot, $FullPath)
+    $Separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $RootPrefix = [IO.Path]::GetFullPath($RepoRoot).TrimEnd($Separators) + [IO.Path]::DirectorySeparatorChar
+    if (!$FullPath.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'package_cleanup_root_invalid'
+    }
+    $Relative = $FullPath.Substring($RootPrefix.Length)
     if ($Relative -ne $ExpectedRelative) {
         throw 'package_cleanup_root_invalid'
     }

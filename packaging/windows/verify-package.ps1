@@ -33,7 +33,12 @@ function Invoke-Msi([string]$Operation, [string]$Msi, [string[]]$Extra, [string]
 
 function Assert-SafeCleanupRoot([string]$Path, [string]$ExpectedRelative) {
     $FullPath = [IO.Path]::GetFullPath($Path)
-    if ([IO.Path]::GetRelativePath($RepoRoot, $FullPath) -ne $ExpectedRelative) {
+    $Separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $RootPrefix = [IO.Path]::GetFullPath($RepoRoot).TrimEnd($Separators) + [IO.Path]::DirectorySeparatorChar
+    if (!$FullPath.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'package_verify_cleanup_root_invalid'
+    }
+    if ($FullPath.Substring($RootPrefix.Length) -ne $ExpectedRelative) {
         throw 'package_verify_cleanup_root_invalid'
     }
     if (Test-Path -LiteralPath $FullPath) {
