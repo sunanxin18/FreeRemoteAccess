@@ -11,7 +11,9 @@ all-features = true
 yanked = "deny"
 unmaintained = "workspace"
 unsound = "all"
-ignore = []
+# Temporary, usage-scoped exception. Production is guarded public-encrypt-only.
+# Remove no later than 2026-11-30, or immediately when rsa publishes a patched version.
+ignore = ["RUSTSEC-2023-0071"]
 
 [bans]
 multiple-versions = "warn"

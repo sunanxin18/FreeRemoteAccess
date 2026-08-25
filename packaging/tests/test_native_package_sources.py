@@ -1,3 +1,6 @@
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +15,7 @@ class NativePackageSourceTests(unittest.TestCase):
     def test_workflow_pins_actions_and_security_tools_and_runs_native_verifiers(self):
         workflow = self.read(".github/workflows/build-desktop-installers.yml")
         clean_runtime = self.read("packaging/linux/verify-clean-runtime.sh")
+        jammy_lock = self.read("packaging/linux/ubuntu-jammy-packages.lock")
         for immutable in (
             "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
             "330a01c490aca151604b8cf639adc76d48f6c5d4",
@@ -30,10 +34,10 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertIn("cargo audit", workflow)
         self.assertIn("cargo deny check", workflow)
         self.assertIn("verify-package", workflow)
-        self.assertIn("python-version: '3.13'", workflow)
+        self.assertIn("python-version: '3.13.14'", workflow)
         self.assertIn("runs-on: ubuntu-22.04", workflow)
         self.assertIn("xvfb-run", clean_runtime)
-        self.assertIn("weston", workflow)
+        self.assertIn("weston=", jammy_lock)
         self.assertIn("LIBGL_ALWAYS_SOFTWARE", clean_runtime)
         self.assertIn("verify-clean-runtime.sh", workflow)
         self.assertIn("if: always()", workflow)
@@ -49,6 +53,75 @@ class NativePackageSourceTests(unittest.TestCase):
         self.assertNotIn("path: dist/macos/*", workflow)
         self.assertNotIn("path: dist/linux/*", workflow)
         self.assertNotIn("-SkipLifecycle", workflow)
+
+    def test_rsa_advisory_exception_is_exact_scoped_and_time_bounded(self):
+        workflow = self.read(".github/workflows/build-desktop-installers.yml")
+        deny = self.read("deny.toml")
+        readme = self.read("README.md")
+        self.assertEqual(workflow.count("--ignore RUSTSEC-2023-0071"), 1)
+        self.assertEqual(deny.count('"RUSTSEC-2023-0071"'), 1)
+        self.assertIn("packaging/check_rsa_usage.py --repo .", workflow)
+        self.assertIn("RUSTSEC-2023-0071", readme)
+        self.assertIn("RsaPublicKey", readme)
+        self.assertIn("2026-11-30", readme)
+        self.assertIn("一旦上游提供 patched version", readme)
+
+    def test_rsa_usage_guard_allows_test_mock_but_rejects_production_private_key(self):
+        guard = REPO_ROOT / "packaging" / "check_rsa_usage.py"
+        self.assertTrue(guard.is_file(), "production RSA usage guard is missing")
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            source = fixture / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text(
+                "use rsa::RsaPublicKey;\n#[cfg(test)]\nmod tests {\n"
+                "use rsa::RsaPrivateKey;\nfn mock(k: RsaPrivateKey) { let _ = k.decrypt(); }\n}\n",
+                encoding="utf-8",
+            )
+            allowed = subprocess.run(
+                [sys.executable, str(guard), "--repo", str(fixture)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+
+            source.write_text(
+                "use rsa::RsaPrivateKey;\nfn production(k: RsaPrivateKey) { let _ = k.decrypt(); }\n",
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [sys.executable, str(guard), "--repo", str(fixture)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("production_rsa_private_operation_rejected", rejected.stderr)
+
+    def test_ubuntu_dependencies_use_one_immutable_snapshot_and_exact_lock(self):
+        workflow = self.read(".github/workflows/build-desktop-installers.yml")
+        installer_path = REPO_ROOT / "packaging/linux/install-ubuntu-jammy-snapshot.sh"
+        package_lock_path = REPO_ROOT / "packaging/linux/ubuntu-jammy-packages.lock"
+        self.assertTrue(installer_path.is_file(), "snapshot installer is missing")
+        self.assertTrue(package_lock_path.is_file(), "snapshot package lock is missing")
+        installer = installer_path.read_text(encoding="utf-8")
+        package_lock = package_lock_path.read_text(encoding="utf-8")
+        self.assertNotIn("apt-get update", workflow)
+        self.assertNotIn("apt-get install", workflow)
+        self.assertGreaterEqual(
+            workflow.count("install-ubuntu-jammy-snapshot.sh"), 3
+        )
+        self.assertIn("snapshot=20260810T000000Z", installer)
+        self.assertIn("apt-get --version", installer)
+        self.assertIn("2.4.11", installer)
+        self.assertIn("--no-install-recommends", installer)
+        self.assertNotIn("latest", installer.lower())
+        locked_lines = [
+            line for line in package_lock.splitlines() if line and not line.startswith("#")
+        ]
+        self.assertGreaterEqual(len(locked_lines), 20)
+        self.assertTrue(all("=" in line for line in locked_lines))
 
     def test_supply_chain_policy_and_locked_fetch_are_explicit(self):
         deny = self.read("deny.toml")
