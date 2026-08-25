@@ -153,6 +153,19 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def msi_product_version(version: str) -> str:
+    if not SEMVER_RE.fullmatch(version):
+        raise _fail("msi_product_version_invalid")
+    core = re.split(r"[-+]", version, maxsplit=1)[0]
+    parts = core.split(".")
+    if len(parts) != 3:
+        raise _fail("msi_product_version_invalid")
+    numbers = tuple(int(part) for part in parts)
+    if numbers[0] > 255 or numbers[1] > 255 or numbers[2] > 65535:
+        raise _fail("msi_product_version_invalid")
+    return ".".join(str(number) for number in numbers)
+
+
 def _cargo_home() -> Path:
     configured = os.environ.get("CARGO_HOME")
     return Path(configured).expanduser() if configured else Path.home() / ".cargo"
@@ -441,6 +454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parent.parent))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("version")
+    commands.add_parser("msi-version")
     prepare = commands.add_parser("prepare-fdk")
     prepare.add_argument("--dest", required=True)
     write = commands.add_parser("write")
@@ -456,6 +470,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     identity = resolve_locked_identity(repo)
     if args.command == "version":
         print(identity.version)
+    elif args.command == "msi-version":
+        print(msi_product_version(identity.version))
     elif args.command == "prepare-fdk":
         bundle = prepare_fdk_bundle(repo, Path(args.dest), identity)
         print(json.dumps({"notice": str(bundle.notice), "source_archive": str(bundle.source_archive)}))

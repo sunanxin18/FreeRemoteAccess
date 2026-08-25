@@ -1,16 +1,16 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="FreeRemoteAccess"
            Manufacturer="FreeRemoteAccess contributors"
-           Version="0.1.0"
+           Version="$(PackageVersion)"
            UpgradeCode="94803D29-B9FA-47D7-9C43-C9665ABAC5B4"
            Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 FreeRemoteAccess。" />
     <MediaTemplate EmbedCab="yes" />
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="FreeRemoteAccess">
-        <Component Id="MainExecutable" Guid="*">
+        <Component Id="MainExecutable" Guid="A05BE69B-BFA0-4829-A56B-7F39A2562392">
           <File Id="FreeRemoteAccessExe"
-                Source="$(SourceDir)\freeremotedesk.exe"
+                Source="$(SourceDir)\FreeRemoteAccess.exe"
                 Name="FreeRemoteAccess.exe"
                 KeyPath="yes">
             <Shortcut Id="StartMenuShortcut"
@@ -20,10 +20,39 @@
                       Advertise="yes" />
           </File>
         </Component>
+        <Component Id="CommandLineExecutable" Guid="8D9D9A04-683B-42C4-89DF-80218D791993">
+          <File Id="FreeRemoteAccessCliExe"
+                Source="$(SourceDir)\freeremotedesk-cli.exe"
+                Name="freeremotedesk-cli.exe"
+                KeyPath="yes" />
+        </Component>
+        <Directory Id="ThirdPartyDirectory" Name="THIRD_PARTY">
+          <Directory Id="FdkPackageDirectory" Name="$(FdkDirectoryName)">
+            <Directory Id="FdkAacDirectory" Name="aac">
+              <Component Id="FdkNoticeComponent" Guid="B3372ED3-8BBE-489E-B060-FBB6C753928E">
+                <File Id="FdkNotice"
+                      Source="$(SourceDir)\THIRD_PARTY\$(FdkDirectoryName)\aac\NOTICE"
+                      Name="NOTICE"
+                      KeyPath="yes" />
+              </Component>
+            </Directory>
+            <Directory Id="FdkSourceDirectory" Name="source">
+              <Component Id="FdkSourceComponent" Guid="7B5A3261-29AC-4436-8D23-E54BF03F465E">
+                <File Id="FdkSourceArchive"
+                      Source="$(SourceDir)\THIRD_PARTY\$(FdkDirectoryName)\source\$(FdkArchiveName)"
+                      Name="$(FdkArchiveName)"
+                      KeyPath="yes" />
+              </Component>
+            </Directory>
+          </Directory>
+        </Directory>
       </Directory>
     </StandardDirectory>
     <Feature Id="MainFeature" Title="FreeRemoteAccess" Level="1">
       <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="CommandLineExecutable" />
+      <ComponentRef Id="FdkNoticeComponent" />
+      <ComponentRef Id="FdkSourceComponent" />
     </Feature>
   </Package>
 </Wix>

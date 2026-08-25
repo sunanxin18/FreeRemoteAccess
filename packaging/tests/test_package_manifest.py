@@ -26,6 +26,14 @@ class PackageManifestTests(unittest.TestCase):
         self.assertTrue(self.identity.fdk_source.startswith("registry+"))
         self.assertRegex(self.identity.fdk_checksum, r"^[0-9a-f]{64}$")
 
+    def test_msi_product_version_is_numeric_bounded_and_derived_from_semver(self):
+        self.assertEqual(package_manifest.msi_product_version("1.2.3"), "1.2.3")
+        self.assertEqual(package_manifest.msi_product_version("1.2.3-beta.1"), "1.2.3")
+        for invalid in ("1.2", "256.0.0", "1.256.0", "1.2.65536", "v1.2.3"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "msi_product_version_invalid"):
+                    package_manifest.msi_product_version(invalid)
+
     def test_prepare_fdk_bundle_verifies_and_copies_exact_registry_archive(self):
         with tempfile.TemporaryDirectory() as temporary:
             support = Path(temporary) / "THIRD_PARTY"
