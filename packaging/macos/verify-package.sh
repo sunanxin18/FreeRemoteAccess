@@ -85,19 +85,46 @@ assert_app "$mount_dir/FreeRemoteAccess.app"
 hdiutil detach "$mount_dir" -quiet
 mounted=0
 
-open -n "$work_dir/archive/FreeRemoteAccess.app"
-for _ in {1..40}; do
-  gui_pid="$(pgrep -f "$work_dir/archive/FreeRemoteAccess.app/Contents/MacOS/FreeRemoteAccess" | head -n1 || true)"
-  [[ -n "$gui_pid" ]] && break
-  sleep 0.25
-done
-if [[ -z "$gui_pid" ]] || ! kill -0 "$gui_pid" 2>/dev/null; then
-  echo 'macos_windowserver_launch_unavailable' >&2
-  exit 1
+app="$work_dir/archive/FreeRemoteAccess.app"
+binary="$app/Contents/MacOS/FreeRemoteAccess"
+current_user="$(id -un)"
+console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+has_aqua_session=0
+if [[ -n "$console_user" && "$console_user" == "$current_user" ]] && \
+    launchctl print "gui/$(id -u)" >/dev/null 2>&1 && \
+    pgrep -x WindowServer >/dev/null 2>&1; then
+  has_aqua_session=1
 fi
-sleep 3
-kill -0 "$gui_pid" 2>/dev/null || { echo 'macos_gui_did_not_survive' >&2; exit 1; }
-kill "$gui_pid"
-wait "$gui_pid" 2>/dev/null || true
-gui_pid=""
+
+if [[ "$has_aqua_session" == 1 ]]; then
+  open_log="$work_dir/aqua-open.log"
+  if ! open -n "$app" >"$open_log" 2>&1; then
+    cat "$open_log" >&2
+    echo 'macos_aqua_app_open_failed' >&2
+    exit 1
+  fi
+  for _ in {1..40}; do
+    gui_pid="$(pgrep -f "$binary" | head -n1 || true)"
+    [[ -n "$gui_pid" ]] && break
+    sleep 0.25
+  done
+  if [[ -z "$gui_pid" ]] || ! kill -0 "$gui_pid" 2>/dev/null; then
+    cat "$open_log" >&2
+    echo 'macos_aqua_app_process_missing' >&2
+    exit 1
+  fi
+  sleep 3
+  kill -0 "$gui_pid" 2>/dev/null || { echo 'macos_gui_did_not_survive' >&2; exit 1; }
+  kill "$gui_pid"
+  wait "$gui_pid" 2>/dev/null || true
+  gui_pid=""
+  echo 'macos-gui-runtime-verification: full-aqua-windowserver-survival'
+else
+  echo 'macos_windowserver_launch_unavailable: classified-no-interactive-aqua-session'
+  echo "macos-gui-session: unavailable (console-user=${console_user:-none}, current-user=$current_user); running bounded direct Mach-O probe"
+  python3 "$repo_root/packaging/macos/probe_macho_launch.py" \
+    --binary "$binary" \
+    --log "$work_dir/direct-macho-launch.log"
+  echo 'macos-gui-runtime-verification: limited-no-aqua-direct-macho'
+fi
 echo 'macos-package-verification: ok'
