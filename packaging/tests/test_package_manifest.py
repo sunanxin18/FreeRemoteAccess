@@ -28,8 +28,15 @@ class PackageManifestTests(unittest.TestCase):
 
     def test_msi_product_version_is_numeric_bounded_and_derived_from_semver(self):
         self.assertEqual(package_manifest.msi_product_version("1.2.3"), "1.2.3")
-        self.assertEqual(package_manifest.msi_product_version("1.2.3-beta.1"), "1.2.3")
-        for invalid in ("1.2", "256.0.0", "1.256.0", "1.2.65536", "v1.2.3"):
+        for invalid in (
+            "1.2",
+            "1.2.3-beta.1",
+            "1.2.3+build.1",
+            "256.0.0",
+            "1.256.0",
+            "1.2.65536",
+            "v1.2.3",
+        ):
             with self.subTest(invalid=invalid):
                 with self.assertRaisesRegex(ValueError, "msi_product_version_invalid"):
                     package_manifest.msi_product_version(invalid)
@@ -107,8 +114,17 @@ class PackageManifestTests(unittest.TestCase):
             support = package_manifest.prepare_fdk_bundle(
                 REPO_ROOT, dist / "THIRD_PARTY", self.identity
             )
+            appdir = dist / "AppDir"
+            (appdir / "usr" / "bin").mkdir(parents=True)
+            (appdir / "usr" / "bin" / "freeremoteaccess").write_bytes(b"elf")
             manifest_path = package_manifest.write_manifest(
-                REPO_ROOT, dist, "linux", "x86_64", artifacts, support
+                REPO_ROOT,
+                dist,
+                "linux",
+                "x86_64",
+                artifacts,
+                support,
+                directories=[("appdir", appdir)],
             )
 
             original_size = artifacts[0][1].stat().st_size
@@ -119,6 +135,63 @@ class PackageManifestTests(unittest.TestCase):
             artifacts[0][1].unlink()
             with self.assertRaisesRegex(ValueError, "artifact_missing"):
                 package_manifest.verify_manifest(REPO_ROOT, manifest_path)
+
+    def test_linux_manifest_records_and_verifies_retained_appdir_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dist = Path(temporary)
+            prefix = f"FreeRemoteAccess-{self.identity.version}-linux-x86_64"
+            artifacts = []
+            for kind, suffix in (
+                ("appdir-archive", "-AppDir.tar.zst"),
+                ("deb", ".deb"),
+                ("appimage", ".AppImage"),
+            ):
+                path = dist / f"{prefix}{suffix}"
+                path.write_bytes(kind.encode("ascii"))
+                artifacts.append((kind, path))
+            appdir = dist / "AppDir"
+            binary = appdir / "usr" / "bin" / "freeremoteaccess"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"elf")
+            support = package_manifest.prepare_fdk_bundle(
+                REPO_ROOT, dist / "THIRD_PARTY", self.identity
+            )
+            manifest_path = package_manifest.write_manifest(
+                REPO_ROOT,
+                dist,
+                "linux",
+                "x86_64",
+                artifacts,
+                support,
+                directories=[("appdir", appdir)],
+            )
+            package_manifest.verify_manifest(REPO_ROOT, manifest_path)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["directories"][0]["kind"], "appdir")
+            self.assertRegex(manifest["directories"][0]["tree_sha256"], r"^[0-9a-f]{64}$")
+
+            binary.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "artifact_directory_tree_mismatch"):
+                package_manifest.verify_manifest(REPO_ROOT, manifest_path)
+
+    def test_appdir_symlink_targets_cannot_escape_and_apprun_is_exact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "AppDir"
+            root.mkdir()
+            link = root / "AppRun"
+            package_manifest.validate_symlink_target(
+                root, link, "usr/bin/freeremoteaccess", require_apprun=True
+            )
+            for target in ("../../outside", str((root.parent / "outside").resolve())):
+                with self.subTest(target=target):
+                    with self.assertRaisesRegex(ValueError, "artifact_symlink_target_invalid"):
+                        package_manifest.validate_symlink_target(
+                            root, link, target, require_apprun=True
+                        )
+            with self.assertRaisesRegex(ValueError, "artifact_apprun_target_invalid"):
+                package_manifest.validate_symlink_target(
+                    root, link, "usr/bin/other", require_apprun=True
+                )
 
     def test_manifest_rejects_unlisted_distributable_and_missing_sidecar(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -143,6 +216,20 @@ class PackageManifestTests(unittest.TestCase):
 
             (dist / "FreeRemoteAccess-9.9.9-macos-universal.dmg").write_bytes(b"stale")
             with self.assertRaisesRegex(ValueError, "artifact_unlisted_file"):
+                package_manifest.verify_manifest(REPO_ROOT, manifest_path)
+
+            rogue = dist / "FreeRemoteAccess-9.9.9-macos-universal.dmg"
+            package_manifest.write_sha256_sidecar(rogue)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"].append(
+                {
+                    "path": rogue.name,
+                    "size": rogue.stat().st_size,
+                    "sha256": package_manifest.sha256_file(rogue),
+                }
+            )
+            self._rewrite_manifest(manifest_path, manifest)
+            with self.assertRaisesRegex(ValueError, "artifact_manifest_file_coverage_invalid"):
                 package_manifest.verify_manifest(REPO_ROOT, manifest_path)
 
     def test_manifest_rejects_unknown_schema_fields_duplicate_paths_and_escape(self):

@@ -9,10 +9,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple, Sequence
 
 
@@ -28,6 +29,7 @@ MANIFEST_FIELDS = {
     "release_status",
     "fdk_aac",
     "artifacts",
+    "directories",
     "files",
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -44,6 +46,7 @@ OPTIONAL_ARTIFACTS = {
     "macos": {"pkg"},
     "linux": {"rpm"},
 }
+REQUIRED_DIRECTORIES = {"windows": set(), "macos": set(), "linux": {"appdir"}}
 ARTIFACT_SUFFIXES = {
     "windows": {
         "gui-exe": ".exe",
@@ -154,10 +157,9 @@ def sha256_file(path: Path) -> str:
 
 
 def msi_product_version(version: str) -> str:
-    if not SEMVER_RE.fullmatch(version):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise _fail("msi_product_version_invalid")
-    core = re.split(r"[-+]", version, maxsplit=1)[0]
-    parts = core.split(".")
+    parts = version.split(".")
     if len(parts) != 3:
         raise _fail("msi_product_version_invalid")
     numbers = tuple(int(part) for part in parts)
@@ -261,12 +263,77 @@ def _relative_file_entry(dist: Path, path: Path) -> dict:
         relative = path.resolve().relative_to(dist.resolve())
     except ValueError as error:
         raise _fail("manifest_file_outside_dist") from error
-    if not path.is_file():
+    if path.is_symlink() or not path.exists() or not stat.S_ISREG(path.lstat().st_mode):
         raise _fail("artifact_missing")
     size = path.stat().st_size
     if size <= 0:
         raise _fail("artifact_empty")
     return {"path": relative.as_posix(), "size": size, "sha256": sha256_file(path)}
+
+
+def validate_symlink_target(
+    root: Path, link: Path, target: str, *, require_apprun: bool = False
+) -> None:
+    posix_target = PurePosixPath(target)
+    if (
+        not target
+        or posix_target.is_absolute()
+        or Path(target).is_absolute()
+        or ".." in posix_target.parts
+        or "\\" in target
+    ):
+        raise _fail("artifact_symlink_target_invalid")
+    try:
+        (link.parent / Path(*posix_target.parts)).resolve().relative_to(root.resolve())
+    except ValueError as error:
+        raise _fail("artifact_symlink_target_invalid") from error
+    if require_apprun and target != "usr/bin/freeremoteaccess":
+        raise _fail("artifact_apprun_target_invalid")
+
+
+def _directory_entries(root: Path) -> list[dict]:
+    if not root.is_dir():
+        raise _fail("artifact_directory_missing")
+    entries = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        stat = path.lstat()
+        mode = stat.st_mode & 0o7777
+        if path.is_symlink():
+            target = os.readlink(path)
+            validate_symlink_target(
+                root,
+                path,
+                target,
+                require_apprun=root.name == "AppDir" and relative == "AppRun",
+            )
+            entries.append(
+                {"path": relative, "type": "symlink", "mode": mode, "target": target}
+            )
+        elif path.is_dir():
+            entries.append({"path": relative, "type": "directory", "mode": mode})
+        elif path.is_file():
+            if stat.st_size <= 0:
+                raise _fail("artifact_directory_empty_file")
+            entries.append(
+                {
+                    "path": relative,
+                    "type": "file",
+                    "mode": mode,
+                    "size": stat.st_size,
+                    "sha256": sha256_file(path),
+                }
+            )
+        else:
+            raise _fail("artifact_directory_special_file")
+    if not entries:
+        raise _fail("artifact_directory_empty")
+    return entries
+
+
+def _tree_sha256(entries: list[dict]) -> str:
+    canonical = json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def write_sha256_sidecar(path: Path) -> Path:
@@ -284,16 +351,37 @@ def write_manifest(
     arch: str,
     artifacts: Sequence[tuple[str, Path]],
     support: FdkBundle,
+    directories: Sequence[tuple[str, Path]] = (),
 ) -> Path:
     identity = resolve_locked_identity(repo_root)
     dist = dist.resolve()
     _validate_artifacts(identity, platform, arch, artifacts)
+    directory_kinds = [kind for kind, _ in directories]
+    if len(directory_kinds) != len(set(directory_kinds)):
+        raise _fail("artifact_directory_kind_duplicate")
+    if set(directory_kinds) != REQUIRED_DIRECTORIES[platform]:
+        raise _fail("artifact_required_directory_missing")
     files = [_relative_file_entry(dist, path) for _, path in artifacts]
     files.extend(
         [_relative_file_entry(dist, support.notice), _relative_file_entry(dist, support.source_archive)]
     )
     for entry in files:
         write_sha256_sidecar(dist / entry["path"])
+    directory_rows = []
+    for kind, root in directories:
+        try:
+            relative = root.resolve().relative_to(dist)
+        except ValueError as error:
+            raise _fail("manifest_file_outside_dist") from error
+        entries = _directory_entries(root)
+        directory_rows.append(
+            {
+                "kind": kind,
+                "path": relative.as_posix(),
+                "tree_sha256": _tree_sha256(entries),
+                "entries": entries,
+            }
+        )
     manifest = {
         "schema": SCHEMA,
         "product": PRODUCT,
@@ -316,6 +404,7 @@ def write_manifest(
             }
             for kind, path in artifacts
         ],
+        "directories": directory_rows,
         "files": sorted(files, key=lambda entry: entry["path"]),
     }
     manifest_path = dist / "artifact-manifest.json"
@@ -335,7 +424,7 @@ def _read_manifest(path: Path) -> dict:
 
 def _verify_sidecar(path: Path) -> None:
     sidecar = Path(f"{path}.sha256")
-    if not sidecar.is_file():
+    if sidecar.is_symlink() or not sidecar.exists() or not stat.S_ISREG(sidecar.lstat().st_mode):
         raise _fail("artifact_sidecar_missing")
     expected = f"{sha256_file(path)}  {path.name}\n"
     if sidecar.read_text(encoding="utf-8") != expected:
@@ -378,6 +467,36 @@ def verify_manifest(repo_root: Path, manifest_path: Path) -> None:
         artifacts.append((row.get("kind"), dist / relative))
     _validate_artifacts(identity, platform, arch, artifacts)
 
+    directory_rows = manifest.get("directories")
+    if not isinstance(directory_rows, list):
+        raise _fail("artifact_manifest_directories_invalid")
+    directory_kinds = []
+    directory_known_files = set()
+    for row in directory_rows:
+        if not isinstance(row, dict) or set(row) != {"kind", "path", "tree_sha256", "entries"}:
+            raise _fail("artifact_manifest_directories_invalid")
+        kind = row.get("kind")
+        path_text = row.get("path")
+        if not isinstance(kind, str) or not isinstance(path_text, str):
+            raise _fail("artifact_manifest_directories_invalid")
+        relative = Path(path_text)
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise _fail("artifact_manifest_path_invalid")
+        directory_kinds.append(kind)
+        root = dist / relative
+        actual_entries = _directory_entries(root)
+        if actual_entries != row.get("entries") or _tree_sha256(actual_entries) != row.get(
+            "tree_sha256"
+        ):
+            raise _fail("artifact_directory_tree_mismatch")
+        for entry in actual_entries:
+            if entry["type"] in {"file", "symlink"}:
+                directory_known_files.add(Path(os.path.abspath(root / entry["path"])))
+    if len(directory_kinds) != len(set(directory_kinds)):
+        raise _fail("artifact_directory_kind_duplicate")
+    if set(directory_kinds) != REQUIRED_DIRECTORIES[platform]:
+        raise _fail("artifact_required_directory_missing")
+
     fdk = manifest.get("fdk_aac", {})
     if not isinstance(fdk, dict) or set(fdk) != {
         "package",
@@ -413,7 +532,11 @@ def verify_manifest(repo_root: Path, manifest_path: Path) -> None:
             raise _fail("artifact_manifest_path_invalid")
         seen.add(path_text)
         path = dist / path_text
-        if not path.is_file():
+        try:
+            path.resolve().relative_to(dist.resolve())
+        except ValueError as error:
+            raise _fail("artifact_manifest_path_invalid") from error
+        if path.is_symlink() or not path.exists() or not stat.S_ISREG(path.lstat().st_mode):
             raise _fail("artifact_missing")
         if path.stat().st_size != entry.get("size"):
             raise _fail("artifact_size_mismatch")
@@ -425,8 +548,8 @@ def verify_manifest(repo_root: Path, manifest_path: Path) -> None:
         fdk.get("notice_path"),
         fdk.get("source_archive_path"),
     }
-    if not required_file_paths.issubset(seen):
-        raise _fail("artifact_manifest_file_coverage_missing")
+    if required_file_paths != seen:
+        raise _fail("artifact_manifest_file_coverage_invalid")
     source_path = dist / fdk["source_archive_path"]
     if sha256_file(source_path) != identity.fdk_checksum:
         raise _fail("fdk_source_archive_hash_mismatch")
@@ -435,13 +558,22 @@ def verify_manifest(repo_root: Path, manifest_path: Path) -> None:
     if delivered_notice != archived_notice:
         raise _fail("fdk_notice_copy_mismatch")
     _verify_sidecar(manifest_path)
-    known_files = {manifest_path.resolve(), Path(f"{manifest_path}.sha256").resolve()}
+    known_files = {
+        Path(os.path.abspath(manifest_path)),
+        Path(os.path.abspath(Path(f"{manifest_path}.sha256"))),
+        *directory_known_files,
+    }
     for path_text in seen:
-        path = (dist / path_text).resolve()
+        path = Path(os.path.abspath(dist / path_text))
         known_files.add(path)
-        known_files.add(Path(f"{path}.sha256").resolve())
+        known_files.add(Path(os.path.abspath(Path(f"{path}.sha256"))))
     for path in dist.rglob("*"):
-        if path.is_file() and path.resolve() not in known_files:
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            raise _fail("artifact_special_file")
+        if Path(os.path.abspath(path)) not in known_files:
             raise _fail("artifact_unlisted_file")
 
 
@@ -463,6 +595,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     write.add_argument("--arch", required=True)
     write.add_argument("--support-root", required=True)
     write.add_argument("--artifact", action="append", default=[], required=True)
+    write.add_argument("--directory", action="append", default=[])
     verify = commands.add_parser("verify")
     verify.add_argument("--manifest", required=True)
     args = parser.parse_args(argv)
@@ -482,6 +615,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise _fail("artifact_argument_invalid")
             kind, path = value.split("=", 1)
             artifacts.append((kind, Path(path)))
+        directories = []
+        for value in args.directory:
+            if "=" not in value:
+                raise _fail("directory_argument_invalid")
+            kind, path = value.split("=", 1)
+            directories.append((kind, Path(path)))
         support_root = Path(args.support_root)
         bundle = FdkBundle(
             support_root / f"{identity.fdk_name}-{identity.fdk_version}" / "aac" / "NOTICE",
@@ -490,7 +629,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             / "source"
             / f"{identity.fdk_name}-{identity.fdk_version}.crate",
         )
-        print(write_manifest(repo, Path(args.dist), args.platform, args.arch, artifacts, bundle))
+        print(
+            write_manifest(
+                repo,
+                Path(args.dist),
+                args.platform,
+                args.arch,
+                artifacts,
+                bundle,
+                directories,
+            )
+        )
     elif args.command == "verify":
         verify_manifest(repo, Path(args.manifest))
         print("artifact-manifest: ok")
