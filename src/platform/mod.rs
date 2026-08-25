@@ -72,7 +72,10 @@ pub struct AudioOutputSink {
 }
 
 impl AudioOutputSink {
-    pub const MAX_INTERLEAVED_I16_SAMPLES_PER_ENQUEUE: usize = 131_072;
+    // Exactly 500 ms of normalized 48 kHz stereo PCM. The platform backend
+    // accepts a chunk transactionally only when this entire sample count fits
+    // in its one shared playback buffer.
+    pub const MAX_INTERLEAVED_I16_SAMPLES_PER_ENQUEUE: usize = 48_000;
 
     pub fn new(spec: AudioOutputSpec, backend: Box<dyn AudioOutputBackend>) -> Self {
         Self { spec, backend }

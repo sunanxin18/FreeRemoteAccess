@@ -2947,6 +2947,7 @@ mod tests {
         enqueues: AtomicUsize,
         open_failures_remaining: AtomicUsize,
         enqueue_failures_remaining: AtomicUsize,
+        queue_full_failures_remaining: AtomicUsize,
     }
 
     struct TestAudioOutputBackend {
@@ -2956,6 +2957,18 @@ mod tests {
     impl AudioOutputBackend for TestAudioOutputBackend {
         fn enqueue_interleaved_i16(&mut self, _samples: &[i16]) -> Result<(), PlatformError> {
             self.state.enqueues.fetch_add(1, AtomicOrdering::SeqCst);
+            if self
+                .state
+                .queue_full_failures_remaining
+                .fetch_update(
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(PlatformError::new("audio_output_queue_full"));
+            }
             if self
                 .state
                 .enqueue_failures_remaining
@@ -3124,6 +3137,36 @@ mod tests {
         );
         assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(output.enqueues.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn audio_queue_full_degrades_only_the_current_generation() {
+        let (mut state, output) = viewer_with_test_audio_output();
+        output
+            .queue_full_failures_remaining
+            .store(1, AtomicOrdering::SeqCst);
+
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![1, -1])),
+            MediaAcceptOutcome::AudioDegraded
+        );
+        assert!(matches!(
+            state.audio_output_phase(),
+            AudioOutputPhase::Degraded { reason }
+                if reason.contains("audio_output_queue_full")
+        ));
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![2, -2])),
+            MediaAcceptOutcome::Discarded
+        );
+        assert_video_and_control_remain_serviceable(&mut state, Instant::now());
+
+        state.reset_generation().unwrap();
+        assert_eq!(
+            state.accept_audio_outcome(decoded_audio(vec![3, -3])),
+            MediaAcceptOutcome::Applied
+        );
+        assert_eq!(output.opens.load(AtomicOrdering::SeqCst), 2);
     }
 
     #[test]

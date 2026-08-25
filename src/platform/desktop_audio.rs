@@ -14,14 +14,14 @@ use std::collections::VecDeque;
 #[cfg(feature = "media")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "media")]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 #[cfg(feature = "media")]
 use std::thread;
 #[cfg(feature = "media")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "media")]
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Sender};
 
 #[cfg(feature = "media")]
 const PLAYBACK_QUEUE_CAPACITY_MILLISECONDS: usize = 500;
@@ -33,11 +33,6 @@ const PLAYBACK_QUEUE_CAPACITY_FRAMES: usize = AudioOutputSpec::NORMALIZED_SAMPLE
     / MILLISECONDS_PER_SECOND;
 #[cfg(feature = "media")]
 const AUDIO_OUTPUT_STARTUP_TIMEOUT: Duration = Duration::from_millis(350);
-#[cfg(feature = "media")]
-const AUDIO_OUTPUT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
-#[cfg(feature = "media")]
-const AUDIO_OUTPUT_PCM_QUEUE_CAPACITY_CHUNKS: usize = 4;
-
 #[cfg(feature = "media")]
 static AUDIO_WORKER_SLOT: OnceLock<Arc<AudioWorkerSlot>> = OnceLock::new();
 
@@ -68,13 +63,20 @@ struct PcmPlaybackBuffer {
 
 #[cfg(feature = "media")]
 impl PcmPlaybackBuffer {
-    fn enqueue_interleaved_stereo(&mut self, pcm: &[i16]) {
+    fn try_enqueue_interleaved_stereo(&mut self, pcm: &[i16]) -> Result<(), PlatformError> {
+        let incoming_frames = pcm.len() / usize::from(AudioOutputSpec::NORMALIZED_CHANNELS);
+        let queued_after = self
+            .frames
+            .len()
+            .checked_add(incoming_frames)
+            .ok_or_else(|| PlatformError::new("audio_output_queue_capacity_overflow"))?;
+        if queued_after > PLAYBACK_QUEUE_CAPACITY_FRAMES {
+            return Err(PlatformError::new("audio_output_queue_full"));
+        }
         for frame in pcm.chunks_exact(2) {
-            if self.frames.len() == PLAYBACK_QUEUE_CAPACITY_FRAMES {
-                self.frames.pop_front();
-            }
             self.frames.push_back([frame[0], frame[1]]);
         }
+        Ok(())
     }
 
     fn render<T>(&mut self, output: &mut [T], channels: usize)
@@ -102,22 +104,125 @@ impl PcmPlaybackBuffer {
 }
 
 #[cfg(feature = "media")]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioWorkerSlotState {
+    Available,
+    Opening,
+    Active,
+    Closing,
+    Stuck,
+}
+
+#[cfg(feature = "media")]
 struct AudioWorkerSlot {
-    occupied: AtomicBool,
+    state: Mutex<AudioWorkerSlotState>,
+    state_changed: Condvar,
     #[cfg(test)]
     spawned_workers: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "media")]
+impl Default for AudioWorkerSlot {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(AudioWorkerSlotState::Available),
+            state_changed: Condvar::new(),
+            #[cfg(test)]
+            spawned_workers: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "media")]
 impl AudioWorkerSlot {
-    fn try_acquire(self: &Arc<Self>) -> Result<AudioWorkerLease, PlatformError> {
-        self.occupied
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| PlatformError::new("audio_output_worker_busy"))?;
-        Ok(AudioWorkerLease {
-            slot: Arc::clone(self),
-        })
+    fn acquire_until(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<AudioWorkerLease, PlatformError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PlatformError::new("audio_output_worker_state_unavailable"))?;
+        loop {
+            match *state {
+                AudioWorkerSlotState::Available => {
+                    *state = AudioWorkerSlotState::Opening;
+                    return Ok(AudioWorkerLease {
+                        slot: Arc::clone(self),
+                    });
+                }
+                AudioWorkerSlotState::Closing => {
+                    let now = Instant::now();
+                    let Some(remaining) = deadline.checked_duration_since(now) else {
+                        return Err(PlatformError::new("audio_output_worker_busy"));
+                    };
+                    if remaining.is_zero() {
+                        return Err(PlatformError::new("audio_output_worker_busy"));
+                    }
+                    let (next_state, wait) = self
+                        .state_changed
+                        .wait_timeout(state, remaining)
+                        .map_err(|_| PlatformError::new("audio_output_worker_state_unavailable"))?;
+                    state = next_state;
+                    if wait.timed_out() && *state == AudioWorkerSlotState::Closing {
+                        return Err(PlatformError::new("audio_output_worker_busy"));
+                    }
+                }
+                AudioWorkerSlotState::Opening
+                | AudioWorkerSlotState::Active
+                | AudioWorkerSlotState::Stuck => {
+                    return Err(PlatformError::new("audio_output_worker_busy"));
+                }
+            }
+        }
+    }
+
+    fn activate_if_opening(&self, closed: &AtomicBool) -> Result<bool, PlatformError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PlatformError::new("audio_output_worker_state_unavailable"))?;
+        if *state == AudioWorkerSlotState::Opening && !closed.load(Ordering::Acquire) {
+            *state = AudioWorkerSlotState::Active;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn mark_stuck(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if matches!(
+                *state,
+                AudioWorkerSlotState::Opening | AudioWorkerSlotState::Active
+            ) {
+                *state = AudioWorkerSlotState::Stuck;
+                self.state_changed.notify_all();
+            }
+        }
+    }
+
+    fn mark_closing(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if matches!(
+                *state,
+                AudioWorkerSlotState::Opening | AudioWorkerSlotState::Active
+            ) {
+                *state = AudioWorkerSlotState::Closing;
+                self.state_changed.notify_all();
+            }
+        }
+    }
+
+    fn wait_until_not_active(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while *state == AudioWorkerSlotState::Active {
+            let Ok(next_state) = self.state_changed.wait(state) else {
+                return;
+            };
+            state = next_state;
+        }
     }
 
     #[cfg(test)]
@@ -134,7 +239,10 @@ struct AudioWorkerLease {
 #[cfg(feature = "media")]
 impl Drop for AudioWorkerLease {
     fn drop(&mut self) {
-        self.slot.occupied.store(false, Ordering::Release);
+        if let Ok(mut state) = self.slot.state.lock() {
+            *state = AudioWorkerSlotState::Available;
+            self.slot.state_changed.notify_all();
+        }
     }
 }
 
@@ -260,24 +368,27 @@ impl AudioDeviceOpener for CpalDeviceOpener {
 
 #[cfg(feature = "media")]
 struct WorkerAudioOutput {
-    pcm_sender: Sender<Vec<i16>>,
+    buffer: Arc<Mutex<PcmPlaybackBuffer>>,
     failure: Arc<AudioOutputFailure>,
     closed: Arc<AtomicBool>,
+    slot: Arc<AudioWorkerSlot>,
     device_description: String,
 }
 
 #[cfg(feature = "media")]
 impl WorkerAudioOutput {
     fn new(
-        pcm_sender: Sender<Vec<i16>>,
+        buffer: Arc<Mutex<PcmPlaybackBuffer>>,
         failure: Arc<AudioOutputFailure>,
         closed: Arc<AtomicBool>,
+        slot: Arc<AudioWorkerSlot>,
         device_description: String,
     ) -> Self {
         Self {
-            pcm_sender,
+            buffer,
             failure,
             closed,
+            slot,
             device_description,
         }
     }
@@ -287,14 +398,11 @@ impl WorkerAudioOutput {
 impl AudioOutputBackend for WorkerAudioOutput {
     fn enqueue_interleaved_i16(&mut self, samples: &[i16]) -> Result<(), PlatformError> {
         self.failure.check()?;
-        match self.pcm_sender.try_send(samples.to_vec()) {
-            Ok(()) => self.failure.check(),
-            Err(TrySendError::Full(_)) => Err(PlatformError::new("audio_output_queue_full")),
-            Err(TrySendError::Disconnected(_)) => {
-                self.failure.check()?;
-                Err(PlatformError::new("audio_output_worker_unavailable"))
-            }
-        }
+        self.buffer
+            .lock()
+            .map_err(|_| PlatformError::new("audio_output_queue_unavailable"))?
+            .try_enqueue_interleaved_stereo(samples)?;
+        self.failure.check()
     }
 
     fn device_description(&self) -> &str {
@@ -305,16 +413,9 @@ impl AudioOutputBackend for WorkerAudioOutput {
 #[cfg(feature = "media")]
 impl Drop for WorkerAudioOutput {
     fn drop(&mut self) {
+        self.slot.mark_closing();
         self.closed.store(true, Ordering::Release);
     }
-}
-
-#[cfg(feature = "media")]
-fn checked_audio_queue_capacity_bytes() -> Result<usize, PlatformError> {
-    AudioOutputSink::MAX_INTERLEAVED_I16_SAMPLES_PER_ENQUEUE
-        .checked_mul(std::mem::size_of::<i16>())
-        .and_then(|bytes| bytes.checked_mul(AUDIO_OUTPUT_PCM_QUEUE_CAPACITY_CHUNKS))
-        .ok_or_else(|| PlatformError::new("audio_output_queue_capacity_overflow"))
 }
 
 #[cfg(feature = "media")]
@@ -324,17 +425,21 @@ fn open_audio_output_with_worker(
     opener: Arc<dyn AudioDeviceOpener>,
     startup_timeout: Duration,
 ) -> Result<AudioOutputSink, PlatformError> {
-    let _queue_capacity_bytes = checked_audio_queue_capacity_bytes()?;
     if startup_timeout.is_zero() {
         return Err(PlatformError::new("audio_output_open_timeout"));
     }
-    let lease = slot.try_acquire()?;
-    let (pcm_sender, pcm_receiver) = bounded(AUDIO_OUTPUT_PCM_QUEUE_CAPACITY_CHUNKS);
+    let deadline = Instant::now()
+        .checked_add(startup_timeout)
+        .ok_or_else(|| PlatformError::new("audio_output_open_timeout"))?;
+    let lease = slot.acquire_until(deadline)?;
     let (startup_sender, startup_receiver) = bounded(1);
+    let buffer = Arc::new(Mutex::new(PcmPlaybackBuffer::default()));
     let failure = Arc::new(AudioOutputFailure::default());
     let closed = Arc::new(AtomicBool::new(false));
+    let worker_buffer = Arc::clone(&buffer);
     let worker_failure = Arc::clone(&failure);
     let worker_closed = Arc::clone(&closed);
+    let worker_slot = Arc::clone(&slot);
     let worker = thread::Builder::new()
         .name("frd-audio-output".to_owned())
         .spawn(move || {
@@ -342,10 +447,11 @@ fn open_audio_output_with_worker(
                 spec,
                 opener,
                 lease,
-                pcm_receiver,
                 startup_sender,
+                worker_buffer,
                 worker_failure,
                 worker_closed,
+                worker_slot,
             );
         })
         .map_err(|_| PlatformError::new("audio_output_worker_spawn_failed"))?;
@@ -353,19 +459,26 @@ fn open_audio_output_with_worker(
     #[cfg(test)]
     slot.spawned_workers.fetch_add(1, Ordering::AcqRel);
 
-    match startup_receiver.recv_timeout(startup_timeout) {
+    let Some(startup_remaining) = deadline.checked_duration_since(Instant::now()) else {
+        closed.store(true, Ordering::Release);
+        slot.mark_stuck();
+        return Err(PlatformError::new("audio_output_open_timeout"));
+    };
+    match startup_receiver.recv_timeout(startup_remaining) {
         Ok(Ok(device_description)) => Ok(AudioOutputSink::new(
             spec,
             Box::new(WorkerAudioOutput::new(
-                pcm_sender,
+                buffer,
                 failure,
                 closed,
+                slot,
                 device_description,
             )),
         )),
         Ok(Err(error)) => Err(error),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
             closed.store(true, Ordering::Release);
+            slot.mark_stuck();
             Err(PlatformError::new("audio_output_open_timeout"))
         }
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -379,37 +492,31 @@ fn run_audio_worker(
     spec: AudioOutputSpec,
     opener: Arc<dyn AudioDeviceOpener>,
     _lease: AudioWorkerLease,
-    pcm_receiver: Receiver<Vec<i16>>,
     startup_sender: Sender<Result<String, PlatformError>>,
+    buffer: Arc<Mutex<PcmPlaybackBuffer>>,
     failure: Arc<AudioOutputFailure>,
     closed: Arc<AtomicBool>,
+    slot: Arc<AudioWorkerSlot>,
 ) {
-    let buffer = Arc::new(Mutex::new(PcmPlaybackBuffer::default()));
     let opened = match opener.open(spec, Arc::clone(&buffer), Arc::clone(&failure)) {
         Ok(opened) => opened,
         Err(error) => {
+            slot.mark_closing();
             let _ = startup_sender.try_send(Err(error));
             return;
         }
     };
-    if closed.load(Ordering::Acquire) {
+    let activated = slot.activate_if_opening(&closed).unwrap_or(false);
+    if !activated {
         return;
     }
     let description = opened.device_description().to_owned();
     if startup_sender.try_send(Ok(description)).is_err() {
+        slot.mark_closing();
         return;
     }
 
-    while !closed.load(Ordering::Acquire) && failure.check().is_ok() {
-        match pcm_receiver.recv_timeout(AUDIO_OUTPUT_WORKER_POLL_INTERVAL) {
-            Ok(pcm) => match buffer.lock() {
-                Ok(mut buffer) => buffer.enqueue_interleaved_stereo(&pcm),
-                Err(_) => failure.mark_stream_failed(),
-            },
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    slot.wait_until_not_active();
     drop(opened);
 }
 
@@ -475,21 +582,22 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use crossbeam_channel::{bounded, Sender};
+    use crossbeam_channel::{bounded, unbounded, Sender};
 
     use super::{
         open_audio_output_with_worker, AudioDeviceOpener, AudioOutputFailure, AudioWorkerSlot,
-        OpenedAudioDevice, PcmPlaybackBuffer, WorkerAudioOutput,
-        AUDIO_OUTPUT_PCM_QUEUE_CAPACITY_CHUNKS, PLAYBACK_QUEUE_CAPACITY_FRAMES,
+        OpenedAudioDevice, PcmPlaybackBuffer, PLAYBACK_QUEUE_CAPACITY_FRAMES,
     };
-    use crate::platform::{AudioOutputBackend, AudioOutputSink, AudioOutputSpec, PlatformError};
+    use crate::platform::{AudioOutputSink, AudioOutputSpec, PlatformError};
 
     struct PermanentlyBlockingOpener {
         opens: Arc<AtomicUsize>,
         entered: Sender<()>,
     }
 
-    struct FakeOpenedAudioDevice;
+    struct FakeOpenedAudioDevice {
+        drop_delay: Duration,
+    }
 
     impl OpenedAudioDevice for FakeOpenedAudioDevice {
         fn device_description(&self) -> &str {
@@ -497,19 +605,58 @@ mod tests {
         }
     }
 
+    impl Drop for FakeOpenedAudioDevice {
+        fn drop(&mut self) {
+            if !self.drop_delay.is_zero() {
+                thread::sleep(self.drop_delay);
+            }
+        }
+    }
+
     struct ReadyOpener {
-        failure_sender: Sender<Arc<AudioOutputFailure>>,
+        ready_sender: Sender<(
+            Arc<AudioOutputFailure>,
+            Arc<std::sync::Mutex<PcmPlaybackBuffer>>,
+        )>,
+        drop_delay: Duration,
     }
 
     impl AudioDeviceOpener for ReadyOpener {
         fn open(
             &self,
             _spec: AudioOutputSpec,
-            _buffer: Arc<std::sync::Mutex<PcmPlaybackBuffer>>,
+            buffer: Arc<std::sync::Mutex<PcmPlaybackBuffer>>,
             failure: Arc<AudioOutputFailure>,
         ) -> Result<Box<dyn OpenedAudioDevice>, PlatformError> {
-            self.failure_sender.try_send(failure).unwrap();
-            Ok(Box::new(FakeOpenedAudioDevice))
+            self.ready_sender.try_send((failure, buffer)).unwrap();
+            Ok(Box::new(FakeOpenedAudioDevice {
+                drop_delay: self.drop_delay,
+            }))
+        }
+    }
+
+    struct SequencedOpener {
+        opens: AtomicUsize,
+    }
+
+    impl AudioDeviceOpener for SequencedOpener {
+        fn open(
+            &self,
+            _spec: AudioOutputSpec,
+            _buffer: Arc<std::sync::Mutex<PcmPlaybackBuffer>>,
+            _failure: Arc<AudioOutputFailure>,
+        ) -> Result<Box<dyn OpenedAudioDevice>, PlatformError> {
+            let open = self.opens.fetch_add(1, Ordering::SeqCst);
+            if open == 1 {
+                thread::sleep(Duration::from_millis(90));
+            }
+            Ok(Box::new(FakeOpenedAudioDevice {
+                drop_delay: if open == 0 {
+                    Duration::from_millis(90)
+                } else {
+                    Duration::ZERO
+                },
+            }))
         }
     }
 
@@ -528,26 +675,12 @@ mod tests {
         }
     }
 
-    fn worker_output_for_test() -> (
-        WorkerAudioOutput,
-        crossbeam_channel::Receiver<Vec<i16>>,
-        Arc<AudioOutputFailure>,
-    ) {
-        let (sender, receiver) = bounded(AUDIO_OUTPUT_PCM_QUEUE_CAPACITY_CHUNKS);
-        let failure = Arc::new(AudioOutputFailure::default());
-        let output = WorkerAudioOutput::new(
-            sender,
-            Arc::clone(&failure),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            "测试worker输出".to_owned(),
-        );
-        (output, receiver, failure)
-    }
-
     #[test]
     fn playback_buffer_preserves_interleaved_stereo_order() {
         let mut buffer = PcmPlaybackBuffer::default();
-        buffer.enqueue_interleaved_stereo(&[i16::MIN, i16::MAX, 0, 16_384]);
+        buffer
+            .try_enqueue_interleaved_stereo(&[i16::MIN, i16::MAX, 0, 16_384])
+            .unwrap();
         let mut output = [0.0f32; 4];
 
         buffer.render(&mut output, 2);
@@ -559,29 +692,39 @@ mod tests {
     }
 
     #[test]
-    fn playback_buffer_drops_the_oldest_whole_frame_at_the_latency_bound() {
+    fn playback_buffer_rejects_a_whole_chunk_instead_of_evicting_old_frames() {
         let mut buffer = PcmPlaybackBuffer::default();
-        let mut pcm = vec![0; PLAYBACK_QUEUE_CAPACITY_FRAMES * 2];
-        pcm.extend_from_slice(&[i16::MAX, i16::MIN]);
+        let pcm = vec![0; PLAYBACK_QUEUE_CAPACITY_FRAMES * 2];
 
-        buffer.enqueue_interleaved_stereo(&pcm);
+        buffer.try_enqueue_interleaved_stereo(&pcm).unwrap();
+        assert_eq!(
+            buffer
+                .try_enqueue_interleaved_stereo(&[i16::MAX, i16::MIN])
+                .unwrap_err()
+                .code(),
+            "audio_output_queue_full"
+        );
 
         assert_eq!(buffer.frames.len(), PLAYBACK_QUEUE_CAPACITY_FRAMES);
-        assert_eq!(buffer.frames.back(), Some(&[i16::MAX, i16::MIN]));
+        assert_eq!(buffer.frames.front(), Some(&[0, 0]));
+        assert_eq!(buffer.frames.back(), Some(&[0, 0]));
     }
 
     #[test]
     fn stream_callback_failure_is_returned_by_the_next_enqueue() {
         let slot = Arc::new(AudioWorkerSlot::default());
-        let (failure_sender, failure_receiver) = bounded(1);
+        let (ready_sender, ready_receiver) = bounded(1);
         let mut output = open_audio_output_with_worker(
             AudioOutputSpec::normalized(),
             slot,
-            Arc::new(ReadyOpener { failure_sender }),
+            Arc::new(ReadyOpener {
+                ready_sender,
+                drop_delay: Duration::ZERO,
+            }),
             Duration::from_millis(100),
         )
         .unwrap();
-        let failure = failure_receiver.recv().unwrap();
+        let (failure, _) = ready_receiver.recv().unwrap();
         failure.mark_stream_failed();
 
         assert_eq!(
@@ -591,24 +734,93 @@ mod tests {
     }
 
     #[test]
-    fn pcm_worker_queue_has_a_checked_total_byte_bound_and_never_silently_drops() {
-        let (mut output, receiver, _failure) = worker_output_for_test();
+    fn shared_playback_buffer_accepts_one_max_chunk_and_rejects_the_next_without_eviction() {
+        let slot = Arc::new(AudioWorkerSlot::default());
+        let (ready_sender, ready_receiver) = bounded(1);
+        let mut output = open_audio_output_with_worker(
+            AudioOutputSpec::normalized(),
+            slot,
+            Arc::new(ReadyOpener {
+                ready_sender,
+                drop_delay: Duration::ZERO,
+            }),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let (_, buffer) = ready_receiver.recv().unwrap();
         let chunk = vec![0; AudioOutputSink::MAX_INTERLEAVED_I16_SAMPLES_PER_ENQUEUE];
+        assert_eq!(chunk.len() * std::mem::size_of::<i16>(), 96_000);
 
-        for _ in 0..AUDIO_OUTPUT_PCM_QUEUE_CAPACITY_CHUNKS {
-            output.enqueue_interleaved_i16(&chunk).unwrap();
-        }
+        output.enqueue_interleaved_i16(&chunk).unwrap();
         assert_eq!(
             output.enqueue_interleaved_i16(&[1, -1]).unwrap_err().code(),
             "audio_output_queue_full"
         );
-        assert_eq!(receiver.len(), 4);
-        assert_eq!(
-            (0..AUDIO_OUTPUT_PCM_QUEUE_CAPACITY_CHUNKS)
-                .map(|_| receiver.try_recv().unwrap().len() * 2)
-                .sum::<usize>(),
-            1_048_576
-        );
+        let buffer = buffer.lock().unwrap();
+        assert_eq!(buffer.frames.len(), PLAYBACK_QUEUE_CAPACITY_FRAMES);
+        assert_eq!(buffer.frames.front(), Some(&[0, 0]));
+        assert_eq!(buffer.frames.back(), Some(&[0, 0]));
+    }
+
+    #[test]
+    fn immediate_reopen_waits_for_known_closing_worker_and_succeeds() {
+        let slot = Arc::new(AudioWorkerSlot::default());
+        let (ready_sender, _ready_receiver) = unbounded();
+        let opener: Arc<dyn AudioDeviceOpener> = Arc::new(ReadyOpener {
+            ready_sender,
+            drop_delay: Duration::from_millis(40),
+        });
+        let first = open_audio_output_with_worker(
+            AudioOutputSpec::normalized(),
+            Arc::clone(&slot),
+            Arc::clone(&opener),
+            Duration::from_millis(150),
+        )
+        .unwrap();
+
+        drop(first);
+        let started = Instant::now();
+        let second = open_audio_output_with_worker(
+            AudioOutputSpec::normalized(),
+            slot,
+            opener,
+            Duration::from_millis(150),
+        )
+        .expect("已知Closing状态必须在同一deadline内等待并重开");
+
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        drop(second);
+    }
+
+    #[test]
+    fn closing_wait_and_next_startup_share_one_absolute_deadline() {
+        let slot = Arc::new(AudioWorkerSlot::default());
+        let opener: Arc<dyn AudioDeviceOpener> = Arc::new(SequencedOpener {
+            opens: AtomicUsize::new(0),
+        });
+        let first = open_audio_output_with_worker(
+            AudioOutputSpec::normalized(),
+            Arc::clone(&slot),
+            Arc::clone(&opener),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        drop(first);
+        let started = Instant::now();
+        let error = open_audio_output_with_worker(
+            AudioOutputSpec::normalized(),
+            slot,
+            opener,
+            Duration::from_millis(120),
+        )
+        .err()
+        .expect("Closing等待与第二次startup不能各自获得完整deadline");
+
+        assert_eq!(error.code(), "audio_output_open_timeout");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_millis(165));
     }
 
     #[test]
