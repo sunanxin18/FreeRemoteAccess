@@ -23,9 +23,28 @@ function Invoke-Msi([string]$Operation, [string]$Msi, [string[]]$Extra, [string]
     $log = Join-Path $LogDir $LogName
     $arguments = "$Operation `"$Msi`" /qn /norestart /L*v `"$log`" $($Extra -join ' ')"
     $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
-    if ($process.ExitCode -notin @(0, 3010)) {
+    if ($process.ExitCode -eq 3010) {
+        throw "msi_reboot_required_not_allowed_$LogName"
+    }
+    if ($process.ExitCode -ne 0) {
         throw "msi_operation_failed_$($process.ExitCode)_$LogName"
     }
+}
+
+function Assert-SafeCleanupRoot([string]$Path, [string]$ExpectedRelative) {
+    $FullPath = [IO.Path]::GetFullPath($Path)
+    if ([IO.Path]::GetRelativePath($RepoRoot, $FullPath) -ne $ExpectedRelative) {
+        throw 'package_verify_cleanup_root_invalid'
+    }
+    if (Test-Path -LiteralPath $FullPath) {
+        $Entries = @((Get-Item -Force -LiteralPath $FullPath)) + @(
+            Get-ChildItem -Force -LiteralPath $FullPath -Recurse
+        )
+        if ($Entries | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) {
+            throw 'package_verify_cleanup_reparse_point_rejected'
+        }
+    }
+    return $FullPath
 }
 
 function Get-PeSubsystem([string]$Path) {
@@ -82,36 +101,85 @@ function Assert-SupportBundle([string]$Root) {
     }
 }
 
-if ((Get-PeSubsystem $GuiArtifact) -ne 2) { throw 'gui_pe_subsystem_must_be_windows' }
-Assert-PeResources $GuiArtifact
-$versionInfo = (Get-Item -LiteralPath $GuiArtifact).VersionInfo
-if ($versionInfo.ProductName -ne 'FreeRemoteAccess') { throw 'gui_product_name_invalid' }
-foreach ($value in @($versionInfo.FileVersion, $versionInfo.ProductVersion)) {
-    if ($value -notmatch '^([0-9]+)\.([0-9]+)\.([0-9]+)') { throw 'gui_version_resource_invalid' }
-    if ("$($Matches[1]).$($Matches[2]).$($Matches[3])" -ne $Manifest.version.Split('-')[0].Split('+')[0]) {
-        throw 'gui_version_resource_mismatch'
+function Assert-VersionInfo([string]$Path) {
+    $versionInfo = (Get-Item -LiteralPath $Path).VersionInfo
+    if ($versionInfo.ProductName -ne 'FreeRemoteAccess') { throw 'pe_product_name_invalid' }
+    foreach ($value in @($versionInfo.FileVersion, $versionInfo.ProductVersion)) {
+        if ($value -notmatch '^([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+            throw 'pe_version_resource_invalid'
+        }
+        if ("$($Matches[1]).$($Matches[2]).$($Matches[3])" -ne $Manifest.version) {
+            throw 'pe_version_resource_mismatch'
+        }
     }
 }
+
+function Assert-ExecutableSet(
+    [string]$Root,
+    [string]$ExpectedGuiHash,
+    [string]$ExpectedCliHash
+) {
+    $gui = Join-Path $Root 'FreeRemoteAccess.exe'
+    $cli = Join-Path $Root 'freeremotedesk-cli.exe'
+    if (!(Test-Path -LiteralPath $gui -PathType Leaf)) { throw 'packaged_gui_missing' }
+    if (!(Test-Path -LiteralPath $cli -PathType Leaf)) { throw 'packaged_cli_missing' }
+    if ((Get-FileHash -LiteralPath $gui -Algorithm SHA256).Hash -ne $ExpectedGuiHash) {
+        throw 'packaged_gui_hash_mismatch'
+    }
+    if ((Get-FileHash -LiteralPath $cli -Algorithm SHA256).Hash -ne $ExpectedCliHash) {
+        throw 'packaged_cli_hash_mismatch'
+    }
+    if ((Get-PeSubsystem $gui) -ne 2) { throw 'gui_pe_subsystem_must_be_windows' }
+    if ((Get-PeSubsystem $cli) -ne 3) { throw 'cli_pe_subsystem_must_be_console' }
+    Assert-PeResources $gui
+    Assert-PeResources $cli
+    Assert-VersionInfo $gui
+    Assert-VersionInfo $cli
+    & $cli --help *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'cli_help_failed' }
+}
+
+if ((Get-PeSubsystem $GuiArtifact) -ne 2) { throw 'gui_pe_subsystem_must_be_windows' }
+Assert-PeResources $GuiArtifact
+Assert-VersionInfo $GuiArtifact
 $cliArtifact = Join-Path $RepoRoot 'target\release\freeremotedesk.exe'
 if ((Get-PeSubsystem $cliArtifact) -ne 3) { throw 'cli_pe_subsystem_must_be_console' }
+Assert-PeResources $cliArtifact
+Assert-VersionInfo $cliArtifact
 & $cliArtifact --help *> $null
 if ($LASTEXITCODE -ne 0) { throw 'cli_help_failed' }
+$ExpectedGuiHash = (Get-FileHash -LiteralPath $GuiArtifact -Algorithm SHA256).Hash
+$ExpectedCliHash = (Get-FileHash -LiteralPath $cliArtifact -Algorithm SHA256).Hash
 
-$ExtractRoot = Join-Path $RepoRoot 'target\package\windows\verify'
+$ExtractRoot = Assert-SafeCleanupRoot (Join-Path $RepoRoot 'target\package\windows\verify') 'target\package\windows\verify'
 if (Test-Path -LiteralPath $ExtractRoot) { Remove-Item -LiteralPath $ExtractRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $ExtractRoot | Out-Null
 $InstalledMsi = $null
+$Gui = $null
+$InstallRoot = Join-Path $env:ProgramFiles 'FreeRemoteAccess'
+$Shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\FreeRemoteAccess.lnk'
+$PrimaryError = $null
+$CleanupErrors = [Collections.Generic.List[string]]::new()
+
+function Assert-LifecycleRemoved {
+    if (Test-Path -LiteralPath $Shortcut) { throw 'msi_shortcut_remained_after_uninstall' }
+    if (Test-Path -LiteralPath $InstallRoot) { throw 'msi_install_directory_remained_after_uninstall' }
+    $remaining = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+        Where-Object DisplayName -eq 'FreeRemoteAccess'
+    if ($remaining) { throw 'msi_registration_remained_after_uninstall' }
+}
+
 try {
     $zipRoot = Join-Path $ExtractRoot 'zip'
     Expand-Archive -LiteralPath $PortableZip -DestinationPath $zipRoot
     $portable = Join-Path $zipRoot 'FreeRemoteAccess'
-    if (!(Test-Path -LiteralPath (Join-Path $portable 'FreeRemoteAccess.exe'))) { throw 'portable_gui_missing' }
-    if (!(Test-Path -LiteralPath (Join-Path $portable 'freeremotedesk-cli.exe'))) { throw 'portable_cli_missing' }
+    Assert-ExecutableSet $portable $ExpectedGuiHash $ExpectedCliHash
     Assert-SupportBundle $portable
 
     $adminRoot = Join-Path $ExtractRoot 'msi-admin'
     Invoke-Msi '/a' $MsiArtifact @("TARGETDIR=`"$adminRoot`"") 'administrative-extract.log'
     $installedRoot = Join-Path $adminRoot 'Program Files\FreeRemoteAccess'
+    Assert-ExecutableSet $installedRoot $ExpectedGuiHash $ExpectedCliHash
     Assert-SupportBundle $installedRoot
 
     if (!$SkipLifecycle) {
@@ -137,49 +205,70 @@ try {
         $existing = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
             Where-Object DisplayName -eq 'FreeRemoteAccess'
         if ($existing) { throw 'msi_lifecycle_requires_clean_runner' }
-        Invoke-Msi '/i' $PreviousMsi @() 'install-previous.log'
         $InstalledMsi = $PreviousMsi
-        Invoke-Msi '/i' $MsiArtifact @() 'upgrade-current.log'
+        Invoke-Msi '/i' $PreviousMsi @() 'install-previous.log'
         $InstalledMsi = $MsiArtifact
+        Invoke-Msi '/i' $MsiArtifact @() 'upgrade-current.log'
         $product = @(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
             Where-Object DisplayName -eq 'FreeRemoteAccess')
-        if ($product.Count -ne 1 -or $product[0].DisplayVersion -ne $Manifest.version) {
+        if ($product.Count -ne 1 -or $product[0].DisplayVersion -ne $MsiVersion) {
             throw 'msi_major_upgrade_failed'
         }
-        $InstallRoot = Join-Path $env:ProgramFiles 'FreeRemoteAccess'
+        Assert-ExecutableSet $InstallRoot $ExpectedGuiHash $ExpectedCliHash
         Assert-SupportBundle $InstallRoot
-        $Shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\FreeRemoteAccess.lnk'
         if (!(Test-Path -LiteralPath $Shortcut)) { throw 'msi_start_menu_shortcut_missing' }
         $ShortcutInfo = (New-Object -ComObject WScript.Shell).CreateShortcut($Shortcut)
         if ($ShortcutInfo.TargetPath -ne (Join-Path $InstallRoot 'FreeRemoteAccess.exe')) {
             throw 'msi_start_menu_target_invalid'
         }
-        $Gui = Start-Process -FilePath $ShortcutInfo.TargetPath -PassThru
+        Start-Process -FilePath $Shortcut | Out-Null
         $deadline = [DateTime]::UtcNow.AddSeconds(15)
         do {
             Start-Sleep -Milliseconds 250
-            $Gui.Refresh()
-        } while (!$Gui.HasExited -and $Gui.MainWindowHandle -eq 0 -and [DateTime]::UtcNow -lt $deadline)
-        if ($Gui.HasExited -or $Gui.MainWindowHandle -eq 0) { throw 'msi_gui_window_not_alive' }
+            $Gui = Get-Process -Name 'FreeRemoteAccess' -ErrorAction SilentlyContinue |
+                Where-Object Path -eq $ShortcutInfo.TargetPath |
+                Select-Object -First 1
+        } while (($null -eq $Gui -or $Gui.MainWindowHandle -eq 0) -and [DateTime]::UtcNow -lt $deadline)
+        if ($null -eq $Gui -or $Gui.HasExited -or $Gui.MainWindowHandle -eq 0) { throw 'msi_gui_window_not_alive' }
         Stop-Process -Id $Gui.Id -Force
+        $Gui.WaitForExit()
+        $Gui = $null
 
         Invoke-Msi '/x' $MsiArtifact @() 'uninstall-current.log'
+        Assert-LifecycleRemoved
         $InstalledMsi = $null
-        if (Test-Path -LiteralPath $Shortcut) { throw 'msi_shortcut_remained_after_uninstall' }
-        if (Test-Path -LiteralPath $InstallRoot) { throw 'msi_install_directory_remained_after_uninstall' }
-        $remaining = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-            Where-Object DisplayName -eq 'FreeRemoteAccess'
-        if ($remaining) { throw 'msi_registration_remained_after_uninstall' }
     }
+} catch {
+    $PrimaryError = $_
 } finally {
+    if ($null -ne $Gui -and !$Gui.HasExited) {
+        try {
+            Stop-Process -Id $Gui.Id -Force
+            $Gui.WaitForExit()
+        } catch {
+            $CleanupErrors.Add("gui_cleanup_failed:$($_.Exception.Message)")
+        }
+    }
     if ($null -ne $InstalledMsi) {
         try {
             Invoke-Msi '/x' $InstalledMsi @() 'cleanup-after-failure.log'
+            Assert-LifecycleRemoved
         } catch {
-            Write-Warning "MSI cleanup failed; original verification failure remains primary: $($_.Exception.Message)"
+            $CleanupErrors.Add("msi_cleanup_failed:$($_.Exception.Message)")
         }
     }
-    if (Test-Path -LiteralPath $ExtractRoot) { Remove-Item -LiteralPath $ExtractRoot -Recurse -Force }
+    try {
+        $ExtractRoot = Assert-SafeCleanupRoot $ExtractRoot 'target\package\windows\verify'
+        if (Test-Path -LiteralPath $ExtractRoot) { Remove-Item -LiteralPath $ExtractRoot -Recurse -Force }
+    } catch {
+        $CleanupErrors.Add("verify_temp_cleanup_failed:$($_.Exception.Message)")
+    }
 }
+
+if ($null -ne $PrimaryError) {
+    foreach ($cleanup in $CleanupErrors) { Write-Warning $cleanup }
+    throw $PrimaryError
+}
+if ($CleanupErrors.Count -gt 0) { throw ($CleanupErrors -join ';') }
 
 Write-Output 'windows-package-verification: ok'

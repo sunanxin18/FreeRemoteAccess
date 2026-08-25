@@ -18,13 +18,30 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($MsiVersion)) {
 }
 $ArtifactPrefix = "FreeRemoteAccess-$Version-windows-x64"
 
-foreach ($Path in @($DistDir, $WorkDir)) {
-    if (Test-Path -LiteralPath $Path) {
-        $Resolved = (Resolve-Path -LiteralPath $Path).Path
-        if (!$Resolved.StartsWith($RepoRoot, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'package_cleanup_outside_repo'
+function Assert-SafeCleanupRoot([string]$Path, [string]$ExpectedRelative) {
+    $FullPath = [IO.Path]::GetFullPath($Path)
+    $Relative = [IO.Path]::GetRelativePath($RepoRoot, $FullPath)
+    if ($Relative -ne $ExpectedRelative) {
+        throw 'package_cleanup_root_invalid'
+    }
+    if (Test-Path -LiteralPath $FullPath) {
+        $Entries = @((Get-Item -Force -LiteralPath $FullPath)) + @(
+            Get-ChildItem -Force -LiteralPath $FullPath -Recurse
+        )
+        if ($Entries | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) {
+            throw 'package_cleanup_reparse_point_rejected'
         }
-        Remove-Item -LiteralPath $Resolved -Recurse -Force
+    }
+    return $FullPath
+}
+
+foreach ($Cleanup in @(
+    [pscustomobject]@{ Path = $DistDir; Relative = 'dist\windows' },
+    [pscustomobject]@{ Path = $WorkDir; Relative = 'target\package\windows' }
+)) {
+    $Path = Assert-SafeCleanupRoot $Cleanup.Path $Cleanup.Relative
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
     }
 }
 New-Item -ItemType Directory -Force -Path $DistDir, $WorkDir | Out-Null
@@ -32,7 +49,7 @@ New-Item -ItemType Directory -Force -Path $DistDir, $WorkDir | Out-Null
 $FdkMetadata = (& python $ManifestTool --repo $RepoRoot prepare-fdk --dest (Join-Path $DistDir 'THIRD_PARTY'))
 if ($LASTEXITCODE -ne 0) { throw 'fdk_supply_chain_gate_failed' }
 $FdkInfo = $FdkMetadata | ConvertFrom-Json
-$FdkDirectoryName = Split-Path (Split-Path $FdkInfo.notice -Parent) -Leaf
+$FdkDirectoryName = Split-Path (Split-Path (Split-Path $FdkInfo.source_archive -Parent) -Parent) -Leaf
 $FdkArchiveName = Split-Path $FdkInfo.source_archive -Leaf
 
 Push-Location $RepoRoot

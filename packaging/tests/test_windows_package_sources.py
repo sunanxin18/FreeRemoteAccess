@@ -39,9 +39,19 @@ class WindowsPackageSourceTests(unittest.TestCase):
         self.assertIn("package_manifest.py", builder)
         self.assertIn("msi-version", builder)
         self.assertIn("prepare-fdk", builder)
+        self.assertIn("FdkInfo.source_archive", builder)
         self.assertIn("THIRD_PARTY", builder)
         self.assertIn("Compress-Archive", builder)
         self.assertIn("artifact-manifest.json", builder)
+
+    def test_windows_cleanup_is_exact_and_reparse_safe(self):
+        builder = self.read("packaging/windows/build-msi.ps1")
+        verifier = self.read("packaging/windows/verify-package.ps1")
+        self.assertIn("GetRelativePath", builder)
+        self.assertIn("ReparsePoint", builder)
+        self.assertNotIn("StartsWith($RepoRoot", builder)
+        self.assertIn("Assert-SafeCleanupRoot", verifier)
+        self.assertIn("ReparsePoint", verifier)
 
     def test_native_verifier_checks_pe_zip_msi_lifecycle_and_cleans_on_failure(self):
         verifier = self.read("packaging/windows/verify-package.ps1")
@@ -58,9 +68,15 @@ class WindowsPackageSourceTests(unittest.TestCase):
             "cleanup-after-failure.log",
             "MainWindowHandle",
             "msi_install_directory_remained_after_uninstall",
+            "Assert-ExecutableSet",
+            "Get-FileHash",
+            "Start-Process -FilePath $Shortcut",
+            "msi_reboot_required_not_allowed",
+            "Assert-LifecycleRemoved",
         ):
             self.assertIn(required, verifier)
         self.assertNotIn("Win32_Product", verifier)
+        self.assertNotIn("Start-Process -FilePath $ShortcutInfo.TargetPath", verifier)
 
 
 if __name__ == "__main__":
