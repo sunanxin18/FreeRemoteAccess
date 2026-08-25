@@ -154,6 +154,7 @@ function Assert-ExecutableSet(
     if ($LASTEXITCODE -ne 0) { throw 'cli_help_failed' }
 }
 
+Assert-SupportBundle $DistDir
 if ((Get-PeSubsystem $GuiArtifact) -ne 2) { throw 'gui_pe_subsystem_must_be_windows' }
 Assert-PeResources $GuiArtifact
 Assert-VersionInfo $GuiArtifact
@@ -265,18 +266,22 @@ try {
         }
     }
     if ($CleanupMsiCandidates.Count -gt 0) {
-        try {
-            for ($index = $CleanupMsiCandidates.Count - 1; $index -ge 0; $index--) {
+        for ($index = $CleanupMsiCandidates.Count - 1; $index -ge 0; $index--) {
+            try {
                 $CleanupLog = if ($index -eq $CleanupMsiCandidates.Count - 1) {
                     'cleanup-after-failure.log'
                 } else {
                     "cleanup-previous-after-failure-$index.log"
                 }
                 Invoke-MsiCleanup $CleanupMsiCandidates[$index] $CleanupLog
+            } catch {
+                $CleanupErrors.Add("msi_candidate_cleanup_failed:$($_.Exception.Message)")
             }
+        }
+        try {
             Assert-LifecycleRemoved
         } catch {
-            $CleanupErrors.Add("msi_cleanup_failed:$($_.Exception.Message)")
+            $CleanupErrors.Add("msi_cleanup_state_failed:$($_.Exception.Message)")
         }
     }
     try {

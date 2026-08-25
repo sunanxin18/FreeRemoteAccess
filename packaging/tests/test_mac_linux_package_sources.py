@@ -26,6 +26,7 @@ class MacLinuxPackageSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, builder)
         self.assertIn("@PACKAGE_VERSION@", plist)
+        self.assertIn("safe_cleanup.py", builder)
 
     def test_mac_native_verifier_checks_bundle_arch_dmg_unsigned_and_gui_survival(self):
         verifier = self.read("packaging/macos/verify-package.sh")
@@ -63,6 +64,7 @@ class MacLinuxPackageSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, builder)
         self.assertNotIn('rm -rf -- "$appdir"', builder)
+        self.assertIn("safe_cleanup.py", builder)
         for soname in (
             "libX11.so.6",
             "libX11-xcb.so.1",

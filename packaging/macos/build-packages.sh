@@ -10,12 +10,13 @@ artifact_prefix="FreeRemoteAccess-$version-macos-universal"
 app_dir="$work_dir/FreeRemoteAccess.app"
 support_root="$dist_dir/THIRD_PARTY"
 
-case "$dist_dir" in "$repo_root"/dist/macos) ;; *) echo 'package_cleanup_outside_repo' >&2; exit 2;; esac
-case "$work_dir" in "$repo_root"/target/package/macos) ;; *) echo 'package_cleanup_outside_repo' >&2; exit 2;; esac
+python3 "$repo_root/packaging/safe_cleanup.py" --repo "$repo_root" --target "$dist_dir" --expected dist/macos >/dev/null
+python3 "$repo_root/packaging/safe_cleanup.py" --repo "$repo_root" --target "$work_dir" --expected target/package/macos >/dev/null
 rm -rf -- "$dist_dir" "$work_dir"
 mkdir -p "$dist_dir" "$work_dir" "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cd "$repo_root"
 
+cargo fetch --locked
 python3 "$manifest_tool" --repo "$repo_root" prepare-fdk --dest "$support_root" >/dev/null
 MACOSX_DEPLOYMENT_TARGET=12.0 cargo build --locked --release --target aarch64-apple-darwin --features gui --bin freeremoteaccess-gui
 MACOSX_DEPLOYMENT_TARGET=12.0 cargo build --locked --release --target x86_64-apple-darwin --features gui --bin freeremoteaccess-gui

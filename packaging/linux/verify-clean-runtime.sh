@@ -49,7 +49,7 @@ xdg_runtime="$work_dir/xdg-runtime"
 mkdir -p "$xdg_runtime"
 chmod 700 "$xdg_runtime"
 XDG_RUNTIME_DIR="$xdg_runtime" weston --backend=headless-backend.so \
-  --renderer=pixman --socket=wayland-frd --idle-time=0 \
+  --use-pixman --socket=wayland-frd --idle-time=0 \
   >"$work_dir/weston.log" 2>&1 &
 weston_pid=$!
 for _ in {1..40}; do

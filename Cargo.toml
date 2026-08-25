@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "纯 Rust 原生远程登录客户端，支持 RDP、Apple ARD 与 RFB/VNC"
 license = "LicenseRef-Proprietary"
+publish = false
 default-run = "freeremotedesk"
 
 [workspace]

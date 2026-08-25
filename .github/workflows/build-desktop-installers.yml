@@ -6,80 +6,156 @@ on:
     branches: [main, feat/five-platform-client]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   RUST_TOOLCHAIN: 1.96.0
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-25
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
-      - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libwayland-dev libxkbcommon-dev
+      - name: Install native and pinned security dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev libxcursor-dev libxi-dev libxrandr-dev libvulkan-dev
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - name: Verify supply chain policy
+        run: |
+          cargo audit --deny yanked
+          cargo deny check
       - name: Verify Rust workspace
         run: |
           cargo fmt --all -- --check
           cargo test --locked --all-targets --features gui
           cargo build --locked --release --no-default-features --features gui
-      - name: Verify artifact contracts
+      - name: Verify packaging contracts
+        run: python -m unittest discover -s packaging/tests -p 'test_*.py' -v
+      - name: Verify legacy artifact contracts
         shell: pwsh
         run: ./packaging/check-artifact.tests.ps1
 
   windows:
+    needs: verify
     runs-on: windows-2022
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-25
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install WiX v4
-        run: dotnet tool install --global wix --version 4.*
-      - name: Build executable and MSI
+      - name: Install pinned WiX v4
         shell: pwsh
-        run: ./packaging/windows/build-msi.ps1
-      - uses: actions/upload-artifact@v5
+        run: |
+          dotnet tool install --global wix --version 4.0.6
+          if ((wix --version).Trim() -ne '4.0.6') { throw 'wix_version_mismatch' }
+      - name: Build canonical executable, ZIP and MSI set
+        shell: pwsh
+        run: ./packaging/windows/build-msi.ps1 -SkipNativeVerification
+      - name: Verify MSI install, launch, upgrade and uninstall lifecycle
+        shell: pwsh
+        run: ./packaging/windows/verify-package.ps1 -DistDir dist/windows
+      - name: Upload MSI lifecycle logs
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: FreeRemoteAccess-windows-msi-logs
+          path: target/package/windows/logs
+          if-no-files-found: warn
+      - name: Upload verified canonical Windows set
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: FreeRemoteAccess-windows-x64
-          path: dist/windows/*
+          path: dist/windows
           if-no-files-found: error
 
   macos:
+    needs: verify
     runs-on: macos-15
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-25
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - name: Build app, pkg and dmg
+      - name: Build and verify universal app archive and DMG
         run: ./packaging/macos/build-packages.sh
-      - uses: actions/upload-artifact@v5
+      - name: Upload verified canonical Mac OS set
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: FreeRemoteAccess-macos-universal
-          path: dist/macos/*
+          path: dist/macos
           if-no-files-found: error
 
   linux:
-    runs-on: ubuntu-24.04
+    needs: verify
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-25
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libwayland-dev libxkbcommon-dev libfuse2 rpm
-      - name: Install packaging tools
+      - name: Install native build and runtime dependencies
         run: |
-          cargo install cargo-deb --locked
-          cargo install cargo-generate-rpm --locked
-      - name: Build deb, rpm and AppImage
+          sudo apt-get update
+          sudo apt-get install -y curl libasound2-dev libfuse2 libwayland-dev libx11-dev libx11-xcb-dev libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev mesa-vulkan-drivers weston xauth xvfb zstd
+      - name: Install pinned packaging tools
+        run: |
+          cargo install cargo-deb --version 3.7.0 --locked
+          cargo install cargo-generate-rpm --version 0.21.0 --locked
+      - name: Build and verify AppDir archive, deb and AppImage
         run: ./packaging/linux/build-packages.sh
-      - uses: actions/upload-artifact@v5
+      - name: Verify GUI in clean Ubuntu 22.04 X11 and Wayland runtimes
+        run: |
+          mkdir -p target/package/linux/clean-runtime-logs
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace ubuntu@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc \
+            bash -euxo pipefail -c '
+              apt-get update
+              apt-get install -y ca-certificates libasound2 libvulkan1 mesa-vulkan-drivers libwayland-client0 libx11-6 libx11-xcb1 libxcursor1 libxi6 libxrandr2 libxkbcommon0 libxkbcommon-x11-0 weston xauth xvfb
+              apt-get install -y ./dist/linux/*.deb
+              ./packaging/linux/verify-clean-runtime.sh /usr/bin/freeremoteaccess /workspace/target/package/linux/clean-runtime-logs
+            '
+      - name: Upload Linux clean-runtime logs
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: FreeRemoteAccess-linux-runtime-logs
+          path: target/package/linux/clean-runtime-logs
+          if-no-files-found: warn
+      - name: Upload verified canonical Linux set
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: FreeRemoteAccess-linux-x86_64
-          path: dist/linux/*
+          path: dist/linux
           if-no-files-found: error

@@ -81,6 +81,9 @@ class WindowsPackageSourceTests(unittest.TestCase):
             self.assertIn(required, verifier)
         self.assertNotIn("Win32_Product", verifier)
         self.assertNotIn("Start-Process -FilePath $ShortcutInfo.TargetPath", verifier)
+        self.assertIn("Assert-SupportBundle $DistDir", verifier)
+        cleanup_loop = verifier[verifier.index("for ($index = $CleanupMsiCandidates.Count") :]
+        self.assertLess(cleanup_loop.index("try {"), cleanup_loop.index("Invoke-MsiCleanup"))
 
 
 if __name__ == "__main__":

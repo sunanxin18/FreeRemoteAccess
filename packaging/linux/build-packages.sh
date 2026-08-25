@@ -14,8 +14,8 @@ appimagetool_sha256='ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb3
 runtime_url='https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64'
 runtime_sha256='2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d'
 
-case "$dist_dir" in "$repo_root"/dist/linux) ;; *) echo 'package_cleanup_outside_repo' >&2; exit 2;; esac
-case "$work_dir" in "$repo_root"/target/package/linux) ;; *) echo 'package_cleanup_outside_repo' >&2; exit 2;; esac
+python3 "$repo_root/packaging/safe_cleanup.py" --repo "$repo_root" --target "$dist_dir" --expected dist/linux >/dev/null
+python3 "$repo_root/packaging/safe_cleanup.py" --repo "$repo_root" --target "$work_dir" --expected target/package/linux >/dev/null
 rm -rf -- "$dist_dir" "$work_dir"
 mkdir -p "$dist_dir" "$work_dir" "$appdir/usr/bin" \
   "$appdir/usr/share/applications" \
@@ -24,6 +24,7 @@ mkdir -p "$dist_dir" "$work_dir" "$appdir/usr/bin" \
   "$appdir/usr/share/doc/freeremoteaccess"
 cd "$repo_root"
 
+cargo fetch --locked
 python3 "$manifest_tool" --repo "$repo_root" prepare-fdk --dest "$support_root" >/dev/null
 cargo build --locked --release --features gui --bin freeremoteaccess-gui
 install -m 755 target/release/freeremoteaccess-gui "$appdir/usr/bin/freeremoteaccess"

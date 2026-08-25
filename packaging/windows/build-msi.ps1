@@ -51,6 +51,8 @@ foreach ($Cleanup in @(
 }
 New-Item -ItemType Directory -Force -Path $DistDir, $WorkDir | Out-Null
 
+cargo fetch --locked --manifest-path (Join-Path $RepoRoot 'Cargo.toml')
+if ($LASTEXITCODE -ne 0) { throw 'cargo_locked_fetch_failed' }
 $FdkMetadata = (& python $ManifestTool --repo $RepoRoot prepare-fdk --dest (Join-Path $DistDir 'THIRD_PARTY'))
 if ($LASTEXITCODE -ne 0) { throw 'fdk_supply_chain_gate_failed' }
 $FdkInfo = $FdkMetadata | ConvertFrom-Json

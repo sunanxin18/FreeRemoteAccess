@@ -74,14 +74,24 @@ cargo build --locked --no-default-features --features cli
 # Windows PowerShell，需要 WiX v4
 .\packaging\windows\build-msi.ps1
 
-# macOS，生成 universal app、pkg、dmg、zip
+# Mac OS，生成 universal app 归档和 DMG
 ./packaging/macos/build-packages.sh
 
-# Linux，需要 cargo-deb、cargo-generate-rpm、AppImage 依赖
+# Linux，保留 AppDir 并生成 AppDir 归档、deb 和 AppImage
 ./packaging/linux/build-packages.sh
 ```
 
 GitHub Actions 工作流 `.github/workflows/build-desktop-installers.yml` 分别在原生 Windows、macOS、Linux runner 构建安装包，产物写入 `dist/<platform>/`。
+
+### 发布与供应链门禁
+
+当前所有桌面构建均标记为 **UNSIGNED / NOT FOR PUBLIC DISTRIBUTION**，只用于内部验证，不能作为公开发行版本。代码签名、公证、发布主体审核和 AAC 专利审核是外部发布前必须独立完成的 fail-closed 门禁。
+
+每个平台的 `dist/<platform>/artifact-manifest.json` 是唯一 canonical artifact set。清单版本来自 `cargo metadata --locked` 的根包版本，并逐项记录产物、FDK AAC NOTICE、与 `Cargo.lock` checksum 完全一致的 `fdk-aac-sys` 原始 `.crate` 及 SHA-256。Windows 裸 GUI EXE 不能脱离同一 canonical artifact set 单独分发，必须与同目录 `THIRD_PARTY`、manifest 和校验和共同交付；portable ZIP、MSI、Mac OS app 归档/DMG、Linux AppDir 归档/deb/AppImage 则各自在包内携带相同的完整 NOTICE 与源码归档。
+
+Fraunhofer FDK AAC 的软件版权许可不授予 AAC 专利许可。即使 NOTICE 和完整对应源码已随包交付，也不代表获得任何专利实施许可；在法律审核和适用地区的专利许可结论完成前，发布门禁保持关闭。
+
+打包清单工具要求 Python 3.11 或更高版本（CI 固定 Python 3.13），供应链检查固定使用 `cargo-audit 0.22.2` 与 `cargo-deny 0.20.2`。构建脚本只接受 `Cargo.lock` 锁定依赖；AppImage 工具及 runtime 使用固定版本和 SHA-256，校验失败立即停止。
 
 最新三平台安装包、SHA-256、签名和启动证据见 [桌面客户端验证矩阵](docs/validation/winit-wgpu-desktop-matrix.md)。
 
