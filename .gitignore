@@ -29,3 +29,5 @@ CREDENTIALS.local.md
 Thumbs.db
 *.swp
 *.tmp
+__pycache__/
+*.py[cod]
