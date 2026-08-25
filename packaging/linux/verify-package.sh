@@ -60,16 +60,9 @@ mkdir "$work_dir/appimage"
 assert_appdir "$work_dir/appimage/squashfs-root"
 
 binary="$appdir/usr/bin/freeremoteaccess"
-ldconfig_output="$(ldconfig -p)"
-while IFS= read -r soname; do
-  [[ -z "$soname" || "$soname" == \#* ]] && continue
-  grep -F "$soname" <<<"$ldconfig_output" >/dev/null || { echo "runtime_library_missing:$soname" >&2; exit 1; }
-  strings "$binary" | grep -Fi "${soname%%.so*}" >/dev/null || {
-    echo "runtime_library_not_declared_by_binary:$soname" >&2; exit 1;
-  }
-done < "$repo_root/packaging/linux/runtime-libraries.txt"
-ldd "$binary" | tee "$work_dir/ldd.txt"
-! grep -q 'not found' "$work_dir/ldd.txt" || { echo 'elf_dependency_missing' >&2; exit 1; }
+python3 "$repo_root/packaging/linux/verify_runtime_libraries.py" \
+  --binary "$binary" \
+  --declarations "$repo_root/packaging/linux/runtime-libraries.txt"
 max_glibc="$(objdump -T "$binary" | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -n1)"
 [[ -n "$max_glibc" ]] || { echo 'glibc_abi_not_found' >&2; exit 1; }
 [[ "$(printf '%s\n%s\n' "$max_glibc" '2.35' | sort -V | tail -n1)" == '2.35' ]] || {

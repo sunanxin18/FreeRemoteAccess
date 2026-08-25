@@ -69,18 +69,22 @@ class MacLinuxPackageSourceTests(unittest.TestCase):
             "libX11.so.6",
             "libX11-xcb.so.1",
             "libxkbcommon-x11.so.0",
+            "libxcb.so.1",
             "libwayland-client.so.0",
             "libvulkan.so.1",
             "libasound.so.2",
+            "libz.so.1",
         ):
             self.assertIn(soname, libraries)
         for package in (
             "libx11-6",
             "libx11-xcb1",
             "libxkbcommon-x11-0",
+            "libxcb1",
             "libwayland-client0",
             "libvulkan1",
             "libasound2",
+            "zlib1g",
         ):
             self.assertIn(package, cargo)
 
@@ -92,9 +96,7 @@ class MacLinuxPackageSourceTests(unittest.TestCase):
             "--appimage-extract",
             "assert_support",
             "readlink",
-            "ldconfig -p",
-            "strings",
-            "ldd",
+            "verify_runtime_libraries.py",
             "objdump -T",
             "2.35",
             "xvfb-run",
