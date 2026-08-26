@@ -920,7 +920,7 @@ mod tests {
         let mut tables = vec![2];
         tables.extend(std::iter::repeat_n(1, 128));
         let full = vec![0, 5, 0, 0, 0, 8, 0xd3, 0x68, 0x00, 0x13, 0x68];
-        let partial = vec![1, 1, 1, 0x40, 0x01, 0xb5, 0xd9, 0xcc];
+        let partial = vec![1, 1, 1, 0x40, 0x52, 0x9b, 0x5d, 0x9c, 0xc0];
         let fragmented = vec![0, 0, 0, 0, 0, 8, 0x83, 0x68, 0x6d];
         let server_tables = tables.clone();
         let server_full = full.clone();
@@ -1132,16 +1132,13 @@ mod tests {
                     decoded_pixel_records += 1;
                 }
                 MvsDecodeDecision::PreparedOpaque(prepared) => {
-                    let before = decoded_pixel_records;
-                    decoder.commit_opaque(prepared).unwrap();
-                    assert_eq!(
-                        decoded_pixel_records, before,
-                        "type-1 opaque commit must not publish decoded pixels"
-                    );
+                    let partial_pixels = decoder.commit_opaque(prepared).unwrap();
+                    assert!(!partial_pixels.operations.is_empty());
+                    decoded_pixel_records += 1;
                 }
                 decision => panic!("unexpected downstream MVS decision: {decision:?}"),
             }
         }
-        assert_eq!(decoded_pixel_records, 2);
+        assert_eq!(decoded_pixel_records, 3);
     }
 }

@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-## Current Roadmap State (2026-08-23)
+## Current Roadmap State (2026-08-26)
 
 - **P1 Dynamic resolution: implemented as a default-off experiment.**
   `hpssview --dynamic-resolution` becomes available only after fail-closed
@@ -14,15 +14,17 @@
   resets MVS state, and requests a full frame; rendering and pointer mapping
   always use current window/surface dimensions. Resized `0x09` remains an
   opt-in wire experiment, not live-interoperability proof.
-- **P2 MVS incremental frames: conservative reassembly/resync implemented.**
+- **P2 MVS incremental frames: ARD 3.10 type-1 decoding implemented.**
   `MvsRecordAssembler` reassembles the declared total exactly (including the
   captured 32748 + 26572 = 59320 case). Full, partial, and malformed payloads
-  are classified strictly; partial data never enters the JPEG path and instead
-  causes a rate-limited-but-not-dropped full resync. Decoder tables/reference
-  state is generation-scoped. `.mvs` capture uses `FRDMVS01` and preserves the
-  rectangle; legacy capture files are rejected explicitly. Exact type-1 partial
-  decoding is **BLOCKED** pending a trustworthy fixture or complete decoder
-  recovery.
+  are classified strictly; type-1 opcode 0/1/2/3, fixed Cb/Cr extents 14/19,
+  unaligned `mvs` terminal, cache behavior, scan-order references, and
+  generation-scoped state follow the recovered ARD 3.10 encoder/decoder.
+  Type-0 mode 5 seeds use the Apple wire order Cr then Cb; type-1 refinement
+  remains Cb then Cr. Pixel/cache publication is transactional and incremental
+  updates do not clone the full desktop. Strict `FRDMVS02` replay proved all 18
+  captured type-1 records with zero malformed/stale records, and a bounded live
+  Mac run applied repeated type-1 updates. Legacy capture files remain rejected.
 - **P3 Mac-to-PC audio and P4 UDP transport are live-interoperable.**
   The typed Message 1 parser, version-3 `0x1c` configuration, version-2 Message
   2 answer, generation-bound Audio/Video sockets, Apple-compatible SRTP/SRTCP,
@@ -140,11 +142,12 @@ FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
   Partial updates validate the byte sequence `0x6d 0x76 0x73` (`mvs`) through a
   bit reader and depend on persistent decoder state. Keep transport reassembly,
   MVS bitstream parsing, and framebuffer application as separate layers.
-- Evidence establishes MVS/OpenCL/shared-memory behavior and AVC/HEVC symbols;
-  it does not establish exact partial-block fields, resized-`0x09` support,
-  UDP framing, HDR, framerate semantics, or all quality/refinement semantics.
-  Label hypotheses as such and capture a failing fixture before implementing an
-  inferred field layout.
+- Evidence establishes the captured ARD 3.10 type-1 grammar and state behavior,
+  plus MVS/OpenCL/shared-memory and AVC/HEVC symbols. It does not establish
+  resized-`0x09` support, UDP framing, HDR, framerate semantics, every
+  non-eight-aligned edge/padding case, or all quality/refinement semantics.
+  Label those remaining hypotheses as such and require a failing fixture before
+  implementing an inferred layout.
 
 ## Build, Test, and Development Commands
 - `cargo build --release` — build optimized Windows executable at `target\release\freeremotedesk.exe`.

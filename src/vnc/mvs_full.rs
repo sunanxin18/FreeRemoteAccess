@@ -1,4 +1,4 @@
-//! Apple MVS type-0 rectangle decoder for verified tile modes 0 through 5.
+//! Apple MVS type-0 full rectangles and type-1 incremental tile updates.
 
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
@@ -37,7 +37,9 @@ const APPLE_LUMA_AC_VALUES: [u8; 162] = [
     0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
     0xf9, 0xfa,
 ];
+#[cfg(test)]
 const APPLE_CHROMA_AC_BITS: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119];
+#[cfg(test)]
 const APPLE_CHROMA_AC_VALUES: [u8; 162] = [
     0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
     0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
@@ -62,6 +64,7 @@ const APPLE_LUMA_AC_HUFFMAN: AppleHuffmanTable = AppleHuffmanTable {
     bits: &APPLE_LUMA_AC_BITS,
     values: &APPLE_LUMA_AC_VALUES,
 };
+#[cfg(test)]
 const APPLE_CHROMA_AC_HUFFMAN: AppleHuffmanTable = AppleHuffmanTable {
     bits: &APPLE_CHROMA_AC_BITS,
     values: &APPLE_CHROMA_AC_VALUES,
@@ -72,6 +75,33 @@ pub struct DecodedMvsRect {
     pub width: usize,
     pub height: usize,
     pub rgb: Vec<u8>,
+}
+
+/// A validated type-1 update expressed as framebuffer operations. The decoder
+/// stages these together with its cache state; callers publish neither half
+/// until both framebuffer application and decoder commit can succeed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPartialPixels {
+    pub operations: Vec<PartialPixelOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartialPixelOperation {
+    Replace {
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        rgb: Vec<u8>,
+    },
+    Copy {
+        source_x: usize,
+        source_y: usize,
+        destination_x: usize,
+        destination_y: usize,
+        width: usize,
+        height: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +162,7 @@ struct MvsSurfaceState {
     height: usize,
     tiles_x: usize,
     tiles: Vec<SavedTileState>,
+    rgb: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,7 +227,8 @@ pub struct PreparedMvsFull {
 
 #[derive(Debug)]
 pub(crate) struct PreparedMvsOpaqueState {
-    next_decoder: MvsFullDecoder,
+    partial_pixels: PreparedPartialPixels,
+    next_cache_state: MvsCacheState,
 }
 
 impl MvsFullDecoder {
@@ -207,6 +239,10 @@ impl MvsFullDecoder {
             surface_state: None,
             cache_state: MvsCacheState::new(),
         }
+    }
+
+    pub(crate) fn replace_tables(&mut self, tables: MvsTables) {
+        self.tables = tables;
     }
 
     pub fn prepare(
@@ -247,6 +283,9 @@ impl MvsFullDecoder {
         if surface_pixel_count > MAX_MVS_DECODE_PIXELS {
             bail!("MVS surface 超过协议解码预算: {surface_pixel_count} 像素");
         }
+        let surface_rgb_len = surface_pixel_count
+            .checked_mul(RGB_CHANNELS)
+            .context("MVS surface RGB 缓冲区长度溢出")?;
         let rect_right = rect_x
             .checked_add(width)
             .context("MVS type-0 矩形右边界溢出")?;
@@ -301,6 +340,7 @@ impl MvsFullDecoder {
                 height: surface_height,
                 tiles_x: surface_tiles_x,
                 tiles: vec![SavedTileState::default(); surface_tile_count],
+                rgb: vec![0; surface_rgb_len],
             },
         };
         let seed_origin_column = rect_x >> 3;
@@ -321,6 +361,7 @@ impl MvsFullDecoder {
         let mut previous_mode_five = None;
         // previous cache index 也在整条 record 成功验证前只存于 staged clone。
         let mut cache_state = self.cache_state.clone();
+        let mut cache_miss_reported = false;
 
         while tile_index < tile_count {
             let mode = u8::try_from(
@@ -357,76 +398,113 @@ impl MvsFullDecoder {
                     .checked_mul(surface_tiles_x)
                     .and_then(|value| value.checked_add(global_tile_column))
                     .context("MVS type-0 全局 tile 索引溢出")?;
-                let global_tile = surface_state
-                    .tiles
-                    .get_mut(global_tile_index)
-                    .context("MVS type-0 全局 tile 索引越界")?;
-                global_tile.generation = record_generation;
-                global_tile.reference = None;
+                {
+                    let global_tile = surface_state
+                        .tiles
+                        .get_mut(global_tile_index)
+                        .context("MVS type-0 全局 tile 索引越界")?;
+                    global_tile.generation = record_generation;
+                    global_tile.reference = None;
+                }
+                let global_x = rect_x
+                    .checked_add(tile_x)
+                    .context("MVS type-0 全局 tile x 溢出")?;
+                let global_y = rect_y
+                    .checked_add(tile_y)
+                    .context("MVS type-0 全局 tile y 溢出")?;
 
                 match mode {
                     0 => fill_tile(&mut rgb, width, height, tile_x, tile_y, [255; 3]),
                     1 => {
-                        if tile_column == 0 {
-                            bail!("MVS type-0 mode 1 不能出现在首列");
-                        }
-                        copy_tile(
+                        // ARD keeps one running source pointer for the complete
+                        // record. It initially equals the first destination,
+                        // then remains on the previous scan-order tile even
+                        // when the destination advances to the next row.
+                        let (source_x, source_y) = if tile_index == 0 {
+                            (global_x, global_y)
+                        } else if tile_column != 0 {
+                            (
+                                global_x
+                                    .checked_sub(TILE_EDGE)
+                                    .context("MVS type-0 mode 1 引用 x 下溢")?,
+                                global_y,
+                            )
+                        } else {
+                            let previous_column = tiles_x - 1;
+                            let previous_x_offset = previous_column
+                                .checked_mul(TILE_EDGE)
+                                .context("MVS type-0 mode 1 跨行 tile x 溢出")?;
+                            (
+                                rect_x
+                                    .checked_add(previous_x_offset)
+                                    .context("MVS type-0 mode 1 跨行引用 x 溢出")?,
+                                global_y
+                                    .checked_sub(TILE_EDGE)
+                                    .context("MVS type-0 mode 1 跨行引用 y 下溢")?,
+                            )
+                        };
+                        copy_surface_tile_to_rect(
+                            &surface_state.rgb,
+                            surface_width,
+                            surface_height,
                             &mut rgb,
                             width,
                             height,
-                            tile_x - TILE_EDGE,
-                            tile_y,
+                            source_x,
+                            source_y,
                             tile_x,
                             tile_y,
-                        );
-                        let source_tile_index = global_tile_index
+                        )?;
+                        surface_state.tiles[global_tile_index].reference = global_tile_index
                             .checked_sub(1)
-                            .context("MVS type-0 mode 1 引用 tile 索引下溢")?;
-                        let source_x = rect_x
-                            .checked_add(tile_x - TILE_EDGE)
-                            .context("MVS type-0 mode 1 引用 x 溢出")?;
-                        let source_y = rect_y
-                            .checked_add(tile_y)
-                            .context("MVS type-0 mode 1 引用 y 溢出")?;
-                        global_tile.reference = Some(SavedTileReference {
-                            tile_index: source_tile_index,
-                            framebuffer_offset: checked_framebuffer_offset(
-                                surface_width,
-                                source_x,
-                                source_y,
-                            )?,
-                        });
+                            .map(|source_tile_index| -> Result<SavedTileReference> {
+                                Ok(SavedTileReference {
+                                    tile_index: source_tile_index,
+                                    framebuffer_offset: checked_framebuffer_offset(
+                                        surface_width,
+                                        source_x,
+                                        source_y,
+                                    )?,
+                                })
+                            })
+                            .transpose()?;
                     }
                     2 => {
-                        if tile_row == 0 {
-                            bail!("MVS type-0 mode 2 不能出现在首行");
-                        }
-                        copy_tile(
+                        // ARD bounds-checks the above-row pointer against the
+                        // framebuffer base. On the surface first row no copy is
+                        // performed, which preserves the existing destination.
+                        let source_y = if global_tile_row == 0 {
+                            global_y
+                        } else {
+                            global_y
+                                .checked_sub(TILE_EDGE)
+                                .context("MVS type-0 mode 2 引用 y 下溢")?
+                        };
+                        copy_surface_tile_to_rect(
+                            &surface_state.rgb,
+                            surface_width,
+                            surface_height,
                             &mut rgb,
                             width,
                             height,
-                            tile_x,
-                            tile_y - TILE_EDGE,
+                            global_x,
+                            source_y,
                             tile_x,
                             tile_y,
-                        );
-                        let source_tile_index = global_tile_index
+                        )?;
+                        surface_state.tiles[global_tile_index].reference = global_tile_index
                             .checked_sub(surface_tiles_x)
-                            .context("MVS type-0 mode 2 引用 tile 索引下溢")?;
-                        let source_x = rect_x
-                            .checked_add(tile_x)
-                            .context("MVS type-0 mode 2 引用 x 溢出")?;
-                        let source_y = rect_y
-                            .checked_add(tile_y - TILE_EDGE)
-                            .context("MVS type-0 mode 2 引用 y 溢出")?;
-                        global_tile.reference = Some(SavedTileReference {
-                            tile_index: source_tile_index,
-                            framebuffer_offset: checked_framebuffer_offset(
-                                surface_width,
-                                source_x,
-                                source_y,
-                            )?,
-                        });
+                            .map(|source_tile_index| -> Result<SavedTileReference> {
+                                Ok(SavedTileReference {
+                                    tile_index: source_tile_index,
+                                    framebuffer_offset: checked_framebuffer_offset(
+                                        surface_width,
+                                        global_x,
+                                        source_y,
+                                    )?,
+                                })
+                            })
+                            .transpose()?;
                     }
                     3 => decode_bitmap_tile(
                         &mut data_bits,
@@ -486,7 +564,7 @@ impl MvsFullDecoder {
                             &self.tables,
                         )?;
                         if let Some(seed) = tile_state.seed {
-                            global_tile.coefficients = Some(seed);
+                            surface_state.tiles[global_tile_index].coefficients = Some(seed);
                         }
                         previous_mode_five = Some(tile_state);
                     }
@@ -506,21 +584,56 @@ impl MvsFullDecoder {
                         } else {
                             cache_state.previous_cache_index.wrapping_add(1)
                         };
-                        let entry = lookup_cache_entry(&cache_state, cache_index)?;
-                        let coefficients = cache_entry_coefficients(&entry);
-                        render_mode_five_tile(
-                            &mut rgb,
-                            width,
-                            height,
-                            tile_x,
-                            tile_y,
-                            &coefficients,
-                            &self.tables,
-                        )?;
-                        cache_state.previous_cache_index = cache_index;
+                        match lookup_cache_entry(&cache_state, cache_index) {
+                            Ok(entry) => {
+                                let coefficients = cache_entry_coefficients(&entry);
+                                render_mode_five_tile(
+                                    &mut rgb,
+                                    width,
+                                    height,
+                                    tile_x,
+                                    tile_y,
+                                    &coefficients,
+                                    &self.tables,
+                                )?;
+                                cache_state.previous_cache_index = cache_index;
+                            }
+                            Err(error) => {
+                                if !cache_miss_reported {
+                                    eprintln!(
+                                        "[mvs] ARD full cache 缺失或过期，保留现有 tile: index={cache_index}, reason={error}"
+                                    );
+                                    cache_miss_reported = true;
+                                }
+                                copy_surface_tile_to_rect(
+                                    &surface_state.rgb,
+                                    surface_width,
+                                    surface_height,
+                                    &mut rgb,
+                                    width,
+                                    height,
+                                    global_x,
+                                    global_y,
+                                    tile_x,
+                                    tile_y,
+                                )?;
+                            }
+                        }
                     }
                     _ => unreachable!("three-bit mode is always in 0..=7"),
                 }
+                copy_rect_tile_to_surface(
+                    &rgb,
+                    width,
+                    height,
+                    tile_x,
+                    tile_y,
+                    &mut surface_state.rgb,
+                    surface_width,
+                    surface_height,
+                    global_x,
+                    global_y,
+                )?;
                 tile_index += 1;
             }
         }
@@ -555,6 +668,10 @@ impl MvsFullDecoder {
     pub fn commit(&mut self, prepared: PreparedMvsFull) -> DecodedMvsRect {
         *self = prepared.next_decoder;
         prepared.decoded
+    }
+
+    pub(crate) fn partial_pixels(prepared: &PreparedMvsOpaqueState) -> &PreparedPartialPixels {
+        &prepared.partial_pixels
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -603,10 +720,18 @@ impl MvsFullDecoder {
             .context("MVS type-1 tile 总数溢出")?;
         let origin_column = rect_x >> 3;
         let origin_row = rect_y >> 3;
+        // ARD 3.10 writes 0x0e/0x13 here: the raw values are the Cb/Cr
+        // AC counts (scan 1..14 and 1..19), not total counts including DC.
+        // `decode_partial_ac` starts its local cursor at zero and adds `start=1`,
+        // so passing the raw values consumes those exact scan ranges.
         let cb_extent = usize::from(payload[1].min(64));
         let cr_extent = usize::from(payload[2].min(64));
         let mut reader = BitReader::new(&payload[3..]);
-        let mut next_decoder = self.clone();
+        // Type-1 never changes persistent tile seed/reference metadata. Stage
+        // only its cache delta and pixel operations; cloning the full decoder
+        // here would copy the complete desktop for every incremental update.
+        let mut next_cache_state = self.cache_state.clone();
+        let mut operations = Vec::new();
 
         for local_tile_index in 0..tile_count {
             let tile_column = local_tile_index % tiles_x;
@@ -625,6 +750,14 @@ impl MvsFullDecoder {
                 .tiles
                 .get(global_tile_index)
                 .context("MVS type-1 全局 tile 索引越界")?;
+            let destination_x = rect_x
+                .checked_add(tile_column * TILE_EDGE)
+                .context("MVS type-1 目标 tile x 溢出")?;
+            let destination_y = rect_y
+                .checked_add(tile_row * TILE_EDGE)
+                .context("MVS type-1 目标 tile y 溢出")?;
+            let visible_width = TILE_EDGE.min(rect_right - destination_x);
+            let visible_height = TILE_EDGE.min(rect_bottom - destination_y);
             let opcode_start_bit = reader.bit_position();
             let opcode_result = reader.read_bits(2).context("MVS type-1 opcode 不完整");
             let opcode = opcode_result.with_context(|| {
@@ -641,26 +774,41 @@ impl MvsFullDecoder {
                             .coefficients
                             .as_ref()
                             .context("MVS type-1 opcode 1 缺少 full-frame 系数 seed")?;
-                        let entry = prepare_partial_cache_entry(
-                            &mut reader,
-                            seed,
-                            cb_extent,
-                            cr_extent,
+                        let (entry, coefficients) =
+                            prepare_partial_cache_entry(&mut reader, seed, cb_extent, cr_extent)?;
+                        operations.push(prepare_replace_operation(
+                            &coefficients,
                             &self.tables,
-                        )?;
-                        stage_cache_population(&mut next_decoder.cache_state, entry)?;
+                            destination_x,
+                            destination_y,
+                            visible_width,
+                            visible_height,
+                        )?);
+                        stage_cache_population(&mut next_cache_state, entry)?;
                     }
-                    2 => validate_saved_reference(surface, tile)?,
+                    2 => {
+                        if let Some(reference) =
+                            resolve_saved_reference(surface, tile, visible_width, visible_height)?
+                        {
+                            let source_pixel =
+                                reference.framebuffer_offset / APPLE_FRAMEBUFFER_PIXEL_BYTES;
+                            operations.push(PartialPixelOperation::Copy {
+                                source_x: source_pixel % surface.width,
+                                source_y: source_pixel / surface.width,
+                                destination_x,
+                                destination_y,
+                                width: visible_width,
+                                height: visible_height,
+                            });
+                        }
+                    }
                     3 => {
                         let index = if reader
                             .read_bits(1)
                             .context("MVS type-1 opcode 3 缺少 selector")?
                             != 0
                         {
-                            next_decoder
-                                .cache_state
-                                .previous_cache_index
-                                .wrapping_add(1)
+                            next_cache_state.previous_cache_index.wrapping_add(1)
                         } else {
                             let high = u16::from(
                                 reader.read_u8().context("MVS type-1 opcode 3 缺少高字节")?,
@@ -676,9 +824,17 @@ impl MvsFullDecoder {
                         // advances the previous-index state. Rust still rejects
                         // unsafe indices inside `lookup_cache_entry` without ever
                         // indexing the fixed cache.
-                        if let Ok(entry) = lookup_cache_entry(&next_decoder.cache_state, index) {
-                            run_cache_entry_idct_scratch(&entry, &self.tables)?;
-                            next_decoder.cache_state.previous_cache_index = index;
+                        if let Ok(entry) = lookup_cache_entry(&next_cache_state, index) {
+                            let coefficients = cache_entry_coefficients(&entry);
+                            operations.push(prepare_replace_operation(
+                                &coefficients,
+                                &self.tables,
+                                destination_x,
+                                destination_y,
+                                visible_width,
+                                visible_height,
+                            )?);
+                            next_cache_state.previous_cache_index = index;
                         }
                     }
                     _ => unreachable!("two-bit opcode is always in 0..=3"),
@@ -710,11 +866,23 @@ impl MvsFullDecoder {
             })?;
         }
 
-        Ok(PreparedMvsOpaqueState { next_decoder })
+        Ok(PreparedMvsOpaqueState {
+            partial_pixels: PreparedPartialPixels { operations },
+            next_cache_state,
+        })
     }
 
-    pub(crate) fn commit_opaque(&mut self, prepared: PreparedMvsOpaqueState) {
-        *self = prepared.next_decoder;
+    pub(crate) fn commit_opaque(
+        &mut self,
+        prepared: PreparedMvsOpaqueState,
+    ) -> PreparedPartialPixels {
+        let surface = self
+            .surface_state
+            .as_mut()
+            .expect("prepared type-1 state retains its committed surface");
+        apply_validated_partial_operations_to_surface(surface, &prepared.partial_pixels.operations);
+        self.cache_state = prepared.next_cache_state;
+        prepared.partial_pixels
     }
 }
 
@@ -918,8 +1086,7 @@ fn prepare_partial_cache_entry(
     seed: &SavedCoefficientSeed,
     cb_extent: usize,
     cr_extent: usize,
-    tables: &MvsTables,
-) -> Result<[i8; MVS_CACHE_ENTRY_BYTES]> {
+) -> Result<([i8; MVS_CACHE_ENTRY_BYTES], ModeFiveCoefficients)> {
     let saved_y = refine_saved_y(reader, seed)?;
     if seed.cb_count != 1 || seed.cr_count != 1 {
         bail!("MVS type-1 opcode 1 saved Cb/Cr count 必须均为 1");
@@ -935,7 +1102,7 @@ fn prepare_partial_cache_entry(
         &mut coefficients.cb,
         1,
         cb_extent,
-        &APPLE_CHROMA_AC_HUFFMAN,
+        &APPLE_LUMA_AC_HUFFMAN,
     )?;
     coefficients.cr[0] = refine_saved_chroma_dc(reader, seed.cr_dc)?;
     decode_partial_ac(
@@ -943,10 +1110,8 @@ fn prepare_partial_cache_entry(
         &mut coefficients.cr,
         1,
         cr_extent,
-        &APPLE_CHROMA_AC_HUFFMAN,
+        &APPLE_LUMA_AC_HUFFMAN,
     )?;
-
-    run_partial_idct_scratch(&coefficients, tables)?;
 
     let mut entry = [0i8; MVS_CACHE_ENTRY_BYTES];
     entry[..64].copy_from_slice(&saved_y);
@@ -956,10 +1121,13 @@ fn prepare_partial_cache_entry(
     for scan in 0..20 {
         entry[79 + scan] = coefficients.cr[APPLE_NATURAL_ORDER[scan]] as i8;
     }
-    Ok(entry)
+    Ok((entry, coefficients))
 }
 
-fn run_partial_idct_scratch(coefficients: &ModeFiveCoefficients, tables: &MvsTables) -> Result<()> {
+fn run_partial_idct_scratch(
+    coefficients: &ModeFiveCoefficients,
+    tables: &MvsTables,
+) -> Result<[u8; TILE_EDGE * TILE_EDGE * RGB_CHANNELS]> {
     let y = inverse_dct_8x8(&coefficients.y, &tables.luminance)
         .context("MVS type-1 Y IDCT scratch 失败")?;
     let cb = inverse_dct_8x8(&coefficients.cb, &tables.chrominance)
@@ -973,7 +1141,36 @@ fn run_partial_idct_scratch(coefficients: &ModeFiveCoefficients, tables: &MvsTab
         scratch[offset..offset + RGB_CHANNELS].copy_from_slice(&color);
     }
     record_partial_order_event(PartialOrderEvent::IdctScratch);
-    Ok(())
+    Ok(scratch)
+}
+
+fn prepare_replace_operation(
+    coefficients: &ModeFiveCoefficients,
+    tables: &MvsTables,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Result<PartialPixelOperation> {
+    let scratch = run_partial_idct_scratch(coefficients, tables)?;
+    let rgb_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(RGB_CHANNELS))
+        .context("MVS type-1 RGB patch 长度溢出")?;
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(rgb_len)
+        .context("MVS type-1 RGB patch 分配失败")?;
+    for row in 0..height {
+        let start = row * TILE_EDGE * RGB_CHANNELS;
+        rgb.extend_from_slice(&scratch[start..start + width * RGB_CHANNELS]);
+    }
+    Ok(PartialPixelOperation::Replace {
+        x,
+        y,
+        width,
+        height,
+        rgb,
+    })
 }
 
 fn stage_cache_population(
@@ -1029,36 +1226,107 @@ fn cache_entry_coefficients(entry: &[i8; MVS_CACHE_ENTRY_BYTES]) -> ModeFiveCoef
     coefficients
 }
 
-fn run_cache_entry_idct_scratch(
-    entry: &[i8; MVS_CACHE_ENTRY_BYTES],
-    tables: &MvsTables,
-) -> Result<()> {
-    run_partial_idct_scratch(&cache_entry_coefficients(entry), tables)
-}
-
-fn validate_saved_reference(surface: &MvsSurfaceState, tile: &SavedTileState) -> Result<()> {
+fn resolve_saved_reference<'a>(
+    surface: &MvsSurfaceState,
+    tile: &'a SavedTileState,
+    width: usize,
+    height: usize,
+) -> Result<Option<&'a SavedTileReference>> {
     // Apple treats an absent saved reference, or a reference whose source
     // generation no longer matches, as a pixel-opaque no-op and continues the
     // type-1 record. A present matching reference is still bounds-validated.
     let Some(reference) = tile.reference.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let source = surface
         .tiles
         .get(reference.tile_index)
         .context("MVS type-1 opcode 2 saved reference tile 越界")?;
     if source.generation != tile.generation {
-        return Ok(());
+        return Ok(None);
     }
     let framebuffer_bytes = surface
         .width
         .checked_mul(surface.height)
         .and_then(|value| value.checked_mul(APPLE_FRAMEBUFFER_PIXEL_BYTES))
         .context("MVS type-1 framebuffer 长度溢出")?;
-    if reference.framebuffer_offset >= framebuffer_bytes {
+    if reference.framebuffer_offset % APPLE_FRAMEBUFFER_PIXEL_BYTES != 0
+        || reference.framebuffer_offset >= framebuffer_bytes
+    {
         bail!("MVS type-1 opcode 2 framebuffer offset 越界");
     }
-    Ok(())
+    let source_pixel = reference.framebuffer_offset / APPLE_FRAMEBUFFER_PIXEL_BYTES;
+    let source_x = source_pixel % surface.width;
+    let source_y = source_pixel / surface.width;
+    if source_x
+        .checked_add(width)
+        .is_none_or(|right| right > surface.width)
+        || source_y
+            .checked_add(height)
+            .is_none_or(|bottom| bottom > surface.height)
+    {
+        bail!("MVS type-1 opcode 2 framebuffer copy 超出 surface");
+    }
+    Ok(Some(reference))
+}
+
+fn apply_validated_partial_operations_to_surface(
+    surface: &mut MvsSurfaceState,
+    operations: &[PartialPixelOperation],
+) {
+    for operation in operations {
+        match operation {
+            PartialPixelOperation::Replace {
+                x,
+                y,
+                width,
+                height,
+                rgb,
+            } => {
+                let row_bytes = width * RGB_CHANNELS;
+                debug_assert_eq!(rgb.len(), row_bytes * *height);
+                debug_assert!(x + *width <= surface.width);
+                debug_assert!(y + *height <= surface.height);
+                for row in 0..*height {
+                    let source = row * row_bytes;
+                    let destination = ((*y + row) * surface.width + *x) * RGB_CHANNELS;
+                    surface.rgb[destination..destination + row_bytes]
+                        .copy_from_slice(&rgb[source..source + row_bytes]);
+                }
+            }
+            PartialPixelOperation::Copy {
+                source_x,
+                source_y,
+                destination_x,
+                destination_y,
+                width,
+                height,
+            } => {
+                debug_assert!(source_x + *width <= surface.width);
+                debug_assert!(source_y + *height <= surface.height);
+                debug_assert!(destination_x + *width <= surface.width);
+                debug_assert!(destination_y + *height <= surface.height);
+                debug_assert!(*width <= TILE_EDGE && *height <= TILE_EDGE);
+                let row_bytes = width * RGB_CHANNELS;
+                let staging_len = row_bytes * *height;
+                let mut staging = [0u8; TILE_EDGE * TILE_EDGE * RGB_CHANNELS];
+                debug_assert!(staging_len <= staging.len());
+                for row in 0..*height {
+                    let source = ((*source_y + row) * surface.width + *source_x) * RGB_CHANNELS;
+                    let destination = row * row_bytes;
+                    staging[destination..destination + row_bytes]
+                        .copy_from_slice(&surface.rgb[source..source + row_bytes]);
+                }
+                for row in 0..*height {
+                    let source = row * row_bytes;
+                    let destination =
+                        ((*destination_y + row) * surface.width + *destination_x) * RGB_CHANNELS;
+                    surface.rgb[destination..destination + row_bytes]
+                        .copy_from_slice(&staging[source..source + row_bytes]);
+                }
+            }
+        }
+    }
 }
 
 fn decode_unary_ones(
@@ -1351,10 +1619,12 @@ fn decode_mode_five_coefficients(
         current.cb[0] = prior.cb[0];
         current.cr[0] = prior.cr[0];
     } else {
-        let cb_delta = decode_dc_rice(reader).context("MVS mode 5 Cb DC 解码失败")?;
-        current.cb[0] = apply_chroma_dc_predictor(prior.cb[0], cb_delta)?;
+        // ARD type-0 mode 5 writes Cr before Cb. This differs deliberately
+        // from type-1, whose partial stream writes Cb before Cr.
         let cr_delta = decode_dc_rice(reader).context("MVS mode 5 Cr DC 解码失败")?;
         current.cr[0] = apply_chroma_dc_predictor(prior.cr[0], cr_delta)?;
+        let cb_delta = decode_dc_rice(reader).context("MVS mode 5 Cb DC 解码失败")?;
+        current.cb[0] = apply_chroma_dc_predictor(prior.cb[0], cb_delta)?;
     }
 
     let y_delta = decode_dc_rice(reader).context("MVS mode 5 Y DC 解码失败")?;
@@ -1430,22 +1700,81 @@ fn fill_tile(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn copy_tile(
-    rgb: &mut [u8],
-    width: usize,
-    height: usize,
+fn copy_surface_tile_to_rect(
+    surface_rgb: &[u8],
+    surface_width: usize,
+    surface_height: usize,
+    rect_rgb: &mut [u8],
+    rect_width: usize,
+    rect_height: usize,
     source_x: usize,
     source_y: usize,
     tile_x: usize,
     tile_y: usize,
-) {
-    for dy in 0..TILE_EDGE.min(height - tile_y) {
-        for dx in 0..TILE_EDGE.min(width - tile_x) {
-            let source = pixel_offset(width, source_x + dx, source_y + dy);
-            let color = [rgb[source], rgb[source + 1], rgb[source + 2]];
-            write_pixel(rgb, width, tile_x + dx, tile_y + dy, color);
+) -> Result<()> {
+    let copy_width = TILE_EDGE.min(rect_width - tile_x);
+    let copy_height = TILE_EDGE.min(rect_height - tile_y);
+    if source_x
+        .checked_add(copy_width)
+        .is_none_or(|right| right > surface_width)
+        || source_y
+            .checked_add(copy_height)
+            .is_none_or(|bottom| bottom > surface_height)
+    {
+        bail!("MVS type-0 copy source 超出 committed surface");
+    }
+    for dy in 0..copy_height {
+        for dx in 0..copy_width {
+            let source = pixel_offset(surface_width, source_x + dx, source_y + dy);
+            let color = [
+                surface_rgb[source],
+                surface_rgb[source + 1],
+                surface_rgb[source + 2],
+            ];
+            write_pixel(rect_rgb, rect_width, tile_x + dx, tile_y + dy, color);
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_rect_tile_to_surface(
+    rect_rgb: &[u8],
+    rect_width: usize,
+    rect_height: usize,
+    tile_x: usize,
+    tile_y: usize,
+    surface_rgb: &mut [u8],
+    surface_width: usize,
+    surface_height: usize,
+    destination_x: usize,
+    destination_y: usize,
+) -> Result<()> {
+    let copy_width = TILE_EDGE.min(rect_width - tile_x);
+    let copy_height = TILE_EDGE.min(rect_height - tile_y);
+    if destination_x
+        .checked_add(copy_width)
+        .is_none_or(|right| right > surface_width)
+        || destination_y
+            .checked_add(copy_height)
+            .is_none_or(|bottom| bottom > surface_height)
+    {
+        bail!("MVS type-0 copy destination 超出 committed surface");
+    }
+    for dy in 0..copy_height {
+        for dx in 0..copy_width {
+            let source = pixel_offset(rect_width, tile_x + dx, tile_y + dy);
+            let color = [rect_rgb[source], rect_rgb[source + 1], rect_rgb[source + 2]];
+            write_pixel(
+                surface_rgb,
+                surface_width,
+                destination_x + dx,
+                destination_y + dy,
+                color,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1833,7 +2162,7 @@ mod tests {
         let cb_minus_forty = "11111110_000_1";
         let cr_plus_twenty_four = "111110_000_0";
         let y_minus_eighty = "1111111111110_000_1";
-        let literal = format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_{y_minus_eighty}_0010");
+        let literal = format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_{y_minus_eighty}_0010");
         let literals = vec![literal.as_str(); tile_count];
         mode_five_data(&literals)
     }
@@ -2297,7 +2626,7 @@ mod tests {
         let cr_plus_twenty_four = "111110_000_0";
         let y_minus_eight = "1110_000_1";
         let data = mode_five_data(&[
-            &format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_00_0010"),
+            &format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_00_0010"),
             &format!("0_1_0_{y_minus_eight}_0010"),
         ]);
         let prepared = prepare(&decoder_with_tables(1, 1), &modes, &data, 16, 8).unwrap();
@@ -2402,7 +2731,7 @@ mod tests {
     fn distinct_luma_and_chroma_tables_produce_literal_mode_five_rgb() {
         let modes = mode_stream(&[(5, 0)]);
         let minus_forty = "11111110_000_1";
-        let data = mode_five_data(&[&format!("0_0_0_{minus_forty}_00_{minus_forty}_0010")]);
+        let data = mode_five_data(&[&format!("0_0_0_00_{minus_forty}_{minus_forty}_0010")]);
         let prepared = prepare(&decoder_with_tables(2, 1), &modes, &data, 8, 8).unwrap();
         assert!(MvsFullDecoder::decoded(&prepared)
             .rgb
@@ -2477,7 +2806,7 @@ mod tests {
         let modes = mode_stream(&[(5, 1)]);
         let cb_minus_forty = "11111110_000_1";
         let cr_plus_twenty_four = "111110_000_0";
-        let source = format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_00_010_0010");
+        let source = format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_00_010_0010");
         let data = mode_five_data(&[&source, "1"]);
         let record = record_with_thresholds(&modes, &data, 15, 0);
         let prepared = decoder_with_tables(64, 1).prepare(&record, 16, 8).unwrap();
@@ -2516,7 +2845,7 @@ mod tests {
         let cb_minus_forty = "11111110_000_1";
         let cr_plus_twenty_four = "111110_000_0";
         let y_minus_eighty = "1111111111110_000_1";
-        let source = format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_{y_minus_eighty}_0010");
+        let source = format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_{y_minus_eighty}_0010");
         let data = mode_five_data(&[&source, "1"]);
         let record = record_with_thresholds(&modes, &data, 15, 31);
         let mut decoder = decoder_with_tables(1, 1);
@@ -2898,11 +3227,23 @@ mod tests {
     fn slice_b_minimal_opcode_one_stages_exact_slot_after_idct_then_commit() {
         let mut decoder = decoder_with_tables(1, 1);
         seed_asymmetric_surface(&mut decoder, 8, 8);
-        let partial = partial_payload(1, 1, &["01_000000_0_00_0_00"]);
+        // ARD 的 partial helper 对两路 chroma 系数都使用标准亮度 AC 表；
+        // 该表的 EOB 是 1010，而不是色度 AC 表的 00。
+        let partial = partial_payload(1, 1, &["01_000000_0_1010_0_1010"]);
         clear_partial_order_trace();
 
         let prepared = decoder.prepare_partial(&partial, 0, 0, 8, 8, 8, 8).unwrap();
         assert_eq!(cache_entry_snapshot(&decoder, 1), None);
+        assert!(matches!(
+            prepared.partial_pixels.operations.as_slice(),
+            [PartialPixelOperation::Replace {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+                rgb,
+            }] if rgb.len() == 8 * 8 * RGB_CHANNELS
+        ));
         assert_eq!(
             take_partial_order_trace(),
             vec![
@@ -2925,7 +3266,7 @@ mod tests {
         let mut decoder = decoder_with_tables(1, 1);
         seed_asymmetric_surface(&mut decoder, 8, 8);
         // Cb: unchanged DC, run1/size1 -1, EOB. Cr: unchanged DC, EOB.
-        let partial = partial_payload(3, 1, &["01_000000_0_1011_0_00_0_00"]);
+        let partial = partial_payload(3, 1, &["01_000000_0_1100_0_1010_0_1010"]);
         let prepared = decoder.prepare_partial(&partial, 0, 0, 8, 8, 8, 8).unwrap();
         decoder.commit_opaque(prepared);
 
@@ -2940,9 +3281,9 @@ mod tests {
     fn slice_b_natural_order_overflow_and_bad_terminal_roll_back_earlier_population() {
         let mut decoder = decoder_with_tables(1, 1);
         seed_asymmetric_surface(&mut decoder, 16, 8);
-        let first = "01_000000_0_00_0_00";
+        let first = "01_000000_0_1010_0_1010";
         let overflow = concat!(
-            "01_000000_0_00_0_",
+            "01_000000_0_1010_0_",
             "1111111010_1111111010_1111111010_11111111100000_1"
         );
         let bad_natural_order = partial_payload(1, 64, &[first, overflow]);
@@ -2970,7 +3311,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .cb_count = 2;
-        let partial = partial_payload(1, 1, &["01_000000_0_00_0_00"]);
+        let partial = partial_payload(1, 1, &["01_000000_0_1010_0_1010"]);
 
         assert!(decoder.prepare_partial(&partial, 0, 0, 8, 8, 8, 8).is_err());
         assert_eq!(cache_index_snapshot(&decoder), (0, 0, 0));
@@ -3041,7 +3382,11 @@ mod tests {
     fn slice_b_opcode_three_explicit_big_endian_and_previous_plus_one_are_bounded() {
         let mut decoder = decoder_with_tables(1, 1);
         seed_asymmetric_surface(&mut decoder, 16, 8);
-        let populate = partial_payload(1, 1, &["01_000000_0_00_0_00", "01_000000_0_00_0_00"]);
+        let populate = partial_payload(
+            1,
+            1,
+            &["01_000000_0_1010_0_1010", "01_000000_0_1010_0_1010"],
+        );
         let prepared = decoder
             .prepare_partial(&populate, 0, 0, 16, 8, 16, 8)
             .unwrap();
@@ -3080,7 +3425,7 @@ mod tests {
         let mut decoder = decoder_with_tables(1, 1);
         seed_asymmetric_surface(&mut decoder, 16, 8);
         let populate_then_missing_lookup =
-            partial_payload(1, 1, &["01_000000_0_00_0_00", "11_0_00000000_00000010"]);
+            partial_payload(1, 1, &["01_000000_0_1010_0_1010", "11_0_00000000_00000010"]);
 
         let prepared = decoder
             .prepare_partial(&populate_then_missing_lookup, 0, 0, 16, 8, 16, 8)
@@ -3118,7 +3463,7 @@ mod tests {
     fn slice_b_population_advances_slot_two_and_wraps_64999_to_overwrite_slot_one() {
         let mut decoder = decoder_with_tables(1, 1);
         seed_asymmetric_surface(&mut decoder, 8, 8);
-        let partial = partial_payload(1, 1, &["01_000000_0_00_0_00"]);
+        let partial = partial_payload(1, 1, &["01_000000_0_1010_0_1010"]);
         let first = decoder.prepare_partial(&partial, 0, 0, 8, 8, 8, 8).unwrap();
         decoder.commit_opaque(first);
         let slot_one = cache_entry_snapshot(&decoder, 1).unwrap();
@@ -3155,7 +3500,7 @@ mod tests {
             let modes = mode_stream(&[(mode, 0)]);
             let full = seeded.prepare(&record(&modes, &data), 8, 8).unwrap();
             seeded.commit(full);
-            let opcode_one = partial_payload(1, 1, &["01_000000_0_00_0_00"]);
+            let opcode_one = partial_payload(1, 1, &["01_000000_0_1010_0_1010"]);
             let opaque = seeded
                 .prepare_partial(&opcode_one, 0, 0, 8, 8, 8, 8)
                 .unwrap();
@@ -3180,7 +3525,7 @@ mod tests {
             decoder.commit(full);
             assert!(reference_snapshot(&decoder, 1).is_some());
 
-            let opcode_one = partial_payload(1, 1, &["00", "01_000000_0_00_0_00"]);
+            let opcode_one = partial_payload(1, 1, &["00", "01_000000_0_1010_0_1010"]);
             let opaque = decoder
                 .prepare_partial(&opcode_one, 0, 0, width, height, width, height)
                 .unwrap();
@@ -3244,59 +3589,17 @@ mod tests {
         initial.commit(prepared);
         assert_eq!(initial.cache_state.previous_cache_index, 1);
 
-        let absent = decoder_with_tables(64, 1);
-        assert!(absent
+        let mut absent = decoder_with_tables(64, 1);
+        let prepared = absent
             .prepare(
                 &record(&mode_stream(&[(7, 0)]), &terminal_only_data()),
                 8,
                 8,
             )
-            .is_err());
-    }
-
-    #[test]
-    fn slice_c_invalid_uninitialized_and_count_mismatch_lookups_are_transactional() {
-        for index in [0u16, 65_000u32 as u16] {
-            let decoder = decoder_with_tables(64, 1);
-            let data = cache_mode_data(&[index]);
-            assert!(decoder
-                .prepare(&record(&mode_stream(&[(6, 0)]), &data), 8, 8)
-                .is_err());
-            assert_eq!(decoder.cache_state.previous_cache_index, 0);
-            assert!(decoder.surface_state.is_none());
-        }
-
-        let mut uninitialized = decoder_with_tables(64, 1);
-        uninitialized.cache_state.population_count = 2;
-        assert!(uninitialized
-            .prepare(
-                &record(&mode_stream(&[(6, 0)]), &cache_mode_data(&[2])),
-                8,
-                8,
-            )
-            .is_err());
-        assert_eq!(uninitialized.cache_state.previous_cache_index, 0);
-
-        let mut mismatch = decoder_with_tables(64, 1);
-        install_cache_entry(&mut mismatch, 2, ac_cache_entry(1), 1);
-        assert!(mismatch
-            .prepare(
-                &record(&mode_stream(&[(6, 0)]), &cache_mode_data(&[2])),
-                8,
-                8,
-            )
-            .is_err());
-        assert_eq!(mismatch.cache_state.previous_cache_index, 0);
-
-        let mut earlier_success = decoder_with_tables(64, 1);
-        install_cache_entry(&mut earlier_success, 1, ac_cache_entry(1), 1);
-        let modes = mode_stream(&[(6, 0), (6, 0)]);
-        let data = cache_mode_data(&[1, 0]);
-        assert!(earlier_success
-            .prepare(&record(&modes, &data), 16, 8)
-            .is_err());
-        assert_eq!(earlier_success.cache_state.previous_cache_index, 0);
-        assert!(earlier_success.surface_state.is_none());
+            .unwrap();
+        assert_eq!(MvsFullDecoder::decoded(&prepared).rgb, vec![0; 8 * 8 * 3]);
+        absent.commit(prepared);
+        assert_eq!(absent.cache_state.previous_cache_index, 0);
     }
 
     #[test]
@@ -3345,7 +3648,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_one_copies_immediately_left_tile_and_rejects_first_column() {
+    fn mode_one_copies_immediately_left_tile_and_preserves_existing_first_column() {
         let modes = mode_stream(&[(3, 1), (1, 0)]);
         let data = two_asymmetric_mode_three_tiles_data();
         let prepared = prepare(&decoder(), &modes, &data, 24, 8).unwrap();
@@ -3358,12 +3661,42 @@ mod tests {
         assert_eq!(pixel(decoded, 15, 0), [255, 255, 255]);
         assert_eq!(copied, immediate_left);
 
-        let invalid_modes = mode_stream(&[(1, 0)]);
-        assert!(prepare(&decoder(), &invalid_modes, &terminal_only_data(), 8, 8,).is_err());
+        let first_column = mode_stream(&[(1, 0)]);
+        let prepared = prepare(&decoder(), &first_column, &terminal_only_data(), 8, 8).unwrap();
+        assert_eq!(MvsFullDecoder::decoded(&prepared).rgb, vec![0; 8 * 8 * 3]);
     }
 
     #[test]
-    fn mode_two_copies_immediately_above_tile_and_rejects_first_row() {
+    fn mode_one_at_subrectangle_first_column_preserves_the_existing_destination_tile() {
+        let mut decoder = decoder();
+        let seed_modes = mode_stream(&[(3, 1)]);
+        let seed_data = two_asymmetric_mode_three_tiles_data();
+        let seed = decoder
+            .prepare(&record(&seed_modes, &seed_data), 16, 8)
+            .unwrap();
+        let expected = complete_tile(MvsFullDecoder::decoded(&seed), 8, 0).to_vec();
+        decoder.commit(seed);
+
+        let modes = mode_stream(&[(1, 0)]);
+        let prepared = decoder
+            .prepare_rect(&record(&modes, &terminal_only_data()), 8, 0, 8, 8, 16, 8)
+            .unwrap();
+
+        assert_eq!(MvsFullDecoder::decoded(&prepared).rgb, expected);
+    }
+
+    #[test]
+    fn mode_one_at_later_record_row_copies_the_previous_scan_tile() {
+        let modes = mode_stream(&[(3, 1), (1, 0), (0, 0)]);
+        let data = two_asymmetric_mode_three_tiles_data();
+        let prepared = prepare(&decoder(), &modes, &data, 16, 16).unwrap();
+        let decoded = MvsFullDecoder::decoded(&prepared);
+
+        assert_eq!(complete_tile(decoded, 0, 8), complete_tile(decoded, 8, 0));
+    }
+
+    #[test]
+    fn mode_two_copies_immediately_above_tile_and_preserves_existing_first_row() {
         let modes = mode_stream(&[(3, 1), (2, 0)]);
         let data = two_asymmetric_mode_three_tiles_data();
         let prepared = prepare(&decoder(), &modes, &data, 8, 24).unwrap();
@@ -3376,8 +3709,9 @@ mod tests {
         assert_eq!(pixel(decoded, 7, 8), [255, 255, 255]);
         assert_eq!(copied, immediate_above);
 
-        let invalid_modes = mode_stream(&[(2, 0)]);
-        assert!(prepare(&decoder(), &invalid_modes, &terminal_only_data(), 8, 8,).is_err());
+        let first_row = mode_stream(&[(2, 0)]);
+        let prepared = prepare(&decoder(), &first_row, &terminal_only_data(), 8, 8).unwrap();
+        assert_eq!(MvsFullDecoder::decoded(&prepared).rgb, vec![0; 8 * 8 * 3]);
     }
 
     #[test]
@@ -3490,12 +3824,26 @@ mod tests {
     }
 
     #[test]
-    fn cache_modes_fail_closed_without_required_fields_or_initialized_slot() {
-        let data = terminal_only_data();
-        for mode in [6, 7] {
+    fn full_cache_miss_is_fail_soft_but_wire_fields_remain_required() {
+        let mut seeded = decoder();
+        let white = prepare(
+            &seeded,
+            &mode_stream(&[(0, 0)]),
+            &terminal_only_data(),
+            8,
+            8,
+        )
+        .unwrap();
+        seeded.commit(white);
+
+        for (mode, data) in [(6, cache_mode_data(&[1])), (7, terminal_only_data())] {
             let modes = mode_stream(&[(mode, 0)]);
-            assert!(prepare(&decoder(), &modes, &data, 8, 8).is_err());
+            let prepared = prepare(&seeded, &modes, &data, 8, 8).unwrap();
+            assert_eq!(MvsFullDecoder::decoded(&prepared).rgb, vec![255; 8 * 8 * 3]);
         }
+
+        let modes = mode_stream(&[(6, 0)]);
+        assert!(prepare(&decoder(), &modes, &terminal_only_data(), 8, 8).is_err());
     }
 
     #[test]

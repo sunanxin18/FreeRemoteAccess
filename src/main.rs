@@ -954,6 +954,87 @@ fn apply_offline_rgb_rect(
     Ok(())
 }
 
+fn apply_offline_partial_pixels(
+    surface: &mut [u8],
+    surface_width: u16,
+    surface_height: u16,
+    partial: &crate::vnc::mvs_full::PreparedPartialPixels,
+) -> Result<()> {
+    use crate::vnc::mvs_full::PartialPixelOperation;
+
+    for operation in &partial.operations {
+        match operation {
+            PartialPixelOperation::Replace {
+                x,
+                y,
+                width,
+                height,
+                rgb,
+            } => apply_offline_rgb_rect(
+                surface,
+                surface_width,
+                surface_height,
+                crate::vnc::mvs_stream::MvsRect {
+                    x: u16::try_from(*x).context("离线 MVS partial x 超出 u16")?,
+                    y: u16::try_from(*y).context("离线 MVS partial y 超出 u16")?,
+                    width: u16::try_from(*width).context("离线 MVS partial width 超出 u16")?,
+                    height: u16::try_from(*height).context("离线 MVS partial height 超出 u16")?,
+                },
+                rgb,
+            )?,
+            PartialPixelOperation::Copy {
+                source_x,
+                source_y,
+                destination_x,
+                destination_y,
+                width,
+                height,
+            } => {
+                let surface_width = usize::from(surface_width);
+                let surface_height = usize::from(surface_height);
+                if source_x
+                    .checked_add(*width)
+                    .is_none_or(|right| right > surface_width)
+                    || source_y
+                        .checked_add(*height)
+                        .is_none_or(|bottom| bottom > surface_height)
+                    || destination_x
+                        .checked_add(*width)
+                        .is_none_or(|right| right > surface_width)
+                    || destination_y
+                        .checked_add(*height)
+                        .is_none_or(|bottom| bottom > surface_height)
+                {
+                    anyhow::bail!("离线 MVS partial copy 超出 surface");
+                }
+                let row_bytes = width
+                    .checked_mul(MVS_RGB_CHANNEL_BYTES)
+                    .context("离线 MVS partial copy 行字节溢出")?;
+                let copied_len = row_bytes
+                    .checked_mul(*height)
+                    .context("离线 MVS partial copy staging 长度溢出")?;
+                let mut copied = Vec::new();
+                copied
+                    .try_reserve_exact(copied_len)
+                    .context("离线 MVS partial copy staging 分配失败")?;
+                for row in 0..*height {
+                    let source =
+                        ((*source_y + row) * surface_width + *source_x) * MVS_RGB_CHANNEL_BYTES;
+                    copied.extend_from_slice(&surface[source..source + row_bytes]);
+                }
+                for row in 0..*height {
+                    let destination = ((*destination_y + row) * surface_width + *destination_x)
+                        * MVS_RGB_CHANNEL_BYTES;
+                    let source = row * row_bytes;
+                    surface[destination..destination + row_bytes]
+                        .copy_from_slice(&copied[source..source + row_bytes]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn replay_offline_mvs_records<'a, I>(
     surface_size: (u16, u16),
     generation: u64,
@@ -1003,11 +1084,30 @@ where
                 stats.type_one += 1;
                 match decoder.prepare_rect(generation, payload, record.rect, width, height) {
                     Ok(mvs::MvsDecodeDecision::PreparedOpaque(prepared)) => {
-                        if decoder.commit_opaque(prepared).is_ok() {
-                            stats.state_applied += 1;
-                        } else {
+                        let has_pixels = !prepared.partial_pixels().operations.is_empty();
+                        let mut staged = rgb.clone();
+                        if apply_offline_partial_pixels(
+                            &mut staged,
+                            width,
+                            height,
+                            prepared.partial_pixels(),
+                        )
+                        .is_err()
+                        {
                             stats.malformed += 1;
                             decoder.request_full(generation)?;
+                            continue;
+                        }
+                        if decoder.commit_opaque(prepared).is_err() {
+                            stats.malformed += 1;
+                            decoder.request_full(generation)?;
+                            continue;
+                        }
+                        rgb = staged;
+                        stats.state_applied += 1;
+                        if has_pixels {
+                            stats.applied += 1;
+                            applied_rects.push(record.rect);
                         }
                     }
                     Ok(mvs::MvsDecodeDecision::IgnoreStale) => stats.stale += 1,
@@ -1170,7 +1270,7 @@ fn cmd_hpss(
             let replay =
                 replay_offline_mvs_records(display, 0, records.iter().map(|record| (0, record)))?;
             println!(
-                "  MVS 顺序回放: tables={} type0={} type1_opaque={} state_applied={} malformed={} stale={} applied={}",
+                "  MVS 顺序回放: tables={} type0={} type1={} partial_state_applied={} malformed={} stale={} pixel_applied={}",
                 replay.stats.tables,
                 replay.stats.type_zero,
                 replay.stats.type_one,
@@ -1564,9 +1664,9 @@ mod tests {
         bits.write_bits(1, 2);
         bits.write_bits(0, 6);
         bits.write_bits(0, 1);
-        bits.write_bits(0, 2);
+        bits.write_bits(0b1010, 4);
         bits.write_bits(0, 1);
-        bits.write_bits(0, 2);
+        bits.write_bits(0b1010, 4);
         bits.write_bits(0x6d, 8);
         bits.write_bits(0x76, 8);
         bits.write_bits(0x73, 8);
@@ -1714,7 +1814,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_d_offline_opaque_population_is_consumed_by_later_mode_six() {
+    fn offline_partial_pixels_and_cache_are_consumed_by_later_mode_six() {
         let mut tables = vec![1; 129];
         tables[0] = 2;
         let records = vec![
@@ -1764,8 +1864,11 @@ mod tests {
         assert_eq!(replay.stats.type_one, 1);
         assert_eq!(replay.stats.state_applied, 1);
         assert_eq!(replay.stats.malformed, 0);
-        assert_eq!(replay.stats.applied, 2);
-        assert_eq!(replay.applied_rects, vec![records[1].rect, records[3].rect]);
+        assert_eq!(replay.stats.applied, 3);
+        assert_eq!(
+            replay.applied_rects,
+            vec![records[1].rect, records[2].rect, records[3].rect]
+        );
     }
 
     #[test]
@@ -2122,54 +2225,23 @@ mod tests {
         let first_failure = if replay.stats.malformed == 0 {
             "none".to_owned()
         } else {
-            let mut prior_malformed = 0usize;
-            strict
+            let records: Vec<_> = strict
                 .records
                 .iter()
-                .enumerate()
-                .find_map(|(record_index, record)| {
-                    let prefix = replay_offline_mvs_records(
-                        surface_size,
-                        0,
-                        strict.records[..=record_index]
-                            .iter()
-                            .map(|record| (record.generation, &record.record)),
+                .map(|record| record.record.clone())
+                .collect();
+            diagnose_first_external_mvs_failure(&records, surface_size)
+                .map(|failure| {
+                    format!(
+                        "record={} rect={:?} category={} reason={}",
+                        failure.record_index, failure.rect, failure.category, failure.reason
                     )
-                    .ok()?;
-                    let failed_here = prefix.stats.malformed > prior_malformed;
-                    prior_malformed = prefix.stats.malformed;
-                    failed_here.then(|| {
-                        let category = match crate::vnc::mvs::classify_mvs_record(
-                            record.record.rect,
-                            &record.record.payload,
-                        ) {
-                            Err(_) => "wire-classification",
-                            Ok(crate::vnc::mvs::MvsRecordKind::Tables(_)) => "table-install",
-                            Ok(crate::vnc::mvs::MvsRecordKind::Frame(payload))
-                                if payload.first() == Some(&1) =>
-                            {
-                                "type1-opaque-replay"
-                            }
-                            Ok(crate::vnc::mvs::MvsRecordKind::Frame(_)) => "type0-pixel-replay",
-                        };
-                        format!(
-                            "category={category} ordinal={} rect=({}, {}, {}, {}) tile=unknown mode=unknown cache_index=unknown",
-                            record.first_source_frame_ordinal,
-                            record.record.rect.x,
-                            record.record.rect.y,
-                            record.record.rect.width,
-                            record.record.rect.height,
-                        )
-                    })
                 })
-                .unwrap_or_else(|| {
-                    "category=replay-summary ordinal=unknown rect=unknown tile=unknown mode=unknown cache_index=unknown"
-                        .to_owned()
-                })
+                .unwrap_or_else(|| "category=replay-summary reason=unknown".to_owned())
         };
 
         eprintln!(
-            "Task7 strict-cold dimensions={}x{} counters: records={} type2={} type0={} type1={} opaque_state={} malformed={} stale={} pixel_applied={} first_failure={}",
+            "Task7 strict-cold dimensions={}x{} counters: records={} type2={} type0={} type1={} partial_state={} malformed={} stale={} pixel_applied={} first_failure={}",
             replay.width,
             replay.height,
             strict.records.len(),
@@ -2204,20 +2276,20 @@ mod tests {
         );
         assert!(
             replay.stats.state_applied <= replay.stats.type_one,
-            "type-1 records may commit only evidence-backed opaque/cache state"
+            "type-1 records may commit only validated incremental pixel/cache state"
         );
         assert_eq!(
             replay.applied_rects.len(),
             replay.stats.applied,
-            "decoded-pixel count must track only committed type-0 rectangles"
+            "decoded-pixel count must track committed type-0/type-1 rectangles"
         );
         assert!(
-            replay.stats.applied <= replay.stats.type_zero,
-            "type-1 records must never increment decoded-pixel application"
+            replay.stats.applied <= replay.stats.type_zero + replay.stats.state_applied,
+            "pixel application cannot exceed committed type-0 plus type-1 records"
         );
         assert!(
             replay.stats.applied >= 1,
-            "PNG requires at least one successfully applied type-0 record"
+            "PNG requires at least one successfully applied pixel record"
         );
         assert!(
             replay.rgb.chunks_exact(3).any(|pixel| pixel != [0, 0, 0]),
@@ -2274,7 +2346,7 @@ mod tests {
         );
 
         eprintln!(
-            "Task9 dimensions={}x{} counters: records={} tables={} type0={} type1_opaque={} state_applied={} malformed={} stale={} applied={} error_categories={}",
+            "Task9 dimensions={}x{} counters: records={} tables={} type0={} type1={} partial_state_applied={} malformed={} stale={} pixel_applied={} error_categories={}",
             replay.width,
             replay.height,
             records.len(),
@@ -2299,11 +2371,11 @@ mod tests {
         );
         assert_eq!(
             replay.stats.type_one, input_type_one,
-            "type-1 只能按 opaque 计数"
+            "type-1 输入计数必须保持完整"
         );
         assert!(
-            replay.stats.applied <= replay.stats.type_zero,
-            "applied 计数不得宣称解码 type-1"
+            replay.stats.applied <= replay.stats.type_zero + replay.stats.state_applied,
+            "pixel_applied 不得超过已提交的 type-0/type-1 记录"
         );
 
         let mut pixels = replay.rgb.chunks_exact(3);

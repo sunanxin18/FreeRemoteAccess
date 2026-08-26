@@ -1,15 +1,15 @@
 //! MVS（Multi Variant Stream）generation-scoped 原生解码事务。
 //!
 //! 经逆向证据校正后的 type-0/type-1/type-2 wire grammar 由
-//! [`crate::vnc::mvs_wire`] 独占；type-0 像素只通过原生 decoder 的
-//! prepare/apply/commit 边界发布。
+//! [`crate::vnc::mvs_wire`] 独占；type-0/type-1 像素只通过原生 decoder
+//! 的 prepare/apply/commit 边界发布。
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
 use crate::vnc::mvs_full::{
-    DecodedMvsRect, MvsFullDecoder, PreparedMvsFull, PreparedMvsOpaqueState,
+    DecodedMvsRect, MvsFullDecoder, PreparedMvsFull, PreparedMvsOpaqueState, PreparedPartialPixels,
 };
 use crate::vnc::mvs_stream::MvsRect;
 use crate::vnc::mvs_wire::{self, MvsWirePayload};
@@ -55,7 +55,6 @@ pub enum MvsRecordKind<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MvsResyncReason {
-    UnsupportedPartial,
     MissingTables,
     MalformedPayload,
 }
@@ -77,6 +76,12 @@ pub struct PreparedOpaqueMvsState {
 impl PreparedGenerationMvs {
     pub fn decoded(&self) -> &DecodedMvsRect {
         MvsFullDecoder::decoded(&self.prepared)
+    }
+}
+
+impl PreparedOpaqueMvsState {
+    pub fn partial_pixels(&self) -> &PreparedPartialPixels {
+        MvsFullDecoder::partial_pixels(&self.prepared)
     }
 }
 
@@ -122,7 +127,11 @@ impl MvsDecodeState {
         let MvsWirePayload::Tables(tables) = mvs_wire::parse_payload(init)? else {
             bail!("MVS 量化表初始化不是 type-2 记录");
         };
-        self.decoder = Some(MvsFullDecoder::new(tables));
+        if let Some(decoder) = self.decoder.as_mut() {
+            decoder.replace_tables(tables);
+        } else {
+            self.decoder = Some(MvsFullDecoder::new(tables));
+        }
         self.owner = Arc::new(());
         Ok(())
     }
@@ -195,7 +204,7 @@ impl MvsDecodeState {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         self.awaiting_full = true;
-                        return Err(error.context("MVS type-1 opaque-state prepare 失败"));
+                        return Err(error.context("MVS type-1 incremental prepare 失败"));
                     }
                 };
                 return Ok(MvsDecodeDecision::PreparedOpaque(PreparedOpaqueMvsState {
@@ -259,7 +268,10 @@ impl MvsDecodeState {
         Ok(decoded)
     }
 
-    pub fn commit_opaque(&mut self, prepared: PreparedOpaqueMvsState) -> Result<()> {
+    pub fn commit_opaque(
+        &mut self,
+        prepared: PreparedOpaqueMvsState,
+    ) -> Result<PreparedPartialPixels> {
         if prepared.generation != self.generation {
             bail!(
                 "MVS prepared opaque state 属于过期 generation: {}",
@@ -273,11 +285,11 @@ impl MvsDecodeState {
             .decoder
             .as_mut()
             .context("MVS opaque commit 前缺少原生 decoder")?;
-        decoder.commit_opaque(prepared.prepared);
-        // Opaque commit 也旋转 owner，但不改变 awaiting_full：
-        // type-1 cache side effect 不能充当 full-frame 证据。
+        let partial_pixels = decoder.commit_opaque(prepared.prepared);
+        // Partial commit 也旋转 owner，但不改变 awaiting_full：type-1
+        // 像素/cache 不能充当首个 type-0 codec 基态证据。
         self.owner = Arc::new(());
-        Ok(())
+        Ok(partial_pixels)
     }
 
     #[cfg(any(feature = "viewer", test))]
@@ -437,9 +449,9 @@ mod tests {
                 bits.write_bits(1, 2);
                 bits.write_bits(0, 6);
                 bits.write_bits(0, 1);
-                bits.write_bits(0, 2);
+                bits.write_bits(0b1010, 4);
                 bits.write_bits(0, 1);
-                bits.write_bits(0, 2);
+                bits.write_bits(0b1010, 4);
             },
             1,
             1,
@@ -475,12 +487,27 @@ mod tests {
     }
 
     #[test]
-    fn type_two_installation_creates_native_decoder_without_pixels() {
+    fn type_two_installation_preserves_native_tile_and_cache_state() {
         let mut state = MvsDecodeState::new(7);
         assert_eq!(state.install_tables(7, &type_two_tables()).unwrap(), ());
+        let seed = prepared(
+            state
+                .prepare(7, &mode_five_seed_full_payload(), 8, 8)
+                .unwrap(),
+        );
+        state.commit(seed).unwrap();
+        let partial = opaque(
+            state
+                .prepare(7, &opcode_one_partial_payload(), 8, 8)
+                .unwrap(),
+        );
+        state.commit_opaque(partial).unwrap();
+
+        state.install_tables(7, &type_two_tables()).unwrap();
+
         assert!(state.awaiting_full());
         assert!(matches!(
-            state.prepare(7, &mode_zero_full_payload(), 8, 8).unwrap(),
+            state.prepare(7, &mode_six_full_payload(1), 8, 8).unwrap(),
             MvsDecodeDecision::Prepared(_)
         ));
     }
@@ -517,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_d_type_one_prepares_opaque_state_and_commit_installs_cache_without_pixels() {
+    fn type_one_prepares_pixels_and_commit_installs_cache_atomically() {
         let mut state = MvsDecodeState::new(7);
         state.install_tables(7, &type_two_tables()).unwrap();
         let full = prepared(
@@ -533,12 +560,13 @@ mod tests {
                 .prepare(7, &opcode_one_partial_payload(), 8, 8)
                 .unwrap(),
         );
+        assert_eq!(first.partial_pixels().operations.len(), 1);
         let same_owner = opaque(
             state
                 .prepare(7, &opcode_one_partial_payload(), 8, 8)
                 .unwrap(),
         );
-        state.commit_opaque(first).unwrap();
+        assert_eq!(state.commit_opaque(first).unwrap().operations.len(), 1);
         assert!(!state.awaiting_full());
         assert!(state.commit_opaque(same_owner).is_err());
 
@@ -549,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_d_opaque_drop_stale_wrong_owner_and_awaiting_full_are_transactional() {
+    fn slice_d_partial_drop_stale_wrong_owner_and_awaiting_full_are_transactional() {
         let mut state = MvsDecodeState::new(7);
         state.install_tables(7, &type_two_tables()).unwrap();
         let full = prepared(
@@ -557,6 +585,7 @@ mod tests {
                 .prepare(7, &mode_five_seed_full_payload(), 8, 8)
                 .unwrap(),
         );
+        let committed_pixels = full.decoded().rgb.clone();
         state.commit(full).unwrap();
 
         let dropped = opaque(
@@ -566,7 +595,8 @@ mod tests {
         );
         drop(dropped);
         assert!(!state.awaiting_full());
-        assert!(state.prepare(7, &mode_six_full_payload(1), 8, 8).is_err());
+        let cache_miss = prepared(state.prepare(7, &mode_six_full_payload(1), 8, 8).unwrap());
+        assert_eq!(cache_miss.decoded().rgb, committed_pixels);
 
         assert!(matches!(
             state

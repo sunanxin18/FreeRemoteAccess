@@ -526,6 +526,14 @@ impl DisplaySurface {
             .saturating_add(1);
         self.native_mvs_observability
     }
+
+    fn record_native_partial_applied(&mut self) -> NativeMvsRenderObservability {
+        self.native_mvs_observability.content_revision = self
+            .native_mvs_observability
+            .content_revision
+            .saturating_add(1);
+        self.native_mvs_observability
+    }
 }
 
 struct DynamicResolutionRuntime {
@@ -929,7 +937,10 @@ impl MvsReceiveState {
         self.decoder.commit(prepared).map(|_| ())
     }
 
-    fn commit_opaque(&mut self, prepared: mvs::PreparedOpaqueMvsState) -> Result<()> {
+    fn commit_opaque(
+        &mut self,
+        prepared: mvs::PreparedOpaqueMvsState,
+    ) -> Result<crate::vnc::mvs_full::PreparedPartialPixels> {
         self.decoder.commit_opaque(prepared)
     }
 
@@ -1154,7 +1165,7 @@ struct FullBoundaryOutcome {
     incremental_sent: bool,
 }
 
-fn finish_opaque_boundary_at<I>(
+fn finish_partial_boundary_at<I>(
     requests: &mut ReaderRequestState,
     mut send_incremental: I,
 ) -> Result<bool>
@@ -1311,7 +1322,7 @@ fn current_surface_size(surface: &Arc<Mutex<DisplaySurface>>) -> DisplaySize {
 enum MvsRecordOutcome {
     TableInstalled,
     FullApplied,
-    OpaqueStateApplied,
+    PartialApplied,
     RecoveryRequested,
     Ignored,
 }
@@ -1384,6 +1395,154 @@ where
     Ok(())
 }
 
+fn validate_partial_pixels_for_framebuffer(
+    framebuffer: &Framebuffer,
+    partial: &crate::vnc::mvs_full::PreparedPartialPixels,
+) -> Result<()> {
+    use crate::vnc::mvs_full::PartialPixelOperation;
+
+    for operation in &partial.operations {
+        match operation {
+            PartialPixelOperation::Replace {
+                x,
+                y,
+                width,
+                height,
+                rgb,
+            } => {
+                if *width == 0 || *height == 0 || *width > 8 || *height > 8 {
+                    bail!("MVS type-1 replace tile 尺寸非法: {width}x{height}");
+                }
+                let width_u16 = u16::try_from(*width).context("MVS type-1 replace 宽度溢出")?;
+                let height_u16 = u16::try_from(*height).context("MVS type-1 replace 高度溢出")?;
+                mvs::validate_decoded_rgb_layout(width_u16, height_u16, rgb.len())?;
+                if x.checked_add(*width)
+                    .is_none_or(|right| right > framebuffer.width)
+                    || y.checked_add(*height)
+                        .is_none_or(|bottom| bottom > framebuffer.height)
+                {
+                    bail!("MVS type-1 framebuffer replace 超出 surface");
+                }
+            }
+            PartialPixelOperation::Copy {
+                source_x,
+                source_y,
+                destination_x,
+                destination_y,
+                width,
+                height,
+            } => {
+                if *width == 0 || *height == 0 || *width > 8 || *height > 8 {
+                    bail!("MVS type-1 copy tile 尺寸非法: {width}x{height}");
+                }
+                if source_x
+                    .checked_add(*width)
+                    .is_none_or(|right| right > framebuffer.width)
+                    || source_y
+                        .checked_add(*height)
+                        .is_none_or(|bottom| bottom > framebuffer.height)
+                    || destination_x
+                        .checked_add(*width)
+                        .is_none_or(|right| right > framebuffer.width)
+                    || destination_y
+                        .checked_add(*height)
+                        .is_none_or(|bottom| bottom > framebuffer.height)
+                {
+                    bail!("MVS type-1 framebuffer copy 超出 surface");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 只接收已经通过 `validate_partial_pixels_for_framebuffer` 的 decoder 输出。
+/// replace 与 copy 都是固定 8x8 上限，因此提交后不再分配内存或返回错误。
+fn apply_validated_partial_pixels_to_framebuffer(
+    framebuffer: &mut Framebuffer,
+    partial: &crate::vnc::mvs_full::PreparedPartialPixels,
+) {
+    use crate::vnc::mvs_full::PartialPixelOperation;
+
+    for operation in &partial.operations {
+        match operation {
+            PartialPixelOperation::Replace {
+                x,
+                y,
+                width,
+                height,
+                rgb,
+            } => {
+                debug_assert!(*width > 0 && *height > 0 && *width <= 8 && *height <= 8);
+                debug_assert_eq!(rgb.len(), width * height * mvs::MVS_RGB_CHANNEL_BYTES);
+                debug_assert!(*x + *width <= framebuffer.width);
+                debug_assert!(*y + *height <= framebuffer.height);
+                for row in 0..*height {
+                    for column in 0..*width {
+                        let source = (row * *width + column) * mvs::MVS_RGB_CHANNEL_BYTES;
+                        let destination = (*y + row) * framebuffer.width + *x + column;
+                        let red = u32::from(rgb[source + mvs::MVS_RGB_RED_OFFSET]);
+                        let green = u32::from(rgb[source + mvs::MVS_RGB_GREEN_OFFSET]);
+                        let blue = u32::from(rgb[source + mvs::MVS_RGB_BLUE_OFFSET]);
+                        framebuffer.pixels_mut()[destination] = (red << PIXEL_RED_SHIFT)
+                            | (green << PIXEL_GREEN_SHIFT)
+                            | (blue << PIXEL_BLUE_SHIFT);
+                    }
+                }
+            }
+            PartialPixelOperation::Copy {
+                source_x,
+                source_y,
+                destination_x,
+                destination_y,
+                width,
+                height,
+            } => {
+                debug_assert!(*width > 0 && *height > 0 && *width <= 8 && *height <= 8);
+                debug_assert!(*source_x + *width <= framebuffer.width);
+                debug_assert!(*source_y + *height <= framebuffer.height);
+                debug_assert!(*destination_x + *width <= framebuffer.width);
+                debug_assert!(*destination_y + *height <= framebuffer.height);
+                let mut staging = [0u32; 8 * 8];
+                for row in 0..*height {
+                    let source = (*source_y + row) * framebuffer.width + *source_x;
+                    let staging_start = row * *width;
+                    staging[staging_start..staging_start + *width]
+                        .copy_from_slice(&framebuffer.pixels()[source..source + *width]);
+                }
+                for row in 0..*height {
+                    let staging_start = row * *width;
+                    let destination = (*destination_y + row) * framebuffer.width + *destination_x;
+                    framebuffer.pixels_mut()[destination..destination + *width]
+                        .copy_from_slice(&staging[staging_start..staging_start + *width]);
+                }
+            }
+        }
+    }
+}
+
+fn apply_prepared_partial_to_surface(
+    receiver: &mut MvsReceiveState,
+    surface: &mut DisplaySurface,
+    prepared: mvs::PreparedOpaqueMvsState,
+) -> Result<bool> {
+    if surface.generation != receiver.generation {
+        bail!(
+            "MVS prepared partial generation 与当前 surface 不一致: receiver={}, surface={}",
+            receiver.generation,
+            surface.generation
+        );
+    }
+    validate_partial_pixels_for_framebuffer(&surface.framebuffer, prepared.partial_pixels())?;
+    let has_pixels = !prepared.partial_pixels().operations.is_empty();
+    let partial_pixels = receiver.commit_opaque(prepared)?;
+    if has_pixels {
+        apply_validated_partial_pixels_to_framebuffer(&mut surface.framebuffer, &partial_pixels);
+        surface.record_native_partial_applied();
+    }
+    Ok(has_pixels)
+}
+
 /// 已严格分类为像素记录后的原生 prepare/apply/commit 事务。
 fn apply_native_mvs_frame_with<F>(
     receiver: &mut MvsReceiveState,
@@ -1417,15 +1576,28 @@ where
     let prepared = match receiver.prepare_rect(&record.payload, record.rect, display_size) {
         Ok(mvs::MvsDecodeDecision::Prepared(prepared)) => prepared,
         Ok(mvs::MvsDecodeDecision::PreparedOpaque(prepared)) => {
-            if let Err(error) = receiver.commit_opaque(prepared) {
-                eprintln!("[hpss-view] MVS type-1 opaque state 提交失败，重同步: {error:#}");
-                receiver.request_full()?;
-                return Ok(MvsRecordOutcome::RecoveryRequested);
+            let applied = {
+                let mut surface = surface.lock().unwrap();
+                if surface.generation != surface_generation {
+                    Err(anyhow::anyhow!(
+                        "MVS surface generation 在 partial 应用前发生变化"
+                    ))
+                } else {
+                    apply_prepared_partial_to_surface(receiver, &mut surface, prepared)
+                }
+            };
+            match applied {
+                Ok(true) => eprintln!("[hpss-view] MVS type-1 增量像素与 codec 状态已提交"),
+                Ok(false) => eprintln!("[hpss-view] MVS type-1 no-op/cache 状态已提交"),
+                Err(error) => {
+                    eprintln!("[hpss-view] MVS type-1 framebuffer 事务失败，重同步: {error:#}");
+                    receiver.request_full()?;
+                    return Ok(MvsRecordOutcome::RecoveryRequested);
+                }
             }
-            // Type-1 只提交 generation/owner-bound codec state；不获取 surface
-            // 锁、不调用 framebuffer apply，也不发布 P1 full-media 证据。
-            eprintln!("[hpss-view] MVS type-1 opaque cache state 已提交");
-            return Ok(MvsRecordOutcome::OpaqueStateApplied);
+            // Partial pixels are visible, but a type-1 update is never the
+            // complete type-0 codec baseline used by the P1 evidence latch.
+            return Ok(MvsRecordOutcome::PartialApplied);
         }
         Ok(mvs::MvsDecodeDecision::RequestFull(reason)) => {
             eprintln!("[hpss-view] MVS 原生记录要求全量重同步: {reason:?}");
@@ -1689,13 +1861,13 @@ fn handle_complete_mvs_record(
         } else if boundary.incremental_sent {
             eprintln!("[hpss-view] MVS full 已应用并请求下一增量响应");
         }
-    } else if outcome == MvsRecordOutcome::OpaqueStateApplied {
+    } else if outcome == MvsRecordOutcome::PartialApplied {
         let size = current_surface_size(surface);
         let incremental = incremental_request_after_full_apply(size.width, size.height);
-        if finish_opaque_boundary_at(requests, || {
+        if finish_partial_boundary_at(requests, || {
             send_encrypted(write_stream, crypto, &incremental)
         })? {
-            eprintln!("[hpss-view] MVS type-1 opaque state 已提交并请求下一增量响应");
+            eprintln!("[hpss-view] MVS type-1 已提交并请求下一增量响应");
         }
     }
     Ok(())
@@ -2516,7 +2688,7 @@ mod tests {
     use super::{
         apply_native_mvs_frame_with, apply_rgb_rect, apply_rgb_rect_for_generation,
         audio_input_probe_progress_diagnostic, commit_server_geometry, drain_udp_media,
-        finish_full_boundary_at, finish_opaque_boundary_at, incremental_request_after_full_apply,
+        finish_full_boundary_at, finish_partial_boundary_at, incremental_request_after_full_apply,
         is_complete_surface_frame, map_pointer, mark_recovery_for_invalid_mvs_geometry,
         process_complete_mvs_record, read_viewer_app_frame_step, reader_frame_class,
         render_surface_frame_with, request_full_update_at, scaled_drawable_size,
@@ -3789,6 +3961,52 @@ mod tests {
         payload
     }
 
+    fn native_mode_five_seed_payload() -> Vec<u8> {
+        let mut mode = TestBitWriter::new();
+        mode.write_bits(1, 1);
+        mode.write_bits(5, 3);
+        mode.write_bits(0, 1);
+        mode.write_bits(0x6d, 8);
+        let mode = mode.finish();
+
+        let mut data = TestBitWriter::new();
+        data.write_bits(0, 3);
+        data.write_bits(0, 2);
+        data.write_bits(0, 2);
+        data.write_bits(0, 2);
+        data.write_bits(0b0010, 4);
+        data.write_bits(0x6d, 8);
+        let data = data.finish();
+        let data_offset = 6 + mode.len();
+        let mut payload = vec![
+            0,
+            0,
+            0,
+            u8::try_from(data_offset >> 16).unwrap(),
+            u8::try_from((data_offset >> 8) & 0xff).unwrap(),
+            u8::try_from(data_offset & 0xff).unwrap(),
+        ];
+        payload.extend_from_slice(&mode);
+        payload.extend_from_slice(&data);
+        payload
+    }
+
+    fn native_opcode_one_partial_payload() -> Vec<u8> {
+        let mut bits = TestBitWriter::new();
+        bits.write_bits(1, 2);
+        bits.write_bits(0, 6);
+        bits.write_bits(0, 1);
+        bits.write_bits(0b1010, 4);
+        bits.write_bits(0, 1);
+        bits.write_bits(0b1010, 4);
+        bits.write_bits(0x6d, 8);
+        bits.write_bits(0x76, 8);
+        bits.write_bits(0x73, 8);
+        let mut payload = vec![1, 1, 1];
+        payload.extend(bits.finish());
+        payload
+    }
+
     fn native_record(rect: MvsRect) -> MvsRecord {
         MvsRecord {
             rect,
@@ -3958,7 +4176,7 @@ mod tests {
                 |_, _, _, _, _, _| panic!("opaque type-1 reached framebuffer apply"),
             )
             .unwrap(),
-            MvsRecordOutcome::OpaqueStateApplied
+            MvsRecordOutcome::PartialApplied
         );
         assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
         assert!(!receiver.awaiting_full());
@@ -3969,19 +4187,68 @@ mod tests {
     }
 
     #[test]
+    fn type_one_opcode_one_replaces_visible_pixels_transactionally() {
+        let surface = native_surface(8, 8);
+        let dynamic = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(0);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let seed = receiver
+            .prepare(&native_mode_five_seed_payload(), 8, 8)
+            .unwrap();
+        let mvs::MvsDecodeDecision::Prepared(seed) = seed else {
+            panic!("expected mode-five seed preparation");
+        };
+        receiver.commit(seed).unwrap();
+        surface
+            .lock()
+            .unwrap()
+            .framebuffer
+            .pixels_mut()
+            .fill(0x0012_3456);
+        let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
+        let record = MvsRecord {
+            rect: MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            payload: native_opcode_one_partial_payload(),
+        };
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                apply_rgb_rect,
+            )
+            .unwrap(),
+            MvsRecordOutcome::PartialApplied
+        );
+        let surface = surface.lock().unwrap();
+        assert_ne!(surface.framebuffer.pixels(), before);
+        assert_eq!(surface.native_mvs_observability.type_zero_applied_count, 0);
+        assert_eq!(surface.native_mvs_observability.content_revision, 1);
+        drop(surface);
+        assert!(!dynamic.lock().unwrap().evidence.current_full_media_applied);
+    }
+
+    #[test]
     fn slice_d_opaque_response_boundary_sends_one_normal_incremental_only() {
         let mut requests = ReaderRequestState::after_startup(Instant::now());
         requests.consume_mvs_response();
         let mut writes = 0usize;
 
-        assert!(finish_opaque_boundary_at(&mut requests, || {
+        assert!(finish_partial_boundary_at(&mut requests, || {
             writes += 1;
             Ok(())
         })
         .unwrap());
         assert_eq!(writes, 1);
         assert!(requests.framebuffer_request_in_flight());
-        assert!(!finish_opaque_boundary_at(&mut requests, || {
+        assert!(!finish_partial_boundary_at(&mut requests, || {
             writes += 1;
             Ok(())
         })
