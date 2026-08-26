@@ -19,6 +19,7 @@ use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::framebuffer::{Framebuffer, PIXEL_BLUE_SHIFT, PIXEL_GREEN_SHIFT, PIXEL_RED_SHIFT};
 use crate::keysym;
+use crate::pointer_input::{PointerInputState, PointerSample};
 use crate::vnc::audio_codec::{
     AacEldEncoder, ArdAudioReceiver, AudioReceiveOutcome, DecodedAudioPacket,
 };
@@ -2397,7 +2398,7 @@ pub fn run_viewer(
 
         let mut scaled: Vec<u32> = Vec::new();
         let mut pressed: HashSet<Key> = HashSet::new();
-        let mut last_pointer: Option<(u16, u16, u8)> = None;
+        let mut pointer_input = PointerInputState::default();
         let mut last_window_size = window.get_size();
 
         loop {
@@ -2461,38 +2462,45 @@ pub fn run_viewer(
                 send_encrypted(&write_stream, &crypto, m)?;
             }
 
-            // 鼠标
-            let mut mask = 0u8;
-            if window.get_mouse_down(MouseButton::Left) {
-                mask |= protocol::pointer::PRIMARY;
-            }
-            if window.get_mouse_down(MouseButton::Middle) {
-                mask |= protocol::pointer::MIDDLE;
-            }
-            if window.get_mouse_down(MouseButton::Right) {
-                mask |= protocol::pointer::SECONDARY;
-            }
-            if let Some((wx, wy)) = window.get_scroll_wheel() {
-                if wy > 0.0 {
-                    mask |= protocol::pointer::WHEEL_UP;
-                } else if wy < 0.0 {
-                    mask |= protocol::pointer::WHEEL_DOWN;
+            // 鼠标：仅窗口激活且指针位于客户区内时采样输入。
+            let pointer_position = if window.is_active() {
+                window.get_mouse_pos(MouseMode::Discard)
+            } else {
+                None
+            };
+            let (sample, local_buttons_down) = if let Some((mx, my)) = pointer_position {
+                let mut mask = 0u8;
+                if window.get_mouse_down(MouseButton::Left) {
+                    mask |= protocol::pointer::PRIMARY;
                 }
-                if wx > 0.0 {
-                    mask |= protocol::pointer::WHEEL_RIGHT;
-                } else if wx < 0.0 {
-                    mask |= protocol::pointer::WHEEL_LEFT;
+                if window.get_mouse_down(MouseButton::Middle) {
+                    mask |= protocol::pointer::MIDDLE;
                 }
-            }
-            if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+                if window.get_mouse_down(MouseButton::Right) {
+                    mask |= protocol::pointer::SECONDARY;
+                }
+                let local_buttons_down = mask != 0;
+                if let Some((wx, wy)) = window.get_scroll_wheel() {
+                    if wy > 0.0 {
+                        mask |= protocol::pointer::WHEEL_UP;
+                    } else if wy < 0.0 {
+                        mask |= protocol::pointer::WHEEL_DOWN;
+                    }
+                    if wx > 0.0 {
+                        mask |= protocol::pointer::WHEEL_RIGHT;
+                    } else if wx < 0.0 {
+                        mask |= protocol::pointer::WHEEL_LEFT;
+                    }
+                }
                 let display_size = current_surface_size(&surface);
                 let (x, y) = map_pointer(mx, my, window_size, display_size);
-                let cur = (x, y, mask);
-                if last_pointer != Some(cur) {
-                    let msg = protocol::msg_pointer_event(mask, x, y);
-                    send_encrypted(&write_stream, &crypto, &msg)?;
-                    last_pointer = Some(cur);
-                }
+                (Some(PointerSample::new(x, y, mask)), local_buttons_down)
+            } else {
+                (None, false)
+            };
+            if let Some(event) = pointer_input.next_event(sample, local_buttons_down) {
+                let msg = protocol::msg_pointer_event(event.mask, event.x, event.y);
+                send_encrypted(&write_stream, &crypto, &msg)?;
             }
         }
 
