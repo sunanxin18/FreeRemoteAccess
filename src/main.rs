@@ -1395,7 +1395,10 @@ fn connect_hpssview_with_frame<A, T>(
 ) -> Result<T> {
     let authenticated = guarded.with_slices(authenticate);
     guarded.clear();
-    let authenticated = authenticated.map_err(|_| anyhow::anyhow!("安全凭据 HPSS 连接失败"))?;
+    let authenticated = authenticated.map_err(|error| {
+        client::stable_apple_security_type_error(&error)
+            .unwrap_or_else(|| anyhow::anyhow!("安全凭据 HPSS 连接失败"))
+    })?;
     let finished = finish(authenticated);
     // 明确把已清零的分配保留到 finish 回调结束：测试可验证 finish 开始前凭据区已为零，
     // 且 finish 无法借用 CredentialSlices。
@@ -1581,16 +1584,16 @@ fn cmd_hpssview(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "viewer")]
+    use super::{
+        authenticate_hpssview, connect_hpssview_from_stdin, finish_hpssview_authenticated,
+        format_hpssview_connection_notice, hpssview_audio_flow, HpssviewConnectionNotice,
+    };
     use super::{
         classify_cold_connection_error, cmd_hpss_capture_v2, cmd_mvs_capture_v2_verify,
         create_cold_writer_then, finish_cold_connection_failure, format_cold_verify_json,
         read_cold_capture_structural_then_strict, replay_offline_mvs_records, rgb_to_png_rgba, Cli,
         Cmd, ColdConnectionFailure, DEFAULT_PASSWORD_ENV, DEFAULT_USERNAME_ENV,
-    };
-    #[cfg(feature = "viewer")]
-    use super::{
-        connect_hpssview_from_stdin, format_hpssview_connection_notice, hpssview_audio_flow,
-        HpssviewConnectionNotice,
     };
     use crate::vnc::hpss::MvsCaptureWriter;
     #[cfg(feature = "viewer")]
@@ -2603,6 +2606,63 @@ mod tests {
         assert_eq!(error.to_string(), "安全凭据 HPSS 连接失败");
         assert!(!format!("{error:#}").contains("fake-target-canary"));
         assert!(!format!("{error:#}").contains("fake-desktop-canary"));
+    }
+
+    #[test]
+    #[cfg(feature = "viewer")]
+    fn hpssview_secure_stdin_type_two_only_preserves_stable_apple_error_without_auth_bytes() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut client_banner = [0_u8; 12];
+            stream.read_exact(&mut client_banner).unwrap();
+            assert_eq!(&client_banner, b"RFB 003.008\n");
+            stream.write_all(&[1, 2]).unwrap();
+            let mut post_offer = Vec::new();
+            stream.read_to_end(&mut post_offer).unwrap();
+            post_offer
+        });
+
+        let host = b"127.0.0.1";
+        let mut frame = b"FRDSTD01".to_vec();
+        frame.extend_from_slice(&19_u32.to_be_bytes());
+        frame.extend_from_slice(&9_u16.to_be_bytes());
+        frame.extend_from_slice(&1_u16.to_be_bytes());
+        frame.extend_from_slice(&1_u16.to_be_bytes());
+        frame.extend_from_slice(&address.port().to_be_bytes());
+        frame.extend_from_slice(host);
+        frame.extend_from_slice(b"u");
+        frame.extend_from_slice(b"p");
+
+        let error = match connect_hpssview_from_stdin(
+            &mut std::io::Cursor::new(frame),
+            |credentials| {
+                authenticate_hpssview(
+                    credentials.host,
+                    credentials.port,
+                    credentials.username,
+                    credentials.password,
+                    false,
+                )
+            },
+            finish_hpssview_authenticated,
+        ) {
+            Ok(_) => panic!("type-2-only secure-stdin HPSS must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            frd_protocol_apple::APPLE_SECURITY_TYPE_UNAVAILABLE
+        );
+        assert!(server.join().unwrap().is_empty());
     }
 
     #[test]

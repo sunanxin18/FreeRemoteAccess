@@ -328,11 +328,18 @@ pub(crate) fn sanitize_cold_connect_error(error: anyhow::Error) -> anyhow::Error
 }
 
 pub(crate) fn sanitize_cold_authentication_error(error: anyhow::Error) -> anyhow::Error {
-    if is_cold_deadline_error(&error) || is_timeout(&error) {
+    if let Some(stable) = stable_apple_security_type_error(&error) {
+        stable
+    } else if is_cold_deadline_error(&error) || is_timeout(&error) {
         cold_deadline_error()
     } else {
         anyhow::anyhow!("cold authentication")
     }
+}
+
+pub(crate) fn stable_apple_security_type_error(error: &anyhow::Error) -> Option<anyhow::Error> {
+    (error.to_string() == frd_protocol_apple::APPLE_SECURITY_TYPE_UNAVAILABLE)
+        .then(|| anyhow::anyhow!(frd_protocol_apple::APPLE_SECURITY_TYPE_UNAVAILABLE))
 }
 
 impl VncClient {

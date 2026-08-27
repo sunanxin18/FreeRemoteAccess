@@ -285,7 +285,7 @@ mod tests {
     use crate::vnc::mvs_stream::MvsRect;
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::io::{self, Cursor};
+    use std::io::{self, Cursor, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -304,6 +304,43 @@ mod tests {
     fn cold_hpss_public_integration_entry_points_exist() {
         let _ = connect_deadline_opts;
         let _ = run_authenticated_cold_session;
+    }
+
+    #[test]
+    fn cold_hpss_type_two_only_preserves_stable_apple_error_without_writing_auth_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut client_banner = [0_u8; 12];
+            stream.read_exact(&mut client_banner).unwrap();
+            assert_eq!(&client_banner, b"RFB 003.008\n");
+            stream.write_all(&[1, 2]).unwrap();
+            let mut post_offer = Vec::new();
+            stream.read_to_end(&mut post_offer).unwrap();
+            post_offer
+        });
+
+        let error = match connect_deadline_opts(
+            &address,
+            std::time::Instant::now() + Duration::from_secs(3),
+            "test-user",
+            "test-password",
+            crate::vnc::session::SessionEncodingProfile::AppleTcpMvs,
+        ) {
+            Ok(_) => panic!("type-2-only cold HPSS must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            frd_protocol_apple::APPLE_SECURITY_TYPE_UNAVAILABLE
+        );
+        assert!(server.join().unwrap().is_empty());
     }
 
     #[test]
