@@ -535,6 +535,7 @@ dependencies = [
  "cbc",
  "ecb",
  "frd-core",
+ "frd-frame",
  "frd-protocol-api",
  "frd-wire-rfb",
  "getrandom 0.2.17",

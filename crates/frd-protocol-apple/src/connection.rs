@@ -55,14 +55,28 @@ enum WriterCommand {
         plaintext: Vec<u8>,
         result: SyncSender<Result<()>>,
     },
-    Shutdown {
-        complete: SyncSender<()>,
-    },
+    Shutdown,
 }
 
 struct WriterControl {
     commands: Sender<WriterCommand>,
+    interrupt: TcpStream,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct WriterHooks {
+    #[cfg(test)]
+    write_started: Option<Sender<()>>,
+}
+
+impl WriterHooks {
+    fn notify_write_started(&self) {
+        #[cfg(test)]
+        if let Some(write_started) = &self.write_started {
+            let _ = write_started.send(());
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -72,31 +86,28 @@ pub struct AppleWriterHandle {
 
 impl AppleWriterHandle {
     pub fn send_private_message(&self, plaintext: &[u8]) -> Result<()> {
+        Self::receive_message_result(self.enqueue_private_message(plaintext.to_vec())?)
+    }
+
+    fn enqueue_private_message(&self, plaintext: Vec<u8>) -> Result<Receiver<Result<()>>> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.control
             .commands
             .send(WriterCommand::Message {
-                plaintext: plaintext.to_vec(),
+                plaintext,
                 result: result_tx,
             })
             .map_err(|_| anyhow!("Apple writer 已关闭"))?;
+        Ok(result_rx)
+    }
+
+    fn receive_message_result(result_rx: Receiver<Result<()>>) -> Result<()> {
         result_rx
             .recv()
             .map_err(|_| anyhow!("Apple writer 未返回发送结果"))?
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        let (complete_tx, complete_rx) = mpsc::sync_channel(1);
-        if self
-            .control
-            .commands
-            .send(WriterCommand::Shutdown {
-                complete: complete_tx,
-            })
-            .is_ok()
-        {
-            let _ = complete_rx.recv();
-        }
         let worker = self
             .control
             .worker
@@ -104,6 +115,8 @@ impl AppleWriterHandle {
             .map_err(|_| anyhow!("Apple writer join 状态已损坏"))?
             .take();
         if let Some(worker) = worker {
+            let _ = self.control.interrupt.shutdown(Shutdown::Both);
+            let _ = self.control.commands.send(WriterCommand::Shutdown);
             worker
                 .join()
                 .map_err(|_| anyhow!("Apple writer 线程异常退出"))?;
@@ -112,18 +125,27 @@ impl AppleWriterHandle {
     }
 }
 
-fn spawn_writer(
+fn spawn_writer_with_hooks(
     mut stream: TcpStream,
+    interrupt: TcpStream,
     absolute_deadline: Option<Instant>,
     mut crypto: Option<OutboundSessionCrypto>,
+    hooks: WriterHooks,
 ) -> AppleWriterHandle {
     let (commands_tx, commands_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        writer_loop(&mut stream, absolute_deadline, &mut crypto, commands_rx)
+        writer_loop(
+            &mut stream,
+            absolute_deadline,
+            &mut crypto,
+            commands_rx,
+            hooks,
+        )
     });
     AppleWriterHandle {
         control: Arc::new(WriterControl {
             commands: commands_tx,
+            interrupt,
             worker: Mutex::new(Some(worker)),
         }),
     }
@@ -134,6 +156,7 @@ fn writer_loop(
     absolute_deadline: Option<Instant>,
     crypto: &mut Option<OutboundSessionCrypto>,
     commands: Receiver<WriterCommand>,
+    hooks: WriterHooks,
 ) {
     while let Ok(command) = commands.recv() {
         match command {
@@ -152,6 +175,7 @@ fn writer_loop(
                         Some(crypto) => crypto.seal(&plaintext)?,
                         None => plaintext,
                     };
+                    hooks.notify_write_started();
                     stream.write_all(&wire).context("写入失败（连接中断？）")
                 })();
                 let failed = send_result.is_err();
@@ -161,9 +185,8 @@ fn writer_loop(
                     break;
                 }
             }
-            WriterCommand::Shutdown { complete } => {
+            WriterCommand::Shutdown => {
                 let _ = stream.shutdown(Shutdown::Both);
-                let _ = complete.send(());
                 break;
             }
         }
@@ -272,6 +295,10 @@ impl AppleConnection {
     }
 
     pub fn writer_handle(&mut self) -> Result<AppleWriterHandle> {
+        self.writer_handle_with_hooks(WriterHooks::default())
+    }
+
+    fn writer_handle_with_hooks(&mut self, hooks: WriterHooks) -> Result<AppleWriterHandle> {
         if let Some(writer) = &self.writer {
             return Ok(writer.clone());
         }
@@ -279,7 +306,17 @@ impl AppleConnection {
             .stream
             .try_clone()
             .context("无法复制 Apple writer socket")?;
-        let writer = spawn_writer(stream, self.absolute_deadline, self.outbound_crypto.take());
+        let interrupt = self
+            .stream
+            .try_clone()
+            .context("无法复制 Apple writer 中断 socket")?;
+        let writer = spawn_writer_with_hooks(
+            stream,
+            interrupt,
+            self.absolute_deadline,
+            self.outbound_crypto.take(),
+            hooks,
+        );
         self.writer = Some(writer.clone());
         Ok(writer)
     }
@@ -578,5 +615,75 @@ mod tests {
         assert!(read_timeout <= Duration::from_secs(30));
         assert!(write_timeout <= Duration::from_secs(30));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_interrupts_in_flight_write_and_disconnects_queued_callers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (peer_ready_tx, peer_ready_rx) = mpsc::channel();
+        let (release_peer_tx, release_peer_rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            peer_ready_tx.send(()).unwrap();
+            release_peer_rx.recv().unwrap();
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+        peer_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut connection = AppleConnection::new(stream);
+        let (write_started_tx, write_started_rx) = mpsc::channel();
+        let writer = connection
+            .writer_handle_with_hooks(WriterHooks {
+                write_started: Some(write_started_tx),
+            })
+            .unwrap();
+
+        let active_writer = writer.clone();
+        let active_send = thread::spawn(move || {
+            active_writer.send_private_message(&vec![0x5a; 64 * 1024 * 1024])
+        });
+        write_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer must enter write_all before shutdown");
+
+        let queued_one = writer.enqueue_private_message(vec![0x11; 8]).unwrap();
+        let queued_two = writer.enqueue_private_message(vec![0x22; 8]).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let shutdown_threads: Vec<_> = [writer.clone(), writer.clone()]
+            .into_iter()
+            .map(|writer| {
+                let barrier = barrier.clone();
+                let shutdown_tx = shutdown_tx.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    shutdown_tx.send(writer.shutdown()).unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        drop(shutdown_tx);
+
+        for _ in 0..2 {
+            assert!(shutdown_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("shutdown must be bounded")
+                .is_ok());
+        }
+        let active_error = active_send.join().unwrap().unwrap_err();
+        assert_eq!(active_error.to_string(), "写入失败（连接中断？）");
+        for queued in [queued_one, queued_two] {
+            let queued_error = AppleWriterHandle::receive_message_result(queued).unwrap_err();
+            assert_eq!(queued_error.to_string(), "Apple writer 未返回发送结果");
+        }
+        for thread in shutdown_threads {
+            thread.join().unwrap();
+        }
+        assert!(writer.shutdown().is_ok());
+        assert!(connection.shutdown().is_ok());
+
+        release_peer_tx.send(()).unwrap();
+        peer.join().unwrap();
     }
 }

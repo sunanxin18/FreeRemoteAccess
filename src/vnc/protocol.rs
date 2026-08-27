@@ -56,6 +56,7 @@ pub mod security {
     pub const ULTRA: u8 = 17;
     pub const VENCRYPT: u8 = 19;
     pub const TLS: u8 = 22;
+    #[allow(unused_imports)]
     pub use frd_protocol_apple::protocol::security::{
         requires_apple_account_credentials, APPLE_ARD, APPLE_ARD_39, APPLE_RSA_SRP, APPLE_SRP,
     };

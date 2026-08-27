@@ -19,3 +19,6 @@ sha2 = "0.10"
 frd-core = { path = "../frd-core" }
 frd-protocol-api = { path = "../frd-protocol-api" }
 frd-wire-rfb = { path = "../frd-wire-rfb" }
+
+[dev-dependencies]
+frd-frame = { path = "../frd-frame" }

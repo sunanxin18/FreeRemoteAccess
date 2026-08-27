@@ -37,7 +37,22 @@ pub fn connect_deadline_opts(
     password: &str,
     profile: SessionEncodingProfile,
 ) -> Result<VncClient> {
-    let client = client::connect_deadline_opts(addr, deadline, username, password, profile)?;
+    let negotiated =
+        client::negotiate_deadline(addr, deadline).map_err(client::sanitize_cold_connect_error)?;
+    let authenticated = frd_protocol_apple::authenticate_negotiated(
+        negotiated.conn,
+        negotiated.version,
+        negotiated.security_types,
+        username,
+        password,
+    )
+    .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)
+    .map_err(client::sanitize_cold_authentication_error)?;
+    let established = frd_protocol_apple::finish_authenticated_session(authenticated, profile)
+        .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)
+        .map_err(client::sanitize_cold_authentication_error)?;
+    let client = client::from_apple_session(established)
+        .map_err(client::sanitize_cold_authentication_error)?;
     if !client.conn.is_encrypted() {
         bail!("cold authentication");
     }

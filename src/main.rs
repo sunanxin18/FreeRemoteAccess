@@ -842,16 +842,38 @@ fn cmd_shot(
     Ok(())
 }
 
+fn connect_apple_timeout(
+    addr: &std::net::SocketAddr,
+    timeout: Duration,
+    username: &str,
+    password: &str,
+    profile: vnc::session::SessionEncodingProfile,
+) -> Result<VncClient> {
+    let negotiated = client::negotiate(addr, timeout)?;
+    let authenticated = frd_protocol_apple::authenticate_negotiated(
+        negotiated.conn,
+        negotiated.version,
+        negotiated.security_types,
+        username,
+        password,
+    )
+    .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)?;
+    let established = frd_protocol_apple::finish_authenticated_session(authenticated, profile)
+        .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)?;
+    client::from_apple_session(established)
+}
+
 /// esess：加密会话端到端验证。
 /// 建立 SRP-36 + Apple 会话加密层后，在加密帧内跑标准 RFB 消息，
 /// 逐帧校验 SHA1 并统计消息类型，最后汇总解密结果。
 fn cmd_esess(host: &str, port: u16, username: &str, password: &str, seconds: u64) -> Result<()> {
     let addr = arp::parse_target(host, port)?;
-    let mut c = VncClient::connect_timeout(
+    let mut c = connect_apple_timeout(
         &addr,
         Duration::from_secs(5),
-        Some(username),
-        Some(password),
+        username,
+        password,
+        vnc::session::SessionEncodingProfile::Raw,
     )?;
     println!(
         "已连接 {addr} — {}（{}x{}，认证类型 {}）",
@@ -1208,11 +1230,11 @@ fn cmd_hpss(
     } else {
         vnc::session::SessionEncodingProfile::AppleTcpMvs
     };
-    let mut c = client::VncClient::connect_timeout_opts(
+    let mut c = connect_apple_timeout(
         &addr,
         Duration::from_secs(5),
-        Some(username),
-        Some(password),
+        username,
+        password,
         encoding_profile,
     )?;
     println!(
@@ -1430,7 +1452,7 @@ fn format_hpssview_connection_notice(
 #[cfg(feature = "viewer")]
 struct PendingHpssviewConnection {
     addr: std::net::SocketAddr,
-    authenticated: client::AuthenticatedSecurity,
+    authenticated: frd_protocol_apple::AppleAuthenticated,
     encoding_profile: vnc::session::SessionEncodingProfile,
 }
 
@@ -1449,7 +1471,14 @@ fn authenticate_hpssview(
         vnc::session::SessionEncodingProfile::AppleTcpMvs
     };
     let negotiated = client::negotiate(&addr, Duration::from_secs(5))?;
-    let authenticated = client::authenticate_security(negotiated, Some(username), Some(password))?;
+    let authenticated = frd_protocol_apple::authenticate_negotiated(
+        negotiated.conn,
+        negotiated.version,
+        negotiated.security_types,
+        username,
+        password,
+    )
+    .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)?;
     Ok(PendingHpssviewConnection {
         addr,
         authenticated,
@@ -1461,8 +1490,12 @@ fn authenticate_hpssview(
 fn finish_hpssview_authenticated(
     pending: PendingHpssviewConnection,
 ) -> Result<(std::net::SocketAddr, VncClient)> {
-    let client =
-        client::finish_authenticated_session(pending.authenticated, pending.encoding_profile)?;
+    let established = frd_protocol_apple::finish_authenticated_session(
+        pending.authenticated,
+        pending.encoding_profile,
+    )
+    .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)?;
+    let client = client::from_apple_session(established)?;
     Ok((pending.addr, client))
 }
 
@@ -2902,7 +2935,7 @@ mod tests {
 
     #[test]
     fn cold_capture_v2_deadline_error_routes_to_pre_trigger_terminal_267_before_equality() {
-        let error = match crate::vnc::client::connect_deadline_opts(
+        let error = match crate::vnc::cold_hpss::connect_deadline_opts(
             &std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
             std::time::Instant::now(),
             "u",

@@ -16,13 +16,9 @@ pub use frd_protocol_apple::AppleConnection as RfbConn;
 #[cfg(feature = "viewer")]
 pub use frd_protocol_apple::AppleWriterHandle;
 
-use super::ard;
 use super::auth;
 use super::hpss;
 use super::protocol::{self, PixelFormat};
-use super::rsa_srp;
-use super::session;
-use super::srp;
 
 #[derive(Debug)]
 struct ColdDeadlineError;
@@ -192,32 +188,13 @@ const fn security_result_is_ok(result: u32) -> bool {
 
 // ---------- 认证与会话初始化 ----------
 
-/// 选择安全类型并完成认证 + ClientInit / ServerInit。
-/// 提供用户名时优先 ARD 认证（类型 30，Mac 真实账号）。
+/// 选择标准 RFB 安全类型并完成认证 + ClientInit / ServerInit。
 pub fn authenticate(
     neg: Negotiated,
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<VncClient> {
-    authenticate_opts(
-        neg,
-        username,
-        password,
-        session::SessionEncodingProfile::Raw,
-    )
-}
-
-/// authenticate 带会话编码档案选择。
-pub fn authenticate_opts(
-    neg: Negotiated,
-    username: Option<&str>,
-    password: Option<&str>,
-    encoding_profile: session::SessionEncodingProfile,
-) -> Result<VncClient> {
-    finish_authenticated_session(
-        authenticate_security(neg, username, password)?,
-        encoding_profile,
-    )
+    finish_authenticated_session(authenticate_security(neg, username, password)?)
 }
 
 /// 已完成安全类型认证、但尚未发送 ClientInit 的拥有型连接状态。
@@ -227,7 +204,6 @@ pub fn authenticate_opts(
 pub struct AuthenticatedSecurity {
     conn: RfbConn,
     choice: u8,
-    srp_key: Option<[u8; 64]>,
 }
 
 /// 选择安全类型并完成所有需要用户名/密码的认证交互。
@@ -243,31 +219,12 @@ pub fn authenticate_security(
         ..
     } = neg;
 
-    let choice = pick_security(&security_types, username, password)?;
-    // 类型 33 的选型字节与 v0 公钥请求必须同帧发送（见 rsa_srp.rs），这里跳过
-    if version.1 != protocol::RFB_VERSION_3_3.1 && choice != protocol::security::APPLE_RSA_SRP {
+    let choice = pick_standard_security(&security_types, username, password)?;
+    if version.1 != protocol::RFB_VERSION_3_3.1 {
         conn.write_all(&[choice])?;
     }
 
-    // SRP（类型 36）的会话密钥 K 是会话加密层的种子；拿到后必须启用加密会话。
-    let mut srp_key: Option<[u8; 64]> = None;
     match choice {
-        protocol::security::APPLE_ARD => {
-            // ARD 认证（类型 30）：DH + AES 凭据块，凭据为 Mac 真实账号
-            ard::authenticate(&mut conn, username.unwrap_or(""), password.unwrap_or(""))?;
-        }
-        protocol::security::APPLE_SRP => {
-            // ARD 认证（类型 36）：SRP-6a + PBKDF2，凭据为 Mac 真实账号
-            srp_key = Some(srp::authenticate(
-                &mut conn,
-                username.unwrap_or(""),
-                password.unwrap_or(""),
-            )?);
-        }
-        protocol::security::APPLE_RSA_SRP => {
-            // ARD 认证（类型 33）：RSA 包裹的 SRP，凭据为 Mac 真实账号
-            rsa_srp::authenticate(&mut conn, username.unwrap_or(""), password.unwrap_or(""))?;
-        }
         protocol::security::VNC_AUTH => {
             // DES 挑战-响应
             let challenge: [u8; protocol::VNC_AUTH_CHALLENGE_BYTES] = conn
@@ -290,32 +247,14 @@ pub fn authenticate_security(
         _ => {}
     }
 
-    Ok(AuthenticatedSecurity {
-        conn,
-        choice,
-        srp_key,
-    })
+    Ok(AuthenticatedSecurity { conn, choice })
 }
 
-/// 在凭据已可清除后完成 ClientInit、ServerInit 与 Apple 加密会话建立。
-pub fn finish_authenticated_session(
-    authenticated: AuthenticatedSecurity,
-    encoding_profile: session::SessionEncodingProfile,
-) -> Result<VncClient> {
-    let AuthenticatedSecurity {
-        mut conn,
-        choice,
-        srp_key,
-    } = authenticated;
+/// 在凭据已可清除后完成标准 RFB ClientInit 与 ServerInit。
+pub fn finish_authenticated_session(authenticated: AuthenticatedSecurity) -> Result<VncClient> {
+    let AuthenticatedSecurity { mut conn, choice } = authenticated;
 
-    // ClientInit：加密会话需置会话选择位（0xC1 = shared | 0x40 会话选择 | 0x80 独占），
-    // 服务器据此进入 Apple 会话协议；普通会话保持 shared = 1
-    let want_enc = srp_key.is_some();
-    conn.write_all(&[if want_enc {
-        protocol::apple_session::ENCRYPTED_SESSION_CLIENT_INIT
-    } else {
-        protocol::apple_session::SHARED_CLIENT_INIT
-    }])?;
+    conn.write_all(&[protocol::apple_session::SHARED_CLIENT_INIT])?;
 
     // ServerInit：帧缓冲尺寸 + 服务器像素格式 + 桌面名称
     let header_bytes = conn.read_vec(SERVER_INIT_HEADER_BYTES)?;
@@ -342,21 +281,6 @@ pub fn finish_authenticated_session(
     // 进入会话：清除握手阶段的兜底超时（会话读超时由调用方自行管理）
     conn.set_read_timeout(None).ok();
 
-    // 加密会话：SelectSession → EncryptionInfo → 激活；之后全部消息为加密帧
-    if want_enc {
-        let key = srp_key.as_ref().unwrap();
-        match session::establish_with_table(&mut conn, key, encoding_profile) {
-            Ok(c) => {
-                conn.set_crypto(c)?;
-                eprintln!("提示: 已建立加密会话（AES-128-CBC，密钥经 SRP 派生）");
-            }
-            Err(e) => {
-                // 加密会话建立失败时服务器可能已进入会话协议，稳妥起见直接断开重连策略交由调用方
-                return Err(e.context("加密会话建立失败；为避免协议降级，本连接不会回退明文会话"));
-            }
-        }
-    }
-
     Ok(VncClient {
         conn,
         used_security: choice,
@@ -367,60 +291,20 @@ pub fn finish_authenticated_session(
     })
 }
 
-fn pick_security(types: &[u8], username: Option<&str>, password: Option<&str>) -> Result<u8> {
+fn pick_standard_security(
+    types: &[u8],
+    _username: Option<&str>,
+    password: Option<&str>,
+) -> Result<u8> {
     let has = |t: u8| types.contains(&t);
-    let has_apple_account_security = || {
-        types
-            .iter()
-            .copied()
-            .any(protocol::security::requires_apple_account_credentials)
-    };
-    let ard_hint =
-        "服务器提供 Apple 账号认证：请通过 FRD_USERNAME 和 FRD_PASSWORD 环境变量提供凭据。";
-    let vnc_hint = "服务器支持标准 VNC 密码：请通过 FRD_PASSWORD 环境变量提供；\
-同时设置 FRD_USERNAME 时会优先尝试 Apple 账号认证。";
-    match (username, password) {
-        (Some(_), Some(_)) => {
-            if has(protocol::security::APPLE_SRP) {
-                // 优先 SRP（类型 36，新一代原生认证）；其次 RSA-SRP（33）、DH（30）
-                Ok(protocol::security::APPLE_SRP)
-            } else if has(protocol::security::APPLE_RSA_SRP) {
-                Ok(protocol::security::APPLE_RSA_SRP)
-            } else if has(protocol::security::APPLE_ARD) {
-                Ok(protocol::security::APPLE_ARD)
-            } else if has(protocol::security::VNC_AUTH) {
-                eprintln!("提示: 服务器不支持 ARD 认证，已改用标准 VNC 密码（用户名被忽略）");
-                Ok(protocol::security::VNC_AUTH)
-            } else if has(protocol::security::NONE) {
-                eprintln!("提示: 服务器无需认证，提供的凭据被忽略");
-                Ok(protocol::security::NONE)
-            } else {
-                bail!("服务器不提供可用的认证方式，可用类型: {types:?}")
-            }
-        }
-        (None, Some(_)) => {
-            if has(protocol::security::VNC_AUTH) {
-                Ok(protocol::security::VNC_AUTH)
-            } else if has_apple_account_security() {
-                bail!("服务器只提供 Apple 账号认证。{ard_hint}")
-            } else if has(protocol::security::NONE) {
-                eprintln!("提示: 服务器无需认证，提供的密码被忽略");
-                Ok(protocol::security::NONE)
-            } else {
-                bail!("服务器不支持 VNC Authentication，可用类型: {types:?}")
-            }
-        }
-        _ => {
-            if has(protocol::security::NONE) {
-                Ok(protocol::security::NONE)
-            } else if has(protocol::security::VNC_AUTH) {
-                bail!("服务器需要认证。{vnc_hint}")
-            } else if has_apple_account_security() {
-                bail!("服务器需要 Apple 账号认证。{ard_hint}")
-            } else {
-                bail!("没有可用的认证方式，可用类型: {types:?}")
-            }
-        }
+    if password.is_some() && has(protocol::security::VNC_AUTH) {
+        Ok(protocol::security::VNC_AUTH)
+    } else if has(protocol::security::NONE) {
+        Ok(protocol::security::NONE)
+    } else if has(protocol::security::VNC_AUTH) {
+        bail!("服务器需要标准 VNC 密码，请通过 FRD_PASSWORD 环境变量提供")
+    } else {
+        bail!("标准 RFB 客户端没有可用的认证方式；Apple 私有认证必须使用 Apple 协议适配器")
     }
 }
 
@@ -435,19 +319,7 @@ pub struct VncClient {
     pub name: String,
 }
 
-pub fn connect_deadline_opts(
-    addr: &SocketAddr,
-    deadline: Instant,
-    username: &str,
-    password: &str,
-    profile: session::SessionEncodingProfile,
-) -> Result<VncClient> {
-    let negotiated = negotiate_deadline(addr, deadline).map_err(sanitize_cold_connect_error)?;
-    authenticate_opts(negotiated, Some(username), Some(password), profile)
-        .map_err(sanitize_cold_authentication_error)
-}
-
-fn sanitize_cold_connect_error(error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn sanitize_cold_connect_error(error: anyhow::Error) -> anyhow::Error {
     if is_cold_deadline_error(&error) || is_timeout(&error) {
         cold_deadline_error()
     } else {
@@ -455,7 +327,7 @@ fn sanitize_cold_connect_error(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-fn sanitize_cold_authentication_error(error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn sanitize_cold_authentication_error(error: anyhow::Error) -> anyhow::Error {
     if is_cold_deadline_error(&error) || is_timeout(&error) {
         cold_deadline_error()
     } else {
@@ -464,17 +336,6 @@ fn sanitize_cold_authentication_error(error: anyhow::Error) -> anyhow::Error {
 }
 
 impl VncClient {
-    pub fn connect_timeout_opts(
-        addr: &SocketAddr,
-        timeout: Duration,
-        username: Option<&str>,
-        password: Option<&str>,
-        encoding_profile: session::SessionEncodingProfile,
-    ) -> Result<VncClient> {
-        let neg = negotiate(addr, timeout)?;
-        authenticate_opts(neg, username, password, encoding_profile)
-    }
-
     pub fn connect_timeout(
         addr: &SocketAddr,
         timeout: Duration,
@@ -507,6 +368,32 @@ impl VncClient {
             self.height,
         )?)
     }
+}
+
+pub fn from_apple_session(
+    established: frd_protocol_apple::EstablishedAppleSession,
+) -> Result<VncClient> {
+    let frd_protocol_apple::EstablishedAppleSession {
+        connection,
+        metadata,
+    } = established;
+    let width = usize::try_from(metadata.size.width).context("ServerInit 宽度无法转换为 usize")?;
+    let height =
+        usize::try_from(metadata.size.height).context("ServerInit 高度无法转换为 usize")?;
+    crate::framebuffer::validate_framebuffer_geometry(width, height).with_context(|| {
+        format!(
+            "服务器返回了无效分辨率 {}x{}",
+            metadata.size.width, metadata.size.height
+        )
+    })?;
+    Ok(VncClient {
+        conn: connection,
+        used_security: metadata.security_type,
+        width: u16::try_from(metadata.size.width).context("ServerInit 宽度超出 u16")?,
+        height: u16::try_from(metadata.size.height).context("ServerInit 高度超出 u16")?,
+        server_pf: metadata.pixel_format,
+        name: metadata.name,
+    })
 }
 
 // ---------- 服务器消息 ----------
@@ -790,9 +677,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("security phase must return without sending ClientInit");
 
-        let client =
-            finish_authenticated_session(authenticated, session::SessionEncodingProfile::Raw)
-                .unwrap();
+        let client = finish_authenticated_session(authenticated).unwrap();
         assert_eq!((client.width, client.height), (8, 4));
         server.join().unwrap();
     }
@@ -842,11 +727,11 @@ mod tests {
     }
 
     #[test]
-    fn every_apple_account_security_type_requires_credentials() {
+    fn standard_selector_directs_apple_only_offers_to_apple_adapter() {
         for security_type in [30u8, 33, 35, 36] {
-            let error = pick_security(&[security_type], None, None).unwrap_err();
-            assert!(error.to_string().contains("FRD_USERNAME"), "{error:#}");
-            assert!(error.to_string().contains("FRD_PASSWORD"), "{error:#}");
+            let error = pick_standard_security(&[security_type], Some("user"), Some("password"))
+                .unwrap_err();
+            assert!(error.to_string().contains("Apple 协议适配器"), "{error:#}");
         }
     }
 

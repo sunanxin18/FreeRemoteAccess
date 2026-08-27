@@ -13,5 +13,8 @@ pub use auth::{
     select_apple_security_type, APPLE_CREDENTIALS_REQUIRED, APPLE_SECURITY_TYPE_UNAVAILABLE,
 };
 pub use connection::{is_cold_deadline_error, is_peer_closed, AppleConnection, AppleWriterHandle};
-pub use factory::{AppleProtocolFactory, AppleProtocolSession};
+pub use factory::{
+    authenticate_negotiated, finish_authenticated_session, AppleAuthenticated, AppleHandshakeError,
+    AppleProtocolFactory, AppleProtocolSession, AppleSessionMetadata, EstablishedAppleSession,
+};
 pub use session::{SessionCrypto, SessionEncodingProfile};

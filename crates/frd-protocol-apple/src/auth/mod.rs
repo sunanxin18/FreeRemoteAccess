@@ -13,7 +13,19 @@ pub fn select_apple_security_type(
     offered: &[u8],
     credentials: &Credentials,
 ) -> Result<u8, ProtocolError> {
-    if credentials.username.is_empty() || credentials.password.expose().is_empty() {
+    select_apple_security_type_parts(
+        offered,
+        &credentials.username,
+        credentials.password.expose(),
+    )
+}
+
+pub(crate) fn select_apple_security_type_parts(
+    offered: &[u8],
+    username: &str,
+    password: &[u8],
+) -> Result<u8, ProtocolError> {
+    if username.is_empty() || password.is_empty() {
         return Err(apple_error(APPLE_CREDENTIALS_REQUIRED));
     }
     [

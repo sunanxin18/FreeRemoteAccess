@@ -12,7 +12,9 @@ use frd_wire_rfb::{
     decode_server_init_header, encode_banner, SERVER_INIT_HEADER_BYTES,
 };
 
-use crate::auth::{select_apple_security_type, APPLE_CREDENTIALS_REQUIRED};
+use crate::auth::{
+    select_apple_security_type, select_apple_security_type_parts, APPLE_CREDENTIALS_REQUIRED,
+};
 use crate::connection::AppleConnection;
 use crate::protocol::{self, security};
 use crate::session::{self, SessionEncodingProfile};
@@ -28,6 +30,61 @@ fn apple_error(code: &'static str) -> ProtocolError {
 }
 
 pub struct AppleProtocolFactory;
+
+#[derive(Debug)]
+pub enum AppleHandshakeError {
+    Protocol(ProtocolError),
+    Transport(anyhow::Error),
+}
+
+impl AppleHandshakeError {
+    fn protocol(error: ProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+
+    fn transport(error: impl Into<anyhow::Error>) -> Self {
+        Self::Transport(error.into())
+    }
+
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Protocol(error) => Some(error.code()),
+            Self::Transport(_) => None,
+        }
+    }
+
+    pub fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Protocol(error) => anyhow::anyhow!(error.code()),
+            Self::Transport(error) => error,
+        }
+    }
+
+    fn into_protocol_error(self, fallback: &'static str) -> ProtocolError {
+        match self {
+            Self::Protocol(error) => error,
+            Self::Transport(_) => apple_error(fallback),
+        }
+    }
+}
+
+pub struct AppleAuthenticated {
+    connection: AppleConnection,
+    security_type: u8,
+    srp_key: Option<[u8; 64]>,
+}
+
+pub struct AppleSessionMetadata {
+    pub security_type: u8,
+    pub size: frd_core::PixelSize,
+    pub pixel_format: frd_wire_rfb::PixelFormat,
+    pub name: String,
+}
+
+pub struct EstablishedAppleSession {
+    pub connection: AppleConnection,
+    pub metadata: AppleSessionMetadata,
+}
 
 impl AppleProtocolFactory {
     pub fn select_security_type(
@@ -103,10 +160,20 @@ fn connect_authenticated(request: &ConnectRequest) -> Result<AppleConnection, Pr
         .credentials
         .as_ref()
         .ok_or_else(|| apple_error(APPLE_CREDENTIALS_REQUIRED))?;
-    let security_type = AppleProtocolFactory.select_security_type(&offered, credentials)?;
-    authenticate(&mut connection, version, security_type, credentials)
+    let password = std::str::from_utf8(credentials.password.expose())
         .map_err(|_| apple_error(APPLE_AUTHENTICATION_FAILED))?;
-    Ok(connection)
+    let authenticated = authenticate_negotiated(
+        connection,
+        version,
+        offered,
+        &credentials.username,
+        password,
+    )
+    .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
+    let established =
+        finish_authenticated_session(authenticated, SessionEncodingProfile::AppleTcpMvs)
+            .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
+    Ok(established.connection)
 }
 
 fn negotiate(connection: &mut AppleConnection) -> Result<((u8, u8), Vec<u8>)> {
@@ -171,51 +238,92 @@ fn read_reason(connection: &mut AppleConnection) -> Result<()> {
     Ok(())
 }
 
-fn authenticate(
-    connection: &mut AppleConnection,
+pub fn authenticate_negotiated(
+    mut connection: AppleConnection,
     version: (u8, u8),
-    security_type: u8,
-    credentials: &Credentials,
-) -> Result<()> {
+    offered: impl AsRef<[u8]>,
+    username: &str,
+    password: &str,
+) -> Result<AppleAuthenticated, AppleHandshakeError> {
+    let security_type =
+        select_apple_security_type_parts(offered.as_ref(), username, password.as_bytes())
+            .map_err(AppleHandshakeError::protocol)?;
     if version.1 != 3 && security_type != security::APPLE_RSA_SRP {
-        connection.write_all(&[security_type])?;
+        connection
+            .write_all(&[security_type])
+            .map_err(AppleHandshakeError::transport)?;
     }
-    let username = credentials.username.as_str();
-    let password =
-        std::str::from_utf8(credentials.password.expose()).context("Apple 密码不是 UTF-8")?;
     let srp_key = match security_type {
         security::APPLE_ARD => {
-            ard::authenticate(connection, username, password)?;
+            ard::authenticate(&mut connection, username, password)
+                .map_err(AppleHandshakeError::transport)?;
             None
         }
         security::APPLE_RSA_SRP => {
-            rsa_srp::authenticate(connection, username, password)?;
+            rsa_srp::authenticate(&mut connection, username, password)
+                .map_err(AppleHandshakeError::transport)?;
             None
         }
-        security::APPLE_SRP => Some(srp::authenticate(connection, username, password)?),
-        _ => anyhow::bail!("Apple 安全类型未实现"),
+        security::APPLE_SRP => Some(
+            srp::authenticate(&mut connection, username, password)
+                .map_err(AppleHandshakeError::transport)?,
+        ),
+        _ => unreachable!("严格 Apple selector 只返回已实现类型"),
     };
 
+    Ok(AppleAuthenticated {
+        connection,
+        security_type,
+        srp_key,
+    })
+}
+
+pub fn finish_authenticated_session(
+    authenticated: AppleAuthenticated,
+    profile: SessionEncodingProfile,
+) -> Result<EstablishedAppleSession, AppleHandshakeError> {
+    let AppleAuthenticated {
+        mut connection,
+        security_type,
+        srp_key,
+    } = authenticated;
+
     let encrypted = srp_key.is_some();
-    connection.write_all(&[if encrypted {
-        protocol::apple_session::ENCRYPTED_SESSION_CLIENT_INIT
-    } else {
-        protocol::apple_session::SHARED_CLIENT_INIT
-    }])?;
-    let header = connection.read_vec(SERVER_INIT_HEADER_BYTES)?;
-    let parsed = decode_server_init_header(&header)?;
+    connection
+        .write_all(&[if encrypted {
+            protocol::apple_session::ENCRYPTED_SESSION_CLIENT_INIT
+        } else {
+            protocol::apple_session::SHARED_CLIENT_INIT
+        }])
+        .map_err(AppleHandshakeError::transport)?;
+    let header = connection
+        .read_vec(SERVER_INIT_HEADER_BYTES)
+        .map_err(AppleHandshakeError::transport)?;
+    let parsed = decode_server_init_header(&header).map_err(AppleHandshakeError::transport)?;
     let mut server_init = header;
-    server_init.extend_from_slice(&connection.read_vec(parsed.name_length)?);
-    let _ = decode_server_init(&server_init)?;
+    server_init.extend_from_slice(
+        &connection
+            .read_vec(parsed.name_length)
+            .map_err(AppleHandshakeError::transport)?,
+    );
+    let server_init = decode_server_init(&server_init).map_err(AppleHandshakeError::transport)?;
     connection.set_read_timeout(None).ok();
 
     if let Some(srp_key) = srp_key {
-        let crypto = session::establish_with_table(
-            connection,
-            &srp_key,
-            SessionEncodingProfile::AppleTcpMvs,
-        )?;
-        connection.set_crypto(crypto)?;
+        let crypto = session::establish_with_table(&mut connection, &srp_key, profile)
+            .map_err(AppleHandshakeError::transport)?;
+        connection
+            .set_crypto(crypto)
+            .map_err(AppleHandshakeError::transport)?;
     }
-    Ok(())
+
+    Ok(EstablishedAppleSession {
+        connection,
+        metadata: AppleSessionMetadata {
+            security_type,
+            size: server_init.size,
+            pixel_format: server_init.pixel_format,
+            name: server_init.name,
+        },
+    })
 }
