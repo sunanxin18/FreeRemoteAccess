@@ -227,6 +227,11 @@ pub enum SessionCommand {
         generation: u64,
         viewport: PhysicalViewport,
     },
+    ResolveServerIdentity {
+        session_id: SessionId,
+        challenge_id: u64,
+        decision: ServerIdentityDecision,
+    },
     ClipboardWrite(ClipboardPayload),
     Disconnect,
 }
@@ -245,6 +250,7 @@ pub struct SessionInput {
 ```rust
 pub enum SessionEvent {
     StageChanged(ConnectionStage),
+    ServerIdentityChallenge(ServerIdentityChallenge),
     SurfaceGenerationChanged {
         session_id: SessionId,
         generation: u64,
@@ -266,6 +272,8 @@ pub enum PresentationEvent {
     },
 }
 ```
+
+RDP 或 RFB/TLS 服务端证书通过系统信任链或当前 endpoint/protocol 的已保存 SHA-256 pin 时可以继续；未知自签名证书必须在同一窗口显示 `ServerIdentityChallenge`，由用户选择仅本次信任、信任并保存或拒绝。Windows 平台通过当前用户范围的 DPAPI 保护持久 pin，adapter 只接收连接时的已有 pin 快照和当前 challenge 的决策，不直接依赖平台存储。pin 不匹配必须 fail closed。为未知证书取证的预握手不得发送用户名、密码或完成 CredSSP/应用层认证；用户批准后必须重连，并由只接受该精确指纹的 verifier 完成正式握手。
 
 协议握手成功和 UI 可展示远程桌面是两个不同事实。adapter 可以进入 `TransportReady`，但 compositor 在当前 generation 的完整 baseline 实际提交到 Surface 后才产生 `PresentationEvent::FramePresented { session_id, generation, revision, completeness }`。host 只转发该事件；`frd-app` reducer 只接受当前 session、当前 generation 且 `completeness == FullBaseline` 的回执，然后更新 UI model 进入远程页面。首帧门禁不重新定义 Apple Connected，也不让 session 依赖 renderer；它只防止旧会话回执或不完整增量把黑屏伪装成产品成功。
 
@@ -399,6 +407,35 @@ Windows 第一版默认使用 DX12。远端 CPU `Bgrx8UnormSrgb` 上传到 `Bgra
 
 ## 单窗口 UI 与平台衔接
 
+产品只有一个登录与会话入口：winit 创建的主窗口。命令行不再拥有独立的连接流程，也不直接启动协议 viewer；它只生成一次性的 `LaunchOptions`，由应用层合并为登录页的 `ConnectionDraft`：
+
+```rust
+pub struct LaunchOptions {
+    pub target_system: Option<TargetSystem>,
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    pub protocol: Option<ProtocolId>,
+    pub username_provider: Option<CredentialProviderId>,
+    pub password_provider: Option<CredentialProviderId>,
+    pub connect_when_complete: bool,
+}
+
+pub struct ConnectionDraft {
+    pub target_system: Option<TargetSystem>,
+    pub address: String,
+    pub port: Option<u16>,
+    pub protocol: ProtocolChoice,
+    pub username: String,
+    // SecretBuffer 与可复制草稿分开持有，不属于这个结构。
+}
+```
+
+- 无参数启动、CLI 缺少任一必填字段或凭据 provider 未能提供值时，都显示同一个 `ConnectionForm` 让用户补齐，不因缺少登录信息退出程序。
+- CLI 只允许地址、端口、目标系统、协议、凭据 provider 名称和 `--connect` 等非秘密参数。实际密码禁止放入 argv；它只能来自 GUI 密码框、环境凭据 provider 或现有受保护的 stdin 凭据帧。
+- `connect_when_complete` 只有在目标系统、地址、端口、协议选择和该协议声明的凭据字段全部通过校验时才触发一次自动连接。校验不完整或 provider 失败时留在登录页，精确标记字段错误，不启动 worker。
+- CLI 与 GUI 都只产生同一个 `ConnectionSubmission`，再由 `AppIntent::Connect` 进入 `frd-app`；不存在第二套 CLI session coordinator、第二个 GUI 或协议专属登录窗口。
+- 断开或失败后回到同一登录页，保留非秘密字段和用户名，清除密码。重新连接仍复用当前窗口和单会话槽。
+
 `frd-ui-model` 保存以下页面状态：
 
 ```text
@@ -410,7 +447,8 @@ ConnectionForm
 ```
 
 - 所有页面在同一个 winit EventLoop 和同一个窗口内切换。
-- `ConnectionForm` 的普通字段可以进入 UI model；密码由同层的不可 `Clone` `SecretBuffer` 单独持有，不进入可复制快照。连接时把秘密所有权移交 session，握手结束或失败后立即清零。
+- `ConnectionForm` 以 `ConnectionDraft` 为唯一可复制表单状态；密码由同层的不可 `Clone` `SecretBuffer` 单独持有，不进入草稿、日志或可复制快照。连接时把秘密所有权移交 session，握手结束或失败后立即清零。
+- 未知 TLS 服务端身份使用当前窗口中的确认页/覆盖层，不另开原生对话框或第二个 GUI；只显示 endpoint、subject/issuer、验证失败原因和 SHA-256 指纹，绝不显示或记录凭据。
 - 失败返回连接页时只保留地址、端口、目标系统、协议和用户名，不保留密码。
 - egui 只处理低频登录表单、设置、状态和工具栏。远程桌面是 wgpu 专用 pass。
 - egui 先消费控件事件；仅当事件位于远程 viewport 且未被 UI 消费时，才转换为远端 `InputEvent`。
