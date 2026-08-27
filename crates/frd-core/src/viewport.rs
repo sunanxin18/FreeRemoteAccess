@@ -61,8 +61,13 @@ impl ContentViewport {
                 return None;
             }
 
-            let scaled = ((value - start) as f64 * f64::from(remote_extent) / f64::from(extent))
-                .floor() as u32;
+            if extent == 1 || remote_extent == 1 {
+                return Some(0);
+            }
+
+            let scaled = ((value - start) as f64 * f64::from(remote_extent - 1)
+                / f64::from(extent - 1))
+            .floor() as u32;
             Some(scaled.min(remote_extent - 1))
         }
 
@@ -107,7 +112,7 @@ mod tests {
         );
         assert_eq!(
             viewport.map_pointer(1279.0, 719.0),
-            Some(PixelPoint { x: 2558, y: 1438 })
+            Some(PixelPoint { x: 2559, y: 1439 })
         );
         assert_eq!(viewport.map_pointer(-0.1, 0.0), None);
 
@@ -173,5 +178,25 @@ mod tests {
             Some(PixelPoint { x: 99, y: 99 })
         );
         assert_eq!(viewport.map_pointer(250.0, 199.0), None);
+    }
+
+    #[test]
+    fn one_pixel_axes_map_safely_without_division_by_zero() {
+        let viewport = ContentViewport::fit(
+            PixelSize {
+                width: 1,
+                height: 5,
+            },
+            PixelSize {
+                width: 1,
+                height: 5,
+            },
+        );
+
+        assert_eq!(
+            viewport.map_pointer(0.0, 4.0),
+            Some(PixelPoint { x: 0, y: 4 })
+        );
+        assert_eq!(viewport.map_pointer(1.0, 4.0), None);
     }
 }

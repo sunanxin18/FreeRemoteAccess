@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{bail, Context, Result};
-use frd_core::{PixelPoint, PointerInputState, PointerSample};
+use frd_core::{PixelPoint, PointerButtons, PointerInputState, PointerSample, WheelDelta};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::framebuffer::Framebuffer;
@@ -31,6 +31,30 @@ fn send(
         }
         None => w.write_all(msg).context("写入失败（连接中断？）"),
     }
+}
+
+fn rfb_pointer_mask(sample: PointerSample) -> u8 {
+    let mut mask = 0;
+    if sample.buttons.primary {
+        mask |= protocol::pointer::PRIMARY;
+    }
+    if sample.buttons.middle {
+        mask |= protocol::pointer::MIDDLE;
+    }
+    if sample.buttons.secondary {
+        mask |= protocol::pointer::SECONDARY;
+    }
+    if sample.wheel.vertical > 0 {
+        mask |= protocol::pointer::WHEEL_UP;
+    } else if sample.wheel.vertical < 0 {
+        mask |= protocol::pointer::WHEEL_DOWN;
+    }
+    if sample.wheel.horizontal > 0 {
+        mask |= protocol::pointer::WHEEL_RIGHT;
+    } else if sample.wheel.horizontal < 0 {
+        mask |= protocol::pointer::WHEEL_LEFT;
+    }
+    mask
 }
 
 pub fn run(client: VncClient, scale: f32) -> Result<()> {
@@ -176,27 +200,23 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
             None
         };
         let (sample, local_buttons_down) = if let Some((mx, my)) = pointer_position {
-            let mut mask = 0u8;
-            if window.get_mouse_down(MouseButton::Left) {
-                mask |= protocol::pointer::PRIMARY;
-            }
-            if window.get_mouse_down(MouseButton::Middle) {
-                mask |= protocol::pointer::MIDDLE;
-            }
-            if window.get_mouse_down(MouseButton::Right) {
-                mask |= protocol::pointer::SECONDARY;
-            }
-            let local_buttons_down = mask != 0;
+            let buttons = PointerButtons {
+                primary: window.get_mouse_down(MouseButton::Left),
+                middle: window.get_mouse_down(MouseButton::Middle),
+                secondary: window.get_mouse_down(MouseButton::Right),
+            };
+            let local_buttons_down = buttons.any_pressed();
+            let mut wheel = WheelDelta::default();
             if let Some((wx, wy)) = window.get_scroll_wheel() {
                 if wy > 0.0 {
-                    mask |= protocol::pointer::WHEEL_UP;
+                    wheel.vertical = 1;
                 } else if wy < 0.0 {
-                    mask |= protocol::pointer::WHEEL_DOWN;
+                    wheel.vertical = -1;
                 }
                 if wx > 0.0 {
-                    mask |= protocol::pointer::WHEEL_RIGHT;
+                    wheel.horizontal = 1;
                 } else if wx < 0.0 {
-                    mask |= protocol::pointer::WHEEL_LEFT;
+                    wheel.horizontal = -1;
                 }
             }
             let x = ((mx / scale) as i32).clamp(0, width as i32 - 1) as u16;
@@ -207,7 +227,8 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
                         x: x.into(),
                         y: y.into(),
                     },
-                    mask,
+                    buttons,
+                    wheel,
                 )),
                 local_buttons_down,
             )
@@ -216,7 +237,7 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
         };
         if let Some(event) = pointer_input.next_event(sample, local_buttons_down) {
             let msg = protocol::msg_pointer_event(
-                event.mask,
+                rfb_pointer_mask(event),
                 event.remote.x as u16,
                 event.remote.y as u16,
             );
@@ -237,5 +258,34 @@ fn downsample(src: &[u32], sw: usize, sh: usize, dst: &mut [u32], dw: usize, dh:
             let sx = (x * sw / dw).min(sw - 1);
             dst[y * dw + x] = src[row + sx];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rfb_pointer_mask;
+    use frd_core::{PixelPoint, PointerButtons, PointerSample, WheelDelta};
+
+    #[test]
+    fn semantic_pointer_sample_packs_to_rfb_mask_locally() {
+        let sample = PointerSample::new(
+            PixelPoint { x: 12, y: 34 },
+            PointerButtons {
+                primary: true,
+                middle: true,
+                ..Default::default()
+            },
+            WheelDelta {
+                vertical: 1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            rfb_pointer_mask(sample),
+            crate::vnc::protocol::pointer::PRIMARY
+                | crate::vnc::protocol::pointer::MIDDLE
+                | crate::vnc::protocol::pointer::WHEEL_UP
+        );
     }
 }

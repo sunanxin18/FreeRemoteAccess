@@ -6,8 +6,8 @@ pub mod viewport;
 
 pub use geometry::{PhysicalViewport, PixelPoint, PixelRect, PixelSize};
 pub use input::{
-    ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton,
-    PointerInputState, PointerSample, SessionInput,
+    ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton, PointerButtons,
+    PointerInputState, PointerSample, SessionInput, WheelDelta,
 };
 pub use secret::{SecretBuffer, SecretBytes};
 pub use session::SessionId;

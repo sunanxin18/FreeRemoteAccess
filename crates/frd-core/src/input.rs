@@ -63,19 +63,60 @@ pub struct SessionInput {
     pub event: InputEvent,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PointerButtons {
+    pub primary: bool,
+    pub middle: bool,
+    pub secondary: bool,
+}
+
+impl PointerButtons {
+    pub const fn any_pressed(self) -> bool {
+        self.primary || self.middle || self.secondary
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WheelDelta {
+    pub horizontal: i8,
+    pub vertical: i8,
+}
+
+impl WheelDelta {
+    pub const fn is_empty(self) -> bool {
+        self.horizontal == 0 && self.vertical == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PointerSample {
     pub remote: PixelPoint,
-    pub mask: u8,
+    pub buttons: PointerButtons,
+    pub wheel: WheelDelta,
 }
 
 impl PointerSample {
-    pub const fn new(remote: PixelPoint, mask: u8) -> Self {
-        Self { remote, mask }
+    pub const fn new(remote: PixelPoint, buttons: PointerButtons, wheel: WheelDelta) -> Self {
+        Self {
+            remote,
+            buttons,
+            wheel,
+        }
     }
 
     fn released(self) -> Self {
-        Self { mask: 0, ..self }
+        Self {
+            buttons: PointerButtons {
+                primary: false,
+                middle: false,
+                secondary: false,
+            },
+            wheel: WheelDelta {
+                horizontal: 0,
+                vertical: 0,
+            },
+            ..self
+        }
     }
 }
 
@@ -96,7 +137,7 @@ impl PointerInputState {
             return self
                 .last_sent
                 .take()
-                .filter(|last| last.mask != 0)
+                .filter(|last| last.buttons.any_pressed() || !last.wheel.is_empty())
                 .map(PointerSample::released);
         };
 
@@ -117,15 +158,33 @@ impl PointerInputState {
 
 #[cfg(test)]
 mod tests {
-    use super::{PointerInputState, PointerSample};
+    use super::{PointerButtons, PointerInputState, PointerSample, WheelDelta};
     use crate::PixelPoint;
 
     #[test]
     fn gate_confines_pointer_input_to_content_and_safely_rearms() {
         let mut state = PointerInputState::default();
-        let idle = PointerSample::new(PixelPoint { x: 10, y: 20 }, 0);
-        let held = PointerSample::new(PixelPoint { x: 11, y: 21 }, 1);
-        let released = PointerSample::new(PixelPoint { x: 11, y: 21 }, 0);
+        let idle = PointerSample::new(
+            PixelPoint { x: 10, y: 20 },
+            PointerButtons::default(),
+            WheelDelta::default(),
+        );
+        let held = PointerSample::new(
+            PixelPoint { x: 11, y: 21 },
+            PointerButtons {
+                primary: true,
+                ..Default::default()
+            },
+            WheelDelta {
+                vertical: 1,
+                ..Default::default()
+            },
+        );
+        let released = PointerSample::new(
+            PixelPoint { x: 11, y: 21 },
+            PointerButtons::default(),
+            WheelDelta::default(),
+        );
 
         assert_eq!(state.next_event(Some(idle), false), Some(idle));
         assert_eq!(state.next_event(Some(idle), false), None);
@@ -135,7 +194,11 @@ mod tests {
         assert_eq!(state.next_event(Some(idle), false), Some(idle));
 
         assert_eq!(state.next_event(Some(held), true), Some(held));
-        assert_eq!(state.next_event(None, false), Some(released));
+        let drag_out_release = state.next_event(None, false);
+        assert_eq!(drag_out_release, Some(released));
+        let drag_out_release = drag_out_release.expect("拖出必须生成中性释放");
+        assert_eq!(drag_out_release.buttons, PointerButtons::default());
+        assert_eq!(drag_out_release.wheel, WheelDelta::default());
         assert_eq!(state.next_event(None, false), None);
 
         assert_eq!(state.next_event(Some(held), true), None);

@@ -15,7 +15,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use frd_core::{ContentViewport, PixelSize, PointerInputState, PointerSample};
+use frd_core::{
+    ContentViewport, PixelSize, PointerButtons, PointerInputState, PointerSample, WheelDelta,
+};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::framebuffer::{Framebuffer, PIXEL_BLUE_SHIFT, PIXEL_GREEN_SHIFT, PIXEL_RED_SHIFT};
@@ -49,6 +51,30 @@ const MAX_AUDIO_ACCESS_UNITS_PER_READER_TICK: usize = 32;
 const MAX_PENDING_MEDIA_ANSWER_FRAME_DIAGNOSTICS: usize = 24;
 const REVIEWED_AUDIO_INPUT_SOURCE_MODE: AudioInputSourceMode =
     AudioInputSourceMode::DeterministicProbe;
+
+fn rfb_pointer_mask(sample: PointerSample) -> u8 {
+    let mut mask = 0;
+    if sample.buttons.primary {
+        mask |= protocol::pointer::PRIMARY;
+    }
+    if sample.buttons.middle {
+        mask |= protocol::pointer::MIDDLE;
+    }
+    if sample.buttons.secondary {
+        mask |= protocol::pointer::SECONDARY;
+    }
+    if sample.wheel.vertical > 0 {
+        mask |= protocol::pointer::WHEEL_UP;
+    } else if sample.wheel.vertical < 0 {
+        mask |= protocol::pointer::WHEEL_DOWN;
+    }
+    if sample.wheel.horizontal > 0 {
+        mask |= protocol::pointer::WHEEL_RIGHT;
+    } else if sample.wheel.horizontal < 0 {
+        mask |= protocol::pointer::WHEEL_LEFT;
+    }
+    mask
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum AudioOutputPhase {
@@ -2384,27 +2410,23 @@ pub fn run_viewer(
                 None
             };
             let (sample, local_buttons_down) = if let Some((mx, my)) = pointer_position {
-                let mut mask = 0u8;
-                if window.get_mouse_down(MouseButton::Left) {
-                    mask |= protocol::pointer::PRIMARY;
-                }
-                if window.get_mouse_down(MouseButton::Middle) {
-                    mask |= protocol::pointer::MIDDLE;
-                }
-                if window.get_mouse_down(MouseButton::Right) {
-                    mask |= protocol::pointer::SECONDARY;
-                }
-                let local_buttons_down = mask != 0;
+                let buttons = PointerButtons {
+                    primary: window.get_mouse_down(MouseButton::Left),
+                    middle: window.get_mouse_down(MouseButton::Middle),
+                    secondary: window.get_mouse_down(MouseButton::Right),
+                };
+                let local_buttons_down = buttons.any_pressed();
+                let mut wheel = WheelDelta::default();
                 if let Some((wx, wy)) = window.get_scroll_wheel() {
                     if wy > 0.0 {
-                        mask |= protocol::pointer::WHEEL_UP;
+                        wheel.vertical = 1;
                     } else if wy < 0.0 {
-                        mask |= protocol::pointer::WHEEL_DOWN;
+                        wheel.vertical = -1;
                     }
                     if wx > 0.0 {
-                        mask |= protocol::pointer::WHEEL_RIGHT;
+                        wheel.horizontal = 1;
                     } else if wx < 0.0 {
-                        mask |= protocol::pointer::WHEEL_LEFT;
+                        wheel.horizontal = -1;
                     }
                 }
                 let display_size = current_surface_size(&surface);
@@ -2421,7 +2443,7 @@ pub fn run_viewer(
                 (
                     viewport
                         .map_pointer(mx, my)
-                        .map(|remote| PointerSample::new(remote, mask)),
+                        .map(|remote| PointerSample::new(remote, buttons, wheel)),
                     local_buttons_down,
                 )
             } else {
@@ -2429,7 +2451,7 @@ pub fn run_viewer(
             };
             if let Some(event) = pointer_input.next_event(sample, local_buttons_down) {
                 let msg = protocol::msg_pointer_event(
-                    event.mask,
+                    rfb_pointer_mask(event),
                     event.remote.x as u16,
                     event.remote.y as u16,
                 );
@@ -2675,6 +2697,29 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, UdpSocket};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn semantic_pointer_sample_packs_to_rfb_mask_locally() {
+        let sample = frd_core::PointerSample::new(
+            frd_core::PixelPoint { x: 12, y: 34 },
+            frd_core::PointerButtons {
+                primary: true,
+                secondary: true,
+                ..Default::default()
+            },
+            frd_core::WheelDelta {
+                horizontal: -1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            super::rfb_pointer_mask(sample),
+            protocol::pointer::PRIMARY
+                | protocol::pointer::SECONDARY
+                | protocol::pointer::WHEEL_LEFT
+        );
+    }
 
     thread_local! {
         static INJECT_NATIVE_MVS_COMMIT_FAILURE: std::cell::Cell<bool> = const {
