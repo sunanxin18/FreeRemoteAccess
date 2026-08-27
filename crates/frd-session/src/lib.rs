@@ -2,7 +2,9 @@
 
 mod coordinator;
 
-pub use coordinator::{ConnectPlan, SessionCoordinator, WriterGate};
+pub use coordinator::{
+    CleanupComplete, CleanupError, CleanupOperations, ConnectPlan, SessionCoordinator, WriterGate,
+};
 pub use frd_protocol_api::{
     PresentationEvent, ServerIdentityChallenge, ServerIdentityDecision, SessionCommand,
     SessionEvent,

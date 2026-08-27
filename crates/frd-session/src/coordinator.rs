@@ -27,6 +27,38 @@ pub struct SessionCoordinator {
     factory_creations: usize,
 }
 
+/// 协调器执行资源回收的失败步骤；不携带协议或平台实现细节。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupError {
+    Cancel,
+    ShutdownWriter,
+    JoinWorkersAndAudio,
+    DisposeMailbox,
+}
+
+/// 会话资源回收的协议中立操作。所有步骤都必须完成才能释放活动会话槽。
+pub trait CleanupOperations {
+    fn cancel(&mut self) -> Result<(), CleanupError>;
+    fn shutdown_writer(&mut self) -> Result<(), CleanupError>;
+    fn join_workers_and_audio(&mut self) -> Result<(), CleanupError>;
+    fn dispose_mailbox(&mut self) -> Result<(), CleanupError>;
+}
+
+/// 仅由 `SessionCoordinator` 在完整资源回收后签发的会话释放能力。
+pub struct CleanupComplete {
+    session_id: SessionId,
+}
+
+impl CleanupComplete {
+    fn new(session_id: SessionId) -> Self {
+        Self { session_id }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+}
+
 impl SessionCoordinator {
     pub fn new(catalog: ProtocolCatalog) -> Self {
         Self {
@@ -49,6 +81,28 @@ impl SessionCoordinator {
 
     pub fn factory_creations(&self) -> usize {
         self.factory_creations
+    }
+
+    /// 依序尝试所有回收步骤。只有每一步都成功时才签发不可伪造的完成能力。
+    pub fn complete_cleanup(
+        &mut self,
+        session_id: SessionId,
+        cleanup_ops: &mut dyn CleanupOperations,
+    ) -> Result<CleanupComplete, CleanupError> {
+        let cancel = cleanup_ops.cancel();
+        let shutdown_writer = cleanup_ops.shutdown_writer();
+        let join_workers_and_audio = cleanup_ops.join_workers_and_audio();
+        let dispose_mailbox = cleanup_ops.dispose_mailbox();
+
+        [
+            cancel,
+            shutdown_writer,
+            join_workers_and_audio,
+            dispose_mailbox,
+        ]
+        .into_iter()
+        .find_map(Result::err)
+        .map_or_else(|| Ok(CleanupComplete::new(session_id)), Err)
     }
 }
 
@@ -85,7 +139,7 @@ mod tests {
     use frd_core::SessionId;
     use frd_protocol_api::{Endpoint, ProtocolCatalog, ProtocolId, TargetSystem};
 
-    use super::{ConnectPlan, SessionCoordinator, WriterGate};
+    use super::{CleanupError, CleanupOperations, ConnectPlan, SessionCoordinator, WriterGate};
 
     #[test]
     fn invalid_target_protocol_is_rejected_before_factory_creation() {
@@ -112,5 +166,91 @@ mod tests {
         assert!(gate.accepts(current, 2));
         assert!(gate.advance_generation(3));
         assert!(!gate.accepts(current, 2));
+    }
+
+    #[test]
+    fn complete_cleanup_runs_every_resource_step_in_order_before_issuing_capability() {
+        let session_id = SessionId::allocate();
+        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
+        let mut cleanup = RecordingCleanup::default();
+
+        let completion = coordinator
+            .complete_cleanup(session_id, &mut cleanup)
+            .expect("all cleanup steps succeed");
+
+        assert_eq!(completion.session_id(), session_id);
+        assert_eq!(
+            cleanup.calls,
+            vec![
+                "cancel",
+                "shutdown_writer",
+                "join_workers_and_audio",
+                "dispose_mailbox"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_cleanup_runs_remaining_steps_without_issuing_capability() {
+        let session_id = SessionId::allocate();
+        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
+        let mut cleanup = RecordingCleanup::failing_at(CleanupError::JoinWorkersAndAudio);
+
+        assert!(matches!(
+            coordinator.complete_cleanup(session_id, &mut cleanup),
+            Err(CleanupError::JoinWorkersAndAudio)
+        ));
+        assert_eq!(
+            cleanup.calls,
+            vec![
+                "cancel",
+                "shutdown_writer",
+                "join_workers_and_audio",
+                "dispose_mailbox"
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingCleanup {
+        calls: Vec<&'static str>,
+        failure: Option<CleanupError>,
+    }
+
+    impl RecordingCleanup {
+        fn failing_at(failure: CleanupError) -> Self {
+            Self {
+                calls: Vec::new(),
+                failure: Some(failure),
+            }
+        }
+
+        fn result(&self, error: CleanupError) -> Result<(), CleanupError> {
+            (self.failure == Some(error))
+                .then_some(error)
+                .map_or(Ok(()), Err)
+        }
+    }
+
+    impl CleanupOperations for RecordingCleanup {
+        fn cancel(&mut self) -> Result<(), CleanupError> {
+            self.calls.push("cancel");
+            self.result(CleanupError::Cancel)
+        }
+
+        fn shutdown_writer(&mut self) -> Result<(), CleanupError> {
+            self.calls.push("shutdown_writer");
+            self.result(CleanupError::ShutdownWriter)
+        }
+
+        fn join_workers_and_audio(&mut self) -> Result<(), CleanupError> {
+            self.calls.push("join_workers_and_audio");
+            self.result(CleanupError::JoinWorkersAndAudio)
+        }
+
+        fn dispose_mailbox(&mut self) -> Result<(), CleanupError> {
+            self.calls.push("dispose_mailbox");
+            self.result(CleanupError::DisposeMailbox)
+        }
     }
 }

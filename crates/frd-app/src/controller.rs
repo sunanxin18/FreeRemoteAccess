@@ -2,9 +2,10 @@ use frd_core::{InputEvent, SessionId, SessionInput};
 use frd_frame::FrameCompleteness;
 use frd_platform_api::{PlatformCapabilities, PlatformError, ServerIdentityStore};
 use frd_protocol_api::{
-    PresentationEvent, ServerIdentityChallenge, ServerIdentityDecision, SessionCapabilities,
-    SessionCommand, SessionEvent,
+    AudioState, ClipboardPayload, PresentationEvent, ServerIdentityChallenge,
+    ServerIdentityDecision, SessionCapabilities, SessionCommand, SessionEvent,
 };
+use frd_session::CleanupComplete;
 use frd_ui_model::Page;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -55,6 +56,8 @@ pub struct AppController {
     platform_capabilities: PlatformCapabilities,
     policy: ProductPolicy,
     challenge: Option<ServerIdentityChallenge>,
+    inbound_clipboard: Option<ClipboardPayload>,
+    audio_state: AudioState,
 }
 
 impl AppController {
@@ -68,6 +71,8 @@ impl AppController {
             platform_capabilities: PlatformCapabilities::default(),
             policy: ProductPolicy::default(),
             challenge: None,
+            inbound_clipboard: None,
+            audio_state: AudioState::Unavailable,
         }
     }
 
@@ -89,10 +94,25 @@ impl AppController {
         self.policy = policy;
     }
 
+    /// 取走最新的入站剪贴板；数据只在内存中短暂聚合，不持久化。
+    pub fn take_inbound_clipboard(&mut self) -> Option<ClipboardPayload> {
+        self.inbound_clipboard.take()
+    }
+
+    pub fn audio_state(&self) -> &AudioState {
+        &self.audio_state
+    }
+
     pub fn handle_session_event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::CapabilitiesChanged(capabilities) => {
                 self.protocol_capabilities = capabilities;
+            }
+            SessionEvent::Clipboard(payload) => {
+                self.inbound_clipboard = Some(payload);
+            }
+            SessionEvent::AudioState(state) => {
+                self.audio_state = state;
             }
             SessionEvent::SurfaceGenerationChanged {
                 session_id,
@@ -249,10 +269,10 @@ impl ActiveSessionSlot {
         }
     }
 
-    /// 仅 coordinator 在取消、writer shutdown、worker join 与 mailbox disposal 完成后调用。
-    pub fn finish_cleanup(&mut self, session_id: SessionId) -> Result<(), ()> {
+    /// 仅接受 `SessionCoordinator` 在完整资源回收后签发的完成能力。
+    pub fn finish_cleanup(&mut self, cleanup: CleanupComplete) -> Result<(), ()> {
         match self.state {
-            Some(SlotState::Disconnecting(current)) if current == session_id => {
+            Some(SlotState::Disconnecting(current)) if current == cleanup.session_id() => {
                 self.state = None;
                 Ok(())
             }

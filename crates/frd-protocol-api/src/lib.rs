@@ -218,7 +218,7 @@ pub enum ServerIdentityDecision {
     Reject,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ClipboardPayload(Box<[u8]>);
 
 impl ClipboardPayload {
@@ -229,6 +229,17 @@ impl ClipboardPayload {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+}
+
+/// 与具体音频设备无关的远端音频生命周期状态。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum AudioState {
+    #[default]
+    Unavailable,
+    Starting,
+    Playing,
+    Stopped,
+    Failed,
 }
 
 pub enum SessionCommand {
@@ -247,7 +258,7 @@ pub enum SessionCommand {
     Disconnect,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum SessionEvent {
     StageChanged(ConnectionStage),
     ServerIdentityChallenge(ServerIdentityChallenge),
@@ -257,6 +268,8 @@ pub enum SessionEvent {
         size: frd_core::PixelSize,
     },
     CapabilitiesChanged(SessionCapabilities),
+    Clipboard(ClipboardPayload),
+    AudioState(AudioState),
     Closed(ProtocolExit),
     Error(ProtocolError),
 }
@@ -618,6 +631,32 @@ mod tests {
     }
 
     #[test]
+    fn adapter_runtime_publishes_clipboard_and_audio_events_with_one_wake_each() {
+        let session_id = SessionId::allocate();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(AdapterEvents(log.clone())),
+            Box::new(AdapterFrames(log.clone())),
+            Box::new(RecordingWake(log.clone())),
+        );
+
+        runtime
+            .publish_event(SessionEvent::Clipboard(super::ClipboardPayload::new(vec![
+                0x11,
+            ])))
+            .expect("clipboard event is delivered");
+        runtime
+            .publish_event(SessionEvent::AudioState(super::AudioState::Playing))
+            .expect("audio event is delivered");
+
+        assert_eq!(
+            *log.lock().expect("log lock"),
+            vec!["clipboard", "wake", "audio", "wake"]
+        );
+    }
+
+    #[test]
     fn adapter_runtime_rejects_direct_generation_reset_and_stale_tagged_publications() {
         let session_id = SessionId::allocate();
         let stale_session = SessionId::allocate();
@@ -788,7 +827,7 @@ mod tests {
             Box::new(FaultEvents(fault_state.clone())),
             Box::new(FaultFrames(fault_state.clone())),
             Some(Box::new(RecordingMedia(media.clone()))),
-            Box::new(FaultWake(fault_state)),
+            Box::new(FaultWake(fault_state.clone())),
         );
         establish_generation(&mut runtime, session_id, 1);
         assert!(runtime
@@ -807,6 +846,16 @@ mod tests {
             Err(ProtocolError::Terminal)
         );
         assert_eq!(
+            runtime.publish_event(SessionEvent::Clipboard(super::ClipboardPayload::new(vec![
+                0x11,
+            ]))),
+            Err(ProtocolError::Terminal)
+        );
+        assert_eq!(
+            runtime.publish_event(SessionEvent::AudioState(super::AudioState::Playing)),
+            Err(ProtocolError::Terminal)
+        );
+        assert_eq!(
             runtime.publish_surface(damage(session_id, 1, 2)),
             Err(ProtocolError::Terminal)
         );
@@ -818,6 +867,10 @@ mod tests {
             Err(ProtocolError::Terminal)
         );
         assert_eq!(*media.lock().expect("media calls"), 0);
+        assert_eq!(
+            fault_state.lock().expect("fault state").attempts,
+            vec!["event", "reset", "wake", "event", "reset", "wake"]
+        );
     }
 
     #[test]
@@ -1037,6 +1090,8 @@ mod tests {
             let label = match event {
                 SessionEvent::SurfaceGenerationChanged { .. } => "generation",
                 SessionEvent::ServerIdentityChallenge(_) => "identity",
+                SessionEvent::Clipboard(_) => "clipboard",
+                SessionEvent::AudioState(_) => "audio",
                 _ => "event",
             };
             self.0.lock().expect("log lock").push(label);
