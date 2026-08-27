@@ -113,7 +113,7 @@ fn run_authenticated_cold_session_io<I: ColdSessionIo>(
             0,
             requested.width,
             requested.height,
-        ),
+        )?,
         4,
     )?;
     require_continue(writer.write_recording_gate()?)?;

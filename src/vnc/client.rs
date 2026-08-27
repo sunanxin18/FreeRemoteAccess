@@ -783,7 +783,7 @@ impl VncClient {
             0,
             self.width,
             self.height,
-        ))
+        )?)
     }
 }
 

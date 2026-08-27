@@ -81,11 +81,19 @@ pub fn decode_rectangle_header(bytes: &[u8]) -> Result<RectangleHeader, WireErro
     let bytes: &[u8; RECTANGLE_HEADER_BYTES] = bytes
         .try_into()
         .map_err(|_| WireError::new("RFB 矩形头长度必须为 12 字节"))?;
+    let width = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if width == 0 {
+        return Err(WireError::new("RFB 矩形宽度不能为零"));
+    }
+    let height = u16::from_be_bytes([bytes[6], bytes[7]]);
+    if height == 0 {
+        return Err(WireError::new("RFB 矩形高度不能为零"));
+    }
     Ok(RectangleHeader {
         x: u16::from_be_bytes([bytes[0], bytes[1]]),
         y: u16::from_be_bytes([bytes[2], bytes[3]]),
-        width: u16::from_be_bytes([bytes[4], bytes[5]]),
-        height: u16::from_be_bytes([bytes[6], bytes[7]]),
+        width,
+        height,
         encoding: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
     })
 }
@@ -122,7 +130,13 @@ pub fn encode_framebuffer_update_request(
     y: u16,
     width: u16,
     height: u16,
-) -> [u8; FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES] {
+) -> Result<[u8; FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES], WireError> {
+    if width == 0 {
+        return Err(WireError::new("FramebufferUpdateRequest 宽度不能为零"));
+    }
+    if height == 0 {
+        return Err(WireError::new("FramebufferUpdateRequest 高度不能为零"));
+    }
     let mut bytes = [0_u8; FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
     bytes[0] = 3;
     bytes[1] = u8::from(incremental);
@@ -130,7 +144,7 @@ pub fn encode_framebuffer_update_request(
     bytes[4..6].copy_from_slice(&y.to_be_bytes());
     bytes[6..8].copy_from_slice(&width.to_be_bytes());
     bytes[8..].copy_from_slice(&height.to_be_bytes());
-    bytes
+    Ok(bytes)
 }
 
 fn validate_security_type_count(count: usize) -> Result<(), WireError> {

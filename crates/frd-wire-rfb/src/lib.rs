@@ -106,6 +106,30 @@ mod tests {
     }
 
     #[test]
+    fn rectangle_header_rejects_zero_width_before_returning_a_header() {
+        assert!(decode_rectangle_header(&[0, 2, 0, 3, 0, 0, 0, 5, 0, 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn rectangle_header_rejects_zero_height_before_returning_a_header() {
+        assert!(decode_rectangle_header(&[0, 2, 0, 3, 0, 4, 0, 0, 0, 0, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn framebuffer_update_request_rejects_each_zero_extent() {
+        assert!(encode_framebuffer_update_request(false, 0, 0, 0, 5).is_err());
+        assert!(encode_framebuffer_update_request(false, 0, 0, 4, 0).is_err());
+    }
+
+    #[test]
+    fn framebuffer_update_request_preserves_the_exact_valid_wire_bytes() {
+        assert_eq!(
+            encode_framebuffer_update_request(true, 2, 3, 4, 5).unwrap(),
+            [3, 1, 0, 2, 0, 3, 0, 4, 0, 5]
+        );
+    }
+
+    #[test]
     fn set_encodings_rejects_count_overflow_before_serialization() {
         let encodings = vec![0_i32; usize::from(u16::MAX) + 1];
         let error = encode_set_encodings(&encodings).expect_err("超出 u16 的数量必须被拒绝");

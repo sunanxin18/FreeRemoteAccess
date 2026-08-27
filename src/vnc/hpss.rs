@@ -609,7 +609,7 @@ pub fn parse_media(m: &[u8]) -> Result<Media> {
 fn full_refresh_request(
     width: u16,
     height: u16,
-) -> [u8; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES] {
+) -> Result<[u8; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES]> {
     protocol::msg_fb_update_request(false, 0, 0, width, height)
 }
 
@@ -645,7 +645,7 @@ pub fn run(
     let w = if virtual_display_active { init_w } else { 1440 };
     let h = if virtual_display_active { init_h } else { 2560 };
     let q09 = build_display_query(DisplaySize::new(w, h).context("HPSS 初始显示尺寸无效")?);
-    let fb_req = full_refresh_request(w, h);
+    let fb_req = full_refresh_request(w, h)?;
     for q in [&q09[..], &fb_req[..]] {
         conn.write_all(q)?;
         std::thread::sleep(Duration::from_millis(120));
@@ -741,7 +741,7 @@ pub fn run(
                     if !seen_full_frame && last_full_request.elapsed() > Duration::from_millis(1500)
                     {
                         last_full_request = Instant::now();
-                        let refresh = full_refresh_request(w, h);
+                        let refresh = full_refresh_request(w, h)?;
                         conn.write_all(&refresh)
                             .context("发送 MVS 全量刷新请求失败")?;
                     }
@@ -1346,7 +1346,7 @@ mod tests {
     #[test]
     fn full_refresh_request_uses_non_incremental_rfb_wire_layout() {
         assert_eq!(
-            full_refresh_request(0x1234, 0xabcd),
+            full_refresh_request(0x1234, 0xabcd).unwrap(),
             [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0xab, 0xcd]
         );
     }

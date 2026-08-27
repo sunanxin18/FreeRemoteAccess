@@ -89,7 +89,7 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
         send(
             &write_stream,
             &crypto,
-            &protocol::msg_fb_update_request(false, 0, 0, width, height),
+            &protocol::msg_fb_update_request(false, 0, 0, width, height)?,
         )?;
     }
 
@@ -106,7 +106,16 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
                 match client::read_server_message(&mut conn) {
                     Ok(ServerEvent::Update(ops)) => {
                         fb.lock().unwrap().apply(&ops);
-                        let req = protocol::msg_fb_update_request(true, 0, 0, width, height);
+                        let req = match protocol::msg_fb_update_request(true, 0, 0, width, height) {
+                            Ok(request) => request,
+                            Err(error) => {
+                                if !closing.load(Ordering::Relaxed) {
+                                    *error_slot.lock().unwrap() =
+                                        Some(format!("构建更新请求失败: {error}"));
+                                }
+                                break;
+                            }
+                        };
                         if let Err(e) = send(&write_stream, &crypto, &req) {
                             if !closing.load(Ordering::Relaxed) {
                                 *error_slot.lock().unwrap() =

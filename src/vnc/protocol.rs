@@ -111,8 +111,14 @@ pub fn msg_fb_update_request(
     y: u16,
     width: u16,
     height: u16,
-) -> [u8; FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES] {
-    frd_wire_rfb::encode_framebuffer_update_request(incremental, x, y, width, height)
+) -> Result<[u8; FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES]> {
+    Ok(frd_wire_rfb::encode_framebuffer_update_request(
+        incremental,
+        x,
+        y,
+        width,
+        height,
+    )?)
 }
 
 /// 标准 RFB 客户端消息类型。

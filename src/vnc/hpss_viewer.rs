@@ -1211,7 +1211,7 @@ fn describe_media_frame_for_diagnostics(msg: &[u8]) -> String {
 fn incremental_request_after_full_apply(
     width: u16,
     height: u16,
-) -> [u8; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES] {
+) -> Result<[u8; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES]> {
     protocol::msg_fb_update_request(true, 0, 0, width, height)
 }
 
@@ -1223,7 +1223,7 @@ fn request_full_update(
     height: u16,
 ) -> Result<()> {
     let now = Instant::now();
-    let req = protocol::msg_fb_update_request(false, 0, 0, width, height);
+    let req = protocol::msg_fb_update_request(false, 0, 0, width, height)?;
     requests.send_rate_limited_full_at(now, thread::sleep, || {
         send_encrypted(write_stream, crypto, &req)
     })
@@ -1686,7 +1686,7 @@ fn service_network_reader_tick(
     now: Instant,
 ) -> Result<ReaderTickOutcome> {
     let size = current_surface_size(surface);
-    let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height);
+    let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
     // 固定锁序：queue → runtime → writer → crypto。surface 已在上方解锁。
     let mut queue = viewport_requests.lock().unwrap();
     let mut runtime = dynamic_resolution.lock().unwrap();
@@ -1721,8 +1721,8 @@ fn finish_network_full_boundary(
     now: Instant,
 ) -> Result<FullBoundaryOutcome> {
     let size = current_surface_size(surface);
-    let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height);
-    let incremental = incremental_request_after_full_apply(size.width, size.height);
+    let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
+    let incremental = incremental_request_after_full_apply(size.width, size.height)?;
     let mut queue = viewport_requests.lock().unwrap();
     let mut runtime = dynamic_resolution.lock().unwrap();
     finish_full_boundary_at(
@@ -1805,7 +1805,7 @@ fn handle_complete_mvs_record(
         }
     } else if outcome == MvsRecordOutcome::PartialApplied {
         let size = current_surface_size(surface);
-        let incremental = incremental_request_after_full_apply(size.width, size.height);
+        let incremental = incremental_request_after_full_apply(size.width, size.height)?;
         if finish_partial_boundary_at(requests, || {
             send_encrypted(write_stream, crypto, &incremental)
         })? {
@@ -1872,7 +1872,7 @@ pub fn run_viewer(
     let w = initial_size.width;
     let h = initial_size.height;
     let q09 = hpss::build_display_query(initial_size);
-    let fb_req = protocol::msg_fb_update_request(false, 0, 0, w, h);
+    let fb_req = protocol::msg_fb_update_request(false, 0, 0, w, h)?;
     conn.write_all(&q09)?;
     std::thread::sleep(Duration::from_millis(120));
     conn.write_all(&fb_req)?;
@@ -5146,8 +5146,8 @@ mod tests {
     #[test]
     fn full_apply_always_queues_next_incremental_request() {
         assert_eq!(
-            incremental_request_after_full_apply(1440, 2560),
-            protocol::msg_fb_update_request(true, 0, 0, 1440, 2560)
+            incremental_request_after_full_apply(1440, 2560).unwrap(),
+            protocol::msg_fb_update_request(true, 0, 0, 1440, 2560).unwrap()
         );
     }
 
