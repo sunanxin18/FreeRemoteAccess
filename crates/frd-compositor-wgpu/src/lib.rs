@@ -3,9 +3,14 @@ mod surface;
 
 use frd_core::PixelSize;
 use frd_protocol_api::PresentationEvent;
-use frd_render_wgpu::{GpuContext, RemoteRenderer, RendererError};
+use frd_render_wgpu::{
+    GpuContext, GpuFaultClass, RecoveryRequirement, RemoteRenderer, RendererError,
+};
 
-use state::{acknowledge_after_present, AcquiredFrame, AcquisitionAction};
+use state::{
+    acknowledge_after_present, AcquiredFrame, AcquisitionAction, ContextPairState,
+    SurfaceSizeAction, SurfaceSizeState,
+};
 pub use surface::{PresentationSurface, PresentationSurfaceLease};
 
 pub trait PresentationHooks {
@@ -17,7 +22,9 @@ pub enum PresentError {
     SurfaceCreation,
     SurfaceUnsupported,
     SurfaceDetached,
-    SurfaceAcquisitionValidation,
+    InvalidPhysicalSize,
+    ContextMismatch,
+    GpuFault(GpuFaultClass),
     Renderer(RendererError),
 }
 
@@ -27,11 +34,21 @@ impl From<RendererError> for PresentError {
     }
 }
 
+impl From<GpuFaultClass> for PresentError {
+    fn from(value: GpuFaultClass) -> Self {
+        Self::GpuFault(value)
+    }
+}
+
+fn require_context_match(matches: bool) -> Result<(), PresentError> {
+    matches.then_some(()).ok_or(PresentError::ContextMismatch)
+}
+
 pub struct PresentationCompositor {
     context: GpuContext,
     presentation: PresentationSurface,
     configuration: Option<wgpu::SurfaceConfiguration>,
-    physical_size: Option<PixelSize>,
+    size_state: SurfaceSizeState,
 }
 
 impl PresentationCompositor {
@@ -40,11 +57,13 @@ impl PresentationCompositor {
         context: GpuContext,
         physical_size: PixelSize,
     ) -> Result<Self, PresentError> {
+        let size_state =
+            SurfaceSizeState::new(physical_size).ok_or(PresentError::InvalidPhysicalSize)?;
         let mut compositor = Self {
             context,
             presentation,
             configuration: None,
-            physical_size: Some(physical_size),
+            size_state,
         };
         compositor.configure_surface()?;
         Ok(compositor)
@@ -54,19 +73,25 @@ impl PresentationCompositor {
         self.configuration.as_ref().map(|config| config.format)
     }
 
-    pub fn resize(&mut self, size: PixelSize) {
-        self.physical_size = Some(size);
-        if let Some(configuration) = self.configuration.as_mut() {
-            configuration.width = size.width;
-            configuration.height = size.height;
-            if let Some(surface) = self.presentation.surface() {
-                surface.configure(self.context.device(), configuration);
+    pub fn resize(&mut self, size: PixelSize) -> Result<(), PresentError> {
+        match self.size_state.resize(size) {
+            SurfaceSizeAction::Pause => {}
+            SurfaceSizeAction::Configure(size) => {
+                if let Some(mut configuration) = self.configuration.clone() {
+                    configuration.width = size.width;
+                    configuration.height = size.height;
+                    self.configure_existing_with(&configuration)?;
+                    self.configuration = Some(configuration);
+                } else {
+                    self.configure_surface()?;
+                }
             }
         }
+        Ok(())
     }
 
     pub fn pause_presenting(&mut self) {
-        self.physical_size = None;
+        self.size_state.pause();
     }
 
     pub fn render(
@@ -75,7 +100,12 @@ impl PresentationCompositor {
         overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
         hooks: &dyn PresentationHooks,
     ) -> Result<Option<PresentationEvent>, PresentError> {
-        let Some(physical_size) = self.physical_size else {
+        let context_pair = ContextPairState::new(self.context.context_id(), remote.context_id());
+        require_context_match(context_pair.matches() && remote.uses_context(&self.context))?;
+        if let Some(fault) = self.context.observed_fault() {
+            return Err(PresentError::GpuFault(fault));
+        }
+        let Some(physical_size) = self.size_state.active() else {
             return Ok(None);
         };
         let target_format = self
@@ -83,11 +113,13 @@ impl PresentationCompositor {
             .as_ref()
             .ok_or(PresentError::SurfaceDetached)?
             .format;
+        let acquisition_scope = self.context.begin_fault_scope()?;
         let acquired = self
             .presentation
             .surface()
             .ok_or(PresentError::SurfaceDetached)?
             .get_current_texture();
+        acquisition_scope.finish()?;
         let acquired = AcquiredFrame::from(acquired);
         let action = acquired.action();
 
@@ -97,6 +129,7 @@ impl PresentationCompositor {
                     AcquiredFrame::Success(texture) | AcquiredFrame::Suboptimal(texture) => texture,
                     _ => unreachable!("渲染动作必须包含 SurfaceTexture"),
                 };
+                let frame_scope = self.context.begin_fault_scope()?;
                 let view = texture
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
@@ -111,13 +144,17 @@ impl PresentationCompositor {
                 hooks.before_submit();
                 self.context.queue().submit([encoder.finish()]);
                 self.context.queue().present(texture);
-
-                let event = acknowledge_after_present(receipt, true);
-                if let Some(receipt) = receipt {
-                    remote.confirm_presented(receipt)?;
-                }
+                // submit/present 在 wgpu 30 中不返回逐帧 Result；同一错误作用域和共享
+                // observer 负责在确认回执前收集同步验证错误与设备丢失。finish 使用
+                // 非阻塞 Poll，不把呈现路径变成等待 GPU 完成的 fence。
+                let gpu_result = frame_scope.finish();
                 if action == AcquisitionAction::RenderThenReconfigure {
                     self.reconfigure_existing()?;
+                }
+                let event = acknowledge_after_present(receipt, gpu_result);
+                gpu_result?;
+                if let Some(receipt) = receipt {
+                    remote.confirm_presented(receipt)?;
                 }
                 Ok(event)
             }
@@ -131,13 +168,42 @@ impl PresentationCompositor {
                 Ok(None)
             }
             AcquisitionAction::Skip => Ok(None),
-            AcquisitionAction::ValidationError => Err(PresentError::SurfaceAcquisitionValidation),
+            AcquisitionAction::ValidationError => {
+                self.context.observe_fault(GpuFaultClass::Validation);
+                Err(PresentError::GpuFault(GpuFaultClass::Validation))
+            }
         }
+    }
+
+    pub fn recover_gpu(
+        &mut self,
+        remote: &mut RemoteRenderer,
+        context: GpuContext,
+    ) -> Result<Option<RecoveryRequirement>, PresentError> {
+        let mut context_pair =
+            ContextPairState::new(self.context.context_id(), remote.context_id());
+        let new_context_id = context.context_id();
+        let candidate = self.presentation.create_candidate(context.instance())?;
+        let configuration = if let Some(size) = self.size_state.active() {
+            let configuration = surface_configuration(&candidate, &context, size)?;
+            configure_surface_with(&candidate, &context, &configuration)?;
+            Some(configuration)
+        } else {
+            None
+        };
+        let requirement = remote.recover_device(context.clone())?;
+        self.presentation.replace_surface(candidate);
+        self.context = context;
+        self.configuration = configuration;
+        context_pair.install_recovery(new_context_id);
+        debug_assert!(context_pair.matches());
+        debug_assert_eq!(self.context.context_id(), remote.context_id());
+        Ok(requirement)
     }
 
     pub fn detach(&mut self) {
         self.configuration = None;
-        self.physical_size = None;
+        self.size_state.pause();
         self.presentation.detach();
     }
 
@@ -146,58 +212,90 @@ impl PresentationCompositor {
             .configuration
             .as_ref()
             .ok_or(PresentError::SurfaceDetached)?;
-        self.presentation
-            .surface()
-            .ok_or(PresentError::SurfaceDetached)?
-            .configure(self.context.device(), configuration);
-        Ok(())
+        self.configure_existing_with(configuration)
     }
 
-    fn configure_surface(&mut self) -> Result<(), PresentError> {
-        let size = self.physical_size.ok_or(PresentError::SurfaceDetached)?;
+    fn configure_existing_with(
+        &self,
+        configuration: &wgpu::SurfaceConfiguration,
+    ) -> Result<(), PresentError> {
         let surface = self
             .presentation
             .surface()
             .ok_or(PresentError::SurfaceDetached)?;
-        let capabilities = surface.get_capabilities(self.context.adapter());
-        let format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(|format| *format == wgpu::TextureFormat::Bgra8UnormSrgb)
-            .or_else(|| {
-                capabilities
-                    .formats
-                    .iter()
-                    .copied()
-                    .find(wgpu::TextureFormat::is_srgb)
-            })
-            .ok_or(PresentError::SurfaceUnsupported)?;
-        let present_mode = capabilities
-            .present_modes
-            .first()
-            .copied()
-            .ok_or(PresentError::SurfaceUnsupported)?;
-        let alpha_mode = capabilities
-            .alpha_modes
-            .first()
-            .copied()
-            .ok_or(PresentError::SurfaceUnsupported)?;
-        let configuration = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width,
-            height: size.height,
-            desired_maximum_frame_latency: 2,
-            present_mode,
-            alpha_mode,
-            view_formats: Vec::new(),
-        };
-        surface.configure(self.context.device(), &configuration);
+        configure_surface_with(surface, &self.context, configuration)
+    }
+
+    fn configure_surface(&mut self) -> Result<(), PresentError> {
+        let size = self
+            .size_state
+            .active()
+            .ok_or(PresentError::InvalidPhysicalSize)?;
+        let surface = self
+            .presentation
+            .surface()
+            .ok_or(PresentError::SurfaceDetached)?;
+        let configuration = surface_configuration(surface, &self.context, size)?;
+        configure_surface_with(surface, &self.context, &configuration)?;
         self.configuration = Some(configuration);
         Ok(())
     }
+}
+
+fn surface_configuration(
+    surface: &wgpu::Surface<'_>,
+    context: &GpuContext,
+    size: PixelSize,
+) -> Result<wgpu::SurfaceConfiguration, PresentError> {
+    if size.width == 0 || size.height == 0 {
+        return Err(PresentError::InvalidPhysicalSize);
+    }
+    let capabilities = surface.get_capabilities(context.adapter());
+    let format = capabilities
+        .formats
+        .iter()
+        .copied()
+        .find(|format| *format == wgpu::TextureFormat::Bgra8UnormSrgb)
+        .or_else(|| {
+            capabilities
+                .formats
+                .iter()
+                .copied()
+                .find(wgpu::TextureFormat::is_srgb)
+        })
+        .ok_or(PresentError::SurfaceUnsupported)?;
+    let present_mode = capabilities
+        .present_modes
+        .first()
+        .copied()
+        .ok_or(PresentError::SurfaceUnsupported)?;
+    let alpha_mode = capabilities
+        .alpha_modes
+        .first()
+        .copied()
+        .ok_or(PresentError::SurfaceUnsupported)?;
+    Ok(wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        color_space: wgpu::SurfaceColorSpace::Auto,
+        width: size.width,
+        height: size.height,
+        desired_maximum_frame_latency: 2,
+        present_mode,
+        alpha_mode,
+        view_formats: Vec::new(),
+    })
+}
+
+fn configure_surface_with(
+    surface: &wgpu::Surface<'_>,
+    context: &GpuContext,
+    configuration: &wgpu::SurfaceConfiguration,
+) -> Result<(), PresentError> {
+    let scope = context.begin_fault_scope()?;
+    surface.configure(context.device(), configuration);
+    scope.finish()?;
+    Ok(())
 }
 
 impl Drop for PresentationCompositor {
@@ -210,7 +308,7 @@ impl Drop for PresentationCompositor {
 mod api_tests {
     use frd_core::PixelSize;
     use frd_protocol_api::PresentationEvent;
-    use frd_render_wgpu::{GpuContext, GpuContextError, RemoteRenderer};
+    use frd_render_wgpu::{GpuContext, GpuContextError, RecoveryRequirement, RemoteRenderer};
 
     use super::{
         PresentError, PresentationCompositor, PresentationHooks, PresentationSurface,
@@ -240,7 +338,15 @@ mod api_tests {
     }
 
     fn resize_contract(compositor: &mut PresentationCompositor, size: PixelSize) {
-        compositor.resize(size);
+        compositor.resize(size).unwrap();
+    }
+
+    fn coordinated_recovery_contract(
+        compositor: &mut PresentationCompositor,
+        renderer: &mut RemoteRenderer,
+        context: GpuContext,
+    ) -> Result<Option<RecoveryRequirement>, PresentError> {
+        compositor.recover_gpu(renderer, context)
     }
 
     #[test]
@@ -249,5 +355,15 @@ mod api_tests {
         let _ = request_context_contract;
         let _ = render_contract;
         let _ = resize_contract;
+        let _ = coordinated_recovery_contract;
+    }
+
+    #[test]
+    fn context_mismatch_is_a_stable_fail_closed_error() {
+        assert_eq!(
+            super::require_context_match(false),
+            Err(PresentError::ContextMismatch)
+        );
+        assert_eq!(super::require_context_match(true), Ok(()));
     }
 }

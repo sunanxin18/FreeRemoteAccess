@@ -1,5 +1,78 @@
+use frd_core::PixelSize;
 use frd_protocol_api::PresentationEvent;
-use frd_render_wgpu::PresentationReceipt;
+use frd_render_wgpu::{GpuFaultClass, PresentationReceipt};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceSizeAction {
+    Pause,
+    Configure(PixelSize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SurfaceSizeState {
+    active: Option<PixelSize>,
+}
+
+impl SurfaceSizeState {
+    pub(crate) fn new(size: PixelSize) -> Option<Self> {
+        is_nonzero(size).then_some(Self { active: Some(size) })
+    }
+
+    pub(crate) fn resize(&mut self, size: PixelSize) -> SurfaceSizeAction {
+        if is_nonzero(size) {
+            self.active = Some(size);
+            SurfaceSizeAction::Configure(size)
+        } else {
+            self.active = None;
+            SurfaceSizeAction::Pause
+        }
+    }
+
+    pub(crate) fn pause(&mut self) {
+        self.active = None;
+    }
+
+    pub(crate) fn active(&self) -> Option<PixelSize> {
+        self.active
+    }
+}
+
+fn is_nonzero(size: PixelSize) -> bool {
+    size.width != 0 && size.height != 0
+}
+
+pub(crate) struct ContextPairState<T> {
+    compositor: T,
+    renderer: T,
+}
+
+impl<T: Copy + Eq> ContextPairState<T> {
+    pub(crate) fn new(compositor: T, renderer: T) -> Self {
+        Self {
+            compositor,
+            renderer,
+        }
+    }
+
+    pub(crate) fn matches(&self) -> bool {
+        self.compositor == self.renderer
+    }
+
+    pub(crate) fn install_recovery(&mut self, context: T) {
+        self.compositor = context;
+        self.renderer = context;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compositor(&self) -> T {
+        self.compositor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn renderer(&self) -> T {
+        self.renderer
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AcquisitionAction {
@@ -50,11 +123,11 @@ impl From<wgpu::CurrentSurfaceTexture> for AcquiredFrame<wgpu::SurfaceTexture> {
 
 pub(crate) fn acknowledge_after_present(
     receipt: Option<PresentationReceipt>,
-    presented: bool,
+    gpu_result: Result<(), GpuFaultClass>,
 ) -> Option<PresentationEvent> {
-    presented
-        .then_some(receipt)
-        .flatten()
+    gpu_result
+        .ok()
+        .and(receipt)
         .map(|receipt| PresentationEvent::FramePresented {
             session_id: receipt.session_id,
             generation: receipt.generation,
@@ -113,9 +186,11 @@ mod tests {
     use frd_core::SessionId;
     use frd_frame::FrameCompleteness;
     use frd_protocol_api::PresentationEvent;
+    use frd_render_wgpu::GpuFaultClass;
 
     use super::{
-        acknowledge_after_present, AcquiredFrame, AcquisitionAction, OwnedSurfaceAndLease,
+        acknowledge_after_present, AcquiredFrame, AcquisitionAction, ContextPairState,
+        OwnedSurfaceAndLease, SurfaceSizeAction, SurfaceSizeState,
     };
     use frd_render_wgpu::PresentationReceipt;
 
@@ -160,9 +235,12 @@ mod tests {
             completeness: FrameCompleteness::FullBaseline,
         };
 
-        assert_eq!(acknowledge_after_present(Some(receipt), false), None);
         assert_eq!(
-            acknowledge_after_present(Some(receipt), true),
+            acknowledge_after_present(Some(receipt), Err(GpuFaultClass::Validation)),
+            None
+        );
+        assert_eq!(
+            acknowledge_after_present(Some(receipt), Ok(())),
             Some(PresentationEvent::FramePresented {
                 session_id: receipt.session_id,
                 generation: 3,
@@ -170,7 +248,27 @@ mod tests {
                 completeness: FrameCompleteness::FullBaseline,
             })
         );
-        assert_eq!(acknowledge_after_present(None, true), None);
+        assert_eq!(acknowledge_after_present(None, Ok(())), None);
+    }
+
+    #[test]
+    fn write_record_submit_present_validation_and_device_lost_faults_never_acknowledge() {
+        let receipt = PresentationReceipt {
+            session_id: SessionId::allocate(),
+            generation: 7,
+            revision: 11,
+            completeness: FrameCompleteness::FullBaseline,
+        };
+
+        for fault in [
+            GpuFaultClass::Validation,
+            GpuFaultClass::OutOfMemory,
+            GpuFaultClass::Internal,
+            GpuFaultClass::DeviceLost,
+            GpuFaultClass::ObservationIncomplete,
+        ] {
+            assert_eq!(acknowledge_after_present(Some(receipt), Err(fault)), None);
+        }
     }
 
     #[derive(Clone)]
@@ -215,5 +313,68 @@ mod tests {
             );
         }
         assert_eq!(&*drop_log.borrow(), &["surface", "lease"]);
+    }
+
+    #[test]
+    fn initial_surface_size_rejects_every_publicly_constructible_zero_axis() {
+        for size in [
+            frd_core::PixelSize {
+                width: 0,
+                height: 1,
+            },
+            frd_core::PixelSize {
+                width: 1,
+                height: 0,
+            },
+            frd_core::PixelSize {
+                width: 0,
+                height: 0,
+            },
+        ] {
+            assert_eq!(SurfaceSizeState::new(size), None);
+        }
+    }
+
+    #[test]
+    fn zero_resize_pauses_without_configure_and_nonzero_resize_resumes_configuration() {
+        let initial = frd_core::PixelSize {
+            width: 800,
+            height: 600,
+        };
+        let resumed = frd_core::PixelSize {
+            width: 1024,
+            height: 768,
+        };
+        let mut state = SurfaceSizeState::new(initial).expect("初始尺寸非零");
+
+        assert_eq!(
+            state.resize(frd_core::PixelSize {
+                width: 0,
+                height: 600,
+            }),
+            SurfaceSizeAction::Pause
+        );
+        assert_eq!(state.active(), None);
+        assert_eq!(
+            state.resize(frd_core::PixelSize {
+                width: 800,
+                height: 0,
+            }),
+            SurfaceSizeAction::Pause
+        );
+        assert_eq!(state.active(), None);
+        assert_eq!(state.resize(resumed), SurfaceSizeAction::Configure(resumed));
+        assert_eq!(state.active(), Some(resumed));
+    }
+
+    #[test]
+    fn context_pair_rejects_mismatch_and_coordinated_recovery_installs_one_identity() {
+        let mut pair = ContextPairState::new("compositor-old", "renderer-other");
+
+        assert!(!pair.matches());
+        pair.install_recovery("shared-new");
+        assert!(pair.matches());
+        assert_eq!(pair.compositor(), "shared-new");
+        assert_eq!(pair.renderer(), "shared-new");
     }
 }

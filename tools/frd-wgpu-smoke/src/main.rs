@@ -91,7 +91,8 @@ impl SmokeApplication {
             .map_err(|error| format!("gpu_context:{error:?}"))?;
         let compositor = PresentationCompositor::new(surface, context.clone(), physical_size)
             .map_err(|error| format!("compositor:{error:?}"))?;
-        let mut renderer = RemoteRenderer::new(context);
+        let mut renderer =
+            RemoteRenderer::new(context).map_err(|error| format!("renderer_create:{error:?}"))?;
         for update in smoke_updates(SessionId::allocate()) {
             renderer
                 .apply_update(update)
@@ -139,7 +140,11 @@ impl ApplicationHandler for SmokeApplication {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(size) = PixelSize::new(size.width, size.height) {
-                    state.compositor.resize(size);
+                    if let Err(error) = state.compositor.resize(size) {
+                        eprintln!("wgpu smoke 调整尺寸失败：{error:?}");
+                        event_loop.exit();
+                        return;
+                    }
                     state.window.request_redraw();
                 } else {
                     state.compositor.pause_presenting();

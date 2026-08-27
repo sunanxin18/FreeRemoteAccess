@@ -1,7 +1,7 @@
 use frd_core::{PixelRect, PixelSize, SessionId};
 use frd_frame::{FrameCompleteness, PixelFormat, PixelPatch, SurfaceUpdate};
 
-use crate::{pass::RemotePass, GpuContext};
+use crate::{pass::RemotePass, GpuContext, GpuContextId, GpuFaultClass};
 
 const MAX_REMOTE_TEXTURE_BYTES: u64 = 256 * 1024 * 1024;
 const BYTES_PER_PIXEL: u32 = 4;
@@ -69,6 +69,13 @@ pub enum RendererError {
     StalePresentationReceipt,
     TextureDimensionUnsupported,
     UnsupportedTargetFormat,
+    GpuFault(GpuFaultClass),
+}
+
+impl From<GpuFaultClass> for RendererError {
+    fn from(value: GpuFaultClass) -> Self {
+        Self::GpuFault(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,16 +109,18 @@ pub struct RemoteRenderer {
 }
 
 impl RemoteRenderer {
-    pub fn new(context: GpuContext) -> Self {
+    pub fn new(context: GpuContext) -> Result<Self, RendererError> {
+        let scope = context.begin_fault_scope()?;
         let (bind_group_layout, sampler) = create_sampling_resources(context.device());
-        Self {
+        scope.finish()?;
+        Ok(Self {
             context,
             bind_group_layout,
             sampler,
             remote: None,
             pass: None,
             state: RemoteUpdateState::default(),
-        }
+        })
     }
 
     pub fn apply_update(&mut self, update: SurfaceUpdate) -> Result<ApplyOutcome, RendererError> {
@@ -124,18 +133,22 @@ impl RemoteRenderer {
                 {
                     return Err(RendererError::TextureDimensionUnsupported);
                 }
-                let remote = create_remote_texture(
-                    self.context.device(),
-                    &self.bind_group_layout,
-                    &self.sampler,
-                    *size,
-                );
-                self.state.commit(plan)?;
-                self.remote = Some(remote);
-                Ok(ApplyOutcome::Reset)
+                let candidate = (|| {
+                    let scope = self.context.begin_fault_scope()?;
+                    let remote = create_remote_texture(
+                        self.context.device(),
+                        &self.bind_group_layout,
+                        &self.sampler,
+                        *size,
+                    );
+                    scope.finish()?;
+                    Ok(remote)
+                })();
+                commit_reset_resource_after_gpu(&mut self.state, &mut self.remote, plan, candidate)
             }
             PlannedUpdateData::Damage { patches, .. } => {
                 let remote = self.remote.as_ref().ok_or(RendererError::ResetRequired)?;
+                let scope = self.context.begin_fault_scope()?;
                 for (patch, upload) in patches.iter().zip(plan.uploads()) {
                     debug_assert_eq!(patch.pixels.len(), upload.byte_len);
                     self.context.queue().write_texture(
@@ -163,12 +176,16 @@ impl RemoteRenderer {
                     );
                 }
                 let uploaded_rectangles = patches.len();
-                self.state.commit(plan)?;
+                let gpu_result = scope.finish().map_err(RendererError::from);
+                commit_planned_update_after_gpu(&mut self.state, plan, gpu_result)?;
                 Ok(ApplyOutcome::Damage {
                     uploaded_rectangles,
                 })
             }
             PlannedUpdateData::Boundary(receipt) => {
+                if let Some(fault) = self.context.observed_fault() {
+                    return Err(RendererError::GpuFault(fault));
+                }
                 let receipt = *receipt;
                 self.state.commit(plan)?;
                 Ok(ApplyOutcome::BoundaryPending(receipt))
@@ -183,44 +200,71 @@ impl RemoteRenderer {
         drawable: PixelSize,
         target_format: wgpu::TextureFormat,
     ) -> Result<Option<PresentationReceipt>, RendererError> {
-        if self
+        let scope = self.context.begin_fault_scope()?;
+        let replacement_pass = if self
             .pass
             .as_ref()
             .is_none_or(|pass| !pass.matches(target_format))
         {
-            self.pass = Some(RemotePass::new(
+            Some(RemotePass::new(
                 self.context.device(),
                 &self.bind_group_layout,
                 target_format,
-            )?);
-        }
+            )?)
+        } else {
+            None
+        };
         let remote = self.remote.as_ref();
-        self.pass.as_ref().expect("远端 pass 已创建").record(
-            encoder,
-            target,
-            remote.map(|texture| &texture.bind_group),
-            remote.map(|texture| texture.size),
-            drawable,
-        );
+        replacement_pass
+            .as_ref()
+            .or(self.pass.as_ref())
+            .expect("远端 pass 已创建")
+            .record(
+                encoder,
+                target,
+                remote.map(|texture| &texture.bind_group),
+                remote.map(|texture| texture.size),
+                drawable,
+            );
+        scope.finish()?;
+        if let Some(replacement_pass) = replacement_pass {
+            self.pass = Some(replacement_pass);
+        }
         Ok(self.state.pending_receipt())
     }
 
     pub fn confirm_presented(&mut self, receipt: PresentationReceipt) -> Result<(), RendererError> {
+        if let Some(fault) = self.context.observed_fault() {
+            return Err(RendererError::GpuFault(fault));
+        }
         self.state.confirm_presented(receipt)
     }
 
-    pub fn recover_device(&mut self, context: GpuContext) -> Option<RecoveryRequirement> {
+    pub fn recover_device(
+        &mut self,
+        context: GpuContext,
+    ) -> Result<Option<RecoveryRequirement>, RendererError> {
+        let scope = context.begin_fault_scope()?;
+        let (bind_group_layout, sampler) = create_sampling_resources(context.device());
+        scope.finish()?;
         let requirement = self
             .remote
             .as_ref()
             .map(|_| self.state.invalidate_for_device_loss());
         self.context = context;
-        let (bind_group_layout, sampler) = create_sampling_resources(self.context.device());
         self.bind_group_layout = bind_group_layout;
         self.sampler = sampler;
         self.remote = None;
         self.pass = None;
-        requirement
+        Ok(requirement)
+    }
+
+    pub fn uses_context(&self, context: &GpuContext) -> bool {
+        self.context.is_same_context(context)
+    }
+
+    pub fn context_id(&self) -> GpuContextId {
+        self.context.context_id()
     }
 
     pub fn detach(&mut self) {
@@ -228,6 +272,27 @@ impl RemoteRenderer {
         self.pass = None;
         self.state.clear();
     }
+}
+
+fn commit_reset_resource_after_gpu<R>(
+    state: &mut RemoteUpdateState,
+    resource: &mut Option<R>,
+    plan: PlannedUpdate,
+    candidate: Result<R, RendererError>,
+) -> Result<ApplyOutcome, RendererError> {
+    let candidate = candidate?;
+    state.commit(plan)?;
+    *resource = Some(candidate);
+    Ok(ApplyOutcome::Reset)
+}
+
+fn commit_planned_update_after_gpu(
+    state: &mut RemoteUpdateState,
+    plan: PlannedUpdate,
+    gpu_result: Result<(), RendererError>,
+) -> Result<(), RendererError> {
+    gpu_result?;
+    state.commit(plan)
 }
 
 fn create_sampling_resources(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Sampler) {
@@ -383,6 +448,11 @@ impl RemoteUpdateState {
     fn last_damage_revision(&self) -> u64 {
         self.current
             .map_or(0, |current| current.last_damage_revision)
+    }
+
+    #[cfg(test)]
+    fn current_generation(&self) -> Option<u64> {
+        self.current.map(|current| current.generation)
     }
 
     #[cfg(test)]
@@ -574,7 +644,11 @@ mod tests {
     use frd_core::{PixelRect, PixelSize, SessionId};
     use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
 
-    use super::{RecoveryRequirement, RemoteColorPolicy, RemoteUpdateState, RendererError};
+    use super::{
+        commit_planned_update_after_gpu, commit_reset_resource_after_gpu, RecoveryRequirement,
+        RemoteColorPolicy, RemoteUpdateState, RendererError,
+    };
+    use crate::GpuFaultClass;
 
     fn reset(
         session_id: SessionId,
@@ -846,6 +920,77 @@ mod tests {
                 .plan(damage(session_id, 1, 2, rect, 8, vec![0; 16]))
                 .unwrap_err(),
             RendererError::ResetRequired
+        );
+    }
+
+    #[test]
+    fn gpu_creation_failure_preserves_old_resource_identity_and_exact_renderer_state() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 2, 2);
+        let mut state = RemoteUpdateState::default();
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 8, vec![0; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan).unwrap();
+        }
+        let pending = state.pending_receipt();
+        let next_reset = state
+            .plan(reset(session_id, 2, size, PixelFormat::Bgrx8UnormSrgb))
+            .unwrap();
+        let mut resource = Some("old-texture-owner");
+
+        assert_eq!(
+            commit_reset_resource_after_gpu(
+                &mut state,
+                &mut resource,
+                next_reset,
+                Err(RendererError::GpuFault(GpuFaultClass::OutOfMemory)),
+            )
+            .unwrap_err(),
+            RendererError::GpuFault(GpuFaultClass::OutOfMemory)
+        );
+        assert_eq!(resource, Some("old-texture-owner"));
+        assert_eq!(state.current_generation(), Some(1));
+        assert_eq!(state.last_damage_revision(), 1);
+        assert_eq!(state.pending_receipt(), pending);
+    }
+
+    #[test]
+    fn gpu_write_failure_does_not_advance_damage_or_make_a_boundary_eligible() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 1, 1);
+        let mut state = RemoteUpdateState::default();
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 4, vec![0; 4]),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan).unwrap();
+        }
+        let failed_damage = state
+            .plan(damage(session_id, 1, 2, rect, 4, vec![0; 4]))
+            .unwrap();
+
+        assert_eq!(
+            commit_planned_update_after_gpu(
+                &mut state,
+                failed_damage,
+                Err(RendererError::GpuFault(GpuFaultClass::Validation)),
+            )
+            .unwrap_err(),
+            RendererError::GpuFault(GpuFaultClass::Validation)
+        );
+        assert_eq!(state.last_damage_revision(), 1);
+        assert_eq!(
+            state
+                .plan(boundary(session_id, 1, 2, FrameCompleteness::Incremental,))
+                .unwrap_err(),
+            RendererError::BoundaryWithoutMatchingDamage
         );
     }
 }

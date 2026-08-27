@@ -57,17 +57,28 @@ impl PresentationSurface {
     }
 
     pub(crate) fn recreate(&mut self, instance: &wgpu::Instance) -> Result<(), PresentError> {
-        self.owned.drop_surface();
+        let surface = self.create_candidate(instance)?;
+        self.replace_surface(surface);
+        Ok(())
+    }
+
+    pub(crate) fn create_candidate(
+        &self,
+        instance: &wgpu::Instance,
+    ) -> Result<wgpu::Surface<'static>, PresentError> {
         let target = self
             .owned
             .lease()
             .ok_or(PresentError::SurfaceDetached)?
             .target();
-        let surface = instance
+        instance
             .create_surface(target)
-            .map_err(|_| PresentError::SurfaceCreation)?;
+            .map_err(|_| PresentError::SurfaceCreation)
+    }
+
+    pub(crate) fn replace_surface(&mut self, surface: wgpu::Surface<'static>) {
+        self.owned.drop_surface();
         self.owned.replace_surface(surface);
-        Ok(())
     }
 
     pub fn detach(&mut self) {
