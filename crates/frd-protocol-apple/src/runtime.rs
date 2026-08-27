@@ -4,10 +4,15 @@
 //! the sole outbound crypto owner; this module only serializes protocol-neutral
 //! commands into that writer.
 
+use std::error;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use frd_core::{ButtonState, InputEvent, PixelPoint, PointerButton, SessionId};
+use frd_core::{
+    ButtonState, InputEvent, PixelPoint, PointerButton, PointerButtons, PointerSample, SessionId,
+    WheelDelta,
+};
 use frd_protocol_api::{
     AudioState, ConnectionStage, ProtocolError, ProtocolExit, ProtocolRuntime, SessionCapabilities,
     SessionCommand, SessionEvent,
@@ -23,21 +28,53 @@ use crate::network_reader::{NetworkFrameOutcome, NetworkReaderRuntime};
 use crate::protocol;
 
 const APPLE_RUNTIME_FAILED: &str = "apple_runtime_failed";
+const APPLE_KEYBOARD_INPUT_UNSUPPORTED: &str = "apple_keyboard_input_unsupported_task_10";
 const APPLE_RUNTIME_READ_POLL: Duration = Duration::from_millis(100);
 
 fn adapter_error() -> ProtocolError {
     ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), APPLE_RUNTIME_FAILED)
 }
 
+#[derive(Debug)]
+struct UnsupportedKeyboardInput;
+
+impl fmt::Display for UnsupportedKeyboardInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Apple 迁移阶段仅支持鼠标；统一键盘输入由 Task 10 恢复")
+    }
+}
+
+impl error::Error for UnsupportedKeyboardInput {}
+
+fn is_unsupported_keyboard(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<UnsupportedKeyboardInput>())
+}
+
+fn protocol_exit_for_runtime_error(error: anyhow::Error) -> ProtocolExit {
+    if is_peer_closed(&error) {
+        ProtocolExit::Closed
+    } else if is_unsupported_keyboard(&error) {
+        ProtocolExit::Failed(ProtocolError::adapter(
+            frd_core::ProtocolId::apple_hpss_mvs(),
+            APPLE_KEYBOARD_INPUT_UNSUPPORTED,
+        ))
+    } else {
+        ProtocolExit::Failed(adapter_error())
+    }
+}
+
 #[derive(Default)]
-struct PointerWireState {
+pub(crate) struct PointerWireState {
     point: Option<PixelPoint>,
     buttons: u8,
 }
 
 impl PointerWireState {
-    fn handle(&mut self, event: InputEvent, writer: &AppleWriterHandle) -> Result<()> {
+    pub(crate) fn handle(&mut self, event: InputEvent, writer: &AppleWriterHandle) -> Result<()> {
         match event {
+            InputEvent::PointerSample(sample) => self.handle_sample(sample, writer)?,
             InputEvent::PointerMove { remote } => {
                 self.point = Some(remote);
                 self.send(self.buttons, writer)?;
@@ -73,13 +110,33 @@ impl PointerWireState {
                 self.send(mask, writer)?;
             }
             InputEvent::ReleaseAll => {
-                self.buttons = 0;
-                self.send(0, writer)?;
+                self.release_all(writer)?;
             }
             // PhysicalKeyCode intentionally has no cross-platform keysym
-            // meaning yet. Do not guess one in the Apple adapter.
-            InputEvent::PhysicalKey { .. } | InputEvent::Text { .. } => {}
+            // meaning yet. Do not guess one in the Apple adapter or silently
+            // claim the input was handled.
+            InputEvent::PhysicalKey { .. } | InputEvent::Text { .. } => {
+                return Err(UnsupportedKeyboardInput.into());
+            }
         }
+        Ok(())
+    }
+
+    fn handle_sample(&mut self, sample: PointerSample, writer: &AppleWriterHandle) -> Result<()> {
+        self.point = Some(sample.remote);
+        self.buttons = pointer_button_mask(sample.buttons);
+        self.send(self.buttons | wheel_mask(sample.wheel), writer)
+    }
+
+    pub(crate) fn release_all(&mut self, writer: &AppleWriterHandle) -> Result<()> {
+        let point = self.point.unwrap_or(PixelPoint { x: 0, y: 0 });
+        writer.send_private_message(&protocol::msg_pointer_event(
+            0,
+            u16::try_from(point.x).context("指针 x 超出 Apple RFB u16 范围")?,
+            u16::try_from(point.y).context("指针 y 超出 Apple RFB u16 范围")?,
+        ))?;
+        self.point = None;
+        self.buttons = 0;
         Ok(())
     }
 
@@ -91,6 +148,38 @@ impl PointerWireState {
         let y = u16::try_from(point.y).context("指针 y 超出 Apple RFB u16 范围")?;
         writer.send_private_message(&protocol::msg_pointer_event(mask, x, y))
     }
+}
+
+fn pointer_button_mask(buttons: PointerButtons) -> u8 {
+    (if buttons.primary {
+        protocol::pointer::PRIMARY
+    } else {
+        0
+    }) | (if buttons.middle {
+        protocol::pointer::MIDDLE
+    } else {
+        0
+    }) | (if buttons.secondary {
+        protocol::pointer::SECONDARY
+    } else {
+        0
+    })
+}
+
+fn wheel_mask(wheel: WheelDelta) -> u8 {
+    (if wheel.vertical > 0 {
+        protocol::pointer::WHEEL_UP
+    } else if wheel.vertical < 0 {
+        protocol::pointer::WHEEL_DOWN
+    } else {
+        0
+    }) | (if wheel.horizontal > 0 {
+        protocol::pointer::WHEEL_RIGHT
+    } else if wheel.horizontal < 0 {
+        protocol::pointer::WHEEL_LEFT
+    } else {
+        0
+    })
 }
 
 pub(crate) fn run_authenticated_session(
@@ -134,8 +223,7 @@ pub fn run_established_hpss_session(
         audio_flow,
     ) {
         Ok(()) => ProtocolExit::Closed,
-        Err(error) if is_peer_closed(&error) => ProtocolExit::Closed,
-        Err(_) => ProtocolExit::Failed(adapter_error()),
+        Err(error) => protocol_exit_for_runtime_error(error),
     }
 }
 
@@ -234,7 +322,14 @@ fn run_authenticated_session_inner(
                 Err(error) if is_timeout(&error) => continue,
                 Err(error) => return Err(error),
             };
-            match reader.handle_frame(message, &writer, &mut media, &mut runtime)? {
+            let mut before_generation_commit = || pointer.release_all(&writer);
+            match reader.handle_frame(
+                message,
+                &writer,
+                &mut media,
+                &mut runtime,
+                &mut before_generation_commit,
+            )? {
                 NetworkFrameOutcome::Consumed => {}
                 NetworkFrameOutcome::Media(Media::PortAnnouncement(announcement)) => {
                     media.handle_port_announcement(
@@ -262,4 +357,118 @@ fn run_authenticated_session_inner(
     let _ = connection.shutdown();
     let _ = writer.shutdown();
     loop_result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use frd_protocol_api::{
+        ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand,
+        SessionEvent, SurfacePublisher,
+    };
+
+    struct NoopEvents;
+
+    impl RuntimeEventSink for NoopEvents {
+        fn publish(&self, _event: SessionEvent) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct NoopFrames;
+
+    impl SurfacePublisher for NoopFrames {
+        fn publish(&self, _update: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct NoopWake;
+
+    impl RuntimeWake for NoopWake {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn production_writer_timeout_unblocks_runtime_to_drain_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        socket2::SockRef::from(&listener)
+            .set_recv_buffer_size(1024)
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_peer_tx, release_peer_rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            socket2::SockRef::from(&stream)
+                .set_recv_buffer_size(1024)
+                .unwrap();
+            release_peer_rx.recv().unwrap();
+            drop(stream);
+        });
+        let client = TcpStream::connect(address).unwrap();
+        socket2::SockRef::from(&client)
+            .set_send_buffer_size(1024)
+            .unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        let session_id = frd_core::SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        commands.send(SessionCommand::Disconnect).unwrap();
+        let active_writer = writer.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let session = thread::spawn(move || {
+            let payload = vec![0x5a; 1024 * 1024];
+            let write: anyhow::Result<()> = loop {
+                if let Err(error) = active_writer.send_private_message(&payload) {
+                    break Err(error);
+                }
+            };
+            let command = runtime.try_next_command();
+            done_tx.send((write, command)).unwrap();
+        });
+
+        let completed = done_rx.recv_timeout(Duration::from_secs(3));
+        let completed_within_bound = completed.is_ok();
+        release_peer_tx.send(()).unwrap();
+        peer.join().unwrap();
+        let (write, command) = completed.unwrap_or_else(|_| {
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("peer close must release the blocked production writer")
+        });
+        session.join().unwrap();
+        writer.shutdown().unwrap();
+
+        assert!(write.is_err());
+        assert!(matches!(command, Some(SessionCommand::Disconnect)));
+        assert!(
+            completed_within_bound,
+            "production write must fail before the 3s session bound"
+        );
+    }
+
+    #[test]
+    fn unsupported_keyboard_input_returns_stable_fail_closed_exit() {
+        let exit = super::protocol_exit_for_runtime_error(super::UnsupportedKeyboardInput.into());
+
+        assert!(matches!(
+            exit,
+            frd_protocol_api::ProtocolExit::Failed(error)
+                if error.code() == "apple_keyboard_input_unsupported_task_10"
+        ));
+    }
 }

@@ -222,20 +222,34 @@ fn commit_server_geometry(
     surface: &mut DisplaySurface,
     media_state: &mut ViewerMediaState,
     observed: DisplaySize,
-) -> Option<GeometryCommit> {
-    let replacement_size = PixelSize::new(observed.width.into(), observed.height.into())?;
-    let internal_commit = runtime.observe_server_state(observed)?;
-    let generation = internal_commit.generation.checked_add(1)?;
+    before_generation_commit: impl FnOnce() -> Result<()>,
+) -> Result<Option<GeometryCommit>> {
+    let Some(replacement_size) = PixelSize::new(observed.width.into(), observed.height.into())
+    else {
+        return Ok(None);
+    };
+    let Some(internal_commit) = runtime.observe_server_state(observed) else {
+        return Ok(None);
+    };
+    let Some(generation) = internal_commit.generation.checked_add(1) else {
+        return Ok(None);
+    };
     if surface.generation.checked_add(1) != Some(generation) {
-        return None;
+        return Ok(None);
     }
-    media_state.reset_generation(generation).ok()?;
+    before_generation_commit()?;
+    if media_state.reset_generation(generation).is_err() {
+        return Ok(None);
+    }
     receiver.reset(generation);
-    *surface = DisplaySurface::new(generation, replacement_size).ok()?;
-    Some(GeometryCommit {
+    let Ok(replacement) = DisplaySurface::new(generation, replacement_size) else {
+        return Ok(None);
+    };
+    *surface = replacement;
+    Ok(Some(GeometryCommit {
         generation,
         size: internal_commit.size,
-    })
+    }))
 }
 
 /// Viewer 读线程持有的、generation 绑定的 MVS 接收状态。
@@ -1391,6 +1405,7 @@ impl NetworkReaderRuntime {
         writer: &AppleWriterHandle,
         media_state: &mut ViewerMediaState,
         protocol_runtime: &mut ProtocolRuntime,
+        before_generation_commit: &mut impl FnMut() -> Result<()>,
     ) -> Result<NetworkFrameOutcome> {
         if reader_frame_class(&self.receiver, &message) == ReaderFrameClass::Continuation {
             let record = match self.receiver.push_continuation(&message) {
@@ -1490,7 +1505,8 @@ impl NetworkReaderRuntime {
                                 &mut surface,
                                 media_state,
                                 observed,
-                            )
+                                before_generation_commit,
+                            )?
                         };
                         if let Some(commit) = commit {
                             let size =
@@ -1534,10 +1550,74 @@ impl NetworkReaderRuntime {
 mod migrated_runtime_tests {
     use super::*;
 
+    struct NoopProtocolEvents;
+
+    impl frd_protocol_api::RuntimeEventSink for NoopProtocolEvents {
+        fn publish(
+            &self,
+            _event: frd_protocol_api::SessionEvent,
+        ) -> Result<(), frd_protocol_api::ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct NoopProtocolFrames;
+
+    impl frd_protocol_api::SurfacePublisher for NoopProtocolFrames {
+        fn publish(
+            &self,
+            _update: frd_frame::SurfaceUpdate,
+        ) -> Result<(), frd_protocol_api::ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct NoopProtocolWake;
+
+    impl frd_protocol_api::RuntimeWake for NoopProtocolWake {
+        fn wake(&self) -> Result<(), frd_protocol_api::ProtocolError> {
+            Ok(())
+        }
+    }
+
     fn type_two_tables_fixture() -> [u8; 129] {
         let mut payload = [0u8; 129];
         payload[0] = 2;
         payload
+    }
+
+    fn decode_private_hex_fixture(hex: &str) -> Vec<u8> {
+        let compact = hex.trim();
+        assert!(compact.len().is_multiple_of(2));
+        compact
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn media_stream_answer_fixture() -> Vec<u8> {
+        let container = decode_private_hex_fixture(&crate::read_private_fixture_text(
+            "ard_re/fixtures/avc_mode_4_answer.bplist.hex",
+        ));
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&(container.len() as u16).to_be_bytes());
+        body.extend_from_slice(&(container.len() as u16).to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&[0; 4]);
+        body.extend_from_slice(&container);
+        body.extend_from_slice(&container);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&[0; 8]);
+        frame.extend_from_slice(&crate::protocol::MEDIA_STREAM_CONTROL_ENCODING.to_be_bytes());
+        frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame
     }
 
     struct TestBitWriter {
@@ -1693,6 +1773,128 @@ mod migrated_runtime_tests {
             assert!(!runtime.observe_initial_server_state(initial, initial));
             assert!(runtime.observe_full_applied(1, initial));
         }
+    }
+
+    #[test]
+    fn exact_ack_releases_old_pointer_once_before_generation_reset_and_clears_new_mask() {
+        use std::io::Read as _;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        use frd_core::{
+            InputEvent, PixelPoint, PointerButtons, PointerSample, SessionId, WheelDelta,
+        };
+        use frd_protocol_api::ProtocolRuntime;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let mut protocol_runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopProtocolEvents),
+            Box::new(NoopProtocolFrames),
+            None,
+            Box::new(NoopProtocolWake),
+        );
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let target = DisplaySize::new(1280, 720).unwrap();
+        let mut reader = NetworkReaderRuntime::new(
+            &mut protocol_runtime,
+            session_id,
+            initial,
+            true,
+            Instant::now(),
+        )
+        .unwrap();
+        {
+            let mut dynamic = reader.dynamic_resolution.lock().unwrap();
+            arm_runtime(&mut dynamic, initial, false);
+            dynamic
+                .send_target_with(target, |_| Ok(Instant::now()))
+                .unwrap()
+                .unwrap();
+        }
+        let mut media = ViewerMediaState::new(
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+        let mut pointer = crate::runtime::PointerWireState::default();
+        pointer
+            .handle(
+                InputEvent::PointerSample(PointerSample::new(
+                    PixelPoint { x: 10, y: 20 },
+                    PointerButtons {
+                        primary: true,
+                        secondary: true,
+                        ..Default::default()
+                    },
+                    WheelDelta {
+                        horizontal: -1,
+                        ..Default::default()
+                    },
+                )),
+                &writer,
+            )
+            .unwrap();
+        let mut before_commit = || pointer.release_all(&writer);
+        let mut server_state = vec![0u8; 94];
+        server_state[0..4].copy_from_slice(&1u32.to_be_bytes());
+        server_state[12..16].copy_from_slice(&encoding::SERVER_STATE.to_be_bytes());
+        server_state[16..18].copy_from_slice(&76u16.to_be_bytes());
+        server_state[18..20].copy_from_slice(&5u16.to_be_bytes());
+        server_state[20..22].copy_from_slice(&target.width.to_be_bytes());
+        server_state[22..24].copy_from_slice(&target.height.to_be_bytes());
+
+        reader
+            .handle_frame(
+                server_state.clone(),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_commit,
+            )
+            .unwrap();
+        reader
+            .handle_frame(
+                server_state,
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_commit,
+            )
+            .unwrap();
+        drop(before_commit);
+        pointer
+            .handle(
+                InputEvent::PointerSample(PointerSample::new(
+                    PixelPoint { x: 30, y: 40 },
+                    PointerButtons::default(),
+                    WheelDelta::default(),
+                )),
+                &writer,
+            )
+            .unwrap();
+
+        let mut wire = [0u8; 28];
+        peer.read_exact(&mut wire).unwrap();
+        assert_eq!(&wire[0..6], &[5, 69, 0, 10, 0, 20]);
+        assert_eq!(&wire[6..12], &[5, 0, 0, 10, 0, 20]);
+        assert_eq!(
+            wire[12], 3,
+            "release must precede the new-generation full request"
+        );
+        assert_eq!(&wire[22..28], &[5, 0, 0, 30, 0, 40]);
+        assert_eq!(reader.generation(), 2);
+        writer.shutdown().unwrap();
     }
     #[test]
     fn capability_arms_only_after_matching_state_and_current_full_in_either_order() {
@@ -2234,6 +2436,45 @@ mod migrated_runtime_tests {
         let record = receiver.push_continuation(&[0x08]).unwrap().unwrap();
 
         assert_eq!(record.payload, vec![0x00, 0x08]);
+    }
+
+    #[test]
+    #[ignore = "需要未纳入公开仓库的本地授权 AVConference fixture"]
+    fn pending_record_does_not_swallow_complete_media_stream_answer() {
+        let mut receiver = MvsReceiveState::new(1);
+        let rect = MvsRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert!(receiver.begin(rect, 1024, &[0]).unwrap().is_none());
+
+        assert_eq!(
+            reader_frame_class(&receiver, &media_stream_answer_fixture()),
+            ReaderFrameClass::ControlOrMedia
+        );
+        assert!(receiver.is_pending());
+    }
+
+    #[test]
+    #[ignore = "需要未纳入公开仓库的本地授权 AVConference fixture"]
+    fn pending_record_keeps_malformed_media_control_lookalike_as_continuation() {
+        let mut receiver = MvsReceiveState::new(1);
+        let rect = MvsRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert!(receiver.begin(rect, 1024, &[0]).unwrap().is_none());
+        let mut truncated = media_stream_answer_fixture();
+        truncated.pop();
+
+        assert_eq!(
+            reader_frame_class(&receiver, &truncated),
+            ReaderFrameClass::Continuation
+        );
     }
     #[test]
     fn truncated_mvs_envelope_requests_resynchronization() {

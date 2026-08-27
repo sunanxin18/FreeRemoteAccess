@@ -286,6 +286,10 @@ impl AppleSurfacePublisher {
         }) {
             Ok(()) => {}
             Err(ProtocolError::NeedsFullSnapshot) => {
+                // Damage 已被 mailbox 接受并推进其 last_damage_revision；
+                // overflow 清队列但不会回滚生命周期。下一次 full recovery
+                // 必须使用更高 revision，同时本次不能建立 baseline。
+                self.revision = revision;
                 return Ok(PublicationOutcome::NeedsFullSnapshot);
             }
             Err(error) => return Err(error),
@@ -344,10 +348,10 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
 
     use frd_core::{PixelRect, PixelSize, SessionId};
-    use frd_frame::{FrameCompleteness, PixelFormat, SurfaceUpdate};
+    use frd_frame::{FrameCompleteness, FrameMailbox, PixelFormat, SurfaceUpdate};
     use frd_protocol_api::{
-        ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent,
-        SurfacePublisher,
+        MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
+        SessionEvent, SurfacePublisher,
     };
 
     use super::{
@@ -562,5 +566,99 @@ mod tests {
             SurfaceUpdate::Reset { generation: 2, .. }
         ));
         assert_eq!(frames.len(), 6, "stale generation must publish nothing");
+    }
+
+    #[test]
+    fn boundary_overflow_consumes_damage_revision_but_full_baseline_recovers_higher() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let (_commands, command_rx) = mpsc::channel();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(2, 4)));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        apply_rgb_rect_for_generation(&mut surface, 1, &[0x11, 0x22, 0x33], 0, 0, 1, 1).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        let full = MvsFrameKind::TypeZero {
+            complete_surface: true,
+            initial_nonblack: true,
+        };
+
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    full,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullSnapshot
+        );
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeOne,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullBaseline,
+            "an unqueued boundary must not establish the baseline"
+        );
+        assert!(matches!(
+            mailbox.lock().unwrap().pop(),
+            Some(SurfaceUpdate::Reset { .. })
+        ));
+
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    full,
+                )
+                .unwrap(),
+            PublicationOutcome::Published
+        );
+        let mut mailbox = mailbox.lock().unwrap();
+        assert!(matches!(
+            mailbox.pop(),
+            Some(SurfaceUpdate::Damage { revision: 2, .. })
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(SurfaceUpdate::FrameBoundary {
+                revision: 2,
+                completeness: FrameCompleteness::FullBaseline,
+                ..
+            })
+        ));
     }
 }

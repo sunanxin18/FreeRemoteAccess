@@ -16,6 +16,8 @@ use crate::session::{
     take_wire_ciphertext_frame, InboundSessionCrypto, OutboundSessionCrypto, SessionCrypto,
 };
 
+const PRODUCTION_WRITER_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug)]
 struct PeerClosed;
 
@@ -174,15 +176,18 @@ fn writer_loop(
         match command {
             WriterCommand::Message { plaintext, result } => {
                 let send_result = (|| {
-                    if let Some(deadline) = absolute_deadline {
-                        let remaining = deadline
+                    let write_timeout = if let Some(deadline) = absolute_deadline {
+                        deadline
                             .checked_duration_since(Instant::now())
                             .filter(|duration| !duration.is_zero())
-                            .ok_or_else(cold_deadline_error)?;
-                        stream
-                            .set_write_timeout(Some(remaining))
-                            .context("设置 deadline 写超时失败")?;
-                    }
+                            .ok_or_else(cold_deadline_error)?
+                            .min(PRODUCTION_WRITER_IO_TIMEOUT)
+                    } else {
+                        PRODUCTION_WRITER_IO_TIMEOUT
+                    };
+                    stream
+                        .set_write_timeout(Some(write_timeout))
+                        .context("设置 Apple writer 写超时失败")?;
                     let wire = match crypto {
                         Some(crypto) => crypto.seal(&plaintext)?,
                         None => plaintext,

@@ -34,6 +34,8 @@ pub struct Modifiers {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
+    /// 一次 UI 采样对应一个原子的协议中立指针状态。
+    PointerSample(PointerSample),
     PointerMove {
         remote: PixelPoint,
     },

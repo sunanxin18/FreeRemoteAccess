@@ -214,7 +214,7 @@ enum Cmd {
         #[arg(short, long, default_value = "ard_capture")]
         out: PathBuf,
     },
-    /// HPSS 实时交互视图：MVS 流解码渲染 + 键鼠输入（高分辨率虚拟显示器）
+    /// HPSS 实时交互视图：MVS 渲染 + 鼠标输入；统一键盘输入由 Task 10 恢复
     #[cfg(feature = "viewer")]
     Hpssview {
         /// 主机；与 --credentials-stdin-v1 二选一
@@ -1377,7 +1377,7 @@ fn rgb_to_png_rgba(rgb: &[u8], width: u16, height: u16) -> Vec<u8> {
     rgba
 }
 
-/// hpssview：HPSS 实时交互视图（MVS 解码渲染 + 键鼠输入）
+/// hpssview：HPSS 实时交互视图（本迁移阶段仅鼠标；统一键盘输入由 Task 10 恢复）
 #[cfg(feature = "viewer")]
 fn hpssview_audio_flow(udp_audio_input: bool) -> Result<vnc::media_negotiation::AudioMediaFlow> {
     if udp_audio_input {
@@ -1540,6 +1540,7 @@ fn run_connected_hpssview(
         "{}",
         format_hpssview_connection_notice(connection_notice, client.width, client.height)
     );
+    println!("输入状态：本迁移阶段仅支持鼠标；统一键盘输入由 Task 10 恢复");
     if !client.conn.is_encrypted() {
         anyhow::bail!("加密会话未建立");
     }
@@ -1554,7 +1555,7 @@ fn run_connected_hpssview(
     )
 }
 
-/// hpssview：HPSS 实时交互视图（MVS 解码渲染 + 键鼠输入）
+/// hpssview：HPSS 实时交互视图（本迁移阶段仅鼠标；统一键盘输入由 Task 10 恢复）
 #[cfg(feature = "viewer")]
 #[allow(
     clippy::too_many_arguments,

@@ -556,6 +556,20 @@ impl ProtocolRuntime {
         result
     }
 
+    /// 尝试发布可独立降级的媒体帧。媒体端口背压或关闭不会把桌面会话
+    /// 标记为终态；调用方必须显式停止该媒体流，不能在循环中隐藏重试。
+    pub fn try_publish_optional_media(&mut self, frame: MediaFrame) -> Result<(), ProtocolError> {
+        if self.terminal {
+            return Err(ProtocolError::Terminal);
+        }
+        let Some(media) = &self.media else {
+            return Err(ProtocolError::MediaPortClosed);
+        };
+        media.publish(frame).map_err(|error| match error {
+            MediaPublishError::Closed | MediaPublishError::Full => ProtocolError::MediaPortClosed,
+        })
+    }
+
     fn poison(&mut self) {
         self.terminal = true;
     }
@@ -936,6 +950,41 @@ mod tests {
     }
 
     #[test]
+    fn optional_media_full_or_closed_does_not_poison_runtime_or_retry() {
+        for failure in [MediaPublishError::Full, MediaPublishError::Closed] {
+            let session_id = SessionId::allocate();
+            let (_, receiver) = mpsc::channel();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let attempts = Arc::new(Mutex::new(0usize));
+            let mut runtime = ProtocolRuntime::new(
+                session_id,
+                receiver,
+                Box::new(RecordingEvents(log.clone())),
+                Box::new(RecordingFrames(log.clone())),
+                Some(Box::new(OptionalFailingMedia {
+                    failure,
+                    attempts: attempts.clone(),
+                })),
+                Box::new(RecordingWake(log)),
+            );
+            establish_generation(&mut runtime, session_id, 1);
+
+            assert_eq!(
+                runtime.try_publish_optional_media(MediaFrame::EncodedVideo {
+                    timestamp_us: 1,
+                    bytes: vec![0x11].into_boxed_slice(),
+                }),
+                Err(ProtocolError::MediaPortClosed)
+            );
+            assert!(!runtime.requires_shutdown());
+            assert_eq!(*attempts.lock().expect("optional media attempts"), 1);
+            assert!(runtime
+                .publish_event(SessionEvent::AudioState(super::AudioState::Failed))
+                .is_ok());
+        }
+    }
+
+    #[test]
     fn publication_port_failure_is_terminal_without_retry_or_old_input_delivery() {
         for failure in [FailureAt::Event, FailureAt::Reset, FailureAt::Wake] {
             let session_id = SessionId::allocate();
@@ -1164,6 +1213,18 @@ mod tests {
     impl MediaPublisher for FailingMedia {
         fn publish(&self, _: MediaFrame) -> Result<(), MediaPublishError> {
             Err(MediaPublishError::Closed)
+        }
+    }
+
+    struct OptionalFailingMedia {
+        failure: MediaPublishError,
+        attempts: Arc<Mutex<usize>>,
+    }
+
+    impl MediaPublisher for OptionalFailingMedia {
+        fn publish(&self, _: MediaFrame) -> Result<(), MediaPublishError> {
+            *self.attempts.lock().expect("optional media attempts") += 1;
+            Err(self.failure.clone())
         }
     }
 

@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use frd_core::{
-    ButtonState, ContentViewport, InputEvent, PhysicalViewport, PixelSize, PointerButton,
-    PointerButtons, PointerInputState, PointerSample, SessionId, SessionInput, WheelDelta,
+    ContentViewport, InputEvent, PhysicalViewport, PixelSize, PointerButtons, PointerInputState,
+    PointerSample, SessionId, SessionInput, WheelDelta,
 };
 use frd_frame::{FrameMailbox, PixelFormat, SurfaceUpdate};
 use frd_media_api::{MediaFrame, MediaPublishError, MediaPublisher};
@@ -82,54 +82,8 @@ fn send_pointer_sample(
         commands,
         session_id,
         generation,
-        InputEvent::PointerMove {
-            remote: sample.remote,
-        },
+        InputEvent::PointerSample(sample),
     )?;
-    for (button, before, after) in [
-        (
-            PointerButton::Primary,
-            previous_buttons.primary,
-            sample.buttons.primary,
-        ),
-        (
-            PointerButton::Middle,
-            previous_buttons.middle,
-            sample.buttons.middle,
-        ),
-        (
-            PointerButton::Secondary,
-            previous_buttons.secondary,
-            sample.buttons.secondary,
-        ),
-    ] {
-        if before != after {
-            send_input(
-                commands,
-                session_id,
-                generation,
-                InputEvent::PointerButton {
-                    button,
-                    state: if after {
-                        ButtonState::Pressed
-                    } else {
-                        ButtonState::Released
-                    },
-                },
-            )?;
-        }
-    }
-    if !sample.wheel.is_empty() {
-        send_input(
-            commands,
-            session_id,
-            generation,
-            InputEvent::Wheel {
-                delta_x: f32::from(sample.wheel.horizontal),
-                delta_y: f32::from(sample.wheel.vertical),
-            },
-        )?;
-    }
     *previous_buttons = sample.buttons;
     Ok(())
 }
@@ -288,7 +242,9 @@ pub fn run_viewer(
         let window_width = ((f32::from(init_w) * scale).ceil() as usize).max(1);
         let window_height = ((f32::from(init_h) * scale).ceil() as usize).max(1);
         let mut window = Window::new(
-            &format!("FreeRemoteDesk HPSS — [{init_w}x{init_h}  Ctrl+Q 退出]"),
+            &format!(
+                "FreeRemoteDesk HPSS — [{init_w}x{init_h}  仅鼠标 · 键盘待 Task 10 · Ctrl+Q 退出]"
+            ),
             window_width,
             window_height,
             WindowOptions {
@@ -408,5 +364,48 @@ pub fn run_viewer(
     match (ui_result, worker_result) {
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use frd_core::{InputEvent, PixelPoint, PointerButtons, PointerSample, SessionId, WheelDelta};
+    use frd_protocol_api::SessionCommand;
+
+    #[test]
+    fn one_legacy_pointer_sample_emits_one_atomic_protocol_command() {
+        let (commands, received) = mpsc::channel();
+        let session_id = SessionId::allocate();
+        let sample = PointerSample::new(
+            PixelPoint { x: 12, y: 34 },
+            PointerButtons {
+                primary: true,
+                secondary: true,
+                ..Default::default()
+            },
+            WheelDelta {
+                horizontal: -1,
+                ..Default::default()
+            },
+        );
+        let mut previous = PointerButtons::default();
+
+        super::send_pointer_sample(&commands, session_id, 1, sample, &mut previous).unwrap();
+
+        assert!(matches!(
+            received.recv().unwrap(),
+            SessionCommand::Input(frd_core::SessionInput {
+                session_id: id,
+                generation: 1,
+                event: InputEvent::PointerSample(observed),
+            }) if id == session_id && observed == sample
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(previous, sample.buttons);
     }
 }
