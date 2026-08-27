@@ -479,6 +479,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-core"
+version = "0.1.0"
+
+[[package]]
 name = "freeremotedesk"
 version = "0.1.0"
 dependencies = [
