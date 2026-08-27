@@ -496,6 +496,7 @@ dependencies = [
  "fdk-aac",
  "fdk-aac-sys",
  "flate2",
+ "frd-core",
  "getrandom 0.2.17",
  "hmac",
  "md-5",

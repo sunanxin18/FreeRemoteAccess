@@ -15,11 +15,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use frd_core::{ContentViewport, PixelSize, PointerInputState, PointerSample};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::framebuffer::{Framebuffer, PIXEL_BLUE_SHIFT, PIXEL_GREEN_SHIFT, PIXEL_RED_SHIFT};
 use crate::keysym;
-use crate::pointer_input::{PointerInputState, PointerSample};
 use crate::vnc::audio_codec::{
     AacEldEncoder, ArdAudioReceiver, AudioReceiveOutcome, DecodedAudioPacket,
 };
@@ -724,91 +724,6 @@ impl ViewportRequestQueue {
     fn drop_latest(&mut self) {
         self.latest = None;
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ContentViewport {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-}
-
-impl ContentViewport {
-    /// 用整数比例把远端 surface 居中放入 drawable；奇数黑边余量留在右/下侧。
-    fn fit(source_size: (usize, usize), drawable_size: (usize, usize)) -> Self {
-        let source_width = source_size.0.max(1);
-        let source_height = source_size.1.max(1);
-        let drawable_width = drawable_size.0.max(1);
-        let drawable_height = drawable_size.1.max(1);
-
-        let drawable_by_source_height = (drawable_width as u128)
-            .checked_mul(source_height as u128)
-            .unwrap_or(u128::MAX);
-        let drawable_height_by_source_width = (drawable_height as u128)
-            .checked_mul(source_width as u128)
-            .unwrap_or(u128::MAX);
-        let (width, height) = if drawable_by_source_height <= drawable_height_by_source_width {
-            let scaled_height = (source_height as u128)
-                .checked_mul(drawable_width as u128)
-                .and_then(|value| value.checked_div(source_width as u128))
-                .unwrap_or(drawable_height as u128)
-                .clamp(1, drawable_height as u128);
-            (
-                drawable_width,
-                usize::try_from(scaled_height).unwrap_or(drawable_height),
-            )
-        } else {
-            let scaled_width = (source_width as u128)
-                .checked_mul(drawable_height as u128)
-                .and_then(|value| value.checked_div(source_height as u128))
-                .unwrap_or(drawable_width as u128)
-                .clamp(1, drawable_width as u128);
-            (
-                usize::try_from(scaled_width).unwrap_or(drawable_width),
-                drawable_height,
-            )
-        };
-
-        Self {
-            x: (drawable_width - width) / 2,
-            y: (drawable_height - height) / 2,
-            width,
-            height,
-        }
-    }
-}
-
-/// 把当前窗口内容视口坐标映射到当前远端显示坐标；黑边会夹到最近内容边界。
-fn map_pointer(
-    window_x: f32,
-    window_y: f32,
-    window_size: (usize, usize),
-    display_size: DisplaySize,
-) -> (u16, u16) {
-    fn map_axis(value: f32, origin: usize, extent: usize, display: u16) -> u16 {
-        if extent <= 1 || display <= 1 || !value.is_finite() {
-            return 0;
-        }
-        let content_max = origin.saturating_add(extent - 1) as f64;
-        let content_origin = origin as f64;
-        let content_extent_max = (extent - 1) as f64;
-        let display_max = (display - 1) as f64;
-        let clamped = (value as f64).clamp(content_origin, content_max) - content_origin;
-        (clamped * display_max / content_extent_max).round() as u16
-    }
-
-    if window_size.0 == 0 || window_size.1 == 0 {
-        return (0, 0);
-    }
-    let viewport = ContentViewport::fit(
-        (display_size.width as usize, display_size.height as usize),
-        window_size,
-    );
-    (
-        map_axis(window_x, viewport.x, viewport.width, display_size.width),
-        map_axis(window_y, viewport.y, viewport.height, display_size.height),
-    )
 }
 
 /// 只有控制器返回精确确认时才提交新 surface，且每个 generation 只提交一次。
@@ -2493,13 +2408,31 @@ pub fn run_viewer(
                     }
                 }
                 let display_size = current_surface_size(&surface);
-                let (x, y) = map_pointer(mx, my, window_size, display_size);
-                (Some(PointerSample::new(x, y, mask)), local_buttons_down)
+                let viewport = ContentViewport::fit(
+                    PixelSize {
+                        width: display_size.width.into(),
+                        height: display_size.height.into(),
+                    },
+                    PixelSize {
+                        width: window_size.0 as u32,
+                        height: window_size.1 as u32,
+                    },
+                );
+                (
+                    viewport
+                        .map_pointer(mx, my)
+                        .map(|remote| PointerSample::new(remote, mask)),
+                    local_buttons_down,
+                )
             } else {
                 (None, false)
             };
             if let Some(event) = pointer_input.next_event(sample, local_buttons_down) {
-                let msg = protocol::msg_pointer_event(event.mask, event.x, event.y);
+                let msg = protocol::msg_pointer_event(
+                    event.mask,
+                    event.remote.x as u16,
+                    event.remote.y as u16,
+                );
                 send_encrypted(&write_stream, &crypto, &msg)?;
             }
         }
@@ -2606,8 +2539,16 @@ where
     let mut snapshot = {
         let surface = surface.lock().unwrap();
         let framebuffer = &surface.framebuffer;
-        let content_viewport =
-            ContentViewport::fit((framebuffer.width, framebuffer.height), drawable_size);
+        let content_viewport = ContentViewport::fit(
+            PixelSize {
+                width: framebuffer.width as u32,
+                height: framebuffer.height as u32,
+            },
+            PixelSize {
+                width: drawable_size.0 as u32,
+                height: drawable_size.1 as u32,
+            },
+        );
         let snapshot = RenderSurfaceSnapshot {
             generation: surface.generation,
             source_size: (framebuffer.width, framebuffer.height),
@@ -2668,11 +2609,12 @@ fn downsample_into_viewport(
     drawable_width: usize,
     viewport: ContentViewport,
 ) {
-    for y in 0..viewport.height {
-        for x in 0..viewport.width {
-            let source_x = x * source_width / viewport.width;
-            let source_y = y * source_height / viewport.height;
-            dst[(viewport.y + y) * drawable_width + viewport.x + x] =
+    let content = viewport.content;
+    for y in 0..content.height as usize {
+        for x in 0..content.width as usize {
+            let source_x = x * source_width / content.width as usize;
+            let source_y = y * source_height / content.height as usize;
+            dst[(content.y as usize + y) * drawable_width + content.x as usize + x] =
                 src[source_y * source_width + source_x];
         }
     }
@@ -2683,9 +2625,10 @@ fn viewport_contains_nonblack(
     drawable_width: usize,
     viewport: ContentViewport,
 ) -> bool {
-    (0..viewport.height).any(|y| {
-        let row_start = (viewport.y + y) * drawable_width + viewport.x;
-        pixels[row_start..row_start + viewport.width]
+    let content = viewport.content;
+    (0..content.height as usize).any(|y| {
+        let row_start = (content.y as usize + y) * drawable_width + content.x as usize;
+        pixels[row_start..row_start + content.width as usize]
             .iter()
             .any(|pixel| *pixel != 0)
     })
@@ -2697,7 +2640,7 @@ mod tests {
         apply_native_mvs_frame_with, apply_rgb_rect, apply_rgb_rect_for_generation,
         audio_input_probe_progress_diagnostic, commit_server_geometry, drain_udp_media,
         finish_full_boundary_at, finish_partial_boundary_at, incremental_request_after_full_apply,
-        is_complete_surface_frame, map_pointer, mark_recovery_for_invalid_mvs_geometry,
+        is_complete_surface_frame, mark_recovery_for_invalid_mvs_geometry,
         process_complete_mvs_record, read_viewer_app_frame_step, reader_frame_class,
         render_surface_frame_with, request_full_update_at, scaled_drawable_size,
         select_initial_display_size, service_reader_tick_at, should_log_audio_input_probe_progress,
@@ -2728,6 +2671,7 @@ mod tests {
     use crate::vnc::mvs_stream::{MvsRecord, MvsRect};
     use crate::vnc::protocol;
     use crate::vnc::srtp::{derive_session_keys, protect_rtp_packet, SrtcpSender, SrtpPacketKind};
+    use frd_core::PixelSize;
     use std::net::{IpAddr, Ipv4Addr, UdpSocket};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -3326,30 +3270,60 @@ mod tests {
     #[test]
     fn content_viewport_preserves_aspect_ratio_and_centers_integer_bars() {
         assert_eq!(
-            ContentViewport::fit((1440, 2560), (1280, 720)),
-            ContentViewport {
+            ContentViewport::fit(
+                PixelSize {
+                    width: 1440,
+                    height: 2560
+                },
+                PixelSize {
+                    width: 1280,
+                    height: 720
+                },
+            )
+            .content,
+            frd_core::PixelRect {
                 x: 437,
                 y: 0,
                 width: 405,
-                height: 720,
+                height: 720
             }
         );
         assert_eq!(
-            ContentViewport::fit((2560, 1440), (720, 1280)),
-            ContentViewport {
+            ContentViewport::fit(
+                PixelSize {
+                    width: 2560,
+                    height: 1440
+                },
+                PixelSize {
+                    width: 720,
+                    height: 1280
+                },
+            )
+            .content,
+            frd_core::PixelRect {
                 x: 0,
                 y: 437,
                 width: 720,
-                height: 405,
+                height: 405
             }
         );
         assert_eq!(
-            ContentViewport::fit((640, 360), (640, 360)),
-            ContentViewport {
+            ContentViewport::fit(
+                PixelSize {
+                    width: 640,
+                    height: 360
+                },
+                PixelSize {
+                    width: 640,
+                    height: 360
+                },
+            )
+            .content,
+            frd_core::PixelRect {
                 x: 0,
                 y: 0,
                 width: 640,
-                height: 360,
+                height: 360
             }
         );
     }
@@ -3390,12 +3364,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            snapshot.content_viewport,
-            ContentViewport {
+            snapshot.content_viewport.content,
+            frd_core::PixelRect {
                 x: 437,
                 y: 0,
                 width: 405,
-                height: 720,
+                height: 720
             }
         );
         assert_eq!(snapshot.first_nonblack_render_revision, Some(1));
@@ -5130,58 +5104,6 @@ mod tests {
             incremental_request_after_full_apply(1440, 2560),
             protocol::msg_fb_update_request(true, 0, 0, 1440, 2560)
         );
-    }
-
-    #[test]
-    fn map_pointer_bottom_right_uses_current_display_bottom_right() {
-        assert_eq!(
-            map_pointer(
-                639.0,
-                359.0,
-                (640, 360),
-                DisplaySize::new(1280, 720).unwrap()
-            ),
-            (1279, 719)
-        );
-    }
-
-    #[test]
-    fn map_pointer_uses_fitted_content_and_clamps_landscape_bars() {
-        let display = DisplaySize::new(1440, 2560).unwrap();
-
-        assert_eq!(map_pointer(437.0, 0.0, (1280, 720), display), (0, 0));
-        assert_eq!(
-            map_pointer(841.0, 719.0, (1280, 720), display),
-            (1439, 2559)
-        );
-        assert_eq!(map_pointer(0.0, 0.0, (1280, 720), display), (0, 0));
-        assert_eq!(
-            map_pointer(1279.0, 719.0, (1280, 720), display),
-            (1439, 2559)
-        );
-    }
-
-    #[test]
-    fn map_pointer_uses_fitted_content_and_clamps_portrait_bars() {
-        let display = DisplaySize::new(2560, 1440).unwrap();
-
-        assert_eq!(map_pointer(0.0, 437.0, (720, 1280), display), (0, 0));
-        assert_eq!(
-            map_pointer(719.0, 841.0, (720, 1280), display),
-            (2559, 1439)
-        );
-        assert_eq!(map_pointer(0.0, 0.0, (720, 1280), display), (0, 0));
-        assert_eq!(
-            map_pointer(719.0, 1279.0, (720, 1280), display),
-            (2559, 1439)
-        );
-    }
-
-    #[test]
-    fn map_pointer_clamps_and_handles_zero_window_axes() {
-        let display = DisplaySize::new(1280, 720).unwrap();
-        assert_eq!(map_pointer(-5.0, 900.0, (640, 360), display), (0, 719));
-        assert_eq!(map_pointer(100.0, 100.0, (0, 0), display), (0, 0));
     }
 
     #[test]

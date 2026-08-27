@@ -1,13 +1,77 @@
+use crate::{PixelPoint, SessionId};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PointerSample {
-    pub(crate) x: u16,
-    pub(crate) y: u16,
-    pub(crate) mask: u8,
+pub enum PointerButton {
+    Primary,
+    Middle,
+    Secondary,
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ButtonState {
+    Pressed,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalKeyCode(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyState {
+    Pressed,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub meta: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InputEvent {
+    PointerMove {
+        remote: PixelPoint,
+    },
+    PointerButton {
+        button: PointerButton,
+        state: ButtonState,
+    },
+    Wheel {
+        delta_x: f32,
+        delta_y: f32,
+    },
+    PhysicalKey {
+        code: PhysicalKeyCode,
+        state: KeyState,
+        modifiers: Modifiers,
+    },
+    Text {
+        utf8: String,
+    },
+    ReleaseAll,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionInput {
+    pub session_id: SessionId,
+    pub generation: u64,
+    pub event: InputEvent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PointerSample {
+    pub remote: PixelPoint,
+    pub mask: u8,
 }
 
 impl PointerSample {
-    pub(crate) const fn new(x: u16, y: u16, mask: u8) -> Self {
-        Self { x, y, mask }
+    pub const fn new(remote: PixelPoint, mask: u8) -> Self {
+        Self { remote, mask }
     }
 
     fn released(self) -> Self {
@@ -16,13 +80,13 @@ impl PointerSample {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct PointerInputState {
+pub struct PointerInputState {
     last_sent: Option<PointerSample>,
     armed: bool,
 }
 
 impl PointerInputState {
-    pub(crate) fn next_event(
+    pub fn next_event(
         &mut self,
         sample: Option<PointerSample>,
         local_buttons_down: bool,
@@ -54,35 +118,29 @@ impl PointerInputState {
 #[cfg(test)]
 mod tests {
     use super::{PointerInputState, PointerSample};
+    use crate::PixelPoint;
 
     #[test]
-    fn gate_confines_pointer_input_to_active_window_and_safely_rearms() {
+    fn gate_confines_pointer_input_to_content_and_safely_rearms() {
         let mut state = PointerInputState::default();
-        let idle = PointerSample::new(10, 20, 0);
-        let held = PointerSample::new(11, 21, 1);
-        let released = PointerSample::new(11, 21, 0);
+        let idle = PointerSample::new(PixelPoint { x: 10, y: 20 }, 0);
+        let held = PointerSample::new(PixelPoint { x: 11, y: 21 }, 1);
+        let released = PointerSample::new(PixelPoint { x: 11, y: 21 }, 0);
 
         assert_eq!(state.next_event(Some(idle), false), Some(idle));
         assert_eq!(state.next_event(Some(idle), false), None);
 
-        // Pointer left the client area: no movement is forwarded and re-entry
-        // starts with a fresh coordinate synchronization.
         assert_eq!(state.next_event(None, false), None);
         assert_eq!(state.next_event(None, false), None);
         assert_eq!(state.next_event(Some(idle), false), Some(idle));
 
-        // Losing the input gate while dragging releases the remote button once.
         assert_eq!(state.next_event(Some(held), true), Some(held));
         assert_eq!(state.next_event(None, false), Some(released));
         assert_eq!(state.next_event(None, false), None);
 
-        // A held button cannot be reintroduced from outside. The pointer is
-        // re-armed only after all local buttons have been observed released.
         assert_eq!(state.next_event(Some(held), true), None);
         assert_eq!(state.next_event(Some(released), false), Some(released));
 
-        // An inactive window is represented by the same closed input gate,
-        // even when its last geometric coordinate remains inside the client.
         assert_eq!(state.next_event(None, false), None);
     }
 }

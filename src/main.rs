@@ -6,8 +6,6 @@ mod arp;
 mod framebuffer;
 #[cfg(feature = "viewer")]
 mod keysym;
-#[cfg(any(feature = "viewer", test))]
-mod pointer_input;
 mod proxy;
 #[cfg(feature = "viewer")]
 mod viewer;

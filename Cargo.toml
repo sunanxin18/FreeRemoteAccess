@@ -37,6 +37,7 @@ cpal = { version = "0.18.2", optional = true }
 flate2 = "1"
 fdk-aac = "0.8"
 fdk-aac-sys = "0.5"
+frd-core = { path = "crates/frd-core" }
 
 [dependencies.windows-sys]
 version = "0.59"

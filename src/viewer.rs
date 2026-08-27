@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{bail, Context, Result};
+use frd_core::{PixelPoint, PointerInputState, PointerSample};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::framebuffer::Framebuffer;
 use crate::keysym;
-use crate::pointer_input::{PointerInputState, PointerSample};
 use crate::vnc::client::{self, ServerEvent, VncClient};
 use crate::vnc::protocol;
 use crate::vnc::session::SessionCrypto;
@@ -201,12 +201,25 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
             }
             let x = ((mx / scale) as i32).clamp(0, width as i32 - 1) as u16;
             let y = ((my / scale) as i32).clamp(0, height as i32 - 1) as u16;
-            (Some(PointerSample::new(x, y, mask)), local_buttons_down)
+            (
+                Some(PointerSample::new(
+                    PixelPoint {
+                        x: x.into(),
+                        y: y.into(),
+                    },
+                    mask,
+                )),
+                local_buttons_down,
+            )
         } else {
             (None, false)
         };
         if let Some(event) = pointer_input.next_event(sample, local_buttons_down) {
-            let msg = protocol::msg_pointer_event(event.mask, event.x, event.y);
+            let msg = protocol::msg_pointer_event(
+                event.mask,
+                event.remote.x as u16,
+                event.remote.y as u16,
+            );
             send(&write_stream, &crypto, &msg)?;
         }
     }

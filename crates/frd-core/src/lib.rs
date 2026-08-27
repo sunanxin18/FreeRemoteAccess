@@ -1,10 +1,17 @@
 pub mod geometry;
+pub mod input;
 pub mod secret;
 pub mod session;
+pub mod viewport;
 
 pub use geometry::{PhysicalViewport, PixelPoint, PixelRect, PixelSize};
+pub use input::{
+    ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton,
+    PointerInputState, PointerSample, SessionInput,
+};
 pub use secret::{SecretBuffer, SecretBytes};
 pub use session::SessionId;
+pub use viewport::ContentViewport;
 
 #[cfg(test)]
 mod tests {
