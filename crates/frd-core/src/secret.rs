@@ -1,3 +1,6 @@
+#[cfg(test)]
+use std::cell::RefCell;
+
 pub struct SecretBuffer(Vec<u8>);
 
 pub struct SecretBytes(Vec<u8>);
@@ -43,23 +46,59 @@ impl Drop for SecretBytes {
 }
 
 fn clear_bytes(bytes: &mut [u8]) {
-    for byte in bytes {
+    for byte in bytes.iter_mut() {
         // SAFETY: `byte` is a valid, uniquely borrowed byte in the owned allocation.
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
+
+    #[cfg(test)]
+    observe_wipe(bytes);
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WIPE_OBSERVATION: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_wipe(bytes: &[u8]) {
+    WIPE_OBSERVATION.with(|observation| *observation.borrow_mut() = Some(bytes.to_vec()));
+}
+
+#[cfg(test)]
+fn reset_wipe_observation() {
+    WIPE_OBSERVATION.with(|observation| *observation.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn take_wipe_observation() -> Option<Vec<u8>> {
+    WIPE_OBSERVATION.with(|observation| observation.borrow_mut().take())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SecretBuffer;
+    use super::{reset_wipe_observation, take_wipe_observation, SecretBuffer};
 
     #[test]
-    fn transferred_secret_owner_clears_its_allocation() {
-        let mut buffer = SecretBuffer::new(vec![0x11, 0x22]);
-        let mut bytes = buffer.take();
+    fn dropping_transferred_secret_bytes_observes_wiped_owner_memory() {
+        let bytes = {
+            let mut buffer = SecretBuffer::new(vec![0x11, 0x22]);
+            buffer.take()
+        };
 
-        bytes.clear();
+        reset_wipe_observation();
+        drop(bytes);
 
-        assert_eq!(bytes.expose(), &[0, 0]);
+        assert_eq!(take_wipe_observation(), Some(vec![0, 0]));
+    }
+
+    #[test]
+    fn dropping_secret_buffer_observes_wiped_owner_memory() {
+        let buffer = SecretBuffer::new(vec![0x11, 0x22]);
+
+        reset_wipe_observation();
+        drop(buffer);
+
+        assert_eq!(take_wipe_observation(), Some(vec![0, 0]));
     }
 }

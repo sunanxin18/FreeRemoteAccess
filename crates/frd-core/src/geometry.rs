@@ -26,6 +26,10 @@ pub struct PixelRect {
 
 impl PixelRect {
     pub fn checked_bounds(self) -> Option<(PixelPoint, PixelPoint)> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+
         Some((
             PixelPoint {
                 x: self.x,
@@ -43,4 +47,19 @@ pub struct PhysicalViewport {
     pub drawable: PixelSize,
     pub content: PixelRect,
     pub remote: PixelSize,
+}
+
+impl PhysicalViewport {
+    pub fn new(drawable: PixelSize, content: PixelRect, remote: PixelSize) -> Option<Self> {
+        if drawable.width == 0 || drawable.height == 0 || remote.width == 0 || remote.height == 0 {
+            return None;
+        }
+
+        let (_, content_end) = content.checked_bounds()?;
+        (content_end.x <= drawable.width && content_end.y <= drawable.height).then_some(Self {
+            drawable,
+            content,
+            remote,
+        })
+    }
 }

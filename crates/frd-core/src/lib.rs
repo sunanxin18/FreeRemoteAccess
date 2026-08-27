@@ -8,7 +8,7 @@ pub use session::SessionId;
 
 #[cfg(test)]
 mod tests {
-    use super::{PixelRect, PixelSize, SecretBuffer, SessionId};
+    use super::{PhysicalViewport, PixelRect, PixelSize, SecretBuffer, SessionId};
 
     #[test]
     fn geometry_requires_nonzero_sizes() {
@@ -27,6 +27,58 @@ mod tests {
         };
 
         assert_eq!(rect.checked_bounds(), None);
+    }
+
+    #[test]
+    fn rectangle_bounds_reject_zero_extents() {
+        assert_eq!(
+            PixelRect {
+                x: 1,
+                y: 2,
+                width: 0,
+                height: 3,
+            }
+            .checked_bounds(),
+            None
+        );
+        assert_eq!(
+            PixelRect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 0,
+            }
+            .checked_bounds(),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_viewport_accepts_content_within_drawable() {
+        let drawable = PixelSize::new(1920, 1080).expect("有效 drawable 尺寸");
+        let remote = PixelSize::new(1280, 720).expect("有效远端尺寸");
+        let content = PixelRect {
+            x: 320,
+            y: 180,
+            width: 1280,
+            height: 720,
+        };
+
+        assert!(PhysicalViewport::new(drawable, content, remote).is_some());
+    }
+
+    #[test]
+    fn physical_viewport_rejects_content_outside_drawable() {
+        let drawable = PixelSize::new(100, 100).expect("有效 drawable 尺寸");
+        let remote = PixelSize::new(100, 100).expect("有效远端尺寸");
+        let content = PixelRect {
+            x: 50,
+            y: 50,
+            width: 51,
+            height: 50,
+        };
+
+        assert!(PhysicalViewport::new(drawable, content, remote).is_none());
     }
 
     #[test]
