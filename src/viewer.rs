@@ -2,35 +2,21 @@
 //! 主线程跑 minifb 窗口，负责渲染并把键鼠事件编码成 RFB 消息回传。
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use frd_core::{PixelPoint, PointerButtons, PointerInputState, PointerSample, WheelDelta};
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::framebuffer::Framebuffer;
 use crate::keysym;
-use crate::vnc::client::{self, ServerEvent, VncClient};
+use crate::vnc::client::{self, AppleWriterHandle, ServerEvent, VncClient};
 use crate::vnc::protocol;
-use crate::vnc::session::SessionCrypto;
 
-/// 统一发送：加密会话时封帧（与 RfbConn 共享同一发送状态），明文直写
-fn send(
-    write_stream: &Mutex<std::net::TcpStream>,
-    crypto: &Option<Arc<Mutex<SessionCrypto>>>,
-    msg: &[u8],
-) -> Result<()> {
-    let mut w = write_stream.lock().unwrap();
-    match crypto {
-        Some(c) => {
-            let wire = c.lock().unwrap().seal(msg)?;
-            w.write_all(&wire).context("写入失败（连接中断？）")
-        }
-        None => w.write_all(msg).context("写入失败（连接中断？）"),
-    }
+fn send(writer: &AppleWriterHandle, msg: &[u8]) -> Result<()> {
+    writer.send_private_message(msg)
 }
 
 fn rfb_pointer_mask(sample: PointerSample) -> u8 {
@@ -59,15 +45,15 @@ fn rfb_pointer_mask(sample: PointerSample) -> u8 {
 
 pub fn run(client: VncClient, scale: f32) -> Result<()> {
     let VncClient {
-        conn,
+        mut conn,
         width,
         height,
         name,
         ..
     } = client;
 
-    let crypto = conn.crypto_handle();
-    let write_stream = Arc::new(Mutex::new(conn.try_clone().context("无法复制 socket")?));
+    let encrypted = conn.is_encrypted();
+    let writer = conn.writer_handle()?;
     let fb = Arc::new(Mutex::new(Framebuffer::new(
         width as usize,
         height as usize,
@@ -79,16 +65,16 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
     // 加密会话（Apple 会话层）内不发 SetPixelFormat/SetEncodings（会被服务器拒绝，
     // 编码表已随 cmd=1 协商消息下发）。
     {
-        if crypto.is_none() {
-            let mut w = write_stream.lock().unwrap();
-            w.write_all(&protocol::msg_set_pixel_format(
+        if !encrypted {
+            writer.send_private_message(&protocol::msg_set_pixel_format(
                 &protocol::PixelFormat::OURS,
             ))?;
-            w.write_all(&protocol::msg_set_encodings(protocol::SUPPORTED_ENCODINGS)?)?;
+            writer.send_private_message(&protocol::msg_set_encodings(
+                protocol::SUPPORTED_ENCODINGS,
+            )?)?;
         }
         send(
-            &write_stream,
-            &crypto,
+            &writer,
             &protocol::msg_fb_update_request(false, 0, 0, width, height)?,
         )?;
     }
@@ -96,8 +82,7 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
     // 读线程：驱动 “收到更新 -> 继续请求增量更新” 的循环
     {
         let fb = fb.clone();
-        let write_stream = write_stream.clone();
-        let crypto = crypto.clone();
+        let writer = writer.clone();
         let closing = closing.clone();
         let error_slot = error_slot.clone();
         thread::spawn(move || {
@@ -116,7 +101,7 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
                                 break;
                             }
                         };
-                        if let Err(e) = send(&write_stream, &crypto, &req) {
+                        if let Err(e) = send(&writer, &req) {
                             if !closing.load(Ordering::Relaxed) {
                                 *error_slot.lock().unwrap() =
                                     Some(format!("发送更新请求失败: {e}"));
@@ -199,7 +184,7 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
         }
         pressed = now;
         for m in &key_msgs {
-            send(&write_stream, &crypto, m)?;
+            send(&writer, m)?;
         }
 
         // 鼠标：仅窗口激活且指针位于客户区内时采样输入。
@@ -250,11 +235,12 @@ pub fn run(client: VncClient, scale: f32) -> Result<()> {
                 event.remote.x as u16,
                 event.remote.y as u16,
             );
-            send(&write_stream, &crypto, &msg)?;
+            send(&writer, &msg)?;
         }
     }
 
     closing.store(true, Ordering::Relaxed);
+    writer.shutdown()?;
     Ok(())
 }
 

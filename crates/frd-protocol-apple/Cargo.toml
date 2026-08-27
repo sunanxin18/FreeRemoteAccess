@@ -1,0 +1,21 @@
+[package]
+name = "frd-protocol-apple"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+aes = "0.8"
+cbc = "0.1"
+ecb = "0.1"
+getrandom = "0.2"
+hmac = "0.12"
+md-5 = "0.10"
+num-bigint = "0.4"
+pbkdf2 = "0.12"
+rsa = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+frd-core = { path = "../frd-core" }
+frd-protocol-api = { path = "../frd-protocol-api" }
+frd-wire-rfb = { path = "../frd-wire-rfb" }

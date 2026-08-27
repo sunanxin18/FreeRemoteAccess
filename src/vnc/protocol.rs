@@ -46,13 +46,7 @@ pub mod pointer {
     pub const WHEEL_LEFT: u8 = 64;
 }
 
-pub mod apple_session {
-    pub const SHARED_CLIENT_INIT: u8 = 0x01;
-    pub const ENCRYPTED_SESSION_CLIENT_INIT: u8 = 0xc1;
-    pub const SERVER_KEEPALIVE_MESSAGE_TYPE: u8 = 0x14;
-    pub const SERVER_KEEPALIVE_MESSAGE_LEN: usize = 8;
-    pub const SERVER_KEEPALIVE_TYPE_FIELD_LEN: usize = size_of::<u8>();
-}
+pub use frd_protocol_apple::protocol::apple_session;
 
 pub mod security {
     pub const INVALID: u8 = 0;
@@ -62,14 +56,9 @@ pub mod security {
     pub const ULTRA: u8 = 17;
     pub const VENCRYPT: u8 = 19;
     pub const TLS: u8 = 22;
-    pub const APPLE_ARD: u8 = 30;
-    pub const APPLE_SRP: u8 = 36;
-    pub const APPLE_RSA_SRP: u8 = 33;
-    pub const APPLE_ARD_39: u8 = 35;
-
-    pub const fn requires_apple_account_credentials(value: u8) -> bool {
-        matches!(value, APPLE_ARD | APPLE_RSA_SRP | APPLE_ARD_39 | APPLE_SRP)
-    }
+    pub use frd_protocol_apple::protocol::security::{
+        requires_apple_account_credentials, APPLE_ARD, APPLE_ARD_39, APPLE_RSA_SRP, APPLE_SRP,
+    };
 }
 
 pub fn security_type_name(value: u8) -> &'static str {

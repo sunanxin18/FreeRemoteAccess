@@ -527,6 +527,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-protocol-apple"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "cbc",
+ "ecb",
+ "frd-core",
+ "frd-protocol-api",
+ "frd-wire-rfb",
+ "getrandom 0.2.17",
+ "hmac",
+ "md-5",
+ "num-bigint",
+ "pbkdf2",
+ "rsa",
+ "sha1",
+ "sha2",
+]
+
+[[package]]
 name = "frd-session"
 version = "0.1.0"
 dependencies = [
@@ -557,24 +578,19 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
- "cbc",
  "clap",
  "cpal",
  "des",
- "ecb",
  "fdk-aac",
  "fdk-aac-sys",
  "flate2",
  "frd-core",
+ "frd-protocol-apple",
  "frd-wire-rfb",
  "getrandom 0.2.17",
  "hmac",
- "md-5",
  "minifb",
- "num-bigint",
- "pbkdf2",
  "png",
- "rsa",
  "sha1",
  "sha2",
  "windows-sys 0.59.0",

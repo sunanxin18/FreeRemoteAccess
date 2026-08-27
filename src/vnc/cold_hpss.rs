@@ -949,7 +949,8 @@ mod tests {
                     .set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut peer = crate::vnc::client::RfbConn::new(stream);
-                peer.set_crypto(crate::vnc::session::SessionCrypto::from_key_iv(KEY, IV));
+                peer.set_crypto(crate::vnc::session::SessionCrypto::from_key_iv(KEY, IV))
+                    .unwrap();
 
                 assert_eq!(peer.read_app_frame().unwrap(), expected_set_config);
                 assert_eq!(peer.read_app_frame().unwrap(), expected_display_query);
@@ -1001,7 +1002,9 @@ mod tests {
             connection
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            connection.set_crypto(crate::vnc::session::SessionCrypto::from_key_iv(KEY, IV));
+            connection
+                .set_crypto(crate::vnc::session::SessionCrypto::from_key_iv(KEY, IV))
+                .unwrap();
             run_authenticated_cold_session(
                 &mut connection,
                 &mut writer,

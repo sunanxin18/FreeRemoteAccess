@@ -25,6 +25,43 @@ pub enum ProtocolError {
     StaleSession,
     StaleSurface,
     NeedsFullSnapshot,
+    Adapter {
+        protocol_id: ProtocolId,
+        code: &'static str,
+    },
+}
+
+impl ProtocolError {
+    pub fn adapter(protocol_id: ProtocolId, code: &'static str) -> Self {
+        Self::Adapter { protocol_id, code }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedTargetProtocol => "unsupported_target_protocol",
+            Self::UnregisteredProtocol => "unregistered_protocol",
+            Self::FactoryDescriptorMismatch => "factory_descriptor_mismatch",
+            Self::InvalidGeneration => "invalid_generation",
+            Self::EventPortClosed => "event_port_closed",
+            Self::FramePortRejected => "frame_port_rejected",
+            Self::WakeFailed => "wake_failed",
+            Self::MediaPortClosed => "media_port_closed",
+            Self::Terminal => "terminal",
+            Self::GenerationPublicationReserved => "generation_publication_reserved",
+            Self::SurfaceResetReserved => "surface_reset_reserved",
+            Self::StaleSession => "stale_session",
+            Self::StaleSurface => "stale_surface",
+            Self::NeedsFullSnapshot => "needs_full_snapshot",
+            Self::Adapter { code, .. } => code,
+        }
+    }
+
+    pub fn protocol_id(&self) -> Option<&ProtocolId> {
+        match self {
+            Self::Adapter { protocol_id, .. } => Some(protocol_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

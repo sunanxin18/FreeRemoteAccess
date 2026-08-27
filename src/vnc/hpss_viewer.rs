@@ -8,7 +8,6 @@
 //! - 主线程：minifb 窗口渲染 + 键鼠事件编码为 RFB 消息 → 加密帧发送
 
 use std::collections::HashSet;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,7 +29,7 @@ use crate::vnc::audio_input::{
     P5_PROBE_SAMPLE_RATE_HZ,
 };
 use crate::vnc::audio_io::AudioPlayback;
-use crate::vnc::client::{is_timeout, RfbConn};
+use crate::vnc::client::{is_timeout, AppleWriterHandle, RfbConn};
 use crate::vnc::dynamic_resolution::{
     DisplaySize, DynamicResolutionCapability, DynamicResolutionController, GeometryCommit,
     ResolutionRequest,
@@ -1216,17 +1215,14 @@ fn incremental_request_after_full_apply(
 }
 
 fn request_full_update(
-    write_stream: &Arc<Mutex<std::net::TcpStream>>,
-    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
+    writer: &AppleWriterHandle,
     requests: &mut ReaderRequestState,
     width: u16,
     height: u16,
 ) -> Result<()> {
     let now = Instant::now();
     let req = protocol::msg_fb_update_request(false, 0, 0, width, height)?;
-    requests.send_rate_limited_full_at(now, thread::sleep, || {
-        send_encrypted(write_stream, crypto, &req)
-    })
+    requests.send_rate_limited_full_at(now, thread::sleep, || send_encrypted(writer, &req))
 }
 
 fn request_full_update_at<S, W>(
@@ -1599,8 +1595,7 @@ fn process_complete_mvs_record(
     record: MvsRecord,
     surface: &Arc<Mutex<DisplaySurface>>,
     dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
-    write_stream: &Arc<Mutex<std::net::TcpStream>>,
-    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
+    writer: &AppleWriterHandle,
     requests: &mut ReaderRequestState,
 ) -> Result<MvsRecordOutcome> {
     let (surface_generation, display_size) = {
@@ -1624,8 +1619,7 @@ fn process_complete_mvs_record(
                 eprintln!("[hpss-view] MVS 表初始化无效，重同步: {e:#}");
                 receiver.request_full()?;
                 return request_full_update(
-                    write_stream,
-                    crypto,
+                    writer,
                     requests,
                     display_size.width,
                     display_size.height,
@@ -1640,14 +1634,8 @@ fn process_complete_mvs_record(
         Err(error) => {
             eprintln!("[hpss-view] MVS 表初始化候选无效，重同步: {error:#}");
             receiver.request_full()?;
-            return request_full_update(
-                write_stream,
-                crypto,
-                requests,
-                display_size.width,
-                display_size.height,
-            )
-            .map(|()| MvsRecordOutcome::RecoveryRequested);
+            return request_full_update(writer, requests, display_size.width, display_size.height)
+                .map(|()| MvsRecordOutcome::RecoveryRequested);
         }
     }
 
@@ -1659,14 +1647,8 @@ fn process_complete_mvs_record(
         apply_rgb_rect,
     )?;
     if outcome == MvsRecordOutcome::RecoveryRequested {
-        return request_full_update(
-            write_stream,
-            crypto,
-            requests,
-            display_size.width,
-            display_size.height,
-        )
-        .map(|()| MvsRecordOutcome::RecoveryRequested);
+        return request_full_update(writer, requests, display_size.width, display_size.height)
+            .map(|()| MvsRecordOutcome::RecoveryRequested);
     }
     Ok(outcome)
 }
@@ -1681,13 +1663,12 @@ fn service_network_reader_tick(
     surface: &Arc<Mutex<DisplaySurface>>,
     viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
     dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
-    write_stream: &Arc<Mutex<std::net::TcpStream>>,
-    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
+    writer: &AppleWriterHandle,
     now: Instant,
 ) -> Result<ReaderTickOutcome> {
     let size = current_surface_size(surface);
     let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
-    // 固定锁序：queue → runtime → writer → crypto。surface 已在上方解锁。
+    // 固定锁序：queue → runtime → Apple writer。surface 已在上方解锁。
     let mut queue = viewport_requests.lock().unwrap();
     let mut runtime = dynamic_resolution.lock().unwrap();
     service_reader_tick_at(
@@ -1697,10 +1678,10 @@ fn service_network_reader_tick(
         &mut runtime,
         now,
         thread::sleep,
-        || send_encrypted(write_stream, crypto, &full),
+        || send_encrypted(writer, &full),
         |target| {
             let query = hpss::build_display_query(target);
-            send_encrypted(write_stream, crypto, &query)?;
+            send_encrypted(writer, &query)?;
             Ok(Instant::now())
         },
     )
@@ -1716,8 +1697,7 @@ fn finish_network_full_boundary(
     surface: &Arc<Mutex<DisplaySurface>>,
     viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
     dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
-    write_stream: &Arc<Mutex<std::net::TcpStream>>,
-    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
+    writer: &AppleWriterHandle,
     now: Instant,
 ) -> Result<FullBoundaryOutcome> {
     let size = current_surface_size(surface);
@@ -1732,13 +1712,13 @@ fn finish_network_full_boundary(
         &mut runtime,
         now,
         thread::sleep,
-        || send_encrypted(write_stream, crypto, &full),
+        || send_encrypted(writer, &full),
         |target| {
             let query = hpss::build_display_query(target);
-            send_encrypted(write_stream, crypto, &query)?;
+            send_encrypted(writer, &query)?;
             Ok(Instant::now())
         },
-        || send_encrypted(write_stream, crypto, &incremental),
+        || send_encrypted(writer, &incremental),
     )
 }
 
@@ -1771,8 +1751,7 @@ fn handle_complete_mvs_record(
     surface: &Arc<Mutex<DisplaySurface>>,
     viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
     dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
-    write_stream: &Arc<Mutex<std::net::TcpStream>>,
-    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
+    writer: &AppleWriterHandle,
 ) -> Result<()> {
     requests.consume_mvs_response();
     let outcome = process_complete_mvs_record(
@@ -1780,8 +1759,7 @@ fn handle_complete_mvs_record(
         record,
         surface,
         dynamic_resolution,
-        write_stream,
-        crypto,
+        writer,
         requests,
     )?;
     if outcome == MvsRecordOutcome::FullApplied {
@@ -1791,8 +1769,7 @@ fn handle_complete_mvs_record(
             surface,
             viewport_requests,
             dynamic_resolution,
-            write_stream,
-            crypto,
+            writer,
             Instant::now(),
         )?;
         if let Some(request) = boundary.dynamic_request {
@@ -1806,9 +1783,7 @@ fn handle_complete_mvs_record(
     } else if outcome == MvsRecordOutcome::PartialApplied {
         let size = current_surface_size(surface);
         let incremental = incremental_request_after_full_apply(size.width, size.height)?;
-        if finish_partial_boundary_at(requests, || {
-            send_encrypted(write_stream, crypto, &incremental)
-        })? {
+        if finish_partial_boundary_at(requests, || send_encrypted(writer, &incremental))? {
             eprintln!("[hpss-view] MVS type-1 已提交并请求下一增量响应");
         }
     }
@@ -1881,8 +1856,10 @@ pub fn run_viewer(
     conn.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     // ── 共享状态 ──
-    let write_stream = Arc::new(Mutex::new(conn.try_clone().context("无法复制 socket")?));
-    let crypto = conn.crypto_handle().context("加密未挂载")?;
+    if !conn.is_encrypted() {
+        bail!("加密未挂载");
+    }
+    let writer = conn.writer_handle()?;
     let surface = Arc::new(Mutex::new(DisplaySurface::new(
         0,
         Framebuffer::new(w as usize, h as usize)?,
@@ -1899,8 +1876,7 @@ pub fn run_viewer(
         let surface = surface.clone();
         let dynamic_resolution = dynamic_resolution.clone();
         let viewport_requests = viewport_requests.clone();
-        let write_stream = write_stream.clone();
-        let crypto = crypto.clone();
+        let writer = writer.clone();
         let closing = closing.clone();
         let error_slot = error_slot.clone();
         thread::spawn(move || {
@@ -1974,8 +1950,7 @@ pub fn run_viewer(
                     &surface,
                     &viewport_requests,
                     &dynamic_resolution,
-                    &write_stream,
-                    &crypto,
+                    &writer,
                     Instant::now(),
                 );
                 match tick {
@@ -2022,13 +1997,9 @@ pub fn run_viewer(
                             let _ = receiver.request_full();
                             requests.consume_mvs_response();
                             let size = current_surface_size(&surface);
-                            if let Err(send_error) = request_full_update(
-                                &write_stream,
-                                &crypto,
-                                &mut requests,
-                                size.width,
-                                size.height,
-                            ) {
+                            if let Err(send_error) =
+                                request_full_update(&writer, &mut requests, size.width, size.height)
+                            {
                                 if !closing.load(Ordering::Relaxed) {
                                     *error_slot.lock().unwrap() =
                                         Some(format!("发送全量更新请求失败: {send_error}"));
@@ -2046,8 +2017,7 @@ pub fn run_viewer(
                             &surface,
                             &viewport_requests,
                             &dynamic_resolution,
-                            &write_stream,
-                            &crypto,
+                            &writer,
                         ) {
                             if !closing.load(Ordering::Relaxed) {
                                 *error_slot.lock().unwrap() =
@@ -2090,8 +2060,7 @@ pub fn run_viewer(
                                 requests.consume_mvs_response();
                                 let size = current_surface_size(&surface);
                                 if let Err(send_error) = request_full_update(
-                                    &write_stream,
-                                    &crypto,
+                                    &writer,
                                     &mut requests,
                                     size.width,
                                     size.height,
@@ -2113,8 +2082,7 @@ pub fn run_viewer(
                                 &surface,
                                 &viewport_requests,
                                 &dynamic_resolution,
-                                &write_stream,
-                                &crypto,
+                                &writer,
                             ) {
                                 if !closing.load(Ordering::Relaxed) {
                                     *error_slot.lock().unwrap() =
@@ -2185,9 +2153,9 @@ pub fn run_viewer(
                                 );
                             }
                             if let Err(error) =
-                                send_encrypted(&write_stream, &crypto, &configuration).and_then(
-                                    |()| media_transport.mark_configuration_sent(media_generation),
-                                )
+                                send_encrypted(&writer, &configuration).and_then(|()| {
+                                    media_transport.mark_configuration_sent(media_generation)
+                                })
                             {
                                 if !closing.load(Ordering::Relaxed) {
                                     *error_slot.lock().unwrap() =
@@ -2253,8 +2221,7 @@ pub fn run_viewer(
                                     );
                                     requests.reset_generation(commit.generation);
                                     if let Err(send_error) = request_full_update(
-                                        &write_stream,
-                                        &crypto,
+                                        &writer,
                                         &mut requests,
                                         commit.size.width,
                                         commit.size.height,
@@ -2276,13 +2243,9 @@ pub fn run_viewer(
                             eprintln!("[hpss-view] MVS 信封截断，重同步: {e:#}");
                             requests.consume_mvs_response();
                             let size = current_surface_size(&surface);
-                            if let Err(send_error) = request_full_update(
-                                &write_stream,
-                                &crypto,
-                                &mut requests,
-                                size.width,
-                                size.height,
-                            ) {
+                            if let Err(send_error) =
+                                request_full_update(&writer, &mut requests, size.width, size.height)
+                            {
                                 if !closing.load(Ordering::Relaxed) {
                                     *error_slot.lock().unwrap() =
                                         Some(format!("发送全量更新请求失败: {send_error}"));
@@ -2400,7 +2363,7 @@ pub fn run_viewer(
             }
             pressed = now;
             for m in &key_msgs {
-                send_encrypted(&write_stream, &crypto, m)?;
+                send_encrypted(&writer, m)?;
             }
 
             // 鼠标：仅窗口激活且指针位于客户区内时采样输入。
@@ -2455,14 +2418,14 @@ pub fn run_viewer(
                     event.remote.x as u16,
                     event.remote.y as u16,
                 );
-                send_encrypted(&write_stream, &crypto, &msg)?;
+                send_encrypted(&writer, &msg)?;
             }
         }
 
         Ok(())
     })();
 
-    let cleanup_result = shutdown_reader(&closing, &write_stream, reader);
+    let cleanup_result = shutdown_reader(&closing, &writer, reader);
     match (main_result, cleanup_result) {
         (Err(main_error), _) => Err(main_error),
         (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
@@ -2502,32 +2465,17 @@ fn apply_rgb_rect(
 }
 
 /// 通过加密会话发送（viewer 同款）
-fn send_encrypted(
-    write_stream: &Arc<Mutex<std::net::TcpStream>>,
-    crypto: &Arc<Mutex<crate::vnc::session::SessionCrypto>>,
-    msg: &[u8],
-) -> Result<()> {
-    // 先串行化整个发送事务，再推进加密链；否则两个线程可能按 A/B seal、B/A write
-    // 的顺序把链式帧写反。输入等常规路径不持 queue/surface/runtime 锁；reader
-    // request-state tick 会按 queue → runtime → writer → crypto 跨单次写入，确保
-    // write 成功后才标记 framebuffer in-flight 或动态 Pending。
-    let mut writer = write_stream.lock().unwrap();
-    let wire = {
-        let mut c = crypto.lock().unwrap();
-        c.seal(msg)
-    }?;
-    writer.write_all(&wire).context("写入失败（连接中断？）")
+fn send_encrypted(writer: &AppleWriterHandle, msg: &[u8]) -> Result<()> {
+    writer.send_private_message(msg)
 }
 
 fn shutdown_reader(
     closing: &Arc<AtomicBool>,
-    write_stream: &Arc<Mutex<std::net::TcpStream>>,
+    writer: &AppleWriterHandle,
     reader: thread::JoinHandle<()>,
 ) -> Result<()> {
     closing.store(true, Ordering::Relaxed);
-    if let Ok(stream) = write_stream.lock() {
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    }
+    writer.shutdown()?;
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("HPSS reader 线程异常退出"))
@@ -3209,7 +3157,7 @@ mod tests {
     #[test]
     fn render_window_update_does_not_hold_the_display_surface_lock() {
         use std::sync::mpsc;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
         use std::thread;
 
         let mut framebuffer = Framebuffer::new(2, 1).unwrap();
@@ -3283,7 +3231,7 @@ mod tests {
 
     #[test]
     fn render_surface_snapshot_preserves_nearest_neighbor_downsample() {
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
         let mut framebuffer = Framebuffer::new(4, 2).unwrap();
         framebuffer.pixels_mut().copy_from_slice(&[
@@ -3713,10 +3661,13 @@ mod tests {
     fn viewer_iteration_services_p5_before_incomplete_encrypted_frame_completes() {
         use std::io::Write as _;
 
-        let key = [0x51; 16];
-        let iv = [0x62; 16];
-        let mut sender_crypto = crate::vnc::session::SessionCrypto::from_key_iv(key, iv);
-        let wire = sender_crypto.seal(b"viewer-progress").unwrap();
+        const WIRE_FRAME: [u8; 34] = [
+            0x00, 0x20, 0xd4, 0x0f, 0x3e, 0x05, 0x98, 0x0f, 0x86, 0xde, 0x8c, 0x7d, 0x28, 0x28,
+            0xdf, 0xf9, 0xf6, 0x02, 0x67, 0x0e, 0xf5, 0xaa, 0xb5, 0x0a, 0x17, 0x45, 0x98, 0xca,
+            0x07, 0xc7, 0xe8, 0x22, 0x9a, 0x43,
+        ];
+        let key = [0x11; 16];
+        let iv = [0x22; 16];
         let (prefix_sent, prefix_ready) = std::sync::mpsc::channel();
         let (release_remainder, remainder_ready) = std::sync::mpsc::channel();
         let (p5_service_progress, p5_service_observed) = std::sync::mpsc::channel();
@@ -3726,10 +3677,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.write_all(&wire[..1]).unwrap();
+            stream.write_all(&WIRE_FRAME[..1]).unwrap();
             prefix_sent.send(()).unwrap();
             remainder_ready.recv().unwrap();
-            stream.write_all(&wire[1..]).unwrap();
+            stream.write_all(&WIRE_FRAME[1..]).unwrap();
         });
 
         let stream = std::net::TcpStream::connect(address).unwrap();
@@ -3737,7 +3688,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let mut connection = crate::vnc::client::RfbConn::new(stream);
-        connection.set_crypto(crate::vnc::session::SessionCrypto::from_key_iv(key, iv));
+        connection
+            .set_crypto(crate::vnc::session::SessionCrypto::from_key_iv(key, iv))
+            .unwrap();
         prefix_ready.recv().unwrap();
 
         let viewer = std::thread::spawn(move || {
@@ -3767,7 +3720,7 @@ mod tests {
             progress_before_completion.is_ok(),
             "viewer/P5 service must regain control before the encrypted frame completes"
         );
-        assert_eq!(plaintext, b"viewer-progress");
+        assert_eq!(plaintext, b"same");
     }
 
     #[test]
@@ -5035,7 +4988,7 @@ mod tests {
         use std::io::Read as _;
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
         use std::thread;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5050,7 +5003,8 @@ mod tests {
             let _ = server.read(&mut byte);
             done.store(true, Ordering::Relaxed);
         });
-        let writer = Arc::new(Mutex::new(client));
+        let mut connection = crate::vnc::client::RfbConn::new(client);
+        let writer = connection.writer_handle().unwrap();
 
         shutdown_reader(&closing, &writer, handle).unwrap();
 
@@ -5311,10 +5265,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = TcpStream::connect(address).unwrap();
         let (_server, _) = listener.accept().unwrap();
-        let write_stream = Arc::new(Mutex::new(client));
-        let crypto = Arc::new(Mutex::new(crate::vnc::session::SessionCrypto::from_key_iv(
-            [1; 16], [2; 16],
-        )));
+        let mut connection = crate::vnc::client::RfbConn::new(client);
+        connection
+            .set_crypto(crate::vnc::session::SessionCrypto::from_key_iv(
+                [1; 16], [2; 16],
+            ))
+            .unwrap();
+        let writer = connection.writer_handle().unwrap();
         let display_size = DisplaySize::new(2, 2).unwrap();
         let surface = Arc::new(Mutex::new(DisplaySurface::new(
             0,
@@ -5369,8 +5326,7 @@ mod tests {
                     record,
                     &surface,
                     &dynamic_resolution,
-                    &write_stream,
-                    &crypto,
+                    &writer,
                     &mut requests,
                 )
                 .unwrap(),

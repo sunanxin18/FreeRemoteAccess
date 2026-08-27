@@ -8,7 +8,7 @@ use anyhow::{bail, ensure, Result};
 /// 服务器媒体控制矩形使用的主流 ID。
 pub const PRIMARY_MEDIA_STREAM_ID: u32 = 1;
 /// `EncodeRFBMediaStreamMessage1` 使用的矩形编码。
-pub const MEDIA_STREAM_CONTROL_ENCODING: i32 = 0x03f2;
+pub use frd_protocol_apple::protocol::MEDIA_STREAM_CONTROL_ENCODING;
 
 /// `MediaStream Message 1` 的已验证版本字段。
 pub const MEDIA_STREAM_PORT_ANNOUNCEMENT_VERSION: u16 = 1;

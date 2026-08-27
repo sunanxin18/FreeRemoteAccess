@@ -2,8 +2,6 @@
 //! ClientInit/ServerInit，以及服务器消息的解析。
 //! 读取走内部缓冲（RfbConn），避免逐字段系统调用；写入直通 socket。
 
-use std::cell::Cell;
-use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 use std::{error, fmt};
@@ -14,6 +12,10 @@ use frd_wire_rfb::{
     decode_server_init, decode_server_init_header, SERVER_INIT_HEADER_BYTES,
 };
 
+pub use frd_protocol_apple::AppleConnection as RfbConn;
+#[cfg(feature = "viewer")]
+pub use frd_protocol_apple::AppleWriterHandle;
+
 use super::ard;
 use super::auth;
 use super::hpss;
@@ -21,17 +23,6 @@ use super::protocol::{self, PixelFormat};
 use super::rsa_srp;
 use super::session;
 use super::srp;
-
-#[derive(Debug)]
-struct PeerClosed;
-
-impl fmt::Display for PeerClosed {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("连接已被服务器关闭（EOF）")
-    }
-}
-
-impl error::Error for PeerClosed {}
 
 #[derive(Debug)]
 struct ColdDeadlineError;
@@ -50,276 +41,7 @@ fn cold_deadline_error() -> anyhow::Error {
 
 pub(crate) fn is_cold_deadline_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<ColdDeadlineError>())
-}
-
-// ---------- 带读缓冲的连接 ----------
-
-/// RFB 连接（TCP 全双工：读缓冲、写直通）。
-/// 挂载会话加密（set_crypto）后，应用层读写透明走 EncryptOneMessage 帧：
-/// 读 = 解密帧注入缓冲再消费；写 = 自动封帧。帧线上字节（长度前缀 + 密文）
-/// 的读取通过 wire_read 标记绕过封帧，避免递归。
-pub struct RfbConn {
-    stream: TcpStream,
-    absolute_deadline: Option<Instant>,
-    read_timeout_cap: Cell<Option<Duration>>,
-    buf: Vec<u8>,
-    pos: usize,
-    end: usize,
-    crypto: Option<std::sync::Arc<std::sync::Mutex<session::SessionCrypto>>>,
-    /// 待解密的线上字节（挂载加密时缓冲残留转入此处，避免被当明文消费）
-    wire_pending: Vec<u8>,
-    /// 正在写帧的线上字节（密文），写路径不再封帧
-    wire_read: bool,
-}
-
-impl RfbConn {
-    pub fn new(stream: TcpStream) -> Self {
-        Self::new_with_optional_deadline(stream, None)
-    }
-
-    pub fn new_with_deadline(stream: TcpStream, deadline: Instant) -> Self {
-        Self::new_with_optional_deadline(stream, Some(deadline))
-    }
-
-    fn new_with_optional_deadline(stream: TcpStream, absolute_deadline: Option<Instant>) -> Self {
-        Self {
-            stream,
-            absolute_deadline,
-            read_timeout_cap: Cell::new(None),
-            buf: vec![0u8; 16384],
-            pos: 0,
-            end: 0,
-            crypto: None,
-            wire_pending: Vec::new(),
-            wire_read: false,
-        }
-    }
-
-    fn apply_deadline_timeouts(&self) -> Result<()> {
-        let Some(deadline) = self.absolute_deadline else {
-            return Ok(());
-        };
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(cold_deadline_error)?;
-        let read_timeout = self
-            .read_timeout_cap
-            .get()
-            .map(|current| current.min(remaining))
-            .unwrap_or(remaining);
-        self.stream
-            .set_read_timeout(Some(read_timeout))
-            .context("设置 deadline 读超时失败")?;
-        self.stream
-            .set_write_timeout(Some(remaining))
-            .context("设置 deadline 写超时失败")?;
-        Ok(())
-    }
-
-    #[cfg(feature = "viewer")]
-    pub fn try_clone(&self) -> std::io::Result<TcpStream> {
-        self.stream.try_clone()
-    }
-
-    pub fn set_read_timeout(&self, d: Option<Duration>) -> Result<()> {
-        self.stream.set_read_timeout(d).context("设置读超时失败")?;
-        self.read_timeout_cap.set(d);
-        Ok(())
-    }
-
-    pub fn peer_addr(&self) -> Result<std::net::SocketAddr> {
-        self.stream.peer_addr().context("读取远端 socket 地址失败")
-    }
-
-    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
-        self.stream.local_addr().context("读取本地 socket 地址失败")
-    }
-
-    /// 挂载会话加密（establish 成功后调用）；此后的应用层读写全部走加密帧。
-    /// 挂载时读缓冲里的残留字节是密文帧的一部分（EncryptionInfo 常与初始突发同包到达），
-    /// 转入 wire_pending 由帧组装路径消费。
-    pub fn set_crypto(&mut self, c: session::SessionCrypto) {
-        self.wire_pending = self.buf[self.pos..self.end].to_vec();
-        self.pos = 0;
-        self.end = 0;
-        self.crypto = Some(std::sync::Arc::new(std::sync::Mutex::new(c)));
-    }
-
-    /// 加密句柄（viewer 等跨线程写侧共享发送状态用）
-    #[cfg(feature = "viewer")]
-    pub fn crypto_handle(
-        &self,
-    ) -> Option<std::sync::Arc<std::sync::Mutex<session::SessionCrypto>>> {
-        self.crypto.clone()
-    }
-
-    pub fn is_encrypted(&self) -> bool {
-        self.crypto.is_some()
-    }
-
-    /// 把已解密的应用层数据插到读缓冲最前（保持未消费部分在后）
-    fn inject(&mut self, data: &[u8]) {
-        let remaining = self.buf[self.pos..self.end].to_vec();
-        let mut joined = data.to_vec();
-        joined.extend_from_slice(&remaining);
-        if joined.len() > self.buf.len() {
-            self.buf.resize(joined.len(), 0);
-        }
-        self.buf[..joined.len()].copy_from_slice(&joined);
-        self.pos = 0;
-        self.end = joined.len();
-    }
-
-    pub fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        if let Some(crypto) = self.crypto.as_ref().filter(|_| !self.wire_read) {
-            let wire = {
-                let mut c = crypto.lock().unwrap();
-                c.seal(buf)
-            }?;
-            self.apply_deadline_timeouts()?;
-            // 线上字节直写 socket（密文不递归封帧）
-            return self
-                .stream
-                .write_all(&wire)
-                .context("写入失败（连接中断？）");
-        }
-        self.apply_deadline_timeouts()?;
-        self.stream.write_all(buf).context("写入失败（连接中断？）")
-    }
-
-    /// 读取填满 out。缓冲为空且剩余需求超过缓冲容量时直接读入目标缓冲，
-    /// 大块像素数据避免二次拷贝。挂载加密时先解一帧注入缓冲。
-    /// 读一整条应用层消息（HPSS：Apple 会话层消息自成帧，一条 = 一条消息明文）。
-    /// 仅限挂载加密的连接；返回本帧解密明文（不与后续帧拼接）。
-    pub fn read_app_frame(&mut self) -> Result<Vec<u8>> {
-        loop {
-            if let Some(data) = self.read_app_frame_step()? {
-                return Ok(data);
-            }
-        }
-    }
-
-    /// 增量读取一条加密应用帧。每次至多执行一次 socket read；若当前帧仍不完整，
-    /// 保留 `wire_pending` 并返回 `None`，让 viewer 有机会推进其它媒体状态机。
-    pub(crate) fn read_app_frame_step(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.crypto.is_none() {
-            bail!("连接未挂载加密");
-        }
-        // 若缓冲有未消费数据（前一条消息的剩余），属于流式模式残留——直接返回报错
-        if self.pos < self.end {
-            bail!("读缓冲有未消费数据，帧模式与流模式混用");
-        }
-        if let Some(ct) = session::take_wire_ciphertext_frame(&mut self.wire_pending)? {
-            let data = {
-                let mut c = self.crypto.as_ref().unwrap().lock().unwrap();
-                c.open(&ct)
-            }?;
-            return Ok(Some(data));
-        }
-        let mut tmp = [0u8; 16384];
-        self.apply_deadline_timeouts()?;
-        let got = self
-            .stream
-            .read(&mut tmp)
-            .context("读取失败（连接可能已被服务器关闭）")?;
-        if got == 0 {
-            return Err(PeerClosed.into());
-        }
-        self.wire_pending.extend_from_slice(&tmp[..got]);
-        let Some(ct) = session::take_wire_ciphertext_frame(&mut self.wire_pending)? else {
-            return Ok(None);
-        };
-        let data = {
-            let mut c = self.crypto.as_ref().unwrap().lock().unwrap();
-            c.open(&ct)
-        }?;
-        Ok(Some(data))
-    }
-
-    fn read_exact_bytes(&mut self, out: &mut [u8]) -> Result<()> {
-        let n = out.len();
-        let mut filled = 0usize;
-        while filled < n {
-            if self.pos < self.end {
-                let take = (self.end - self.pos).min(n - filled);
-                out[filled..filled + take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
-                self.pos += take;
-                filled += take;
-            } else if self.crypto.is_some() {
-                // 组装一个完整的加密帧：先消费 wire_pending（挂载时的缓冲残留），
-                // 不足再从 socket 补；解出明文注入读缓冲
-                loop {
-                    if let Some(ct) = session::take_wire_ciphertext_frame(&mut self.wire_pending)? {
-                        let data = {
-                            let mut c = self.crypto.as_ref().unwrap().lock().unwrap();
-                            c.open(&ct)
-                        }?;
-                        self.inject(&data);
-                        break;
-                    }
-                    // 从 socket 补充线上字节
-                    let mut tmp = [0u8; 16384];
-                    self.apply_deadline_timeouts()?;
-                    let got = self
-                        .stream
-                        .read(&mut tmp)
-                        .context("读取失败（连接可能已被服务器关闭）")?;
-                    if got == 0 {
-                        return Err(PeerClosed.into());
-                    }
-                    self.wire_pending.extend_from_slice(&tmp[..got]);
-                }
-            } else if n - filled >= self.buf.len() {
-                self.apply_deadline_timeouts()?;
-                let got = self
-                    .stream
-                    .read(&mut out[filled..])
-                    .context("读取失败（连接可能已被服务器关闭）")?;
-                if got == 0 {
-                    return Err(PeerClosed.into());
-                }
-                filled += got;
-            } else {
-                self.pos = 0;
-                self.end = 0;
-                self.apply_deadline_timeouts()?;
-                let got = self
-                    .stream
-                    .read(&mut self.buf)
-                    .context("读取失败（连接可能已被服务器关闭）")?;
-                if got == 0 {
-                    return Err(PeerClosed.into());
-                }
-                self.end = got;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn read_vec(&mut self, n: usize) -> Result<Vec<u8>> {
-        let mut v = vec![0u8; n];
-        self.read_exact_bytes(&mut v)?;
-        Ok(v)
-    }
-
-    pub(crate) fn read_u8(&mut self) -> Result<u8> {
-        let mut b = [0u8; 1];
-        self.read_exact_bytes(&mut b)?;
-        Ok(b[0])
-    }
-
-    pub(crate) fn read_u16(&mut self) -> Result<u16> {
-        let mut b = [0u8; 2];
-        self.read_exact_bytes(&mut b)?;
-        Ok(u16::from_be_bytes(b))
-    }
-
-    pub(crate) fn read_u32(&mut self) -> Result<u32> {
-        let mut b = [0u8; 4];
-        self.read_exact_bytes(&mut b)?;
-        Ok(u32::from_be_bytes(b))
-    }
+        || frd_protocol_apple::is_cold_deadline_error(error)
 }
 
 /// 判断错误链中是否为读超时（Windows 报 TimedOut，Unix 报 WouldBlock）
@@ -336,7 +58,7 @@ pub fn is_timeout(e: &anyhow::Error) -> bool {
 
 /// 判断加密会话的 TCP 对端是否发送了有序 EOF。
 pub fn is_peer_closed(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| cause.is::<PeerClosed>())
+    frd_protocol_apple::is_peer_closed(e)
 }
 
 // ---------- 版本握手与安全类型枚举 ----------
@@ -625,7 +347,7 @@ pub fn finish_authenticated_session(
         let key = srp_key.as_ref().unwrap();
         match session::establish_with_table(&mut conn, key, encoding_profile) {
             Ok(c) => {
-                conn.set_crypto(c);
+                conn.set_crypto(c)?;
                 eprintln!("提示: 已建立加密会话（AES-128-CBC，密钥经 SRP 派生）");
             }
             Err(e) => {
@@ -972,88 +694,10 @@ pub fn read_server_message(conn: &mut RfbConn) -> Result<ServerEvent> {
 mod tests {
     use super::*;
     use crate::framebuffer::Framebuffer;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Instant;
-
-    #[test]
-    fn encrypted_frame_prefix_read_app_frame_and_stream_refills_decrypt_same_literal_wire_frame() {
-        const WIRE_FRAME: [u8; 34] = [
-            0x00, 0x20, 0xd4, 0x0f, 0x3e, 0x05, 0x98, 0x0f, 0x86, 0xde, 0x8c, 0x7d, 0x28, 0x28,
-            0xdf, 0xf9, 0xf6, 0x02, 0x67, 0x0e, 0xf5, 0xaa, 0xb5, 0x0a, 0x17, 0x45, 0x98, 0xca,
-            0x07, 0xc7, 0xe8, 0x22, 0x9a, 0x43,
-        ];
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.write_all(&WIRE_FRAME[1..]).unwrap();
-        });
-        let stream = TcpStream::connect(address).unwrap();
-        let mut app_connection = RfbConn::new(stream);
-        app_connection.set_crypto(session::SessionCrypto::from_key_iv([0x11; 16], [0x22; 16]));
-        app_connection
-            .wire_pending
-            .extend_from_slice(&WIRE_FRAME[..1]);
-        assert_eq!(app_connection.read_app_frame().unwrap(), b"same");
-        server.join().unwrap();
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.write_all(&WIRE_FRAME[7..]).unwrap();
-        });
-        let stream = TcpStream::connect(address).unwrap();
-        let mut stream_connection = RfbConn::new(stream);
-        stream_connection.set_crypto(session::SessionCrypto::from_key_iv([0x11; 16], [0x22; 16]));
-        stream_connection
-            .wire_pending
-            .extend_from_slice(&WIRE_FRAME[..7]);
-        let mut plaintext = [0u8; 4];
-        stream_connection.read_exact_bytes(&mut plaintext).unwrap();
-        assert_eq!(&plaintext, b"same");
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn encrypted_app_frame_step_yields_after_one_incomplete_socket_read() {
-        let key = [0x31; 16];
-        let iv = [0x42; 16];
-        let mut sender_crypto = session::SessionCrypto::from_key_iv(key, iv);
-        let wire = sender_crypto.seal(b"incremental").unwrap();
-        let (first_byte_sent, first_byte_ready) = std::sync::mpsc::channel();
-        let (remainder_ready, send_remainder) = std::sync::mpsc::channel();
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.write_all(&wire[..1]).unwrap();
-            first_byte_sent.send(()).unwrap();
-            send_remainder.recv().unwrap();
-            stream.write_all(&wire[1..]).unwrap();
-        });
-
-        let stream = TcpStream::connect(address).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let mut connection = RfbConn::new(stream);
-        connection.set_crypto(session::SessionCrypto::from_key_iv(key, iv));
-        first_byte_ready.recv().unwrap();
-
-        assert_eq!(connection.read_app_frame_step().unwrap(), None);
-        remainder_ready.send(()).unwrap();
-        let plaintext = loop {
-            if let Some(plaintext) = connection.read_app_frame_step().unwrap() {
-                break plaintext;
-            }
-        };
-        assert_eq!(plaintext, b"incremental");
-        server.join().unwrap();
-    }
 
     #[test]
     fn raw_pixel_decoder_preserves_exact_little_endian_bgrx_and_rejects_remainder() {
@@ -1426,8 +1070,8 @@ mod tests {
 
         connection.write_all(&[0x5a]).unwrap();
 
-        let read_timeout = connection.stream.read_timeout().unwrap().unwrap();
-        let write_timeout = connection.stream.write_timeout().unwrap().unwrap();
+        let read_timeout = connection.read_timeout().unwrap().unwrap();
+        let write_timeout = connection.write_timeout().unwrap().unwrap();
         assert!(read_timeout > Duration::ZERO && read_timeout <= Duration::from_secs(2));
         assert!(write_timeout > Duration::ZERO && write_timeout <= Duration::from_secs(2));
         assert_eq!(server.join().unwrap(), 0x5a);
@@ -1453,8 +1097,8 @@ mod tests {
 
         assert_eq!(connection.read_u8().unwrap(), 0x5a);
 
-        let read_timeout = connection.stream.read_timeout().unwrap().unwrap();
-        let write_timeout = connection.stream.write_timeout().unwrap().unwrap();
+        let read_timeout = connection.read_timeout().unwrap().unwrap();
+        let write_timeout = connection.write_timeout().unwrap().unwrap();
         assert!(read_timeout > Duration::ZERO && read_timeout <= Duration::from_secs(2));
         assert!(write_timeout > Duration::ZERO && write_timeout <= Duration::from_secs(2));
         server.join().unwrap();
@@ -1480,8 +1124,8 @@ mod tests {
             )
             .unwrap();
 
-            let read_timeout = negotiated.conn.stream.read_timeout().unwrap().unwrap();
-            let write_timeout = negotiated.conn.stream.write_timeout().unwrap().unwrap();
+            let read_timeout = negotiated.conn.read_timeout().unwrap().unwrap();
+            let write_timeout = negotiated.conn.write_timeout().unwrap().unwrap();
             assert!(read_timeout > Duration::from_secs(10));
             assert!(write_timeout > Duration::from_secs(10));
             assert!(read_timeout <= Duration::from_secs(seconds));
@@ -1505,49 +1149,10 @@ mod tests {
         let negotiated = negotiate_connected(stream, None, Some(&address)).unwrap();
 
         assert_eq!(
-            negotiated.conn.stream.read_timeout().unwrap(),
+            negotiated.conn.read_timeout().unwrap(),
             Some(Duration::from_secs(10))
         );
-        assert_eq!(negotiated.conn.stream.write_timeout().unwrap(), None);
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn sequential_deadline_reads_and_writes_refresh_both_socket_timeouts() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for expected in [0x11_u8, 0x22] {
-                let mut byte = [0_u8; 1];
-                stream.read_exact(&mut byte).unwrap();
-                assert_eq!(byte[0], expected);
-                stream.write_all(&[expected.wrapping_add(1)]).unwrap();
-            }
-        });
-        let stream = TcpStream::connect(address).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut connection = RfbConn::new_with_deadline(stream, deadline);
-
-        connection.write_all(&[0x11]).unwrap();
-        assert_eq!(connection.read_u8().unwrap(), 0x12);
-        connection
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        connection
-            .stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        connection.write_all(&[0x22]).unwrap();
-        assert_eq!(connection.read_u8().unwrap(), 0x23);
-
-        let read_timeout = connection.stream.read_timeout().unwrap().unwrap();
-        let write_timeout = connection.stream.write_timeout().unwrap().unwrap();
-        assert!(read_timeout > Duration::from_secs(10));
-        assert!(write_timeout > Duration::from_secs(10));
-        assert!(read_timeout <= Duration::from_secs(30));
-        assert!(write_timeout <= Duration::from_secs(30));
+        assert_eq!(negotiated.conn.write_timeout().unwrap(), None);
         server.join().unwrap();
     }
 
@@ -1622,8 +1227,8 @@ mod tests {
 
         connection.write_all(&[0x5a]).unwrap();
 
-        assert!(connection.stream.read_timeout().unwrap().is_none());
-        assert!(connection.stream.write_timeout().unwrap().is_none());
+        assert!(connection.read_timeout().unwrap().is_none());
+        assert!(connection.write_timeout().unwrap().is_none());
         server.join().unwrap();
     }
 }
