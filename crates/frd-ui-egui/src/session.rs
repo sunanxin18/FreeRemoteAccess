@@ -1,6 +1,9 @@
 use egui::Ui;
 use frd_app::{AppIntent, AppPage};
-use frd_protocol_api::{ServerIdentityChallenge, ServerIdentityDecision, ServerIdentityValidation};
+use frd_protocol_api::{
+    ServerIdentityChallenge, ServerIdentityDecision, ServerIdentityValidation,
+    ServerIdentityValidationFailure,
+};
 
 pub fn show_session_page(
     ui: &mut Ui,
@@ -36,6 +39,11 @@ pub fn show_session_page(
             ui.button("取消")
                 .clicked()
                 .then_some(AppIntent::CancelConnect)
+        }
+        AppPage::Disconnecting { .. } => {
+            ui.heading("正在断开连接");
+            ui.label("正在清理会话资源，请稍候。");
+            None
         }
         AppPage::RemoteSession { capabilities, .. } => {
             ui.horizontal(|ui| {
@@ -80,6 +88,11 @@ fn show_identity_challenge(ui: &mut Ui, challenge: &ServerIdentityChallenge) -> 
     ui.label(format!("端点：{}", challenge.endpoint));
     ui.label(format!("主题：{}", challenge.subject));
     ui.label(format!("签发者：{}", challenge.issuer));
+    if let Some(failure) = &challenge.validation_failure {
+        let [code, reason] = validation_failure_labels(failure);
+        ui.colored_label(ui.visuals().warn_fg_color, code);
+        ui.colored_label(ui.visuals().warn_fg_color, reason);
+    }
     ui.label(format!(
         "SHA-256：{}",
         challenge
@@ -118,6 +131,13 @@ fn show_identity_challenge(ui: &mut Ui, challenge: &ServerIdentityChallenge) -> 
     intent
 }
 
+fn validation_failure_labels(failure: &ServerIdentityValidationFailure) -> [String; 2] {
+    [
+        format!("验证代码：{}", failure.code()),
+        format!("验证原因：{}", failure.reason()),
+    ]
+}
+
 fn identity_intent(
     challenge: &ServerIdentityChallenge,
     decision: ServerIdentityDecision,
@@ -126,5 +146,27 @@ fn identity_intent(
         session_id: challenge.session_id,
         challenge_id: challenge.challenge_id,
         decision,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use frd_protocol_api::ServerIdentityValidationFailure;
+
+    use super::validation_failure_labels;
+
+    #[test]
+    fn identity_page_labels_include_sanitized_validation_code_and_reason() {
+        let failure =
+            ServerIdentityValidationFailure::new("certificate.expired", "服务器证书已过期")
+                .expect("sanitized failure");
+
+        assert_eq!(
+            validation_failure_labels(&failure),
+            [
+                "验证代码：certificate.expired".to_owned(),
+                "验证原因：服务器证书已过期".to_owned(),
+            ]
+        );
     }
 }

@@ -90,6 +90,22 @@ pub struct ProtocolDescriptor {
     pub id: ProtocolId,
     pub display_name: String,
     pub default_port: u16,
+    pub credential_requirements: CredentialRequirements,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialRequirements {
+    pub username: bool,
+    pub password: bool,
+}
+
+impl CredentialRequirements {
+    pub const fn username_password() -> Self {
+        Self {
+            username: true,
+            password: true,
+        }
+    }
 }
 
 impl From<ProtocolId> for ProtocolDescriptor {
@@ -97,6 +113,7 @@ impl From<ProtocolId> for ProtocolDescriptor {
         Self {
             display_name: id.as_str().to_owned(),
             default_port: default_port_for(&id),
+            credential_requirements: CredentialRequirements::username_password(),
             id,
         }
     }
@@ -121,6 +138,12 @@ impl ProtocolCatalog {
 
     pub fn descriptors(&self) -> &[ProtocolDescriptor] {
         &self.descriptors
+    }
+
+    pub fn descriptor(&self, protocol_id: &ProtocolId) -> Option<&ProtocolDescriptor> {
+        self.descriptors
+            .iter()
+            .find(|descriptor| &descriptor.id == protocol_id)
     }
 
     pub fn select(
@@ -240,6 +263,59 @@ pub fn evaluate_server_identity(
     }
 }
 
+const MAX_IDENTITY_VALIDATION_CODE_BYTES: usize = 64;
+const MAX_IDENTITY_VALIDATION_REASON_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerIdentityValidationFailureError {
+    InvalidCode,
+    InvalidReason,
+}
+
+/// 仅承载 adapter 映射后的稳定代码与用户安全摘要；禁止复制底层原始诊断。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerIdentityValidationFailure {
+    code: String,
+    reason: String,
+}
+
+impl ServerIdentityValidationFailure {
+    pub fn new(
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self, ServerIdentityValidationFailureError> {
+        let code = code.into();
+        if code.is_empty()
+            || code.len() > MAX_IDENTITY_VALIDATION_CODE_BYTES
+            || !code.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+        {
+            return Err(ServerIdentityValidationFailureError::InvalidCode);
+        }
+
+        let reason = reason.into();
+        if reason.is_empty()
+            || reason.len() > MAX_IDENTITY_VALIDATION_REASON_BYTES
+            || reason.trim() != reason
+            || reason.chars().any(char::is_control)
+        {
+            return Err(ServerIdentityValidationFailureError::InvalidReason);
+        }
+        Ok(Self { code, reason })
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerIdentityChallenge {
     pub session_id: SessionId,
@@ -250,6 +326,7 @@ pub struct ServerIdentityChallenge {
     pub subject: String,
     pub issuer: String,
     pub validation: ServerIdentityValidation,
+    pub validation_failure: Option<ServerIdentityValidationFailure>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -612,6 +689,29 @@ mod tests {
 
         assert_eq!(validation, ServerIdentityValidation::PinMismatch);
         assert!(!validation.allows_credential_continuation());
+    }
+
+    #[test]
+    fn identity_validation_failure_accepts_only_bounded_sanitized_code_and_reason() {
+        let failure = super::ServerIdentityValidationFailure::new(
+            "certificate.hostname_mismatch",
+            "证书名称与目标端点不匹配",
+        )
+        .expect("bounded sanitized failure is accepted");
+        assert_eq!(failure.code(), "certificate.hostname_mismatch");
+        assert_eq!(failure.reason(), "证书名称与目标端点不匹配");
+
+        assert!(super::ServerIdentityValidationFailure::new("bad code", "安全摘要").is_err());
+        assert!(super::ServerIdentityValidationFailure::new(
+            "certificate.expired",
+            "第一行\n第二行"
+        )
+        .is_err());
+        assert!(super::ServerIdentityValidationFailure::new(
+            "certificate.expired",
+            "x".repeat(257),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1109,6 +1209,7 @@ mod tests {
             subject: "mac.example".to_owned(),
             issuer: "test issuer".to_owned(),
             validation: ServerIdentityValidation::Unknown,
+            validation_failure: None,
         }
     }
 

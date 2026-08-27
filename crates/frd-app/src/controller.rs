@@ -64,6 +64,7 @@ pub enum AppAction {
 pub enum AppControllerError {
     SessionAlreadyActive,
     NoActiveSession,
+    InvalidSubmission(&'static str),
     InvalidConnection(ProtocolError),
     Platform(PlatformError),
     Identity(IdentityDecisionError),
@@ -218,8 +219,10 @@ impl AppController {
         self.session_slot.finish_cleanup(cleanup)?;
         if self.session_id == Some(session_id) {
             self.session_id = None;
-            self.generation = 0;
-            self.challenge = None;
+            self.reset_session_bound_state();
+            if matches!(self.page, Page::Disconnecting { .. }) {
+                self.page = Page::ConnectionForm(ConnectionForm::new(self.page.retained_draft()));
+            }
         }
         Ok(())
     }
@@ -239,6 +242,9 @@ impl AppController {
                 self.session_slot
                     .begin_disconnect(session_id)
                     .map_err(|_| AppControllerError::NoActiveSession)?;
+                let draft = self.page.retained_draft();
+                self.reset_session_bound_state();
+                self.page = Page::Disconnecting { draft };
                 Ok(Some(AppAction::SessionCommand(SessionCommand::Disconnect)))
             }
             AppIntent::ReturnToConnection => {
@@ -267,19 +273,31 @@ impl AppController {
         if self.session_slot.is_occupied() {
             return Err(AppControllerError::SessionAlreadyActive);
         }
-        let target =
-            submission
-                .draft
-                .target_system
-                .ok_or(AppControllerError::InvalidConnection(
-                    ProtocolError::UnsupportedTargetProtocol,
-                ))?;
+        let Some(target) = submission.draft.target_system else {
+            return self.reject_submission(submission, "target_system_required");
+        };
+        if submission.draft.address.trim().is_empty() {
+            return self.reject_submission(submission, "address_required");
+        }
+        if submission.draft.port.is_none() || submission.draft.port == Some(0) {
+            return self.reject_submission(submission, "port_required");
+        }
         let protocol_id = catalog
             .select(
                 target,
                 ProtocolSelection::Explicit(submission.resolved_protocol.clone()),
             )
             .map_err(AppControllerError::InvalidConnection)?;
+        let requirements = catalog
+            .descriptor(&protocol_id)
+            .expect("selected protocol must have a descriptor")
+            .credential_requirements;
+        if requirements.username && submission.draft.username.trim().is_empty() {
+            return self.reject_submission(submission, "username_required");
+        }
+        if requirements.password && submission.password.is_empty() {
+            return self.reject_submission(submission, "password_required");
+        }
         let endpoint = frd_core::Endpoint::new(
             submission.draft.address.clone(),
             submission.draft.port.unwrap_or(0),
@@ -307,15 +325,25 @@ impl AppController {
             saved_server_pin,
         };
         self.session_id = Some(session_id);
-        self.generation = 0;
-        self.challenge = None;
-        self.protocol_capabilities = SessionCapabilities::default();
+        self.reset_session_bound_state();
         self.page = Page::Connecting {
             draft,
             stage: ConnectionStage::Connecting,
             diagnostics: None,
         };
         Ok(AppAction::StartSession(request))
+    }
+
+    fn reject_submission(
+        &mut self,
+        submission: ConnectionSubmission,
+        code: &'static str,
+    ) -> Result<AppAction, AppControllerError> {
+        let mut form = ConnectionForm::new(submission.draft);
+        form.set_password(submission.password);
+        form.set_validation_error(code);
+        self.page = Page::ConnectionForm(form);
+        Err(AppControllerError::InvalidSubmission(code))
     }
 
     pub fn effective_capabilities(&self) -> SessionCapabilities {
@@ -326,10 +354,27 @@ impl AppController {
 
     pub fn set_platform_capabilities(&mut self, capabilities: PlatformCapabilities) {
         self.platform_capabilities = capabilities;
+        self.refresh_presented_capabilities();
     }
 
     pub fn set_product_policy(&mut self, policy: ProductPolicy) {
         self.policy = policy;
+        self.refresh_presented_capabilities();
+    }
+
+    fn refresh_presented_capabilities(&mut self) {
+        let effective = self.effective_capabilities();
+        if let Page::RemoteSession { capabilities, .. } = &mut self.page {
+            *capabilities = effective;
+        }
+    }
+
+    fn reset_session_bound_state(&mut self) {
+        self.generation = 0;
+        self.challenge = None;
+        self.protocol_capabilities = SessionCapabilities::default();
+        self.inbound_clipboard = None;
+        self.audio_state = AudioState::Unavailable;
     }
 
     /// 取走最新的入站剪贴板；数据只在内存中短暂聚合，不持久化。
@@ -342,11 +387,31 @@ impl AppController {
     }
 
     pub fn handle_session_event(&mut self, event: SessionEvent) {
-        if matches!(self.page, Page::ConnectionForm(_) | Page::Failed { .. }) {
+        if let SessionEvent::Error(error) = &event {
+            self.handle_terminal_event(error.code());
+            return;
+        }
+        if let SessionEvent::Closed(exit) = &event {
+            let code = match exit {
+                frd_protocol_api::ProtocolExit::Closed => "session_closed",
+                frd_protocol_api::ProtocolExit::Failed(error) => error.code(),
+            };
+            self.handle_terminal_event(code);
+            return;
+        }
+        if matches!(
+            self.page,
+            Page::ConnectionForm(_) | Page::Disconnecting { .. } | Page::Failed { .. }
+        ) {
             return;
         }
         match event {
             SessionEvent::StageChanged(stage) => {
+                if stage == ConnectionStage::TransportReady {
+                    if let Some(session_id) = self.session_id {
+                        let _ = self.session_slot.mark_active(session_id);
+                    }
+                }
                 let draft = self.page.retained_draft();
                 self.page = if stage == ConnectionStage::TransportReady {
                     Page::AwaitingFirstFrame {
@@ -364,12 +429,7 @@ impl AppController {
             }
             SessionEvent::CapabilitiesChanged(capabilities) => {
                 self.protocol_capabilities = capabilities;
-                if matches!(self.page, Page::RemoteSession { .. }) {
-                    self.page = Page::RemoteSession {
-                        draft: self.page.retained_draft(),
-                        capabilities: self.effective_capabilities(),
-                    };
-                }
+                self.refresh_presented_capabilities();
             }
             SessionEvent::Clipboard(payload) => {
                 self.inbound_clipboard = Some(payload);
@@ -392,25 +452,28 @@ impl AppController {
             SessionEvent::ServerIdentityChallenge(challenge) => {
                 self.handle_server_identity_challenge(challenge);
             }
-            SessionEvent::Error(error) => {
-                self.page = Page::Failed {
-                    draft: self.page.retained_draft(),
-                    code: error.code().to_owned(),
-                };
-                self.challenge = None;
-            }
-            SessionEvent::Closed(exit) => {
-                let code = match exit {
-                    frd_protocol_api::ProtocolExit::Closed => "session_closed",
-                    frd_protocol_api::ProtocolExit::Failed(ref error) => error.code(),
-                };
-                self.page = Page::Failed {
-                    draft: self.page.retained_draft(),
-                    code: code.to_owned(),
-                };
-                self.challenge = None;
+            SessionEvent::Error(_) | SessionEvent::Closed(_) => {
+                unreachable!("terminal handled above")
             }
             _ => {}
+        }
+    }
+
+    fn handle_terminal_event(&mut self, code: &str) {
+        let Some(session_id) = self.session_id else {
+            return;
+        };
+        if self.session_slot.begin_terminal(session_id).is_err() {
+            return;
+        }
+        let draft = self.page.retained_draft();
+        let already_failed = matches!(self.page, Page::Failed { .. });
+        self.reset_session_bound_state();
+        if !already_failed {
+            self.page = Page::Failed {
+                draft,
+                code: code.to_owned(),
+            };
         }
     }
 
@@ -448,7 +511,12 @@ impl AppController {
     }
 
     pub fn handle_server_identity_challenge(&mut self, challenge: ServerIdentityChallenge) {
-        if Some(challenge.session_id) == self.session_id {
+        if Some(challenge.session_id) == self.session_id
+            && !matches!(
+                self.page,
+                Page::ConnectionForm(_) | Page::Disconnecting { .. } | Page::Failed { .. }
+            )
+        {
             self.challenge = Some(challenge);
         }
     }
@@ -521,6 +589,7 @@ enum SlotState {
     Connecting(SessionId),
     Active(SessionId),
     Disconnecting(SessionId),
+    CleanupPending(SessionId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -569,10 +638,27 @@ impl ActiveSessionSlot {
         }
     }
 
+    fn begin_terminal(&mut self, session_id: SessionId) -> Result<(), ActiveSessionError> {
+        match self.state {
+            Some(
+                SlotState::Connecting(current)
+                | SlotState::Active(current)
+                | SlotState::Disconnecting(current),
+            ) if current == session_id => {
+                self.state = Some(SlotState::CleanupPending(session_id));
+                Ok(())
+            }
+            Some(SlotState::CleanupPending(current)) if current == session_id => Ok(()),
+            _ => Err(ActiveSessionError::InvalidTransition),
+        }
+    }
+
     /// 仅接受 `SessionCoordinator` 在完整资源回收后签发的完成能力。
     pub fn finish_cleanup(&mut self, cleanup: CleanupComplete) -> Result<(), ActiveSessionError> {
         match self.state {
-            Some(SlotState::Disconnecting(current)) if current == cleanup.session_id() => {
+            Some(SlotState::Disconnecting(current) | SlotState::CleanupPending(current))
+                if current == cleanup.session_id() =>
+            {
                 self.state = None;
                 Ok(())
             }

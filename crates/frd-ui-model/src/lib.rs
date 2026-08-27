@@ -104,6 +104,17 @@ impl ConnectionForm {
         self.errors.password = Some(code.to_owned());
     }
 
+    pub fn set_validation_error(&mut self, code: &'static str) {
+        match code {
+            "target_system_required" => self.errors.target_system = Some(code.to_owned()),
+            "address_required" => self.errors.address = Some(code.to_owned()),
+            "port_required" => self.errors.port = Some(code.to_owned()),
+            "username_required" => self.errors.username = Some(code.to_owned()),
+            "password_required" => self.errors.password = Some(code.to_owned()),
+            _ => self.errors.protocol = Some(code.to_owned()),
+        }
+    }
+
     pub fn validate(&mut self, catalog: &ProtocolCatalog) -> bool {
         self.validate_and_resolve(catalog).is_some()
     }
@@ -191,6 +202,9 @@ pub enum Page {
         stage: ConnectionStage,
         diagnostics: Option<String>,
     },
+    Disconnecting {
+        draft: ConnectionDraft,
+    },
     RemoteSession {
         draft: ConnectionDraft,
         capabilities: SessionCapabilities,
@@ -211,6 +225,7 @@ impl Page {
             Self::ConnectionForm(form) => form.draft.clone(),
             Self::Connecting { draft, .. }
             | Self::AwaitingFirstFrame { draft, .. }
+            | Self::Disconnecting { draft }
             | Self::RemoteSession { draft, .. }
             | Self::Failed { draft, .. } => draft.clone(),
         }

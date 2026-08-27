@@ -178,6 +178,64 @@ mod tests {
     }
 
     #[test]
+    fn presented_capabilities_refresh_when_platform_and_policy_change() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        let all = frd_protocol_api::SessionCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        };
+        controller.set_platform_capabilities(PlatformCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.set_product_policy(ProductPolicy {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.handle_session_event(SessionEvent::CapabilitiesChanged(all));
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+
+        controller.set_platform_capabilities(PlatformCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: false,
+            text_input: true,
+        });
+        let AppPage::RemoteSession { capabilities, .. } = controller.page() else {
+            panic!("session stays presented");
+        };
+        assert!(!capabilities.remote_audio);
+
+        controller.set_product_policy(ProductPolicy {
+            dynamic_resolution: true,
+            clipboard_read: false,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        let AppPage::RemoteSession { capabilities, .. } = controller.page() else {
+            panic!("session stays presented");
+        };
+        assert!(!capabilities.clipboard_read);
+    }
+
+    #[test]
     fn controller_rejects_a_second_active_connection() {
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
@@ -197,6 +255,71 @@ mod tests {
             Err(AppControllerError::SessionAlreadyActive)
         ));
         drop(first_action);
+    }
+
+    #[test]
+    fn malformed_direct_submission_stays_editable_and_starts_no_worker() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller =
+            AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
+        let malformed = frd_ui_model::ConnectionSubmission {
+            draft: ConnectionDraft {
+                target_system: Some(TargetSystem::MacOs),
+                address: "host.invalid".to_owned(),
+                port: Some(5900),
+                protocol: ProtocolChoice::Automatic,
+                username: String::new(),
+            },
+            resolved_protocol: ProtocolId::apple_hpss_mvs(),
+            password: SecretBuffer::new(b"retained-password".to_vec()),
+        };
+
+        assert_eq!(
+            controller.handle_intent(malformed, &catalog, &store).err(),
+            Some(AppControllerError::InvalidSubmission("username_required"))
+        );
+        let AppPage::ConnectionForm(form) = controller.page() else {
+            panic!("invalid direct submission stays editable");
+        };
+        assert_eq!(form.errors().username.as_deref(), Some("username_required"));
+        assert!(!form.password_is_empty());
+
+        let valid = complete_form()
+            .take_submission(&catalog)
+            .expect("valid submission");
+        assert!(matches!(
+            controller.handle_intent(valid, &catalog, &store),
+            Ok(Some(AppAction::StartSession(_)))
+        ));
+    }
+
+    #[test]
+    fn direct_submission_without_protocol_required_password_starts_no_worker() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller =
+            AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
+        let malformed = frd_ui_model::ConnectionSubmission {
+            draft: ConnectionDraft {
+                target_system: Some(TargetSystem::MacOs),
+                address: "host.invalid".to_owned(),
+                port: Some(5900),
+                protocol: ProtocolChoice::Automatic,
+                username: "test-user".to_owned(),
+            },
+            resolved_protocol: ProtocolId::apple_hpss_mvs(),
+            password: SecretBuffer::new(Vec::new()),
+        };
+
+        assert_eq!(
+            controller.handle_intent(malformed, &catalog, &store).err(),
+            Some(AppControllerError::InvalidSubmission("password_required"))
+        );
+        let AppPage::ConnectionForm(form) = controller.page() else {
+            panic!("invalid direct submission stays editable");
+        };
+        assert_eq!(form.errors().password.as_deref(), Some("password_required"));
     }
 
     #[test]
@@ -243,6 +366,178 @@ mod tests {
             controller.handle_intent(reconnect, &catalog, &store),
             Ok(Some(AppAction::StartSession(_)))
         ));
+    }
+
+    #[test]
+    fn spontaneous_error_requires_matching_cleanup_before_reconnect() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::connection_form(complete_form());
+        let AppAction::StartSession(request) = controller
+            .handle_intent(
+                complete_form()
+                    .take_submission(&catalog)
+                    .expect("valid submission"),
+                &catalog,
+                &store,
+            )
+            .expect("connection starts")
+            .expect("start action")
+        else {
+            panic!("connection starts a worker");
+        };
+        let session_id = request.session_id;
+        controller.set_platform_capabilities(PlatformCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.set_product_policy(ProductPolicy {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.handle_session_event(SessionEvent::CapabilitiesChanged(
+            frd_protocol_api::SessionCapabilities {
+                dynamic_resolution: true,
+                clipboard_read: true,
+                clipboard_write: true,
+                remote_audio: true,
+                text_input: true,
+            },
+        ));
+        controller.handle_session_event(SessionEvent::Clipboard(ClipboardPayload::new(vec![0x22])));
+        controller.handle_session_event(SessionEvent::AudioState(AudioState::Playing));
+        controller.handle_server_identity_challenge(challenge(session_id, 7, [0x11; 32]));
+
+        controller.handle_session_event(SessionEvent::Error(ProtocolError::Adapter {
+            protocol_id: ProtocolId::apple_hpss_mvs(),
+            code: "spontaneous_failure",
+        }));
+        assert!(controller.take_inbound_clipboard().is_none());
+        assert_eq!(controller.audio_state(), &AudioState::Unavailable);
+        assert_eq!(
+            controller.effective_capabilities(),
+            frd_protocol_api::SessionCapabilities::default()
+        );
+        assert!(controller.current_server_identity_challenge().is_none());
+        assert!(controller
+            .finish_session_cleanup(cleanup_completion(SessionId::allocate()))
+            .is_err());
+        let retry = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert_eq!(
+            controller.handle_intent(retry, &catalog, &store).err(),
+            Some(AppControllerError::SessionAlreadyActive)
+        );
+
+        controller
+            .finish_session_cleanup(cleanup_completion(session_id))
+            .expect("matching cleanup releases the failed session");
+        let retry = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert!(matches!(
+            controller.handle_intent(retry, &catalog, &store),
+            Ok(Some(AppAction::StartSession(_)))
+        ));
+    }
+
+    #[test]
+    fn spontaneous_closed_requires_matching_cleanup_before_reconnect() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::connection_form(complete_form());
+        let AppAction::StartSession(request) = controller
+            .handle_intent(
+                complete_form()
+                    .take_submission(&catalog)
+                    .expect("valid submission"),
+                &catalog,
+                &store,
+            )
+            .expect("connection starts")
+            .expect("start action")
+        else {
+            panic!("connection starts a worker");
+        };
+        let session_id = request.session_id;
+
+        controller
+            .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
+        let retry = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert!(matches!(
+            controller.handle_intent(retry, &catalog, &store),
+            Err(AppControllerError::SessionAlreadyActive)
+        ));
+
+        controller
+            .finish_session_cleanup(cleanup_completion(session_id))
+            .expect("matching cleanup releases the closed session");
+        let retry = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert!(matches!(
+            controller.handle_intent(retry, &catalog, &store),
+            Ok(Some(AppAction::StartSession(_)))
+        ));
+    }
+
+    #[test]
+    fn error_then_closed_is_idempotent_and_preserves_first_terminal_code() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+
+        controller.handle_session_event(SessionEvent::Error(ProtocolError::Adapter {
+            protocol_id: ProtocolId::apple_hpss_mvs(),
+            code: "first_terminal_error",
+        }));
+        controller
+            .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
+        assert!(matches!(
+            controller.page(),
+            AppPage::Failed { code, .. } if code == "first_terminal_error"
+        ));
+        let retry = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert!(matches!(
+            controller.handle_intent(retry, &catalog, &store),
+            Err(AppControllerError::SessionAlreadyActive)
+        ));
+
+        controller
+            .finish_session_cleanup(cleanup_completion(session_id))
+            .expect("one cleanup capability releases the session once");
+        controller
+            .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
+        assert!(matches!(
+            controller.page(),
+            AppPage::Failed { code, .. } if code == "first_terminal_error"
+        ));
+        let retry = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert!(matches!(
+            controller.handle_intent(retry, &catalog, &store),
+            Ok(Some(AppAction::StartSession(_)))
+        ));
+    }
+
+    fn cleanup_completion(session_id: SessionId) -> frd_session::CleanupComplete {
+        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
+        coordinator
+            .complete_cleanup(session_id, &mut RecordingCleanup::default())
+            .expect("test cleanup completes")
     }
 
     #[test]
@@ -582,6 +877,77 @@ mod tests {
     }
 
     #[test]
+    fn cancel_then_late_full_baseline_does_not_enter_remote() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(session_id, 3);
+
+        controller
+            .handle_intent(AppIntent::CancelConnect, &catalog, &store)
+            .expect("cancel enters disconnecting");
+        assert!(matches!(controller.page(), AppPage::Disconnecting { .. }));
+
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 3,
+            revision: 9,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+
+        assert!(matches!(controller.page(), AppPage::Disconnecting { .. }));
+    }
+
+    #[test]
+    fn disconnect_then_route_input_returns_none() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(session_id, 3);
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 3,
+            revision: 9,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        assert!(controller
+            .route_input(frd_core::InputEvent::ReleaseAll)
+            .is_some());
+
+        controller
+            .handle_intent(AppIntent::Disconnect, &catalog, &store)
+            .expect("disconnect enters disconnecting");
+
+        assert!(controller
+            .route_input(frd_core::InputEvent::ReleaseAll)
+            .is_none());
+    }
+
+    #[test]
+    fn disconnecting_then_late_transport_ready_and_generation_do_not_resurrect() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(session_id, 3);
+
+        controller
+            .handle_intent(AppIntent::Disconnect, &catalog, &store)
+            .expect("disconnect enters disconnecting");
+        controller
+            .handle_session_event(SessionEvent::StageChanged(ConnectionStage::TransportReady));
+        controller.handle_session_event(SessionEvent::SurfaceGenerationChanged {
+            session_id,
+            generation: 4,
+            size: PixelSize::new(1024, 768).expect("valid size"),
+        });
+
+        assert!(matches!(controller.page(), AppPage::Disconnecting { .. }));
+        assert!(controller
+            .route_input(frd_core::InputEvent::ReleaseAll)
+            .is_none());
+    }
+
+    #[test]
     fn stage_change_after_terminal_failure_does_not_resurrect_connecting() {
         let current = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(current, 3);
@@ -625,6 +991,55 @@ mod tests {
         controller.handle_session_event(SessionEvent::AudioState(AudioState::Playing));
 
         assert_eq!(controller.audio_state(), &AudioState::Playing);
+    }
+
+    #[test]
+    fn cleanup_and_reconnect_do_not_expose_prior_session_state() {
+        let first = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(first, 1);
+        controller.handle_session_event(SessionEvent::CapabilitiesChanged(
+            frd_protocol_api::SessionCapabilities {
+                dynamic_resolution: true,
+                clipboard_read: true,
+                clipboard_write: true,
+                remote_audio: true,
+                text_input: true,
+            },
+        ));
+        controller.handle_session_event(SessionEvent::Clipboard(ClipboardPayload::new(vec![0x22])));
+        controller.handle_session_event(SessionEvent::AudioState(AudioState::Playing));
+        controller.handle_server_identity_challenge(challenge(first, 7, [0x11; 32]));
+
+        controller
+            .handle_intent(AppIntent::Disconnect, &catalog, &store)
+            .expect("disconnect begins cleanup");
+        assert!(controller.take_inbound_clipboard().is_none());
+        assert_eq!(controller.audio_state(), &AudioState::Unavailable);
+        assert_eq!(
+            controller.effective_capabilities(),
+            frd_protocol_api::SessionCapabilities::default()
+        );
+        assert!(controller.current_server_identity_challenge().is_none());
+
+        controller
+            .finish_session_cleanup(cleanup_completion(first))
+            .expect("cleanup releases first session");
+        let second = complete_form()
+            .take_submission(&catalog)
+            .expect("second submission");
+        assert!(matches!(
+            controller.handle_intent(second, &catalog, &store),
+            Ok(Some(AppAction::StartSession(_)))
+        ));
+        assert!(controller.take_inbound_clipboard().is_none());
+        assert_eq!(controller.audio_state(), &AudioState::Unavailable);
+        assert_eq!(
+            controller.effective_capabilities(),
+            frd_protocol_api::SessionCapabilities::default()
+        );
+        assert!(controller.current_server_identity_challenge().is_none());
     }
 
     #[test]
@@ -759,6 +1174,7 @@ mod tests {
             subject: "mac.example".to_owned(),
             issuer: "local test".to_owned(),
             validation,
+            validation_failure: None,
         }
     }
 

@@ -20,31 +20,54 @@ impl PcmPlaybackBuffer {
         }
     }
 
+    #[cfg(test)]
     fn enqueue_pcm(
         &mut self,
         sample_rate_hz: u32,
         channels: u8,
         samples: &[i16],
     ) -> Result<(), AudioOutputError> {
-        if sample_rate_hz != SAMPLE_RATE_HZ
-            || channels != CHANNELS
-            || !samples.len().is_multiple_of(usize::from(CHANNELS))
-        {
-            return Err(AudioOutputError::UnsupportedFormat);
-        }
-
-        for frame in samples.chunks_exact(2) {
-            if self.frames.len() == self.max_frames {
-                self.frames.pop_front();
-            }
-            self.frames.push_back([frame[0], frame[1]]);
-        }
+        let frames = prepare_pcm_frames(sample_rate_hz, channels, samples, self.max_frames)?;
+        self.enqueue_frames(frames);
         Ok(())
+    }
+
+    fn enqueue_frames(&mut self, frames: VecDeque<[i16; 2]>) {
+        debug_assert!(frames.len() <= self.max_frames);
+        let overflow = self
+            .frames
+            .len()
+            .saturating_add(frames.len())
+            .saturating_sub(self.max_frames);
+        self.frames.drain(..overflow);
+        self.frames.extend(frames);
     }
 
     fn take_frame(&mut self) -> Option<[i16; 2]> {
         self.frames.pop_front()
     }
+}
+
+fn prepare_pcm_frames(
+    sample_rate_hz: u32,
+    channels: u8,
+    samples: &[i16],
+    max_frames: usize,
+) -> Result<VecDeque<[i16; 2]>, AudioOutputError> {
+    if sample_rate_hz != SAMPLE_RATE_HZ
+        || channels != CHANNELS
+        || !samples.len().is_multiple_of(usize::from(CHANNELS))
+    {
+        return Err(AudioOutputError::UnsupportedFormat);
+    }
+
+    let total_frames = samples.len() / usize::from(CHANNELS);
+    let retained_frames = total_frames.min(max_frames);
+    let start = (total_frames - retained_frames) * usize::from(CHANNELS);
+    Ok(samples[start..]
+        .chunks_exact(usize::from(CHANNELS))
+        .map(|frame| [frame[0], frame[1]])
+        .collect())
 }
 
 #[cfg(windows)]
@@ -91,7 +114,7 @@ impl WindowsAudioOutput {
                 let callback_buffer = buffer.clone();
                 device.build_output_stream::<i16, _, _>(
                     config,
-                    move |output, _| fill_i16(output, &callback_buffer),
+                    move |output, _| try_fill_i16(output, &callback_buffer),
                     error_callback,
                     None,
                 )
@@ -140,21 +163,25 @@ impl AudioOutput for WindowsAudioOutput {
         if self.failed.load(Ordering::Acquire) {
             return Err(AudioOutputError::Closed);
         }
+        let frames = prepare_pcm_frames(sample_rate_hz, channels, &samples, MAX_BUFFERED_FRAMES)?;
         self.buffer
             .lock()
             .map_err(|_| AudioOutputError::Closed)?
-            .enqueue_pcm(sample_rate_hz, channels, &samples)
+            .enqueue_frames(frames);
+        Ok(())
     }
 }
 
-#[cfg(windows)]
-fn fill_i16(output: &mut [i16], buffer: &std::sync::Arc<std::sync::Mutex<PcmPlaybackBuffer>>) {
-    let Ok(mut buffer) = buffer.lock() else {
-        output.fill(0);
+#[cfg(any(windows, test))]
+fn try_fill_i16(output: &mut [i16], buffer: &std::sync::Arc<std::sync::Mutex<PcmPlaybackBuffer>>) {
+    output.fill(0);
+    let Ok(mut buffer) = buffer.try_lock() else {
         return;
     };
     for output_frame in output.chunks_mut(2) {
-        let frame = buffer.take_frame().unwrap_or([0, 0]);
+        let Some(frame) = buffer.take_frame() else {
+            break;
+        };
         output_frame[0] = frame[0];
         if output_frame.len() == 2 {
             output_frame[1] = frame[1];
@@ -164,12 +191,14 @@ fn fill_i16(output: &mut [i16], buffer: &std::sync::Arc<std::sync::Mutex<PcmPlay
 
 #[cfg(windows)]
 fn fill_f32(output: &mut [f32], buffer: &std::sync::Arc<std::sync::Mutex<PcmPlaybackBuffer>>) {
-    let Ok(mut buffer) = buffer.lock() else {
-        output.fill(0.0);
+    output.fill(0.0);
+    let Ok(mut buffer) = buffer.try_lock() else {
         return;
     };
     for output_frame in output.chunks_mut(2) {
-        let frame = buffer.take_frame().unwrap_or([0, 0]);
+        let Some(frame) = buffer.take_frame() else {
+            break;
+        };
         output_frame[0] = f32::from(frame[0]) / 32_768.0;
         if output_frame.len() == 2 {
             output_frame[1] = f32::from(frame[1]) / 32_768.0;
@@ -179,12 +208,14 @@ fn fill_f32(output: &mut [f32], buffer: &std::sync::Arc<std::sync::Mutex<PcmPlay
 
 #[cfg(windows)]
 fn fill_u16(output: &mut [u16], buffer: &std::sync::Arc<std::sync::Mutex<PcmPlaybackBuffer>>) {
-    let Ok(mut buffer) = buffer.lock() else {
-        output.fill(32_768);
+    output.fill(32_768);
+    let Ok(mut buffer) = buffer.try_lock() else {
         return;
     };
     for output_frame in output.chunks_mut(2) {
-        let frame = buffer.take_frame().unwrap_or([0, 0]);
+        let Some(frame) = buffer.take_frame() else {
+            break;
+        };
         output_frame[0] = (i32::from(frame[0]) + 32_768) as u16;
         if output_frame.len() == 2 {
             output_frame[1] = (i32::from(frame[1]) + 32_768) as u16;
@@ -211,9 +242,11 @@ impl AudioOutput for WindowsAudioOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use frd_media_api::AudioOutputError;
 
-    use super::PcmPlaybackBuffer;
+    use super::{try_fill_i16, PcmPlaybackBuffer, MAX_BUFFERED_FRAMES};
 
     #[test]
     fn pcm_output_queue_drops_the_oldest_whole_frame_at_its_latency_bound() {
@@ -245,5 +278,50 @@ mod tests {
             Err(AudioOutputError::UnsupportedFormat)
         );
         assert_eq!(buffer.take_frame(), None);
+    }
+
+    #[test]
+    fn oversized_enqueue_retains_only_newest_4800_complete_stereo_frames() {
+        let mut buffer = PcmPlaybackBuffer::new(MAX_BUFFERED_FRAMES);
+        let samples = (0..5_000_i16)
+            .flat_map(|frame| [frame, -frame])
+            .collect::<Vec<_>>();
+
+        buffer
+            .enqueue_pcm(48_000, 2, &samples)
+            .expect("valid oversized PCM is accepted");
+
+        assert_eq!(buffer.take_frame(), Some([200, -200]));
+        for _ in 1..MAX_BUFFERED_FRAMES - 1 {
+            assert!(buffer.take_frame().is_some());
+        }
+        assert_eq!(buffer.take_frame(), Some([4_999, -4_999]));
+        assert_eq!(buffer.take_frame(), None);
+    }
+
+    #[test]
+    fn realtime_fill_is_nonblocking_and_silent_when_queue_lock_is_busy() {
+        let buffer = Arc::new(Mutex::new(PcmPlaybackBuffer::new(2)));
+        let _held = buffer.lock().expect("test owns queue lock");
+        let mut output = [7_i16; 4];
+
+        try_fill_i16(&mut output, &buffer);
+
+        assert_eq!(output, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn realtime_fill_emits_silence_for_underrun() {
+        let buffer = Arc::new(Mutex::new(PcmPlaybackBuffer::new(2)));
+        buffer
+            .lock()
+            .expect("queue lock")
+            .enqueue_pcm(48_000, 2, &[11, 22])
+            .expect("valid PCM");
+        let mut output = [7_i16; 4];
+
+        try_fill_i16(&mut output, &buffer);
+
+        assert_eq!(output, [11, 22, 0, 0]);
     }
 }
