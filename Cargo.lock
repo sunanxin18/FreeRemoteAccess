@@ -503,6 +503,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-legacy-minifb-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cpal",
+ "frd-core",
+ "frd-frame",
+ "frd-media-api",
+ "frd-protocol-api",
+ "frd-protocol-apple",
+ "minifb",
+]
+
+[[package]]
 name = "frd-media-api"
 version = "0.1.0"
 dependencies = [
@@ -585,20 +600,14 @@ dependencies = [
  "aes",
  "anyhow",
  "clap",
- "cpal",
  "des",
  "fdk-aac",
  "fdk-aac-sys",
  "flate2",
- "frd-core",
- "frd-frame",
- "frd-media-api",
- "frd-protocol-api",
  "frd-protocol-apple",
  "frd-wire-rfb",
  "getrandom 0.2.17",
  "hmac",
- "minifb",
  "png",
  "sha1",
  "sha2",

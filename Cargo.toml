@@ -17,6 +17,7 @@ members = [
     "crates/frd-platform-api",
     "crates/frd-app",
     "crates/frd-protocol-apple",
+    "tools/frd-legacy-minifb-lab",
 ]
 
 [workspace.dependencies]
@@ -37,25 +38,15 @@ hmac = "0.12"
 aes = "0.8"
 sha1 = "0.10"
 getrandom = "0.2"
-minifb = { version = "0.28", optional = true }
-cpal = { version = "0.18.2", optional = true }
 flate2 = "1"
 fdk-aac = "0.8"
 fdk-aac-sys = "0.5"
-frd-core = { path = "crates/frd-core" }
 frd-wire-rfb = { path = "crates/frd-wire-rfb" }
-frd-frame = { path = "crates/frd-frame" }
-frd-media-api = { path = "crates/frd-media-api" }
-frd-protocol-api = { path = "crates/frd-protocol-api" }
 frd-protocol-apple = { path = "crates/frd-protocol-apple" }
 
 [dependencies.windows-sys]
 version = "0.59"
 features = ["Win32_NetworkManagement_IpHelper"]
-
-[features]
-default = ["viewer"]
-viewer = ["dep:minifb", "dep:cpal"]
 
 [profile.release]
 lto = "thin"

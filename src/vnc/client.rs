@@ -13,8 +13,6 @@ use frd_wire_rfb::{
 };
 
 pub use frd_protocol_apple::AppleConnection as RfbConn;
-#[cfg(feature = "viewer")]
-pub use frd_protocol_apple::AppleWriterHandle;
 
 use super::auth;
 use super::hpss;

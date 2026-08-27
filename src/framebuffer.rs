@@ -1,5 +1,4 @@
-//! 帧缓冲。内部每像素一个 u32（0x00RRGGBB，小端），与 minifb 窗口
-//! 缓冲格式一致，渲染时可直接整块提交。
+//! 帧缓冲。内部每像素一个 u32（0x00RRGGBB，小端），供截图和协议实验使用。
 
 use anyhow::{ensure, Context, Result};
 
@@ -32,14 +31,9 @@ impl Framebuffer {
         })
     }
 
-    #[cfg(any(feature = "viewer", test))]
+    #[cfg(test)]
     pub fn pixels(&self) -> &[u32] {
         &self.pixels
-    }
-
-    #[cfg(feature = "viewer")]
-    pub fn pixels_mut(&mut self) -> &mut [u32] {
-        &mut self.pixels
     }
 
     pub fn apply(&mut self, ops: &[RectOp]) {

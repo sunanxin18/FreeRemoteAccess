@@ -4,11 +4,7 @@
 
 mod arp;
 mod framebuffer;
-#[cfg(feature = "viewer")]
-mod keysym;
 mod proxy;
-#[cfg(feature = "viewer")]
-mod viewer;
 mod vnc;
 
 use std::path::PathBuf;
@@ -71,7 +67,6 @@ fn require_login(credentials: &CredentialValues) -> Result<(&str, &str)> {
     Ok((username, password))
 }
 
-#[cfg(feature = "viewer")]
 fn parse_display_scale(value: &str) -> std::result::Result<f32, String> {
     let scale = value
         .parse::<f32>()
@@ -185,8 +180,7 @@ enum Cmd {
         #[arg(long, default_value_t = 3000)]
         wait_ms: u64,
     },
-    /// 打开本地窗口实时查看并控制远程屏幕（键鼠输入）
-    #[cfg(feature = "viewer")]
+    /// 已迁移：请显式运行 frd-legacy-minifb-lab
     View {
         host: String,
         #[arg(long, default_value_t = 5900)]
@@ -214,8 +208,7 @@ enum Cmd {
         #[arg(short, long, default_value = "ard_capture")]
         out: PathBuf,
     },
-    /// HPSS 实时交互视图：MVS 渲染 + 鼠标输入；统一键盘输入由 Task 10 恢复
-    #[cfg(feature = "viewer")]
+    /// 已迁移：请显式运行 frd-legacy-minifb-lab
     Hpssview {
         /// 主机；与 --credentials-stdin-v1 二选一
         #[arg(
@@ -366,28 +359,9 @@ fn run(cli: Cli) -> Result<()> {
                 wait_ms,
             )
         }
-        #[cfg(feature = "viewer")]
-        Cmd::View {
-            host,
-            port,
-            username_env,
-            password_env,
-            scale,
-        } => {
-            let credentials = load_credentials(&username_env, &password_env)?;
-            let addr = arp::parse_target(&host, port)?;
-            let client = VncClient::connect_timeout(
-                &addr,
-                Duration::from_secs(5),
-                credentials.username.as_deref(),
-                credentials.password.as_deref(),
-            )?;
-            println!(
-                "已连接 {addr} — {}（{}x{}），打开窗口…",
-                client.name, client.width, client.height
-            );
-            viewer::run(client, scale)
-        }
+        Cmd::View { .. } => anyhow::bail!(
+            "旧实时查看器已移至开发工具 frd-legacy-minifb-lab；请显式运行该二进制，root CLI 不会自动启动它"
+        ),
         Cmd::Proxy {
             target,
             port,
@@ -400,60 +374,9 @@ fn run(cli: Cli) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("非法监听地址 {listen}: {e}"))?;
             proxy::run(listen_addr, target_addr, out)
         }
-        #[cfg(feature = "viewer")]
-        Cmd::Hpssview {
-            host,
-            credentials_stdin_v1,
-            port,
-            username_env,
-            password_env,
-            scale,
-            display_name,
-            dynamic_resolution,
-            udp_media,
-            udp_audio_input,
-        } => match (host.as_deref(), credentials_stdin_v1) {
-            (Some(host), false) => {
-                let credentials = load_credentials(&username_env, &password_env)?;
-                let (username, password) = require_login(&credentials)?;
-                cmd_hpssview(
-                    host,
-                    port,
-                    username,
-                    password,
-                    scale,
-                    &display_name,
-                    dynamic_resolution,
-                    udp_media,
-                    udp_audio_input,
-                )
-            }
-            (None, true) => {
-                let audio_flow = hpssview_audio_flow(udp_audio_input)?;
-                let connected = connect_hpssview_from_process_stdin(
-                    |credentials| {
-                        authenticate_hpssview(
-                            credentials.host,
-                            credentials.port,
-                            credentials.username,
-                            credentials.password,
-                            udp_media,
-                        )
-                    },
-                    finish_hpssview_authenticated,
-                )?;
-                run_connected_hpssview(
-                    connected,
-                    scale,
-                    &display_name,
-                    dynamic_resolution,
-                    audio_flow,
-                    true,
-                )
-                .map_err(|_| anyhow::anyhow!("安全凭据 HPSS 会话失败"))
-            }
-            _ => anyhow::bail!("hpssview 目标来源参数无效"),
-        },
+        Cmd::Hpssview { .. } => anyhow::bail!(
+            "旧实时查看器已移至开发工具 frd-legacy-minifb-lab；请显式运行该二进制，root CLI 不会自动启动它"
+        ),
         Cmd::Hpss {
             host,
             port,
@@ -1377,220 +1300,8 @@ fn rgb_to_png_rgba(rgb: &[u8], width: u16, height: u16) -> Vec<u8> {
     rgba
 }
 
-/// hpssview：HPSS 实时交互视图（本迁移阶段仅鼠标；统一键盘输入由 Task 10 恢复）
-#[cfg(feature = "viewer")]
-fn hpssview_audio_flow(udp_audio_input: bool) -> Result<vnc::media_negotiation::AudioMediaFlow> {
-    if udp_audio_input {
-        anyhow::bail!(
-            "用户名/密码 HPSS 不支持 PC→Mac Audio Chat；Apple 的 stock 实现由 IDS/Apple ID 邀请会话门控，P5 保持禁用"
-        );
-    }
-    Ok(vnc::media_negotiation::AudioMediaFlow::MacToPc)
-}
-
-#[cfg(feature = "viewer")]
-fn connect_hpssview_with_frame<A, T>(
-    mut guarded: vnc::cold_credentials::GuardedCredentialFrame,
-    authenticate: impl FnOnce(vnc::cold_credentials::CredentialSlices<'_>) -> Result<A>,
-    finish: impl FnOnce(A) -> Result<T>,
-) -> Result<T> {
-    let authenticated = guarded.with_slices(authenticate);
-    guarded.clear();
-    let authenticated = authenticated.map_err(|error| {
-        client::stable_apple_security_type_error(&error)
-            .unwrap_or_else(|| anyhow::anyhow!("安全凭据 HPSS 连接失败"))
-    })?;
-    let finished = finish(authenticated);
-    // 明确把已清零的分配保留到 finish 回调结束：测试可验证 finish 开始前凭据区已为零，
-    // 且 finish 无法借用 CredentialSlices。
-    drop(guarded);
-    finished.map_err(|_| anyhow::anyhow!("安全凭据 HPSS 会话失败"))
-}
-
-#[cfg(all(feature = "viewer", test))]
-fn connect_hpssview_from_stdin<R: std::io::Read, A, T>(
-    reader: &mut R,
-    authenticate: impl FnOnce(vnc::cold_credentials::CredentialSlices<'_>) -> Result<A>,
-    finish: impl FnOnce(A) -> Result<T>,
-) -> Result<T> {
-    let guarded = vnc::cold_credentials::GuardedCredentialFrame::read_stdin_v1(reader)
-        .map_err(|_| anyhow::anyhow!("安全凭据输入无效"))?;
-    connect_hpssview_with_frame(guarded, authenticate, finish)
-}
-
-#[cfg(feature = "viewer")]
-fn connect_hpssview_from_process_stdin<A, T>(
-    authenticate: impl FnOnce(vnc::cold_credentials::CredentialSlices<'_>) -> Result<A>,
-    finish: impl FnOnce(A) -> Result<T>,
-) -> Result<T> {
-    let guarded = vnc::cold_credentials::GuardedCredentialFrame::read_process_stdin_v1()
-        .map_err(|_| anyhow::anyhow!("安全凭据输入无效"))?;
-    connect_hpssview_with_frame(guarded, authenticate, finish)
-}
-
-#[cfg(feature = "viewer")]
-enum HpssviewConnectionNotice<'a> {
-    Legacy {
-        addr: &'a std::net::SocketAddr,
-        desktop_name: &'a str,
-    },
-    Redacted,
-}
-
-#[cfg(feature = "viewer")]
-fn format_hpssview_connection_notice(
-    notice: HpssviewConnectionNotice<'_>,
-    width: u16,
-    height: u16,
-) -> String {
-    match notice {
-        HpssviewConnectionNotice::Legacy { addr, desktop_name } => {
-            format!("已连接 {addr} — {desktop_name}（{width}x{height}），打开 HPSS 视图…")
-        }
-        HpssviewConnectionNotice::Redacted => {
-            format!("已安全连接目标（{width}x{height}），打开 HPSS 视图…")
-        }
-    }
-}
-
-#[cfg(feature = "viewer")]
-struct PendingHpssviewConnection {
-    addr: std::net::SocketAddr,
-    authenticated: frd_protocol_apple::AppleAuthenticated,
-    encoding_profile: vnc::session::SessionEncodingProfile,
-}
-
-#[cfg(feature = "viewer")]
-fn authenticate_hpssview(
-    host: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-    udp_media: bool,
-) -> Result<PendingHpssviewConnection> {
-    let addr = arp::parse_target(host, port)?;
-    let encoding_profile = if udp_media {
-        vnc::session::SessionEncodingProfile::AppleUdpMedia
-    } else {
-        vnc::session::SessionEncodingProfile::AppleTcpMvs
-    };
-    let negotiated = client::negotiate(&addr, Duration::from_secs(5))?;
-    let authenticated = frd_protocol_apple::authenticate_negotiated(
-        negotiated.conn,
-        negotiated.version,
-        negotiated.security_types,
-        username,
-        password,
-    )
-    .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)?;
-    Ok(PendingHpssviewConnection {
-        addr,
-        authenticated,
-        encoding_profile,
-    })
-}
-
-#[cfg(feature = "viewer")]
-fn finish_hpssview_authenticated(
-    pending: PendingHpssviewConnection,
-) -> Result<(std::net::SocketAddr, VncClient)> {
-    let established = frd_protocol_apple::finish_authenticated_session(
-        pending.authenticated,
-        pending.encoding_profile,
-    )
-    .map_err(frd_protocol_apple::AppleHandshakeError::into_anyhow)?;
-    let client = client::from_apple_session(established)?;
-    Ok((pending.addr, client))
-}
-
-#[cfg(feature = "viewer")]
-fn connect_hpssview(
-    host: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-    udp_media: bool,
-) -> Result<(std::net::SocketAddr, VncClient)> {
-    finish_hpssview_authenticated(authenticate_hpssview(
-        host, port, username, password, udp_media,
-    )?)
-}
-
-#[cfg(feature = "viewer")]
-fn run_connected_hpssview(
-    connected: (std::net::SocketAddr, VncClient),
-    scale: f32,
-    display_name: &str,
-    dynamic_resolution: bool,
-    audio_flow: vnc::media_negotiation::AudioMediaFlow,
-    redact_connection_notice: bool,
-) -> Result<()> {
-    use crate::vnc::hpss_viewer;
-
-    let (addr, client) = connected;
-    let connection_notice = if redact_connection_notice {
-        HpssviewConnectionNotice::Redacted
-    } else {
-        HpssviewConnectionNotice::Legacy {
-            addr: &addr,
-            desktop_name: &client.name,
-        }
-    };
-    println!(
-        "{}",
-        format_hpssview_connection_notice(connection_notice, client.width, client.height)
-    );
-    println!("输入状态：本迁移阶段仅支持鼠标；统一键盘输入由 Task 10 恢复");
-    if !client.conn.is_encrypted() {
-        anyhow::bail!("加密会话未建立");
-    }
-    hpss_viewer::run_viewer(
-        client.conn,
-        display_name,
-        client.width,
-        client.height,
-        scale,
-        dynamic_resolution,
-        audio_flow,
-    )
-}
-
-/// hpssview：HPSS 实时交互视图（本迁移阶段仅鼠标；统一键盘输入由 Task 10 恢复）
-#[cfg(feature = "viewer")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "命令边界逐项承接 clap 参数，保持调用处与 CLI 字段一一对应"
-)]
-fn cmd_hpssview(
-    host: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-    scale: f32,
-    display_name: &str,
-    dynamic_resolution: bool,
-    udp_media: bool,
-    udp_audio_input: bool,
-) -> Result<()> {
-    let audio_flow = hpssview_audio_flow(udp_audio_input)?;
-    let connected = connect_hpssview(host, port, username, password, udp_media)?;
-    run_connected_hpssview(
-        connected,
-        scale,
-        display_name,
-        dynamic_resolution,
-        audio_flow,
-        false,
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "viewer")]
-    use super::{
-        authenticate_hpssview, connect_hpssview_from_stdin, finish_hpssview_authenticated,
-        format_hpssview_connection_notice, hpssview_audio_flow, HpssviewConnectionNotice,
-    };
     use super::{
         classify_cold_connection_error, cmd_hpss_capture_v2, cmd_mvs_capture_v2_verify,
         create_cold_writer_then, finish_cold_connection_failure, format_cold_verify_json,
@@ -1598,8 +1309,6 @@ mod tests {
         Cmd, ColdConnectionFailure, DEFAULT_PASSWORD_ENV, DEFAULT_USERNAME_ENV,
     };
     use crate::vnc::hpss::MvsCaptureWriter;
-    #[cfg(feature = "viewer")]
-    use crate::vnc::media_negotiation::AudioMediaFlow;
     use crate::vnc::mvs_stream::{MvsRecord, MvsRect};
     use clap::{CommandFactory, Parser};
 
@@ -2448,20 +2157,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
-    fn password_hpss_audio_input_is_rejected_before_session_selection() {
-        assert_eq!(hpssview_audio_flow(false).unwrap(), AudioMediaFlow::MacToPc);
-        let error = hpssview_audio_flow(true).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("用户名/密码 HPSS 不支持 PC→Mac Audio Chat"),
-            "应明确说明 stock Apple Audio Chat 的身份门控，实际错误: {error:#}"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "viewer")]
     fn udp_audio_input_without_udp_media_is_rejected_by_cli_before_dispatch() {
         let error = match Cli::try_parse_from([
             "freeremotedesk",
@@ -2480,7 +2175,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
     fn hpssview_credentials_stdin_v1_is_accepted_without_positional_host() {
         let cli = Cli::try_parse_from(["freeremotedesk", "hpssview", "--credentials-stdin-v1"])
             .expect("stdin credential mode must not put HOST in process arguments");
@@ -2498,7 +2192,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
     fn hpssview_cli_requires_exactly_one_target_source() {
         let missing = match Cli::try_parse_from(["freeremotedesk", "hpssview"]) {
             Ok(_) => panic!("hpssview must require HOST or --credentials-stdin-v1"),
@@ -2522,7 +2215,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
     fn hpssview_stdin_mode_rejects_explicit_legacy_provider_options() {
         for (option, value) in [
             ("--port", "5901"),
@@ -2548,7 +2240,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
     fn hpssview_legacy_host_mode_remains_available() {
         let cli = Cli::try_parse_from(["freeremotedesk", "hpssview", "example.invalid"])
             .expect("legacy HOST plus environment credential mode must remain compatible");
@@ -2566,153 +2257,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
-    fn hpssview_stdin_connection_notice_cannot_format_target_or_desktop_name() {
-        assert_eq!(
-            format_hpssview_connection_notice(HpssviewConnectionNotice::Redacted, 1920, 1080),
-            "已安全连接目标（1920x1080），打开 HPSS 视图…"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "viewer")]
-    fn hpssview_stdin_frame_is_borrowed_only_by_the_connect_callback() {
-        let frame = b"FRDSTD01\x00\x00\x00\x0e\x00\x04\x00\x01\x00\x01\x17\x0chostup";
-        let connected = connect_hpssview_from_stdin(
-            &mut std::io::Cursor::new(frame),
-            |credentials| {
-                assert_eq!(credentials.host, "host");
-                assert_eq!(credentials.username, "u");
-                assert_eq!(credentials.password, "p");
-                assert_eq!(credentials.port, 5900);
-                Ok::<_, anyhow::Error>(73_u8)
-            },
-            Ok,
-        )
-        .expect("valid frame must produce an owned connection result");
-
-        assert_eq!(connected, 73);
-    }
-
-    #[test]
-    #[cfg(feature = "viewer")]
-    fn hpssview_stdin_connect_error_is_category_only() {
-        let frame = b"FRDSTD01\x00\x00\x00\x0e\x00\x04\x00\x01\x00\x01\x17\x0chostup";
-        let error = connect_hpssview_from_stdin(
-            &mut std::io::Cursor::new(frame),
-            |_| Err::<(), _>(anyhow::anyhow!("fake-target-canary fake-desktop-canary")),
-            Ok,
-        )
-        .unwrap_err();
-
-        assert_eq!(error.to_string(), "安全凭据 HPSS 连接失败");
-        assert!(!format!("{error:#}").contains("fake-target-canary"));
-        assert!(!format!("{error:#}").contains("fake-desktop-canary"));
-    }
-
-    #[test]
-    #[cfg(feature = "viewer")]
-    fn hpssview_secure_stdin_type_two_only_preserves_stable_apple_error_without_auth_bytes() {
-        use std::io::{Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"RFB 003.008\n").unwrap();
-            let mut client_banner = [0_u8; 12];
-            stream.read_exact(&mut client_banner).unwrap();
-            assert_eq!(&client_banner, b"RFB 003.008\n");
-            stream.write_all(&[1, 2]).unwrap();
-            let mut post_offer = Vec::new();
-            stream.read_to_end(&mut post_offer).unwrap();
-            post_offer
-        });
-
-        let host = b"127.0.0.1";
-        let mut frame = b"FRDSTD01".to_vec();
-        frame.extend_from_slice(&19_u32.to_be_bytes());
-        frame.extend_from_slice(&9_u16.to_be_bytes());
-        frame.extend_from_slice(&1_u16.to_be_bytes());
-        frame.extend_from_slice(&1_u16.to_be_bytes());
-        frame.extend_from_slice(&address.port().to_be_bytes());
-        frame.extend_from_slice(host);
-        frame.extend_from_slice(b"u");
-        frame.extend_from_slice(b"p");
-
-        let error = match connect_hpssview_from_stdin(
-            &mut std::io::Cursor::new(frame),
-            |credentials| {
-                authenticate_hpssview(
-                    credentials.host,
-                    credentials.port,
-                    credentials.username,
-                    credentials.password,
-                    false,
-                )
-            },
-            finish_hpssview_authenticated,
-        ) {
-            Ok(_) => panic!("type-2-only secure-stdin HPSS must fail closed"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error.to_string(),
-            frd_protocol_apple::APPLE_SECURITY_TYPE_UNAVAILABLE
-        );
-        assert!(server.join().unwrap().is_empty());
-    }
-
-    #[test]
-    #[cfg(feature = "viewer")]
-    fn hpssview_stdin_frame_is_zeroed_before_session_finish_callback() {
-        let frame = b"FRDSTD01\x00\x00\x00\x0e\x00\x04\x00\x01\x00\x01\x17\x0chostup";
-        type Probe = (*const u8, usize);
-        let finished = connect_hpssview_from_stdin(
-            &mut std::io::Cursor::new(frame),
-            |credentials| {
-                Ok::<_, anyhow::Error>([
-                    (credentials.host.as_ptr(), credentials.host.len()),
-                    (credentials.username.as_ptr(), credentials.username.len()),
-                    (credentials.password.as_ptr(), credentials.password.len()),
-                ])
-            },
-            |probes: [Probe; 3]| {
-                for (pointer, length) in probes {
-                    // SAFETY: connect_hpssview_with_frame explicitly keeps the guarded allocation
-                    // alive until this finish callback returns. Each probe points to a previously
-                    // validated range inside that allocation and retains its original length.
-                    let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
-                    assert!(bytes.iter().all(|byte| *byte == 0));
-                }
-                Ok::<_, anyhow::Error>(91_u8)
-            },
-        )
-        .expect("finish callback must observe a cleared frame");
-
-        assert_eq!(finished, 91);
-    }
-
-    #[test]
-    #[cfg(feature = "viewer")]
-    fn hpssview_stdin_finish_error_is_category_only() {
-        let frame = b"FRDSTD01\x00\x00\x00\x0e\x00\x04\x00\x01\x00\x01\x17\x0chostup";
-        let error = connect_hpssview_from_stdin(
-            &mut std::io::Cursor::new(frame),
-            |_| Ok::<_, anyhow::Error>(()),
-            |_| Err::<(), _>(anyhow::anyhow!("fake-finish-canary")),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.to_string(), "安全凭据 HPSS 会话失败");
-        assert!(!format!("{error:#}").contains("fake-finish-canary"));
-    }
-
-    #[test]
     fn process_stdin_credential_dispatch_never_uses_the_global_buffered_reader() {
         let production = include_str!("main.rs")
             .split("#[cfg(test)]\nmod tests")
@@ -2726,13 +2270,12 @@ mod tests {
         );
         assert_eq!(
             production.matches("read_process_stdin_v1").count(),
-            2,
-            "cold capture 与 hpssview 必须都使用无额外用户态缓冲的进程 stdin 入口"
+            1,
+            "仅 cold capture 保留无额外用户态缓冲的进程 stdin 入口"
         );
     }
 
     #[test]
-    #[cfg(feature = "viewer")]
     fn viewer_scale_is_rejected_by_cli_before_credentials_or_connection() {
         for command in ["view", "hpssview"] {
             for scale in ["NaN", "inf", "0", "-0.25", "1.01"] {
@@ -2748,6 +2291,23 @@ mod tests {
                     "{command} --scale {scale} 必须在读取凭据或连接前被拒绝"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn root_viewer_commands_direct_to_the_explicit_lab_before_credential_access() {
+        let expected = "旧实时查看器已移至开发工具 frd-legacy-minifb-lab；请显式运行该二进制，root CLI 不会自动启动它";
+        for command in ["view", "hpssview"] {
+            let cli = Cli::try_parse_from([
+                "freeremotedesk",
+                command,
+                "example.invalid",
+                "--username-env",
+                "9-invalid-provider-name",
+            ])
+            .unwrap();
+
+            assert_eq!(super::run(cli).unwrap_err().to_string(), expected);
         }
     }
 

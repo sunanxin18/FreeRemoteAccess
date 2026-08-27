@@ -612,7 +612,6 @@ fn parse_record(
 }
 
 fn validate_record_rect(rect: MvsRect, surface: MvsCaptureV2Geometry) -> Result<()> {
-    #[cfg(any(feature = "viewer", test))]
     crate::vnc::mvs_stream::validate_mvs_rect_against_surface(rect, surface.width, surface.height)?;
     ensure!(
         rect.width != 0 && rect.height != 0,

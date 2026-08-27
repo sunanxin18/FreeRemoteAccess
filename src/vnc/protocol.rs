@@ -35,17 +35,6 @@ pub mod limits {
     pub const MAX_UPDATE_RAW_BYTES: usize = 128 * BINARY_MEBIBYTE_BYTES;
 }
 
-#[cfg(feature = "viewer")]
-pub mod pointer {
-    pub const PRIMARY: u8 = 1;
-    pub const MIDDLE: u8 = 2;
-    pub const SECONDARY: u8 = 4;
-    pub const WHEEL_UP: u8 = 8;
-    pub const WHEEL_DOWN: u8 = 16;
-    pub const WHEEL_RIGHT: u8 = 32;
-    pub const WHEEL_LEFT: u8 = 64;
-}
-
 pub use frd_protocol_apple::protocol::apple_session;
 
 pub mod security {
@@ -144,50 +133,5 @@ impl TryFrom<u8> for RfbServerMessageType {
             3 => Ok(Self::ServerCutText),
             _ => bail!("未知标准 RFB 服务器消息类型 {value}"),
         }
-    }
-}
-
-#[cfg(feature = "viewer")]
-pub fn msg_key_event(down: bool, keysym: u32) -> [u8; 8] {
-    let mut message = [0_u8; 8];
-    message[0] = RfbClientMessageType::KeyEvent as u8;
-    message[1] = u8::from(down);
-    message[4..].copy_from_slice(&keysym.to_be_bytes());
-    message
-}
-
-#[cfg(feature = "viewer")]
-pub fn msg_pointer_event(button_mask: u8, x: u16, y: u16) -> [u8; 6] {
-    let mut message = [0_u8; 6];
-    message[0] = RfbClientMessageType::PointerEvent as u8;
-    message[1] = button_mask;
-    message[2..4].copy_from_slice(&x.to_be_bytes());
-    message[4..].copy_from_slice(&y.to_be_bytes());
-    message
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[cfg(feature = "viewer")]
-    fn pointer_mask_owners_match_independent_boundary_and_combined_fixtures() {
-        use super::{msg_pointer_event, pointer};
-
-        assert_eq!(
-            [
-                pointer::PRIMARY,
-                pointer::MIDDLE,
-                pointer::SECONDARY,
-                pointer::WHEEL_UP,
-                pointer::WHEEL_DOWN,
-                pointer::WHEEL_RIGHT,
-                pointer::WHEEL_LEFT,
-            ],
-            [1, 2, 4, 8, 16, 32, 64]
-        );
-        assert_eq!(
-            msg_pointer_event(pointer::PRIMARY | pointer::WHEEL_LEFT, u16::MAX, 0),
-            [5, 65, 0xff, 0xff, 0, 0]
-        );
     }
 }

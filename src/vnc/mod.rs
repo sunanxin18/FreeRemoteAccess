@@ -1,18 +1,14 @@
 pub mod ard;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(test)]
 pub mod audio_codec;
-#[cfg(any(feature = "viewer", test))]
+#[cfg(test)]
 pub mod audio_input;
-#[cfg(feature = "viewer")]
-pub mod audio_io;
 pub mod auth;
 pub mod client;
 pub mod cold_credentials;
 pub mod cold_hpss;
 pub mod dynamic_resolution;
 pub mod hpss;
-#[cfg(feature = "viewer")]
-pub mod hpss_viewer;
 pub mod media_negotiation;
 pub mod media_protocol;
 pub mod media_transport;

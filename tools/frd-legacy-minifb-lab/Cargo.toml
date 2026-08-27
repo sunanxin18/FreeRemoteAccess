@@ -1,0 +1,18 @@
+[package]
+name = "frd-legacy-minifb-lab"
+version = "0.1.0"
+edition = "2021"
+description = "显式启动的 FreeRemoteDesk minifb 串行对照工具"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.18.2"
+frd-core = { path = "../../crates/frd-core" }
+frd-frame = { path = "../../crates/frd-frame" }
+frd-media-api = { path = "../../crates/frd-media-api" }
+frd-protocol-api = { path = "../../crates/frd-protocol-api" }
+frd-protocol-apple = { path = "../../crates/frd-protocol-apple" }
+minifb = "0.28"
+
