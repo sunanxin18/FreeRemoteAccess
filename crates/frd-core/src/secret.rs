@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "secret-wipe-test-hook"))]
 use std::cell::RefCell;
 
 pub struct SecretBuffer(Vec<u8>);
@@ -51,28 +51,40 @@ fn clear_bytes(bytes: &mut [u8]) {
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "secret-wipe-test-hook"))]
     observe_wipe(bytes);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "secret-wipe-test-hook"))]
 std::thread_local! {
     static WIPE_OBSERVATION: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "secret-wipe-test-hook"))]
 fn observe_wipe(bytes: &[u8]) {
     WIPE_OBSERVATION.with(|observation| *observation.borrow_mut() = Some(bytes.to_vec()));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "secret-wipe-test-hook"))]
 fn reset_wipe_observation() {
     WIPE_OBSERVATION.with(|observation| *observation.borrow_mut() = None);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "secret-wipe-test-hook"))]
 fn take_wipe_observation() -> Option<Vec<u8>> {
     WIPE_OBSERVATION.with(|observation| observation.borrow_mut().take())
+}
+
+#[cfg(feature = "secret-wipe-test-hook")]
+#[doc(hidden)]
+pub mod wipe_test_observer {
+    pub fn reset_wipe_observation() {
+        super::reset_wipe_observation();
+    }
+
+    pub fn take_wipe_observation() -> Option<Vec<u8>> {
+        super::take_wipe_observation()
+    }
 }
 
 #[cfg(test)]

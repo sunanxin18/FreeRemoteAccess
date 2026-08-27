@@ -15,3 +15,6 @@ frd-media-api = { path = "../../crates/frd-media-api" }
 frd-protocol-api = { path = "../../crates/frd-protocol-api" }
 frd-protocol-apple = { path = "../../crates/frd-protocol-apple" }
 minifb = "0.28"
+
+[dev-dependencies]
+frd-core = { path = "../../crates/frd-core", features = ["secret-wipe-test-hook"] }

@@ -1,6 +1,24 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use frd_core::{ContentViewport, PixelSize, SessionId};
 use frd_frame::{PixelFormat, SurfaceUpdate};
+
+const MAX_CANONICAL_SURFACE_BYTES: usize = 256 * 1024 * 1024;
+
+fn checked_surface_pixel_count(size: PixelSize) -> Result<usize> {
+    let width = usize::try_from(size.width).context("legacy surface 宽度超出本机地址空间")?;
+    let height = usize::try_from(size.height).context("legacy surface 高度超出本机地址空间")?;
+    let pixel_count = width
+        .checked_mul(height)
+        .context("legacy surface 像素数量溢出")?;
+    let byte_count = pixel_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .context("legacy surface 字节数量溢出")?;
+    ensure!(
+        byte_count <= MAX_CANONICAL_SURFACE_BYTES,
+        "legacy surface 超过 256 MiB 安全上限"
+    );
+    Ok(pixel_count)
+}
 
 pub struct LegacySurface {
     session_id: Option<SessionId>,
@@ -30,22 +48,19 @@ impl LegacySurface {
                 if format != PixelFormat::Bgrx8UnormSrgb {
                     bail!("legacy minifb lab 只接受 BGRX surface");
                 }
-                let pixel_count = usize::try_from(size.width)
-                    .ok()
-                    .and_then(|width| {
-                        usize::try_from(size.height)
-                            .ok()
-                            .and_then(|height| width.checked_mul(height))
-                    })
-                    .context("legacy surface 尺寸超出本机地址空间")?;
+                let pixel_count = checked_surface_pixel_count(size)?;
+                let mut pixels = Vec::new();
+                pixels
+                    .try_reserve_exact(pixel_count)
+                    .context("legacy surface 像素分配失败")?;
+                pixels.resize(pixel_count, 0);
                 let generation_changed = self.session_id != Some(session_id)
                     || self.generation != generation
                     || self.size != Some(size);
                 self.session_id = Some(session_id);
                 self.generation = generation;
                 self.size = Some(size);
-                self.pixels.clear();
-                self.pixels.resize(pixel_count, 0);
+                self.pixels = pixels;
                 Ok(generation_changed)
             }
             SurfaceUpdate::Damage {
@@ -143,7 +158,7 @@ mod tests {
     use frd_core::{PixelRect, PixelSize, SessionId};
     use frd_frame::{PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
 
-    use super::{render_nearest, LegacySurface};
+    use super::{checked_surface_pixel_count, render_nearest, LegacySurface};
 
     #[test]
     fn current_generation_bgrx_damage_renders_centered_without_channel_swap() {
@@ -222,5 +237,73 @@ mod tests {
             })
             .unwrap());
         assert_eq!(surface.pixels(), &[0]);
+    }
+
+    #[test]
+    fn maximum_u16_geometry_is_rejected_transactionally() {
+        let session_id = SessionId::allocate();
+        let mut surface = LegacySurface::empty();
+        surface
+            .apply(SurfaceUpdate::Reset {
+                session_id,
+                generation: 1,
+                size: PixelSize::new(2, 1).unwrap(),
+                format: PixelFormat::Bgrx8UnormSrgb,
+            })
+            .unwrap();
+        surface
+            .apply(SurfaceUpdate::Damage {
+                session_id,
+                generation: 1,
+                revision: 1,
+                patches: vec![PixelPatch {
+                    rect: PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 1,
+                    },
+                    stride_bytes: 8,
+                    pixels: PixelBuffer::new(vec![0, 0, 255, 0, 0, 255, 0, 0]),
+                }],
+            })
+            .unwrap();
+        let extreme = PixelSize::new(u16::MAX.into(), u16::MAX.into()).unwrap();
+
+        assert!(checked_surface_pixel_count(extreme).is_err());
+        let error = surface
+            .apply(SurfaceUpdate::Reset {
+                session_id,
+                generation: 2,
+                size: extreme,
+                format: PixelFormat::Bgrx8UnormSrgb,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("256 MiB"));
+        assert_eq!(surface.generation(), 1);
+        assert_eq!(surface.size(), PixelSize::new(2, 1));
+        assert_eq!(surface.pixels(), &[0x00ff_0000, 0x0000_ff00]);
+    }
+
+    #[test]
+    fn within_budget_reset_allocates_and_commits_the_new_surface() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(64, 32).unwrap();
+        let mut surface = LegacySurface::empty();
+
+        assert_eq!(checked_surface_pixel_count(size).unwrap(), 2_048);
+        assert!(surface
+            .apply(SurfaceUpdate::Reset {
+                session_id,
+                generation: 1,
+                size,
+                format: PixelFormat::Bgrx8UnormSrgb,
+            })
+            .unwrap());
+
+        assert_eq!(surface.size(), Some(size));
+        assert_eq!(surface.pixels().len(), 2_048);
+        assert!(surface.pixels().iter().all(|pixel| *pixel == 0));
     }
 }

@@ -17,8 +17,8 @@ use frd_core::{
 use frd_frame::FrameMailbox;
 use frd_media_api::MediaFrame;
 use frd_protocol_api::{
-    ConnectRequest, Credentials, ProtocolExit, ProtocolFactory, ProtocolId, SessionCommand,
-    SessionEvent,
+    ConnectRequest, Credentials, ProtocolExit, ProtocolFactory, ProtocolId, ProtocolRuntime,
+    ProtocolSession, SessionCommand, SessionEvent,
 };
 use frd_protocol_apple::AppleProtocolFactory;
 use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
@@ -64,7 +64,7 @@ fn parse_display_scale(value: &str) -> std::result::Result<f32, String> {
     Ok(scale)
 }
 
-fn read_required_credential_environment(name: &str, description: &str) -> Result<String> {
+fn validate_environment_name(name: &str, description: &str) -> Result<()> {
     let mut chars = name.chars();
     let valid_start = chars
         .next()
@@ -73,14 +73,55 @@ fn read_required_credential_environment(name: &str, description: &str) -> Result
     if !valid_start || !valid_rest {
         bail!("{description}环境变量名无效");
     }
+    Ok(())
+}
 
+fn read_required_username_environment(name: &str) -> Result<String> {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => Ok(value),
         Ok(_) | Err(std::env::VarError::NotPresent) => {
-            bail!("缺少{description}：请通过指定的环境变量提供")
+            bail!("缺少用户名：请通过指定的环境变量提供")
         }
-        Err(std::env::VarError::NotUnicode(_)) => bail!("{description}环境变量不是有效 UTF-8"),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("用户名环境变量不是有效 UTF-8"),
     }
+}
+
+fn read_required_password_environment(name: &str) -> Result<SecretBuffer> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(SecretBuffer::new(value.into_bytes())),
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            bail!("缺少密码：请通过指定的环境变量提供")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => bail!("密码环境变量不是有效 UTF-8"),
+    }
+}
+
+fn build_connect_request_with<U, P>(
+    cli: &Cli,
+    username_provider: U,
+    password_provider: P,
+) -> Result<ConnectRequest>
+where
+    U: FnOnce(&str) -> Result<String>,
+    P: FnOnce(&str) -> Result<SecretBuffer>,
+{
+    let endpoint = Endpoint::new(cli.host.clone(), cli.port).context("Apple endpoint 无效")?;
+    validate_environment_name(&cli.username_env, "用户名")?;
+    validate_environment_name(&cli.password_env, "密码")?;
+    let username = username_provider(&cli.username_env)
+        .map_err(|_| anyhow::anyhow!("读取用户名环境变量失败"))?;
+    let mut password = password_provider(&cli.password_env)
+        .map_err(|_| anyhow::anyhow!("读取密码环境变量失败"))?;
+    Ok(ConnectRequest {
+        session_id: SessionId::allocate(),
+        endpoint,
+        protocol_id: ProtocolId::apple_hpss_mvs(),
+        credentials: Some(Credentials {
+            username,
+            password: password.take(),
+        }),
+        saved_server_pin: None,
+    })
 }
 
 fn main() {
@@ -90,22 +131,22 @@ fn main() {
     }
 }
 
+fn create_apple_session(
+    request: ConnectRequest,
+    runtime: ProtocolRuntime,
+) -> Result<Box<dyn ProtocolSession>> {
+    AppleProtocolFactory
+        .create(request, runtime)
+        .map_err(|error| anyhow::anyhow!("Apple adapter 构造失败: {}", error.code()))
+}
+
 fn run(cli: Cli) -> Result<()> {
-    let username = read_required_credential_environment(&cli.username_env, "用户名")?;
-    let password = read_required_credential_environment(&cli.password_env, "密码")?;
-    let endpoint = Endpoint::new(cli.host, cli.port).context("Apple endpoint 无效")?;
-    let session_id = SessionId::allocate();
-    let mut password = SecretBuffer::new(password.into_bytes());
-    let request = ConnectRequest {
-        session_id,
-        endpoint,
-        protocol_id: ProtocolId::apple_hpss_mvs(),
-        credentials: Some(Credentials {
-            username,
-            password: password.take(),
-        }),
-        saved_server_pin: None,
-    };
+    let request = build_connect_request_with(
+        &cli,
+        read_required_username_environment,
+        read_required_password_environment,
+    )?;
+    let session_id = request.session_id;
     let LabRuntimePorts {
         runtime,
         commands,
@@ -113,9 +154,7 @@ fn run(cli: Cli) -> Result<()> {
         media,
         mailbox,
     } = create_runtime_ports(session_id);
-    let session = AppleProtocolFactory
-        .create(request, runtime)
-        .map_err(|error| anyhow::anyhow!("Apple adapter 构造失败: {}", error.code()))?;
+    let session = create_apple_session(request, runtime)?;
     let worker = std::thread::spawn(move || session.run());
 
     let ui_result = run_window(
@@ -170,10 +209,12 @@ fn run_window(
     let mut previous_buttons = PointerButtons::default();
 
     while window.is_open() && !worker.is_finished() {
-        if drain_mailbox(mailbox, &mut surface)? {
-            pointer_input = PointerInputState::default();
-            previous_buttons = PointerButtons::default();
-        }
+        let generation_changed = drain_mailbox(mailbox, &mut surface)?;
+        reset_pointer_gate_after_generation_change(
+            generation_changed,
+            &mut pointer_input,
+            &mut previous_buttons,
+        );
         drain_events(events);
         drain_media(media, &mut playback);
 
@@ -234,6 +275,17 @@ fn run_window(
         );
     }
     Ok(())
+}
+
+fn reset_pointer_gate_after_generation_change(
+    generation_changed: bool,
+    pointer_input: &mut PointerInputState,
+    previous_buttons: &mut PointerButtons,
+) {
+    if generation_changed {
+        *pointer_input = PointerInputState::default();
+        *previous_buttons = PointerButtons::default();
+    }
 }
 
 fn drain_mailbox(mailbox: &Arc<Mutex<FrameMailbox>>, surface: &mut LegacySurface) -> Result<bool> {
@@ -310,9 +362,25 @@ fn join_worker(worker: JoinHandle<ProtocolExit>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, Parser};
+    use std::cell::Cell;
+    use std::sync::{mpsc, Arc, Mutex};
 
-    use super::Cli;
+    use clap::{CommandFactory, Parser};
+    use frd_core::secret::wipe_test_observer::{reset_wipe_observation, take_wipe_observation};
+    use frd_core::{
+        InputEvent, PixelPoint, PixelSize, PointerButtons, PointerInputState, PointerSample,
+        SecretBuffer, SessionId, WheelDelta,
+    };
+    use frd_frame::{FrameMailbox, PixelFormat, PushOutcome, SurfaceUpdate};
+    use frd_protocol_api::SessionCommand;
+
+    use frd_legacy_minifb_lab::presenter::LegacySurface;
+    use frd_legacy_minifb_lab::runtime_ports::{create_runtime_ports, send_pointer_sample};
+
+    use super::{
+        build_connect_request_with, create_apple_session, drain_mailbox,
+        reset_pointer_gate_after_generation_change, Cli,
+    };
 
     #[test]
     fn cli_has_no_literal_username_or_password_option() {
@@ -333,5 +401,191 @@ mod tests {
             Cli::try_parse_from(["frd-legacy-minifb-lab", "example.invalid", "--scale", "0"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn endpoint_validation_precedes_all_credential_provider_access() {
+        let cli = Cli::try_parse_from(["frd-legacy-minifb-lab", "example.invalid", "--port", "0"])
+            .unwrap();
+        let provider_accesses = Cell::new(0_u8);
+
+        let result = build_connect_request_with(
+            &cli,
+            |_| {
+                provider_accesses.set(provider_accesses.get() + 1);
+                Ok("developer".to_owned())
+            },
+            |_| {
+                provider_accesses.set(provider_accesses.get() + 1);
+                Ok(SecretBuffer::new(b"password-canary".to_vec()))
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("非法 endpoint 不得读取凭据"),
+            Err(error) => error,
+        };
+
+        assert_eq!(provider_accesses.get(), 0);
+        assert_eq!(error.to_string(), "Apple endpoint 无效");
+    }
+
+    #[test]
+    fn post_provider_failure_drops_zeroized_secret_without_error_canary() {
+        let cli = Cli::try_parse_from(["frd-legacy-minifb-lab", "example.invalid"]).unwrap();
+        let canary = b"post-provider-password-canary";
+        let mut request = build_connect_request_with(
+            &cli,
+            |_| Ok("developer".to_owned()),
+            |_| Ok(SecretBuffer::new(canary.to_vec())),
+        )
+        .expect("有效的公共参数与 provider 必须产生连接请求");
+        let session_id = request.session_id;
+        request.protocol_id = frd_core::ProtocolId::rdp();
+        let ports = create_runtime_ports(session_id);
+
+        reset_wipe_observation();
+        let error = match create_apple_session(request, ports.runtime) {
+            Ok(_) => panic!("错误协议必须在 provider 后由 Apple factory 拒绝"),
+            Err(error) => error,
+        };
+
+        assert_eq!(take_wipe_observation(), Some(vec![0; canary.len()]));
+        assert!(!error.to_string().contains("post-provider-password-canary"));
+    }
+
+    #[test]
+    fn generation_reset_disarms_held_pointer_until_release_and_new_press() {
+        let session_id = SessionId::allocate();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(8, 1024)));
+        let mut surface = LegacySurface::empty();
+        let mut pointer_input = PointerInputState::default();
+        let mut previous_buttons = PointerButtons::default();
+        let (commands, received) = mpsc::channel();
+
+        assert_eq!(
+            mailbox.lock().unwrap().push(SurfaceUpdate::Reset {
+                session_id,
+                generation: 1,
+                size: PixelSize::new(2, 2).unwrap(),
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }),
+            PushOutcome::Queued
+        );
+        let generation_changed = drain_mailbox(&mailbox, &mut surface).unwrap();
+        reset_pointer_gate_after_generation_change(
+            generation_changed,
+            &mut pointer_input,
+            &mut previous_buttons,
+        );
+        assert_eq!(surface.generation(), 1);
+
+        let released_gen1 = PointerSample::new(
+            PixelPoint { x: 1, y: 1 },
+            PointerButtons::default(),
+            WheelDelta::default(),
+        );
+        let pressed_gen1 = PointerSample::new(
+            PixelPoint { x: 1, y: 1 },
+            PointerButtons {
+                primary: true,
+                ..Default::default()
+            },
+            WheelDelta::default(),
+        );
+        let sample = pointer_input
+            .next_event(Some(released_gen1), false)
+            .unwrap();
+        send_pointer_sample(&commands, session_id, surface.generation(), sample).unwrap();
+        previous_buttons = sample.buttons;
+        assert_eq!(previous_buttons, PointerButtons::default());
+        let sample = pointer_input.next_event(Some(pressed_gen1), true).unwrap();
+        send_pointer_sample(&commands, session_id, surface.generation(), sample).unwrap();
+        previous_buttons = sample.buttons;
+        assert!(matches!(received.recv().unwrap(), SessionCommand::Input(_)));
+        assert!(matches!(
+            received.recv().unwrap(),
+            SessionCommand::Input(frd_core::SessionInput {
+                generation: 1,
+                event: InputEvent::PointerSample(observed),
+                ..
+            }) if observed == pressed_gen1
+        ));
+        assert!(previous_buttons.primary);
+
+        assert_eq!(
+            mailbox.lock().unwrap().push(SurfaceUpdate::Reset {
+                session_id,
+                generation: 2,
+                size: PixelSize::new(4, 4).unwrap(),
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }),
+            PushOutcome::Queued
+        );
+        let generation_changed = drain_mailbox(&mailbox, &mut surface).unwrap();
+        reset_pointer_gate_after_generation_change(
+            generation_changed,
+            &mut pointer_input,
+            &mut previous_buttons,
+        );
+        assert!(generation_changed);
+        assert_eq!(surface.generation(), 2);
+        assert_eq!(previous_buttons, PointerButtons::default());
+
+        let held_gen2 = PointerSample::new(
+            PixelPoint { x: 3, y: 3 },
+            PointerButtons {
+                primary: true,
+                ..Default::default()
+            },
+            WheelDelta::default(),
+        );
+        assert_eq!(pointer_input.next_event(Some(held_gen2), true), None);
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let released_gen2 = PointerSample::new(
+            PixelPoint { x: 3, y: 3 },
+            PointerButtons::default(),
+            WheelDelta::default(),
+        );
+        let sample = pointer_input
+            .next_event(Some(released_gen2), false)
+            .expect("观察到全释放后必须重新 arm");
+        send_pointer_sample(&commands, session_id, surface.generation(), sample).unwrap();
+        previous_buttons = sample.buttons;
+        assert_eq!(previous_buttons, PointerButtons::default());
+        assert!(matches!(
+            received.recv().unwrap(),
+            SessionCommand::Input(frd_core::SessionInput {
+                generation: 2,
+                event: InputEvent::PointerSample(observed),
+                ..
+            }) if observed == released_gen2
+        ));
+
+        let new_press_gen2 = PointerSample::new(
+            PixelPoint { x: 3, y: 3 },
+            PointerButtons {
+                primary: true,
+                ..Default::default()
+            },
+            WheelDelta::default(),
+        );
+        let sample = pointer_input
+            .next_event(Some(new_press_gen2), true)
+            .expect("只有新的本地按下边沿可以进入 generation 2");
+        send_pointer_sample(&commands, session_id, surface.generation(), sample).unwrap();
+        previous_buttons = sample.buttons;
+        assert!(matches!(
+            received.recv().unwrap(),
+            SessionCommand::Input(frd_core::SessionInput {
+                generation: 2,
+                event: InputEvent::PointerSample(observed),
+                ..
+            }) if observed == new_press_gen2
+        ));
+        assert!(previous_buttons.primary);
     }
 }
