@@ -720,12 +720,12 @@ impl MvsFullDecoder {
             .context("MVS type-1 tile 总数溢出")?;
         let origin_column = rect_x >> 3;
         let origin_row = rect_y >> 3;
-        // ARD 3.10 writes 0x0e/0x13 here: the raw values are the Cb/Cr
+        // ARD 3.10 writes 0x0e/0x13 here: the raw values are the Cr/Cb
         // AC counts (scan 1..14 and 1..19), not total counts including DC.
         // `decode_partial_ac` starts its local cursor at zero and adds `start=1`,
         // so passing the raw values consumes those exact scan ranges.
-        let cb_extent = usize::from(payload[1].min(64));
-        let cr_extent = usize::from(payload[2].min(64));
+        let cr_extent = usize::from(payload[1].min(64));
+        let cb_extent = usize::from(payload[2].min(64));
         let mut reader = BitReader::new(&payload[3..]);
         // Type-1 never changes persistent tile seed/reference metadata. Stage
         // only its cache delta and pixel operations; cloning the full decoder
@@ -775,7 +775,7 @@ impl MvsFullDecoder {
                             .as_ref()
                             .context("MVS type-1 opcode 1 缺少 full-frame 系数 seed")?;
                         let (entry, coefficients) =
-                            prepare_partial_cache_entry(&mut reader, seed, cb_extent, cr_extent)?;
+                            prepare_partial_cache_entry(&mut reader, seed, cr_extent, cb_extent)?;
                         operations.push(prepare_replace_operation(
                             &coefficients,
                             &self.tables,
@@ -1084,8 +1084,8 @@ fn refine_saved_chroma_dc(reader: &mut BitReader<'_>, saved: i8) -> Result<i16> 
 fn prepare_partial_cache_entry(
     reader: &mut BitReader<'_>,
     seed: &SavedCoefficientSeed,
-    cb_extent: usize,
     cr_extent: usize,
+    cb_extent: usize,
 ) -> Result<([i8; MVS_CACHE_ENTRY_BYTES], ModeFiveCoefficients)> {
     let saved_y = refine_saved_y(reader, seed)?;
     if seed.cb_count != 1 || seed.cr_count != 1 {
@@ -1096,14 +1096,6 @@ fn prepare_partial_cache_entry(
     for (scan, &value) in saved_y.iter().enumerate() {
         coefficients.y[APPLE_NATURAL_ORDER[scan]] = i16::from(value);
     }
-    coefficients.cb[0] = refine_saved_chroma_dc(reader, seed.cb_dc)?;
-    decode_partial_ac(
-        reader,
-        &mut coefficients.cb,
-        1,
-        cb_extent,
-        &APPLE_LUMA_AC_HUFFMAN,
-    )?;
     coefficients.cr[0] = refine_saved_chroma_dc(reader, seed.cr_dc)?;
     decode_partial_ac(
         reader,
@@ -1112,14 +1104,22 @@ fn prepare_partial_cache_entry(
         cr_extent,
         &APPLE_LUMA_AC_HUFFMAN,
     )?;
+    coefficients.cb[0] = refine_saved_chroma_dc(reader, seed.cb_dc)?;
+    decode_partial_ac(
+        reader,
+        &mut coefficients.cb,
+        1,
+        cb_extent,
+        &APPLE_LUMA_AC_HUFFMAN,
+    )?;
 
     let mut entry = [0i8; MVS_CACHE_ENTRY_BYTES];
     entry[..64].copy_from_slice(&saved_y);
     for scan in 0..15 {
-        entry[64 + scan] = coefficients.cb[APPLE_NATURAL_ORDER[scan]] as i8;
+        entry[64 + scan] = coefficients.cr[APPLE_NATURAL_ORDER[scan]] as i8;
     }
     for scan in 0..20 {
-        entry[79 + scan] = coefficients.cr[APPLE_NATURAL_ORDER[scan]] as i8;
+        entry[79 + scan] = coefficients.cb[APPLE_NATURAL_ORDER[scan]] as i8;
     }
     Ok((entry, coefficients))
 }
@@ -1218,10 +1218,10 @@ fn cache_entry_coefficients(entry: &[i8; MVS_CACHE_ENTRY_BYTES]) -> ModeFiveCoef
         coefficients.y[APPLE_NATURAL_ORDER[scan]] = i16::from(entry[scan]);
     }
     for scan in 0..15 {
-        coefficients.cb[APPLE_NATURAL_ORDER[scan]] = i16::from(entry[64 + scan]);
+        coefficients.cr[APPLE_NATURAL_ORDER[scan]] = i16::from(entry[64 + scan]);
     }
     for scan in 0..20 {
-        coefficients.cr[APPLE_NATURAL_ORDER[scan]] = i16::from(entry[79 + scan]);
+        coefficients.cb[APPLE_NATURAL_ORDER[scan]] = i16::from(entry[79 + scan]);
     }
     coefficients
 }
@@ -1619,12 +1619,10 @@ fn decode_mode_five_coefficients(
         current.cb[0] = prior.cb[0];
         current.cr[0] = prior.cr[0];
     } else {
-        // ARD type-0 mode 5 writes Cr before Cb. This differs deliberately
-        // from type-1, whose partial stream writes Cb before Cr.
-        let cr_delta = decode_dc_rice(reader).context("MVS mode 5 Cr DC 解码失败")?;
-        current.cr[0] = apply_chroma_dc_predictor(prior.cr[0], cr_delta)?;
         let cb_delta = decode_dc_rice(reader).context("MVS mode 5 Cb DC 解码失败")?;
         current.cb[0] = apply_chroma_dc_predictor(prior.cb[0], cb_delta)?;
+        let cr_delta = decode_dc_rice(reader).context("MVS mode 5 Cr DC 解码失败")?;
+        current.cr[0] = apply_chroma_dc_predictor(prior.cr[0], cr_delta)?;
     }
 
     let y_delta = decode_dc_rice(reader).context("MVS mode 5 Y DC 解码失败")?;
@@ -2162,7 +2160,7 @@ mod tests {
         let cb_minus_forty = "11111110_000_1";
         let cr_plus_twenty_four = "111110_000_0";
         let y_minus_eighty = "1111111111110_000_1";
-        let literal = format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_{y_minus_eighty}_0010");
+        let literal = format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_{y_minus_eighty}_0010");
         let literals = vec![literal.as_str(); tile_count];
         mode_five_data(&literals)
     }
@@ -2214,13 +2212,13 @@ mod tests {
         Some((reference.tile_index, reference.framebuffer_offset))
     }
 
-    fn partial_payload(chroma_extent: u8, cr_extent: u8, fields: &[&str]) -> Vec<u8> {
-        partial_payload_with_terminals(chroma_extent, cr_extent, fields, [0x6d, 0x76, 0x73])
+    fn partial_payload(cr_extent: u8, cb_extent: u8, fields: &[&str]) -> Vec<u8> {
+        partial_payload_with_terminals(cr_extent, cb_extent, fields, [0x6d, 0x76, 0x73])
     }
 
     fn partial_payload_with_terminals(
-        chroma_extent: u8,
         cr_extent: u8,
+        cb_extent: u8,
         fields: &[&str],
         terminals: [u8; 3],
     ) -> Vec<u8> {
@@ -2231,7 +2229,7 @@ mod tests {
         for terminal in terminals {
             writer.write_bits(u32::from(terminal), 8);
         }
-        let mut payload = vec![1, chroma_extent, cr_extent];
+        let mut payload = vec![1, cr_extent, cb_extent];
         payload.extend(writer.finish());
         payload
     }
@@ -2595,6 +2593,23 @@ mod tests {
     }
 
     #[test]
+    fn apple_type_zero_mode_five_assigns_first_chroma_delta_to_cb_plane() {
+        let modes = mode_stream(&[(5, 0)]);
+        let first_plus_twenty_four = "111110_000_0";
+        let second_minus_forty = "11111110_000_1";
+        let data = mode_five_data(&[&format!(
+            "0_0_0_{first_plus_twenty_four}_{second_minus_forty}_00_0010"
+        )]);
+
+        let prepared = prepare(&decoder_with_tables(1, 1), &modes, &data, 8, 8).unwrap();
+
+        assert_eq!(
+            pixel(MvsFullDecoder::decoded(&prepared), 0, 0),
+            [142, 123, 117]
+        );
+    }
+
+    #[test]
     fn mode_five_dc_only_tile_decodes_complete_dual_stream_to_neutral_rgb() {
         let modes = mode_stream(&[(5, 0)]);
         let data = mode_five_data(&["0_1_0_00_0010"]);
@@ -2626,7 +2641,7 @@ mod tests {
         let cr_plus_twenty_four = "111110_000_0";
         let y_minus_eight = "1110_000_1";
         let data = mode_five_data(&[
-            &format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_00_0010"),
+            &format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_00_0010"),
             &format!("0_1_0_{y_minus_eight}_0010"),
         ]);
         let prepared = prepare(&decoder_with_tables(1, 1), &modes, &data, 16, 8).unwrap();
@@ -2731,7 +2746,7 @@ mod tests {
     fn distinct_luma_and_chroma_tables_produce_literal_mode_five_rgb() {
         let modes = mode_stream(&[(5, 0)]);
         let minus_forty = "11111110_000_1";
-        let data = mode_five_data(&[&format!("0_0_0_00_{minus_forty}_{minus_forty}_0010")]);
+        let data = mode_five_data(&[&format!("0_0_0_{minus_forty}_00_{minus_forty}_0010")]);
         let prepared = prepare(&decoder_with_tables(2, 1), &modes, &data, 8, 8).unwrap();
         assert!(MvsFullDecoder::decoded(&prepared)
             .rgb
@@ -2806,7 +2821,7 @@ mod tests {
         let modes = mode_stream(&[(5, 1)]);
         let cb_minus_forty = "11111110_000_1";
         let cr_plus_twenty_four = "111110_000_0";
-        let source = format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_00_010_0010");
+        let source = format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_00_010_0010");
         let data = mode_five_data(&[&source, "1"]);
         let record = record_with_thresholds(&modes, &data, 15, 0);
         let prepared = decoder_with_tables(64, 1).prepare(&record, 16, 8).unwrap();
@@ -2845,7 +2860,7 @@ mod tests {
         let cb_minus_forty = "11111110_000_1";
         let cr_plus_twenty_four = "111110_000_0";
         let y_minus_eighty = "1111111111110_000_1";
-        let source = format!("0_0_0_{cr_plus_twenty_four}_{cb_minus_forty}_{y_minus_eighty}_0010");
+        let source = format!("0_0_0_{cb_minus_forty}_{cr_plus_twenty_four}_{y_minus_eighty}_0010");
         let data = mode_five_data(&[&source, "1"]);
         let record = record_with_thresholds(&modes, &data, 15, 31);
         let mut decoder = decoder_with_tables(1, 1);
@@ -3255,26 +3270,55 @@ mod tests {
 
         let mut expected = [0i8; 99];
         expected[0] = 80;
-        expected[64] = 80;
-        expected[79] = -48;
+        expected[64] = -48;
+        expected[79] = 80;
         assert_eq!(cache_entry_snapshot(&decoder, 1), Some(expected));
         assert_eq!(cache_index_snapshot(&decoder), (0, 1, 1));
+    }
+
+    #[test]
+    fn apple_type_one_refines_cr_before_cb_and_preserves_cache_plane_layout() {
+        let seed = SavedCoefficientSeed {
+            selected_threshold: 0,
+            y: [0; 64],
+            cb_count: 1,
+            cb_dc: -20,
+            cr_count: 1,
+            cr_dc: 10,
+        };
+        let mut bits = TestBitWriter::new();
+        bits.write_bits(0, 6);
+        bits.write_bits(1, 1);
+        bits.write_bits(0, 1);
+        let bytes = bits.finish();
+        let mut reader = BitReader::new(&bytes);
+
+        let (entry, coefficients) = prepare_partial_cache_entry(&mut reader, &seed, 0, 0).unwrap();
+
+        assert_eq!(coefficients.cr[0], 11);
+        assert_eq!(coefficients.cb[0], -20);
+        assert_eq!(entry[64], 11);
+        assert_eq!(entry[79], -20);
+        let round_trip = cache_entry_coefficients(&entry);
+        assert_eq!(round_trip.cr[0], 11);
+        assert_eq!(round_trip.cb[0], -20);
+        assert_eq!(reader.bit_position(), 8);
     }
 
     #[test]
     fn slice_b_non_eob_ac_locks_run_sign_natural_order_and_exact_cache_byte() {
         let mut decoder = decoder_with_tables(1, 1);
         seed_asymmetric_surface(&mut decoder, 8, 8);
-        // Cb: unchanged DC, run1/size1 -1, EOB. Cr: unchanged DC, EOB.
+        // Cr: unchanged DC, run1/size1 -1, EOB. Cb: unchanged DC, EOB.
         let partial = partial_payload(3, 1, &["01_000000_0_1100_0_1010_0_1010"]);
         let prepared = decoder.prepare_partial(&partial, 0, 0, 8, 8, 8, 8).unwrap();
         decoder.commit_opaque(prepared);
 
         let entry = cache_entry_snapshot(&decoder, 1).unwrap();
-        assert_eq!(entry[64], 80);
+        assert_eq!(entry[64], -48);
         assert_eq!(entry[65], 0);
         assert_eq!(entry[66], -1);
-        assert_eq!(entry[79], -48);
+        assert_eq!(entry[79], 80);
     }
 
     #[test]
@@ -3482,7 +3526,7 @@ mod tests {
         decoder.commit_opaque(wrapped);
         let wrapped_slot_one = cache_entry_snapshot(&decoder, 1).unwrap();
         assert_ne!(wrapped_slot_one, slot_one);
-        assert_eq!(wrapped_slot_one[64], 79);
+        assert_eq!(wrapped_slot_one[79], 79);
         assert_eq!(cache_entry_snapshot(&decoder, 2), Some(slot_two));
         assert_eq!(decoder.cache_state.last_insert_index, 1);
         assert_eq!(decoder.cache_state.population_count, 3);
