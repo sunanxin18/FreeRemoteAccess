@@ -19,6 +19,7 @@ pub enum ProtocolError {
     FramePortRejected,
     WakeFailed,
     MediaPortClosed,
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -311,6 +312,7 @@ pub struct ProtocolRuntime {
     frames: Box<dyn SurfacePublisher>,
     media: Option<Box<dyn MediaPublisher>>,
     wake: Box<dyn RuntimeWake>,
+    terminal: bool,
 }
 
 impl ProtocolRuntime {
@@ -330,6 +332,7 @@ impl ProtocolRuntime {
             frames,
             media,
             wake,
+            terminal: false,
         }
     }
 
@@ -344,7 +347,7 @@ impl ProtocolRuntime {
     }
 
     /// 按 event、Reset、单次 wake 的顺序发布新的 generation。
-    /// 任一步失败都会返回错误且不会报告成功；随后各层只可安全地销毁此会话。
+    /// 任一端口失败后进入终态；不会伪称回滚已发布的 event/Reset。
     pub fn begin_generation(
         &mut self,
         session_id: SessionId,
@@ -352,6 +355,9 @@ impl ProtocolRuntime {
         size: frd_core::PixelSize,
         format: PixelFormat,
     ) -> Result<(), ProtocolError> {
+        if self.terminal {
+            return Err(ProtocolError::Terminal);
+        }
         if session_id != self.session_id
             || generation == 0
             || self
@@ -360,27 +366,42 @@ impl ProtocolRuntime {
         {
             return Err(ProtocolError::InvalidGeneration);
         }
-        self.events
-            .publish(SessionEvent::SurfaceGenerationChanged {
-                session_id,
-                generation,
-                size,
-            })?;
-        self.frames.publish(SurfaceUpdate::Reset {
+        if let Err(error) = self.events.publish(SessionEvent::SurfaceGenerationChanged {
+            session_id,
+            generation,
+            size,
+        }) {
+            self.poison();
+            return Err(error);
+        }
+        if let Err(error) = self.frames.publish(SurfaceUpdate::Reset {
             session_id,
             generation,
             size,
             format,
-        })?;
-        self.wake.wake()?;
+        }) {
+            self.poison();
+            return Err(error);
+        }
+        if let Err(error) = self.wake.wake() {
+            self.poison();
+            return Err(error);
+        }
         self.current_generation = Some(generation);
         Ok(())
+    }
+
+    /// `true` 时 `ProtocolSession::run` / coordinator 必须关闭并 join 该会话。
+    pub fn requires_shutdown(&self) -> bool {
+        self.terminal
     }
 
     /// writer 端仅可看到本会话、当前 generation 的输入；旧命令直接丢弃。
     pub fn try_next_command(&mut self) -> Option<SessionCommand> {
         loop {
             match self.commands.try_recv() {
+                Ok(SessionCommand::Disconnect) => return Some(SessionCommand::Disconnect),
+                Ok(_) if self.terminal => {}
                 Ok(SessionCommand::Input(input))
                     if input.session_id != self.session_id
                         || self.current_generation != Some(input.generation) => {}
@@ -398,19 +419,23 @@ impl ProtocolRuntime {
             MediaPublishError::Closed | MediaPublishError::Full => ProtocolError::MediaPortClosed,
         })
     }
+
+    fn poison(&mut self) {
+        self.terminal = true;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
 
-    use frd_core::{PixelSize, SessionId};
+    use frd_core::{InputEvent, PhysicalViewport, PixelRect, PixelSize, SessionId, SessionInput};
     use frd_frame::{PixelFormat, SurfaceUpdate};
 
     use super::{
         evaluate_server_identity, ProtocolCatalog, ProtocolError, ProtocolId, ProtocolRuntime,
-        ProtocolSelection, RuntimeEventSink, RuntimeWake, ServerIdentityValidation, SessionEvent,
-        SurfacePublisher, TargetSystem,
+        ProtocolSelection, RuntimeEventSink, RuntimeWake, ServerIdentityValidation, SessionCommand,
+        SessionEvent, SurfacePublisher, TargetSystem,
     };
 
     #[test]
@@ -457,6 +482,157 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_drops_wrong_and_old_input_but_delivers_the_current_generation() {
+        let session_id = SessionId::allocate();
+        let wrong_session = SessionId::allocate();
+        let (sender, receiver) = mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            receiver,
+            Box::new(RecordingEvents(log.clone())),
+            Box::new(RecordingFrames(log.clone())),
+            None,
+            Box::new(RecordingWake(log)),
+        );
+        establish_generation(&mut runtime, session_id, 1);
+        sender
+            .send(input(wrong_session, 1))
+            .expect("runtime receiver remains open");
+        sender
+            .send(input(session_id, 1))
+            .expect("runtime receiver remains open");
+
+        assert!(matches!(
+            runtime.try_next_command(),
+            Some(SessionCommand::Input(SessionInput { session_id: id, generation: 1, .. })) if id == session_id
+        ));
+
+        establish_generation(&mut runtime, session_id, 2);
+        sender
+            .send(input(session_id, 1))
+            .expect("runtime receiver remains open");
+        sender
+            .send(input(session_id, 2))
+            .expect("runtime receiver remains open");
+
+        assert!(matches!(
+            runtime.try_next_command(),
+            Some(SessionCommand::Input(SessionInput { session_id: id, generation: 2, .. })) if id == session_id
+        ));
+    }
+
+    #[test]
+    fn publication_port_failure_is_terminal_without_retry_or_old_input_delivery() {
+        for failure in [FailureAt::Event, FailureAt::Reset, FailureAt::Wake] {
+            let session_id = SessionId::allocate();
+            let (sender, receiver) = mpsc::channel();
+            let state = Arc::new(Mutex::new(FaultState::new(failure)));
+            let mut runtime = ProtocolRuntime::new(
+                session_id,
+                receiver,
+                Box::new(FaultEvents(state.clone())),
+                Box::new(FaultFrames(state.clone())),
+                None,
+                Box::new(FaultWake(state.clone())),
+            );
+
+            establish_generation(&mut runtime, session_id, 1);
+            assert!(runtime
+                .begin_generation(
+                    session_id,
+                    2,
+                    PixelSize::new(800, 600).expect("valid size"),
+                    PixelFormat::Bgrx8UnormSrgb,
+                )
+                .is_err());
+            assert!(runtime.requires_shutdown());
+            assert_eq!(
+                state.lock().expect("fault state").attempts,
+                failure.expected_attempts()
+            );
+
+            sender
+                .send(input(session_id, 1))
+                .expect("runtime receiver remains open");
+            sender
+                .send(SessionCommand::ViewportChanged {
+                    session_id,
+                    generation: 1,
+                    viewport: viewport(),
+                })
+                .expect("runtime receiver remains open");
+            sender
+                .send(SessionCommand::ClipboardWrite(
+                    super::ClipboardPayload::new(vec![0x11]),
+                ))
+                .expect("runtime receiver remains open");
+            sender
+                .send(SessionCommand::ResolveServerIdentity {
+                    session_id,
+                    challenge_id: 9,
+                    decision: super::ServerIdentityDecision::Reject,
+                })
+                .expect("runtime receiver remains open");
+            sender
+                .send(SessionCommand::Disconnect)
+                .expect("runtime receiver remains open");
+            assert!(matches!(
+                runtime.try_next_command(),
+                Some(SessionCommand::Disconnect)
+            ));
+
+            assert_eq!(
+                runtime.begin_generation(
+                    session_id,
+                    2,
+                    PixelSize::new(800, 600).expect("valid size"),
+                    PixelFormat::Bgrx8UnormSrgb,
+                ),
+                Err(ProtocolError::Terminal)
+            );
+            assert_eq!(
+                state.lock().expect("fault state").attempts,
+                failure.expected_attempts()
+            );
+        }
+    }
+
+    fn establish_generation(runtime: &mut ProtocolRuntime, session_id: SessionId, generation: u64) {
+        runtime
+            .begin_generation(
+                session_id,
+                generation,
+                PixelSize::new(800, 600).expect("valid size"),
+                PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation succeeds");
+    }
+
+    fn input(session_id: SessionId, generation: u64) -> SessionCommand {
+        SessionCommand::Input(SessionInput {
+            session_id,
+            generation,
+            event: InputEvent::ReleaseAll,
+        })
+    }
+
+    fn viewport() -> PhysicalViewport {
+        let size = PixelSize::new(800, 600).expect("valid size");
+        PhysicalViewport::new(
+            size,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            size,
+        )
+        .expect("valid viewport")
+    }
+
     struct RecordingEvents(Arc<Mutex<Vec<&'static str>>>);
 
     impl RuntimeEventSink for RecordingEvents {
@@ -482,6 +658,73 @@ mod tests {
         fn wake(&self) -> Result<(), ProtocolError> {
             self.0.lock().expect("log lock").push("wake");
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FailureAt {
+        Event,
+        Reset,
+        Wake,
+    }
+
+    impl FailureAt {
+        fn expected_attempts(self) -> Vec<&'static str> {
+            match self {
+                Self::Event => vec!["event", "reset", "wake", "event"],
+                Self::Reset => vec!["event", "reset", "wake", "event", "reset"],
+                Self::Wake => vec!["event", "reset", "wake", "event", "reset", "wake"],
+            }
+        }
+    }
+
+    struct FaultState {
+        failure: FailureAt,
+        attempts: Vec<&'static str>,
+    }
+
+    impl FaultState {
+        fn new(failure: FailureAt) -> Self {
+            Self {
+                failure,
+                attempts: Vec::new(),
+            }
+        }
+    }
+
+    struct FaultEvents(Arc<Mutex<FaultState>>);
+
+    impl RuntimeEventSink for FaultEvents {
+        fn publish(&self, _: SessionEvent) -> Result<(), ProtocolError> {
+            let mut state = self.0.lock().expect("fault state");
+            state.attempts.push("event");
+            (state.attempts.len() > 3 && matches!(state.failure, FailureAt::Event))
+                .then_some(ProtocolError::EventPortClosed)
+                .map_or(Ok(()), Err)
+        }
+    }
+
+    struct FaultFrames(Arc<Mutex<FaultState>>);
+
+    impl SurfacePublisher for FaultFrames {
+        fn publish(&self, _: SurfaceUpdate) -> Result<(), ProtocolError> {
+            let mut state = self.0.lock().expect("fault state");
+            state.attempts.push("reset");
+            (state.attempts.len() > 3 && matches!(state.failure, FailureAt::Reset))
+                .then_some(ProtocolError::FramePortRejected)
+                .map_or(Ok(()), Err)
+        }
+    }
+
+    struct FaultWake(Arc<Mutex<FaultState>>);
+
+    impl RuntimeWake for FaultWake {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            let mut state = self.0.lock().expect("fault state");
+            state.attempts.push("wake");
+            (state.attempts.len() > 3 && matches!(state.failure, FailureAt::Wake))
+                .then_some(ProtocolError::WakeFailed)
+                .map_or(Ok(()), Err)
         }
     }
 }

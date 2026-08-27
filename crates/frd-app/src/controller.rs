@@ -42,6 +42,8 @@ fn platform_capabilities(capabilities: PlatformCapabilities) -> SessionCapabilit
 pub enum IdentityDecisionError {
     NoCurrentChallenge,
     StaleChallenge,
+    PinMismatch,
+    TrustAndRememberRequiresUnknown,
     Store(PlatformError),
 }
 
@@ -177,7 +179,15 @@ impl AppController {
         {
             return Err(IdentityDecisionError::StaleChallenge);
         }
+        if challenge.validation == frd_protocol_api::ServerIdentityValidation::PinMismatch
+            && decision != ServerIdentityDecision::Reject
+        {
+            return Err(IdentityDecisionError::PinMismatch);
+        }
         if decision == ServerIdentityDecision::TrustAndRemember {
+            if challenge.validation != frd_protocol_api::ServerIdentityValidation::Unknown {
+                return Err(IdentityDecisionError::TrustAndRememberRequiresUnknown);
+            }
             let store = store.ok_or(IdentityDecisionError::NoCurrentChallenge)?;
             store
                 .store_pin(
@@ -239,10 +249,14 @@ impl ActiveSessionSlot {
         }
     }
 
-    pub fn finish_cleanup(&mut self, session_id: SessionId) {
-        if matches!(self.state, Some(SlotState::Connecting(current) | SlotState::Active(current) | SlotState::Disconnecting(current)) if current == session_id)
-        {
-            self.state = None;
+    /// 仅 coordinator 在取消、writer shutdown、worker join 与 mailbox disposal 完成后调用。
+    pub fn finish_cleanup(&mut self, session_id: SessionId) -> Result<(), ()> {
+        match self.state {
+            Some(SlotState::Disconnecting(current)) if current == session_id => {
+                self.state = None;
+                Ok(())
+            }
+            _ => Err(()),
         }
     }
 }

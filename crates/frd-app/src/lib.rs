@@ -29,14 +29,27 @@ mod tests {
     use super::{ActiveSessionSlot, AppController, AppPage, PresentationEvent};
 
     #[test]
-    fn active_session_slot_rejects_a_second_session_until_cleanup_finishes() {
+    fn active_session_slot_rejects_cleanup_while_connecting_or_active() {
+        let first = SessionId::allocate();
+        let mut slot = ActiveSessionSlot::default();
+
+        assert!(slot.begin_connect(first).is_ok());
+        assert!(slot.finish_cleanup(first).is_err());
+        assert!(slot.mark_active(first).is_ok());
+        assert!(slot.finish_cleanup(first).is_err());
+    }
+
+    #[test]
+    fn active_session_slot_rejects_second_connect_until_disconnect_cleanup_completes() {
         let first = SessionId::allocate();
         let second = SessionId::allocate();
         let mut slot = ActiveSessionSlot::default();
 
         assert!(slot.begin_connect(first).is_ok());
         assert!(slot.begin_connect(second).is_err());
-        slot.finish_cleanup(first);
+        assert!(slot.begin_disconnect(first).is_ok());
+        assert!(slot.begin_connect(second).is_err());
+        assert!(slot.finish_cleanup(first).is_ok());
         assert!(slot.begin_connect(second).is_ok());
     }
 
@@ -72,6 +85,21 @@ mod tests {
     }
 
     #[test]
+    fn current_incremental_presentation_does_not_enter_remote_session() {
+        let current = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(current, 3);
+
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id: current,
+            generation: 3,
+            revision: 9,
+            completeness: FrameCompleteness::Incremental,
+        });
+
+        assert!(!matches!(controller.page(), AppPage::RemoteSession { .. }));
+    }
+
+    #[test]
     fn current_challenge_decision_is_accepted_but_stale_one_is_rejected() {
         let session_id = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
@@ -100,7 +128,7 @@ mod tests {
                 &store,
             )
             .is_err());
-        assert_eq!(*store.pin.lock().expect("pin lock"), None);
+        assert!(store.stores.lock().expect("store lock").is_empty());
 
         controller
             .resolve_server_identity_with_store(
@@ -110,13 +138,89 @@ mod tests {
                 &store,
             )
             .expect("current challenge is persisted");
-        assert_eq!(*store.pin.lock().expect("pin lock"), Some([0x11; 32]));
+        assert_eq!(
+            *store.stores.lock().expect("store lock"),
+            vec![(
+                ProtocolId::apple_hpss_mvs(),
+                Endpoint::new("mac.example", 5900).expect("valid endpoint"),
+                [0x11; 32],
+            )]
+        );
+    }
+
+    #[test]
+    fn pin_mismatch_rejects_trust_decisions_without_storing_or_emitting_a_command() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        let store = RecordingStore::default();
+        controller.handle_server_identity_challenge(challenge_with_validation(
+            session_id,
+            7,
+            [0x22; 32],
+            ServerIdentityValidation::PinMismatch,
+        ));
+
+        assert!(matches!(
+            controller.resolve_server_identity(session_id, 7, ServerIdentityDecision::TrustOnce),
+            Err(super::IdentityDecisionError::PinMismatch)
+        ));
+        assert!(matches!(
+            controller.resolve_server_identity_with_store(
+                session_id,
+                7,
+                ServerIdentityDecision::TrustAndRemember,
+                &store,
+            ),
+            Err(super::IdentityDecisionError::PinMismatch)
+        ));
+        assert!(store.stores.lock().expect("store lock").is_empty());
+        assert!(controller
+            .resolve_server_identity(session_id, 7, ServerIdentityDecision::Reject)
+            .is_ok());
+    }
+
+    #[test]
+    fn remember_rejects_current_non_unknown_identity_without_storing() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        let store = RecordingStore::default();
+        controller.handle_server_identity_challenge(challenge_with_validation(
+            session_id,
+            7,
+            [0x11; 32],
+            ServerIdentityValidation::PinMatched,
+        ));
+
+        assert!(matches!(
+            controller.resolve_server_identity_with_store(
+                session_id,
+                7,
+                ServerIdentityDecision::TrustAndRemember,
+                &store,
+            ),
+            Err(super::IdentityDecisionError::TrustAndRememberRequiresUnknown)
+        ));
+        assert!(store.stores.lock().expect("store lock").is_empty());
     }
 
     fn challenge(
         session_id: SessionId,
         challenge_id: u64,
         pin: [u8; 32],
+    ) -> ServerIdentityChallenge {
+        challenge_with_validation(
+            session_id,
+            challenge_id,
+            pin,
+            ServerIdentityValidation::Unknown,
+        )
+    }
+
+    fn challenge_with_validation(
+        session_id: SessionId,
+        challenge_id: u64,
+        pin: [u8; 32],
+        validation: ServerIdentityValidation,
     ) -> ServerIdentityChallenge {
         ServerIdentityChallenge {
             session_id,
@@ -126,13 +230,13 @@ mod tests {
             sha256_fingerprint: pin,
             subject: "mac.example".to_owned(),
             issuer: "local test".to_owned(),
-            validation: ServerIdentityValidation::Unknown,
+            validation,
         }
     }
 
     #[derive(Default)]
     struct RecordingStore {
-        pin: Mutex<Option<[u8; 32]>>,
+        stores: Mutex<Vec<(ProtocolId, Endpoint, [u8; 32])>>,
     }
 
     impl ServerIdentityStore for RecordingStore {
@@ -141,16 +245,19 @@ mod tests {
             _: &ProtocolId,
             _: &Endpoint,
         ) -> Result<Option<[u8; 32]>, PlatformError> {
-            Ok(*self.pin.lock().expect("pin lock"))
+            Ok(None)
         }
 
         fn store_pin(
             &self,
-            _: &ProtocolId,
-            _: &Endpoint,
+            protocol: &ProtocolId,
+            endpoint: &Endpoint,
             pin: [u8; 32],
         ) -> Result<(), PlatformError> {
-            *self.pin.lock().expect("pin lock") = Some(pin);
+            self.stores
+                .lock()
+                .expect("store lock")
+                .push((protocol.clone(), endpoint.clone(), pin));
             Ok(())
         }
     }
