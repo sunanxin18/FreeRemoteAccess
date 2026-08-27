@@ -6,7 +6,7 @@ description = "ARP 局域网发现 + VNC(RFB) 客户端，用于连接 macOS 屏
 
 [workspace]
 resolver = "2"
-members = ["crates/frd-core"]
+members = ["crates/frd-core", "crates/frd-frame"]
 
 [workspace.dependencies]
 winit = "=0.30.13"
