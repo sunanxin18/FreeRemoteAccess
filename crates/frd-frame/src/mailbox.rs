@@ -19,6 +19,7 @@ struct SurfaceState {
     bytes_per_pixel: u32,
     last_damage_revision: u64,
     last_boundary_revision: u64,
+    boundary_eligible_revision: Option<u64>,
 }
 
 /// 对单一会话世代的更新进行有界排队。
@@ -83,10 +84,9 @@ impl FrameMailbox {
                 };
                 let outcome = self.push_current(update, pixel_bytes);
                 if outcome == PushOutcome::Queued {
-                    self.current
-                        .as_mut()
-                        .expect("当前表面已在损伤入队前验证")
-                        .last_damage_revision = revision;
+                    let current = self.current.as_mut().expect("当前表面已在损伤入队前验证");
+                    current.last_damage_revision = revision;
+                    current.boundary_eligible_revision = Some(revision);
                 }
                 outcome
             }
@@ -102,16 +102,16 @@ impl FrameMailbox {
                 if !matches_current(current, session_id, generation)
                     || revision == 0
                     || revision != current.last_damage_revision
+                    || current.boundary_eligible_revision != Some(revision)
                     || revision <= current.last_boundary_revision
                 {
                     return PushOutcome::Rejected;
                 }
                 let outcome = self.push_current(update, 0);
                 if outcome == PushOutcome::Queued {
-                    self.current
-                        .as_mut()
-                        .expect("当前表面已在边界入队前验证")
-                        .last_boundary_revision = revision;
+                    let current = self.current.as_mut().expect("当前表面已在边界入队前验证");
+                    current.last_boundary_revision = revision;
+                    current.boundary_eligible_revision = None;
                 }
                 outcome
             }
@@ -166,6 +166,7 @@ impl FrameMailbox {
             bytes_per_pixel,
             last_damage_revision: 0,
             last_boundary_revision: 0,
+            boundary_eligible_revision: None,
         });
         self.queue.clear();
         self.queued_pixel_bytes = 0;
@@ -222,6 +223,10 @@ impl FrameMailbox {
                 total.checked_add(update_pixel_bytes(update))
             })
             .expect("已入队帧像素字节溢出");
+        self.current
+            .as_mut()
+            .expect("溢出清理要求当前表面存在")
+            .boundary_eligible_revision = None;
     }
 }
 

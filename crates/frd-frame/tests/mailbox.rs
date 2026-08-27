@@ -557,3 +557,96 @@ fn overflow_does_not_advance_damage_revision() {
 fn mailbox_rejects_zero_entry_capacity() {
     let _ = FrameMailbox::new(0, 0);
 }
+
+#[test]
+fn entry_overflow_invalidates_the_discarded_damage_boundary_eligibility() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(2, 64);
+    mailbox.push(reset(session_id, 1));
+    mailbox.push(damage(session_id, 1, 1, vec![one_pixel_patch()]));
+
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::NeedsFullSnapshot
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Rejected
+    );
+    assert_eq!((mailbox.len(), mailbox.queued_pixel_bytes()), (1, 0));
+    assert!(matches!(mailbox.pop(), Some(SurfaceUpdate::Reset { .. })));
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 2,
+            completeness: FrameCompleteness::FullBaseline,
+        }),
+        PushOutcome::Queued
+    );
+}
+
+#[test]
+fn byte_overflow_invalidates_the_discarded_damage_boundary_eligibility() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(4, 8);
+    mailbox.push(reset(session_id, 1));
+    mailbox.push(damage(session_id, 1, 1, vec![one_pixel_patch()]));
+
+    // FrameBoundary 没有像素负载，不能触发字节预算溢出；此更大 Damage 是对应路径。
+    assert_eq!(
+        mailbox.push(damage(
+            session_id,
+            1,
+            2,
+            vec![patch(
+                PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                },
+                8,
+                8,
+            )],
+        )),
+        PushOutcome::NeedsFullSnapshot
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Rejected
+    );
+    assert_eq!((mailbox.len(), mailbox.queued_pixel_bytes()), (1, 0));
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 2,
+            completeness: FrameCompleteness::FullBaseline,
+        }),
+        PushOutcome::Queued
+    );
+}
