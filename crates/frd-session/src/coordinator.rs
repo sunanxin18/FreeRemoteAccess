@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use frd_core::{SessionId, TargetSystem};
@@ -63,7 +64,11 @@ impl SessionStartPermit {
 }
 
 /// Task 11 composition boundary：实现方选择中立 request 对应的 concrete factory/runtime，
-/// 启动 worker 并返回其完整 cleanup bundle。返回 `Err` 前必须回收本次构造的任何部分资源。
+/// 启动 worker 并返回其完整 cleanup bundle。
+///
+/// `Ok` 表示资源所有权已经完整移交给 coordinator。`Err` 是具有约束力的回滚证明：
+/// launcher 必须先停止并回收本次构造的全部部分资源，才能返回错误。调用方不得把 `Err`
+/// 当成重试许可，也不得重建已经消费且可能包含密码的 `ConnectRequest`。
 pub trait SessionLauncher {
     fn launch(self, request: ConnectRequest) -> Result<Box<dyn CleanupOperations>, ProtocolError>;
 }
@@ -77,10 +82,45 @@ where
     }
 }
 
-/// 启动失败不会签发 cleanup handle；permit 退还给 composition root 以便安全重试。
+/// launcher 完成回滚后签发的一次性 reservation abort 能力。
+pub struct SessionStartAbort {
+    identity: Arc<SessionStartIdentity>,
+    consumed: AtomicBool,
+}
+
+impl SessionStartAbort {
+    pub fn session_id(&self) -> SessionId {
+        self.identity.session_id
+    }
+
+    pub fn matches_owner(&self, owner: &SessionStartOwner) -> bool {
+        Arc::ptr_eq(&self.identity, &owner.identity)
+    }
+
+    /// 只有持有同一 opaque owner 的 app slot 能消费；成功后永久失效。
+    pub fn consume_for(&self, owner: &SessionStartOwner) -> bool {
+        self.matches_owner(owner)
+            && self
+                .consumed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+}
+
+impl fmt::Debug for SessionStartAbort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionStartAbort")
+            .field("session_id", &self.session_id())
+            .field("consumed", &self.consumed.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+/// 启动失败不会签发 cleanup handle，也不会退还可重试 permit；只携带终态错误和一次性 abort。
 pub struct SessionStartFailure {
     error: ProtocolError,
-    permit: SessionStartPermit,
+    abort: SessionStartAbort,
 }
 
 impl SessionStartFailure {
@@ -88,8 +128,8 @@ impl SessionStartFailure {
         &self.error
     }
 
-    pub fn into_permit(self) -> SessionStartPermit {
-        self.permit
+    pub fn abort(&self) -> &SessionStartAbort {
+        &self.abort
     }
 }
 
@@ -98,9 +138,17 @@ impl fmt::Debug for SessionStartFailure {
         formatter
             .debug_struct("SessionStartFailure")
             .field("error", &self.error)
-            .field("session_id", &self.permit.session_id())
+            .field("abort", &self.abort)
             .finish_non_exhaustive()
     }
+}
+
+/// 一次 reservation transaction 只有这两个终态，且二者都继承原 permit 的 opaque identity。
+pub enum SessionStartOutcome {
+    /// coordinator 已独占成功资源；之后只有匹配 handle 完成回收才能签发 cleanup completion。
+    Started(SessionCleanupHandle),
+    /// launcher 已在返回错误前回滚全部部分资源；failure 携带同 identity 的一次性 abort。
+    LaunchRolledBack(SessionStartFailure),
 }
 
 /// 仅由一次成功 `start` 签发；不可复制，且不能由调用者构造或改写 session 绑定。
@@ -164,38 +212,33 @@ impl SessionCoordinator {
     }
 
     /// 先完成 reservation、catalog 和单会话门禁，再通过 Task 11 launcher 创建资源。
-    /// launcher 失败不会占用 coordinator，也不会签发 handle/completion。
+    /// launcher 失败不会占用 coordinator、签发 cleanup handle 或允许重试已消费的 request；
+    /// 它只返回同一 reservation 的 `LaunchRolledBack` 终态。
     pub fn start<L>(
         &mut self,
         permit: SessionStartPermit,
         target: TargetSystem,
         request: ConnectRequest,
         launcher: L,
-    ) -> Result<SessionCleanupHandle, SessionStartFailure>
+    ) -> SessionStartOutcome
     where
         L: SessionLauncher,
     {
         if self.active.is_some() {
-            return Err(SessionStartFailure {
-                error: ProtocolError::Terminal,
-                permit,
-            });
+            return launch_rolled_back(permit, ProtocolError::Terminal);
         }
         if permit.session_id() != request.session_id {
-            return Err(SessionStartFailure {
-                error: ProtocolError::StaleSession,
-                permit,
-            });
+            return launch_rolled_back(permit, ProtocolError::StaleSession);
         }
         if let Err(error) = self.catalog.select(
             target,
             ProtocolSelection::Explicit(request.protocol_id.clone()),
         ) {
-            return Err(SessionStartFailure { error, permit });
+            return launch_rolled_back(permit, error);
         }
         let cleanup_ops = match launcher.launch(request) {
             Ok(cleanup_ops) => cleanup_ops,
-            Err(error) => return Err(SessionStartFailure { error, permit }),
+            Err(error) => return launch_rolled_back(permit, error),
         };
         self.successful_launches = self
             .successful_launches
@@ -207,7 +250,7 @@ impl SessionCoordinator {
             cleanup_ops,
             progress: CleanupProgress::default(),
         });
-        Ok(SessionCleanupHandle { identity })
+        SessionStartOutcome::Started(SessionCleanupHandle { identity })
     }
 
     pub fn successful_launches(&self) -> usize {
@@ -245,6 +288,16 @@ impl SessionCoordinator {
         self.active = None;
         Ok(CleanupComplete { identity })
     }
+}
+
+fn launch_rolled_back(permit: SessionStartPermit, error: ProtocolError) -> SessionStartOutcome {
+    SessionStartOutcome::LaunchRolledBack(SessionStartFailure {
+        error,
+        abort: SessionStartAbort {
+            identity: permit.identity,
+            consumed: AtomicBool::new(false),
+        },
+    })
 }
 
 /// 协议 writer 的会话/世代过滤器。generation 前进后旧输入即刻失效。
@@ -287,42 +340,32 @@ mod tests {
 
     use super::{
         reserve_session_start, CleanupError, CleanupOperations, SessionCoordinator,
-        SessionLauncher, SessionStartFailure, WriterGate,
+        SessionLauncher, SessionStartFailure, SessionStartOutcome, WriterGate,
     };
 
     #[test]
-    fn launcher_failure_issues_no_handle_and_leaves_coordinator_reusable() {
+    fn launcher_rollback_is_a_terminal_outcome_and_never_retries_the_consumed_request() {
         let session_id = SessionId::allocate();
-        let (_owner, permit) = reserve_session_start(session_id);
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let (owner, permit) = reserve_session_start(session_id);
         let mut coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
 
-        let failure = match coordinator.start(
+        let rollback = match coordinator.start(
             permit,
             TargetSystem::MacOs,
             connect_request(session_id),
             |_| Err(ProtocolError::Terminal),
         ) {
-            Ok(_) => panic!("failed launcher must not sign a cleanup handle"),
-            Err(failure) => failure,
+            SessionStartOutcome::Started(_) => {
+                panic!("failed launcher must not sign a cleanup handle")
+            }
+            SessionStartOutcome::LaunchRolledBack(rollback) => rollback,
         };
-        assert_eq!(failure.error(), &ProtocolError::Terminal);
+        assert_eq!(rollback.error(), &ProtocolError::Terminal);
+        assert!(rollback.abort().matches_owner(&owner));
+        assert!(rollback.abort().consume_for(&owner));
+        assert!(!rollback.abort().consume_for(&owner));
         assert_eq!(coordinator.successful_launches(), 0);
-
-        let handle = coordinator
-            .start(
-                failure.into_permit(),
-                TargetSystem::MacOs,
-                connect_request(session_id),
-                {
-                    let log = log.clone();
-                    move |_| Ok(Box::new(SharedCleanup::new(log)) as Box<dyn CleanupOperations>)
-                },
-            )
-            .expect("the same reserved start can retry after launcher rollback");
-        assert_eq!(coordinator.successful_launches(), 1);
-        assert!(coordinator.complete_cleanup(&handle).is_ok());
     }
 
     #[test]
@@ -534,8 +577,8 @@ mod tests {
             coordinator.complete_cleanup(&handle),
             Err(CleanupError::ShutdownWriter)
         );
-        assert!(coordinator
-            .start(
+        assert!(matches!(
+            coordinator.start(
                 reserve_session_start(second).1,
                 TargetSystem::MacOs,
                 connect_request(second),
@@ -549,12 +592,13 @@ mod tests {
                         )
                     }
                 },
-            )
-            .is_err());
+            ),
+            SessionStartOutcome::LaunchRolledBack(_)
+        ));
         assert_eq!(second_resource_creations.load(Ordering::Relaxed), 0);
         assert!(coordinator.complete_cleanup(&handle).is_ok());
-        assert!(coordinator
-            .start(
+        assert!(matches!(
+            coordinator.start(
                 reserve_session_start(second).1,
                 TargetSystem::MacOs,
                 connect_request(second),
@@ -568,8 +612,9 @@ mod tests {
                         )
                     }
                 },
-            )
-            .is_ok());
+            ),
+            SessionStartOutcome::Started(_)
+        ));
         assert_eq!(second_resource_creations.load(Ordering::Relaxed), 1);
     }
 
@@ -592,12 +637,15 @@ mod tests {
     where
         L: SessionLauncher,
     {
-        coordinator.start(
+        match coordinator.start(
             reserve_session_start(session_id).1,
             target,
             connect_request(session_id),
             launcher,
-        )
+        ) {
+            SessionStartOutcome::Started(handle) => Ok(handle),
+            SessionStartOutcome::LaunchRolledBack(failure) => Err(failure),
+        }
     }
 
     struct SharedCleanup {

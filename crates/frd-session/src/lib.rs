@@ -4,8 +4,8 @@ mod coordinator;
 
 pub use coordinator::{
     reserve_session_start, CleanupComplete, CleanupError, CleanupOperations, SessionCleanupHandle,
-    SessionCoordinator, SessionLauncher, SessionStartFailure, SessionStartOwner,
-    SessionStartPermit, WriterGate,
+    SessionCoordinator, SessionLauncher, SessionStartAbort, SessionStartFailure,
+    SessionStartOutcome, SessionStartOwner, SessionStartPermit, WriterGate,
 };
 pub use frd_protocol_api::{
     PresentationEvent, ServerIdentityChallenge, ServerIdentityDecision, SessionCommand,

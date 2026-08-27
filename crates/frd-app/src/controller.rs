@@ -8,7 +8,10 @@ use frd_protocol_api::{
     ProtocolCatalog, ProtocolError, ServerIdentityChallenge, ServerIdentityDecision,
     SessionCapabilities, SessionCommand, SessionEvent,
 };
-use frd_session::{reserve_session_start, CleanupComplete, SessionStartOwner, SessionStartPermit};
+use frd_session::{
+    reserve_session_start, CleanupComplete, SessionStartAbort, SessionStartFailure,
+    SessionStartOwner, SessionStartPermit,
+};
 use frd_ui_model::{
     ConnectionDraft, ConnectionForm, ConnectionSubmission, LaunchOptions, Page, ProtocolChoice,
 };
@@ -247,6 +250,29 @@ impl AppController {
         Ok(())
     }
 
+    /// 消费 launcher 已回滚终态；只释放仍处于 Connecting 的同一 reservation。
+    pub fn consume_launch_rollback(
+        &mut self,
+        failure: &SessionStartFailure,
+    ) -> Result<(), ActiveSessionError> {
+        if !matches!(self.page, Page::Connecting { .. }) {
+            return Err(ActiveSessionError::InvalidTransition);
+        }
+        let session_id = failure.abort().session_id();
+        if self.session_id != Some(session_id) {
+            return Err(ActiveSessionError::InvalidTransition);
+        }
+        self.session_slot.abort_connect(failure.abort())?;
+        let draft = self.page.retained_draft();
+        self.session_id = None;
+        self.reset_session_bound_state();
+        self.page = Page::Failed {
+            draft,
+            code: failure.error().code().to_owned(),
+        };
+        Ok(())
+    }
+
     pub fn handle_intent<I: Into<AppIntent>>(
         &mut self,
         intent: I,
@@ -417,15 +443,16 @@ impl AppController {
 
     pub fn handle_session_event(&mut self, event: SessionEvent) {
         if let SessionEvent::Error(error) = &event {
-            self.handle_terminal_event(error.code());
+            self.handle_terminal_failure(error.code());
             return;
         }
         if let SessionEvent::Closed(exit) = &event {
-            let code = match exit {
-                frd_protocol_api::ProtocolExit::Closed => "session_closed",
-                frd_protocol_api::ProtocolExit::Failed(error) => error.code(),
-            };
-            self.handle_terminal_event(code);
+            match exit {
+                frd_protocol_api::ProtocolExit::Closed => self.handle_normal_close(),
+                frd_protocol_api::ProtocolExit::Failed(error) => {
+                    self.handle_terminal_failure(error.code())
+                }
+            }
             return;
         }
         if matches!(
@@ -495,7 +522,7 @@ impl AppController {
         }
     }
 
-    fn handle_terminal_event(&mut self, code: &str) {
+    fn handle_terminal_failure(&mut self, code: &str) {
         let Some(session_id) = self.session_id else {
             return;
         };
@@ -511,6 +538,21 @@ impl AppController {
                 code: code.to_owned(),
             };
         }
+    }
+
+    fn handle_normal_close(&mut self) {
+        let Some(session_id) = self.session_id else {
+            return;
+        };
+        if self.session_slot.begin_terminal(session_id).is_err() {
+            return;
+        }
+        if matches!(self.page, Page::Failed { .. }) {
+            return;
+        }
+        let draft = self.page.retained_draft();
+        self.reset_session_bound_state();
+        self.page = Page::Disconnecting { draft };
     }
 
     fn handle_disconnect_stage(&mut self) {
@@ -688,6 +730,21 @@ impl ActiveSessionSlot {
                 if state.session_id == session_id && state.phase == SlotPhase::Connecting =>
             {
                 state.phase = SlotPhase::Active;
+                Ok(())
+            }
+            _ => Err(ActiveSessionError::InvalidTransition),
+        }
+    }
+
+    /// 仅接受同一 Connecting reservation 的一次性 launcher rollback abort。
+    pub fn abort_connect(&mut self, abort: &SessionStartAbort) -> Result<(), ActiveSessionError> {
+        match self.state.as_ref() {
+            Some(state)
+                if state.session_id == abort.session_id()
+                    && state.phase == SlotPhase::Connecting
+                    && abort.consume_for(&state.owner) =>
+            {
+                self.state = None;
                 Ok(())
             }
             _ => Err(ActiveSessionError::InvalidTransition),

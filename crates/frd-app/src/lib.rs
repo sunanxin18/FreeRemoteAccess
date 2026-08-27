@@ -46,7 +46,7 @@ mod tests {
     };
     use frd_session::{
         CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
-        SessionStartPermit,
+        SessionStartOutcome, SessionStartPermit,
     };
 
     use frd_ui_model::{ConnectionDraft, ConnectionForm, LaunchOptions, ProtocolChoice};
@@ -408,7 +408,7 @@ mod tests {
         else {
             panic!("first connection starts a session");
         };
-        let mut lifecycle = StartedTestSession::from_retry_permit(
+        let mut lifecycle = StartedTestSession::from_request(
             first_permit,
             first_request,
             RecordingCleanup::default(),
@@ -461,7 +461,7 @@ mod tests {
         };
         let session_id = request.session_id;
         let mut lifecycle =
-            StartedTestSession::from_retry_permit(permit, request, RecordingCleanup::default());
+            StartedTestSession::from_request(permit, request, RecordingCleanup::default());
         controller.set_platform_capabilities(PlatformCapabilities {
             dynamic_resolution: true,
             clipboard_read: true,
@@ -557,7 +557,7 @@ mod tests {
             panic!("connection starts a worker");
         };
         let mut lifecycle =
-            StartedTestSession::from_retry_permit(permit, request, RecordingCleanup::default());
+            StartedTestSession::from_request(permit, request, RecordingCleanup::default());
 
         controller
             .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
@@ -599,6 +599,12 @@ mod tests {
             protocol_id: ProtocolId::apple_hpss_mvs(),
             code: "first_terminal_error",
         }));
+        controller.handle_session_event(SessionEvent::Closed(
+            frd_protocol_api::ProtocolExit::Failed(ProtocolError::Adapter {
+                protocol_id: ProtocolId::apple_hpss_mvs(),
+                code: "later_terminal_error",
+            }),
+        ));
         controller
             .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
         assert!(matches!(
@@ -647,21 +653,24 @@ mod tests {
             session_id: SessionId,
             cleanup: RecordingCleanup,
         ) -> Self {
-            Self::from_retry_permit(permit, test_connect_request(session_id), cleanup)
+            Self::from_request(permit, test_connect_request(session_id), cleanup)
         }
 
-        fn from_retry_permit(
+        fn from_request(
             permit: SessionStartPermit,
             request: ConnectRequest,
             cleanup: RecordingCleanup,
         ) -> Self {
             let mut coordinator =
                 SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-            let handle = coordinator
-                .start(permit, TargetSystem::MacOs, request, move |_| {
-                    Ok(Box::new(cleanup) as Box<dyn CleanupOperations>)
-                })
-                .expect("test coordinator starts the session");
+            let handle = match coordinator.start(permit, TargetSystem::MacOs, request, move |_| {
+                Ok(Box::new(cleanup) as Box<dyn CleanupOperations>)
+            }) {
+                SessionStartOutcome::Started(handle) => handle,
+                SessionStartOutcome::LaunchRolledBack(failure) => {
+                    panic!("test coordinator launch rolled back: {:?}", failure.error())
+                }
+            };
             Self {
                 coordinator,
                 handle,
@@ -992,34 +1001,139 @@ mod tests {
     }
 
     #[test]
-    fn launcher_failure_has_no_app_release_capability_and_can_retry_the_reservation() {
-        let session_id = SessionId::allocate();
-        let mut slot = ActiveSessionSlot::default();
-        let permit = slot
-            .begin_connect(session_id)
-            .expect("app reserves the start");
+    fn controller_consumes_original_launch_rollback_and_accepts_a_fresh_connect() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::connection_form(complete_form());
+        let AppAction::StartSession(request, permit) = controller
+            .handle_intent(
+                complete_form()
+                    .take_submission(&catalog)
+                    .expect("valid first submission"),
+                &catalog,
+                &store,
+            )
+            .expect("first connect is accepted")
+            .expect("first connect starts one reservation")
+        else {
+            panic!("connect uses the session start transaction");
+        };
+        let session_id = request.session_id;
+        assert!(request.credentials.is_some());
         let mut coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let failure = match coordinator.start(
-            permit,
+        let rollback = match coordinator.start(permit, TargetSystem::MacOs, request, |_| {
+            Err(ProtocolError::Terminal)
+        }) {
+            SessionStartOutcome::Started(_) => {
+                panic!("failed launch must roll back instead of issuing cleanup")
+            }
+            SessionStartOutcome::LaunchRolledBack(rollback) => rollback,
+        };
+        controller
+            .consume_launch_rollback(&rollback)
+            .expect("the original rollback releases its connecting reservation");
+        assert!(matches!(
+            controller.page(),
+            AppPage::Failed { code, draft } if code == "terminal" && draft.username == "test-user"
+        ));
+
+        let AppAction::StartSession(fresh_request, _fresh_permit) = controller
+            .handle_intent(
+                complete_form()
+                    .take_submission(&catalog)
+                    .expect("fresh submission owns a fresh password"),
+                &catalog,
+                &store,
+            )
+            .expect("fresh connect is accepted by the same controller")
+            .expect("fresh connect creates a new reservation")
+        else {
+            panic!("fresh connect uses the session start transaction");
+        };
+        assert_ne!(fresh_request.session_id, session_id);
+    }
+
+    #[test]
+    fn mismatched_duplicate_and_stale_launch_rollbacks_leave_the_current_slot_untouched() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::connection_form(complete_form());
+        let AppAction::StartSession(request, permit) = controller
+            .handle_intent(
+                complete_form()
+                    .take_submission(&catalog)
+                    .expect("valid first submission"),
+                &catalog,
+                &store,
+            )
+            .expect("first connect is accepted")
+            .expect("first connect starts one reservation")
+        else {
+            panic!("connect uses the session start transaction");
+        };
+        let session_id = request.session_id;
+
+        let foreign_permit = frd_session::reserve_session_start(session_id).1;
+        let mut foreign_coordinator =
+            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let foreign_rollback = match foreign_coordinator.start(
+            foreign_permit,
             TargetSystem::MacOs,
             test_connect_request(session_id),
             |_| Err(ProtocolError::Terminal),
         ) {
-            Ok(_) => panic!("failed launcher must not sign a cleanup handle"),
-            Err(failure) => failure,
+            SessionStartOutcome::Started(_) => panic!("foreign launch must fail"),
+            SessionStartOutcome::LaunchRolledBack(rollback) => rollback,
         };
-        slot.begin_disconnect(session_id)
-            .expect("failed product start remains reserved for explicit recovery");
-        assert!(slot.is_occupied());
+        assert!(controller
+            .consume_launch_rollback(&foreign_rollback)
+            .is_err());
 
-        let mut lifecycle = StartedTestSession::from_retry_permit(
-            failure.into_permit(),
-            test_connect_request(session_id),
-            RecordingCleanup::default(),
+        let mut coordinator =
+            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let original_rollback =
+            match coordinator.start(permit, TargetSystem::MacOs, request, |_| {
+                Err(ProtocolError::Terminal)
+            }) {
+                SessionStartOutcome::Started(_) => panic!("original launch must fail"),
+                SessionStartOutcome::LaunchRolledBack(rollback) => rollback,
+            };
+        controller
+            .consume_launch_rollback(&original_rollback)
+            .expect("matching rollback releases only its reservation");
+        assert!(controller
+            .consume_launch_rollback(&original_rollback)
+            .is_err());
+
+        let AppAction::StartSession(_fresh_request, _fresh_permit) = controller
+            .handle_intent(
+                complete_form()
+                    .take_submission(&catalog)
+                    .expect("fresh submission"),
+                &catalog,
+                &store,
+            )
+            .expect("fresh connect starts")
+            .expect("fresh reservation is returned")
+        else {
+            panic!("fresh connect uses the session start transaction");
+        };
+        assert!(controller
+            .consume_launch_rollback(&original_rollback)
+            .is_err());
+        assert_eq!(
+            controller
+                .handle_intent(
+                    complete_form()
+                        .take_submission(&catalog)
+                        .expect("blocked third submission"),
+                    &catalog,
+                    &store,
+                )
+                .err(),
+            Some(AppControllerError::SessionAlreadyActive)
         );
-        let completion = lifecycle.complete().expect("retry resources clean up");
-        assert!(slot.finish_cleanup(&completion).is_ok());
     }
 
     #[test]
@@ -1126,6 +1240,8 @@ mod tests {
 
         controller.handle_session_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
         controller.handle_session_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
+        controller
+            .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
 
         assert!(matches!(controller.page(), AppPage::Disconnecting { .. }));
         assert!(controller
@@ -1138,6 +1254,10 @@ mod tests {
             frd_protocol_api::SessionCapabilities::default()
         );
         assert!(controller.current_server_identity_challenge().is_none());
+        assert!(matches!(
+            controller.handle_intent(AppIntent::Disconnect, &catalog, &store),
+            Ok(None)
+        ));
         let blocked = complete_form()
             .take_submission(&catalog)
             .expect("retry submission");
@@ -1153,6 +1273,7 @@ mod tests {
                     .expect("bound start resources complete cleanup"),
             )
             .expect("bound completion releases the slot");
+        assert!(matches!(controller.page(), AppPage::ConnectionForm(_)));
         let retry = complete_form()
             .take_submission(&catalog)
             .expect("retry submission");
