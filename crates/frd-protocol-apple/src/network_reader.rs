@@ -1,0 +1,2585 @@
+//! Apple HPSS/MVS reader、generation 与动态分辨率状态机。
+
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use frd_core::{PhysicalViewport, PixelRect, PixelSize};
+use frd_protocol_api::{ProtocolError, ProtocolRuntime};
+
+use crate::connection::AppleWriterHandle;
+use crate::dynamic_resolution::{
+    DisplaySize, DynamicResolutionCapability, DynamicResolutionController, GeometryCommit,
+    ResolutionRequest,
+};
+use crate::hpss::{self, encoding, parse_media, Media};
+use crate::media_runtime::ViewerMediaState;
+use crate::mvs;
+use crate::mvs_stream::{MvsRecord, MvsRecordAssembler, MvsRect};
+use crate::protocol;
+use crate::surface_publisher::{
+    AppleSurfacePublisher, CpuFramebuffer as Framebuffer, DisplaySurface, MvsFrameKind,
+    PublicationOutcome,
+};
+
+const MVS_INCOMPLETE_TIMEOUT: Duration = Duration::from_secs(2);
+struct DynamicResolutionRuntime {
+    controller: DynamicResolutionController,
+    pending_since: Option<Instant>,
+    initial_size: DisplaySize,
+    opt_in: bool,
+    evidence: DynamicCapabilityEvidence,
+    armed: bool,
+}
+
+#[derive(Default)]
+struct DynamicCapabilityEvidence {
+    controlling_role: bool,
+    matching_initial_server_state: bool,
+    current_full_media_applied: bool,
+    non_paused_media_activity: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetDisposition {
+    Ready,
+    Duplicate,
+    Wait,
+}
+
+impl DynamicResolutionRuntime {
+    fn new(initial_size: DisplaySize, enabled: bool) -> Self {
+        // hpssview 是本地明确选择的交互控制角色；其余 Apple capability 谓词
+        // 必须由本会话可观察事件逐步满足。MVS 活动只作为本实验的 active-media
+        // 证据，不宣称它静态证明 Apple 私有的 isUsingAVCMediaStream 谓词。
+        let capability = DynamicResolutionCapability::new(false, false, true, true);
+        Self {
+            controller: DynamicResolutionController::new(initial_size, enabled, capability),
+            pending_since: None,
+            initial_size,
+            opt_in: enabled,
+            evidence: DynamicCapabilityEvidence {
+                controlling_role: true,
+                ..Default::default()
+            },
+            armed: false,
+        }
+    }
+
+    fn maybe_arm(&mut self) -> bool {
+        if self.armed
+            || !self.evidence.controlling_role
+            || !self.evidence.matching_initial_server_state
+            || !self.evidence.current_full_media_applied
+            || !self.evidence.non_paused_media_activity
+        {
+            return false;
+        }
+        self.controller = DynamicResolutionController::new(
+            self.initial_size,
+            self.opt_in,
+            DynamicResolutionCapability::new(
+                self.evidence.current_full_media_applied,
+                self.evidence.matching_initial_server_state,
+                self.evidence.controlling_role,
+                !self.evidence.non_paused_media_activity,
+            ),
+        );
+        self.armed = true;
+        self.opt_in
+    }
+
+    fn observe_initial_server_state(
+        &mut self,
+        observed: DisplaySize,
+        current_surface: DisplaySize,
+    ) -> bool {
+        if !self.armed && current_surface == self.initial_size && observed == current_surface {
+            self.evidence.matching_initial_server_state = true;
+        }
+        self.maybe_arm()
+    }
+
+    fn observe_full_applied(&mut self, generation: u64, current_surface: DisplaySize) -> bool {
+        if !self.armed && generation == 1 && current_surface == self.initial_size {
+            self.evidence.current_full_media_applied = true;
+            self.evidence.non_paused_media_activity = true;
+            return self.maybe_arm();
+        }
+        generation
+            .checked_sub(1)
+            .is_some_and(|internal| self.controller.mark_full_frame(internal))
+    }
+
+    fn target_disposition(&self, target: DisplaySize) -> TargetDisposition {
+        match self.controller.state() {
+            crate::dynamic_resolution::DynamicResolutionState::Stable { size, .. }
+                if *size == target =>
+            {
+                TargetDisposition::Duplicate
+            }
+            crate::dynamic_resolution::DynamicResolutionState::Stable { .. } => {
+                TargetDisposition::Ready
+            }
+            _ => TargetDisposition::Wait,
+        }
+    }
+
+    /// 调用方必须持有 runtime mutex。发送成功前 controller 保持 Stable，
+    /// 因而 reader 既无法取得 mutex，也看不到尚未上 wire 的 Pending。
+    fn send_target_with<F>(
+        &mut self,
+        target: DisplaySize,
+        send: F,
+    ) -> Result<Option<ResolutionRequest>>
+    where
+        F: FnOnce(DisplaySize) -> Result<Instant>,
+    {
+        if self.target_disposition(target) != TargetDisposition::Ready {
+            return Ok(None);
+        }
+        let sent_at = send(target)?;
+        let request = self
+            .controller
+            .request_target(target)
+            .context("动态分辨率发送成功后无法激活 Pending")?;
+        self.pending_since = Some(sent_at);
+        Ok(Some(request))
+    }
+
+    fn observe_server_state(&mut self, size: DisplaySize) -> Option<GeometryCommit> {
+        let commit = self.controller.observe_server_state(size)?;
+        self.pending_since = None;
+        Some(commit)
+    }
+
+    fn timeout_pending(&mut self, now: Instant) -> bool {
+        let Some(since) = self.pending_since else {
+            return false;
+        };
+        if now.duration_since(since) < Duration::from_secs(2) {
+            return false;
+        }
+        let timed_out = self.controller.timeout_pending();
+        if timed_out {
+            self.pending_since = None;
+        }
+        timed_out
+    }
+}
+
+#[derive(Default)]
+struct ViewportRequestQueue {
+    latest: Option<(DisplaySize, Instant)>,
+}
+
+impl ViewportRequestQueue {
+    fn observe(&mut self, target: DisplaySize, now: Instant) {
+        self.latest = Some((target, now));
+    }
+
+    fn service<F>(
+        &mut self,
+        runtime: &mut DynamicResolutionRuntime,
+        now: Instant,
+        send: F,
+    ) -> Result<Option<ResolutionRequest>>
+    where
+        F: FnOnce(DisplaySize) -> Result<Instant>,
+    {
+        let Some((target, since)) = self.latest else {
+            return Ok(None);
+        };
+        if now.duration_since(since) < Duration::from_millis(250) {
+            return Ok(None);
+        }
+        match runtime.target_disposition(target) {
+            TargetDisposition::Wait => Ok(None),
+            TargetDisposition::Duplicate => {
+                self.latest = None;
+                Ok(None)
+            }
+            TargetDisposition::Ready => {
+                let request = runtime.send_target_with(target, send)?;
+                if request.is_some() {
+                    self.latest = None;
+                }
+                Ok(request)
+            }
+        }
+    }
+
+    fn drop_latest(&mut self) {
+        self.latest = None;
+    }
+}
+
+/// 只有控制器返回精确确认时才提交新 surface，且每个 generation 只提交一次。
+fn commit_server_geometry(
+    runtime: &mut DynamicResolutionRuntime,
+    receiver: &mut MvsReceiveState,
+    surface: &mut DisplaySurface,
+    media_state: &mut ViewerMediaState,
+    observed: DisplaySize,
+) -> Option<GeometryCommit> {
+    let replacement_size = PixelSize::new(observed.width.into(), observed.height.into())?;
+    let internal_commit = runtime.observe_server_state(observed)?;
+    let generation = internal_commit.generation.checked_add(1)?;
+    if surface.generation.checked_add(1) != Some(generation) {
+        return None;
+    }
+    media_state.reset_generation(generation).ok()?;
+    receiver.reset(generation);
+    *surface = DisplaySurface::new(generation, replacement_size).ok()?;
+    Some(GeometryCommit {
+        generation,
+        size: internal_commit.size,
+    })
+}
+
+/// Viewer 读线程持有的、generation 绑定的 MVS 接收状态。
+struct MvsReceiveState {
+    assembler: MvsRecordAssembler,
+    decoder: mvs::MvsDecodeState,
+    generation: u64,
+    incomplete_since: Option<Instant>,
+}
+
+impl MvsReceiveState {
+    fn new(generation: u64) -> Self {
+        Self {
+            assembler: MvsRecordAssembler::default(),
+            decoder: mvs::MvsDecodeState::new(generation),
+            generation,
+            incomplete_since: None,
+        }
+    }
+
+    fn begin(&mut self, rect: MvsRect, total: u32, first: &[u8]) -> Result<Option<MvsRecord>> {
+        self.begin_at(rect, total, first, Instant::now())
+    }
+
+    fn begin_at(
+        &mut self,
+        rect: MvsRect,
+        total: u32,
+        first: &[u8],
+        now: Instant,
+    ) -> Result<Option<MvsRecord>> {
+        let result = self.assembler.begin(rect, total, first);
+        self.incomplete_since = if matches!(result, Ok(None)) && self.assembler.is_pending() {
+            Some(now)
+        } else {
+            None
+        };
+        result
+    }
+
+    fn push_continuation(&mut self, chunk: &[u8]) -> Result<Option<MvsRecord>> {
+        let result = self.assembler.push_continuation(chunk);
+        if !matches!(result, Ok(None)) {
+            self.incomplete_since = None;
+        }
+        result
+    }
+
+    fn is_pending(&self) -> bool {
+        self.assembler.is_pending()
+    }
+
+    fn reset(&mut self, generation: u64) {
+        self.assembler.abort();
+        self.incomplete_since = None;
+        self.decoder.reset(generation);
+        self.generation = generation;
+    }
+
+    fn install_tables(&mut self, payload: &[u8]) -> Result<()> {
+        self.decoder.install_tables(self.generation, payload)
+    }
+
+    #[cfg(test)]
+    fn prepare(
+        &mut self,
+        payload: &[u8],
+        width: u16,
+        height: u16,
+    ) -> Result<mvs::MvsDecodeDecision> {
+        self.decoder
+            .prepare(self.generation, payload, width, height)
+    }
+
+    fn prepare_rect(
+        &mut self,
+        payload: &[u8],
+        rect: MvsRect,
+        display_size: DisplaySize,
+    ) -> Result<mvs::MvsDecodeDecision> {
+        self.decoder.prepare_rect(
+            self.generation,
+            payload,
+            rect,
+            display_size.width,
+            display_size.height,
+        )
+    }
+
+    fn commit(&mut self, prepared: mvs::PreparedGenerationMvs) -> Result<()> {
+        self.decoder.commit(prepared).map(|_| ())
+    }
+
+    fn commit_opaque(
+        &mut self,
+        prepared: mvs::PreparedOpaqueMvsState,
+    ) -> Result<crate::mvs_full::PreparedPartialPixels> {
+        self.decoder.commit_opaque(prepared)
+    }
+
+    fn request_full(&mut self) -> Result<()> {
+        self.assembler.abort();
+        self.incomplete_since = None;
+        self.decoder.request_full(self.generation)
+    }
+
+    fn timeout_incomplete(&mut self, now: Instant) -> Result<bool> {
+        let Some(since) = self.incomplete_since else {
+            return Ok(false);
+        };
+        if now.checked_duration_since(since).unwrap_or_default() < MVS_INCOMPLETE_TIMEOUT {
+            return Ok(false);
+        }
+        self.request_full()?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn awaiting_full(&self) -> bool {
+        self.decoder.awaiting_full()
+    }
+
+    fn reject_truncated_mvs_envelope(&mut self, msg: &[u8]) -> Result<bool> {
+        if hpss::is_truncated_mvs_envelope(msg) {
+            self.request_full()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableScheduleStatus {
+    Scheduled,
+    AlreadyScheduled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableFollowupState {
+    None,
+    Scheduled { generation: u64, due: Instant },
+    Sent { generation: u64 },
+}
+
+struct ReaderRequestState {
+    generation: u64,
+    framebuffer_request_in_flight: bool,
+    last_full_request: Option<Instant>,
+    table_followup: TableFollowupState,
+}
+
+impl ReaderRequestState {
+    fn after_startup(sent_at: Instant) -> Self {
+        Self {
+            generation: 0,
+            framebuffer_request_in_flight: true,
+            last_full_request: Some(sent_at),
+            table_followup: TableFollowupState::None,
+        }
+    }
+
+    fn framebuffer_request_in_flight(&self) -> bool {
+        self.framebuffer_request_in_flight
+    }
+
+    fn consume_mvs_response(&mut self) {
+        self.framebuffer_request_in_flight = false;
+    }
+
+    fn mark_incremental_request_sent(&mut self) {
+        self.framebuffer_request_in_flight = true;
+    }
+
+    fn mark_full_request_sent(&mut self, sent_at: Instant) {
+        self.framebuffer_request_in_flight = true;
+        self.last_full_request = Some(sent_at);
+    }
+
+    fn reset_generation(&mut self, generation: u64) {
+        self.generation = generation;
+        self.framebuffer_request_in_flight = false;
+        self.table_followup = TableFollowupState::None;
+    }
+
+    fn on_valid_table_record(
+        &mut self,
+        generation: u64,
+        arrived_at: Instant,
+    ) -> Result<TableScheduleStatus> {
+        if generation != self.generation {
+            bail!("MVS 表 follow-up 属于过期 generation {generation}");
+        }
+        match self.table_followup {
+            TableFollowupState::None => {
+                let rate_due = self
+                    .last_full_request
+                    .map(|last| last + Duration::from_millis(200))
+                    .unwrap_or(arrived_at);
+                let due = (arrived_at + Duration::from_millis(200)).max(rate_due);
+                self.table_followup = TableFollowupState::Scheduled { generation, due };
+                Ok(TableScheduleStatus::Scheduled)
+            }
+            TableFollowupState::Scheduled {
+                generation: scheduled,
+                ..
+            } if scheduled == generation => Ok(TableScheduleStatus::AlreadyScheduled),
+            TableFollowupState::Sent {
+                generation: sent, ..
+            } if sent == generation => {
+                bail!("同一 generation 在 table follow-up 后再次返回 table-only 响应")
+            }
+            _ => bail!("MVS table follow-up generation 状态不一致"),
+        }
+    }
+
+    fn table_followup_due(&self) -> Option<Instant> {
+        match self.table_followup {
+            TableFollowupState::Scheduled { due, .. } => Some(due),
+            _ => None,
+        }
+    }
+
+    fn table_followup_blocks_dynamic(&self) -> bool {
+        !matches!(self.table_followup, TableFollowupState::None)
+    }
+
+    fn mark_table_followup_sent(&mut self, sent_at: Instant) -> Result<()> {
+        let TableFollowupState::Scheduled { generation, .. } = self.table_followup else {
+            bail!("MVS table follow-up 未处于 Scheduled")
+        };
+        self.table_followup = TableFollowupState::Sent { generation };
+        self.mark_full_request_sent(sent_at);
+        Ok(())
+    }
+
+    fn on_full_applied(&mut self, generation: u64) -> Result<()> {
+        if generation != self.generation {
+            bail!("MVS full boundary 属于过期 generation {generation}");
+        }
+        self.table_followup = TableFollowupState::None;
+        Ok(())
+    }
+
+    fn send_rate_limited_full_at<S, W>(&mut self, now: Instant, sleep: S, write: W) -> Result<()>
+    where
+        S: FnMut(Duration),
+        W: FnMut() -> Result<()>,
+    {
+        request_full_update_at(&mut self.last_full_request, now, sleep, write)?;
+        self.framebuffer_request_in_flight = true;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ReaderTickOutcome {
+    incomplete_recovered: bool,
+    dynamic_timed_out: bool,
+    table_followup_sent: bool,
+    dynamic_request: Option<ResolutionRequest>,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "纯状态机测试需要显式注入四组状态与三条无 I/O 副作用的回调"
+)]
+fn service_reader_tick_at<S, FW, DW>(
+    receiver: &mut MvsReceiveState,
+    requests: &mut ReaderRequestState,
+    queue: &mut ViewportRequestQueue,
+    runtime: &mut DynamicResolutionRuntime,
+    now: Instant,
+    mut sleep: S,
+    mut write_full: FW,
+    send_dynamic: DW,
+) -> Result<ReaderTickOutcome>
+where
+    S: FnMut(Duration),
+    FW: FnMut() -> Result<()>,
+    DW: FnMut(DisplaySize) -> Result<Instant>,
+{
+    let mut outcome = ReaderTickOutcome::default();
+
+    if receiver.timeout_incomplete(now)? {
+        requests.consume_mvs_response();
+        requests.send_rate_limited_full_at(now, &mut sleep, &mut write_full)?;
+        outcome.incomplete_recovered = true;
+    }
+
+    if runtime.timeout_pending(now) {
+        queue.drop_latest();
+        outcome.dynamic_timed_out = true;
+    }
+
+    if !outcome.incomplete_recovered
+        && !receiver.is_pending()
+        && !requests.framebuffer_request_in_flight()
+        && runtime.pending_since.is_none()
+        && requests.table_followup_due().is_some_and(|due| now >= due)
+    {
+        write_full()?;
+        requests.mark_table_followup_sent(now)?;
+        outcome.table_followup_sent = true;
+    }
+
+    if !outcome.incomplete_recovered
+        && !outcome.table_followup_sent
+        && !receiver.is_pending()
+        && !requests.framebuffer_request_in_flight()
+        && !requests.table_followup_blocks_dynamic()
+    {
+        outcome.dynamic_request = queue.service(runtime, now, send_dynamic)?;
+    }
+
+    Ok(outcome)
+}
+
+struct FullBoundaryOutcome {
+    dynamic_request: Option<ResolutionRequest>,
+    incremental_sent: bool,
+}
+
+fn finish_partial_boundary_at<I>(
+    requests: &mut ReaderRequestState,
+    mut send_incremental: I,
+) -> Result<bool>
+where
+    I: FnMut() -> Result<()>,
+{
+    if requests.framebuffer_request_in_flight() {
+        return Ok(false);
+    }
+    send_incremental()?;
+    requests.mark_incremental_request_sent();
+    Ok(true)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "full 边界事务显式携带四组状态及各类写回调以验证严格调用顺序"
+)]
+fn finish_full_boundary_at<S, FW, DW, IW>(
+    receiver: &mut MvsReceiveState,
+    requests: &mut ReaderRequestState,
+    queue: &mut ViewportRequestQueue,
+    runtime: &mut DynamicResolutionRuntime,
+    now: Instant,
+    sleep: S,
+    write_full: FW,
+    send_dynamic: DW,
+    mut send_incremental: IW,
+) -> Result<FullBoundaryOutcome>
+where
+    S: FnMut(Duration),
+    FW: FnMut() -> Result<()>,
+    DW: FnMut(DisplaySize) -> Result<Instant>,
+    IW: FnMut() -> Result<()>,
+{
+    requests.on_full_applied(receiver.generation)?;
+    let tick = service_reader_tick_at(
+        receiver,
+        requests,
+        queue,
+        runtime,
+        now,
+        sleep,
+        write_full,
+        send_dynamic,
+    )?;
+    let incremental_sent =
+        if tick.dynamic_request.is_none() && !requests.framebuffer_request_in_flight() {
+            send_incremental()?;
+            requests.mark_incremental_request_sent();
+            true
+        } else {
+            false
+        };
+    Ok(FullBoundaryOutcome {
+        dynamic_request: tick.dynamic_request,
+        incremental_sent,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaderFrameClass {
+    Continuation,
+    ServerKeepalive,
+    Query,
+    ControlOrMedia,
+}
+
+fn reader_frame_class(receiver: &MvsReceiveState, msg: &[u8]) -> ReaderFrameClass {
+    // Apple session frames preserve message boundaries, and the server may
+    // interleave a complete MediaStream control message between MVS chunks.
+    // Only a fully validated 0x3f2 message may preempt the opaque continuation
+    // rule; heartbeat/query-shaped bytes remain MVS payload while reassembling.
+    let interleaved_media_control = matches!(
+        parse_media(msg),
+        Ok(Media::PortAnnouncement(_) | Media::StreamAnswer(_))
+    );
+    if receiver.is_pending() && !interleaved_media_control {
+        return ReaderFrameClass::Continuation;
+    }
+    match msg.first().copied() {
+        Some(protocol::apple_session::SERVER_KEEPALIVE_MESSAGE_TYPE) => {
+            ReaderFrameClass::ServerKeepalive
+        }
+        Some(hpss::msg::QUERY_08) => ReaderFrameClass::Query,
+        _ => ReaderFrameClass::ControlOrMedia,
+    }
+}
+
+fn incremental_request_after_full_apply(
+    width: u16,
+    height: u16,
+) -> Result<[u8; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES]> {
+    protocol::msg_fb_update_request(true, 0, 0, width, height)
+}
+
+fn send_encrypted(writer: &AppleWriterHandle, message: &[u8]) -> Result<()> {
+    writer.send_private_message(message)
+}
+
+fn request_full_update(
+    writer: &AppleWriterHandle,
+    requests: &mut ReaderRequestState,
+    width: u16,
+    height: u16,
+) -> Result<()> {
+    let now = Instant::now();
+    let req = protocol::msg_fb_update_request(false, 0, 0, width, height)?;
+    requests.send_rate_limited_full_at(now, thread::sleep, || send_encrypted(writer, &req))
+}
+
+fn request_full_update_at<S, W>(
+    last_full_request: &mut Option<Instant>,
+    now: Instant,
+    sleep: S,
+    write: W,
+) -> Result<()>
+where
+    S: FnOnce(Duration),
+    W: FnOnce() -> Result<()>,
+{
+    let limit = Duration::from_millis(200);
+    let delay = last_full_request
+        .and_then(|last| (last + limit).checked_duration_since(now))
+        .unwrap_or_default();
+    if !delay.is_zero() {
+        sleep(delay);
+    }
+    write()?;
+    *last_full_request = Some(now + delay);
+    Ok(())
+}
+
+fn current_surface_size(surface: &Arc<Mutex<DisplaySurface>>) -> DisplaySize {
+    let surface = surface.lock().unwrap();
+    DisplaySize::new(
+        surface.framebuffer.width as u16,
+        surface.framebuffer.height as u16,
+    )
+    .expect("DisplaySurface dimensions are non-zero u16 values")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MvsRecordOutcome {
+    TableInstalled,
+    FullApplied { complete_surface: bool },
+    PartialApplied { has_pixels: bool },
+    RecoveryRequested,
+    Ignored,
+}
+
+fn is_complete_surface_frame(rect: MvsRect, display_size: DisplaySize) -> bool {
+    rect.x == 0
+        && rect.y == 0
+        && rect.width == display_size.width
+        && rect.height == display_size.height
+}
+
+/// 校验完成记录的矩形；无效远端输入只推进到 fail-closed 全量重同步，不能杀死读线程。
+fn mark_recovery_for_invalid_mvs_geometry(
+    receiver: &mut MvsReceiveState,
+    rect: MvsRect,
+    display_size: DisplaySize,
+) -> Result<bool> {
+    if let Err(error) = crate::mvs_stream::validate_mvs_rect_against_surface(
+        rect,
+        display_size.width,
+        display_size.height,
+    ) {
+        eprintln!("[hpss-view] MVS 矩形无效，重同步: {error:#}");
+        receiver.request_full()?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// 在私有 staging framebuffer 上应用像素，decoder commit 成功后才发布 surface。
+/// `receiver` 只属于 reader 线程；持有 surface 锁期间不进行任何 socket I/O。
+fn apply_prepared_mvs_to_surface_with<F>(
+    receiver: &mut MvsReceiveState,
+    surface: &mut DisplaySurface,
+    prepared: mvs::PreparedGenerationMvs,
+    rect: MvsRect,
+    apply: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut Framebuffer, &[u8], usize, usize, usize, usize) -> Result<()>,
+{
+    if surface.generation != receiver.generation {
+        bail!(
+            "MVS prepared frame generation 与当前 surface 不一致: receiver={}, surface={}",
+            receiver.generation,
+            surface.generation
+        );
+    }
+    let decoded = prepared.decoded();
+    if decoded.width != usize::from(rect.width) || decoded.height != usize::from(rect.height) {
+        bail!("MVS 原生解码矩形与 wire 矩形不一致");
+    }
+    let mut staged = Framebuffer::new(surface.framebuffer.width, surface.framebuffer.height)?;
+    staged
+        .pixels_mut()
+        .copy_from_slice(surface.framebuffer.pixels());
+    apply(
+        &mut staged,
+        &decoded.rgb,
+        usize::from(rect.x),
+        usize::from(rect.y),
+        usize::from(rect.width),
+        usize::from(rect.height),
+    )?;
+    receiver.commit(prepared)?;
+    surface.framebuffer = staged;
+    Ok(())
+}
+
+fn validate_partial_pixels_for_framebuffer(
+    framebuffer: &Framebuffer,
+    partial: &crate::mvs_full::PreparedPartialPixels,
+) -> Result<()> {
+    use crate::mvs_full::PartialPixelOperation;
+
+    for operation in &partial.operations {
+        match operation {
+            PartialPixelOperation::Replace {
+                x,
+                y,
+                width,
+                height,
+                rgb,
+            } => {
+                if *width == 0 || *height == 0 || *width > 8 || *height > 8 {
+                    bail!("MVS type-1 replace tile 尺寸非法: {width}x{height}");
+                }
+                let width_u16 = u16::try_from(*width).context("MVS type-1 replace 宽度溢出")?;
+                let height_u16 = u16::try_from(*height).context("MVS type-1 replace 高度溢出")?;
+                mvs::validate_decoded_rgb_layout(width_u16, height_u16, rgb.len())?;
+                if x.checked_add(*width)
+                    .is_none_or(|right| right > framebuffer.width)
+                    || y.checked_add(*height)
+                        .is_none_or(|bottom| bottom > framebuffer.height)
+                {
+                    bail!("MVS type-1 framebuffer replace 超出 surface");
+                }
+            }
+            PartialPixelOperation::Copy {
+                source_x,
+                source_y,
+                destination_x,
+                destination_y,
+                width,
+                height,
+            } => {
+                if *width == 0 || *height == 0 || *width > 8 || *height > 8 {
+                    bail!("MVS type-1 copy tile 尺寸非法: {width}x{height}");
+                }
+                if source_x
+                    .checked_add(*width)
+                    .is_none_or(|right| right > framebuffer.width)
+                    || source_y
+                        .checked_add(*height)
+                        .is_none_or(|bottom| bottom > framebuffer.height)
+                    || destination_x
+                        .checked_add(*width)
+                        .is_none_or(|right| right > framebuffer.width)
+                    || destination_y
+                        .checked_add(*height)
+                        .is_none_or(|bottom| bottom > framebuffer.height)
+                {
+                    bail!("MVS type-1 framebuffer copy 超出 surface");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 只接收已经通过 `validate_partial_pixels_for_framebuffer` 的 decoder 输出。
+/// replace 与 copy 都是固定 8x8 上限，因此提交后不再分配内存或返回错误。
+fn apply_validated_partial_pixels_to_framebuffer(
+    framebuffer: &mut Framebuffer,
+    partial: &crate::mvs_full::PreparedPartialPixels,
+) {
+    use crate::mvs_full::PartialPixelOperation;
+
+    for operation in &partial.operations {
+        match operation {
+            PartialPixelOperation::Replace {
+                x,
+                y,
+                width,
+                height,
+                rgb,
+            } => {
+                debug_assert!(*width > 0 && *height > 0 && *width <= 8 && *height <= 8);
+                debug_assert_eq!(rgb.len(), width * height * mvs::MVS_RGB_CHANNEL_BYTES);
+                debug_assert!(*x + *width <= framebuffer.width);
+                debug_assert!(*y + *height <= framebuffer.height);
+                for row in 0..*height {
+                    for column in 0..*width {
+                        let source = (row * *width + column) * mvs::MVS_RGB_CHANNEL_BYTES;
+                        let destination = (*y + row) * framebuffer.width + *x + column;
+                        let red = u32::from(rgb[source + mvs::MVS_RGB_RED_OFFSET]);
+                        let green = u32::from(rgb[source + mvs::MVS_RGB_GREEN_OFFSET]);
+                        let blue = u32::from(rgb[source + mvs::MVS_RGB_BLUE_OFFSET]);
+                        framebuffer.pixels_mut()[destination] = (red << 16) | (green << 8) | blue;
+                    }
+                }
+            }
+            PartialPixelOperation::Copy {
+                source_x,
+                source_y,
+                destination_x,
+                destination_y,
+                width,
+                height,
+            } => {
+                debug_assert!(*width > 0 && *height > 0 && *width <= 8 && *height <= 8);
+                debug_assert!(*source_x + *width <= framebuffer.width);
+                debug_assert!(*source_y + *height <= framebuffer.height);
+                debug_assert!(*destination_x + *width <= framebuffer.width);
+                debug_assert!(*destination_y + *height <= framebuffer.height);
+                let mut staging = [0u32; 8 * 8];
+                for row in 0..*height {
+                    let source = (*source_y + row) * framebuffer.width + *source_x;
+                    let staging_start = row * *width;
+                    staging[staging_start..staging_start + *width]
+                        .copy_from_slice(&framebuffer.pixels()[source..source + *width]);
+                }
+                for row in 0..*height {
+                    let staging_start = row * *width;
+                    let destination = (*destination_y + row) * framebuffer.width + *destination_x;
+                    framebuffer.pixels_mut()[destination..destination + *width]
+                        .copy_from_slice(&staging[staging_start..staging_start + *width]);
+                }
+            }
+        }
+    }
+}
+
+fn apply_rgb_rect(
+    framebuffer: &mut Framebuffer,
+    rgb: &[u8],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(mvs::MVS_RGB_CHANNEL_BYTES))
+        .context("RGB 矩形尺寸溢出")?;
+    if rgb.len() != expected {
+        bail!("RGB 数据长度不匹配: 期望 {expected}, 实际 {}", rgb.len());
+    }
+    if x.checked_add(width)
+        .is_none_or(|right| right > framebuffer.width)
+        || y.checked_add(height)
+            .is_none_or(|bottom| bottom > framebuffer.height)
+    {
+        bail!("RGB 矩形超出 framebuffer");
+    }
+    for row in 0..height {
+        for column in 0..width {
+            let source = (row * width + column) * mvs::MVS_RGB_CHANNEL_BYTES;
+            let destination = (y + row) * framebuffer.width + x + column;
+            let red = u32::from(rgb[source + mvs::MVS_RGB_RED_OFFSET]);
+            let green = u32::from(rgb[source + mvs::MVS_RGB_GREEN_OFFSET]);
+            let blue = u32::from(rgb[source + mvs::MVS_RGB_BLUE_OFFSET]);
+            framebuffer.pixels_mut()[destination] = (red << 16) | (green << 8) | blue;
+        }
+    }
+    Ok(())
+}
+
+fn apply_prepared_partial_to_surface(
+    receiver: &mut MvsReceiveState,
+    surface: &mut DisplaySurface,
+    prepared: mvs::PreparedOpaqueMvsState,
+) -> Result<bool> {
+    if surface.generation != receiver.generation {
+        bail!(
+            "MVS prepared partial generation 与当前 surface 不一致: receiver={}, surface={}",
+            receiver.generation,
+            surface.generation
+        );
+    }
+    validate_partial_pixels_for_framebuffer(&surface.framebuffer, prepared.partial_pixels())?;
+    let has_pixels = !prepared.partial_pixels().operations.is_empty();
+    let partial_pixels = receiver.commit_opaque(prepared)?;
+    if has_pixels {
+        apply_validated_partial_pixels_to_framebuffer(&mut surface.framebuffer, &partial_pixels);
+        surface.record_native_partial_applied();
+    }
+    Ok(has_pixels)
+}
+
+/// 已严格分类为像素记录后的原生 prepare/apply/commit 事务。
+fn apply_native_mvs_frame_with<F>(
+    receiver: &mut MvsReceiveState,
+    record: &MvsRecord,
+    surface: &Arc<Mutex<DisplaySurface>>,
+    dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
+    apply: F,
+) -> Result<MvsRecordOutcome>
+where
+    F: FnOnce(&mut Framebuffer, &[u8], usize, usize, usize, usize) -> Result<()>,
+{
+    let (surface_generation, display_size) = {
+        let surface = surface.lock().unwrap();
+        (
+            surface.generation,
+            DisplaySize::new(
+                surface.framebuffer.width as u16,
+                surface.framebuffer.height as u16,
+            )
+            .expect("DisplaySurface dimensions are non-zero u16 values"),
+        )
+    };
+    if receiver.generation != surface_generation {
+        eprintln!("[hpss-view] 忽略过期 generation 的 MVS 记录");
+        return Ok(MvsRecordOutcome::Ignored);
+    }
+    if !mark_recovery_for_invalid_mvs_geometry(receiver, record.rect, display_size)? {
+        return Ok(MvsRecordOutcome::RecoveryRequested);
+    }
+    let complete_surface = is_complete_surface_frame(record.rect, display_size);
+    let prepared = match receiver.prepare_rect(&record.payload, record.rect, display_size) {
+        Ok(mvs::MvsDecodeDecision::Prepared(prepared)) => prepared,
+        Ok(mvs::MvsDecodeDecision::PreparedOpaque(prepared)) => {
+            let applied = {
+                let mut surface = surface.lock().unwrap();
+                if surface.generation != surface_generation {
+                    Err(anyhow::anyhow!(
+                        "MVS surface generation 在 partial 应用前发生变化"
+                    ))
+                } else {
+                    apply_prepared_partial_to_surface(receiver, &mut surface, prepared)
+                }
+            };
+            let has_pixels = match applied {
+                Ok(true) => {
+                    eprintln!("[hpss-view] MVS type-1 增量像素与 codec 状态已提交");
+                    true
+                }
+                Ok(false) => {
+                    eprintln!("[hpss-view] MVS type-1 no-op/cache 状态已提交");
+                    false
+                }
+                Err(error) => {
+                    eprintln!("[hpss-view] MVS type-1 framebuffer 事务失败，重同步: {error:#}");
+                    receiver.request_full()?;
+                    return Ok(MvsRecordOutcome::RecoveryRequested);
+                }
+            };
+            // Partial pixels are visible, but a type-1 update is never the
+            // complete type-0 codec baseline used by the P1 evidence latch.
+            return Ok(MvsRecordOutcome::PartialApplied { has_pixels });
+        }
+        Ok(mvs::MvsDecodeDecision::RequestFull(reason)) => {
+            eprintln!("[hpss-view] MVS 原生记录要求全量重同步: {reason:?}");
+            receiver.request_full()?;
+            return Ok(MvsRecordOutcome::RecoveryRequested);
+        }
+        Ok(mvs::MvsDecodeDecision::IgnoreStale) => {
+            eprintln!("[hpss-view] 忽略过期 generation 的 MVS prepare");
+            return Ok(MvsRecordOutcome::Ignored);
+        }
+        Err(error) => {
+            eprintln!("[hpss-view] MVS 原生 prepare 失败，重同步: {error:#}");
+            receiver.request_full()?;
+            return Ok(MvsRecordOutcome::RecoveryRequested);
+        }
+    };
+
+    let applied = {
+        let mut surface = surface.lock().unwrap();
+        if surface.generation != surface_generation {
+            Err(anyhow::anyhow!("MVS surface generation 在应用前发生变化"))
+        } else {
+            apply_prepared_mvs_to_surface_with(receiver, &mut surface, prepared, record.rect, apply)
+                .map(|()| surface.record_native_type_zero_applied())
+        }
+    };
+    let observability = match applied {
+        Ok(observability) => observability,
+        Err(error) => {
+            eprintln!("[hpss-view] MVS 原生 framebuffer 事务失败，重同步: {error:#}");
+            receiver.request_full()?;
+            return Ok(MvsRecordOutcome::RecoveryRequested);
+        }
+    };
+
+    eprintln!(
+        "[hpss-view] native MVS: generation={}, rect=({},{} {}x{}), type0_total={}",
+        receiver.generation,
+        record.rect.x,
+        record.rect.y,
+        record.rect.width,
+        record.rect.height,
+        observability.type_zero_applied_count,
+    );
+    if complete_surface {
+        dynamic_resolution
+            .lock()
+            .unwrap()
+            .observe_full_applied(receiver.generation, display_size);
+        eprintln!("[hpss-view] 当前 generation 的完整 surface 证据已确认");
+    }
+    Ok(MvsRecordOutcome::FullApplied { complete_surface })
+}
+
+fn process_complete_mvs_record(
+    receiver: &mut MvsReceiveState,
+    record: MvsRecord,
+    surface: &Arc<Mutex<DisplaySurface>>,
+    dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
+    writer: &AppleWriterHandle,
+    requests: &mut ReaderRequestState,
+) -> Result<MvsRecordOutcome> {
+    let (surface_generation, display_size) = {
+        let surface = surface.lock().unwrap();
+        (
+            surface.generation,
+            DisplaySize::new(
+                surface.framebuffer.width as u16,
+                surface.framebuffer.height as u16,
+            )
+            .expect("DisplaySurface dimensions are non-zero u16 values"),
+        )
+    };
+    if receiver.generation != surface_generation {
+        return Ok(MvsRecordOutcome::Ignored);
+    }
+
+    match mvs::classify_mvs_record(record.rect, &record.payload) {
+        Ok(mvs::MvsRecordKind::Tables(payload)) => {
+            if let Err(e) = receiver.install_tables(payload) {
+                eprintln!("[hpss-view] MVS 表初始化无效，重同步: {e:#}");
+                receiver.request_full()?;
+                return request_full_update(
+                    writer,
+                    requests,
+                    display_size.width,
+                    display_size.height,
+                )
+                .map(|()| MvsRecordOutcome::RecoveryRequested);
+            }
+            let status = requests.on_valid_table_record(receiver.generation, Instant::now())?;
+            eprintln!("[hpss-view] MVS 量化表就绪，full follow-up 已调度: {status:?}");
+            return Ok(MvsRecordOutcome::TableInstalled);
+        }
+        Ok(mvs::MvsRecordKind::Frame(_)) => {}
+        Err(error) => {
+            eprintln!("[hpss-view] MVS 表初始化候选无效，重同步: {error:#}");
+            receiver.request_full()?;
+            return request_full_update(writer, requests, display_size.width, display_size.height)
+                .map(|()| MvsRecordOutcome::RecoveryRequested);
+        }
+    }
+
+    let outcome = apply_native_mvs_frame_with(
+        receiver,
+        &record,
+        surface,
+        dynamic_resolution,
+        apply_rgb_rect,
+    )?;
+    if outcome == MvsRecordOutcome::RecoveryRequested {
+        return request_full_update(writer, requests, display_size.width, display_size.height)
+            .map(|()| MvsRecordOutcome::RecoveryRequested);
+    }
+    Ok(outcome)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "网络适配层显式传入共享状态，避免隐藏全局状态和锁顺序"
+)]
+fn service_network_reader_tick(
+    receiver: &mut MvsReceiveState,
+    requests: &mut ReaderRequestState,
+    surface: &Arc<Mutex<DisplaySurface>>,
+    viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
+    dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
+    writer: &AppleWriterHandle,
+    now: Instant,
+) -> Result<ReaderTickOutcome> {
+    let size = current_surface_size(surface);
+    let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
+    // 固定锁序：queue → runtime → Apple writer。surface 已在上方解锁。
+    let mut queue = viewport_requests.lock().unwrap();
+    let mut runtime = dynamic_resolution.lock().unwrap();
+    service_reader_tick_at(
+        receiver,
+        requests,
+        &mut queue,
+        &mut runtime,
+        now,
+        thread::sleep,
+        || send_encrypted(writer, &full),
+        |target| {
+            let query = hpss::build_display_query(target);
+            send_encrypted(writer, &query)?;
+            Ok(Instant::now())
+        },
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "网络 full 边界适配器显式传入共享状态，保持锁和写事务可审计"
+)]
+fn finish_network_full_boundary(
+    receiver: &mut MvsReceiveState,
+    requests: &mut ReaderRequestState,
+    surface: &Arc<Mutex<DisplaySurface>>,
+    viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
+    dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
+    writer: &AppleWriterHandle,
+    now: Instant,
+) -> Result<FullBoundaryOutcome> {
+    let size = current_surface_size(surface);
+    let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
+    let incremental = incremental_request_after_full_apply(size.width, size.height)?;
+    let mut queue = viewport_requests.lock().unwrap();
+    let mut runtime = dynamic_resolution.lock().unwrap();
+    finish_full_boundary_at(
+        receiver,
+        requests,
+        &mut queue,
+        &mut runtime,
+        now,
+        thread::sleep,
+        || send_encrypted(writer, &full),
+        |target| {
+            let query = hpss::build_display_query(target);
+            send_encrypted(writer, &query)?;
+            Ok(Instant::now())
+        },
+        || send_encrypted(writer, &incremental),
+    )
+}
+
+fn log_reader_tick(outcome: &ReaderTickOutcome) {
+    if outcome.incomplete_recovered {
+        eprintln!("[hpss-view] MVS 不完整记录超时，已中止并请求全量重同步");
+    }
+    if outcome.dynamic_timed_out {
+        eprintln!("[hpss-view] 动态分辨率确认超时，保留当前显示面并丢弃待处理 viewport");
+    }
+    if outcome.table_followup_sent {
+        eprintln!("[hpss-view] MVS table follow-up full request 已发送");
+    }
+    if let Some(request) = outcome.dynamic_request {
+        eprintln!(
+            "[hpss-view] 请求动态分辨率 {}x{} (generation {})",
+            request.target.width, request.target.height, request.generation
+        );
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "完整 MVS 记录处理需要显式传入 generation 状态与事务写器"
+)]
+fn handle_complete_mvs_record(
+    receiver: &mut MvsReceiveState,
+    requests: &mut ReaderRequestState,
+    record: MvsRecord,
+    surface: &Arc<Mutex<DisplaySurface>>,
+    viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
+    dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
+    writer: &AppleWriterHandle,
+    protocol_runtime: &mut ProtocolRuntime,
+    publisher: &mut AppleSurfacePublisher,
+) -> Result<()> {
+    requests.consume_mvs_response();
+    let dirty = PixelRect {
+        x: u32::from(record.rect.x),
+        y: u32::from(record.rect.y),
+        width: u32::from(record.rect.width),
+        height: u32::from(record.rect.height),
+    };
+    let outcome = process_complete_mvs_record(
+        receiver,
+        record,
+        surface,
+        dynamic_resolution,
+        writer,
+        requests,
+    )?;
+    let publication = match outcome {
+        MvsRecordOutcome::FullApplied { complete_surface } => {
+            let surface = surface.lock().unwrap();
+            publisher
+                .publish_committed(
+                    protocol_runtime,
+                    &surface,
+                    receiver.generation,
+                    dirty,
+                    MvsFrameKind::TypeZero {
+                        complete_surface,
+                        initial_nonblack: surface.contains_nonblack(),
+                    },
+                )
+                .map_err(|error| anyhow::anyhow!(error.code()))?
+        }
+        MvsRecordOutcome::PartialApplied { has_pixels: true } => {
+            let surface = surface.lock().unwrap();
+            publisher
+                .publish_committed(
+                    protocol_runtime,
+                    &surface,
+                    receiver.generation,
+                    dirty,
+                    MvsFrameKind::TypeOne,
+                )
+                .map_err(|error| anyhow::anyhow!(error.code()))?
+        }
+        _ => PublicationOutcome::Published,
+    };
+    if matches!(
+        publication,
+        PublicationOutcome::NeedsFullBaseline | PublicationOutcome::NeedsFullSnapshot
+    ) {
+        receiver.request_full()?;
+        let size = current_surface_size(surface);
+        request_full_update(writer, requests, size.width, size.height)?;
+        return Ok(());
+    }
+    if matches!(outcome, MvsRecordOutcome::FullApplied { .. }) {
+        let boundary = finish_network_full_boundary(
+            receiver,
+            requests,
+            surface,
+            viewport_requests,
+            dynamic_resolution,
+            writer,
+            Instant::now(),
+        )?;
+        if let Some(request) = boundary.dynamic_request {
+            eprintln!(
+                "[hpss-view] full 边界切换为动态分辨率 {}x{} (generation {})",
+                request.target.width, request.target.height, request.generation
+            );
+        } else if boundary.incremental_sent {
+            eprintln!("[hpss-view] MVS full 已应用并请求下一增量响应");
+        }
+    } else if matches!(outcome, MvsRecordOutcome::PartialApplied { .. }) {
+        let size = current_surface_size(surface);
+        let incremental = incremental_request_after_full_apply(size.width, size.height)?;
+        if finish_partial_boundary_at(requests, || send_encrypted(writer, &incremental))? {
+            eprintln!("[hpss-view] MVS type-1 已提交并请求下一增量响应");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) enum NetworkFrameOutcome {
+    Consumed,
+    Media(Media),
+}
+
+pub(crate) struct NetworkReaderRuntime {
+    receiver: MvsReceiveState,
+    requests: ReaderRequestState,
+    surface: Arc<Mutex<DisplaySurface>>,
+    viewport_requests: Arc<Mutex<ViewportRequestQueue>>,
+    dynamic_resolution: Arc<Mutex<DynamicResolutionRuntime>>,
+    publisher: AppleSurfacePublisher,
+}
+
+impl NetworkReaderRuntime {
+    pub(crate) fn new(
+        protocol_runtime: &mut ProtocolRuntime,
+        session_id: frd_core::SessionId,
+        initial_size: DisplaySize,
+        dynamic_resolution_enabled: bool,
+        startup_fb_sent_at: Instant,
+    ) -> Result<Self, ProtocolError> {
+        let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
+            .ok_or(ProtocolError::FramePortRejected)?;
+        let publisher = AppleSurfacePublisher::begin(protocol_runtime, session_id, size)?;
+        let surface = DisplaySurface::new(1, size).map_err(|_| ProtocolError::FramePortRejected)?;
+        Ok(Self {
+            receiver: MvsReceiveState::new(1),
+            requests: ReaderRequestState::after_startup(startup_fb_sent_at),
+            surface: Arc::new(Mutex::new(surface)),
+            viewport_requests: Arc::new(Mutex::new(ViewportRequestQueue::default())),
+            dynamic_resolution: Arc::new(Mutex::new(DynamicResolutionRuntime::new(
+                initial_size,
+                dynamic_resolution_enabled,
+            ))),
+            publisher,
+        })
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.publisher.generation()
+    }
+
+    pub(crate) fn observe_viewport(&self, viewport: PhysicalViewport, now: Instant) {
+        let width = viewport.content.width as usize;
+        let height = viewport.content.height as usize;
+        if let Some(target) = DisplaySize::from_viewport(width, height) {
+            self.viewport_requests.lock().unwrap().observe(target, now);
+        } else {
+            self.viewport_requests.lock().unwrap().drop_latest();
+        }
+    }
+
+    pub(crate) fn service_tick(&mut self, writer: &AppleWriterHandle, now: Instant) -> Result<()> {
+        let outcome = service_network_reader_tick(
+            &mut self.receiver,
+            &mut self.requests,
+            &self.surface,
+            &self.viewport_requests,
+            &self.dynamic_resolution,
+            writer,
+            now,
+        )?;
+        log_reader_tick(&outcome);
+        Ok(())
+    }
+
+    pub(crate) fn handle_frame(
+        &mut self,
+        message: Vec<u8>,
+        writer: &AppleWriterHandle,
+        media_state: &mut ViewerMediaState,
+        protocol_runtime: &mut ProtocolRuntime,
+    ) -> Result<NetworkFrameOutcome> {
+        if reader_frame_class(&self.receiver, &message) == ReaderFrameClass::Continuation {
+            let record = match self.receiver.push_continuation(&message) {
+                Ok(record) => record,
+                Err(error) => {
+                    eprintln!("[hpss-view] MVS continuation 结构错误，重同步: {error:#}");
+                    self.receiver.request_full()?;
+                    self.requests.consume_mvs_response();
+                    let size = current_surface_size(&self.surface);
+                    request_full_update(writer, &mut self.requests, size.width, size.height)?;
+                    return Ok(NetworkFrameOutcome::Consumed);
+                }
+            };
+            if let Some(record) = record {
+                handle_complete_mvs_record(
+                    &mut self.receiver,
+                    &mut self.requests,
+                    record,
+                    &self.surface,
+                    &self.viewport_requests,
+                    &self.dynamic_resolution,
+                    writer,
+                    protocol_runtime,
+                    &mut self.publisher,
+                )?;
+            }
+            return Ok(NetworkFrameOutcome::Consumed);
+        }
+
+        match reader_frame_class(&self.receiver, &message) {
+            ReaderFrameClass::ServerKeepalive | ReaderFrameClass::Query => {
+                return Ok(NetworkFrameOutcome::Consumed);
+            }
+            ReaderFrameClass::ControlOrMedia => {}
+            ReaderFrameClass::Continuation => unreachable!("continuation 已在上方处理"),
+        }
+
+        match parse_media(&message) {
+            Ok(Media::Mvs {
+                x,
+                y,
+                w,
+                h,
+                total,
+                body,
+            }) => {
+                let record = match self.receiver.begin(
+                    MvsRect {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    },
+                    total,
+                    &body,
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        eprintln!("[hpss-view] MVS 首片结构错误，重同步: {error:#}");
+                        self.receiver.request_full()?;
+                        self.requests.consume_mvs_response();
+                        let size = current_surface_size(&self.surface);
+                        request_full_update(writer, &mut self.requests, size.width, size.height)?;
+                        return Ok(NetworkFrameOutcome::Consumed);
+                    }
+                };
+                if let Some(record) = record {
+                    handle_complete_mvs_record(
+                        &mut self.receiver,
+                        &mut self.requests,
+                        record,
+                        &self.surface,
+                        &self.viewport_requests,
+                        &self.dynamic_resolution,
+                        writer,
+                        protocol_runtime,
+                        &mut self.publisher,
+                    )?;
+                }
+                Ok(NetworkFrameOutcome::Consumed)
+            }
+            Ok(Media::State(encoding::SERVER_STATE)) => {
+                if let Some((width, height)) = hpss::parse_server_state_w_h(&message) {
+                    if let Some(observed) = DisplaySize::new(width, height) {
+                        let commit = {
+                            let mut dynamic = self.dynamic_resolution.lock().unwrap();
+                            let mut surface = self.surface.lock().unwrap();
+                            let current = DisplaySize::new(
+                                surface.framebuffer.width as u16,
+                                surface.framebuffer.height as u16,
+                            )
+                            .expect("DisplaySurface dimensions are non-zero u16 values");
+                            dynamic.observe_initial_server_state(observed, current);
+                            commit_server_geometry(
+                                &mut dynamic,
+                                &mut self.receiver,
+                                &mut surface,
+                                media_state,
+                                observed,
+                            )
+                        };
+                        if let Some(commit) = commit {
+                            let size =
+                                PixelSize::new(commit.size.width.into(), commit.size.height.into())
+                                    .context("动态分辨率确认尺寸非法")?;
+                            self.publisher
+                                .begin_next_generation(protocol_runtime, commit.generation, size)
+                                .map_err(|error| anyhow::anyhow!(error.code()))?;
+                            self.requests.reset_generation(commit.generation);
+                            request_full_update(
+                                writer,
+                                &mut self.requests,
+                                commit.size.width,
+                                commit.size.height,
+                            )?;
+                        }
+                    }
+                }
+                Ok(NetworkFrameOutcome::Consumed)
+            }
+            Ok(Media::State(_)) | Ok(Media::Cursor { .. }) => Ok(NetworkFrameOutcome::Consumed),
+            Ok(media @ (Media::PortAnnouncement(_) | Media::StreamAnswer(_))) => {
+                Ok(NetworkFrameOutcome::Media(media))
+            }
+            Err(error) => match self.receiver.reject_truncated_mvs_envelope(&message) {
+                Ok(true) => {
+                    eprintln!("[hpss-view] MVS 信封截断，重同步: {error:#}");
+                    self.requests.consume_mvs_response();
+                    let size = current_surface_size(&self.surface);
+                    request_full_update(writer, &mut self.requests, size.width, size.height)?;
+                    Ok(NetworkFrameOutcome::Consumed)
+                }
+                Ok(false) => Ok(NetworkFrameOutcome::Consumed),
+                Err(state_error) => Err(state_error),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod migrated_runtime_tests {
+    use super::*;
+
+    fn type_two_tables_fixture() -> [u8; 129] {
+        let mut payload = [0u8; 129];
+        payload[0] = 2;
+        payload
+    }
+
+    struct TestBitWriter {
+        bytes: Vec<u8>,
+        current: u8,
+        used: u8,
+    }
+
+    impl TestBitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                current: 0,
+                used: 0,
+            }
+        }
+
+        fn write_bits(&mut self, value: u32, count: u8) {
+            for shift in (0..count).rev() {
+                self.current = (self.current << 1) | (((value >> shift) & 1) as u8);
+                self.used += 1;
+                if self.used == 8 {
+                    self.bytes.push(self.current);
+                    self.current = 0;
+                    self.used = 0;
+                }
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.used != 0 {
+                self.current <<= 8 - self.used;
+                self.bytes.push(self.current);
+            }
+            self.bytes
+        }
+    }
+
+    fn native_mode_zero_payload() -> Vec<u8> {
+        let mut mode = TestBitWriter::new();
+        mode.write_bits(1, 1);
+        mode.write_bits(0, 3);
+        mode.write_bits(0, 1);
+        mode.write_bits(0x6d, 8);
+        let mode = mode.finish();
+
+        let mut data = TestBitWriter::new();
+        data.write_bits(0x6d, 8);
+        let data = data.finish();
+        let data_offset = 6 + mode.len();
+        let mut payload = vec![
+            0,
+            0,
+            0,
+            u8::try_from(data_offset >> 16).unwrap(),
+            u8::try_from((data_offset >> 8) & 0xff).unwrap(),
+            u8::try_from(data_offset & 0xff).unwrap(),
+        ];
+        payload.extend_from_slice(&mode);
+        payload.extend_from_slice(&data);
+        payload
+    }
+
+    fn native_opcode_zero_partial_payload() -> Vec<u8> {
+        let mut bits = TestBitWriter::new();
+        bits.write_bits(0, 2);
+        bits.write_bits(0x6d, 8);
+        bits.write_bits(0x76, 8);
+        bits.write_bits(0x73, 8);
+        let mut payload = vec![1, 0, 0];
+        payload.extend(bits.finish());
+        payload
+    }
+
+    fn native_mode_five_seed_payload() -> Vec<u8> {
+        let mut mode = TestBitWriter::new();
+        mode.write_bits(1, 1);
+        mode.write_bits(5, 3);
+        mode.write_bits(0, 1);
+        mode.write_bits(0x6d, 8);
+        let mode = mode.finish();
+
+        let mut data = TestBitWriter::new();
+        data.write_bits(0, 3);
+        data.write_bits(0, 2);
+        data.write_bits(0, 2);
+        data.write_bits(0, 2);
+        data.write_bits(0b0010, 4);
+        data.write_bits(0x6d, 8);
+        let data = data.finish();
+        let data_offset = 6 + mode.len();
+        let mut payload = vec![
+            0,
+            0,
+            0,
+            u8::try_from(data_offset >> 16).unwrap(),
+            u8::try_from((data_offset >> 8) & 0xff).unwrap(),
+            u8::try_from(data_offset & 0xff).unwrap(),
+        ];
+        payload.extend_from_slice(&mode);
+        payload.extend_from_slice(&data);
+        payload
+    }
+
+    fn native_opcode_one_partial_payload() -> Vec<u8> {
+        let mut bits = TestBitWriter::new();
+        bits.write_bits(1, 2);
+        bits.write_bits(0, 6);
+        bits.write_bits(0, 1);
+        bits.write_bits(0b1010, 4);
+        bits.write_bits(0, 1);
+        bits.write_bits(0b1010, 4);
+        bits.write_bits(0x6d, 8);
+        bits.write_bits(0x76, 8);
+        bits.write_bits(0x73, 8);
+        let mut payload = vec![1, 1, 1];
+        payload.extend(bits.finish());
+        payload
+    }
+
+    fn native_record(rect: MvsRect) -> MvsRecord {
+        MvsRecord {
+            rect,
+            payload: native_mode_zero_payload(),
+        }
+    }
+
+    fn native_surface(width: usize, height: usize) -> Arc<Mutex<DisplaySurface>> {
+        Arc::new(Mutex::new(
+            DisplaySurface::new(1, PixelSize::new(width as u32, height as u32).unwrap()).unwrap(),
+        ))
+    }
+
+    fn native_runtime(width: u16, height: u16) -> Arc<Mutex<DynamicResolutionRuntime>> {
+        Arc::new(Mutex::new(DynamicResolutionRuntime::new(
+            DisplaySize::new(width, height).unwrap(),
+            true,
+        )))
+    }
+
+    fn commit_native_mode_zero(receiver: &mut MvsReceiveState) {
+        let decision = receiver.prepare(&native_mode_zero_payload(), 8, 8).unwrap();
+        let mvs::MvsDecodeDecision::Prepared(prepared) = decision else {
+            panic!("expected native preparation");
+        };
+        receiver.commit(prepared).unwrap();
+    }
+    fn arm_runtime(runtime: &mut DynamicResolutionRuntime, initial: DisplaySize, full_first: bool) {
+        if full_first {
+            assert!(!runtime.observe_full_applied(1, initial));
+            assert!(runtime.observe_initial_server_state(initial, initial));
+        } else {
+            assert!(!runtime.observe_initial_server_state(initial, initial));
+            assert!(runtime.observe_full_applied(1, initial));
+        }
+    }
+    #[test]
+    fn capability_arms_only_after_matching_state_and_current_full_in_either_order() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let target = DisplaySize::new(1280, 720).unwrap();
+
+        for full_first in [false, true] {
+            let mut runtime = DynamicResolutionRuntime::new(initial, true);
+            assert!(runtime
+                .send_target_with(target, |_| Ok(Instant::now()))
+                .unwrap()
+                .is_none());
+            arm_runtime(&mut runtime, initial, full_first);
+            assert!(runtime
+                .send_target_with(target, |_| Ok(Instant::now()))
+                .unwrap()
+                .is_some());
+        }
+    }
+    #[test]
+    fn capability_mismatch_and_default_off_never_arm_dynamic_requests() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let target = DisplaySize::new(1280, 720).unwrap();
+        let mismatch = DisplaySize::new(1024, 768).unwrap();
+
+        let mut mismatch_runtime = DynamicResolutionRuntime::new(initial, true);
+        assert!(!mismatch_runtime.observe_initial_server_state(mismatch, initial));
+        assert!(!mismatch_runtime.observe_full_applied(1, initial));
+        assert!(mismatch_runtime
+            .send_target_with(target, |_| Ok(Instant::now()))
+            .unwrap()
+            .is_none());
+
+        let mut disabled = DynamicResolutionRuntime::new(initial, false);
+        assert!(!disabled.observe_initial_server_state(initial, initial));
+        assert!(!disabled.observe_full_applied(1, initial));
+        assert!(disabled
+            .send_target_with(target, |_| Ok(Instant::now()))
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn resize_pending_becomes_visible_only_after_successful_send() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let target = DisplaySize::new(1280, 720).unwrap();
+        let sent_at = Instant::now();
+        let mut initial_runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut initial_runtime, initial, false);
+        let runtime = Arc::new(Mutex::new(initial_runtime));
+        let reader_runtime = runtime.clone();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            start_rx.recv().unwrap();
+            attempt_tx.send(()).unwrap();
+            let committed = reader_runtime
+                .lock()
+                .unwrap()
+                .observe_server_state(target)
+                .is_some();
+            commit_tx.send(committed).unwrap();
+        });
+
+        let request = {
+            let mut runtime = runtime.lock().unwrap();
+            runtime
+                .send_target_with(target, |_| {
+                    start_tx.send(()).unwrap();
+                    attempt_rx.recv().unwrap();
+                    assert!(commit_rx.try_recv().is_err());
+                    Ok(sent_at)
+                })
+                .unwrap()
+                .unwrap()
+        };
+
+        assert!(commit_rx.recv().unwrap());
+        reader.join().unwrap();
+        assert_eq!(request.target, target);
+        assert_eq!(runtime.lock().unwrap().pending_since, None);
+    }
+    #[test]
+    fn failed_resize_send_leaves_controller_stable_without_timestamp() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let target = DisplaySize::new(1280, 720).unwrap();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+
+        assert!(runtime
+            .send_target_with(target, |_| anyhow::bail!("injected send failure"))
+            .is_err());
+        assert!(runtime.pending_since.is_none());
+        assert!(matches!(
+            runtime.controller.state(),
+            crate::dynamic_resolution::DynamicResolutionState::Stable { size, .. }
+                if *size == initial
+        ));
+    }
+    #[test]
+    fn latest_debounced_viewport_waits_for_inflight_then_sends_once() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let first = DisplaySize::new(1280, 720).unwrap();
+        let latest = DisplaySize::new(1024, 768).unwrap();
+        let started = Instant::now();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        let mut queue = ViewportRequestQueue::default();
+        let mut sent = Vec::new();
+
+        queue.observe(first, started);
+        queue
+            .service(&mut runtime, started + Duration::from_millis(250), |size| {
+                sent.push(size);
+                Ok(started + Duration::from_millis(250))
+            })
+            .unwrap();
+        queue.observe(latest, started + Duration::from_millis(300));
+        queue
+            .service(&mut runtime, started + Duration::from_millis(550), |size| {
+                sent.push(size);
+                Ok(started + Duration::from_millis(550))
+            })
+            .unwrap();
+        assert_eq!(sent, vec![first]);
+        assert!(queue.latest.is_some());
+
+        assert!(runtime.observe_server_state(first).is_some());
+        assert!(runtime.observe_full_applied(2, first));
+        queue
+            .service(&mut runtime, started + Duration::from_millis(551), |size| {
+                sent.push(size);
+                Ok(started + Duration::from_millis(551))
+            })
+            .unwrap();
+        queue
+            .service(&mut runtime, started + Duration::from_millis(800), |size| {
+                sent.push(size);
+                Ok(started + Duration::from_millis(800))
+            })
+            .unwrap();
+
+        assert_eq!(sent, vec![first, latest]);
+        assert!(queue.latest.is_none());
+    }
+    #[test]
+    fn old_incremental_inflight_defers_dynamic_until_fragmented_response_boundary() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let target = DisplaySize::new(1280, 720).unwrap();
+        let started = Instant::now();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        let mut receiver = MvsReceiveState::new(0);
+        let mut requests = ReaderRequestState::after_startup(started);
+        let mut queue = ViewportRequestQueue::default();
+        queue.observe(target, started);
+        let mut dynamic_sends = Vec::new();
+        let mut full_sends = 0;
+
+        let before_response = service_reader_tick_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            started + Duration::from_millis(250),
+            |_| {},
+            || {
+                full_sends += 1;
+                Ok(())
+            },
+            |size| {
+                dynamic_sends.push(size);
+                Ok(started + Duration::from_millis(250))
+            },
+        )
+        .unwrap();
+        assert!(before_response.dynamic_request.is_none());
+        assert!(requests.framebuffer_request_in_flight());
+
+        let rect = MvsRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert!(receiver
+            .begin_at(rect, 2, &[0], started + Duration::from_millis(300))
+            .unwrap()
+            .is_none());
+        let while_fragmented = service_reader_tick_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            started + Duration::from_millis(350),
+            |_| {},
+            || {
+                full_sends += 1;
+                Ok(())
+            },
+            |size| {
+                dynamic_sends.push(size);
+                Ok(started + Duration::from_millis(350))
+            },
+        )
+        .unwrap();
+        assert!(while_fragmented.dynamic_request.is_none());
+        assert!(receiver.push_continuation(&[1]).unwrap().is_some());
+        requests.consume_mvs_response();
+
+        let mut incrementals = 0;
+        let boundary = finish_full_boundary_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            started + Duration::from_millis(351),
+            |_| {},
+            || {
+                full_sends += 1;
+                Ok(())
+            },
+            |size| {
+                dynamic_sends.push(size);
+                Ok(started + Duration::from_millis(351))
+            },
+            || {
+                incrementals += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(boundary.dynamic_request.is_some());
+        assert!(!boundary.incremental_sent);
+        assert_eq!(dynamic_sends, vec![target]);
+        assert_eq!(incrementals, 0);
+        assert_eq!(full_sends, 0);
+        let server_state = [
+            0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x51, 0, 0x4c, 0, 5, 0x05, 0xa0, 0x0a, 0,
+        ];
+        assert_eq!(
+            reader_frame_class(&receiver, &server_state),
+            ReaderFrameClass::ControlOrMedia
+        );
+        assert!(runtime.observe_server_state(target).is_some());
+    }
+    #[test]
+    fn full_boundary_without_mature_candidate_sends_one_incremental() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let started = Instant::now();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        let mut receiver = MvsReceiveState::new(0);
+        let mut requests = ReaderRequestState::after_startup(started);
+        let mut queue = ViewportRequestQueue::default();
+        requests.consume_mvs_response();
+        let mut incrementals = 0;
+
+        let boundary = finish_full_boundary_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            started + Duration::from_millis(10),
+            |_| {},
+            || Ok(()),
+            |_| anyhow::bail!("dynamic send should not run"),
+            || {
+                incrementals += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(boundary.dynamic_request.is_none());
+        assert!(boundary.incremental_sent);
+        assert_eq!(incrementals, 1);
+        assert!(requests.framebuffer_request_in_flight());
+    }
+    #[test]
+    fn table_followup_is_one_shot_and_full_before_due_cancels_it() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let started = Instant::now();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        let mut receiver = MvsReceiveState::new(0);
+        let mut requests = ReaderRequestState::after_startup(started);
+        let mut queue = ViewportRequestQueue::default();
+        requests.consume_mvs_response();
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        assert_eq!(
+            requests.on_valid_table_record(0, started).unwrap(),
+            TableScheduleStatus::Scheduled
+        );
+        let due = requests.table_followup_due().unwrap();
+        assert_eq!(
+            requests
+                .on_valid_table_record(0, started + Duration::from_millis(50))
+                .unwrap(),
+            TableScheduleStatus::AlreadyScheduled
+        );
+        assert_eq!(requests.table_followup_due(), Some(due));
+
+        let mut table_full_writes = 0;
+        service_reader_tick_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            due - Duration::from_millis(1),
+            |_| {},
+            || {
+                table_full_writes += 1;
+                Ok(())
+            },
+            |_| anyhow::bail!("dynamic send should not run"),
+        )
+        .unwrap();
+        assert_eq!(table_full_writes, 0);
+
+        requests.consume_mvs_response();
+        commit_native_mode_zero(&mut receiver);
+        let mut incrementals = 0;
+        finish_full_boundary_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            due - Duration::from_millis(1),
+            |_| {},
+            || {
+                table_full_writes += 1;
+                Ok(())
+            },
+            |_| anyhow::bail!("dynamic send should not run"),
+            || {
+                incrementals += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        service_reader_tick_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            due + Duration::from_secs(1),
+            |_| {},
+            || {
+                table_full_writes += 1;
+                Ok(())
+            },
+            |_| anyhow::bail!("dynamic send should not run"),
+        )
+        .unwrap();
+
+        assert_eq!(table_full_writes, 0);
+        assert_eq!(incrementals, 1);
+        assert!(requests.table_followup_due().is_none());
+        assert!(!receiver.awaiting_full());
+    }
+    #[test]
+    fn table_only_followup_sends_exactly_once_and_duplicate_after_sent_is_error() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let started = Instant::now();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        let mut receiver = MvsReceiveState::new(0);
+        let mut requests = ReaderRequestState::after_startup(started);
+        let mut queue = ViewportRequestQueue::default();
+        requests.consume_mvs_response();
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        assert_eq!(
+            requests.on_valid_table_record(0, started).unwrap(),
+            TableScheduleStatus::Scheduled
+        );
+        let due = requests.table_followup_due().unwrap();
+        let mut writes = 0;
+
+        let tick = service_reader_tick_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            due,
+            |_| {},
+            || {
+                writes += 1;
+                Ok(())
+            },
+            |_| anyhow::bail!("dynamic send should not run"),
+        )
+        .unwrap();
+        assert!(tick.table_followup_sent);
+        assert_eq!(writes, 1);
+        requests.consume_mvs_response();
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        assert!(requests
+            .on_valid_table_record(0, due + Duration::from_millis(1))
+            .is_err());
+        service_reader_tick_at(
+            &mut receiver,
+            &mut requests,
+            &mut queue,
+            &mut runtime,
+            due + Duration::from_secs(1),
+            |_| {},
+            || {
+                writes += 1;
+                Ok(())
+            },
+            |_| anyhow::bail!("dynamic send should not run"),
+        )
+        .unwrap();
+        assert_eq!(writes, 1);
+    }
+    #[test]
+    fn loop_tick_expires_continuous_continuations_and_independently_times_out_dynamic() {
+        let initial = DisplaySize::new(1440, 900).unwrap();
+        let target = DisplaySize::new(1280, 720).unwrap();
+        let latest = DisplaySize::new(1024, 768).unwrap();
+        let started = Instant::now();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        runtime.send_target_with(target, |_| Ok(started)).unwrap();
+        let mut receiver = MvsReceiveState::new(0);
+        let rect = MvsRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert!(receiver
+            .begin_at(rect, 100, &[0], started)
+            .unwrap()
+            .is_none());
+        let mut requests = ReaderRequestState::after_startup(started);
+        let mut queue = ViewportRequestQueue::default();
+        queue.observe(latest, started + Duration::from_millis(10));
+        let mut full_writes = 0;
+        let mut final_tick = None;
+
+        for step in 1..=40 {
+            let now = started + Duration::from_millis(step * 50);
+            let tick = service_reader_tick_at(
+                &mut receiver,
+                &mut requests,
+                &mut queue,
+                &mut runtime,
+                now,
+                |_| {},
+                || {
+                    full_writes += 1;
+                    Ok(())
+                },
+                |_| anyhow::bail!("dynamic send should not run"),
+            )
+            .unwrap();
+            if step < 40 {
+                assert!(!tick.incomplete_recovered);
+                assert!(receiver.push_continuation(&[]).unwrap().is_none());
+            } else {
+                final_tick = Some(tick);
+            }
+        }
+
+        let final_tick = final_tick.unwrap();
+        assert!(final_tick.incomplete_recovered);
+        assert!(final_tick.dynamic_timed_out);
+        assert_eq!(full_writes, 1);
+        assert!(!receiver.is_pending());
+        assert!(queue.latest.is_none());
+        assert_eq!(
+            reader_frame_class(&receiver, &[0x14]),
+            ReaderFrameClass::ServerKeepalive
+        );
+        let server_state = [
+            0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x51, 0, 0x4c, 0, 5, 0x05, 0xa0, 0x0a, 0,
+        ];
+        assert_eq!(
+            reader_frame_class(&receiver, &server_state),
+            ReaderFrameClass::ControlOrMedia
+        );
+    }
+    #[test]
+    fn full_resync_rate_limit_waits_then_writes_exactly_once() {
+        let now = Instant::now();
+        let mut last_request = Some(now);
+        let mut delays = Vec::new();
+        let mut writes = 0;
+
+        request_full_update_at(
+            &mut last_request,
+            now,
+            |delay| delays.push(delay),
+            || {
+                writes += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(delays, vec![Duration::from_millis(200)]);
+        assert_eq!(writes, 1);
+        assert_eq!(last_request, Some(now + Duration::from_millis(200)));
+    }
+    #[test]
+    fn pending_record_treats_heartbeat_shaped_frame_as_opaque_continuation() {
+        let mut receiver = MvsReceiveState::new(0);
+        let rect = MvsRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+
+        assert!(receiver.begin(rect, 2, &[0x00]).unwrap().is_none());
+        let record = receiver.push_continuation(&[0x14]).unwrap().unwrap();
+
+        assert_eq!(record.rect, rect);
+        assert_eq!(record.payload, vec![0x00, 0x14]);
+    }
+    #[test]
+    fn pending_record_treats_query_shaped_frame_as_opaque_continuation() {
+        let mut receiver = MvsReceiveState::new(0);
+        let rect = MvsRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+
+        assert!(receiver.begin(rect, 2, &[0x00]).unwrap().is_none());
+        let record = receiver.push_continuation(&[0x08]).unwrap().unwrap();
+
+        assert_eq!(record.payload, vec![0x00, 0x08]);
+    }
+    #[test]
+    fn truncated_mvs_envelope_requests_resynchronization() {
+        let mut receiver = MvsReceiveState::new(0);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        commit_native_mode_zero(&mut receiver);
+        let mut truncated = vec![0; 16];
+        truncated[12..16].copy_from_slice(&encoding::MVS.to_be_bytes());
+
+        assert!(receiver.reject_truncated_mvs_envelope(&truncated).unwrap());
+        assert!(receiver.awaiting_full());
+        assert!(hpss::is_truncated_mvs_envelope(&truncated));
+    }
+    #[test]
+    fn full_apply_always_queues_next_incremental_request() {
+        assert_eq!(
+            incremental_request_after_full_apply(1440, 2560).unwrap(),
+            protocol::msg_fb_update_request(true, 0, 0, 1440, 2560).unwrap()
+        );
+    }
+    #[test]
+    fn out_of_bounds_mvs_geometry_marks_recovery_instead_of_failing_the_reader() {
+        let mut receiver = MvsReceiveState::new(0);
+        let display = DisplaySize::new(640, 480).unwrap();
+        let invalid = MvsRect {
+            x: 630,
+            y: 470,
+            width: 20,
+            height: 20,
+        };
+
+        assert!(!mark_recovery_for_invalid_mvs_geometry(&mut receiver, invalid, display).unwrap());
+        assert!(receiver.awaiting_full());
+    }
+    #[test]
+    fn native_subrectangle_applies_without_complete_surface_evidence() {
+        let surface = native_surface(16, 8);
+        let dynamic = native_runtime(16, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let record = native_record(MvsRect {
+            x: 8,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                apply_rgb_rect,
+            )
+            .unwrap(),
+            MvsRecordOutcome::FullApplied {
+                complete_surface: false
+            }
+        );
+        let surface = surface.lock().unwrap();
+        assert!(surface.framebuffer.pixels()[..8]
+            .iter()
+            .all(|pixel| *pixel == 0));
+        assert!(surface.framebuffer.pixels()[8..16]
+            .iter()
+            .all(|pixel| *pixel == 0x00ff_ffff));
+        drop(surface);
+        assert!(!dynamic.lock().unwrap().evidence.current_full_media_applied);
+        assert!(!receiver.awaiting_full());
+    }
+    #[test]
+    fn slice_d_opaque_record_commits_through_orchestrator_without_surface_or_p1_publication() {
+        let surface = native_surface(8, 8);
+        surface
+            .lock()
+            .unwrap()
+            .framebuffer
+            .pixels_mut()
+            .fill(0x0012_3456);
+        let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
+        let dynamic = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        commit_native_mode_zero(&mut receiver);
+        assert!(!receiver.awaiting_full());
+        let record = MvsRecord {
+            rect: MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            payload: native_opcode_zero_partial_payload(),
+        };
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                |_, _, _, _, _, _| panic!("opaque type-1 reached framebuffer apply"),
+            )
+            .unwrap(),
+            MvsRecordOutcome::PartialApplied { has_pixels: false }
+        );
+        assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
+        assert!(!receiver.awaiting_full());
+        let runtime = dynamic.lock().unwrap();
+        assert!(!runtime.evidence.current_full_media_applied);
+        assert!(!runtime.evidence.non_paused_media_activity);
+        assert!(!runtime.armed);
+    }
+    #[test]
+    fn type_one_opcode_one_replaces_visible_pixels_transactionally() {
+        let surface = native_surface(8, 8);
+        let dynamic = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let seed = receiver
+            .prepare(&native_mode_five_seed_payload(), 8, 8)
+            .unwrap();
+        let mvs::MvsDecodeDecision::Prepared(seed) = seed else {
+            panic!("expected mode-five seed preparation");
+        };
+        receiver.commit(seed).unwrap();
+        surface
+            .lock()
+            .unwrap()
+            .framebuffer
+            .pixels_mut()
+            .fill(0x0012_3456);
+        let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
+        let record = MvsRecord {
+            rect: MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            payload: native_opcode_one_partial_payload(),
+        };
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                apply_rgb_rect,
+            )
+            .unwrap(),
+            MvsRecordOutcome::PartialApplied { has_pixels: true }
+        );
+        let surface = surface.lock().unwrap();
+        assert_ne!(surface.framebuffer.pixels(), before);
+        assert_eq!(surface.native_mvs_observability.type_zero_applied_count, 0);
+        assert_eq!(surface.native_mvs_observability.content_revision, 1);
+        drop(surface);
+        assert!(!dynamic.lock().unwrap().evidence.current_full_media_applied);
+    }
+    #[test]
+    fn slice_d_opaque_response_boundary_sends_one_normal_incremental_only() {
+        let mut requests = ReaderRequestState::after_startup(Instant::now());
+        requests.consume_mvs_response();
+        let mut writes = 0usize;
+
+        assert!(finish_partial_boundary_at(&mut requests, || {
+            writes += 1;
+            Ok(())
+        })
+        .unwrap());
+        assert_eq!(writes, 1);
+        assert!(requests.framebuffer_request_in_flight());
+        assert!(!finish_partial_boundary_at(&mut requests, || {
+            writes += 1;
+            Ok(())
+        })
+        .unwrap());
+        assert_eq!(writes, 1);
+    }
+    #[test]
+    fn invalid_geometry_is_rejected_before_native_prepare_or_surface_mutation() {
+        let surface = native_surface(8, 8);
+        let dynamic = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let initial = native_record(MvsRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        apply_native_mvs_frame_with(&mut receiver, &initial, &surface, &dynamic, apply_rgb_rect)
+            .unwrap();
+        assert!(!receiver.awaiting_full());
+        let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
+        let invalid = native_record(MvsRect {
+            x: 1,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &invalid,
+                &surface,
+                &dynamic,
+                |_, _, _, _, _, _| panic!("invalid geometry reached framebuffer apply"),
+            )
+            .unwrap(),
+            MvsRecordOutcome::RecoveryRequested
+        );
+        assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
+        assert!(receiver.awaiting_full());
+    }
+    #[test]
+    fn failed_surface_apply_drops_preparation_and_retry_decodes_identically() {
+        let surface = native_surface(8, 8);
+        let dynamic = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let record = native_record(MvsRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                |_, _, _, _, _, _| anyhow::bail!("injected framebuffer failure"),
+            )
+            .unwrap(),
+            MvsRecordOutcome::RecoveryRequested
+        );
+        assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
+        assert!(receiver.awaiting_full());
+        {
+            let runtime = dynamic.lock().unwrap();
+            assert!(!runtime.evidence.current_full_media_applied);
+            assert!(!runtime.armed);
+        }
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                apply_rgb_rect,
+            )
+            .unwrap(),
+            MvsRecordOutcome::FullApplied {
+                complete_surface: true
+            }
+        );
+        assert!(surface
+            .lock()
+            .unwrap()
+            .framebuffer
+            .pixels()
+            .iter()
+            .all(|pixel| *pixel == 0x00ff_ffff));
+    }
+    #[test]
+    fn type_one_and_decode_failure_preserve_visible_surface_and_request_resync() {
+        let surface = native_surface(8, 8);
+        surface
+            .lock()
+            .unwrap()
+            .framebuffer
+            .pixels_mut()
+            .fill(0x0012_3456);
+        let dynamic = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
+
+        for payload in [vec![1, 0x6d, 0x76, 0x73], vec![0]] {
+            let record = MvsRecord {
+                rect: MvsRect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+                payload,
+            };
+            assert_eq!(
+                apply_native_mvs_frame_with(
+                    &mut receiver,
+                    &record,
+                    &surface,
+                    &dynamic,
+                    apply_rgb_rect,
+                )
+                .unwrap(),
+                MvsRecordOutcome::RecoveryRequested
+            );
+            assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
+            assert!(receiver.awaiting_full());
+        }
+    }
+    #[test]
+    fn exact_native_surface_commits_before_arming_p1_evidence() {
+        let surface = native_surface(8, 8);
+        let dynamic = native_runtime(8, 8);
+        let initial = DisplaySize::new(8, 8).unwrap();
+        assert!(!dynamic
+            .lock()
+            .unwrap()
+            .observe_initial_server_state(initial, initial));
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let record = native_record(MvsRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+
+        assert_eq!(
+            apply_native_mvs_frame_with(
+                &mut receiver,
+                &record,
+                &surface,
+                &dynamic,
+                apply_rgb_rect,
+            )
+            .unwrap(),
+            MvsRecordOutcome::FullApplied {
+                complete_surface: true
+            }
+        );
+        assert!(!receiver.awaiting_full());
+        let runtime = dynamic.lock().unwrap();
+        assert!(runtime.evidence.current_full_media_applied);
+        assert!(runtime.armed);
+    }
+}

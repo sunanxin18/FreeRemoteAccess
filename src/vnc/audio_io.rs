@@ -227,6 +227,7 @@ impl PcmCaptureBuffer {
 
 /// Owns the active system input stream and yields exact 480-frame stereo PCM units.
 #[cfg(test)]
+#[allow(dead_code)]
 pub struct AudioCapture {
     _stream: Stream,
     buffer: Arc<Mutex<PcmCaptureBuffer>>,
@@ -234,6 +235,7 @@ pub struct AudioCapture {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl AudioCapture {
     pub fn open_default() -> Result<Self> {
         let host = cpal::default_host();

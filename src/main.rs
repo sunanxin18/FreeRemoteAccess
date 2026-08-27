@@ -71,6 +71,7 @@ fn require_login(credentials: &CredentialValues) -> Result<(&str, &str)> {
     Ok((username, password))
 }
 
+#[cfg(feature = "viewer")]
 fn parse_display_scale(value: &str) -> std::result::Result<f32, String> {
     let scale = value
         .parse::<f32>()

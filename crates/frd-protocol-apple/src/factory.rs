@@ -134,21 +134,24 @@ impl ProtocolSession for AppleProtocolSession {
             return ProtocolExit::Failed(error);
         }
         match connect_authenticated(&self.request) {
-            Ok(_connection) => {
-                if let Err(error) = self
-                    .runtime
-                    .publish_event(SessionEvent::StageChanged(ConnectionStage::TransportReady))
-                {
-                    return ProtocolExit::Failed(error);
-                }
-                ProtocolExit::Closed
+            Ok(established) => {
+                // Authentication is complete; do not retain the credential
+                // buffer for the long-running HPSS/MVS session.
+                self.request.credentials.take();
+                crate::runtime::run_authenticated_session(
+                    established,
+                    self.runtime,
+                    self.request.session_id,
+                )
             }
             Err(error) => ProtocolExit::Failed(error),
         }
     }
 }
 
-fn connect_authenticated(request: &ConnectRequest) -> Result<AppleConnection, ProtocolError> {
+fn connect_authenticated(
+    request: &ConnectRequest,
+) -> Result<EstablishedAppleSession, ProtocolError> {
     let stream = TcpStream::connect((request.endpoint.host(), request.endpoint.port()))
         .map_err(|_| apple_error(APPLE_CONNECTION_FAILED))?;
     stream.set_nodelay(true).ok();
@@ -170,10 +173,8 @@ fn connect_authenticated(request: &ConnectRequest) -> Result<AppleConnection, Pr
         password,
     )
     .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
-    let established =
-        finish_authenticated_session(authenticated, SessionEncodingProfile::AppleTcpMvs)
-            .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
-    Ok(established.connection)
+    finish_authenticated_session(authenticated, SessionEncodingProfile::AppleUdpMedia)
+        .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))
 }
 
 fn negotiate(connection: &mut AppleConnection) -> Result<((u8, u8), Vec<u8>)> {

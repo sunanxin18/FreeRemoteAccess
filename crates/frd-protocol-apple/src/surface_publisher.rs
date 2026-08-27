@@ -1,0 +1,566 @@
+use anyhow::{bail, Context, Result};
+use frd_core::{PixelRect, PixelSize, SessionId};
+use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
+use frd_protocol_api::{ProtocolError, ProtocolRuntime};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeMvsRenderObservability {
+    pub(crate) type_zero_applied_count: u64,
+    pub(crate) content_revision: u64,
+    pub(crate) first_nonblack_render_revision: Option<u64>,
+}
+
+impl Default for NativeMvsRenderObservability {
+    fn default() -> Self {
+        Self {
+            type_zero_applied_count: 0,
+            content_revision: 0,
+            first_nonblack_render_revision: None,
+        }
+    }
+}
+
+/// Apple decoder 的 generation-bound canonical CPU surface。
+pub(crate) struct CpuFramebuffer {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pixels: Vec<u32>,
+}
+
+impl CpuFramebuffer {
+    pub(crate) fn new(width: usize, height: usize) -> Result<Self> {
+        if width == 0 || height == 0 {
+            bail!("framebuffer 尺寸必须非零");
+        }
+        let pixel_count = width
+            .checked_mul(height)
+            .context("Apple surface 像素数量溢出")?;
+        if pixel_count > crate::protocol::limits::MAX_FRAMEBUFFER_PIXELS {
+            bail!("Apple surface 超出资源预算: {width}x{height}");
+        }
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(pixel_count)
+            .context("Apple surface 内存预留失败")?;
+        pixels.resize(pixel_count, 0);
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    pub(crate) fn pixels(&self) -> &[u32] {
+        &self.pixels
+    }
+
+    pub(crate) fn pixels_mut(&mut self) -> &mut [u32] {
+        &mut self.pixels
+    }
+}
+
+pub(crate) struct DisplaySurface {
+    pub(crate) generation: u64,
+    pub(crate) framebuffer: CpuFramebuffer,
+    pub(crate) native_mvs_observability: NativeMvsRenderObservability,
+}
+
+impl DisplaySurface {
+    pub(crate) fn new(generation: u64, size: PixelSize) -> Result<Self> {
+        if generation == 0 {
+            bail!("Apple surface generation 必须非零");
+        }
+        Ok(Self {
+            generation,
+            framebuffer: CpuFramebuffer::new(size.width as usize, size.height as usize)?,
+            native_mvs_observability: NativeMvsRenderObservability::default(),
+        })
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.framebuffer.width
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.framebuffer.height
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pixels_mut(&mut self) -> &mut [u32] {
+        self.framebuffer.pixels_mut()
+    }
+
+    pub(crate) fn record_native_type_zero_applied(&mut self) -> NativeMvsRenderObservability {
+        self.native_mvs_observability.type_zero_applied_count = self
+            .native_mvs_observability
+            .type_zero_applied_count
+            .saturating_add(1);
+        self.native_mvs_observability.content_revision = self
+            .native_mvs_observability
+            .content_revision
+            .saturating_add(1);
+        self.native_mvs_observability
+    }
+
+    pub(crate) fn record_native_partial_applied(&mut self) -> NativeMvsRenderObservability {
+        self.native_mvs_observability.content_revision = self
+            .native_mvs_observability
+            .content_revision
+            .saturating_add(1);
+        self.native_mvs_observability
+    }
+
+    pub(crate) fn contains_nonblack(&self) -> bool {
+        self.framebuffer
+            .pixels()
+            .iter()
+            .any(|pixel| *pixel & 0x00ff_ffff != 0)
+    }
+
+    fn bgrx_patch(&self, rect: PixelRect) -> Result<PixelPatch> {
+        if rect.width == 0 || rect.height == 0 {
+            bail!("Apple surface dirty rect 不能为空");
+        }
+        let right = rect
+            .x
+            .checked_add(rect.width)
+            .context("Apple surface dirty rect x 溢出")?;
+        let bottom = rect
+            .y
+            .checked_add(rect.height)
+            .context("Apple surface dirty rect y 溢出")?;
+        if right > self.width() as u32 || bottom > self.height() as u32 {
+            bail!("Apple surface dirty rect 超出 surface");
+        }
+        let stride_bytes = rect
+            .width
+            .checked_mul(4)
+            .context("Apple surface stride 溢出")?;
+        let byte_count = usize::try_from(stride_bytes)
+            .ok()
+            .and_then(|stride| stride.checked_mul(rect.height as usize))
+            .context("Apple surface dirty payload 溢出")?;
+        let mut bytes = Vec::with_capacity(byte_count);
+        let surface_width = self.width();
+        let x = rect.x as usize;
+        let width = rect.width as usize;
+        for row in rect.y as usize..bottom as usize {
+            let start = row
+                .checked_mul(surface_width)
+                .and_then(|offset| offset.checked_add(x))
+                .context("Apple surface dirty row 溢出")?;
+            for pixel in &self.framebuffer.pixels()[start..start + width] {
+                bytes.extend_from_slice(&pixel.to_le_bytes());
+            }
+        }
+        Ok(PixelPatch {
+            rect,
+            stride_bytes,
+            pixels: PixelBuffer::new(bytes),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvsFrameKind {
+    TypeZero {
+        complete_surface: bool,
+        initial_nonblack: bool,
+    },
+    TypeOne,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationOutcome {
+    Published,
+    NeedsFullBaseline,
+    NeedsFullSnapshot,
+    IgnoredStale,
+}
+
+pub(crate) struct AppleSurfacePublisher {
+    session_id: SessionId,
+    generation: u64,
+    revision: u64,
+    baseline_established: bool,
+}
+
+impl AppleSurfacePublisher {
+    pub(crate) fn begin(
+        runtime: &mut ProtocolRuntime,
+        session_id: SessionId,
+        size: PixelSize,
+    ) -> Result<Self, ProtocolError> {
+        runtime.begin_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)?;
+        Ok(Self {
+            session_id,
+            generation: 1,
+            revision: 0,
+            baseline_established: false,
+        })
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn begin_next_generation(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        generation: u64,
+        size: PixelSize,
+    ) -> Result<(), ProtocolError> {
+        runtime.begin_generation(
+            self.session_id,
+            generation,
+            size,
+            PixelFormat::Bgrx8UnormSrgb,
+        )?;
+        self.generation = generation;
+        self.revision = 0;
+        self.baseline_established = false;
+        Ok(())
+    }
+
+    pub(crate) fn publish_committed(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        surface: &DisplaySurface,
+        generation: u64,
+        dirty: PixelRect,
+        kind: MvsFrameKind,
+    ) -> Result<PublicationOutcome, ProtocolError> {
+        if generation != self.generation || surface.generation != self.generation {
+            return Ok(PublicationOutcome::IgnoredStale);
+        }
+        let completeness = match kind {
+            MvsFrameKind::TypeZero {
+                complete_surface: true,
+                initial_nonblack: true,
+            } => FrameCompleteness::FullBaseline,
+            MvsFrameKind::TypeZero {
+                complete_surface: true,
+                initial_nonblack: false,
+            } => {
+                return Ok(PublicationOutcome::NeedsFullBaseline);
+            }
+            MvsFrameKind::TypeZero {
+                complete_surface: false,
+                ..
+            } if !self.baseline_established => {
+                return Ok(PublicationOutcome::NeedsFullBaseline);
+            }
+            MvsFrameKind::TypeZero {
+                complete_surface: false,
+                ..
+            } => FrameCompleteness::Incremental,
+            MvsFrameKind::TypeOne if !self.baseline_established => {
+                return Ok(PublicationOutcome::NeedsFullBaseline);
+            }
+            MvsFrameKind::TypeOne => FrameCompleteness::Incremental,
+        };
+        let patch = surface
+            .bgrx_patch(dirty)
+            .map_err(|_| ProtocolError::FramePortRejected)?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ProtocolError::FramePortRejected)?;
+        match runtime.publish_surface(SurfaceUpdate::Damage {
+            session_id: self.session_id,
+            generation: self.generation,
+            revision,
+            patches: vec![patch],
+        }) {
+            Ok(()) => {}
+            Err(ProtocolError::NeedsFullSnapshot) => {
+                return Ok(PublicationOutcome::NeedsFullSnapshot);
+            }
+            Err(error) => return Err(error),
+        }
+        match runtime.publish_surface(SurfaceUpdate::FrameBoundary {
+            session_id: self.session_id,
+            generation: self.generation,
+            revision,
+            completeness,
+        }) {
+            Ok(()) => {}
+            Err(ProtocolError::NeedsFullSnapshot) => {
+                return Ok(PublicationOutcome::NeedsFullSnapshot);
+            }
+            Err(error) => return Err(error),
+        }
+        self.revision = revision;
+        if completeness == FrameCompleteness::FullBaseline {
+            self.baseline_established = true;
+        }
+        Ok(PublicationOutcome::Published)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn apply_rgb_rect_for_generation(
+    surface: &mut DisplaySurface,
+    generation: u64,
+    rgb: &[u8],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Result<bool> {
+    if surface.generation != generation {
+        return Ok(false);
+    }
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .context("RGB 矩形尺寸溢出")?;
+    if rgb.len() != expected {
+        bail!("RGB 数据长度不匹配: 期望 {expected}, 实际 {}", rgb.len());
+    }
+    if x.checked_add(width)
+        .is_none_or(|right| right > surface.width())
+        || y.checked_add(height)
+            .is_none_or(|bottom| bottom > surface.height())
+    {
+        bail!("RGB 矩形超出 framebuffer");
+    }
+    let surface_width = surface.width();
+    for row in 0..height {
+        for column in 0..width {
+            let source = (row * width + column) * 3;
+            let destination = (y + row) * surface_width + x + column;
+            let red = u32::from(rgb[source]);
+            let green = u32::from(rgb[source + 1]);
+            let blue = u32::from(rgb[source + 2]);
+            surface.pixels_mut()[destination] = (red << 16) | (green << 8) | blue;
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{mpsc, Arc, Mutex};
+
+    use frd_core::{PixelRect, PixelSize, SessionId};
+    use frd_frame::{FrameCompleteness, PixelFormat, SurfaceUpdate};
+    use frd_protocol_api::{
+        ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent,
+        SurfacePublisher,
+    };
+
+    use super::{
+        apply_rgb_rect_for_generation, AppleSurfacePublisher, DisplaySurface, MvsFrameKind,
+        PublicationOutcome,
+    };
+
+    struct NoopEvents;
+
+    impl RuntimeEventSink for NoopEvents {
+        fn publish(&self, _event: SessionEvent) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingFrames(Arc<Mutex<Vec<SurfaceUpdate>>>);
+
+    impl SurfacePublisher for RecordingFrames {
+        fn publish(&self, update: SurfaceUpdate) -> Result<(), ProtocolError> {
+            self.0.lock().expect("frame log lock").push(update);
+            Ok(())
+        }
+    }
+
+    struct NoopWake;
+
+    impl RuntimeWake for NoopWake {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    fn runtime_with_frames(
+        session_id: SessionId,
+    ) -> (ProtocolRuntime, Arc<Mutex<Vec<SurfaceUpdate>>>) {
+        let (_commands, command_rx) = mpsc::channel();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(RecordingFrames(frames.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        (runtime, frames)
+    }
+
+    #[test]
+    fn type_one_cannot_publish_full_baseline_before_complete_type_zero() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let (mut runtime, frames) = runtime_with_frames(session_id);
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        apply_rgb_rect_for_generation(&mut surface, 1, &[1, 2, 3], 0, 0, 1, 1).unwrap();
+
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeOne,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullBaseline
+        );
+
+        assert!(!frames.lock().unwrap().iter().any(|update| matches!(
+            update,
+            SurfaceUpdate::FrameBoundary {
+                completeness: FrameCompleteness::FullBaseline,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn publication_orders_initial_reset_full_bgrx_then_incremental_and_drops_stale() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let (mut runtime, frames) = runtime_with_frames(session_id);
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        apply_rgb_rect_for_generation(
+            &mut surface,
+            1,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            0,
+            0,
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeZero {
+                        complete_surface: true,
+                        initial_nonblack: true,
+                    },
+                )
+                .unwrap(),
+            PublicationOutcome::Published
+        );
+        apply_rgb_rect_for_generation(&mut surface, 1, &[0xaa, 0xbb, 0xcc], 1, 0, 1, 1).unwrap();
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 1,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeOne,
+                )
+                .unwrap(),
+            PublicationOutcome::Published
+        );
+        let next_size = PixelSize::new(1, 1).unwrap();
+        publisher
+            .begin_next_generation(&mut runtime, 2, next_size)
+            .unwrap();
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeOne,
+                )
+                .unwrap(),
+            PublicationOutcome::IgnoredStale
+        );
+
+        let frames = frames.lock().unwrap();
+        assert!(matches!(
+            frames[0],
+            SurfaceUpdate::Reset {
+                generation: 1,
+                format: PixelFormat::Bgrx8UnormSrgb,
+                ..
+            }
+        ));
+        let SurfaceUpdate::Damage {
+            revision: 1,
+            ref patches,
+            ..
+        } = frames[1]
+        else {
+            panic!("complete type-0 must publish damage first");
+        };
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0].pixels.as_bytes(),
+            &[0x33, 0x22, 0x11, 0, 0x66, 0x55, 0x44, 0]
+        );
+        assert!(matches!(
+            frames[2],
+            SurfaceUpdate::FrameBoundary {
+                revision: 1,
+                completeness: FrameCompleteness::FullBaseline,
+                ..
+            }
+        ));
+        let SurfaceUpdate::Damage {
+            revision: 2,
+            ref patches,
+            ..
+        } = frames[3]
+        else {
+            panic!("type-1 must publish dirty damage");
+        };
+        assert_eq!(patches[0].rect.width, 1);
+        assert_eq!(patches[0].pixels.as_bytes(), &[0xcc, 0xbb, 0xaa, 0]);
+        assert!(matches!(
+            frames[4],
+            SurfaceUpdate::FrameBoundary {
+                revision: 2,
+                completeness: FrameCompleteness::Incremental,
+                ..
+            }
+        ));
+        assert!(matches!(
+            frames[5],
+            SurfaceUpdate::Reset { generation: 2, .. }
+        ));
+        assert_eq!(frames.len(), 6, "stale generation must publish nothing");
+    }
+}

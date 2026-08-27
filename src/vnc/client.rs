@@ -52,11 +52,6 @@ pub fn is_timeout(e: &anyhow::Error) -> bool {
         })
 }
 
-/// 判断加密会话的 TCP 对端是否发送了有序 EOF。
-pub fn is_peer_closed(e: &anyhow::Error) -> bool {
-    frd_protocol_apple::is_peer_closed(e)
-}
-
 // ---------- 版本握手与安全类型枚举 ----------
 
 /// 已完成版本握手、拿到服务器安全类型列表（尚未发送密码）

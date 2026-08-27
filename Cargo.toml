@@ -44,6 +44,9 @@ fdk-aac = "0.8"
 fdk-aac-sys = "0.5"
 frd-core = { path = "crates/frd-core" }
 frd-wire-rfb = { path = "crates/frd-wire-rfb" }
+frd-frame = { path = "crates/frd-frame" }
+frd-media-api = { path = "crates/frd-media-api" }
+frd-protocol-api = { path = "crates/frd-protocol-api" }
 frd-protocol-apple = { path = "crates/frd-protocol-apple" }
 
 [dependencies.windows-sys]

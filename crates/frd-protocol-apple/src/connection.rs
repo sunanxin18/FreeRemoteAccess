@@ -50,6 +50,18 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<PeerClosed>())
 }
 
+pub fn is_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io_error| {
+            matches!(
+                io_error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        })
+}
+
 enum WriterCommand {
     Message {
         plaintext: Vec<u8>,
