@@ -1,0 +1,13 @@
+[package]
+name = "frd-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-media-api = { path = "../frd-media-api" }
+frd-session = { path = "../frd-session" }
+frd-protocol-api = { path = "../frd-protocol-api" }
+frd-ui-model = { path = "../frd-ui-model" }
+frd-platform-api = { path = "../frd-platform-api" }

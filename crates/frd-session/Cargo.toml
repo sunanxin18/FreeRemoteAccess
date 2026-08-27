@@ -1,0 +1,10 @@
+[package]
+name = "frd-session"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-media-api = { path = "../frd-media-api" }
+frd-protocol-api = { path = "../frd-protocol-api" }

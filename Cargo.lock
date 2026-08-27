@@ -479,6 +479,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-app"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-frame",
+ "frd-media-api",
+ "frd-platform-api",
+ "frd-protocol-api",
+ "frd-session",
+ "frd-ui-model",
+]
+
+[[package]]
 name = "frd-core"
 version = "0.1.0"
 
@@ -487,6 +500,48 @@ name = "frd-frame"
 version = "0.1.0"
 dependencies = [
  "frd-core",
+]
+
+[[package]]
+name = "frd-media-api"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-frame",
+]
+
+[[package]]
+name = "frd-platform-api"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+]
+
+[[package]]
+name = "frd-protocol-api"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-frame",
+ "frd-media-api",
+]
+
+[[package]]
+name = "frd-session"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-frame",
+ "frd-media-api",
+ "frd-protocol-api",
+]
+
+[[package]]
+name = "frd-ui-model"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-protocol-api",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod geometry;
 pub mod input;
 pub mod secret;
@@ -107,3 +108,4 @@ mod tests {
         assert_eq!(bytes.expose(), &[0x11, 0x22]);
     }
 }
+pub use connection::{Endpoint, ProtocolId, TargetSystem};
