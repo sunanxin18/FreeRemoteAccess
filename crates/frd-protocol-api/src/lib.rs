@@ -238,31 +238,6 @@ pub enum ConnectionStage {
     Disconnecting,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ServerIdentityValidation {
-    Unknown,
-    TrustedBySystem,
-    PinMatched,
-    PinMismatch,
-}
-
-impl ServerIdentityValidation {
-    pub fn allows_credential_continuation(&self) -> bool {
-        matches!(self, Self::TrustedBySystem | Self::PinMatched)
-    }
-}
-
-pub fn evaluate_server_identity(
-    saved_pin: Option<[u8; 32]>,
-    presented_pin: [u8; 32],
-) -> ServerIdentityValidation {
-    match saved_pin {
-        Some(pin) if pin == presented_pin => ServerIdentityValidation::PinMatched,
-        Some(_) => ServerIdentityValidation::PinMismatch,
-        None => ServerIdentityValidation::Unknown,
-    }
-}
-
 const MAX_IDENTITY_VALIDATION_CODE_BYTES: usize = 64;
 const MAX_IDENTITY_VALIDATION_REASON_BYTES: usize = 256;
 
@@ -314,6 +289,114 @@ impl ServerIdentityValidationFailure {
     pub fn reason(&self) -> &str {
         &self.reason
     }
+
+    fn generic_unknown() -> Self {
+        Self {
+            code: "identity.system_trust_unavailable".to_owned(),
+            reason: "系统未确认该服务器身份".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerIdentityValidationKind {
+    Unknown,
+    TrustedBySystem,
+    PinMatched,
+    PinMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerIdentityValidationInvariantError {
+    MissingFailure,
+    UnexpectedFailure,
+}
+
+/// 把验证结论与安全详情绑定；`Unknown` 在类型构造边界必定携带详情。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerIdentityValidation {
+    kind: ServerIdentityValidationKind,
+    failure: Option<ServerIdentityValidationFailure>,
+}
+
+impl ServerIdentityValidation {
+    pub fn new(
+        kind: ServerIdentityValidationKind,
+        failure: Option<ServerIdentityValidationFailure>,
+    ) -> Result<Self, ServerIdentityValidationInvariantError> {
+        match (kind, failure) {
+            (ServerIdentityValidationKind::Unknown, Some(failure)) => Ok(Self {
+                kind,
+                failure: Some(failure),
+            }),
+            (ServerIdentityValidationKind::Unknown, None) => {
+                Err(ServerIdentityValidationInvariantError::MissingFailure)
+            }
+            (_, Some(_)) => Err(ServerIdentityValidationInvariantError::UnexpectedFailure),
+            (_, None) => Ok(Self {
+                kind,
+                failure: None,
+            }),
+        }
+    }
+
+    pub fn unknown(failure: ServerIdentityValidationFailure) -> Self {
+        Self {
+            kind: ServerIdentityValidationKind::Unknown,
+            failure: Some(failure),
+        }
+    }
+
+    pub fn kind(&self) -> ServerIdentityValidationKind {
+        self.kind
+    }
+
+    pub fn failure(&self) -> Option<&ServerIdentityValidationFailure> {
+        self.failure.as_ref()
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.kind == ServerIdentityValidationKind::Unknown
+    }
+
+    pub fn is_pin_mismatch(&self) -> bool {
+        self.kind == ServerIdentityValidationKind::PinMismatch
+    }
+
+    pub fn allows_credential_continuation(&self) -> bool {
+        matches!(
+            self.kind,
+            ServerIdentityValidationKind::TrustedBySystem
+                | ServerIdentityValidationKind::PinMatched
+        )
+    }
+
+    fn pin_matched() -> Self {
+        Self {
+            kind: ServerIdentityValidationKind::PinMatched,
+            failure: None,
+        }
+    }
+
+    fn pin_mismatch() -> Self {
+        Self {
+            kind: ServerIdentityValidationKind::PinMismatch,
+            failure: None,
+        }
+    }
+}
+
+pub fn evaluate_server_identity(
+    saved_pin: Option<[u8; 32]>,
+    presented_pin: [u8; 32],
+) -> ServerIdentityValidation {
+    match saved_pin {
+        Some(pin) if pin == presented_pin => ServerIdentityValidation::pin_matched(),
+        Some(_) => ServerIdentityValidation::pin_mismatch(),
+        None => {
+            ServerIdentityValidation::unknown(ServerIdentityValidationFailure::generic_unknown())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -326,7 +409,6 @@ pub struct ServerIdentityChallenge {
     pub subject: String,
     pub issuer: String,
     pub validation: ServerIdentityValidation,
-    pub validation_failure: Option<ServerIdentityValidationFailure>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -669,8 +751,7 @@ mod tests {
     use super::{
         evaluate_server_identity, Endpoint, MailboxSurfacePublisher, ProtocolCatalog,
         ProtocolError, ProtocolId, ProtocolRuntime, ProtocolSelection, RuntimeEventSink,
-        RuntimeWake, ServerIdentityValidation, SessionCommand, SessionEvent, SurfacePublisher,
-        TargetSystem,
+        RuntimeWake, SessionCommand, SessionEvent, SurfacePublisher, TargetSystem,
     };
 
     #[test]
@@ -687,7 +768,10 @@ mod tests {
     fn pin_mismatch_fails_closed_before_credential_continuation() {
         let validation = evaluate_server_identity(Some([0x11; 32]), [0x22; 32]);
 
-        assert_eq!(validation, ServerIdentityValidation::PinMismatch);
+        assert_eq!(
+            validation.kind(),
+            super::ServerIdentityValidationKind::PinMismatch
+        );
         assert!(!validation.allows_credential_continuation());
     }
 
@@ -712,6 +796,35 @@ mod tests {
             "x".repeat(257),
         )
         .is_err());
+    }
+
+    #[test]
+    fn unknown_identity_validation_without_reason_is_rejected() {
+        assert_eq!(
+            super::ServerIdentityValidation::new(
+                super::ServerIdentityValidationKind::Unknown,
+                None,
+            ),
+            Err(super::ServerIdentityValidationInvariantError::MissingFailure)
+        );
+    }
+
+    #[test]
+    fn generic_unknown_identity_validation_always_exposes_a_bounded_reason() {
+        let validation = evaluate_server_identity(None, [0x22; 32]);
+
+        assert_eq!(
+            validation.kind(),
+            super::ServerIdentityValidationKind::Unknown
+        );
+        let failure = validation
+            .failure()
+            .expect("unknown validation always carries a safe reason");
+        assert!(!failure.code().is_empty());
+        assert!(!failure.reason().is_empty());
+        assert!(
+            super::ServerIdentityValidationFailure::new(failure.code(), failure.reason(),).is_ok()
+        );
     }
 
     #[test]
@@ -1208,8 +1321,7 @@ mod tests {
             sha256_fingerprint: [0x11; 32],
             subject: "mac.example".to_owned(),
             issuer: "test issuer".to_owned(),
-            validation: ServerIdentityValidation::Unknown,
-            validation_failure: None,
+            validation: evaluate_server_identity(None, [0x11; 32]),
         }
     }
 

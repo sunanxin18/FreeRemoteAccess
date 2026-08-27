@@ -3,7 +3,8 @@
 mod coordinator;
 
 pub use coordinator::{
-    CleanupComplete, CleanupError, CleanupOperations, ConnectPlan, SessionCoordinator, WriterGate,
+    CleanupComplete, CleanupError, CleanupOperations, ConnectPlan, SessionCleanupHandle,
+    SessionCoordinator, WriterGate,
 };
 pub use frd_protocol_api::{
     PresentationEvent, ServerIdentityChallenge, ServerIdentityDecision, SessionCommand,

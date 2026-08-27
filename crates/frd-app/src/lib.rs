@@ -2,7 +2,7 @@ mod controller;
 
 pub use controller::{
     ActiveSessionError, ActiveSessionSlot, AppAction, AppController, AppControllerError, AppLaunch,
-    IdentityDecisionError, ProductPolicy,
+    DisconnectTransition, IdentityDecisionError, ProductPolicy,
 };
 use frd_core::SessionId;
 pub use frd_protocol_api::PresentationEvent;
@@ -40,11 +40,13 @@ mod tests {
     };
 
     use frd_protocol_api::{
-        AudioState, ClipboardPayload, ConnectionStage, Endpoint, ProtocolCatalog, ProtocolError,
-        ProtocolId, ServerIdentityChallenge, ServerIdentityDecision, ServerIdentityValidation,
-        SessionEvent,
+        evaluate_server_identity, AudioState, ClipboardPayload, ConnectionStage, Endpoint,
+        ProtocolCatalog, ProtocolError, ProtocolId, ServerIdentityChallenge,
+        ServerIdentityDecision, ServerIdentityValidation, SessionCommand, SessionEvent,
     };
-    use frd_session::{CleanupError, CleanupOperations, SessionCoordinator};
+    use frd_session::{
+        CleanupError, CleanupOperations, ConnectPlan, SessionCleanupHandle, SessionCoordinator,
+    };
 
     use frd_ui_model::{ConnectionDraft, ConnectionForm, LaunchOptions, ProtocolChoice};
 
@@ -323,6 +325,74 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_explicit_and_resolved_protocol_stays_editable_without_starting() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs(), ProtocolId::rdp()]);
+        let store = RecordingStore::default();
+        let mut controller =
+            AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
+        let submission = frd_ui_model::ConnectionSubmission {
+            draft: ConnectionDraft {
+                target_system: Some(TargetSystem::Custom),
+                address: "host.invalid".to_owned(),
+                port: Some(5900),
+                protocol: ProtocolChoice::Explicit(ProtocolId::rdp()),
+                username: "test-user".to_owned(),
+            },
+            resolved_protocol: ProtocolId::apple_hpss_mvs(),
+            password: SecretBuffer::new(b"test-password".to_vec()),
+        };
+
+        assert_eq!(
+            controller.handle_intent(submission, &catalog, &store).err(),
+            Some(AppControllerError::InvalidSubmission(
+                "protocol_resolution_mismatch"
+            ))
+        );
+        let AppPage::ConnectionForm(form) = controller.page() else {
+            panic!("inconsistent protocol stays editable");
+        };
+        assert_eq!(
+            form.errors().protocol.as_deref(),
+            Some("protocol_resolution_mismatch")
+        );
+        assert_eq!(store.load_count(), 0);
+    }
+
+    #[test]
+    fn unregistered_resolved_protocol_stays_editable_without_starting() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller =
+            AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
+        let submission = frd_ui_model::ConnectionSubmission {
+            draft: ConnectionDraft {
+                target_system: Some(TargetSystem::MacOs),
+                address: "host.invalid".to_owned(),
+                port: Some(5900),
+                protocol: ProtocolChoice::Automatic,
+                username: "test-user".to_owned(),
+            },
+            resolved_protocol: ProtocolId::new("unregistered-test").expect("valid protocol id"),
+            password: SecretBuffer::new(b"test-password".to_vec()),
+        };
+
+        assert_eq!(
+            controller.handle_intent(submission, &catalog, &store).err(),
+            Some(AppControllerError::InvalidSubmission(
+                "unregistered_protocol"
+            ))
+        );
+        let AppPage::ConnectionForm(form) = controller.page() else {
+            panic!("unregistered protocol stays editable");
+        };
+        assert_eq!(
+            form.errors().protocol.as_deref(),
+            Some("unregistered_protocol")
+        );
+        assert_eq!(store.load_count(), 0);
+    }
+
+    #[test]
     fn controller_allows_reconnect_only_after_coordinator_cleanup_completes() {
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
@@ -338,6 +408,7 @@ mod tests {
             panic!("first connection starts a session");
         };
         let first_session_id = first_request.session_id;
+        let mut lifecycle = StartedTestSession::new(first_session_id);
         controller
             .handle_intent(AppIntent::Disconnect, &catalog, &store)
             .expect("disconnect begins");
@@ -350,11 +421,9 @@ mod tests {
             Err(AppControllerError::SessionAlreadyActive)
         ));
 
-        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
-        let mut cleanup = RecordingCleanup::default();
-        let complete = coordinator
-            .complete_cleanup(first_session_id, &mut cleanup)
-            .expect("all session resources are reclaimed");
+        let complete = lifecycle
+            .complete()
+            .expect("started session resources are reclaimed");
         controller
             .finish_session_cleanup(complete)
             .expect("cleanup capability releases the controller slot");
@@ -387,6 +456,7 @@ mod tests {
             panic!("connection starts a worker");
         };
         let session_id = request.session_id;
+        let mut lifecycle = StartedTestSession::new(session_id);
         controller.set_platform_capabilities(PlatformCapabilities {
             dynamic_resolution: true,
             clipboard_read: true,
@@ -425,9 +495,11 @@ mod tests {
             frd_protocol_api::SessionCapabilities::default()
         );
         assert!(controller.current_server_identity_challenge().is_none());
-        assert!(controller
-            .finish_session_cleanup(cleanup_completion(SessionId::allocate()))
-            .is_err());
+        let mut wrong_lifecycle = StartedTestSession::new(SessionId::allocate());
+        let wrong_completion = wrong_lifecycle
+            .complete()
+            .expect("other started session cleanup completes");
+        assert!(controller.finish_session_cleanup(wrong_completion).is_err());
         let retry = complete_form()
             .take_submission(&catalog)
             .expect("retry submission");
@@ -437,7 +509,11 @@ mod tests {
         );
 
         controller
-            .finish_session_cleanup(cleanup_completion(session_id))
+            .finish_session_cleanup(
+                lifecycle
+                    .complete()
+                    .expect("current started session cleanup completes"),
+            )
             .expect("matching cleanup releases the failed session");
         let retry = complete_form()
             .take_submission(&catalog)
@@ -467,6 +543,7 @@ mod tests {
             panic!("connection starts a worker");
         };
         let session_id = request.session_id;
+        let mut lifecycle = StartedTestSession::new(session_id);
 
         controller
             .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
@@ -479,7 +556,11 @@ mod tests {
         ));
 
         controller
-            .finish_session_cleanup(cleanup_completion(session_id))
+            .finish_session_cleanup(
+                lifecycle
+                    .complete()
+                    .expect("closed started session cleanup completes"),
+            )
             .expect("matching cleanup releases the closed session");
         let retry = complete_form()
             .take_submission(&catalog)
@@ -496,6 +577,7 @@ mod tests {
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        let mut lifecycle = StartedTestSession::new(session_id);
 
         controller.handle_session_event(SessionEvent::Error(ProtocolError::Adapter {
             protocol_id: ProtocolId::apple_hpss_mvs(),
@@ -516,7 +598,11 @@ mod tests {
         ));
 
         controller
-            .finish_session_cleanup(cleanup_completion(session_id))
+            .finish_session_cleanup(
+                lifecycle
+                    .complete()
+                    .expect("terminal started session cleanup completes"),
+            )
             .expect("one cleanup capability releases the session once");
         controller
             .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
@@ -533,11 +619,39 @@ mod tests {
         ));
     }
 
-    fn cleanup_completion(session_id: SessionId) -> frd_session::CleanupComplete {
-        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
-        coordinator
-            .complete_cleanup(session_id, &mut RecordingCleanup::default())
-            .expect("test cleanup completes")
+    struct StartedTestSession {
+        coordinator: SessionCoordinator,
+        handle: SessionCleanupHandle,
+    }
+
+    impl StartedTestSession {
+        fn new(session_id: SessionId) -> Self {
+            Self::with_cleanup(session_id, RecordingCleanup::default())
+        }
+
+        fn with_cleanup(session_id: SessionId, cleanup: RecordingCleanup) -> Self {
+            let mut coordinator =
+                SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+            let plan = ConnectPlan::for_session(
+                session_id,
+                TargetSystem::MacOs,
+                ProtocolId::apple_hpss_mvs(),
+                Endpoint::new("mac.example", 5900).expect("valid endpoint"),
+            );
+            let handle = coordinator
+                .start(plan, move || -> Box<dyn CleanupOperations> {
+                    Box::new(cleanup)
+                })
+                .expect("test coordinator starts the session");
+            Self {
+                coordinator,
+                handle,
+            }
+        }
+
+        fn complete(&mut self) -> Result<frd_session::CleanupComplete, CleanupError> {
+            self.coordinator.complete_cleanup(&self.handle)
+        }
     }
 
     #[test]
@@ -735,28 +849,16 @@ mod tests {
         let first = SessionId::allocate();
         let second = SessionId::allocate();
         let mut slot = ActiveSessionSlot::default();
-        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
-        let mut cleanup = RecordingCleanup::default();
+        let mut lifecycle = StartedTestSession::new(first);
 
         slot.begin_connect(first)
             .expect("first connect is accepted");
         slot.begin_disconnect(first)
             .expect("first session begins disconnect");
-        let completed = coordinator
-            .complete_cleanup(first, &mut cleanup)
-            .expect("all resources are reclaimed");
+        let completed = lifecycle.complete().expect("all resources are reclaimed");
         slot.finish_cleanup(completed)
             .expect("matching cleanup completion releases the slot");
         assert!(slot.begin_connect(second).is_ok());
-        assert_eq!(
-            cleanup.calls,
-            vec![
-                "cancel",
-                "shutdown_writer",
-                "join_workers_and_audio",
-                "dispose_mailbox"
-            ]
-        );
     }
 
     #[test]
@@ -765,16 +867,14 @@ mod tests {
         let other = SessionId::allocate();
         let second = SessionId::allocate();
         let mut slot = ActiveSessionSlot::default();
-        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
-        let mut cleanup = RecordingCleanup::default();
-
         slot.begin_connect(first)
             .expect("first connect is accepted");
         slot.begin_disconnect(first)
             .expect("first session begins disconnect");
-        let other_completion = coordinator
-            .complete_cleanup(other, &mut cleanup)
-            .expect("other cleanup completes");
+        let mut other_lifecycle = StartedTestSession::new(other);
+        let other_completion = other_lifecycle
+            .complete()
+            .expect("other started session cleanup completes");
 
         assert!(slot.finish_cleanup(other_completion).is_err());
         assert!(slot.begin_connect(second).is_err());
@@ -785,27 +885,20 @@ mod tests {
         let first = SessionId::allocate();
         let second = SessionId::allocate();
         let mut slot = ActiveSessionSlot::default();
-        let mut coordinator = SessionCoordinator::new(ProtocolCatalog::new([]));
-        let mut cleanup = RecordingCleanup::failing_at(CleanupError::ShutdownWriter);
+        let mut lifecycle = StartedTestSession::with_cleanup(
+            first,
+            RecordingCleanup::failing_at(CleanupError::ShutdownWriter),
+        );
 
         slot.begin_connect(first)
             .expect("first connect is accepted");
         slot.begin_disconnect(first)
             .expect("first session begins disconnect");
         assert!(matches!(
-            coordinator.complete_cleanup(first, &mut cleanup),
+            lifecycle.complete(),
             Err(CleanupError::ShutdownWriter)
         ));
         assert!(slot.begin_connect(second).is_err());
-        assert_eq!(
-            cleanup.calls,
-            vec![
-                "cancel",
-                "shutdown_writer",
-                "join_workers_and_audio",
-                "dispose_mailbox"
-            ]
-        );
     }
 
     #[test]
@@ -837,6 +930,93 @@ mod tests {
         });
 
         assert!(matches!(controller.page(), AppPage::RemoteSession { .. }));
+    }
+
+    #[test]
+    fn presented_session_ignores_late_stages_without_closing_input() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 3);
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 3,
+            revision: 9,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+
+        for stage in [
+            ConnectionStage::Connecting,
+            ConnectionStage::TransportReady,
+            ConnectionStage::AwaitingIdentityDecision,
+        ] {
+            controller.handle_session_event(SessionEvent::StageChanged(stage));
+            assert!(matches!(controller.page(), AppPage::RemoteSession { .. }));
+            assert!(controller
+                .route_input(frd_core::InputEvent::ReleaseAll)
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn repeated_cancel_is_a_successful_noop_after_one_disconnect_command() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+
+        assert!(matches!(
+            controller
+                .handle_intent(AppIntent::CancelConnect, &catalog, &store)
+                .expect("first cancel succeeds"),
+            Some(AppAction::SessionCommand(SessionCommand::Disconnect))
+        ));
+        assert!(matches!(
+            controller.handle_intent(AppIntent::CancelConnect, &catalog, &store),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn repeated_disconnect_is_a_successful_noop_after_one_disconnect_command() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+
+        assert!(matches!(
+            controller
+                .handle_intent(AppIntent::Disconnect, &catalog, &store)
+                .expect("first disconnect succeeds"),
+            Some(AppAction::SessionCommand(SessionCommand::Disconnect))
+        ));
+        assert!(matches!(
+            controller.handle_intent(AppIntent::Disconnect, &catalog, &store),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn cancel_then_disconnect_emits_only_the_first_disconnect_command() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+
+        assert!(matches!(
+            controller
+                .handle_intent(AppIntent::CancelConnect, &catalog, &store)
+                .expect("cancel succeeds"),
+            Some(AppAction::SessionCommand(SessionCommand::Disconnect))
+        ));
+        assert!(matches!(
+            controller.handle_intent(AppIntent::Disconnect, &catalog, &store),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -999,6 +1179,7 @@ mod tests {
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(first, 1);
+        let mut lifecycle = StartedTestSession::new(first);
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(
             frd_protocol_api::SessionCapabilities {
                 dynamic_resolution: true,
@@ -1024,7 +1205,11 @@ mod tests {
         assert!(controller.current_server_identity_challenge().is_none());
 
         controller
-            .finish_session_cleanup(cleanup_completion(first))
+            .finish_session_cleanup(
+                lifecycle
+                    .complete()
+                    .expect("first started session cleanup completes"),
+            )
             .expect("cleanup releases first session");
         let second = complete_form()
             .take_submission(&catalog)
@@ -1100,7 +1285,7 @@ mod tests {
             session_id,
             7,
             [0x22; 32],
-            ServerIdentityValidation::PinMismatch,
+            evaluate_server_identity(Some([0x11; 32]), [0x22; 32]),
         ));
 
         assert!(matches!(
@@ -1131,7 +1316,7 @@ mod tests {
             session_id,
             7,
             [0x11; 32],
-            ServerIdentityValidation::PinMatched,
+            evaluate_server_identity(Some([0x11; 32]), [0x11; 32]),
         ));
 
         assert!(matches!(
@@ -1155,7 +1340,7 @@ mod tests {
             session_id,
             challenge_id,
             pin,
-            ServerIdentityValidation::Unknown,
+            evaluate_server_identity(None, pin),
         )
     }
 
@@ -1174,13 +1359,13 @@ mod tests {
             subject: "mac.example".to_owned(),
             issuer: "local test".to_owned(),
             validation,
-            validation_failure: None,
         }
     }
 
     #[derive(Default)]
     struct RecordingStore {
         saved_pin: Option<[u8; 32]>,
+        loads: Mutex<usize>,
         stores: Mutex<Vec<(ProtocolId, Endpoint, [u8; 32])>>,
     }
 
@@ -1188,8 +1373,13 @@ mod tests {
         fn with_saved_pin(saved_pin: [u8; 32]) -> Self {
             Self {
                 saved_pin: Some(saved_pin),
+                loads: Mutex::new(0),
                 stores: Mutex::new(Vec::new()),
             }
+        }
+
+        fn load_count(&self) -> usize {
+            *self.loads.lock().expect("load count lock")
         }
     }
 
@@ -1199,6 +1389,7 @@ mod tests {
             _: &ProtocolId,
             _: &Endpoint,
         ) -> Result<Option<[u8; 32]>, PlatformError> {
+            *self.loads.lock().expect("load count lock") += 1;
             Ok(self.saved_pin)
         }
 

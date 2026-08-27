@@ -1,8 +1,7 @@
 use egui::Ui;
 use frd_app::{AppIntent, AppPage};
 use frd_protocol_api::{
-    ServerIdentityChallenge, ServerIdentityDecision, ServerIdentityValidation,
-    ServerIdentityValidationFailure,
+    ServerIdentityChallenge, ServerIdentityDecision, ServerIdentityValidationFailure,
 };
 
 pub fn show_session_page(
@@ -88,7 +87,7 @@ fn show_identity_challenge(ui: &mut Ui, challenge: &ServerIdentityChallenge) -> 
     ui.label(format!("端点：{}", challenge.endpoint));
     ui.label(format!("主题：{}", challenge.subject));
     ui.label(format!("签发者：{}", challenge.issuer));
-    if let Some(failure) = &challenge.validation_failure {
+    if let Some(failure) = challenge.validation.failure() {
         let [code, reason] = validation_failure_labels(failure);
         ui.colored_label(ui.visuals().warn_fg_color, code);
         ui.colored_label(ui.visuals().warn_fg_color, reason);
@@ -102,7 +101,7 @@ fn show_identity_challenge(ui: &mut Ui, challenge: &ServerIdentityChallenge) -> 
             .collect::<Vec<_>>()
             .join(":")
     ));
-    if challenge.validation == ServerIdentityValidation::PinMismatch {
+    if challenge.validation.is_pin_mismatch() {
         ui.colored_label(ui.visuals().error_fg_color, "已保存的服务器指纹不匹配");
         return ui
             .button("拒绝")
@@ -151,7 +150,7 @@ fn identity_intent(
 
 #[cfg(test)]
 mod tests {
-    use frd_protocol_api::ServerIdentityValidationFailure;
+    use frd_protocol_api::{evaluate_server_identity, ServerIdentityValidationFailure};
 
     use super::validation_failure_labels;
 
@@ -168,5 +167,18 @@ mod tests {
                 "验证原因：服务器证书已过期".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn unknown_identity_page_always_has_validation_labels() {
+        let validation = evaluate_server_identity(None, [0x22; 32]);
+        let failure = validation
+            .failure()
+            .expect("unknown validation has a required reason");
+
+        let [code, reason] = validation_failure_labels(failure);
+        assert!(code.starts_with("验证代码：identity."));
+        assert!(reason.starts_with("验证原因："));
+        assert!(reason.len() > "验证原因：".len());
     }
 }

@@ -5,8 +5,8 @@ use frd_platform_api::{
 };
 use frd_protocol_api::{
     AudioState, ClipboardPayload, ConnectRequest, ConnectionStage, Credentials, PresentationEvent,
-    ProtocolCatalog, ProtocolError, ProtocolSelection, ServerIdentityChallenge,
-    ServerIdentityDecision, SessionCapabilities, SessionCommand, SessionEvent,
+    ProtocolCatalog, ProtocolError, ServerIdentityChallenge, ServerIdentityDecision,
+    SessionCapabilities, SessionCommand, SessionEvent,
 };
 use frd_session::CleanupComplete;
 use frd_ui_model::{
@@ -239,9 +239,13 @@ impl AppController {
             }
             AppIntent::CancelConnect | AppIntent::Disconnect => {
                 let session_id = self.session_id.ok_or(AppControllerError::NoActiveSession)?;
-                self.session_slot
+                let transition = self
+                    .session_slot
                     .begin_disconnect(session_id)
                     .map_err(|_| AppControllerError::NoActiveSession)?;
+                if transition == DisconnectTransition::AlreadyInProgress {
+                    return Ok(None);
+                }
                 let draft = self.page.retained_draft();
                 self.reset_session_bound_state();
                 self.page = Page::Disconnecting { draft };
@@ -282,12 +286,16 @@ impl AppController {
         if submission.draft.port.is_none() || submission.draft.port == Some(0) {
             return self.reject_submission(submission, "port_required");
         }
-        let protocol_id = catalog
-            .select(
-                target,
-                ProtocolSelection::Explicit(submission.resolved_protocol.clone()),
-            )
-            .map_err(AppControllerError::InvalidConnection)?;
+        if catalog.descriptor(&submission.resolved_protocol).is_none() {
+            return self.reject_submission(submission, "unregistered_protocol");
+        }
+        let protocol_id = match catalog.select(target, submission.draft.protocol.clone().into()) {
+            Ok(protocol_id) => protocol_id,
+            Err(error) => return self.reject_submission(submission, error.code()),
+        };
+        if protocol_id != submission.resolved_protocol {
+            return self.reject_submission(submission, "protocol_resolution_mismatch");
+        }
         let requirements = catalog
             .descriptor(&protocol_id)
             .expect("selected protocol must have a descriptor")
@@ -407,6 +415,9 @@ impl AppController {
         }
         match event {
             SessionEvent::StageChanged(stage) => {
+                if matches!(self.page, Page::RemoteSession { .. }) {
+                    return;
+                }
                 if stage == ConnectionStage::TransportReady {
                     if let Some(session_id) = self.session_id {
                         let _ = self.session_slot.mark_active(session_id);
@@ -557,13 +568,11 @@ impl AppController {
         {
             return Err(IdentityDecisionError::StaleChallenge);
         }
-        if challenge.validation == frd_protocol_api::ServerIdentityValidation::PinMismatch
-            && decision != ServerIdentityDecision::Reject
-        {
+        if challenge.validation.is_pin_mismatch() && decision != ServerIdentityDecision::Reject {
             return Err(IdentityDecisionError::PinMismatch);
         }
         if decision == ServerIdentityDecision::TrustAndRemember {
-            if challenge.validation != frd_protocol_api::ServerIdentityValidation::Unknown {
+            if !challenge.validation.is_unknown() {
                 return Err(IdentityDecisionError::TrustAndRememberRequiresUnknown);
             }
             let store = store.ok_or(IdentityDecisionError::NoCurrentChallenge)?;
@@ -590,6 +599,12 @@ enum SlotState {
     Active(SessionId),
     Disconnecting(SessionId),
     CleanupPending(SessionId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisconnectTransition {
+    Started,
+    AlreadyInProgress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -626,13 +641,21 @@ impl ActiveSessionSlot {
         }
     }
 
-    pub fn begin_disconnect(&mut self, session_id: SessionId) -> Result<(), ActiveSessionError> {
+    pub fn begin_disconnect(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<DisconnectTransition, ActiveSessionError> {
         match self.state {
             Some(SlotState::Connecting(current) | SlotState::Active(current))
                 if current == session_id =>
             {
                 self.state = Some(SlotState::Disconnecting(session_id));
-                Ok(())
+                Ok(DisconnectTransition::Started)
+            }
+            Some(SlotState::Disconnecting(current) | SlotState::CleanupPending(current))
+                if current == session_id =>
+            {
+                Ok(DisconnectTransition::AlreadyInProgress)
             }
             _ => Err(ActiveSessionError::InvalidTransition),
         }
