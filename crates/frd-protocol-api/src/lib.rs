@@ -119,6 +119,10 @@ impl ProtocolCatalog {
         }
     }
 
+    pub fn descriptors(&self) -> &[ProtocolDescriptor] {
+        &self.descriptors
+    }
+
     pub fn select(
         &self,
         target: TargetSystem,

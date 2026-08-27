@@ -5,6 +5,7 @@ pub mod secret;
 pub mod session;
 pub mod viewport;
 
+pub use connection::{CredentialProviderId, Endpoint, ProtocolId, TargetSystem};
 pub use geometry::{PhysicalViewport, PixelPoint, PixelRect, PixelSize};
 pub use input::{
     ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton, PointerButtons,
@@ -108,4 +109,3 @@ mod tests {
         assert_eq!(bytes.expose(), &[0x11, 0x22]);
     }
 }
-pub use connection::{Endpoint, ProtocolId, TargetSystem};

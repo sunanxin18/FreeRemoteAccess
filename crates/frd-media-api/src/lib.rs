@@ -20,6 +20,23 @@ pub enum MediaPublishError {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioOutputError {
+    Unavailable,
+    UnsupportedFormat,
+    Closed,
+}
+
+/// 平台音频输出只消费协议已经解码出的 PCM；实现不得打开输入设备。
+pub trait AudioOutput: Send {
+    fn enqueue_pcm(
+        &mut self,
+        sample_rate_hz: u32,
+        channels: u8,
+        samples: Box<[i16]>,
+    ) -> Result<(), AudioOutputError>;
+}
+
 pub trait MediaPublisher: Send {
     fn publish(&self, frame: MediaFrame) -> Result<(), MediaPublishError>;
 }

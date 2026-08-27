@@ -1,6 +1,24 @@
 use core::fmt;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CredentialProviderId(String);
+
+impl CredentialProviderId {
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.trim().is_empty()).then_some(Self(value))
+    }
+
+    pub fn environment() -> Self {
+        Self("environment".to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProtocolId(String);
 
 impl ProtocolId {

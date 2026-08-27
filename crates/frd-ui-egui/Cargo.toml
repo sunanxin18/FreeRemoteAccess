@@ -1,0 +1,11 @@
+[package]
+name = "frd-ui-egui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui = { workspace = true }
+frd-app = { path = "../frd-app" }
+frd-core = { path = "../frd-core" }
+frd-protocol-api = { path = "../frd-protocol-api" }
+frd-ui-model = { path = "../frd-ui-model" }
