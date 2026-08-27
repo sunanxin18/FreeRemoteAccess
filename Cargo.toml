@@ -8,6 +8,7 @@ description = "ARP 局域网发现 + VNC(RFB) 客户端，用于连接 macOS 屏
 resolver = "2"
 members = [
     "crates/frd-core",
+    "crates/frd-wire-rfb",
     "crates/frd-frame",
     "crates/frd-media-api",
     "crates/frd-protocol-api",
@@ -47,6 +48,7 @@ flate2 = "1"
 fdk-aac = "0.8"
 fdk-aac-sys = "0.5"
 frd-core = { path = "crates/frd-core" }
+frd-wire-rfb = { path = "crates/frd-wire-rfb" }
 
 [dependencies.windows-sys]
 version = "0.59"

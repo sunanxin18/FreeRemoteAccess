@@ -545,6 +545,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-wire-rfb"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+]
+
+[[package]]
 name = "freeremotedesk"
 version = "0.1.0"
 dependencies = [
@@ -559,6 +566,7 @@ dependencies = [
  "fdk-aac-sys",
  "flate2",
  "frd-core",
+ "frd-wire-rfb",
  "getrandom 0.2.17",
  "hmac",
  "md-5",

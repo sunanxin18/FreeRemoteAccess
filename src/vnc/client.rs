@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use std::{error, fmt};
 
 use anyhow::{bail, ensure, Context, Result};
+use frd_wire_rfb::{
+    self, decode_rectangle_header, decode_security_types, decode_security_types_header,
+    decode_server_init, decode_server_init_header, SERVER_INIT_HEADER_BYTES,
+};
 
 use super::ard;
 use super::auth;
@@ -316,10 +320,6 @@ impl RfbConn {
         self.read_exact_bytes(&mut b)?;
         Ok(u32::from_be_bytes(b))
     }
-
-    fn read_i32(&mut self) -> Result<i32> {
-        self.read_u32().map(|v| v as i32)
-    }
 }
 
 /// 判断错误链中是否为读超时（Windows 报 TimedOut，Unix 报 WouldBlock）
@@ -384,7 +384,7 @@ fn negotiate_connected(
 
     // 1. 版本握手：服务器发固定 ASCII banner，客户端回一个双方都支持的版本。
     let raw_banner = conn.read_vec(protocol::RFB_BANNER_BYTES)?;
-    let banner = protocol::parse_rfb_banner(&raw_banner).with_context(|| {
+    let banner = frd_wire_rfb::decode_banner(&raw_banner).with_context(|| {
         diagnostic_addr.map_or_else(
             || "服务器返回了非法 RFB banner".to_owned(),
             |addr| format!("{addr} 返回了非法 RFB banner"),
@@ -419,33 +419,31 @@ fn negotiate_connected(
     //    3.7 用 u16 计数、3.8 用 u8 计数；计数为 0 表示失败并附带原因。
     let security_types = match version.1 {
         minor if minor == protocol::RFB_VERSION_3_3.1 => {
-            let t = conn.read_u32()?;
-            if t == 0 {
+            let types = decode_security_types(3, &conn.read_vec(size_of::<u32>())?)?;
+            if types.is_empty() {
                 bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
             }
-            vec![u8::try_from(t).context("RFB 3.3 security type 超出 u8 表示范围")?]
+            types
         }
         minor if minor == protocol::RFB_VERSION_3_7.1 => {
-            let n = conn.read_u16()?;
-            if n == 0 {
+            let prefix = conn.read_vec(size_of::<u16>())?;
+            let (_, count) = decode_security_types_header(7, &prefix)?;
+            if count == 0 {
                 bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
             }
-            let mut v = Vec::with_capacity(usize::from(n));
-            for _ in 0..n {
-                v.push(conn.read_u8()?);
-            }
-            v
+            let mut bytes = prefix;
+            bytes.extend_from_slice(&conn.read_vec(count)?);
+            decode_security_types(7, &bytes)?
         }
         _ => {
-            let n = conn.read_u8()?;
-            if n == 0 {
+            let prefix = conn.read_vec(size_of::<u8>())?;
+            let (_, count) = decode_security_types_header(8, &prefix)?;
+            if count == 0 {
                 bail!("服务器拒绝连接: {}", read_reason(&mut conn)?);
             }
-            let mut v = Vec::with_capacity(usize::from(n));
-            for _ in 0..n {
-                v.push(conn.read_u8()?);
-            }
-            v
+            let mut bytes = prefix;
+            bytes.extend_from_slice(&conn.read_vec(count)?);
+            decode_security_types(8, &bytes)?
         }
     };
 
@@ -598,17 +596,26 @@ pub fn finish_authenticated_session(
     }])?;
 
     // ServerInit：帧缓冲尺寸 + 服务器像素格式 + 桌面名称
-    let width = conn.read_u16()?;
-    let height = conn.read_u16()?;
-    crate::framebuffer::validate_framebuffer_geometry(width.into(), height.into())
-        .with_context(|| format!("服务器返回了无效分辨率 {width}x{height}"))?;
-    let server_pf = PixelFormat::parse(&conn.read_vec(protocol::RFB_PIXEL_FORMAT_BYTES)?);
-    let name_len =
-        usize::try_from(conn.read_u32()?).context("ServerInit 桌面名称长度无法转换为 usize")?;
-    if name_len > protocol::SERVER_INIT_DESKTOP_NAME_MAX_BYTES {
-        bail!("ServerInit 桌面名称长度异常: {name_len}");
-    }
-    let name = String::from_utf8_lossy(&conn.read_vec(name_len)?).into_owned();
+    let header_bytes = conn.read_vec(SERVER_INIT_HEADER_BYTES)?;
+    let server_init_header = decode_server_init_header(&header_bytes)?;
+    let framebuffer_width = usize::try_from(server_init_header.size.width)
+        .context("ServerInit 宽度无法转换为 usize")?;
+    let framebuffer_height = usize::try_from(server_init_header.size.height)
+        .context("ServerInit 高度无法转换为 usize")?;
+    crate::framebuffer::validate_framebuffer_geometry(framebuffer_width, framebuffer_height)
+        .with_context(|| {
+            format!(
+                "服务器返回了无效分辨率 {}x{}",
+                server_init_header.size.width, server_init_header.size.height
+            )
+        })?;
+    let mut server_init_bytes = header_bytes;
+    server_init_bytes.extend_from_slice(&conn.read_vec(server_init_header.name_length)?);
+    let server_init = decode_server_init(&server_init_bytes)?;
+    let width = u16::try_from(server_init.size.width).context("ServerInit 宽度超出 u16")?;
+    let height = u16::try_from(server_init.size.height).context("ServerInit 高度超出 u16")?;
+    let server_pf = server_init.pixel_format;
+    let name = server_init.name;
 
     // 进入会话：清除握手阶段的兜底超时（会话读超时由调用方自行管理）
     conn.set_read_timeout(None).ok();
@@ -885,11 +892,12 @@ pub fn read_server_message(conn: &mut RfbConn) -> Result<ServerEvent> {
             let mut ops = Vec::with_capacity(n);
             let mut update_raw_bytes = 0usize;
             for _ in 0..n {
-                let x = conn.read_u16()? as usize;
-                let y = conn.read_u16()? as usize;
-                let w = conn.read_u16()? as usize;
-                let h = conn.read_u16()? as usize;
-                match conn.read_i32()? {
+                let header = decode_rectangle_header(&conn.read_vec(12)?)?;
+                let x = usize::from(header.x);
+                let y = usize::from(header.y);
+                let w = usize::from(header.width);
+                let h = usize::from(header.height);
+                match header.encoding {
                     protocol::RAW => {
                         let count = checked_rectangle_pixel_count(w, h)?;
                         update_raw_bytes = checked_update_raw_bytes(
