@@ -1,39 +1,12 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
+use std::sync::Arc;
 
-use frd_core::{Endpoint, SessionId, TargetSystem};
-use frd_protocol_api::{ProtocolCatalog, ProtocolError, ProtocolId, ProtocolSelection};
-
-/// 连接选择在调用 factory 前完成，避免错误组合创建 worker。
-pub struct ConnectPlan {
-    session_id: SessionId,
-    target: TargetSystem,
-    protocol_id: ProtocolId,
-    endpoint: Endpoint,
-}
-
-impl ConnectPlan {
-    pub fn for_session(
-        session_id: SessionId,
-        target: TargetSystem,
-        protocol_id: ProtocolId,
-        endpoint: Endpoint,
-    ) -> Self {
-        Self {
-            session_id,
-            target,
-            protocol_id,
-            endpoint,
-        }
-    }
-
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
-    }
-}
+use frd_core::{SessionId, TargetSystem};
+use frd_protocol_api::{ConnectRequest, ProtocolCatalog, ProtocolError, ProtocolSelection};
 
 pub struct SessionCoordinator {
     catalog: ProtocolCatalog,
-    factory_creations: usize,
+    successful_launches: usize,
     active: Option<ActiveSessionResources>,
 }
 
@@ -56,17 +29,87 @@ pub trait CleanupOperations {
     fn dispose_mailbox(&mut self) -> Result<(), CleanupError>;
 }
 
-static NEXT_CLEANUP_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
+struct SessionStartIdentity {
+    session_id: SessionId,
+}
+
+/// app 活动槽独占持有的 reservation owner；外部不能构造或复制其身份。
+pub struct SessionStartOwner {
+    identity: Arc<SessionStartIdentity>,
+}
+
+/// `AppAction::StartSession` 一次性移交给 Task 11 composition root 的 start capability。
+pub struct SessionStartPermit {
+    identity: Arc<SessionStartIdentity>,
+}
+
+/// 为一个 app 活动槽签发彼此配对、但职责不同的 owner/permit。
+///
+/// 任意另一轮调用即使复用相同 `SessionId`，也会获得不同的 opaque identity。
+pub fn reserve_session_start(session_id: SessionId) -> (SessionStartOwner, SessionStartPermit) {
+    let identity = Arc::new(SessionStartIdentity { session_id });
+    (
+        SessionStartOwner {
+            identity: identity.clone(),
+        },
+        SessionStartPermit { identity },
+    )
+}
+
+impl SessionStartPermit {
+    fn session_id(&self) -> SessionId {
+        self.identity.session_id
+    }
+}
+
+/// Task 11 composition boundary：实现方选择中立 request 对应的 concrete factory/runtime，
+/// 启动 worker 并返回其完整 cleanup bundle。返回 `Err` 前必须回收本次构造的任何部分资源。
+pub trait SessionLauncher {
+    fn launch(self, request: ConnectRequest) -> Result<Box<dyn CleanupOperations>, ProtocolError>;
+}
+
+impl<F> SessionLauncher for F
+where
+    F: FnOnce(ConnectRequest) -> Result<Box<dyn CleanupOperations>, ProtocolError>,
+{
+    fn launch(self, request: ConnectRequest) -> Result<Box<dyn CleanupOperations>, ProtocolError> {
+        self(request)
+    }
+}
+
+/// 启动失败不会签发 cleanup handle；permit 退还给 composition root 以便安全重试。
+pub struct SessionStartFailure {
+    error: ProtocolError,
+    permit: SessionStartPermit,
+}
+
+impl SessionStartFailure {
+    pub fn error(&self) -> &ProtocolError {
+        &self.error
+    }
+
+    pub fn into_permit(self) -> SessionStartPermit {
+        self.permit
+    }
+}
+
+impl fmt::Debug for SessionStartFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionStartFailure")
+            .field("error", &self.error)
+            .field("session_id", &self.permit.session_id())
+            .finish_non_exhaustive()
+    }
+}
 
 /// 仅由一次成功 `start` 签发；不可复制，且不能由调用者构造或改写 session 绑定。
 pub struct SessionCleanupHandle {
-    session_id: SessionId,
-    handle_id: u64,
+    identity: Arc<SessionStartIdentity>,
 }
 
 struct ActiveSessionResources {
-    session_id: SessionId,
-    handle_id: u64,
+    identity: Arc<SessionStartIdentity>,
     cleanup_ops: Box<dyn CleanupOperations>,
     progress: CleanupProgress,
 }
@@ -80,69 +123,95 @@ struct CleanupProgress {
 }
 
 /// 仅由 `SessionCoordinator` 在完整资源回收后签发的会话释放能力。
-#[derive(Debug, Eq, PartialEq)]
 pub struct CleanupComplete {
-    session_id: SessionId,
+    identity: Arc<SessionStartIdentity>,
 }
 
 impl CleanupComplete {
-    fn new(session_id: SessionId) -> Self {
-        Self { session_id }
+    pub fn session_id(&self) -> SessionId {
+        self.identity.session_id
     }
 
-    pub fn session_id(&self) -> SessionId {
-        self.session_id
+    pub fn matches_owner(&self, owner: &SessionStartOwner) -> bool {
+        Arc::ptr_eq(&self.identity, &owner.identity)
     }
 }
+
+impl fmt::Debug for CleanupComplete {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CleanupComplete")
+            .field("session_id", &self.session_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for CleanupComplete {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+impl Eq for CleanupComplete {}
 
 impl SessionCoordinator {
     pub fn new(catalog: ProtocolCatalog) -> Self {
         Self {
             catalog,
-            factory_creations: 0,
+            successful_launches: 0,
             active: None,
         }
     }
 
-    /// 先完成无副作用预检和单会话门禁，再创建并独占该 session 的清理资源。
-    pub fn start<F>(
+    /// 先完成 reservation、catalog 和单会话门禁，再通过 Task 11 launcher 创建资源。
+    /// launcher 失败不会占用 coordinator，也不会签发 handle/completion。
+    pub fn start<L>(
         &mut self,
-        plan: ConnectPlan,
-        create_resources: F,
-    ) -> Result<SessionCleanupHandle, ProtocolError>
+        permit: SessionStartPermit,
+        target: TargetSystem,
+        request: ConnectRequest,
+        launcher: L,
+    ) -> Result<SessionCleanupHandle, SessionStartFailure>
     where
-        F: FnOnce() -> Box<dyn CleanupOperations>,
+        L: SessionLauncher,
     {
         if self.active.is_some() {
-            return Err(ProtocolError::Terminal);
+            return Err(SessionStartFailure {
+                error: ProtocolError::Terminal,
+                permit,
+            });
         }
-        let _ = plan.endpoint();
-        self.catalog
-            .select(plan.target, ProtocolSelection::Explicit(plan.protocol_id))?;
-        let handle_id = NEXT_CLEANUP_HANDLE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("session cleanup handle ID 已耗尽");
-        let cleanup_ops = create_resources();
-        self.factory_creations = self
-            .factory_creations
+        if permit.session_id() != request.session_id {
+            return Err(SessionStartFailure {
+                error: ProtocolError::StaleSession,
+                permit,
+            });
+        }
+        if let Err(error) = self.catalog.select(
+            target,
+            ProtocolSelection::Explicit(request.protocol_id.clone()),
+        ) {
+            return Err(SessionStartFailure { error, permit });
+        }
+        let cleanup_ops = match launcher.launch(request) {
+            Ok(cleanup_ops) => cleanup_ops,
+            Err(error) => return Err(SessionStartFailure { error, permit }),
+        };
+        self.successful_launches = self
+            .successful_launches
             .checked_add(1)
-            .expect("factory 创建计数溢出");
+            .expect("会话启动计数溢出");
+        let identity = permit.identity;
         self.active = Some(ActiveSessionResources {
-            session_id: plan.session_id,
-            handle_id,
+            identity: identity.clone(),
             cleanup_ops,
             progress: CleanupProgress::default(),
         });
-        Ok(SessionCleanupHandle {
-            session_id: plan.session_id,
-            handle_id,
-        })
+        Ok(SessionCleanupHandle { identity })
     }
 
-    pub fn factory_creations(&self) -> usize {
-        self.factory_creations
+    pub fn successful_launches(&self) -> usize {
+        self.successful_launches
     }
 
     /// 只清理与本 coordinator 成功 start 绑定的资源；已成功的步骤不会在重试时重复。
@@ -151,7 +220,7 @@ impl SessionCoordinator {
         handle: &SessionCleanupHandle,
     ) -> Result<CleanupComplete, CleanupError> {
         let active = self.active.as_mut().ok_or(CleanupError::NoActiveSession)?;
-        if active.session_id != handle.session_id || active.handle_id != handle.handle_id {
+        if !Arc::ptr_eq(&active.identity, &handle.identity) {
             return Err(CleanupError::WrongSessionHandle);
         }
 
@@ -172,9 +241,9 @@ impl SessionCoordinator {
             active.progress.dispose_mailbox = true;
         }
 
-        let session_id = active.session_id;
+        let identity = active.identity.clone();
         self.active = None;
-        Ok(CleanupComplete::new(session_id))
+        Ok(CleanupComplete { identity })
     }
 }
 
@@ -212,29 +281,65 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use frd_core::SessionId;
-    use frd_protocol_api::{Endpoint, ProtocolCatalog, ProtocolId, TargetSystem};
+    use frd_protocol_api::{
+        ConnectRequest, Endpoint, ProtocolCatalog, ProtocolError, ProtocolId, TargetSystem,
+    };
 
-    use super::{CleanupError, CleanupOperations, ConnectPlan, SessionCoordinator, WriterGate};
+    use super::{
+        reserve_session_start, CleanupError, CleanupOperations, SessionCoordinator,
+        SessionLauncher, SessionStartFailure, WriterGate,
+    };
 
     #[test]
-    fn invalid_target_protocol_is_rejected_before_factory_creation() {
+    fn launcher_failure_issues_no_handle_and_leaves_coordinator_reusable() {
+        let session_id = SessionId::allocate();
+        let (_owner, permit) = reserve_session_start(session_id);
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let request = ConnectPlan::for_session(
-            SessionId::allocate(),
-            TargetSystem::Windows,
-            ProtocolId::apple_hpss_mvs(),
-            Endpoint::new("host.example", 3389).expect("valid endpoint"),
-        );
+
+        let failure = match coordinator.start(
+            permit,
+            TargetSystem::MacOs,
+            connect_request(session_id),
+            |_| Err(ProtocolError::Terminal),
+        ) {
+            Ok(_) => panic!("failed launcher must not sign a cleanup handle"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.error(), &ProtocolError::Terminal);
+        assert_eq!(coordinator.successful_launches(), 0);
+
+        let handle = coordinator
+            .start(
+                failure.into_permit(),
+                TargetSystem::MacOs,
+                connect_request(session_id),
+                {
+                    let log = log.clone();
+                    move |_| Ok(Box::new(SharedCleanup::new(log)) as Box<dyn CleanupOperations>)
+                },
+            )
+            .expect("the same reserved start can retry after launcher rollback");
+        assert_eq!(coordinator.successful_launches(), 1);
+        assert!(coordinator.complete_cleanup(&handle).is_ok());
+    }
+
+    #[test]
+    fn invalid_target_protocol_is_rejected_before_launcher_invocation() {
+        let mut coordinator =
+            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let session_id = SessionId::allocate();
         let log = Arc::new(Mutex::new(Vec::new()));
 
-        assert!(coordinator
-            .start(request, {
+        assert!(
+            start_session(&mut coordinator, session_id, TargetSystem::Windows, {
                 let log = log.clone();
-                move || Box::new(SharedCleanup::new(log))
+                move |_| Ok(Box::new(SharedCleanup::new(log)) as Box<dyn CleanupOperations>)
             })
-            .is_err());
-        assert_eq!(coordinator.factory_creations(), 0);
+            .is_err()
+        );
+        assert_eq!(coordinator.successful_launches(), 0);
         assert!(log.lock().expect("log lock").is_empty());
     }
 
@@ -257,12 +362,11 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let handle = coordinator
-            .start(connect_plan(session_id), {
-                let log = log.clone();
-                move || Box::new(SharedCleanup::new(log))
-            })
-            .expect("session starts");
+        let handle = start_session(&mut coordinator, session_id, TargetSystem::MacOs, {
+            let log = log.clone();
+            move |_| Ok(Box::new(SharedCleanup::new(log)) as Box<dyn CleanupOperations>)
+        })
+        .expect("session starts");
 
         let completion = coordinator
             .complete_cleanup(&handle)
@@ -286,17 +390,16 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let handle = coordinator
-            .start(connect_plan(session_id), {
-                let log = log.clone();
-                move || {
-                    Box::new(SharedCleanup::failing_once(
-                        log,
-                        CleanupError::JoinWorkersAndAudio,
-                    ))
-                }
-            })
-            .expect("session starts");
+        let handle = start_session(&mut coordinator, session_id, TargetSystem::MacOs, {
+            let log = log.clone();
+            move |_| {
+                Ok(Box::new(SharedCleanup::failing_once(
+                    log,
+                    CleanupError::JoinWorkersAndAudio,
+                )) as Box<dyn CleanupOperations>)
+            }
+        })
+        .expect("session starts");
 
         assert!(matches!(
             coordinator.complete_cleanup(&handle),
@@ -318,12 +421,11 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut owner =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let handle = owner
-            .start(connect_plan(session_id), {
-                let log = log.clone();
-                move || Box::new(SharedCleanup::new(log))
-            })
-            .expect("owner starts the session");
+        let handle = start_session(&mut owner, session_id, TargetSystem::MacOs, {
+            let log = log.clone();
+            move |_| Ok(Box::new(SharedCleanup::new(log)) as Box<dyn CleanupOperations>)
+        })
+        .expect("owner starts the session");
         let mut never_started = SessionCoordinator::new(ProtocolCatalog::new([]));
 
         assert_eq!(
@@ -346,24 +448,29 @@ mod tests {
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
         let mut same_id_other_coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let _first_handle = first_coordinator
-            .start(connect_plan(first), {
-                let first_log = first_log.clone();
-                move || Box::new(SharedCleanup::new(first_log))
-            })
-            .expect("first starts");
-        let other_handle = other_coordinator
-            .start(connect_plan(other), {
-                let other_log = other_log.clone();
-                move || Box::new(SharedCleanup::new(other_log))
-            })
-            .expect("other starts");
-        let same_id_other_handle = same_id_other_coordinator
-            .start(connect_plan(first), {
+        let _first_handle = start_session(&mut first_coordinator, first, TargetSystem::MacOs, {
+            let first_log = first_log.clone();
+            move |_| Ok(Box::new(SharedCleanup::new(first_log)) as Box<dyn CleanupOperations>)
+        })
+        .expect("first starts");
+        let other_handle = start_session(&mut other_coordinator, other, TargetSystem::MacOs, {
+            let other_log = other_log.clone();
+            move |_| Ok(Box::new(SharedCleanup::new(other_log)) as Box<dyn CleanupOperations>)
+        })
+        .expect("other starts");
+        let same_id_other_handle = start_session(
+            &mut same_id_other_coordinator,
+            first,
+            TargetSystem::MacOs,
+            {
                 let same_id_other_start_log = same_id_other_start_log.clone();
-                move || Box::new(SharedCleanup::new(same_id_other_start_log))
-            })
-            .expect("same session ID starts under another coordinator");
+                move |_| {
+                    Ok(Box::new(SharedCleanup::new(same_id_other_start_log))
+                        as Box<dyn CleanupOperations>)
+                }
+            },
+        )
+        .expect("same session ID starts under another coordinator");
 
         assert_eq!(
             first_coordinator.complete_cleanup(&other_handle),
@@ -387,12 +494,11 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let handle = coordinator
-            .start(connect_plan(session_id), {
-                let log = log.clone();
-                move || Box::new(SharedCleanup::new(log))
-            })
-            .expect("session starts");
+        let handle = start_session(&mut coordinator, session_id, TargetSystem::MacOs, {
+            let log = log.clone();
+            move |_| Ok(Box::new(SharedCleanup::new(log)) as Box<dyn CleanupOperations>)
+        })
+        .expect("session starts");
 
         let completion = coordinator
             .complete_cleanup(&handle)
@@ -413,51 +519,84 @@ mod tests {
         let second_resource_creations = Arc::new(AtomicUsize::new(0));
         let mut coordinator =
             SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-        let handle = coordinator
-            .start(connect_plan(first), {
-                let log = log.clone();
-                move || {
-                    Box::new(SharedCleanup::failing_once(
-                        log,
-                        CleanupError::ShutdownWriter,
-                    ))
-                }
-            })
-            .expect("first session starts");
+        let handle = start_session(&mut coordinator, first, TargetSystem::MacOs, {
+            let log = log.clone();
+            move |_| {
+                Ok(Box::new(SharedCleanup::failing_once(
+                    log,
+                    CleanupError::ShutdownWriter,
+                )) as Box<dyn CleanupOperations>)
+            }
+        })
+        .expect("first session starts");
 
         assert_eq!(
             coordinator.complete_cleanup(&handle),
             Err(CleanupError::ShutdownWriter)
         );
         assert!(coordinator
-            .start(connect_plan(second), {
-                let creations = second_resource_creations.clone();
-                move || {
-                    creations.fetch_add(1, Ordering::Relaxed);
-                    Box::new(SharedCleanup::new(Arc::new(Mutex::new(Vec::new()))))
-                }
-            })
+            .start(
+                reserve_session_start(second).1,
+                TargetSystem::MacOs,
+                connect_request(second),
+                {
+                    let creations = second_resource_creations.clone();
+                    move |_| {
+                        creations.fetch_add(1, Ordering::Relaxed);
+                        Ok(
+                            Box::new(SharedCleanup::new(Arc::new(Mutex::new(Vec::new()))))
+                                as Box<dyn CleanupOperations>,
+                        )
+                    }
+                },
+            )
             .is_err());
         assert_eq!(second_resource_creations.load(Ordering::Relaxed), 0);
         assert!(coordinator.complete_cleanup(&handle).is_ok());
         assert!(coordinator
-            .start(connect_plan(second), {
-                let creations = second_resource_creations.clone();
-                move || {
-                    creations.fetch_add(1, Ordering::Relaxed);
-                    Box::new(SharedCleanup::new(Arc::new(Mutex::new(Vec::new()))))
-                }
-            })
+            .start(
+                reserve_session_start(second).1,
+                TargetSystem::MacOs,
+                connect_request(second),
+                {
+                    let creations = second_resource_creations.clone();
+                    move |_| {
+                        creations.fetch_add(1, Ordering::Relaxed);
+                        Ok(
+                            Box::new(SharedCleanup::new(Arc::new(Mutex::new(Vec::new()))))
+                                as Box<dyn CleanupOperations>,
+                        )
+                    }
+                },
+            )
             .is_ok());
         assert_eq!(second_resource_creations.load(Ordering::Relaxed), 1);
     }
 
-    fn connect_plan(session_id: SessionId) -> ConnectPlan {
-        ConnectPlan::for_session(
+    fn connect_request(session_id: SessionId) -> ConnectRequest {
+        ConnectRequest {
             session_id,
-            TargetSystem::MacOs,
-            ProtocolId::apple_hpss_mvs(),
-            Endpoint::new("host.example", 5900).expect("valid endpoint"),
+            endpoint: Endpoint::new("host.example", 5900).expect("valid endpoint"),
+            protocol_id: ProtocolId::apple_hpss_mvs(),
+            credentials: None,
+            saved_server_pin: None,
+        }
+    }
+
+    fn start_session<L>(
+        coordinator: &mut SessionCoordinator,
+        session_id: SessionId,
+        target: TargetSystem,
+        launcher: L,
+    ) -> Result<super::SessionCleanupHandle, SessionStartFailure>
+    where
+        L: SessionLauncher,
+    {
+        coordinator.start(
+            reserve_session_start(session_id).1,
+            target,
+            connect_request(session_id),
+            launcher,
         )
     }
 

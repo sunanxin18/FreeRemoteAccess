@@ -8,7 +8,7 @@ use frd_protocol_api::{
     ProtocolCatalog, ProtocolError, ServerIdentityChallenge, ServerIdentityDecision,
     SessionCapabilities, SessionCommand, SessionEvent,
 };
-use frd_session::CleanupComplete;
+use frd_session::{reserve_session_start, CleanupComplete, SessionStartOwner, SessionStartPermit};
 use frd_ui_model::{
     ConnectionDraft, ConnectionForm, ConnectionSubmission, LaunchOptions, Page, ProtocolChoice,
 };
@@ -56,7 +56,7 @@ pub enum IdentityDecisionError {
 }
 
 pub enum AppAction {
-    StartSession(ConnectRequest),
+    StartSession(ConnectRequest, SessionStartPermit),
     SessionCommand(SessionCommand),
 }
 
@@ -169,31 +169,51 @@ impl AppController {
         }
     }
 
+    #[cfg(test)]
     pub fn awaiting_first_frame(session_id: SessionId, generation: u64) -> Self {
+        Self::reserve_awaiting_first_frame(session_id, generation).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn awaiting_first_frame_with_start(
+        session_id: SessionId,
+        generation: u64,
+    ) -> (Self, SessionStartPermit) {
+        Self::reserve_awaiting_first_frame(session_id, generation)
+    }
+
+    #[cfg(test)]
+    fn reserve_awaiting_first_frame(
+        session_id: SessionId,
+        generation: u64,
+    ) -> (Self, SessionStartPermit) {
         assert!(generation != 0, "首帧 generation 必须大于零");
         let mut session_slot = ActiveSessionSlot::default();
-        session_slot
+        let permit = session_slot
             .begin_connect(session_id)
             .expect("新控制器的会话槽为空");
         session_slot
             .mark_active(session_id)
             .expect("新控制器的会话进入活动状态");
-        Self {
-            session_id: Some(session_id),
-            generation,
-            page: Page::AwaitingFirstFrame {
-                draft: ConnectionDraft::default(),
-                stage: ConnectionStage::TransportReady,
-                diagnostics: None,
+        (
+            Self {
+                session_id: Some(session_id),
+                generation,
+                page: Page::AwaitingFirstFrame {
+                    draft: ConnectionDraft::default(),
+                    stage: ConnectionStage::TransportReady,
+                    diagnostics: None,
+                },
+                session_slot,
+                protocol_capabilities: SessionCapabilities::default(),
+                platform_capabilities: PlatformCapabilities::default(),
+                policy: ProductPolicy::default(),
+                challenge: None,
+                inbound_clipboard: None,
+                audio_state: AudioState::Unavailable,
             },
-            session_slot,
-            protocol_capabilities: SessionCapabilities::default(),
-            platform_capabilities: PlatformCapabilities::default(),
-            policy: ProductPolicy::default(),
-            challenge: None,
-            inbound_clipboard: None,
-            audio_state: AudioState::Unavailable,
-        }
+            permit,
+        )
     }
 
     pub fn page(&self) -> &Page {
@@ -216,7 +236,7 @@ impl AppController {
         cleanup: CleanupComplete,
     ) -> Result<(), ActiveSessionError> {
         let session_id = cleanup.session_id();
-        self.session_slot.finish_cleanup(cleanup)?;
+        self.session_slot.finish_cleanup(&cleanup)?;
         if self.session_id == Some(session_id) {
             self.session_id = None;
             self.reset_session_bound_state();
@@ -317,7 +337,8 @@ impl AppController {
             .load_pin(&protocol_id, &endpoint)
             .map_err(AppControllerError::Platform)?;
         let session_id = SessionId::allocate();
-        self.session_slot
+        let permit = self
+            .session_slot
             .begin_connect(session_id)
             .map_err(|_| AppControllerError::SessionAlreadyActive)?;
 
@@ -339,7 +360,7 @@ impl AppController {
             stage: ConnectionStage::Connecting,
             diagnostics: None,
         };
-        Ok(AppAction::StartSession(request))
+        Ok(AppAction::StartSession(request, permit))
     }
 
     fn reject_submission(
@@ -415,6 +436,10 @@ impl AppController {
         }
         match event {
             SessionEvent::StageChanged(stage) => {
+                if stage == ConnectionStage::Disconnecting {
+                    self.handle_disconnect_stage();
+                    return;
+                }
                 if matches!(self.page, Page::RemoteSession { .. }) {
                     return;
                 }
@@ -486,6 +511,18 @@ impl AppController {
                 code: code.to_owned(),
             };
         }
+    }
+
+    fn handle_disconnect_stage(&mut self) {
+        let Some(session_id) = self.session_id else {
+            return;
+        };
+        if self.session_slot.begin_disconnect(session_id).is_err() {
+            return;
+        }
+        let draft = self.page.retained_draft();
+        self.reset_session_bound_state();
+        self.page = Page::Disconnecting { draft };
     }
 
     pub fn handle_presentation(&mut self, event: PresentationEvent) {
@@ -594,11 +631,17 @@ impl AppController {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SlotState {
-    Connecting(SessionId),
-    Active(SessionId),
-    Disconnecting(SessionId),
-    CleanupPending(SessionId),
+enum SlotPhase {
+    Connecting,
+    Active,
+    Disconnecting,
+    CleanupPending,
+}
+
+struct SlotState {
+    session_id: SessionId,
+    owner: SessionStartOwner,
+    phase: SlotPhase,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -623,18 +666,28 @@ impl ActiveSessionSlot {
         self.state.is_some()
     }
 
-    pub fn begin_connect(&mut self, session_id: SessionId) -> Result<(), ActiveSessionError> {
+    pub fn begin_connect(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<SessionStartPermit, ActiveSessionError> {
         if self.state.is_some() {
             return Err(ActiveSessionError::Occupied);
         }
-        self.state = Some(SlotState::Connecting(session_id));
-        Ok(())
+        let (owner, permit) = reserve_session_start(session_id);
+        self.state = Some(SlotState {
+            session_id,
+            owner,
+            phase: SlotPhase::Connecting,
+        });
+        Ok(permit)
     }
 
     pub fn mark_active(&mut self, session_id: SessionId) -> Result<(), ActiveSessionError> {
-        match self.state {
-            Some(SlotState::Connecting(current)) if current == session_id => {
-                self.state = Some(SlotState::Active(session_id));
+        match self.state.as_mut() {
+            Some(state)
+                if state.session_id == session_id && state.phase == SlotPhase::Connecting =>
+            {
+                state.phase = SlotPhase::Active;
                 Ok(())
             }
             _ => Err(ActiveSessionError::InvalidTransition),
@@ -645,15 +698,20 @@ impl ActiveSessionSlot {
         &mut self,
         session_id: SessionId,
     ) -> Result<DisconnectTransition, ActiveSessionError> {
-        match self.state {
-            Some(SlotState::Connecting(current) | SlotState::Active(current))
-                if current == session_id =>
+        match self.state.as_mut() {
+            Some(state)
+                if state.session_id == session_id
+                    && matches!(state.phase, SlotPhase::Connecting | SlotPhase::Active) =>
             {
-                self.state = Some(SlotState::Disconnecting(session_id));
+                state.phase = SlotPhase::Disconnecting;
                 Ok(DisconnectTransition::Started)
             }
-            Some(SlotState::Disconnecting(current) | SlotState::CleanupPending(current))
-                if current == session_id =>
+            Some(state)
+                if state.session_id == session_id
+                    && matches!(
+                        state.phase,
+                        SlotPhase::Disconnecting | SlotPhase::CleanupPending
+                    ) =>
             {
                 Ok(DisconnectTransition::AlreadyInProgress)
             }
@@ -662,25 +720,36 @@ impl ActiveSessionSlot {
     }
 
     fn begin_terminal(&mut self, session_id: SessionId) -> Result<(), ActiveSessionError> {
-        match self.state {
-            Some(
-                SlotState::Connecting(current)
-                | SlotState::Active(current)
-                | SlotState::Disconnecting(current),
-            ) if current == session_id => {
-                self.state = Some(SlotState::CleanupPending(session_id));
+        match self.state.as_mut() {
+            Some(state)
+                if state.session_id == session_id
+                    && matches!(
+                        state.phase,
+                        SlotPhase::Connecting | SlotPhase::Active | SlotPhase::Disconnecting
+                    ) =>
+            {
+                state.phase = SlotPhase::CleanupPending;
                 Ok(())
             }
-            Some(SlotState::CleanupPending(current)) if current == session_id => Ok(()),
+            Some(state)
+                if state.session_id == session_id && state.phase == SlotPhase::CleanupPending =>
+            {
+                Ok(())
+            }
             _ => Err(ActiveSessionError::InvalidTransition),
         }
     }
 
     /// 仅接受 `SessionCoordinator` 在完整资源回收后签发的完成能力。
-    pub fn finish_cleanup(&mut self, cleanup: CleanupComplete) -> Result<(), ActiveSessionError> {
-        match self.state {
-            Some(SlotState::Disconnecting(current) | SlotState::CleanupPending(current))
-                if current == cleanup.session_id() =>
+    pub fn finish_cleanup(&mut self, cleanup: &CleanupComplete) -> Result<(), ActiveSessionError> {
+        match self.state.as_ref() {
+            Some(state)
+                if state.session_id == cleanup.session_id()
+                    && matches!(
+                        state.phase,
+                        SlotPhase::Disconnecting | SlotPhase::CleanupPending
+                    )
+                    && cleanup.matches_owner(&state.owner) =>
             {
                 self.state = None;
                 Ok(())

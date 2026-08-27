@@ -40,12 +40,13 @@ mod tests {
     };
 
     use frd_protocol_api::{
-        evaluate_server_identity, AudioState, ClipboardPayload, ConnectionStage, Endpoint,
-        ProtocolCatalog, ProtocolError, ProtocolId, ServerIdentityChallenge,
+        evaluate_server_identity, AudioState, ClipboardPayload, ConnectRequest, ConnectionStage,
+        Endpoint, ProtocolCatalog, ProtocolError, ProtocolId, ServerIdentityChallenge,
         ServerIdentityDecision, ServerIdentityValidation, SessionCommand, SessionEvent,
     };
     use frd_session::{
-        CleanupError, CleanupOperations, ConnectPlan, SessionCleanupHandle, SessionCoordinator,
+        CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
+        SessionStartPermit,
     };
 
     use frd_ui_model::{ConnectionDraft, ConnectionForm, LaunchOptions, ProtocolChoice};
@@ -71,7 +72,7 @@ mod tests {
             .expect("connect intent is accepted")
             .expect("connect starts one worker")
         {
-            AppAction::StartSession(request) => request,
+            AppAction::StartSession(request, _permit) => request,
             AppAction::SessionCommand(_) => panic!("connect must start through the single path"),
         };
         let session_id = request.session_id;
@@ -131,7 +132,7 @@ mod tests {
             .handle_intent(submission, &catalog, &store)
             .expect("connect intent is accepted")
             .expect("connect starts one worker");
-        let AppAction::StartSession(request) = action else {
+        let AppAction::StartSession(request, _permit) = action else {
             panic!("connect starts through the session request path");
         };
 
@@ -292,7 +293,7 @@ mod tests {
             .expect("valid submission");
         assert!(matches!(
             controller.handle_intent(valid, &catalog, &store),
-            Ok(Some(AppAction::StartSession(_)))
+            Ok(Some(AppAction::StartSession(_, _)))
         ));
     }
 
@@ -400,15 +401,18 @@ mod tests {
         let first = complete_form()
             .take_submission(&catalog)
             .expect("first submission");
-        let AppAction::StartSession(first_request) = controller
+        let AppAction::StartSession(first_request, first_permit) = controller
             .handle_intent(first, &catalog, &store)
             .expect("first connection")
             .expect("session start action")
         else {
             panic!("first connection starts a session");
         };
-        let first_session_id = first_request.session_id;
-        let mut lifecycle = StartedTestSession::new(first_session_id);
+        let mut lifecycle = StartedTestSession::from_retry_permit(
+            first_permit,
+            first_request,
+            RecordingCleanup::default(),
+        );
         controller
             .handle_intent(AppIntent::Disconnect, &catalog, &store)
             .expect("disconnect begins");
@@ -433,7 +437,7 @@ mod tests {
             .expect("reconnect submission");
         assert!(matches!(
             controller.handle_intent(reconnect, &catalog, &store),
-            Ok(Some(AppAction::StartSession(_)))
+            Ok(Some(AppAction::StartSession(_, _)))
         ));
     }
 
@@ -442,7 +446,7 @@ mod tests {
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
-        let AppAction::StartSession(request) = controller
+        let AppAction::StartSession(request, permit) = controller
             .handle_intent(
                 complete_form()
                     .take_submission(&catalog)
@@ -456,7 +460,8 @@ mod tests {
             panic!("connection starts a worker");
         };
         let session_id = request.session_id;
-        let mut lifecycle = StartedTestSession::new(session_id);
+        let mut lifecycle =
+            StartedTestSession::from_retry_permit(permit, request, RecordingCleanup::default());
         controller.set_platform_capabilities(PlatformCapabilities {
             dynamic_resolution: true,
             clipboard_read: true,
@@ -495,7 +500,16 @@ mod tests {
             frd_protocol_api::SessionCapabilities::default()
         );
         assert!(controller.current_server_identity_challenge().is_none());
-        let mut wrong_lifecycle = StartedTestSession::new(SessionId::allocate());
+        let wrong_session_id = SessionId::allocate();
+        let mut wrong_slot = ActiveSessionSlot::default();
+        let wrong_permit = wrong_slot
+            .begin_connect(wrong_session_id)
+            .expect("other start reserves a distinct owner");
+        let mut wrong_lifecycle = StartedTestSession::from_permit(
+            wrong_permit,
+            wrong_session_id,
+            RecordingCleanup::default(),
+        );
         let wrong_completion = wrong_lifecycle
             .complete()
             .expect("other started session cleanup completes");
@@ -520,7 +534,7 @@ mod tests {
             .expect("retry submission");
         assert!(matches!(
             controller.handle_intent(retry, &catalog, &store),
-            Ok(Some(AppAction::StartSession(_)))
+            Ok(Some(AppAction::StartSession(_, _)))
         ));
     }
 
@@ -529,7 +543,7 @@ mod tests {
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
-        let AppAction::StartSession(request) = controller
+        let AppAction::StartSession(request, permit) = controller
             .handle_intent(
                 complete_form()
                     .take_submission(&catalog)
@@ -542,8 +556,8 @@ mod tests {
         else {
             panic!("connection starts a worker");
         };
-        let session_id = request.session_id;
-        let mut lifecycle = StartedTestSession::new(session_id);
+        let mut lifecycle =
+            StartedTestSession::from_retry_permit(permit, request, RecordingCleanup::default());
 
         controller
             .handle_session_event(SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed));
@@ -567,7 +581,7 @@ mod tests {
             .expect("retry submission");
         assert!(matches!(
             controller.handle_intent(retry, &catalog, &store),
-            Ok(Some(AppAction::StartSession(_)))
+            Ok(Some(AppAction::StartSession(_, _)))
         ));
     }
 
@@ -576,8 +590,10 @@ mod tests {
         let session_id = SessionId::allocate();
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
-        let mut controller = AppController::awaiting_first_frame(session_id, 1);
-        let mut lifecycle = StartedTestSession::new(session_id);
+        let (mut controller, permit) =
+            AppController::awaiting_first_frame_with_start(session_id, 1);
+        let mut lifecycle =
+            StartedTestSession::from_permit(permit, session_id, RecordingCleanup::default());
 
         controller.handle_session_event(SessionEvent::Error(ProtocolError::Adapter {
             protocol_id: ProtocolId::apple_hpss_mvs(),
@@ -615,32 +631,35 @@ mod tests {
             .expect("retry submission");
         assert!(matches!(
             controller.handle_intent(retry, &catalog, &store),
-            Ok(Some(AppAction::StartSession(_)))
+            Ok(Some(AppAction::StartSession(_, _)))
         ));
     }
 
+    /// 纯协议中立测试 harness；只验证 Task 10 ownership，不代表 Apple worker 已接线。
     struct StartedTestSession {
         coordinator: SessionCoordinator,
         handle: SessionCleanupHandle,
     }
 
     impl StartedTestSession {
-        fn new(session_id: SessionId) -> Self {
-            Self::with_cleanup(session_id, RecordingCleanup::default())
+        fn from_permit(
+            permit: SessionStartPermit,
+            session_id: SessionId,
+            cleanup: RecordingCleanup,
+        ) -> Self {
+            Self::from_retry_permit(permit, test_connect_request(session_id), cleanup)
         }
 
-        fn with_cleanup(session_id: SessionId, cleanup: RecordingCleanup) -> Self {
+        fn from_retry_permit(
+            permit: SessionStartPermit,
+            request: ConnectRequest,
+            cleanup: RecordingCleanup,
+        ) -> Self {
             let mut coordinator =
                 SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
-            let plan = ConnectPlan::for_session(
-                session_id,
-                TargetSystem::MacOs,
-                ProtocolId::apple_hpss_mvs(),
-                Endpoint::new("mac.example", 5900).expect("valid endpoint"),
-            );
             let handle = coordinator
-                .start(plan, move || -> Box<dyn CleanupOperations> {
-                    Box::new(cleanup)
+                .start(permit, TargetSystem::MacOs, request, move |_| {
+                    Ok(Box::new(cleanup) as Box<dyn CleanupOperations>)
                 })
                 .expect("test coordinator starts the session");
             Self {
@@ -849,14 +868,16 @@ mod tests {
         let first = SessionId::allocate();
         let second = SessionId::allocate();
         let mut slot = ActiveSessionSlot::default();
-        let mut lifecycle = StartedTestSession::new(first);
 
-        slot.begin_connect(first)
+        let permit = slot
+            .begin_connect(first)
             .expect("first connect is accepted");
+        let mut lifecycle =
+            StartedTestSession::from_permit(permit, first, RecordingCleanup::default());
         slot.begin_disconnect(first)
             .expect("first session begins disconnect");
         let completed = lifecycle.complete().expect("all resources are reclaimed");
-        slot.finish_cleanup(completed)
+        slot.finish_cleanup(&completed)
             .expect("matching cleanup completion releases the slot");
         assert!(slot.begin_connect(second).is_ok());
     }
@@ -867,16 +888,22 @@ mod tests {
         let other = SessionId::allocate();
         let second = SessionId::allocate();
         let mut slot = ActiveSessionSlot::default();
-        slot.begin_connect(first)
+        let _first_permit = slot
+            .begin_connect(first)
             .expect("first connect is accepted");
         slot.begin_disconnect(first)
             .expect("first session begins disconnect");
-        let mut other_lifecycle = StartedTestSession::new(other);
+        let mut other_slot = ActiveSessionSlot::default();
+        let other_permit = other_slot
+            .begin_connect(other)
+            .expect("other start is reserved");
+        let mut other_lifecycle =
+            StartedTestSession::from_permit(other_permit, other, RecordingCleanup::default());
         let other_completion = other_lifecycle
             .complete()
             .expect("other started session cleanup completes");
 
-        assert!(slot.finish_cleanup(other_completion).is_err());
+        assert!(slot.finish_cleanup(&other_completion).is_err());
         assert!(slot.begin_connect(second).is_err());
     }
 
@@ -885,13 +912,15 @@ mod tests {
         let first = SessionId::allocate();
         let second = SessionId::allocate();
         let mut slot = ActiveSessionSlot::default();
-        let mut lifecycle = StartedTestSession::with_cleanup(
+        let permit = slot
+            .begin_connect(first)
+            .expect("first connect is accepted");
+        let mut lifecycle = StartedTestSession::from_permit(
+            permit,
             first,
             RecordingCleanup::failing_at(CleanupError::ShutdownWriter),
         );
 
-        slot.begin_connect(first)
-            .expect("first connect is accepted");
         slot.begin_disconnect(first)
             .expect("first session begins disconnect");
         assert!(matches!(
@@ -899,6 +928,98 @@ mod tests {
             Err(CleanupError::ShutdownWriter)
         ));
         assert!(slot.begin_connect(second).is_err());
+    }
+
+    #[test]
+    fn completion_from_a_different_valid_start_with_same_session_id_cannot_release_slot() {
+        let session_id = SessionId::allocate();
+        let mut slot = ActiveSessionSlot::default();
+        let permit = slot
+            .begin_connect(session_id)
+            .expect("the product slot reserves one start");
+        let mut other_slot = ActiveSessionSlot::default();
+        let other_permit = other_slot
+            .begin_connect(session_id)
+            .expect("another slot issues a distinct reservation");
+        let mut lifecycle =
+            StartedTestSession::from_permit(permit, session_id, RecordingCleanup::default());
+        let mut other_lifecycle =
+            StartedTestSession::from_permit(other_permit, session_id, RecordingCleanup::default());
+        slot.begin_disconnect(session_id)
+            .expect("the product session begins disconnect");
+
+        let other_completion = other_lifecycle
+            .complete()
+            .expect("the other start reclaims only its own resources");
+        assert!(slot.finish_cleanup(&other_completion).is_err());
+        assert!(slot.is_occupied());
+
+        let completion = lifecycle
+            .complete()
+            .expect("the product start reclaims its bound resources");
+        assert!(slot.finish_cleanup(&completion).is_ok());
+    }
+
+    #[test]
+    fn stale_completion_is_rejected_after_a_new_start_with_the_same_session_id() {
+        let session_id = SessionId::allocate();
+        let mut slot = ActiveSessionSlot::default();
+        let first_permit = slot
+            .begin_connect(session_id)
+            .expect("first start is reserved");
+        let mut first_lifecycle =
+            StartedTestSession::from_permit(first_permit, session_id, RecordingCleanup::default());
+        slot.begin_disconnect(session_id)
+            .expect("first session disconnects");
+        let stale_completion = first_lifecycle.complete().expect("first cleanup completes");
+        slot.finish_cleanup(&stale_completion)
+            .expect("first completion releases only the first reservation");
+
+        let second_permit = slot
+            .begin_connect(session_id)
+            .expect("same session ID receives a new opaque reservation");
+        let mut second_lifecycle =
+            StartedTestSession::from_permit(second_permit, session_id, RecordingCleanup::default());
+        slot.begin_disconnect(session_id)
+            .expect("second session disconnects");
+
+        assert!(slot.finish_cleanup(&stale_completion).is_err());
+        assert!(slot.is_occupied());
+        let second_completion = second_lifecycle
+            .complete()
+            .expect("second cleanup completes");
+        assert!(slot.finish_cleanup(&second_completion).is_ok());
+    }
+
+    #[test]
+    fn launcher_failure_has_no_app_release_capability_and_can_retry_the_reservation() {
+        let session_id = SessionId::allocate();
+        let mut slot = ActiveSessionSlot::default();
+        let permit = slot
+            .begin_connect(session_id)
+            .expect("app reserves the start");
+        let mut coordinator =
+            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let failure = match coordinator.start(
+            permit,
+            TargetSystem::MacOs,
+            test_connect_request(session_id),
+            |_| Err(ProtocolError::Terminal),
+        ) {
+            Ok(_) => panic!("failed launcher must not sign a cleanup handle"),
+            Err(failure) => failure,
+        };
+        slot.begin_disconnect(session_id)
+            .expect("failed product start remains reserved for explicit recovery");
+        assert!(slot.is_occupied());
+
+        let mut lifecycle = StartedTestSession::from_retry_permit(
+            failure.into_permit(),
+            test_connect_request(session_id),
+            RecordingCleanup::default(),
+        );
+        let completion = lifecycle.complete().expect("retry resources clean up");
+        assert!(slot.finish_cleanup(&completion).is_ok());
     }
 
     #[test]
@@ -954,6 +1075,91 @@ mod tests {
                 .route_input(frd_core::InputEvent::ReleaseAll)
                 .is_some());
         }
+    }
+
+    #[test]
+    fn presented_apple_disconnecting_stage_closes_input_once_and_waits_for_bound_cleanup() {
+        let session_id = SessionId::allocate();
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let (mut controller, permit) =
+            AppController::awaiting_first_frame_with_start(session_id, 3);
+        let mut lifecycle =
+            StartedTestSession::from_permit(permit, session_id, RecordingCleanup::default());
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 3,
+            revision: 9,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        controller.set_platform_capabilities(PlatformCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.set_product_policy(ProductPolicy {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.handle_session_event(SessionEvent::CapabilitiesChanged(
+            frd_protocol_api::SessionCapabilities {
+                dynamic_resolution: true,
+                clipboard_read: true,
+                clipboard_write: true,
+                remote_audio: true,
+                text_input: true,
+            },
+        ));
+        controller.handle_session_event(SessionEvent::Clipboard(ClipboardPayload::new(vec![0x22])));
+        controller.handle_session_event(SessionEvent::AudioState(AudioState::Playing));
+        controller.handle_server_identity_challenge(challenge(session_id, 7, [0x11; 32]));
+        assert!(controller
+            .route_input(frd_core::InputEvent::ReleaseAll)
+            .is_some());
+        assert!(controller.effective_capabilities().remote_audio);
+        assert!(controller.current_server_identity_challenge().is_some());
+
+        controller.handle_session_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
+        controller.handle_session_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
+
+        assert!(matches!(controller.page(), AppPage::Disconnecting { .. }));
+        assert!(controller
+            .route_input(frd_core::InputEvent::ReleaseAll)
+            .is_none());
+        assert!(controller.take_inbound_clipboard().is_none());
+        assert_eq!(controller.audio_state(), &AudioState::Unavailable);
+        assert_eq!(
+            controller.effective_capabilities(),
+            frd_protocol_api::SessionCapabilities::default()
+        );
+        assert!(controller.current_server_identity_challenge().is_none());
+        let blocked = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert_eq!(
+            controller.handle_intent(blocked, &catalog, &store).err(),
+            Some(AppControllerError::SessionAlreadyActive)
+        );
+
+        controller
+            .finish_session_cleanup(
+                lifecycle
+                    .complete()
+                    .expect("bound start resources complete cleanup"),
+            )
+            .expect("bound completion releases the slot");
+        let retry = complete_form()
+            .take_submission(&catalog)
+            .expect("retry submission");
+        assert!(matches!(
+            controller.handle_intent(retry, &catalog, &store),
+            Ok(Some(AppAction::StartSession(_, _)))
+        ));
     }
 
     #[test]
@@ -1178,8 +1384,9 @@ mod tests {
         let first = SessionId::allocate();
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
         let store = RecordingStore::default();
-        let mut controller = AppController::awaiting_first_frame(first, 1);
-        let mut lifecycle = StartedTestSession::new(first);
+        let (mut controller, permit) = AppController::awaiting_first_frame_with_start(first, 1);
+        let mut lifecycle =
+            StartedTestSession::from_permit(permit, first, RecordingCleanup::default());
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(
             frd_protocol_api::SessionCapabilities {
                 dynamic_resolution: true,
@@ -1216,7 +1423,7 @@ mod tests {
             .expect("second submission");
         assert!(matches!(
             controller.handle_intent(second, &catalog, &store),
-            Ok(Some(AppAction::StartSession(_)))
+            Ok(Some(AppAction::StartSession(_, _)))
         ));
         assert!(controller.take_inbound_clipboard().is_none());
         assert_eq!(controller.audio_state(), &AudioState::Unavailable);
@@ -1342,6 +1549,16 @@ mod tests {
             pin,
             evaluate_server_identity(None, pin),
         )
+    }
+
+    fn test_connect_request(session_id: SessionId) -> ConnectRequest {
+        ConnectRequest {
+            session_id,
+            endpoint: Endpoint::new("mac.example", 5900).expect("valid endpoint"),
+            protocol_id: ProtocolId::apple_hpss_mvs(),
+            credentials: None,
+            saved_server_pin: None,
+        }
     }
 
     fn challenge_with_validation(
