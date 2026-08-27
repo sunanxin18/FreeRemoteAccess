@@ -17,12 +17,15 @@ members = [
     "crates/frd-platform-api",
     "crates/frd-app",
     "crates/frd-protocol-apple",
+    "crates/frd-render-wgpu",
+    "crates/frd-compositor-wgpu",
     "tools/frd-legacy-minifb-lab",
+    "tools/frd-wgpu-smoke",
 ]
 
 [workspace.dependencies]
 winit = "=0.30.13"
-wgpu = { version = "=30.0.1", default-features = false }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "wgsl"] }
 egui = "=0.36.1"
 egui-winit = { version = "=0.36.1", default-features = false }
 egui-wgpu = { version = "=0.36.1", default-features = false }

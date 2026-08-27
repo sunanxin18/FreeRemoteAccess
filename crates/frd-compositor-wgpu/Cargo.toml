@@ -1,0 +1,12 @@
+[package]
+name = "frd-compositor-wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-protocol-api = { path = "../frd-protocol-api" }
+frd-render-wgpu = { path = "../frd-render-wgpu" }
+raw-window-handle.workspace = true
+wgpu.workspace = true

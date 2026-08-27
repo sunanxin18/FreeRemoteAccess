@@ -1,0 +1,9 @@
+[package]
+name = "frd-render-wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+wgpu.workspace = true
