@@ -291,12 +291,19 @@ fn run_authenticated_session_inner(
     .map_err(|error| anyhow::anyhow!(error.code()))?;
     let mut pointer = PointerWireState::default();
     let mut disconnect_requested = false;
+    #[cfg(test)]
+    connection
+        .notify_session_runtime_test_event(crate::connection::SessionRuntimeTestEvent::LoopEntered);
 
     let loop_result = (|| -> Result<()> {
         while !disconnect_requested {
             while let Some(command) = runtime.try_next_command() {
                 match command {
                     SessionCommand::Disconnect => {
+                        #[cfg(test)]
+                        connection.notify_session_runtime_test_event(
+                            crate::connection::SessionRuntimeTestEvent::DisconnectDequeued,
+                        );
                         disconnect_requested = true;
                         break;
                     }
@@ -354,8 +361,19 @@ fn run_authenticated_session_inner(
     let _ = runtime.publish_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
     let _ = runtime.publish_event(SessionEvent::AudioState(AudioState::Stopped));
     let _ = media.close(reader.generation());
+    #[cfg(test)]
+    connection
+        .notify_session_runtime_test_event(crate::connection::SessionRuntimeTestEvent::MediaClosed);
     let _ = connection.shutdown();
+    #[cfg(test)]
+    connection.notify_session_runtime_test_event(
+        crate::connection::SessionRuntimeTestEvent::ConnectionShutdown,
+    );
     let _ = writer.shutdown();
+    #[cfg(test)]
+    connection.notify_session_runtime_test_event(
+        crate::connection::SessionRuntimeTestEvent::WriterShutdown,
+    );
     loop_result
 }
 
@@ -364,28 +382,12 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use frd_protocol_api::{
         ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand,
         SessionEvent, SurfacePublisher,
     };
-
-    struct NoopEvents;
-
-    impl RuntimeEventSink for NoopEvents {
-        fn publish(&self, _event: SessionEvent) -> Result<(), ProtocolError> {
-            Ok(())
-        }
-    }
-
-    struct NoopFrames;
-
-    impl SurfacePublisher for NoopFrames {
-        fn publish(&self, _update: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
-            Ok(())
-        }
-    }
 
     struct NoopWake;
 
@@ -395,70 +397,185 @@ mod tests {
         }
     }
 
+    struct RecordingEvents(mpsc::Sender<SessionEvent>);
+
+    impl RuntimeEventSink for RecordingEvents {
+        fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
+            self.0.send(event).map_err(|_| ProtocolError::Terminal)
+        }
+    }
+
+    struct RecordingFrames(mpsc::Sender<frd_frame::SurfaceUpdate>);
+
+    impl SurfacePublisher for RecordingFrames {
+        fn publish(&self, update: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
+            self.0.send(update).map_err(|_| ProtocolError::Terminal)
+        }
+    }
+
     #[test]
-    fn production_writer_timeout_unblocks_runtime_to_drain_disconnect() {
+    fn production_session_disconnect_interrupts_blocked_writer_and_runs_cleanup() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         socket2::SockRef::from(&listener)
             .set_recv_buffer_size(1024)
             .unwrap();
         let address = listener.local_addr().unwrap();
+        let (peer_ready_tx, peer_ready_rx) = mpsc::channel();
         let (release_peer_tx, release_peer_rx) = mpsc::channel();
         let peer = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             socket2::SockRef::from(&stream)
                 .set_recv_buffer_size(1024)
                 .unwrap();
-            release_peer_rx.recv().unwrap();
+            peer_ready_tx.send(()).unwrap();
+            let _ = release_peer_rx.recv_timeout(Duration::from_secs(5));
             drop(stream);
         });
         let client = TcpStream::connect(address).unwrap();
         socket2::SockRef::from(&client)
             .set_send_buffer_size(1024)
             .unwrap();
+        peer_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let mut connection = crate::AppleConnection::new(client);
-        let writer = connection.writer_handle().unwrap();
+        connection
+            .set_crypto(crate::session::SessionCrypto::from_key_iv(
+                [0x31; 16], [0x42; 16],
+            ))
+            .unwrap();
+        let (session_trace_tx, session_trace_rx) = mpsc::channel();
+        connection.set_session_runtime_test_events(session_trace_tx);
+        let (writer_io_tx, writer_io_rx) = mpsc::channel();
+        let writer = connection
+            .writer_handle_with_io_events(writer_io_tx)
+            .unwrap();
         let session_id = frd_core::SessionId::allocate();
         let (commands, command_rx) = mpsc::channel();
-        let mut runtime = ProtocolRuntime::new(
+        let (events_tx, events_rx) = mpsc::channel();
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let runtime = ProtocolRuntime::new(
             session_id,
             command_rx,
-            Box::new(NoopEvents),
-            Box::new(NoopFrames),
+            Box::new(RecordingEvents(events_tx)),
+            Box::new(RecordingFrames(frames_tx)),
             None,
             Box::new(NoopWake),
         );
-        commands.send(SessionCommand::Disconnect).unwrap();
-        let active_writer = writer.clone();
-        let (done_tx, done_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
         let session = thread::spawn(move || {
-            let payload = vec![0x5a; 1024 * 1024];
-            let write: anyhow::Result<()> = loop {
-                if let Err(error) = active_writer.send_private_message(&payload) {
-                    break Err(error);
-                }
-            };
-            let command = runtime.try_next_command();
-            done_tx.send((write, command)).unwrap();
+            let exit = super::run_established_hpss_session(
+                connection,
+                "session-shutdown-test".to_owned(),
+                frd_core::PixelSize::new(64, 64).unwrap(),
+                runtime,
+                session_id,
+                false,
+                crate::media_negotiation::AudioMediaFlow::MacToPc,
+            );
+            exit_tx.send(exit).unwrap();
         });
 
-        let completed = done_rx.recv_timeout(Duration::from_secs(3));
-        let completed_within_bound = completed.is_ok();
+        assert!(matches!(
+            frames_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            frd_frame::SurfaceUpdate::Reset { generation: 1, .. }
+        ));
+        assert_eq!(
+            session_trace_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            crate::connection::SessionRuntimeTestEvent::LoopEntered
+        );
+        while writer_io_rx.try_recv().is_ok() {}
+
+        let active_writer = writer.clone();
+        let (blocked_send_tx, blocked_send_rx) = mpsc::channel();
+        let blocked_sender = thread::spawn(move || {
+            let payload = vec![0x5a; 60_000];
+            loop {
+                if let Err(error) = active_writer.send_private_message(&payload) {
+                    blocked_send_tx.send(error).unwrap();
+                    break;
+                }
+            }
+        });
+
+        let write_block_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = write_block_deadline
+                .checked_duration_since(Instant::now())
+                .expect("production writer never entered a blocked write_all");
+            match writer_io_rx.recv_timeout(remaining).unwrap() {
+                crate::connection::WriterIoTestEvent::Started { wire_bytes }
+                    if wire_bytes >= 60_000 =>
+                {
+                    match writer_io_rx.recv_timeout(Duration::from_millis(150)) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Ok(crate::connection::WriterIoTestEvent::Finished { .. }) => continue,
+                        Ok(other) => panic!("unexpected writer event after start: {other:?}"),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            panic!("writer exited before Disconnect")
+                        }
+                    }
+                }
+                crate::connection::WriterIoTestEvent::Started { .. }
+                | crate::connection::WriterIoTestEvent::Finished { .. } => {}
+            }
+        }
+
+        let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+        commands.send(SessionCommand::Disconnect).unwrap();
+        assert_eq!(
+            session_trace_rx
+                .recv_timeout(cleanup_deadline.duration_since(Instant::now()))
+                .expect("production loop must dequeue Disconnect within the cleanup bound"),
+            crate::connection::SessionRuntimeTestEvent::DisconnectDequeued
+        );
+        let exit = exit_rx
+            .recv_timeout(cleanup_deadline.duration_since(Instant::now()))
+            .expect("production session cleanup must return within 3s");
+        let blocked_error = blocked_send_rx
+            .recv_timeout(cleanup_deadline.duration_since(Instant::now()))
+            .expect("blocked production sender must receive the shutdown error within 3s");
+        session.join().unwrap();
+        blocked_sender.join().unwrap();
+
+        assert!(matches!(exit, frd_protocol_api::ProtocolExit::Closed));
+        assert!(blocked_error.to_string().contains("写入失败"));
+        assert!(writer.send_private_message(b"after-cleanup").is_err());
+        assert!(matches!(
+            exit_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(
+            session_trace_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                crate::connection::SessionRuntimeTestEvent::MediaClosed,
+                crate::connection::SessionRuntimeTestEvent::ConnectionShutdown,
+                crate::connection::SessionRuntimeTestEvent::WriterShutdown,
+            ]
+        );
+        let cleanup_events: Vec<_> = events_rx.try_iter().collect();
+        let disconnecting = cleanup_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::StageChanged(frd_protocol_api::ConnectionStage::Disconnecting)
+                )
+            })
+            .expect("production cleanup must publish Disconnecting");
+        let audio_stopped = cleanup_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::AudioState(frd_protocol_api::AudioState::Stopped)
+                )
+            })
+            .expect("production cleanup must publish AudioState::Stopped");
+        assert!(disconnecting < audio_stopped);
+
         release_peer_tx.send(()).unwrap();
         peer.join().unwrap();
-        let (write, command) = completed.unwrap_or_else(|_| {
-            done_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("peer close must release the blocked production writer")
-        });
-        session.join().unwrap();
-        writer.shutdown().unwrap();
-
-        assert!(write.is_err());
-        assert!(matches!(command, Some(SessionCommand::Disconnect)));
-        assert!(
-            completed_within_bound,
-            "production write must fail before the 3s session bound"
-        );
     }
 
     #[test]

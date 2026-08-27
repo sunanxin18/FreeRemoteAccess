@@ -78,17 +78,45 @@ struct WriterControl {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriterIoTestEvent {
+    Started { wire_bytes: usize },
+    Finished { succeeded: bool },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionRuntimeTestEvent {
+    LoopEntered,
+    DisconnectDequeued,
+    MediaClosed,
+    ConnectionShutdown,
+    WriterShutdown,
+}
+
 #[derive(Default)]
 struct WriterHooks {
     #[cfg(test)]
-    write_started: Option<Sender<()>>,
+    io_events: Option<Sender<WriterIoTestEvent>>,
 }
 
 impl WriterHooks {
-    fn notify_write_started(&self) {
+    fn notify_write_started(&self, _wire_bytes: usize) {
         #[cfg(test)]
-        if let Some(write_started) = &self.write_started {
-            let _ = write_started.send(());
+        if let Some(io_events) = &self.io_events {
+            let _ = io_events.send(WriterIoTestEvent::Started {
+                wire_bytes: _wire_bytes,
+            });
+        }
+    }
+
+    fn notify_write_finished(&self, _succeeded: bool) {
+        #[cfg(test)]
+        if let Some(io_events) = &self.io_events {
+            let _ = io_events.send(WriterIoTestEvent::Finished {
+                succeeded: _succeeded,
+            });
         }
     }
 }
@@ -192,8 +220,10 @@ fn writer_loop(
                         Some(crypto) => crypto.seal(&plaintext)?,
                         None => plaintext,
                     };
-                    hooks.notify_write_started();
-                    stream.write_all(&wire).context("写入失败（连接中断？）")
+                    hooks.notify_write_started(wire.len());
+                    let write_result = stream.write_all(&wire).context("写入失败（连接中断？）");
+                    hooks.notify_write_finished(write_result.is_ok());
+                    write_result
                 })();
                 let failed = send_result.is_err();
                 let _ = result.send(send_result);
@@ -221,6 +251,8 @@ pub struct AppleConnection {
     outbound_crypto: Option<OutboundSessionCrypto>,
     wire_pending: Vec<u8>,
     writer: Option<AppleWriterHandle>,
+    #[cfg(test)]
+    session_runtime_test_events: Option<Sender<SessionRuntimeTestEvent>>,
 }
 
 impl AppleConnection {
@@ -244,6 +276,8 @@ impl AppleConnection {
             outbound_crypto: None,
             wire_pending: Vec::new(),
             writer: None,
+            #[cfg(test)]
+            session_runtime_test_events: None,
         }
     }
 
@@ -313,6 +347,31 @@ impl AppleConnection {
 
     pub fn writer_handle(&mut self) -> Result<AppleWriterHandle> {
         self.writer_handle_with_hooks(WriterHooks::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writer_handle_with_io_events(
+        &mut self,
+        io_events: Sender<WriterIoTestEvent>,
+    ) -> Result<AppleWriterHandle> {
+        self.writer_handle_with_hooks(WriterHooks {
+            io_events: Some(io_events),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_session_runtime_test_events(
+        &mut self,
+        events: Sender<SessionRuntimeTestEvent>,
+    ) {
+        self.session_runtime_test_events = Some(events);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_session_runtime_test_event(&self, event: SessionRuntimeTestEvent) {
+        if let Some(events) = &self.session_runtime_test_events {
+            let _ = events.send(event);
+        }
     }
 
     fn writer_handle_with_hooks(&mut self, hooks: WriterHooks) -> Result<AppleWriterHandle> {
@@ -649,20 +708,19 @@ mod tests {
         let stream = TcpStream::connect(address).unwrap();
         peer_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let mut connection = AppleConnection::new(stream);
-        let (write_started_tx, write_started_rx) = mpsc::channel();
+        let (writer_io_tx, writer_io_rx) = mpsc::channel();
         let writer = connection
-            .writer_handle_with_hooks(WriterHooks {
-                write_started: Some(write_started_tx),
-            })
+            .writer_handle_with_io_events(writer_io_tx)
             .unwrap();
 
         let active_writer = writer.clone();
         let active_send = thread::spawn(move || {
             active_writer.send_private_message(&vec![0x5a; 64 * 1024 * 1024])
         });
-        write_started_rx
+        let event = writer_io_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("writer must enter write_all before shutdown");
+        assert!(matches!(event, WriterIoTestEvent::Started { .. }));
 
         let queued_one = writer.enqueue_private_message(vec![0x11; 8]).unwrap();
         let queued_two = writer.enqueue_private_message(vec![0x22; 8]).unwrap();

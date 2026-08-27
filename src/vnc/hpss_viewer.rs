@@ -92,11 +92,12 @@ fn apply_mailbox_updates(
     mailbox: &Arc<Mutex<FrameMailbox>>,
     framebuffer: &mut Framebuffer,
     generation: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut generation_changed = false;
     loop {
         let update = mailbox.lock().unwrap().pop();
         let Some(update) = update else {
-            return Ok(());
+            return Ok(generation_changed);
         };
         match update {
             SurfaceUpdate::Reset {
@@ -108,6 +109,7 @@ fn apply_mailbox_updates(
                 if format != PixelFormat::Bgrx8UnormSrgb {
                     bail!("legacy HPSS viewer only accepts BGRX surfaces");
                 }
+                generation_changed |= next != *generation;
                 *framebuffer = Framebuffer::new(size.width as usize, size.height as usize)?;
                 *generation = next;
             }
@@ -263,7 +265,10 @@ pub fn run_viewer(
         let mut playback = None;
 
         while window.is_open() && !worker.is_finished() {
-            apply_mailbox_updates(&mailbox, &mut framebuffer, &mut generation)?;
+            if apply_mailbox_updates(&mailbox, &mut framebuffer, &mut generation)? {
+                pointer_input = PointerInputState::default();
+                previous_buttons = PointerButtons::default();
+            }
             while let Ok(event) = events_rx.try_recv() {
                 if let SessionEvent::Error(error) = event {
                     eprintln!("[hpss-view] adapter error: {}", error.code());
@@ -370,9 +375,16 @@ pub fn run_viewer(
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
 
-    use frd_core::{InputEvent, PixelPoint, PointerButtons, PointerSample, SessionId, WheelDelta};
+    use frd_core::{
+        InputEvent, PixelPoint, PixelSize, PointerButtons, PointerInputState, PointerSample,
+        SessionId, WheelDelta,
+    };
+    use frd_frame::{FrameMailbox, PixelFormat, PushOutcome, SurfaceUpdate};
     use frd_protocol_api::SessionCommand;
+
+    use crate::framebuffer::Framebuffer;
 
     #[test]
     fn one_legacy_pointer_sample_emits_one_atomic_protocol_command() {
@@ -407,5 +419,160 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
         assert_eq!(previous, sample.buttons);
+    }
+
+    #[test]
+    fn generation_reset_disarms_held_pointer_until_release_and_new_press() {
+        let session_id = SessionId::allocate();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(8, 1024)));
+        let mut framebuffer = Framebuffer::new(2, 2).unwrap();
+        let mut generation = 0;
+        let mut pointer_input = PointerInputState::default();
+        let mut previous_buttons = PointerButtons::default();
+        let (commands, received) = mpsc::channel();
+
+        assert_eq!(
+            mailbox.lock().unwrap().push(SurfaceUpdate::Reset {
+                session_id,
+                generation: 1,
+                size: PixelSize::new(2, 2).unwrap(),
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }),
+            PushOutcome::Queued
+        );
+        let generation_changed =
+            super::apply_mailbox_updates(&mailbox, &mut framebuffer, &mut generation).unwrap();
+        if generation_changed {
+            pointer_input = PointerInputState::default();
+            previous_buttons = PointerButtons::default();
+        }
+        assert_eq!(generation, 1);
+
+        let released_gen1 = PointerSample::new(
+            PixelPoint { x: 1, y: 1 },
+            PointerButtons::default(),
+            WheelDelta::default(),
+        );
+        let held_gen1 = PointerSample::new(
+            PixelPoint { x: 1, y: 1 },
+            PointerButtons {
+                primary: true,
+                ..Default::default()
+            },
+            WheelDelta::default(),
+        );
+        let sample = pointer_input
+            .next_event(Some(released_gen1), false)
+            .unwrap();
+        super::send_pointer_sample(
+            &commands,
+            session_id,
+            generation,
+            sample,
+            &mut previous_buttons,
+        )
+        .unwrap();
+        let sample = pointer_input.next_event(Some(held_gen1), true).unwrap();
+        super::send_pointer_sample(
+            &commands,
+            session_id,
+            generation,
+            sample,
+            &mut previous_buttons,
+        )
+        .unwrap();
+        assert!(matches!(received.recv().unwrap(), SessionCommand::Input(_)));
+        assert!(matches!(received.recv().unwrap(), SessionCommand::Input(_)));
+        assert!(previous_buttons.primary);
+
+        assert_eq!(
+            mailbox.lock().unwrap().push(SurfaceUpdate::Reset {
+                session_id,
+                generation: 2,
+                size: PixelSize::new(4, 4).unwrap(),
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }),
+            PushOutcome::Queued
+        );
+        let generation_changed =
+            super::apply_mailbox_updates(&mailbox, &mut framebuffer, &mut generation).unwrap();
+        if generation_changed {
+            pointer_input = PointerInputState::default();
+            previous_buttons = PointerButtons::default();
+        }
+        assert!(generation_changed);
+        assert_eq!(generation, 2);
+        assert_eq!(previous_buttons, PointerButtons::default());
+
+        let held_gen2_changed_geometry = PointerSample::new(
+            PixelPoint { x: 3, y: 3 },
+            PointerButtons {
+                primary: true,
+                ..Default::default()
+            },
+            WheelDelta::default(),
+        );
+        assert_eq!(
+            pointer_input.next_event(Some(held_gen2_changed_geometry), true),
+            None,
+            "a held physical button must not synthesize a generation-2 press"
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let released_gen2 = PointerSample::new(
+            PixelPoint { x: 3, y: 3 },
+            PointerButtons::default(),
+            WheelDelta::default(),
+        );
+        let sample = pointer_input
+            .next_event(Some(released_gen2), false)
+            .expect("observing all buttons released must re-arm the gate");
+        super::send_pointer_sample(
+            &commands,
+            session_id,
+            generation,
+            sample,
+            &mut previous_buttons,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            SessionCommand::Input(frd_core::SessionInput {
+                generation: 2,
+                event: InputEvent::PointerSample(observed),
+                ..
+            }) if observed == released_gen2
+        ));
+
+        let new_press_gen2 = PointerSample::new(
+            PixelPoint { x: 3, y: 3 },
+            PointerButtons {
+                primary: true,
+                ..Default::default()
+            },
+            WheelDelta::default(),
+        );
+        let sample = pointer_input
+            .next_event(Some(new_press_gen2), true)
+            .expect("a new local press edge may enter generation 2");
+        super::send_pointer_sample(
+            &commands,
+            session_id,
+            generation,
+            sample,
+            &mut previous_buttons,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            SessionCommand::Input(frd_core::SessionInput {
+                generation: 2,
+                event: InputEvent::PointerSample(observed),
+                ..
+            }) if observed == new_press_gen2
+        ));
     }
 }
