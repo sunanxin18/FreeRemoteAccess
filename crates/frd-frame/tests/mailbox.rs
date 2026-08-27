@@ -43,6 +43,19 @@ fn damage(
     }
 }
 
+fn one_pixel_patch() -> PixelPatch {
+    patch(
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        4,
+        4,
+    )
+}
+
 #[test]
 fn accepts_patch_with_exact_stride_length_and_surface_bounds() {
     let session_id = session();
@@ -358,4 +371,189 @@ fn pixel_buffer_is_moved_into_the_mailbox_without_copying() {
         panic!("应能按值取出已入队的损伤");
     };
     assert_eq!(patches[0].pixels.as_bytes(), &[0x44; 4]);
+}
+
+#[test]
+fn rejects_stale_same_session_reset_without_mutating_the_current_mailbox() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(4, 64);
+    mailbox.push(reset(session_id, 2));
+    mailbox.push(damage(session_id, 2, 1, vec![one_pixel_patch()]));
+
+    assert_eq!(mailbox.push(reset(session_id, 2)), PushOutcome::Rejected);
+    assert_eq!(mailbox.push(reset(session_id, 1)), PushOutcome::Rejected);
+    assert_eq!((mailbox.len(), mailbox.queued_pixel_bytes()), (2, 4));
+    assert_eq!(
+        mailbox.push(damage(session_id, 2, 2, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+}
+
+#[test]
+fn rejects_older_session_reset_without_changing_current_revision_acceptance() {
+    let older_session = session();
+    let current_session = session();
+    let mut mailbox = FrameMailbox::new(4, 64);
+    mailbox.push(reset(current_session, 1));
+    mailbox.push(damage(current_session, 1, 1, vec![one_pixel_patch()]));
+
+    assert_eq!(
+        mailbox.push(reset(older_session, 99)),
+        PushOutcome::Rejected
+    );
+    assert_eq!((mailbox.len(), mailbox.queued_pixel_bytes()), (2, 4));
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id: current_session,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Queued
+    );
+}
+
+#[test]
+fn accepts_newer_session_reset_and_resets_revision_lifecycle() {
+    let older_session = session();
+    let newer_session = session();
+    let mut mailbox = FrameMailbox::new(4, 64);
+    mailbox.push(reset(older_session, 9));
+    mailbox.push(damage(older_session, 9, 1, vec![one_pixel_patch()]));
+    mailbox.push(SurfaceUpdate::FrameBoundary {
+        session_id: older_session,
+        generation: 9,
+        revision: 1,
+        completeness: FrameCompleteness::FullBaseline,
+    });
+
+    assert_eq!(mailbox.push(reset(newer_session, 1)), PushOutcome::Queued);
+    assert_eq!(mailbox.len(), 1);
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id: newer_session,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Rejected
+    );
+    assert_eq!(
+        mailbox.push(damage(newer_session, 1, 1, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+}
+
+#[test]
+fn damage_revisions_must_strictly_increase() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(6, 64);
+    mailbox.push(reset(session_id, 1));
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()])),
+        PushOutcome::Rejected
+    );
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 1, vec![one_pixel_patch()])),
+        PushOutcome::Rejected
+    );
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 3, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+}
+
+#[test]
+fn frame_boundaries_require_the_latest_damage_and_strictly_increase() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(8, 64);
+    mailbox.push(reset(session_id, 1));
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Rejected
+    );
+    mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()]));
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Rejected
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 3,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Rejected
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 2,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Queued
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 2,
+            completeness: FrameCompleteness::Incremental,
+        }),
+        PushOutcome::Rejected
+    );
+}
+
+#[test]
+fn overflow_does_not_advance_damage_revision() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(3, 64);
+    mailbox.push(reset(session_id, 1));
+    mailbox.push(damage(session_id, 1, 1, vec![one_pixel_patch()]));
+    mailbox.push(SurfaceUpdate::FrameBoundary {
+        session_id,
+        generation: 1,
+        revision: 1,
+        completeness: FrameCompleteness::Incremental,
+    });
+
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()])),
+        PushOutcome::NeedsFullSnapshot
+    );
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 2,
+            completeness: FrameCompleteness::FullBaseline,
+        }),
+        PushOutcome::Queued
+    );
+}
+
+#[test]
+#[should_panic(expected = "entry_limit 必须大于零")]
+fn mailbox_rejects_zero_entry_capacity() {
+    let _ = FrameMailbox::new(0, 0);
 }

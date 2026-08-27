@@ -17,6 +17,8 @@ struct SurfaceState {
     generation: u64,
     size: PixelSize,
     bytes_per_pixel: u32,
+    last_damage_revision: u64,
+    last_boundary_revision: u64,
 }
 
 /// 对单一会话世代的更新进行有界排队。
@@ -31,10 +33,15 @@ pub struct FrameMailbox {
 }
 
 impl FrameMailbox {
+    /// 创建具有固定条目和像素字节预算的邮箱。
+    ///
+    /// # Panics
+    ///
+    /// 当 `entry_limit` 为零时恐慌；一个可用邮箱至少必须能够保留 Reset。
     pub fn new(entry_limit: usize, pixel_byte_limit: usize) -> Self {
+        assert!(entry_limit > 0, "帧邮箱 entry_limit 必须大于零");
         Self {
-            // 一个 Reset 必须能保留，以便消费者知道之后的更新所属的表面。
-            entry_limit: entry_limit.max(1),
+            entry_limit,
             pixel_byte_limit,
             queue: VecDeque::new(),
             queued_pixel_bytes: 0,
@@ -65,13 +72,23 @@ impl FrameMailbox {
                 let Some(current) = self.current else {
                     return PushOutcome::Rejected;
                 };
-                if !matches_current(current, session_id, generation) || revision == 0 {
+                if !matches_current(current, session_id, generation)
+                    || revision == 0
+                    || revision <= current.last_damage_revision
+                {
                     return PushOutcome::Rejected;
                 }
                 let Some(pixel_bytes) = patches_pixel_bytes(patches, current) else {
                     return PushOutcome::Rejected;
                 };
-                self.push_current(update, pixel_bytes)
+                let outcome = self.push_current(update, pixel_bytes);
+                if outcome == PushOutcome::Queued {
+                    self.current
+                        .as_mut()
+                        .expect("当前表面已在损伤入队前验证")
+                        .last_damage_revision = revision;
+                }
+                outcome
             }
             SurfaceUpdate::FrameBoundary {
                 session_id,
@@ -82,10 +99,21 @@ impl FrameMailbox {
                 let Some(current) = self.current else {
                     return PushOutcome::Rejected;
                 };
-                if !matches_current(current, session_id, generation) || revision == 0 {
+                if !matches_current(current, session_id, generation)
+                    || revision == 0
+                    || revision != current.last_damage_revision
+                    || revision <= current.last_boundary_revision
+                {
                     return PushOutcome::Rejected;
                 }
-                self.push_current(update, 0)
+                let outcome = self.push_current(update, 0);
+                if outcome == PushOutcome::Queued {
+                    self.current
+                        .as_mut()
+                        .expect("当前表面已在边界入队前验证")
+                        .last_boundary_revision = revision;
+                }
+                outcome
             }
         }
     }
@@ -122,12 +150,22 @@ impl FrameMailbox {
         if generation == 0 || size.width == 0 || size.height == 0 {
             return PushOutcome::Rejected;
         }
+        if let Some(current) = self.current {
+            let advances_current_session =
+                session_id == current.session_id && generation > current.generation;
+            let starts_newer_session = session_id.get() > current.session_id.get();
+            if !advances_current_session && !starts_newer_session {
+                return PushOutcome::Rejected;
+            }
+        }
 
         self.current = Some(SurfaceState {
             session_id,
             generation,
             size,
             bytes_per_pixel,
+            last_damage_revision: 0,
+            last_boundary_revision: 0,
         });
         self.queue.clear();
         self.queued_pixel_bytes = 0;
@@ -135,6 +173,8 @@ impl FrameMailbox {
         PushOutcome::Queued
     }
 
+    /// 溢出触发的更新不会推进生命周期修订号。
+    /// 生产者必须重新发布更高修订的规范完整快照。
     fn push_current(&mut self, update: SurfaceUpdate, pixel_bytes: usize) -> PushOutcome {
         let entry_overflow = self
             .queue
