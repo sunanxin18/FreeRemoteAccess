@@ -58,7 +58,7 @@ impl PresentationSurface {
 
     pub(crate) fn recreate(&mut self, instance: &wgpu::Instance) -> Result<(), PresentError> {
         let surface = self.create_candidate(instance)?;
-        self.replace_surface(surface);
+        drop(self.replace_surface(surface));
         Ok(())
     }
 
@@ -76,9 +76,13 @@ impl PresentationSurface {
             .map_err(|_| PresentError::SurfaceCreation)
     }
 
-    pub(crate) fn replace_surface(&mut self, surface: wgpu::Surface<'static>) {
-        self.owned.drop_surface();
-        self.owned.replace_surface(surface);
+    pub(crate) fn replace_surface(
+        &mut self,
+        surface: wgpu::Surface<'static>,
+    ) -> wgpu::Surface<'static> {
+        self.owned
+            .replace_surface(surface)
+            .expect("attached presentation surface exists")
     }
 
     pub fn detach(&mut self) {

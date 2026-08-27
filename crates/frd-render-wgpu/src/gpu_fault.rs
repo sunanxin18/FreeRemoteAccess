@@ -1,6 +1,5 @@
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,70 +32,124 @@ impl GpuFaultClass {
     }
 }
 
+#[derive(Clone, Copy)]
+struct GpuFaultState {
+    epoch: u64,
+    current: Option<GpuFaultClass>,
+}
+
 pub(crate) struct GpuFaultObserver {
-    epoch: AtomicU64,
-    current: AtomicU8,
+    state: Mutex<GpuFaultState>,
+}
+
+pub struct GpuCleanToken {
+    observer: Arc<GpuFaultObserver>,
+    context_id: crate::GpuContextId,
+    epoch: u64,
 }
 
 impl GpuFaultObserver {
     pub(crate) fn new() -> Self {
         Self {
-            epoch: AtomicU64::new(0),
-            current: AtomicU8::new(0),
+            state: Mutex::new(GpuFaultState {
+                epoch: 0,
+                current: None,
+            }),
         }
     }
 
     pub(crate) fn begin_operation(&self) -> Result<u64, GpuFaultClass> {
-        let epoch = self.epoch.load(Ordering::Acquire);
-        match self.current() {
+        let state = self.lock_state();
+        match state.current {
             Some(fault) => Err(fault),
-            None => Ok(epoch),
+            None => Ok(state.epoch),
         }
     }
 
     pub(crate) fn record(&self, fault: GpuFaultClass) {
-        let mut current = self.current.load(Ordering::Acquire);
-        loop {
-            let retained = decode_fault(current).filter(|seen| seen.priority() >= fault.priority());
-            let next = retained.unwrap_or(fault) as u8;
-            match self.current.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn fault_since(&self, epoch: u64) -> Option<GpuFaultClass> {
-        (self.epoch.load(Ordering::Acquire) != epoch)
-            .then(|| self.current())
-            .flatten()
+        self.record_with(fault, || {});
     }
 
     pub(crate) fn current(&self) -> Option<GpuFaultClass> {
-        decode_fault(self.current.load(Ordering::Acquire))
+        self.lock_state().current
+    }
+
+    pub(crate) fn clean_token(
+        self: &Arc<Self>,
+        context_id: crate::GpuContextId,
+        epoch: u64,
+    ) -> Result<GpuCleanToken, GpuFaultClass> {
+        let state = self.lock_state();
+        if let Some(fault) = state.current {
+            return Err(fault);
+        }
+        if state.epoch != epoch {
+            return Err(GpuFaultClass::ObservationIncomplete);
+        }
+        Ok(GpuCleanToken {
+            observer: self.clone(),
+            context_id,
+            epoch,
+        })
+    }
+
+    pub(crate) fn commit_if_unchanged<R>(
+        self: &Arc<Self>,
+        context_id: crate::GpuContextId,
+        token: GpuCleanToken,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GpuFaultClass> {
+        if context_id != token.context_id || !Arc::ptr_eq(self, &token.observer) {
+            return Err(GpuFaultClass::Internal);
+        }
+        let state = self.lock_state();
+        if let Some(fault) = state.current {
+            drop(state);
+            return Err(fault);
+        }
+        if state.epoch != token.epoch {
+            drop(state);
+            return Err(GpuFaultClass::ObservationIncomplete);
+        }
+        let result = commit();
+        drop(state);
+        Ok(result)
+    }
+
+    fn record_with(&self, fault: GpuFaultClass, after_publication: impl FnOnce()) {
+        let mut state = self.lock_state();
+        let retained = state
+            .current
+            .filter(|seen| seen.priority() >= fault.priority());
+        state.current = Some(retained.unwrap_or(fault));
+        state.epoch = state.epoch.saturating_add(1);
+        after_publication();
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, GpuFaultState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poison) => {
+                let mut state = poison.into_inner();
+                state.current = Some(GpuFaultClass::Internal);
+                state.epoch = state.epoch.saturating_add(1);
+                state
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_with_publication_paused(
+        &self,
+        fault: GpuFaultClass,
+        after_publication: impl FnOnce(),
+    ) {
+        self.record_with(fault, after_publication);
     }
 
     #[cfg(test)]
     pub(crate) fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
-    }
-}
-
-fn decode_fault(value: u8) -> Option<GpuFaultClass> {
-    match value {
-        0 => None,
-        1 => Some(GpuFaultClass::Validation),
-        2 => Some(GpuFaultClass::OutOfMemory),
-        3 => Some(GpuFaultClass::Internal),
-        4 => Some(GpuFaultClass::DeviceLost),
-        5 => Some(GpuFaultClass::ObservationIncomplete),
-        _ => Some(GpuFaultClass::Internal),
+        self.lock_state().epoch
     }
 }
 
@@ -104,6 +157,7 @@ fn decode_fault(value: u8) -> Option<GpuFaultClass> {
 pub struct GpuFaultScope {
     device: wgpu::Device,
     observer: Arc<GpuFaultObserver>,
+    context_id: crate::GpuContextId,
     start_epoch: u64,
     validation: Option<wgpu::ErrorScopeGuard>,
     internal: Option<wgpu::ErrorScopeGuard>,
@@ -114,6 +168,7 @@ impl GpuFaultScope {
     pub(crate) fn new(
         device: wgpu::Device,
         observer: Arc<GpuFaultObserver>,
+        context_id: crate::GpuContextId,
     ) -> Result<Self, GpuFaultClass> {
         let start_epoch = observer.begin_operation()?;
         let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
@@ -122,6 +177,7 @@ impl GpuFaultScope {
         Ok(Self {
             device,
             observer,
+            context_id,
             start_epoch,
             validation: Some(validation),
             internal: Some(internal),
@@ -129,7 +185,7 @@ impl GpuFaultScope {
         })
     }
 
-    pub fn finish(mut self) -> Result<(), GpuFaultClass> {
+    pub fn finish(mut self) -> Result<GpuCleanToken, GpuFaultClass> {
         let validation = self
             .validation
             .take()
@@ -160,18 +216,11 @@ impl GpuFaultScope {
         .flatten()
         .max_by_key(|fault| fault.priority());
 
-        let fault = [self.observer.fault_since(self.start_epoch), scope_fault]
-            .into_iter()
-            .flatten()
-            .max_by_key(|fault| fault.priority());
-        if let Some(fault) = fault {
+        if let Some(fault) = scope_fault {
             self.observer.record(fault);
-            return Err(fault);
+            return Err(self.observer.current().unwrap_or(fault));
         }
-        if let Some(fault) = self.observer.fault_since(self.start_epoch) {
-            return Err(fault);
-        }
-        Ok(())
+        self.observer.clean_token(self.context_id, self.start_epoch)
     }
 }
 
@@ -182,5 +231,61 @@ fn poll_error_scope(future: impl Future<Output = Option<wgpu::Error>>) -> Option
         Poll::Ready(Some(error)) => Some(GpuFaultClass::from_wgpu_error(&error)),
         Poll::Ready(None) => None,
         Poll::Pending => Some(GpuFaultClass::ObservationIncomplete),
+    }
+}
+
+#[cfg(test)]
+mod linearization_tests {
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    use crate::GpuContextId;
+
+    use super::{GpuFaultClass, GpuFaultObserver};
+
+    #[test]
+    fn fault_publication_at_the_old_split_blocks_reset_ownership_and_state_commit() {
+        let context_id = GpuContextId(41);
+        let observer = Arc::new(GpuFaultObserver::new());
+        let epoch = observer.begin_operation().unwrap();
+        let token = observer.clean_token(context_id, epoch).unwrap();
+        let reset_state = Arc::new(Mutex::new((1_u64, "old-texture-owner")));
+        let published = Arc::new(Barrier::new(2));
+        let commit_ready = Arc::new(Barrier::new(2));
+        let release_publication = Arc::new(Barrier::new(2));
+
+        let fault_thread = {
+            let observer = observer.clone();
+            let published = published.clone();
+            let release_publication = release_publication.clone();
+            thread::spawn(move || {
+                observer.record_with_publication_paused(GpuFaultClass::Validation, || {
+                    published.wait();
+                    release_publication.wait();
+                });
+            })
+        };
+        published.wait();
+
+        let commit_thread = {
+            let observer = observer.clone();
+            let reset_state = reset_state.clone();
+            let commit_ready = commit_ready.clone();
+            thread::spawn(move || {
+                commit_ready.wait();
+                observer.commit_if_unchanged(context_id, token, || {
+                    *reset_state.lock().unwrap() = (2, "new-texture-owner");
+                })
+            })
+        };
+
+        commit_ready.wait();
+        release_publication.wait();
+        fault_thread.join().unwrap();
+        assert_eq!(
+            commit_thread.join().unwrap(),
+            Err(GpuFaultClass::Validation)
+        );
+        assert_eq!(*reset_state.lock().unwrap(), (1, "old-texture-owner"));
     }
 }

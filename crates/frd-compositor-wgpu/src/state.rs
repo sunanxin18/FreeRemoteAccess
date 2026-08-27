@@ -1,6 +1,4 @@
 use frd_core::PixelSize;
-use frd_protocol_api::PresentationEvent;
-use frd_render_wgpu::{GpuFaultClass, PresentationReceipt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SurfaceSizeAction {
@@ -121,21 +119,6 @@ impl From<wgpu::CurrentSurfaceTexture> for AcquiredFrame<wgpu::SurfaceTexture> {
     }
 }
 
-pub(crate) fn acknowledge_after_present(
-    receipt: Option<PresentationReceipt>,
-    gpu_result: Result<(), GpuFaultClass>,
-) -> Option<PresentationEvent> {
-    gpu_result
-        .ok()
-        .and(receipt)
-        .map(|receipt| PresentationEvent::FramePresented {
-            session_id: receipt.session_id,
-            generation: receipt.generation,
-            revision: receipt.revision,
-            completeness: receipt.completeness,
-        })
-}
-
 pub(crate) struct OwnedSurfaceAndLease<S, L> {
     surface: Option<S>,
     lease: Option<L>,
@@ -162,13 +145,8 @@ impl<S, L> OwnedSurfaceAndLease<S, L> {
         self.lease.as_ref()
     }
 
-    pub(crate) fn drop_surface(&mut self) {
-        drop(self.surface.take());
-    }
-
-    pub(crate) fn replace_surface(&mut self, surface: S) {
-        debug_assert!(self.surface.is_none());
-        self.surface = Some(surface);
+    pub(crate) fn replace_surface(&mut self, surface: S) -> Option<S> {
+        self.surface.replace(surface)
     }
 }
 
@@ -183,16 +161,10 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use frd_core::SessionId;
-    use frd_frame::FrameCompleteness;
-    use frd_protocol_api::PresentationEvent;
-    use frd_render_wgpu::GpuFaultClass;
-
     use super::{
-        acknowledge_after_present, AcquiredFrame, AcquisitionAction, ContextPairState,
-        OwnedSurfaceAndLease, SurfaceSizeAction, SurfaceSizeState,
+        AcquiredFrame, AcquisitionAction, ContextPairState, OwnedSurfaceAndLease,
+        SurfaceSizeAction, SurfaceSizeState,
     };
-    use frd_render_wgpu::PresentationReceipt;
 
     #[test]
     fn wgpu_30_acquisition_actions_match_the_recovery_contract() {
@@ -224,51 +196,6 @@ mod tests {
             AcquiredFrame::<()>::Validation.action(),
             AcquisitionAction::ValidationError
         );
-    }
-
-    #[test]
-    fn acknowledgement_exists_only_after_successful_present() {
-        let receipt = PresentationReceipt {
-            session_id: SessionId::allocate(),
-            generation: 3,
-            revision: 5,
-            completeness: FrameCompleteness::FullBaseline,
-        };
-
-        assert_eq!(
-            acknowledge_after_present(Some(receipt), Err(GpuFaultClass::Validation)),
-            None
-        );
-        assert_eq!(
-            acknowledge_after_present(Some(receipt), Ok(())),
-            Some(PresentationEvent::FramePresented {
-                session_id: receipt.session_id,
-                generation: 3,
-                revision: 5,
-                completeness: FrameCompleteness::FullBaseline,
-            })
-        );
-        assert_eq!(acknowledge_after_present(None, Ok(())), None);
-    }
-
-    #[test]
-    fn write_record_submit_present_validation_and_device_lost_faults_never_acknowledge() {
-        let receipt = PresentationReceipt {
-            session_id: SessionId::allocate(),
-            generation: 7,
-            revision: 11,
-            completeness: FrameCompleteness::FullBaseline,
-        };
-
-        for fault in [
-            GpuFaultClass::Validation,
-            GpuFaultClass::OutOfMemory,
-            GpuFaultClass::Internal,
-            GpuFaultClass::DeviceLost,
-            GpuFaultClass::ObservationIncomplete,
-        ] {
-            assert_eq!(acknowledge_after_present(Some(receipt), Err(fault)), None);
-        }
     }
 
     #[derive(Clone)]

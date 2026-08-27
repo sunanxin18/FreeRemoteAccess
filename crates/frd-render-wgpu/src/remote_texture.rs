@@ -1,7 +1,7 @@
 use frd_core::{PixelRect, PixelSize, SessionId};
 use frd_frame::{FrameCompleteness, PixelFormat, PixelPatch, SurfaceUpdate};
 
-use crate::{pass::RemotePass, GpuContext, GpuContextId, GpuFaultClass};
+use crate::{pass::RemotePass, GpuCleanToken, GpuContext, GpuContextId, GpuFaultClass};
 
 const MAX_REMOTE_TEXTURE_BYTES: u64 = 256 * 1024 * 1024;
 const BYTES_PER_PIXEL: u32 = 4;
@@ -12,6 +12,15 @@ pub struct PresentationReceipt {
     pub generation: u64,
     pub revision: u64,
     pub completeness: FrameCompleteness,
+}
+
+#[derive(Debug)]
+pub struct ConfirmedPresentation(PresentationReceipt);
+
+impl ConfirmedPresentation {
+    pub fn into_receipt(self) -> PresentationReceipt {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +108,20 @@ struct RemoteTexture {
     size: PixelSize,
 }
 
+struct PreparedRendererRecovery {
+    context: GpuContext,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+struct DetachedRendererResources {
+    _context: GpuContext,
+    _bind_group_layout: wgpu::BindGroupLayout,
+    _sampler: wgpu::Sampler,
+    _remote: Option<RemoteTexture>,
+    _pass: Option<RemotePass>,
+}
+
 pub struct RemoteRenderer {
     context: GpuContext,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -112,15 +135,18 @@ impl RemoteRenderer {
     pub fn new(context: GpuContext) -> Result<Self, RendererError> {
         let scope = context.begin_fault_scope()?;
         let (bind_group_layout, sampler) = create_sampling_resources(context.device());
-        scope.finish()?;
-        Ok(Self {
-            context,
-            bind_group_layout,
-            sampler,
-            remote: None,
-            pass: None,
-            state: RemoteUpdateState::default(),
-        })
+        let token = scope.finish()?;
+        let commit_context = context.clone();
+        commit_context
+            .commit_if_unchanged(token, || Self {
+                context,
+                bind_group_layout,
+                sampler,
+                remote: None,
+                pass: None,
+                state: RemoteUpdateState::default(),
+            })
+            .map_err(RendererError::from)
     }
 
     pub fn apply_update(&mut self, update: SurfaceUpdate) -> Result<ApplyOutcome, RendererError> {
@@ -133,18 +159,28 @@ impl RemoteRenderer {
                 {
                     return Err(RendererError::TextureDimensionUnsupported);
                 }
-                let candidate = (|| {
-                    let scope = self.context.begin_fault_scope()?;
-                    let remote = create_remote_texture(
-                        self.context.device(),
-                        &self.bind_group_layout,
-                        &self.sampler,
-                        *size,
-                    );
-                    scope.finish()?;
-                    Ok(remote)
-                })();
-                commit_reset_resource_after_gpu(&mut self.state, &mut self.remote, plan, candidate)
+                let scope = self.context.begin_fault_scope()?;
+                let candidate = create_remote_texture(
+                    self.context.device(),
+                    &self.bind_group_layout,
+                    &self.sampler,
+                    *size,
+                );
+                let token = scope.finish()?;
+                let context = self.context.clone();
+                let committed = context
+                    .commit_if_unchanged(token, || {
+                        commit_reset_resource_after_gpu(
+                            &mut self.state,
+                            &mut self.remote,
+                            plan,
+                            Ok(candidate),
+                        )
+                    })
+                    .map_err(RendererError::from)??;
+                let (outcome, old_remote) = committed;
+                drop(old_remote);
+                Ok(outcome)
             }
             PlannedUpdateData::Damage { patches, .. } => {
                 let remote = self.remote.as_ref().ok_or(RendererError::ResetRequired)?;
@@ -176,18 +212,25 @@ impl RemoteRenderer {
                     );
                 }
                 let uploaded_rectangles = patches.len();
-                let gpu_result = scope.finish().map_err(RendererError::from);
-                commit_planned_update_after_gpu(&mut self.state, plan, gpu_result)?;
+                let token = scope.finish()?;
+                let context = self.context.clone();
+                context
+                    .commit_if_unchanged(token, || {
+                        commit_planned_update_after_gpu(&mut self.state, plan, Ok(()))
+                    })
+                    .map_err(RendererError::from)??;
                 Ok(ApplyOutcome::Damage {
                     uploaded_rectangles,
                 })
             }
             PlannedUpdateData::Boundary(receipt) => {
-                if let Some(fault) = self.context.observed_fault() {
-                    return Err(RendererError::GpuFault(fault));
-                }
                 let receipt = *receipt;
-                self.state.commit(plan)?;
+                let scope = self.context.begin_fault_scope()?;
+                let token = scope.finish()?;
+                let context = self.context.clone();
+                context
+                    .commit_if_unchanged(token, || self.state.commit(plan))
+                    .map_err(RendererError::from)?;
                 Ok(ApplyOutcome::BoundaryPending(receipt))
             }
         }
@@ -226,37 +269,83 @@ impl RemoteRenderer {
                 remote.map(|texture| texture.size),
                 drawable,
             );
-        scope.finish()?;
-        if let Some(replacement_pass) = replacement_pass {
-            self.pass = Some(replacement_pass);
-        }
-        Ok(self.state.pending_receipt())
+        let token = scope.finish()?;
+        let context = self.context.clone();
+        let (old_pass, pending_receipt) = context
+            .commit_if_unchanged(token, || {
+                let old_pass = replacement_pass.and_then(|pass| self.pass.replace(pass));
+                (old_pass, self.state.pending_receipt())
+            })
+            .map_err(RendererError::from)?;
+        drop(old_pass);
+        Ok(pending_receipt)
     }
 
-    pub fn confirm_presented(&mut self, receipt: PresentationReceipt) -> Result<(), RendererError> {
-        if let Some(fault) = self.context.observed_fault() {
-            return Err(RendererError::GpuFault(fault));
-        }
-        self.state.confirm_presented(receipt)
+    pub fn confirm_presented(
+        &mut self,
+        token: GpuCleanToken,
+        receipt: PresentationReceipt,
+    ) -> Result<ConfirmedPresentation, RendererError> {
+        let context = self.context.clone();
+        confirm_presented_with_commit(&mut self.state, receipt, |state, receipt| {
+            context
+                .commit_if_unchanged(token, || state.confirm_presented(receipt))
+                .map_err(RendererError::from)?
+        })
     }
 
     pub fn recover_device(
         &mut self,
         context: GpuContext,
     ) -> Result<Option<RecoveryRequirement>, RendererError> {
+        let (requirement, ()) = self.recover_device_coordinated(context, || ())?;
+        Ok(requirement)
+    }
+
+    pub fn recover_device_coordinated<R>(
+        &mut self,
+        context: GpuContext,
+        install_peer: impl FnOnce() -> R,
+    ) -> Result<(Option<RecoveryRequirement>, R), RendererError> {
         let scope = context.begin_fault_scope()?;
         let (bind_group_layout, sampler) = create_sampling_resources(context.device());
-        scope.finish()?;
+        let token = scope.finish()?;
+        let commit_context = context.clone();
+        let prepared = PreparedRendererRecovery {
+            context,
+            bind_group_layout,
+            sampler,
+        };
+        let ((requirement, detached), peer) = commit_context
+            .commit_if_unchanged(token, || {
+                let installed = self.install_prepared_recovery(prepared);
+                let peer = install_peer();
+                (installed, peer)
+            })
+            .map_err(RendererError::from)?;
+        drop(detached);
+        Ok((requirement, peer))
+    }
+
+    fn install_prepared_recovery(
+        &mut self,
+        prepared: PreparedRendererRecovery,
+    ) -> (Option<RecoveryRequirement>, DetachedRendererResources) {
         let requirement = self
             .remote
             .as_ref()
             .map(|_| self.state.invalidate_for_device_loss());
-        self.context = context;
-        self.bind_group_layout = bind_group_layout;
-        self.sampler = sampler;
-        self.remote = None;
-        self.pass = None;
-        Ok(requirement)
+        let detached = DetachedRendererResources {
+            _context: std::mem::replace(&mut self.context, prepared.context),
+            _bind_group_layout: std::mem::replace(
+                &mut self.bind_group_layout,
+                prepared.bind_group_layout,
+            ),
+            _sampler: std::mem::replace(&mut self.sampler, prepared.sampler),
+            _remote: self.remote.take(),
+            _pass: self.pass.take(),
+        };
+        (requirement, detached)
     }
 
     pub fn uses_context(&self, context: &GpuContext) -> bool {
@@ -279,11 +368,11 @@ fn commit_reset_resource_after_gpu<R>(
     resource: &mut Option<R>,
     plan: PlannedUpdate,
     candidate: Result<R, RendererError>,
-) -> Result<ApplyOutcome, RendererError> {
+) -> Result<(ApplyOutcome, Option<R>), RendererError> {
     let candidate = candidate?;
-    state.commit(plan)?;
-    *resource = Some(candidate);
-    Ok(ApplyOutcome::Reset)
+    state.commit(plan);
+    let old_resource = resource.replace(candidate);
+    Ok((ApplyOutcome::Reset, old_resource))
 }
 
 fn commit_planned_update_after_gpu(
@@ -292,7 +381,17 @@ fn commit_planned_update_after_gpu(
     gpu_result: Result<(), RendererError>,
 ) -> Result<(), RendererError> {
     gpu_result?;
-    state.commit(plan)
+    state.commit(plan);
+    Ok(())
+}
+
+fn confirm_presented_with_commit(
+    state: &mut RemoteUpdateState,
+    receipt: PresentationReceipt,
+    commit: impl FnOnce(&mut RemoteUpdateState, PresentationReceipt) -> Result<(), RendererError>,
+) -> Result<ConfirmedPresentation, RendererError> {
+    commit(state, receipt)?;
+    Ok(ConfirmedPresentation(receipt))
 }
 
 fn create_sampling_resources(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Sampler) {
@@ -407,7 +506,7 @@ impl RemoteUpdateState {
         }
     }
 
-    fn commit(&mut self, plan: PlannedUpdate) -> Result<(), RendererError> {
+    fn commit(&mut self, plan: PlannedUpdate) {
         match plan.data {
             PlannedUpdateData::Reset {
                 session_id,
@@ -427,17 +526,22 @@ impl RemoteUpdateState {
             }
             PlannedUpdateData::Damage { revision, patches } => {
                 let _pixels_are_consumed_after_upload = patches;
-                let current = self.current.as_mut().ok_or(RendererError::ResetRequired)?;
+                let current = self
+                    .current
+                    .as_mut()
+                    .expect("damage plan requires reset state");
                 current.last_damage_revision = revision;
                 self.pending_receipt = None;
             }
             PlannedUpdateData::Boundary(receipt) => {
-                let current = self.current.as_mut().ok_or(RendererError::ResetRequired)?;
+                let current = self
+                    .current
+                    .as_mut()
+                    .expect("boundary plan requires reset state");
                 current.last_boundary_revision = receipt.revision;
                 self.pending_receipt = Some(receipt);
             }
         }
-        Ok(())
     }
 
     fn pending_receipt(&self) -> Option<PresentationReceipt> {
@@ -641,14 +745,18 @@ impl RemoteColorPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use frd_core::{PixelRect, PixelSize, SessionId};
     use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
 
     use super::{
-        commit_planned_update_after_gpu, commit_reset_resource_after_gpu, RecoveryRequirement,
-        RemoteColorPolicy, RemoteUpdateState, RendererError,
+        commit_planned_update_after_gpu, commit_reset_resource_after_gpu,
+        confirm_presented_with_commit, RecoveryRequirement, RemoteColorPolicy, RemoteUpdateState,
+        RendererError,
     };
-    use crate::GpuFaultClass;
+    use crate::{GpuContextId, GpuFaultClass, GpuFaultObserver};
 
     fn reset(
         session_id: SessionId,
@@ -715,20 +823,16 @@ mod tests {
         let rect = pixel_rect(0, 0, 1, 1);
         let mut state = RemoteUpdateState::default();
 
-        state
-            .commit(
-                state
-                    .plan(reset(session_id, 7, size, PixelFormat::Bgrx8UnormSrgb))
-                    .unwrap(),
-            )
-            .unwrap();
-        state
-            .commit(
-                state
-                    .plan(damage(session_id, 7, 1, rect, 4, vec![0; 4]))
-                    .unwrap(),
-            )
-            .unwrap();
+        state.commit(
+            state
+                .plan(reset(session_id, 7, size, PixelFormat::Bgrx8UnormSrgb))
+                .unwrap(),
+        );
+        state.commit(
+            state
+                .plan(damage(session_id, 7, 1, rect, 4, vec![0; 4]))
+                .unwrap(),
+        );
 
         assert_eq!(
             state
@@ -769,7 +873,7 @@ mod tests {
             boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
         ] {
             let plan = state.plan(update).unwrap();
-            state.commit(plan).unwrap();
+            state.commit(plan);
         }
         let receipt = state.pending_receipt().unwrap();
         state.confirm_presented(receipt).unwrap();
@@ -778,7 +882,7 @@ mod tests {
         let plan = state
             .plan(reset(session_id, 2, size, PixelFormat::Bgrx8UnormSrgb))
             .unwrap();
-        state.commit(plan).unwrap();
+        state.commit(plan);
 
         assert!(!state.baseline_presented());
         assert_eq!(state.pending_receipt(), None);
@@ -798,7 +902,7 @@ mod tests {
             boundary(session_id, 1, 1, FrameCompleteness::Incremental),
         ] {
             let plan = state.plan(update).unwrap();
-            state.commit(plan).unwrap();
+            state.commit(plan);
         }
 
         let incremental = state.pending_receipt().unwrap();
@@ -812,7 +916,7 @@ mod tests {
             boundary(session_id, 1, 2, FrameCompleteness::FullBaseline),
         ] {
             let plan = state.plan(update).unwrap();
-            state.commit(plan).unwrap();
+            state.commit(plan);
         }
 
         let full = state.pending_receipt().unwrap();
@@ -831,7 +935,7 @@ mod tests {
         let plan = state
             .plan(reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb))
             .unwrap();
-        state.commit(plan).unwrap();
+        state.commit(plan);
 
         let plan = state
             .plan(damage(session_id, 1, 1, rect, 12, vec![0; 12]))
@@ -841,7 +945,7 @@ mod tests {
         assert_eq!(plan.uploads()[0].stride_bytes, 12);
         assert_eq!(plan.uploads()[0].byte_len, 12);
         assert_ne!(plan.uploads()[0].rect, pixel_rect(0, 0, 4, 4));
-        state.commit(plan).unwrap();
+        state.commit(plan);
 
         assert_eq!(
             state
@@ -904,7 +1008,7 @@ mod tests {
             boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
         ] {
             let plan = state.plan(update).unwrap();
-            state.commit(plan).unwrap();
+            state.commit(plan);
         }
 
         assert_eq!(
@@ -935,7 +1039,7 @@ mod tests {
             boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
         ] {
             let plan = state.plan(update).unwrap();
-            state.commit(plan).unwrap();
+            state.commit(plan);
         }
         let pending = state.pending_receipt();
         let next_reset = state
@@ -970,7 +1074,7 @@ mod tests {
             damage(session_id, 1, 1, rect, 4, vec![0; 4]),
         ] {
             let plan = state.plan(update).unwrap();
-            state.commit(plan).unwrap();
+            state.commit(plan);
         }
         let failed_damage = state
             .plan(damage(session_id, 1, 2, rect, 4, vec![0; 4]))
@@ -992,5 +1096,70 @@ mod tests {
                 .unwrap_err(),
             RendererError::BoundaryWithoutMatchingDamage
         );
+    }
+
+    #[test]
+    fn fault_at_receipt_commit_boundary_preserves_pending_baseline_and_returns_no_confirmation() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 2, 2);
+        let mut state = RemoteUpdateState::default();
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 8, vec![0; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+        let receipt = state.pending_receipt().unwrap();
+        let context_id = GpuContextId(73);
+        let observer = Arc::new(GpuFaultObserver::new());
+        let epoch = observer.begin_operation().unwrap();
+        let token = observer.clean_token(context_id, epoch).unwrap();
+        let published = Arc::new(Barrier::new(2));
+        let confirmation_ready = Arc::new(Barrier::new(2));
+        let release_publication = Arc::new(Barrier::new(2));
+
+        let fault_thread = {
+            let observer = observer.clone();
+            let published = published.clone();
+            let release_publication = release_publication.clone();
+            thread::spawn(move || {
+                observer.record_with_publication_paused(GpuFaultClass::DeviceLost, || {
+                    published.wait();
+                    release_publication.wait();
+                });
+            })
+        };
+        published.wait();
+
+        let confirmation_thread = {
+            let observer = observer.clone();
+            let confirmation_ready = confirmation_ready.clone();
+            thread::spawn(move || {
+                confirmation_ready.wait();
+                let confirmation =
+                    confirm_presented_with_commit(&mut state, receipt, |state, receipt| {
+                        observer
+                            .commit_if_unchanged(context_id, token, || {
+                                state.confirm_presented(receipt)
+                            })
+                            .map_err(RendererError::from)?
+                    });
+                (confirmation, state)
+            })
+        };
+
+        confirmation_ready.wait();
+        release_publication.wait();
+        fault_thread.join().unwrap();
+        let (confirmation, state) = confirmation_thread.join().unwrap();
+        assert_eq!(
+            confirmation.unwrap_err(),
+            RendererError::GpuFault(GpuFaultClass::DeviceLost)
+        );
+        assert_eq!(state.pending_receipt(), Some(receipt));
+        assert!(!state.baseline_presented());
     }
 }

@@ -4,12 +4,11 @@ mod surface;
 use frd_core::PixelSize;
 use frd_protocol_api::PresentationEvent;
 use frd_render_wgpu::{
-    GpuContext, GpuFaultClass, RecoveryRequirement, RemoteRenderer, RendererError,
+    GpuCleanToken, GpuContext, GpuFaultClass, RecoveryRequirement, RemoteRenderer, RendererError,
 };
 
 use state::{
-    acknowledge_after_present, AcquiredFrame, AcquisitionAction, ContextPairState,
-    SurfaceSizeAction, SurfaceSizeState,
+    AcquiredFrame, AcquisitionAction, ContextPairState, SurfaceSizeAction, SurfaceSizeState,
 };
 pub use surface::{PresentationSurface, PresentationSurfaceLease};
 
@@ -80,8 +79,11 @@ impl PresentationCompositor {
                 if let Some(mut configuration) = self.configuration.clone() {
                     configuration.width = size.width;
                     configuration.height = size.height;
-                    self.configure_existing_with(&configuration)?;
-                    self.configuration = Some(configuration);
+                    let token = self.configure_existing_with(&configuration)?;
+                    let context = self.context.clone();
+                    context.commit_if_unchanged(token, || {
+                        self.configuration = Some(configuration);
+                    })?;
                 } else {
                     self.configure_surface()?;
                 }
@@ -119,7 +121,8 @@ impl PresentationCompositor {
             .surface()
             .ok_or(PresentError::SurfaceDetached)?
             .get_current_texture();
-        acquisition_scope.finish()?;
+        let acquisition_token = acquisition_scope.finish()?;
+        self.context.commit_if_unchanged(acquisition_token, || ())?;
         let acquired = AcquiredFrame::from(acquired);
         let action = acquired.action();
 
@@ -147,15 +150,24 @@ impl PresentationCompositor {
                 // submit/present 在 wgpu 30 中不返回逐帧 Result；同一错误作用域和共享
                 // observer 负责在确认回执前收集同步验证错误与设备丢失。finish 使用
                 // 非阻塞 Poll，不把呈现路径变成等待 GPU 完成的 fence。
-                let gpu_result = frame_scope.finish();
+                let frame_token = frame_scope.finish()?;
                 if action == AcquisitionAction::RenderThenReconfigure {
                     self.reconfigure_existing()?;
                 }
-                let event = acknowledge_after_present(receipt, gpu_result);
-                gpu_result?;
-                if let Some(receipt) = receipt {
-                    remote.confirm_presented(receipt)?;
-                }
+                let event = if let Some(receipt) = receipt {
+                    let receipt = remote
+                        .confirm_presented(frame_token, receipt)?
+                        .into_receipt();
+                    Some(PresentationEvent::FramePresented {
+                        session_id: receipt.session_id,
+                        generation: receipt.generation,
+                        revision: receipt.revision,
+                        completeness: receipt.completeness,
+                    })
+                } else {
+                    self.context.commit_if_unchanged(frame_token, || ())?;
+                    None
+                };
                 Ok(event)
             }
             AcquisitionAction::Reconfigure => {
@@ -186,15 +198,21 @@ impl PresentationCompositor {
         let candidate = self.presentation.create_candidate(context.instance())?;
         let configuration = if let Some(size) = self.size_state.active() {
             let configuration = surface_configuration(&candidate, &context, size)?;
-            configure_surface_with(&candidate, &context, &configuration)?;
+            let token = configure_surface_with(&candidate, &context, &configuration)?;
+            context.commit_if_unchanged(token, || ())?;
             Some(configuration)
         } else {
             None
         };
-        let requirement = remote.recover_device(context.clone())?;
-        self.presentation.replace_surface(candidate);
-        self.context = context;
-        self.configuration = configuration;
+        let renderer_context = context.clone();
+        let (requirement, detached_presentation) =
+            remote.recover_device_coordinated(renderer_context, || {
+                let old_surface = self.presentation.replace_surface(candidate);
+                let old_context = std::mem::replace(&mut self.context, context);
+                let old_configuration = std::mem::replace(&mut self.configuration, configuration);
+                (old_surface, old_context, old_configuration)
+            })?;
+        drop(detached_presentation);
         context_pair.install_recovery(new_context_id);
         debug_assert!(context_pair.matches());
         debug_assert_eq!(self.context.context_id(), remote.context_id());
@@ -212,13 +230,15 @@ impl PresentationCompositor {
             .configuration
             .as_ref()
             .ok_or(PresentError::SurfaceDetached)?;
-        self.configure_existing_with(configuration)
+        let token = self.configure_existing_with(configuration)?;
+        self.context.commit_if_unchanged(token, || ())?;
+        Ok(())
     }
 
     fn configure_existing_with(
         &self,
         configuration: &wgpu::SurfaceConfiguration,
-    ) -> Result<(), PresentError> {
+    ) -> Result<GpuCleanToken, PresentError> {
         let surface = self
             .presentation
             .surface()
@@ -236,8 +256,11 @@ impl PresentationCompositor {
             .surface()
             .ok_or(PresentError::SurfaceDetached)?;
         let configuration = surface_configuration(surface, &self.context, size)?;
-        configure_surface_with(surface, &self.context, &configuration)?;
-        self.configuration = Some(configuration);
+        let token = configure_surface_with(surface, &self.context, &configuration)?;
+        let context = self.context.clone();
+        context.commit_if_unchanged(token, || {
+            self.configuration = Some(configuration);
+        })?;
         Ok(())
     }
 }
@@ -291,11 +314,10 @@ fn configure_surface_with(
     surface: &wgpu::Surface<'_>,
     context: &GpuContext,
     configuration: &wgpu::SurfaceConfiguration,
-) -> Result<(), PresentError> {
+) -> Result<GpuCleanToken, PresentError> {
     let scope = context.begin_fault_scope()?;
     surface.configure(context.device(), configuration);
-    scope.finish()?;
-    Ok(())
+    scope.finish().map_err(PresentError::from)
 }
 
 impl Drop for PresentationCompositor {

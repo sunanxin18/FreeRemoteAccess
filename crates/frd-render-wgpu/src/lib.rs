@@ -2,9 +2,10 @@ mod gpu_fault;
 mod pass;
 mod remote_texture;
 
-pub use gpu_fault::{GpuFaultClass, GpuFaultScope};
+pub use gpu_fault::{GpuCleanToken, GpuFaultClass, GpuFaultScope};
 pub use remote_texture::{
-    ApplyOutcome, PresentationReceipt, RecoveryRequirement, RemoteRenderer, RendererError,
+    ApplyOutcome, ConfirmedPresentation, PresentationReceipt, RecoveryRequirement, RemoteRenderer,
+    RendererError,
 };
 
 pub(crate) use gpu_fault::GpuFaultObserver;
@@ -99,7 +100,18 @@ impl GpuContext {
     }
 
     pub fn begin_fault_scope(&self) -> Result<GpuFaultScope, GpuFaultClass> {
-        GpuFaultScope::new(self.device.clone(), self.observer.clone())
+        GpuFaultScope::new(self.device.clone(), self.observer.clone(), self.context_id)
+    }
+
+    pub fn commit_if_unchanged<R>(
+        &self,
+        token: GpuCleanToken,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GpuFaultClass> {
+        // 临界区只允许最终 CPU 所有权/状态移动；调用点不得在闭包内执行 wgpu API，
+        // 被替换的 GPU handle 必须由闭包返回并在锁释放后析构。
+        self.observer
+            .commit_if_unchanged(self.context_id, token, commit)
     }
 
     pub fn observed_fault(&self) -> Option<GpuFaultClass> {
@@ -178,12 +190,9 @@ mod fault_observer_tests {
 
         observer.record(GpuFaultClass::Validation);
 
-        assert_eq!(
-            observer.fault_since(operation_epoch),
-            Some(GpuFaultClass::Validation)
-        );
+        assert_eq!(observer.current(), Some(GpuFaultClass::Validation));
         assert_eq!(observer.begin_operation(), Err(GpuFaultClass::Validation));
-        assert_eq!(observer.epoch(), 1);
+        assert!(observer.epoch() > operation_epoch);
     }
 
     #[test]
