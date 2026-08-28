@@ -4,6 +4,7 @@ mod fatal;
 mod input;
 mod lifecycle;
 mod repaint;
+mod ui_fonts;
 
 pub use application::{
     AudioOutputFactory, BackgroundLaunchOutcome, DesktopApplication, DesktopUserEvent,

@@ -45,6 +45,7 @@ use crate::lifecycle::{
     PresentationRecoveryBackend, PresentationRecoveryContext, PresentationRecoveryFailure,
 };
 use crate::repaint::{RepaintPlan, RepaintScheduler};
+use crate::ui_fonts::system_font_definitions;
 use crate::{InputGate, InputOwnership, InputRouter};
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -1004,6 +1005,7 @@ impl DesktopApplication {
             )
         })?;
         let egui_context = egui::Context::default();
+        egui_context.set_fonts(system_font_definitions());
         let egui_state = egui_winit::State::new(
             egui_context.clone(),
             egui::ViewportId::ROOT,
@@ -2145,7 +2147,7 @@ impl PresentationRecoveryBackend for DesktopWindowRecovery<'_> {
         );
         self.window
             .egui_context
-            .set_fonts(egui::FontDefinitions::default());
+            .set_fonts(system_font_definitions());
         self.window.gpu = gpu;
         Ok(requirement)
     }
