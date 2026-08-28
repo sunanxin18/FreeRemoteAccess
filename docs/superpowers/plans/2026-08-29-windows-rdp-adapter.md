@@ -17,9 +17,10 @@
 - Keep `ProtocolId::rdp()` equal to `"rdp"` and use default port 3389.
 - Accept `user`, `DOMAIN\user`, and `user@domain` through the existing username field.
 - Do not add a new public feature schema, advanced RDP settings page, title-bar group, or protocol-specific UI control.
+- Do not claim Caps Lock, Num Lock, or Scroll Lock synchronization: the current protocol-neutral `Modifiers` contract has no lock bits. Keep physical modifier keys unchanged and defer lock-state synchronization to a future approved public input-contract task.
 - Do not depend on `frd-protocol-apple`, `frd-wire-rfb`, winit, wgpu, egui, minifb, or a platform crate from `frd-protocol-rdp`.
 - Do not copy IronRDP's permissive TLS verifier, viewer, CLI password argument, server, software renderer, or per-update full-frame output conversion.
-- Validate server identity before any CredSSP credential write. Unknown identity uses the existing challenge; a saved-pin mismatch fails closed.
+- Validate server identity before any CredSSP credential write. Only an untrusted issuer with an otherwise valid leaf uses the existing challenge; a saved-pin mismatch and every other certificate failure fail closed.
 - Do not place credentials, certificate bodies, TLS secrets, target secrets, or raw upstream errors in argv, configuration, logs, captures, fixtures, or UI strings.
 - Publish only `PixelFormat::Bgrx8UnormSrgb` and current generation-bound `SurfaceUpdate` values.
 - Return one `ProtocolExit`; the shell remains the only producer of `SessionEvent::Closed`.
@@ -196,7 +197,7 @@ enum IdentityDisposition {
 }
 ```
 
-Tests must cover system trust, exact saved pin, unknown self-signed challenge, pin mismatch, Reject, stale challenge ID, Disconnect while waiting, and bounded sanitized subject/issuer text.
+Tests must cover system trust, exact saved pin, untrusted-issuer challenge, pin mismatch, Reject, stale challenge ID, Disconnect while waiting, bounded sanitized subject/issuer text, and deterministic wrong-host, expired, not-yet-valid, invalid-EKU, and malformed/non-issuer failures. Only the untrusted-issuer class may reach TrustOnce or TrustAndRemember.
 
 - [ ] **Step 2: Run RED**
 
@@ -208,7 +209,7 @@ Expected: fail because policy and transport are absent.
 
 - [ ] **Step 3: Implement certificate fingerprint and classification**
 
-Use SHA-256 of the complete leaf DER bytes. Exact saved-pin comparison happens before presenting a new challenge. A mismatch returns `rdp_server_identity_changed` and cannot be overridden by retry.
+Use SHA-256 of the complete leaf DER bytes and preserve the rustls certificate-failure class. Exact saved-pin comparison happens before presenting a new challenge, but a matching pin overrides only `UnknownIssuer`; server name, validity, server-auth/EKU, malformed, revoked, and other non-issuer failures remain fail-closed. A mismatch returns `rdp_server_identity_changed` and cannot be overridden by retry, including a leaf change between preflight and the verified reconnect.
 
 ```rust
 fn fingerprint_sha256(leaf_der: &[u8]) -> [u8; 32];
@@ -223,7 +224,7 @@ fn classify_identity(
 
 - [ ] **Step 4: Implement the credential-free preflight**
 
-The preflight verifier may capture the presented chain only in a transport state that cannot call the RDP connector or access credentials. It completes the TLS handshake, records the leaf, performs no application write, and closes.
+The preflight verifier may capture the presented chain only in a transport state that cannot call the RDP connector or access credentials. It completes the TLS handshake, records the leaf and platform failure class, performs no application write, and closes. Before treating `UnknownIssuer` as challengeable, independently validate server name, validity, and server-auth/EKU so a chain-policy precedence result cannot hide a non-overridable leaf defect.
 
 The second connection uses either:
 
@@ -428,7 +429,7 @@ git commit -m "feat: publish bounded RDP desktop damage"
 
 - [ ] **Step 1: Add RED input tests**
 
-Cover scan-code press/release, E0 extended keys, Unicode text, pointer movement, left/middle/right/X1/X2 buttons, vertical/horizontal wheel, stale generation rejection, and `ReleaseAll` after focus loss/disconnect.
+Cover scan-code press/release, E0 extended keys, physical modifier keys, Unicode text, pointer movement, left/middle/right/X1/X2 buttons, vertical/horizontal wheel, stale generation rejection, and `ReleaseAll` after focus loss/disconnect. Lock-state synchronization is not part of this task's acceptance and must not add public schema.
 
 - [ ] **Step 2: Run RED**
 

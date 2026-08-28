@@ -24,6 +24,13 @@ pub(crate) fn validate_negotiated_size(
 ) -> Result<PixelSize, RdpSurfaceError> {
     let size =
         PixelSize::new(u32::from(width), u32::from(height)).ok_or(RdpSurfaceError::InvalidSize)?;
+    validate_surface_size(size)
+}
+
+pub(crate) fn validate_surface_size(size: PixelSize) -> Result<PixelSize, RdpSurfaceError> {
+    if size.width == 0 || size.height == 0 {
+        return Err(RdpSurfaceError::InvalidSize);
+    }
     let surface_bytes = u64::from(size.width)
         .checked_mul(u64::from(size.height))
         .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL as u64))

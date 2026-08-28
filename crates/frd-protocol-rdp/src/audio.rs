@@ -49,20 +49,27 @@ pub(crate) fn observe_negotiation(rdpsnd: &Rdpsnd, adapter: &RdpAudioAdapter) {
             .iter()
             .any(|supported| supported == format)
         {
-            exact_format = Some(format);
+            exact_format = Some((usize::from(format_no), format));
             break;
         }
     }
-    let (sample_rate_hz, channels, bits_per_sample) = exact_format
-        .map(|format| {
+    let (format_no, sample_rate_hz, channels, bits_per_sample) = exact_format
+        .map(|(format_no, format)| {
             (
+                Some(format_no),
                 format.n_samples_per_sec,
                 format.n_channels,
                 format.bits_per_sample,
             )
         })
         .unwrap_or_default();
-    adapter.observe_server_offer(offer_epoch, sample_rate_hz, channels, bits_per_sample);
+    adapter.observe_server_offer(
+        offer_epoch,
+        format_no,
+        sample_rate_hz,
+        channels,
+        bits_per_sample,
+    );
 }
 
 pub(crate) fn capabilities(adapter: &RdpAudioAdapter) -> SessionCapabilities {
@@ -76,7 +83,7 @@ pub(crate) fn capabilities(adapter: &RdpAudioAdapter) -> SessionCapabilities {
 struct AudioStateInner {
     next_offer_epoch: u64,
     pending_offer_epoch: Option<u64>,
-    current_offer_epoch: Option<u64>,
+    current_offer: Option<(u64, usize)>,
     degraded: bool,
     playing: bool,
     pending_state: Option<AudioState>,
@@ -92,7 +99,7 @@ impl AudioStateInner {
 
     fn degrade(&mut self) {
         self.pending_offer_epoch = None;
-        self.current_offer_epoch = None;
+        self.current_offer = None;
         self.degraded = true;
         self.playing = false;
         self.clear_frames();
@@ -123,7 +130,7 @@ impl RdpAudioAdapter {
         let epoch = inner.next_offer_epoch.checked_add(1).unwrap_or(1);
         inner.next_offer_epoch = epoch;
         inner.pending_offer_epoch = Some(epoch);
-        inner.current_offer_epoch = None;
+        inner.current_offer = None;
         inner.degraded = false;
         inner.playing = false;
         inner.clear_frames();
@@ -138,13 +145,16 @@ impl RdpAudioAdapter {
     pub(crate) fn observe_server_offer(
         &self,
         offer_epoch: u64,
+        format_no: Option<usize>,
         sample_rate_hz: u32,
         channels: u16,
         bits_per_sample: u16,
     ) -> bool {
-        let compatible = sample_rate_hz == PCM_SAMPLE_RATE_HZ
-            && channels == PCM_CHANNELS
-            && bits_per_sample == PCM_BITS_PER_SAMPLE;
+        let accepted_format_no = format_no.filter(|_| {
+            sample_rate_hz == PCM_SAMPLE_RATE_HZ
+                && channels == PCM_CHANNELS
+                && bits_per_sample == PCM_BITS_PER_SAMPLE
+        });
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
@@ -152,8 +162,8 @@ impl RdpAudioAdapter {
             return false;
         }
         inner.pending_offer_epoch = None;
-        if compatible {
-            inner.current_offer_epoch = Some(offer_epoch);
+        if let Some(format_no) = accepted_format_no {
+            inner.current_offer = Some((offer_epoch, format_no));
             true
         } else {
             false
@@ -163,7 +173,7 @@ impl RdpAudioAdapter {
     pub(crate) fn remote_audio(&self) -> bool {
         self.inner
             .lock()
-            .map(|inner| inner.current_offer_epoch.is_some() && !inner.degraded)
+            .map(|inner| inner.current_offer.is_some() && !inner.degraded)
             .unwrap_or(false)
     }
 
@@ -171,7 +181,10 @@ impl RdpAudioAdapter {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        if inner.current_offer_epoch.is_none() || inner.degraded {
+        let Some((_, accepted_format_no)) = inner.current_offer else {
+            return;
+        };
+        if inner.degraded {
             return;
         }
         let sample_count = data.len() / 2;
@@ -180,7 +193,7 @@ impl RdpAudioAdapter {
                 .queued_samples
                 .checked_add(sample_count)
                 .is_none_or(|queued| queued > MAX_QUEUED_PCM_SAMPLES);
-        if format_no != 0
+        if format_no != accepted_format_no
             || data.is_empty()
             || !data.len().is_multiple_of(PCM_BLOCK_ALIGN_BYTES)
             || data.len() > MAX_QUEUED_PCM_BYTES
@@ -256,11 +269,11 @@ impl RdpAudioAdapter {
 
     pub(crate) fn stop(&self) {
         if let Ok(mut inner) = self.inner.lock() {
-            if (inner.current_offer_epoch.is_some() || inner.playing) && !inner.degraded {
+            if (inner.current_offer.is_some() || inner.playing) && !inner.degraded {
                 inner.pending_state = Some(AudioState::Stopped);
             }
             inner.pending_offer_epoch = None;
-            inner.current_offer_epoch = None;
+            inner.current_offer = None;
             inner.playing = false;
             inner.clear_frames();
         }
@@ -331,9 +344,9 @@ mod tests {
         assert!(adapter.take_frame().is_none());
 
         let incompatible_epoch = begin_offer(&adapter);
-        assert!(!adapter.observe_server_offer(incompatible_epoch, 44_100, 2, 16));
+        assert!(!adapter.observe_server_offer(incompatible_epoch, Some(0), 44_100, 2, 16));
         let exact_epoch = begin_offer(&adapter);
-        assert!(adapter.observe_server_offer(exact_epoch, 48_000, 2, 16));
+        assert!(adapter.observe_server_offer(exact_epoch, Some(0), 48_000, 2, 16));
         adapter.accept_wave(0, &[0x34, 0x12, 0xCC, 0xFF]);
         let MediaFrame::Pcm {
             sample_rate_hz,
@@ -352,7 +365,7 @@ mod tests {
     fn audio_backpressure_degrades_only_audio_and_keeps_runtime_alive() {
         let adapter = RdpAudioAdapter::new();
         let epoch = begin_offer(&adapter);
-        assert!(adapter.observe_server_offer(epoch, 48_000, 2, 16));
+        assert!(adapter.observe_server_offer(epoch, Some(0), 48_000, 2, 16));
         adapter.accept_wave(0, &[0x01, 0x00, 0x02, 0x00]);
         let (_commands, command_rx) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
@@ -383,7 +396,7 @@ mod tests {
     fn audio_close_publishes_stopped_without_stopping_the_runtime() {
         let adapter = RdpAudioAdapter::new();
         let epoch = begin_offer(&adapter);
-        assert!(adapter.observe_server_offer(epoch, 48_000, 2, 16));
+        assert!(adapter.observe_server_offer(epoch, Some(0), 48_000, 2, 16));
         let (_commands, command_rx) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
         let mut runtime = ProtocolRuntime::new(
@@ -420,15 +433,15 @@ mod tests {
         assert!(adapter.take_frame().is_none());
 
         let first_epoch = begin_offer(&adapter);
-        assert!(adapter.observe_server_offer(first_epoch, 48_000, 2, 16));
+        assert!(adapter.observe_server_offer(first_epoch, Some(0), 48_000, 2, 16));
         handler.close();
-        assert!(!adapter.observe_server_offer(first_epoch, 48_000, 2, 16));
+        assert!(!adapter.observe_server_offer(first_epoch, Some(0), 48_000, 2, 16));
         handler.wave(0, 0, Cow::Borrowed(&[0x03, 0x00, 0x04, 0x00]));
         assert!(!adapter.remote_audio());
         assert!(adapter.take_frame().is_none());
 
         let second_epoch = begin_offer(&adapter);
-        assert!(adapter.observe_server_offer(second_epoch, 48_000, 2, 16));
+        assert!(adapter.observe_server_offer(second_epoch, Some(0), 48_000, 2, 16));
         handler.wave(0, 0, Cow::Borrowed(&[0x05, 0x00, 0x06, 0x00]));
         assert!(adapter.take_frame().is_some());
     }
@@ -492,10 +505,72 @@ mod tests {
     }
 
     #[test]
+    fn audio_real_format_offer_preserves_exact_server_index_for_wave2() {
+        let server_formats = || {
+            let mut inexact = supported_formats()[0].clone();
+            inexact.n_samples_per_sec = 44_100;
+            vec![inexact, supported_formats()[0].clone()]
+        };
+        let formats_pdu = || {
+            ServerAudioOutputPdu::AudioFormat(ServerAudioFormatPdu {
+                version: Version::V8,
+                formats: server_formats(),
+            })
+        };
+
+        let adapter = RdpAudioAdapter::new();
+        let mut rdpsnd = new_rdpsnd(&adapter);
+        process_server_audio_pdu(&mut rdpsnd, formats_pdu());
+        observe_negotiation(&rdpsnd, &adapter);
+        assert!(adapter.remote_audio());
+        process_server_audio_pdu(
+            &mut rdpsnd,
+            ServerAudioOutputPdu::Training(TrainingPdu {
+                timestamp: 1,
+                data: Vec::new(),
+            }),
+        );
+        process_server_audio_pdu(
+            &mut rdpsnd,
+            ServerAudioOutputPdu::Wave2(Wave2Pdu {
+                timestamp: 2,
+                format_no: 1,
+                block_no: 1,
+                audio_timestamp: 2,
+                data: Cow::Borrowed(&[0x01, 0x00, 0x02, 0x00]),
+            }),
+        );
+        assert!(adapter.take_frame().is_some());
+
+        let wrong_index_adapter = RdpAudioAdapter::new();
+        let mut wrong_index_rdpsnd = new_rdpsnd(&wrong_index_adapter);
+        process_server_audio_pdu(&mut wrong_index_rdpsnd, formats_pdu());
+        observe_negotiation(&wrong_index_rdpsnd, &wrong_index_adapter);
+        process_server_audio_pdu(
+            &mut wrong_index_rdpsnd,
+            ServerAudioOutputPdu::Training(TrainingPdu {
+                timestamp: 1,
+                data: Vec::new(),
+            }),
+        );
+        process_server_audio_pdu(
+            &mut wrong_index_rdpsnd,
+            ServerAudioOutputPdu::Wave2(Wave2Pdu {
+                timestamp: 3,
+                format_no: 0,
+                block_no: 2,
+                audio_timestamp: 3,
+                data: Cow::Borrowed(&[0x03, 0x00, 0x04, 0x00]),
+            }),
+        );
+        assert!(wrong_index_adapter.take_frame().is_none());
+    }
+
+    #[test]
     fn audio_misaligned_pcm_degrades_without_stopping_graphics() {
         let adapter = RdpAudioAdapter::new();
         let epoch = begin_offer(&adapter);
-        assert!(adapter.observe_server_offer(epoch, 48_000, 2, 16));
+        assert!(adapter.observe_server_offer(epoch, Some(0), 48_000, 2, 16));
         adapter.accept_wave(0, &[0x01, 0x00]);
         let (_commands, command_rx) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
@@ -523,7 +598,7 @@ mod tests {
         );
         let next_epoch = begin_offer(&adapter);
         assert!(
-            adapter.observe_server_offer(next_epoch, 48_000, 2, 16),
+            adapter.observe_server_offer(next_epoch, Some(0), 48_000, 2, 16),
             "a new exact server offer starts a fresh audio epoch"
         );
     }
@@ -532,14 +607,14 @@ mod tests {
     fn audio_oversize_or_ninth_queued_frame_degrades_before_publication() {
         let oversized = RdpAudioAdapter::new();
         let epoch = begin_offer(&oversized);
-        assert!(oversized.observe_server_offer(epoch, 48_000, 2, 16));
+        assert!(oversized.observe_server_offer(epoch, Some(0), 48_000, 2, 16));
         oversized.accept_wave(0, &vec![0; 192_004]);
         assert!(!oversized.remote_audio());
         assert!(oversized.take_frame().is_none());
 
         let queued = RdpAudioAdapter::new();
         let epoch = begin_offer(&queued);
-        assert!(queued.observe_server_offer(epoch, 48_000, 2, 16));
+        assert!(queued.observe_server_offer(epoch, Some(0), 48_000, 2, 16));
         for _ in 0..9 {
             queued.accept_wave(0, &[0x01, 0x00, 0x02, 0x00]);
         }

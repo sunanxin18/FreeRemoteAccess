@@ -1,6 +1,8 @@
 use frd_core::{PhysicalViewport, PixelSize};
 use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 
+use crate::surface::validate_surface_size;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResizeConfirmation {
     NoRequest,
@@ -50,6 +52,10 @@ impl DisplayControlAdapter {
             viewport.content.height,
         );
         let target = PixelSize { width, height };
+        if validate_surface_size(target).is_err() {
+            self.queued = None;
+            return;
+        }
         if let Some(in_flight) = self.in_flight {
             self.queued = (target != in_flight).then_some(target);
         } else if target == self.confirmed_size {
@@ -252,5 +258,29 @@ mod tests {
             ResizeConfirmation::Mismatch
         );
         assert_eq!(adapter.confirmed_size(), initial);
+    }
+
+    #[test]
+    fn display_surface_budget_accepts_exact_limit_and_ignores_over_budget_target() {
+        let initial = PixelSize {
+            width: 1280,
+            height: 720,
+        };
+        let mut exact = DisplayControlAdapter::new(initial);
+        exact.set_negotiated(true);
+        exact.observe_viewport(viewport(8192, 2048));
+        assert_eq!(
+            exact.take_resize_request(),
+            Some(PixelSize {
+                width: 8192,
+                height: 2048,
+            })
+        );
+
+        let mut over_budget = DisplayControlAdapter::new(initial);
+        over_budget.set_negotiated(true);
+        over_budget.observe_viewport(viewport(8192, 2049));
+        assert_eq!(over_budget.take_resize_request(), None);
+        assert_eq!(over_budget.confirmed_size(), initial);
     }
 }

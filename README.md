@@ -61,13 +61,13 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
-| 服务器身份与 TLS | RDP TLS + 系统信任链 + SHA-256 pin | **开发中** | 已实现系统信任链、主机名、有效期、未知证书显式确认、精确 pin 重连和指纹变化 fail-closed；身份确认及第二次 TLS 验证前不读取用户名/密码。2026-08-29 证据仅限 `frd-protocol-rdp` 单元测试与 workspace 测试，尚无 Windows 真机证书互操作证明 |
+| 服务器身份与 TLS | RDP TLS + 系统信任链 + SHA-256 pin | **开发中** | 已实现系统信任链、主机名、有效期、server-auth/EKU、仅不受信任签发者可显式确认、精确 pin 重连和指纹变化 fail-closed；错误主机、过期/尚未生效、用途错误及畸形证书不可交互覆盖。身份确认及第二次 TLS 验证前不读取用户名/密码。2026-08-29 证据仅限 `frd-protocol-rdp` 单元测试与 workspace 测试，尚无 Windows 真机证书互操作证明 |
 | 账号密码认证 | CredSSP/NLA | **开发中** | 私有 adapter 已实现只允许 NLA/TLS 的 CredSSP、licensing 与 activation 基线；2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录或会话证明。凭据不得进入 argv、普通配置、日志或抓包 |
 | 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 已有 `freeremotedesk-windows` Release 构建，设计为 BGRX 脏矩形发布；尚无 Windows 真机首帧证据 |
-| 鼠标与键盘 | RDP fast-path input | **开发中** | 设计包含 scan code、Unicode、鼠标、滚轮和失焦 `ReleaseAll`；尚未完成产品互操作 |
+| 鼠标与键盘 | RDP fast-path input | **开发中** | 已有离线 scan code、物理修饰键、Unicode、鼠标、滚轮和失焦 `ReleaseAll` 覆盖；当前协议中立 `Modifiers` 没有 Caps/Num/Scroll Lock 状态位，锁定状态同步明确延期且本分支不新增公共输入/UI schema；尚未完成产品互操作 |
 | 动态分辨率与多显示器 | Display Control DVC | **开发中** | 已通过现有 viewport 接口实现单主显示器 latest-only 调整，仅在 DVC 打开且服务端能力就绪后宣告，并在精确 reactivation 尺寸确认后切换 generation；多显示器仍不支持。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 现代图形 | EGFX、ZGFX、AVC/AVC420、AVC444 | **计划中** | 均未实现或验证，不得宣告支持；未来只允许作为 RDP adapter 内部解码路径发布现有 `SurfaceUpdate`，不新增 UI |
-| 文本剪贴板 | CLIPRDR | **开发中** | 已复用现有剪贴板能力和事件接口适配 Unicode 文本，读写方向按实际协商分别宣告；文件能力保持关闭。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
+| 文本剪贴板 | CLIPRDR | **开发中** | CLIPRDR 仅在私有 RDP adapter 内适配 Unicode 文本，并由现有协商能力作产品门控；Windows 平台剪贴板 gate 本分支未启用，文件能力保持关闭，不能宣称端到端剪贴板。2026-08-29 证据仅限 adapter 单元/workspace 测试，无 Windows 真机互操作证明 |
 | Windows→客户端音频 | RDPSND | **开发中** | 已将共同协商的 48 kHz 双声道 16-bit PCM 通过协议中立 `MediaFrame` 端口发布，媒体背压只降级音频，RDP adapter 不打开平台音频设备。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 客户端麦克风、文件、磁盘与设备 | RDPEAI、CLIPRDR 文件、RDPDR | **计划中** | 不在当前 RDP 开发范围，也不新增入口或公共接口；未来必须单独设计并获得批准 |
 

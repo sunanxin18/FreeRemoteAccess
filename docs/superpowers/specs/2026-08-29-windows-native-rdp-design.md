@@ -105,10 +105,14 @@ FreeRemoteDesk. The product path must implement the following sequence:
 1. Open a credential-free TCP/TLS preflight connection.
 2. Validate the system trust chain, server name, validity period, and server
    authentication usage.
-3. Continue automatically only when ordinary validation succeeds or an exact
-   saved endpoint/protocol SHA-256 pin matches.
-4. For an unknown self-signed certificate, publish the existing generic server
-   identity challenge before any CredSSP write.
+3. Continue automatically only when ordinary validation succeeds, or when an
+   exact saved endpoint/protocol SHA-256 pin matches and the leaf still passes
+   server-name, validity, and server-auth/EKU checks. A pin may override only
+   the untrusted-issuer class.
+4. Only for an untrusted issuer whose leaf passes those independent checks,
+   publish the existing generic server identity challenge before any CredSSP
+   write. Wrong-host, expired/not-yet-valid, invalid-purpose/EKU, malformed,
+   revoked, and all other non-issuer failures are not interactive overrides.
 5. On TrustOnce or TrustAndRemember, close the preflight connection and open a
    new connection that accepts only the exact approved fingerprint.
 6. Persist only an explicit TrustAndRemember decision through the existing
@@ -131,13 +135,20 @@ Phase 1 delivers the agreed minimum:
 - one remote display with a fixed initial remote size;
 - raw bitmap, Interleaved RLE, RDP 6.0 bitmap compression, and RemoteFX;
 - mouse movement, buttons, extra buttons, vertical and horizontal wheel;
-- scan-code keys, extended keys, Unicode text, lock synchronization, and
+- scan-code keys, extended keys, Unicode text, physical modifier keys, and
   `ReleaseAll` on focus loss, pointer disarm, disconnect, or generation change;
 - the existing login UI, secure credential store, certificate decision page,
   connection lifecycle, frame mailbox, and wgpu renderer;
 - local system cursor only; server cursor shape fidelity is deferred;
 - audio, clipboard, disk/device redirection, dynamic resolution, EGFX, AVC420,
   and AVC444 disabled.
+
+Caps Lock, Num Lock, and Scroll Lock state synchronization is explicitly
+deferred. The current protocol-neutral `Modifiers` contract carries no lock
+state bits, so this branch does not invent state or add a public input/UI
+schema. Existing physical modifier-key events and all other input behavior are
+unchanged; lock synchronization requires a future approved protocol-neutral
+input-contract change.
 
 The new crate is divided by responsibility:
 
@@ -223,6 +234,8 @@ profile field, or public interface in the current RDP work:
 - printer, smart-card, USB, COM plugin, and generic device redirection;
 - new multi-monitor configuration, per-monitor DPI controls, or RDP-specific
   performance/codec selectors;
+- Caps Lock, Num Lock, and Scroll Lock state synchronization until a future
+  protocol-neutral input contract represents those states;
 - any other IronRDP feature not representable by the existing product contracts.
 
 Their presence in IronRDP source or Cargo features does not make them a
@@ -260,7 +273,8 @@ Automated tests remain focused on core protocol and boundaries:
 - proof that certificate preflight performs no CredSSP credential write;
 - BGRX colour, stride, inclusive rectangle, and dirty-row extraction;
 - baseline coverage and bounded full-snapshot recovery;
-- scan-code, Unicode, pointer, wheel, stale generation, and `ReleaseAll`;
+- scan-code, physical modifier, Unicode, pointer, wheel, stale generation, and
+  `ReleaseAll`; lock-state synchronization is not current acceptance;
 - cancellation and exactly one terminal lifecycle outcome;
 - dependency graph isolation and composition-root-only registration;
 - all existing Apple authentication, MVS, generation, input, frame, audio, and

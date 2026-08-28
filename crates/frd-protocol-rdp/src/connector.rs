@@ -12,7 +12,7 @@ use ironrdp::connector::{
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::pdu::gcc::KeyboardType;
-use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, MajorPlatformType};
+use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_blocking::{Framed, ShouldUpgrade};
 
@@ -396,7 +396,8 @@ fn baseline_connector(
             bitmap: Some(BitmapConfig {
                 lossy_compression: false,
                 color_depth: 32,
-                codecs: BitmapCodecs::default(),
+                codecs: client_codecs_capabilities(&[])
+                    .expect("empty pinned codec configuration is infallible"),
             }),
             client_build: 0,
             client_name: "FreeRemoteDesk".to_owned(),
@@ -464,6 +465,9 @@ fn client_platform() -> MajorPlatformType {
 mod tests {
     use ironrdp::connector::{Credentials, DesktopSize};
     use ironrdp::dvc::DrdynvcClient;
+    use ironrdp::pdu::rdp::capability_sets::{
+        CodecId, CodecProperty, RemoteFxContainer, CODEC_ID_REMOTEFX,
+    };
 
     use super::baseline_connector;
 
@@ -509,6 +513,15 @@ mod tests {
         assert_eq!(connector.config.desktop_size.width, 1280);
         assert_eq!(connector.config.desktop_size.height, 720);
         assert_eq!(bitmap.color_depth, 32);
+        assert_eq!(bitmap.codecs.0.len(), 1);
+        assert_eq!(
+            CodecId::from_u8(bitmap.codecs.0[0].id),
+            Some(CODEC_ID_REMOTEFX)
+        );
+        assert!(matches!(
+            bitmap.codecs.0[0].property,
+            CodecProperty::RemoteFx(RemoteFxContainer::ClientContainer(_))
+        ));
         assert!(connector.config.enable_server_pointer);
         assert!(!connector.config.pointer_software_rendering);
         assert!(connector.config.enable_audio_playback);

@@ -16,17 +16,11 @@ pub(crate) enum BaselineError {
     AllocationFailed,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CoveredSpan {
-    start: u32,
-    end: u32,
-}
-
 pub(crate) struct CoverageTracker {
     session_id: SessionId,
     generation: u64,
     size: PixelSize,
-    rows: Vec<Vec<CoveredSpan>>,
+    coverage_words: Box<[u64]>,
     covered_pixels: u64,
 }
 
@@ -39,16 +33,24 @@ impl CoverageTracker {
         if generation == 0 || size.width == 0 || size.height == 0 {
             return Err(BaselineError::InvalidSize);
         }
-        let row_count = usize::try_from(size.height).map_err(|_| BaselineError::InvalidSize)?;
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(row_count)
+        let total_pixels = u64::from(size.width)
+            .checked_mul(u64::from(size.height))
+            .ok_or(BaselineError::InvalidSize)?;
+        let word_count = total_pixels
+            .checked_add(63)
+            .map(|rounded| rounded / 64)
+            .and_then(|words| usize::try_from(words).ok())
+            .ok_or(BaselineError::InvalidSize)?;
+        let mut coverage_words = Vec::new();
+        coverage_words
+            .try_reserve_exact(word_count)
             .map_err(|_| BaselineError::AllocationFailed)?;
-        rows.resize_with(row_count, Vec::new);
+        coverage_words.resize(word_count, 0);
         Ok(Self {
             session_id,
             generation,
             size,
-            rows,
+            coverage_words: coverage_words.into_boxed_slice(),
             covered_pixels: 0,
         })
     }
@@ -65,6 +67,11 @@ impl CoverageTracker {
     #[cfg(test)]
     pub(crate) fn covered_pixels(&self) -> u64 {
         self.covered_pixels
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.coverage_words.len() * std::mem::size_of::<u64>()
     }
 
     #[cfg(test)]
@@ -89,41 +96,16 @@ impl CoverageTracker {
     ) -> Result<bool, BaselineError> {
         self.validate_current_region(session_id, generation, &region)?;
 
-        let start = u32::from(region.left);
-        let end = u32::from(region.right) + 1;
+        let start_x = u64::from(region.left);
+        let end_x = u64::from(region.right) + 1;
         for y in region.top..=region.bottom {
-            let spans = &mut self.rows[usize::from(y)];
-            let mut insert_at = 0;
-            while insert_at < spans.len() && spans[insert_at].end < start {
-                insert_at += 1;
-            }
-
-            let mut merged_start = start;
-            let mut merged_end = end;
-            let mut removed_width = 0u64;
-            while insert_at < spans.len() && spans[insert_at].start <= merged_end {
-                let span = spans.remove(insert_at);
-                merged_start = merged_start.min(span.start);
-                merged_end = merged_end.max(span.end);
-                removed_width = removed_width
-                    .checked_add(u64::from(span.end - span.start))
-                    .ok_or(BaselineError::InvalidRegion)?;
-            }
-            spans
-                .try_reserve(1)
-                .map_err(|_| BaselineError::AllocationFailed)?;
-            spans.insert(
-                insert_at,
-                CoveredSpan {
-                    start: merged_start,
-                    end: merged_end,
-                },
-            );
-            let merged_width = u64::from(merged_end - merged_start);
+            let row_start = u64::from(y)
+                .checked_mul(u64::from(self.size.width))
+                .ok_or(BaselineError::InvalidRegion)?;
+            let added = self.mark_range(row_start + start_x, row_start + end_x)?;
             self.covered_pixels = self
                 .covered_pixels
-                .checked_sub(removed_width)
-                .and_then(|covered| covered.checked_add(merged_width))
+                .checked_add(added)
                 .ok_or(BaselineError::InvalidRegion)?;
         }
 
@@ -150,14 +132,41 @@ impl CoverageTracker {
     }
 
     fn mark_full(&mut self) {
-        for row in &mut self.rows {
-            row.clear();
-            row.push(CoveredSpan {
-                start: 0,
-                end: self.size.width,
-            });
+        self.coverage_words.fill(u64::MAX);
+        let trailing_bits = (self.total_pixels() % 64) as u32;
+        if trailing_bits != 0 {
+            let final_mask = (1_u64 << trailing_bits) - 1;
+            if let Some(last) = self.coverage_words.last_mut() {
+                *last = final_mask;
+            }
         }
         self.covered_pixels = self.total_pixels();
+    }
+
+    fn mark_range(&mut self, start: u64, end: u64) -> Result<u64, BaselineError> {
+        let mut cursor = start;
+        let mut added = 0_u64;
+        while cursor < end {
+            let word_index =
+                usize::try_from(cursor / 64).map_err(|_| BaselineError::InvalidRegion)?;
+            let bit_offset = (cursor % 64) as u32;
+            let bit_count = u32::try_from((end - cursor).min(u64::from(64 - bit_offset)))
+                .map_err(|_| BaselineError::InvalidRegion)?;
+            let mask = if bit_count == 64 {
+                u64::MAX
+            } else {
+                ((1_u64 << bit_count) - 1) << bit_offset
+            };
+            let word = self
+                .coverage_words
+                .get_mut(word_index)
+                .ok_or(BaselineError::InvalidRegion)?;
+            let new_bits = mask & !*word;
+            *word |= mask;
+            added += u64::from(new_bits.count_ones());
+            cursor += u64::from(bit_count);
+        }
+        Ok(added)
     }
 
     fn total_pixels(&self) -> u64 {
@@ -535,6 +544,31 @@ mod tests {
             Err(BaselineError::StaleGeneration)
         );
         assert_eq!(coverage.covered_pixels(), 0);
+    }
+
+    #[test]
+    fn baseline_fragmented_one_pixel_updates_keep_fixed_bounded_storage() {
+        let session_id = SessionId::allocate();
+        let mut coverage = CoverageTracker::new(
+            session_id,
+            1,
+            PixelSize {
+                width: 8192,
+                height: 2048,
+            },
+        )
+        .expect("maximum accepted surface has bounded coverage storage");
+        let storage_bytes = coverage.storage_bytes();
+        assert_eq!(storage_bytes, 2 * 1024 * 1024);
+
+        for x in (0_u16..8192).step_by(2) {
+            assert!(!coverage
+                .record(session_id, 1, region(x, 0, x, 0))
+                .expect("fragmented one-pixel update"));
+        }
+
+        assert_eq!(coverage.covered_pixels(), 4096);
+        assert_eq!(coverage.storage_bytes(), storage_bytes);
     }
 
     #[test]

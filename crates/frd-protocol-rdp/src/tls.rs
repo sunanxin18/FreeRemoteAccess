@@ -1,4 +1,5 @@
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use frd_protocol_api::{Endpoint, ProtocolError};
@@ -10,9 +11,10 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme, StreamOwned};
 use rustls_platform_verifier::{ConfigVerifierExt, Verifier};
 use x509_cert::der::Decode as _;
+use x509_cert::ext::pkix::ExtendedKeyUsage;
 use x509_cert::Certificate;
 
-use crate::error::{rdp_error, RDP_TLS_FAILED};
+use crate::error::{rdp_error, RDP_SERVER_IDENTITY_CHANGED, RDP_TLS_FAILED};
 use crate::server_identity::{
     fingerprint_sha256, AcceptedServerIdentity, ObservedServerIdentity, PlatformValidationFailure,
     SanitizedCertificateNames,
@@ -66,11 +68,26 @@ impl ServerCertVerifier for PreflightVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let platform_validation = self
-            .platform
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-            .map(|_| ())
-            .map_err(|_| PlatformValidationFailure);
+        let platform_validation = match self.platform.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let failure = PlatformValidationFailure::from_rustls(error);
+                if failure.is_unknown_issuer() {
+                    match validate_untrusted_leaf_requirements(end_entity, server_name, now) {
+                        Ok(()) => Err(failure),
+                        Err(error) => Err(PlatformValidationFailure::from_rustls(error)),
+                    }
+                } else {
+                    Err(failure)
+                }
+            }
+        };
         let observed = ObservedServerIdentity {
             fingerprint: fingerprint_sha256(end_entity.as_ref()),
             platform_validation,
@@ -124,6 +141,7 @@ impl ServerCertVerifier for PreflightVerifier {
 struct ExactPinVerifier {
     fingerprint: [u8; 32],
     provider: Arc<CryptoProvider>,
+    mismatch: Arc<AtomicBool>,
 }
 
 impl ServerCertVerifier for ExactPinVerifier {
@@ -136,6 +154,7 @@ impl ServerCertVerifier for ExactPinVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         if fingerprint_sha256(end_entity.as_ref()) != self.fingerprint {
+            self.mismatch.store(true, Ordering::Release);
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
@@ -209,10 +228,11 @@ pub(crate) fn establish_verified_tls(
     endpoint: &Endpoint,
     accepted_identity: &AcceptedServerIdentity,
 ) -> Result<VerifiedTlsTransport, ProtocolError> {
-    let config = match accepted_identity {
-        AcceptedServerIdentity::SystemTrusted { .. } => platform_client_config()?,
+    let (config, exact_pin_mismatch) = match accepted_identity {
+        AcceptedServerIdentity::SystemTrusted { .. } => (platform_client_config()?, None),
         AcceptedServerIdentity::ExactPin { fingerprint } => {
             let provider = configured_crypto_provider();
+            let mismatch = Arc::new(AtomicBool::new(false));
             let mut config = ClientConfig::builder_with_provider(provider.clone())
                 .with_safe_default_protocol_versions()
                 .map_err(|_| tls_error())?
@@ -220,14 +240,25 @@ pub(crate) fn establish_verified_tls(
                 .with_custom_certificate_verifier(Arc::new(ExactPinVerifier {
                     fingerprint: *fingerprint,
                     provider,
+                    mismatch: mismatch.clone(),
                 }))
                 .with_no_client_auth();
             config.resumption = Resumption::disabled();
             config.enable_early_data = false;
-            config
+            (config, Some(mismatch))
         }
     };
-    let tls = complete_handshake(stream, endpoint, config)?;
+    let tls = match complete_handshake(stream, endpoint, config) {
+        Ok(tls) => tls,
+        Err(_)
+            if exact_pin_mismatch
+                .as_ref()
+                .is_some_and(|mismatch| mismatch.load(Ordering::Acquire)) =>
+        {
+            return Err(rdp_error(RDP_SERVER_IDENTITY_CHANGED));
+        }
+        Err(error) => return Err(error),
+    };
     let leaf = tls
         .conn
         .peer_certificates()
@@ -278,6 +309,62 @@ fn certificate_names(leaf_der: &[u8]) -> SanitizedCertificateNames {
     }
 }
 
+fn validate_untrusted_leaf_requirements(
+    end_entity: &CertificateDer<'_>,
+    server_name: &ServerName<'_>,
+    now: UnixTime,
+) -> Result<(), rustls::Error> {
+    let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
+    rustls::client::verify_server_name(&parsed, server_name)?;
+
+    let certificate = Certificate::from_der(end_entity.as_ref())
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let now = now.as_secs();
+    if now
+        < certificate
+            .tbs_certificate
+            .validity
+            .not_before
+            .to_unix_duration()
+            .as_secs()
+    {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidYet,
+        ));
+    }
+    if now
+        > certificate
+            .tbs_certificate
+            .validity
+            .not_after
+            .to_unix_duration()
+            .as_secs()
+    {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired,
+        ));
+    }
+
+    let extended_key_usage = certificate
+        .tbs_certificate
+        .get::<ExtendedKeyUsage>()
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    if extended_key_usage.is_some_and(|(_, usages)| {
+        !usages.0.iter().any(|usage| {
+            matches!(
+                usage.to_string().as_str(),
+                "1.3.6.1.5.5.7.3.1" | "2.5.29.37.0"
+            )
+        })
+    }) {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::InvalidPurpose,
+        ));
+    }
+
+    Ok(())
+}
+
 fn extract_server_public_key(leaf_der: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     Certificate::from_der(leaf_der)
         .map_err(|_| tls_error())?
@@ -291,4 +378,116 @@ fn extract_server_public_key(leaf_der: &[u8]) -> Result<Vec<u8>, ProtocolError> 
 
 fn tls_error() -> ProtocolError {
     rdp_error(RDP_TLS_FAILED)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rcgen::{date_time_ymd, CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{CertificateError, Error};
+
+    use super::validate_untrusted_leaf_requirements;
+
+    const TEST_NOW: UnixTime = UnixTime::since_unix_epoch(Duration::from_secs(1_767_225_600));
+
+    #[test]
+    fn certificate_wrong_host_fixture_is_not_overridable() {
+        let certificate = certificate_fixture(
+            "other.test",
+            (2020, 1, 1),
+            (2030, 1, 1),
+            vec![ExtendedKeyUsagePurpose::ServerAuth],
+        );
+
+        assert!(matches!(
+            validate_untrusted_leaf_requirements(
+                &certificate,
+                &ServerName::try_from("rdp.test").expect("valid server name"),
+                TEST_NOW,
+            ),
+            Err(Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn certificate_expired_fixture_is_not_overridable() {
+        let certificate = certificate_fixture(
+            "rdp.test",
+            (2020, 1, 1),
+            (2021, 1, 1),
+            vec![ExtendedKeyUsagePurpose::ServerAuth],
+        );
+
+        assert!(matches!(
+            validate_untrusted_leaf_requirements(
+                &certificate,
+                &ServerName::try_from("rdp.test").expect("valid server name"),
+                TEST_NOW,
+            ),
+            Err(Error::InvalidCertificate(CertificateError::Expired))
+        ));
+    }
+
+    #[test]
+    fn certificate_not_yet_valid_fixture_is_not_overridable() {
+        let certificate = certificate_fixture(
+            "rdp.test",
+            (2030, 1, 1),
+            (2040, 1, 1),
+            vec![ExtendedKeyUsagePurpose::ServerAuth],
+        );
+
+        assert!(matches!(
+            validate_untrusted_leaf_requirements(
+                &certificate,
+                &ServerName::try_from("rdp.test").expect("valid server name"),
+                TEST_NOW,
+            ),
+            Err(Error::InvalidCertificate(CertificateError::NotValidYet))
+        ));
+    }
+
+    #[test]
+    fn certificate_invalid_eku_fixture_is_not_overridable() {
+        let certificate = certificate_fixture(
+            "rdp.test",
+            (2020, 1, 1),
+            (2030, 1, 1),
+            vec![ExtendedKeyUsagePurpose::ClientAuth],
+        );
+
+        assert!(matches!(
+            validate_untrusted_leaf_requirements(
+                &certificate,
+                &ServerName::try_from("rdp.test").expect("valid server name"),
+                TEST_NOW,
+            ),
+            Err(Error::InvalidCertificate(CertificateError::InvalidPurpose))
+        ));
+    }
+
+    fn certificate_fixture(
+        dns_name: &str,
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+        extended_key_usages: Vec<ExtendedKeyUsagePurpose>,
+    ) -> CertificateDer<'static> {
+        let mut params = CertificateParams::new(vec![dns_name.to_owned()])
+            .expect("valid certificate parameters");
+        params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
+        params.extended_key_usages = extended_key_usages;
+        let key = KeyPair::generate().expect("generate fixture key");
+        CertificateDer::from(
+            params
+                .self_signed(&key)
+                .expect("generate fixture certificate")
+                .der()
+                .to_vec(),
+        )
+    }
 }

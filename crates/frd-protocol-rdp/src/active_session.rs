@@ -33,6 +33,7 @@ use crate::tls::TlsStream;
 use crate::writer::OrderedRdpWriter;
 
 const ACTIVE_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ACTIVE_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_FAST_PATH_INPUT_EVENTS: usize = 255;
 
 pub(crate) fn run_active_session(
@@ -61,6 +62,9 @@ fn run_active_session_inner(
     if writer
         .set_read_timeout(ACTIVE_SOCKET_POLL_INTERVAL)
         .is_err()
+        || writer
+            .set_write_timeout(ACTIVE_SOCKET_WRITE_TIMEOUT)
+            .is_err()
     {
         writer.shutdown();
         return Err(rdp_error(RDP_ACTIVATION_FAILED));
@@ -847,7 +851,7 @@ mod tests {
         let epoch = audio
             .begin_server_offer()
             .expect("server offer begins an epoch");
-        assert!(audio.observe_server_offer(epoch, 48_000, 2, 16));
+        assert!(audio.observe_server_offer(epoch, Some(0), 48_000, 2, 16));
         audio.accept_wave(0, &[0x01, 0x00, 0x02, 0x00]);
 
         stop_and_drain_audio(&mut runtime, &audio).expect("audio lifecycle stop publishes");

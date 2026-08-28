@@ -70,6 +70,14 @@ impl OrderedRdpWriter<crate::tls::TlsStream> {
             .set_read_timeout(Some(timeout))
     }
 
+    pub(crate) fn set_write_timeout(&self, timeout: std::time::Duration) -> io::Result<()> {
+        self.framed
+            .get_inner()
+            .0
+            .sock
+            .set_write_timeout(Some(timeout))
+    }
+
     pub(crate) fn shutdown(&mut self) {
         self.stop_writes();
         let _ = self.framed.get_inner().0.sock.shutdown(Shutdown::Both);
@@ -79,10 +87,19 @@ impl OrderedRdpWriter<crate::tls::TlsStream> {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
+    use frd_protocol_api::Endpoint;
     use ironrdp_blocking::Framed;
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
     use super::OrderedRdpWriter;
+    use crate::server_identity::{fingerprint_sha256, AcceptedServerIdentity};
+    use crate::tls::establish_verified_tls;
 
     #[test]
     fn writer_preserves_exact_frame_order() {
@@ -125,6 +142,77 @@ mod tests {
 
         let io = writer.into_framed().into_inner_no_leftover();
         assert_eq!((io.writes, io.flushes), (1, 1));
+    }
+
+    #[test]
+    fn writer_stalled_tls_peer_times_out_disarms_and_disconnects() {
+        let (address, certificate_der, release, server) = spawn_stalled_tls_peer();
+        let endpoint = Endpoint::new("localhost", address.port()).expect("valid endpoint");
+        let transport = establish_verified_tls(
+            TcpStream::connect(address).expect("connect stalled TLS peer"),
+            &endpoint,
+            &AcceptedServerIdentity::ExactPin {
+                fingerprint: fingerprint_sha256(&certificate_der),
+            },
+        )
+        .expect("exact pin establishes TLS");
+        let (framed, _) = transport.into_parts();
+        let mut writer = OrderedRdpWriter::new(framed);
+        writer
+            .set_write_timeout(Duration::from_millis(100))
+            .expect("configure finite write timeout");
+
+        let payload = vec![0_u8; 32 * 1024 * 1024];
+        let started = Instant::now();
+        let error = writer
+            .write_frame(&payload)
+            .expect_err("a non-reading peer must not block the ordered writer forever");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        assert!(elapsed < Duration::from_secs(2), "write took {elapsed:?}");
+        assert!(!writer.is_writable());
+        writer.shutdown();
+        release.send(()).expect("release stalled peer");
+        server.join().expect("stalled TLS peer exits");
+    }
+
+    fn spawn_stalled_tls_peer() -> (
+        std::net::SocketAddr,
+        Vec<u8>,
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_owned()])
+                .expect("generate runtime-only test certificate");
+        let certificate_der = cert.der().to_vec();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate_der.clone())],
+                PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+            )
+            .expect("valid server TLS config");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TLS test server");
+        let address = listener.local_addr().expect("TLS test server address");
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().expect("accept TLS test client");
+            let mut connection =
+                rustls::ServerConnection::new(Arc::new(config)).expect("server connection");
+            connection
+                .complete_io(&mut tcp)
+                .expect("complete server TLS handshake");
+            released
+                .recv_timeout(Duration::from_secs(3))
+                .expect("client disconnects stalled peer within the test bound");
+        });
+
+        (address, certificate_der, release, server)
     }
 
     #[derive(Default)]

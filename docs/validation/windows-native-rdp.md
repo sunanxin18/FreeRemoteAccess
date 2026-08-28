@@ -6,13 +6,21 @@
 Windows Remote Desktop Services 的真机登录、首帧、键鼠、证书、NLA、剪贴板、音频或
 Display Control 互操作证明。因此 README 中 Windows RDP 仍为 **开发中**。
 
-已实现并纳入离线门禁的适配器边界包括：系统信任链和显式证书确认/精确 pin、仅
-CredSSP/NLA 的连接路径、licensing/activation 基线、BGRX 脏矩形发布、fast-path
-键鼠、单主显示器 Display Control、Unicode 文本 CLIPRDR，以及 48 kHz 双声道 PCM
-RDPSND 发布。离线基线图形仅为 Raw、Interleaved RLE、RDP 6 Bitmap 和 RemoteFX。
+已实现并纳入离线门禁的适配器边界包括：系统信任链和仅不受信任签发者可用的显式
+证书确认/精确 pin、仅 CredSSP/NLA 的连接路径、licensing/activation 基线、BGRX
+脏矩形发布、fast-path 键鼠、单主显示器 Display Control、adapter 内 Unicode 文本
+CLIPRDR，以及 48 kHz
+双声道 PCM RDPSND 发布。离线测试断言 pinned IronRDP 的 outgoing capability 列表仅含
+Phase-1 RemoteFX codec；传统图形基线为 Raw、Interleaved RLE、RDP 6 Bitmap 和
+RemoteFX。
 EGFX、ZGFX、AVC/AVC420 与 AVC444 均未实现或验证，不得因本次构建而作出支持声明。
 未纳入当前范围的其他能力仍为：RDPDR/文件/磁盘/设备、AUDIN/客户端麦克风、网关、
 智能卡、打印机和多显示器。
+
+当前协议中立 `Modifiers` 没有 Caps Lock、Num Lock 或 Scroll Lock 状态位；锁定状态
+同步不属于本分支验收，也没有新增公共输入/UI schema。物理修饰键及现有输入保持不变。
+CLIPRDR 仍是 adapter-local、按协商能力作产品门控的离线实现；Windows 平台剪贴板
+gate 未启用，本记录不构成端到端剪贴板证明。
 
 ## 工具链
 
@@ -27,7 +35,8 @@ EGFX、ZGFX、AVC/AVC420 与 AVC444 均未实现或验证，不得因本次构�
 ## 命令与结果
 
 下列命令在 `D:\FreeRemoteDesk\.worktrees\windows-rdp` 执行，均退出成功，除明确
-列出的 11 项既有、带原因的忽略测试外没有失败：
+列出的 11 项既有、带原因的忽略测试外没有测试失败；“均退出成功”不包括下表单列的
+严格 `-D warnings` Clippy 既有阻塞：
 
 ```powershell
 cargo +stable fmt -- --check
@@ -36,9 +45,18 @@ cargo +stable test -p frd-shell-desktop
 cargo +stable test -p freeremotedesk-windows --test dependency_boundary
 cargo +stable test --workspace
 cargo +stable test --workspace --no-default-features
+cargo +stable test --workspace -- --list
+cargo +stable test --workspace --no-default-features -- --list
+cargo +stable check --workspace
+cargo +stable check --workspace --no-default-features
+cargo +stable clippy --workspace --all-targets
+cargo +stable clippy --workspace --all-targets -- -D warnings
+cargo +stable clippy -p frd-protocol-rdp --all-targets --no-deps -- -D warnings -A clippy::result_unit_err
 cargo +stable build -p freeremotedesk-windows --release
 cargo +stable build --no-default-features
 cargo +stable tree -p frd-protocol-rdp -e normal
+cargo +stable run -- --help
+cargo +stable run -- hpssview --help
 rg -n "NoCertificateVerification|danger_accept_invalid_certs|SSLKEYLOGFILE|--password|ClearTextPassword" crates/frd-protocol-rdp apps/freeremotedesk-windows
 git diff --check
 ```
@@ -46,18 +64,22 @@ git diff --check
 | 门禁 | 结果 |
 |---|---|
 | 格式 | `cargo +stable fmt -- --check` 通过 |
-| RDP 协议单元/文档测试 | 92 通过，0 失败，0 忽略 |
+| RDP 协议单元/文档测试 | 102 通过，0 失败，0 忽略 |
 | 桌面 shell 单元/文档测试 | 40 通过，0 失败，0 忽略 |
 | Windows 依赖边界集成测试 | 2 通过，0 失败，0 忽略 |
-| 完整 workspace（默认特性） | 832 项列出；821 通过，0 失败，11 既有忽略 |
-| 完整 workspace（`--no-default-features`） | 832 项列出；821 通过，0 失败，11 既有忽略 |
+| 完整 workspace（默认特性） | 838 项列出；827 通过，0 失败，11 既有忽略 |
+| 完整 workspace（`--no-default-features`） | 838 项列出；827 通过，0 失败，11 既有忽略 |
+| 两个 workspace `cargo check` | 均通过；根 legacy binary 仅有下述 5 个既有 `dead_code` 警告 |
+| 普通 workspace Clippy | 通过；报告既有 lint 警告，不含本轮新增 lint |
+| 严格 workspace Clippy | 在未改动的 `frd-frame::PixelBuffer::len` 上因既有 `len_without_is_empty` 失败；`frd-protocol-rdp --no-deps` 继续暴露未改动 `config.rs` 的既有 `result_unit_err`。只豁免后者时，本轮 RDP 全目标以 `-D warnings` 通过 |
 | 发布构建 | `freeremotedesk-windows` 通过 |
 | 无默认特性构建 | 通过；见下方既有警告 |
+| 顶层与 `hpssview` 帮助 | 均成功输出；既有 Apple/HPSS CLI 未改变 |
 | 差异空白检查 | `git diff --check` 通过 |
 
 通过 `cargo +stable test --workspace [--no-default-features] -- --list` 复核两个配置均列出
-832 项；源代码中的 11 个 `#[ignore]` 均为现有、需要未纳入公开仓库的授权媒体/捕获
-fixture 的测试。因此实际执行的 821 项全部通过。
+838 项；源代码中的 11 个 `#[ignore]` 均为现有、需要未纳入公开仓库的授权媒体/捕获
+fixture 的测试。因此实际执行的 827 项全部通过。
 
 `cargo +stable build --no-default-features` 发出 5 个既有 `dead_code` 警告，均位于旧
 `src/vnc/mvs_capture_v2*.rs` 的历史/诊断捕获 API；该命令仍成功完成。它们不在 RDP
@@ -83,8 +105,8 @@ adapter 或 Windows 产品包中，且本离线门禁没有证明需要修改它
 发布命令产生的 Windows 可执行文件：
 
 - 路径：`D:\FreeRemoteDesk\.worktrees\windows-rdp\target\release\freeremotedesk-windows.exe`
-- 大小：41,569,280 bytes
-- SHA-256：`17932F150A78E01A0AF32AEBF03442713D6EAE296682EDE5051437D5DBD63D7C`
+- 大小：41,599,488 bytes
+- SHA-256：`ECAECFE885CC5B0DADD60A8E3CD1314BE6855558E300E5321BD469FBD5348669`
 
 哈希仅标识该工作树的本机构建产物；它不是签名、安装包验证，也不是任何在线
 互操作证明。本记录不包含主机、凭据、证书 DER、会话密钥或捕获密钥材料。
@@ -99,13 +121,17 @@ adapter 或 Windows 产品包中，且本离线门禁没有证明需要修改它
 | `Get-Service TermService` | `Running`，启动类型 `Manual`。 |
 | `Get-NetTCPConnection -LocalPort 3389 -State Listen` | PID 29056 同时监听 `0.0.0.0:3389` 与 `[::]:3389`。 |
 | `Get-CimInstance Win32_OperatingSystem` / `Win32_ComputerSystem` | 当前主机为 Windows 11 专业版 10.0.26200（工作组工作站）。 |
-| `qwinsta` | 当前用户 `rabbit` 的 `console` 会话 ID 1 为 `Active`；仅有 `rdp-tcp` 的 `Listen` 条目。 |
-| 产品安全 profile/pin 存储（只统计，不输出地址、用户名或密码） | `connections-v1.json` 有 1 个有效 profile，但 `windows-rdp` profile 为 0；server-identity-pins 目录不存在，pin 文件为 0。未枚举或读取任何其他 Windows 凭据。 |
+| `qwinsta` | 本地 `console` 会话 ID 1 为 `Active`（账号名已从记录删节）；仅有 `rdp-tcp` 的 `Listen` 条目。 |
+| 产品安全 profile/pin 存储（只统计，不输出具体目标或账号） | `connections-v1.json` 有 1 个有效 profile，但 `windows-rdp` profile 为 0；server-identity-pins 目录不存在，pin 文件为 0。聚合脚本没有访问任何已保存 profile 的 `username` 字段，也没有枚举或读取 Windows Credential Manager。 |
 | Release 产物 | `target\release\freeremotedesk-windows.exe` 存在（41,569,280 bytes）；其哈希见上节的 Task 9 离线构建记录。 |
 
-唯一已知且可监听的 RDP 目标正是运行 Codex 的当前主机。对该主机发起完整的回环
-RDP 登录可能切换或锁定上述 Active console，从而中断当前工作会话；此外产品安全
-profile 中没有另一台已授权的 RDP 目标和凭据。因此未运行证书确认、NLA、首帧、
+上表 Release 行保留 Task 10 前提检查当时的历史产物；本轮最终 fix-wave 二进制已由
+“发布产物”一节的新大小与 SHA-256 取代。
+
+在本轮用户提供输入和已检查的产品配置范围内，唯一已知且可监听的 RDP 目标是运行
+Codex 的当前主机。对该主机发起完整的回环 RDP 登录可能切换或锁定上述 Active
+console，从而中断当前工作会话；已检查的产品 profile 中也没有另一台 RDP 目标。
+因此未运行证书确认、NLA、首帧、
 增量、输入、断开、pin 重连、能力协商或损伤路径测量。这是**缺少安全的已授权
 目标**造成的 `BLOCKED_LIVE`，不是 adapter 的实现失败，也不能据此改变 Windows
 RDP 的 **开发中** 状态。
