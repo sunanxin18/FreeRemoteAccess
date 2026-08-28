@@ -1,0 +1,23 @@
+[package]
+name = "frd-shell-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+frd-app = { path = "../frd-app" }
+frd-compositor-wgpu = { path = "../frd-compositor-wgpu" }
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-media-api = { path = "../frd-media-api" }
+frd-platform-api = { path = "../frd-platform-api" }
+frd-protocol-api = { path = "../frd-protocol-api" }
+frd-render-wgpu = { path = "../frd-render-wgpu" }
+frd-session = { path = "../frd-session" }
+frd-ui-egui = { path = "../frd-ui-egui" }
+frd-ui-model = { path = "../frd-ui-model" }
+pollster = "0.4"
+wgpu.workspace = true
+winit.workspace = true

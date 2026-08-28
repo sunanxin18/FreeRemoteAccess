@@ -21,6 +21,8 @@ members = [
     "crates/frd-compositor-wgpu",
     "crates/frd-platform-windows",
     "crates/frd-ui-egui",
+    "crates/frd-shell-desktop",
+    "apps/freeremotedesk-windows",
     "tools/frd-legacy-minifb-lab",
     "tools/frd-wgpu-smoke",
 ]

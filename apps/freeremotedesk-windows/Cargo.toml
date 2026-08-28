@@ -1,0 +1,22 @@
+[package]
+name = "freeremotedesk-windows"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+frd-app = { path = "../../crates/frd-app" }
+frd-core = { path = "../../crates/frd-core" }
+frd-media-api = { path = "../../crates/frd-media-api" }
+frd-platform-api = { path = "../../crates/frd-platform-api" }
+frd-platform-windows = { path = "../../crates/frd-platform-windows" }
+frd-protocol-api = { path = "../../crates/frd-protocol-api" }
+frd-protocol-apple = { path = "../../crates/frd-protocol-apple" }
+frd-shell-desktop = { path = "../../crates/frd-shell-desktop" }
+frd-ui-model = { path = "../../crates/frd-ui-model" }
+winit.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
