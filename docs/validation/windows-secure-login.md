@@ -18,12 +18,12 @@
 | 命令 | 结果 | 证据摘要 |
 |---|---|---|
 | `cargo +stable fmt --all -- --check` | 通过 | 全新 clean detached worktree、提交 `7409d65`，退出码 0。 |
-| `cargo +stable test -p frd-platform-api` | 通过 | 2 个单元测试和 1 个 compile-fail 文档测试通过。 |
-| `cargo +stable test -p frd-platform-windows -- --test-threads=1` | 通过 | 18 个测试通过；包含进程唯一 Windows Credential Manager 暂存、提交、读取、丢弃、删除及清理保护。 |
-| `cargo +stable test -p frd-ui-model` | 通过 | 7 个测试通过。 |
-| `cargo +stable test -p frd-app` | 通过 | 63 个测试通过；覆盖暂存/提交/回滚、成功后取消保存和单次连接意图。 |
-| `cargo +stable test -p frd-ui-egui` | 通过 | 19 个测试通过；覆盖窄屏布局、图标帮助文本、密码 Enter 单次提交、IME 与重复键过滤。 |
-| `cargo +stable test -p freeremotedesk-windows` | 通过 | 当前共享工作树为 12 个二进制单元测试、2 个依赖边界测试、2 个图标资源测试；精确暂存区快照为 11 个二进制单元测试和 2 个依赖边界测试，均通过。 |
+| `cargo +stable test -p frd-platform-api` | 通过 | clean `7409d65`：2/2 个单元测试和 1/1 个 compile-fail 文档测试通过。 |
+| `cargo +stable test -p frd-platform-windows -- --test-threads=1` | 通过 | clean `7409d65`：18/18 个测试通过；包含进程唯一 Windows Credential Manager 暂存、提交、读取、丢弃、删除及清理保护。 |
+| `cargo +stable test -p frd-ui-model` | 通过 | clean `7409d65`：8/8 个测试通过。 |
+| `cargo +stable test -p frd-app` | 通过 | clean `7409d65`：69/69 个测试通过；覆盖部分提交补偿、动作相关持久警告、暂存/提交/回滚、成功后取消保存和单次连接意图。 |
+| `cargo +stable test -p frd-ui-egui` | 通过 | clean `7409d65`：12/12 个测试通过；覆盖窄屏布局、密码 Enter 单次提交、IME 与重复键过滤，以及身份页安全诊断映射。 |
+| `cargo +stable test -p freeremotedesk-windows` | 通过 | clean `7409d65`：11/11 个二进制单元测试和 2/2 个依赖边界测试通过。 |
 | `cargo +stable test --workspace -- --test-threads=1` | 通过 | 全新 clean detached worktree、提交 `7409d65`；工作区测试及文档测试退出码 0，需要未公开授权 fixture 的既有测试保持 ignored。 |
 | `cargo +stable clippy --workspace --all-targets -- -D warnings` | **阻断** | clean `7409d65` 仍仅在既有已提交文件 `crates/frd-frame/src/surface.rs:35` 触发 `clippy::len_without_is_empty`；该文件不属于本功能，按任务边界未扩展修复。 |
 | `cargo +stable build --release -p freeremotedesk-windows` | 通过 | 全新 clean detached worktree、提交 `7409d65`，退出码 0；产物哈希见上。 |
