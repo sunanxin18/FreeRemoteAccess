@@ -40,7 +40,8 @@ use crate::cleanup::{
     PendingCleanup,
 };
 use crate::lifecycle::{
-    OcclusionAction, PresentFailureAction, PresentationLifecycle, PresentationOperation,
+    execute_presentation_recovery, OcclusionAction, PresentationLifecycle, PresentationOperation,
+    PresentationRecoveryBackend, PresentationRecoveryContext, PresentationRecoveryFailure,
 };
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::{InputGate, InputOwnership, InputRouter};
@@ -733,6 +734,7 @@ pub enum DesktopUserEvent {
 pub struct PresentationFailure {
     pub operation: PresentationOperation,
     pub source: PresentError,
+    pub retry: Option<PresentError>,
     pub recovery: Option<PresentError>,
 }
 
@@ -797,6 +799,59 @@ struct DesktopWindowState {
     remote: Option<RemoteBinding>,
 }
 
+#[derive(Default)]
+struct ApplicationExitState {
+    when_clean: bool,
+    pending_launch_deadline: Option<std::time::Instant>,
+    fatal_pending_launch: bool,
+}
+
+impl ApplicationExitState {
+    fn cancel_pending_launch(
+        &mut self,
+        sessions: &mut SessionHost,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        if !sessions.cancel_pending_launch() {
+            return None;
+        }
+        self.when_clean = true;
+        if let Some(deadline) = self.pending_launch_deadline {
+            return Some(deadline);
+        }
+        let deadline = now + PENDING_LAUNCH_SHUTDOWN_TIMEOUT;
+        self.pending_launch_deadline = Some(deadline);
+        Some(deadline)
+    }
+
+    fn cancel_pending_launch_for_fatal(
+        &mut self,
+        sessions: &mut SessionHost,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        let deadline = self.cancel_pending_launch(sessions, now)?;
+        self.fatal_pending_launch = true;
+        Some(deadline)
+    }
+
+    fn launch_finished(&mut self) -> bool {
+        self.pending_launch_deadline = None;
+        std::mem::take(&mut self.fatal_pending_launch)
+    }
+
+    fn wait_for_cleanup(&mut self) {
+        self.when_clean = true;
+    }
+
+    fn pending_launch_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_launch_deadline
+    }
+
+    fn should_exit(&self, sessions: &SessionHost) -> bool {
+        self.when_clean && !sessions.is_active()
+    }
+}
+
 pub struct DesktopApplication {
     launch: AppLaunch,
     catalog: ProtocolCatalog,
@@ -806,9 +861,8 @@ pub struct DesktopApplication {
     proxy: EventLoopProxy<DesktopUserEvent>,
     window: Option<DesktopWindowState>,
     mode: DesktopMode,
-    exit_when_clean: bool,
+    exit_state: ApplicationExitState,
     return_to_form_after_cancelled_launch: bool,
-    pending_launch_shutdown_deadline: Option<std::time::Instant>,
     repaint_scheduler: RepaintScheduler,
     armed_repaint: Option<RepaintPlan>,
 }
@@ -833,9 +887,8 @@ impl DesktopApplication {
             proxy,
             window: None,
             mode: DesktopMode::Product,
-            exit_when_clean: false,
+            exit_state: ApplicationExitState::default(),
             return_to_form_after_cancelled_launch: false,
-            pending_launch_shutdown_deadline: None,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
         }
@@ -868,9 +921,8 @@ impl DesktopApplication {
                 resize_after: options.resize_after,
                 driver_started: false,
             },
-            exit_when_clean: false,
+            exit_state: ApplicationExitState::default(),
             return_to_form_after_cancelled_launch: false,
-            pending_launch_shutdown_deadline: None,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
         }
@@ -1279,7 +1331,7 @@ impl DesktopApplication {
         };
 
         if let Some(error) = presentation_error {
-            self.transition_presentation_error(PresentationOperation::Redraw, error);
+            self.transition_presentation_error(PresentationRecoveryContext::Redraw, error);
         }
 
         if let Some(intent) = intent {
@@ -1311,74 +1363,106 @@ impl DesktopApplication {
 
     fn transition_presentation_error(
         &mut self,
-        operation: PresentationOperation,
+        context: PresentationRecoveryContext,
         source: PresentError,
     ) {
-        if PresentationLifecycle::classify_present_error(operation, source)
-            == PresentFailureAction::Fatal
-        {
-            let _ =
-                self.proxy
-                    .send_event(DesktopUserEvent::PresentationFatal(PresentationFailure {
-                        operation,
-                        source,
-                        recovery: None,
-                    }));
+        let Some(window) = self.window.as_mut() else {
+            self.publish_presentation_fatal(PresentationRecoveryFailure {
+                operation: context.operation(),
+                source,
+                retry: None,
+                recovery: Some(PresentError::SurfaceDetached),
+            });
             return;
-        }
+        };
 
         let test_session_id = match &self.mode {
             DesktopMode::TestTexture { session_id, .. } => Some(*session_id),
             DesktopMode::Product => None,
         };
-        let recovery = self
-            .window
-            .as_mut()
-            .map(recover_window_gpu)
-            .unwrap_or(Err(PresentError::SurfaceDetached));
-        match recovery {
-            Ok(None) => self.request_redraw(),
-            Ok(Some(RecoveryRequirement::ResetAndFullSnapshot { .. })) => {
-                if let Some(session_id) = test_session_id {
-                    let restore = self.window.as_mut().map(|window| {
+        let recovery = {
+            let mut backend = DesktopWindowRecovery::new(window);
+            execute_presentation_recovery(context, source, &mut backend)
+        };
+        let success = match recovery {
+            Ok(success) => success,
+            Err(failure) => {
+                self.publish_presentation_fatal(failure);
+                return;
+            }
+        };
+
+        let mut publish_viewport = false;
+        if let Some(size) = success.geometry_commit() {
+            let Some(window) = self.window.as_mut() else {
+                self.publish_presentation_fatal(PresentationRecoveryFailure {
+                    operation: context.operation(),
+                    source,
+                    retry: None,
+                    recovery: Some(PresentError::SurfaceDetached),
+                });
+                return;
+            };
+            if let Err(recovery) = window.lifecycle.finish_resize(size, Ok(())) {
+                self.publish_presentation_fatal(PresentationRecoveryFailure {
+                    operation: context.operation(),
+                    source,
+                    retry: None,
+                    recovery: Some(recovery),
+                });
+                return;
+            }
+            window.physical_size = size;
+            publish_viewport = success.publish_viewport();
+        }
+
+        if let Some(RecoveryRequirement::ResetAndFullSnapshot { .. }) = success.requirement {
+            if let Some(session_id) = test_session_id {
+                let restore = self
+                    .window
+                    .as_mut()
+                    .ok_or(PresentError::SurfaceDetached)
+                    .and_then(|window| {
                         for update in test_texture_updates(session_id) {
                             window.renderer.apply_update(update)?;
                         }
-                        Ok::<(), PresentError>(())
+                        Ok(())
                     });
-                    match restore {
-                        Some(Ok(())) => self.request_redraw(),
-                        Some(Err(recovery)) => {
-                            self.publish_presentation_fatal(operation, source, Some(recovery))
-                        }
-                        None => self.publish_presentation_fatal(
-                            operation,
-                            source,
-                            Some(PresentError::SurfaceDetached),
-                        ),
-                    }
-                } else {
-                    self.publish_presentation_fatal(operation, source, None);
+                if let Err(recovery) = restore {
+                    self.publish_presentation_fatal(PresentationRecoveryFailure {
+                        operation: context.operation(),
+                        source,
+                        retry: None,
+                        recovery: Some(recovery),
+                    });
+                    return;
                 }
+            } else {
+                self.publish_presentation_fatal(PresentationRecoveryFailure {
+                    operation: context.operation(),
+                    source,
+                    retry: None,
+                    recovery: None,
+                });
+                return;
             }
-            Err(recovery) => {
-                self.publish_presentation_fatal(operation, source, Some(recovery));
-            }
+        }
+        if publish_viewport {
+            self.send_viewport_changed();
+        }
+        if success.request_redraw() {
+            self.request_redraw();
         }
     }
 
-    fn publish_presentation_fatal(
-        &self,
-        operation: PresentationOperation,
-        source: PresentError,
-        recovery: Option<PresentError>,
-    ) {
+    fn publish_presentation_fatal(&self, failure: PresentationRecoveryFailure) {
         let _ = self
             .proxy
             .send_event(DesktopUserEvent::PresentationFatal(PresentationFailure {
-                operation,
-                source,
-                recovery,
+                operation: failure.operation,
+                source: failure.source,
+                retry: failure.retry,
+                recovery: failure.recovery,
             }));
     }
 
@@ -1437,16 +1521,15 @@ impl DesktopApplication {
 
     fn begin_shutdown(&mut self, event_loop: &ActiveEventLoop) {
         self.block_and_release_input();
-        if self.sessions.launch_is_pending() {
-            self.exit_when_clean = true;
-            let _ = self.sessions.cancel_pending_launch();
-            let deadline = std::time::Instant::now() + PENDING_LAUNCH_SHUTDOWN_TIMEOUT;
-            self.pending_launch_shutdown_deadline = Some(deadline);
+        if let Some(deadline) = self
+            .exit_state
+            .cancel_pending_launch(&mut self.sessions, std::time::Instant::now())
+        {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             return;
         }
         if self.sessions.is_active() {
-            self.exit_when_clean = true;
+            self.exit_state.wait_for_cleanup();
             if !matches!(self.launch.controller().page(), Page::Disconnecting { .. }) {
                 self.dispatch_intent(AppIntent::Disconnect);
             }
@@ -1472,7 +1555,7 @@ impl DesktopApplication {
         event_loop: &ActiveEventLoop,
         outcome: BackgroundLaunchOutcome,
     ) {
-        self.pending_launch_shutdown_deadline = None;
+        let fatal_pending_launch = self.exit_state.launch_finished();
         let proxy = self.proxy.clone();
         let accepted = self
             .sessions
@@ -1501,6 +1584,11 @@ impl DesktopApplication {
                         let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
                     }
                 }
+                if fatal_pending_launch {
+                    self.launch
+                        .controller_mut()
+                        .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
+                }
                 self.return_to_form_after_cancelled_launch = false;
             }
             Ok(AcceptedLaunchOutcome::CancelledLaunchRolledBack(failure)) => {
@@ -1513,7 +1601,7 @@ impl DesktopApplication {
                     let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
                     return;
                 }
-                if self.return_to_form_after_cancelled_launch && !self.exit_when_clean {
+                if self.return_to_form_after_cancelled_launch && !self.exit_state.when_clean {
                     let _ = self.launch.controller_mut().handle_intent(
                         AppIntent::ReturnToConnection,
                         &self.catalog,
@@ -1589,20 +1677,31 @@ impl DesktopApplication {
         failure: PresentationFailure,
     ) {
         eprintln!(
-            "窗口合成进入不可恢复状态：operation={:?}, source={:?}, recovery={:?}",
-            failure.operation, failure.source, failure.recovery
+            "窗口合成进入不可恢复状态：operation={:?}, source={:?}, retry={:?}, recovery={:?}",
+            failure.operation, failure.source, failure.retry, failure.recovery
         );
         self.handle_application_fatal(event_loop);
     }
 
     fn handle_application_fatal(&mut self, event_loop: &ActiveEventLoop) {
         self.block_and_release_input();
-        self.launch
-            .controller_mut()
-            .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
+        let pending_deadline = self
+            .exit_state
+            .cancel_pending_launch_for_fatal(&mut self.sessions, std::time::Instant::now());
+        if pending_deadline.is_none() {
+            self.launch
+                .controller_mut()
+                .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
+        }
+        // Fatal launch cancellation must become visible to the launch outcome
+        // acceptance path before the native presentation lease is detached.
         self.detach_window();
+        if let Some(deadline) = pending_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
+        }
         if self.sessions.is_active() {
-            self.exit_when_clean = true;
+            self.exit_state.wait_for_cleanup();
             self.start_background_cleanup();
         } else {
             event_loop.exit();
@@ -1610,7 +1709,7 @@ impl DesktopApplication {
     }
 
     fn maybe_finish_exit(&self, event_loop: &ActiveEventLoop) {
-        if self.exit_when_clean && !self.sessions.is_active() {
+        if self.exit_state.should_exit(&self.sessions) {
             event_loop.exit();
         }
     }
@@ -1753,7 +1852,10 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                         self.send_viewport_changed();
                         self.request_redraw();
                     } else if let Some(error) = presentation_error {
-                        self.transition_presentation_error(PresentationOperation::Resize, error);
+                        self.transition_presentation_error(
+                            PresentationRecoveryContext::Resize { requested: size },
+                            error,
+                        );
                     }
                 } else if let Some(window) = self.window.as_mut() {
                     window.compositor.pause_presenting();
@@ -1773,17 +1875,25 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                         }
                     }
                     OcclusionAction::ResumeAndRedraw => {
-                        let result = self
+                        let committed = self
                             .window
-                            .as_mut()
-                            .map(|window| {
-                                window.compositor.resize(window.lifecycle.committed_size())
-                            })
-                            .unwrap_or(Err(PresentError::SurfaceDetached));
+                            .as_ref()
+                            .map(|window| window.lifecycle.committed_size());
+                        let result = self.window.as_mut().map_or(
+                            Err(PresentError::SurfaceDetached),
+                            |window| {
+                                window.compositor.resize(
+                                    committed.expect("resume retains its committed drawable"),
+                                )
+                            },
+                        );
                         match result {
                             Ok(()) => self.request_redraw(),
                             Err(error) => self.transition_presentation_error(
-                                PresentationOperation::OcclusionResume,
+                                PresentationRecoveryContext::OcclusionResume {
+                                    committed: committed
+                                        .expect("resume retains its committed drawable"),
+                                },
                                 error,
                             ),
                         }
@@ -1814,7 +1924,8 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = std::time::Instant::now();
         if self
-            .pending_launch_shutdown_deadline
+            .exit_state
+            .pending_launch_deadline()
             .is_some_and(|deadline| now >= deadline && self.sessions.launch_is_pending())
         {
             eprintln!("后台会话启动取消超过有界等待策略");
@@ -1837,7 +1948,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             .armed_repaint
             .map(|plan| plan.deadline)
             .into_iter()
-            .chain(self.pending_launch_shutdown_deadline)
+            .chain(self.exit_state.pending_launch_deadline())
             .min();
         event_loop.set_control_flow(
             next_deadline
@@ -1880,28 +1991,56 @@ fn dx12_instance() -> wgpu::Instance {
     wgpu::Instance::new(descriptor)
 }
 
-fn recover_window_gpu(
-    window: &mut DesktopWindowState,
-) -> Result<Option<RecoveryRequirement>, PresentError> {
-    let (requirement, gpu) = pollster::block_on(
-        window
+struct DesktopWindowRecovery<'a> {
+    window: &'a mut DesktopWindowState,
+    recovered: Option<(Option<RecoveryRequirement>, GpuContext)>,
+}
+
+impl<'a> DesktopWindowRecovery<'a> {
+    fn new(window: &'a mut DesktopWindowState) -> Self {
+        Self {
+            window,
+            recovered: None,
+        }
+    }
+}
+
+impl PresentationRecoveryBackend for DesktopWindowRecovery<'_> {
+    fn recover_gpu(&mut self) -> Result<(), PresentError> {
+        let recovered = pollster::block_on(
+            self.window
+                .compositor
+                .recover_gpu_with_new_instance(&mut self.window.renderer, dx12_instance()),
+        )?;
+        self.recovered = Some(recovered);
+        Ok(())
+    }
+
+    fn configure(&mut self, size: PixelSize) -> Result<(), PresentError> {
+        self.window.compositor.resize(size)
+    }
+
+    fn finish_gpu_recovery(&mut self) -> Result<Option<RecoveryRequirement>, PresentError> {
+        let (requirement, gpu) = self
+            .recovered
+            .take()
+            .expect("successful recovery owns the replacement GPU context");
+        let target_format = self
+            .window
             .compositor
-            .recover_gpu_with_new_instance(&mut window.renderer, dx12_instance()),
-    )?;
-    let target_format = window
-        .compositor
-        .target_format()
-        .ok_or(PresentError::SurfaceUnsupported)?;
-    window.egui_renderer = egui_wgpu::Renderer::new(
-        gpu.device(),
-        target_format,
-        egui_wgpu::RendererOptions::default(),
-    );
-    window
-        .egui_context
-        .set_fonts(egui::FontDefinitions::default());
-    window.gpu = gpu;
-    Ok(requirement)
+            .target_format()
+            .ok_or(PresentError::SurfaceUnsupported)?;
+        self.window.egui_renderer = egui_wgpu::Renderer::new(
+            gpu.device(),
+            target_format,
+            egui_wgpu::RendererOptions::default(),
+        );
+        self.window
+            .egui_context
+            .set_fonts(egui::FontDefinitions::default());
+        self.window.gpu = gpu;
+        Ok(requirement)
+    }
 }
 
 fn map_mouse_button(button: MouseButton) -> Option<PointerButton> {
@@ -2062,8 +2201,8 @@ mod tests {
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
 
     use super::{
-        AcceptedLaunchOutcome, AudioOutputFactory, SessionHost, TestLaunchOutcome, WakeSink,
-        WorkerKind, WorkerSpawner,
+        AcceptedLaunchOutcome, ApplicationExitState, AudioOutputFactory, SessionHost,
+        TestLaunchOutcome, WakeSink, WorkerKind, WorkerSpawner,
     };
 
     struct CountingWake(AtomicUsize);
@@ -2204,6 +2343,71 @@ mod tests {
 
     struct BlockingFactory {
         worker_started: mpsc::Sender<()>,
+    }
+
+    struct ObservedBlockingFactory {
+        create_count: Arc<AtomicUsize>,
+        drop_count: Arc<AtomicUsize>,
+        create_entered: Option<mpsc::Sender<()>>,
+        release_create: Mutex<Option<mpsc::Receiver<()>>>,
+        worker_started: mpsc::Sender<()>,
+    }
+
+    impl ProtocolFactory for ObservedBlockingFactory {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                id: ProtocolId::apple_hpss_mvs(),
+                display_name: "observed-test-protocol".to_owned(),
+                default_port: 5900,
+                credential_requirements: CredentialRequirements::username_password(),
+            }
+        }
+
+        fn create(
+            &self,
+            _request: ConnectRequest,
+            runtime: ProtocolRuntime,
+        ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
+            self.create_count.fetch_add(1, Ordering::AcqRel);
+            if let Some(create_entered) = &self.create_entered {
+                create_entered.send(()).unwrap();
+            }
+            if let Some(release_create) = self.release_create.lock().unwrap().take() {
+                release_create.recv().unwrap();
+            }
+            Ok(Box::new(ObservedBlockingSession {
+                runtime,
+                worker_started: self.worker_started.clone(),
+                drop_count: self.drop_count.clone(),
+            }))
+        }
+    }
+
+    struct ObservedBlockingSession {
+        runtime: ProtocolRuntime,
+        worker_started: mpsc::Sender<()>,
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ObservedBlockingSession {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl ProtocolSession for ObservedBlockingSession {
+        fn run(mut self: Box<Self>) -> ProtocolExit {
+            self.worker_started.send(()).unwrap();
+            loop {
+                if matches!(
+                    self.runtime.try_next_command(),
+                    Some(SessionCommand::Disconnect)
+                ) {
+                    return ProtocolExit::Closed;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 
     struct FailOnceFactory {
@@ -2567,6 +2771,124 @@ mod tests {
             .expect("cancelled launch cleanup completes");
         assert_eq!(completion.session_id(), session_id);
         assert!(!host.is_active());
+    }
+
+    #[test]
+    fn fatal_before_launch_finished_cancels_once_and_reaches_the_bounded_exit_path() {
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let (create_entered_tx, create_entered_rx) = mpsc::channel();
+        let (release_create_tx, release_create_rx) = mpsc::channel();
+        let mut host = test_host(
+            Arc::new(ObservedBlockingFactory {
+                create_count: create_count.clone(),
+                drop_count: drop_count.clone(),
+                create_entered: Some(create_entered_tx),
+                release_create: Mutex::new(Some(release_create_rx)),
+                worker_started: mpsc::channel().0,
+            }),
+            Arc::new(TestAudioFactory),
+        );
+        let session_id = SessionId::allocate();
+        let (_owner, permit) = reserve_session_start(session_id);
+        let (launch_tx, launch_rx) = mpsc::channel();
+        host.begin_launch(
+            permit,
+            TargetSystem::MacOs,
+            test_request(session_id),
+            move |outcome| launch_tx.send(outcome).unwrap(),
+        )
+        .expect("background launch starts");
+        create_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fatal is injected while factory creation owns the request");
+
+        let now = Instant::now();
+        let mut exit = ApplicationExitState::default();
+        let deadline = exit
+            .cancel_pending_launch_for_fatal(&mut host, now)
+            .expect("fatal arms the pending-launch deadline");
+        assert_eq!(deadline, now + super::PENDING_LAUNCH_SHUTDOWN_TIMEOUT);
+        assert_eq!(exit.pending_launch_deadline(), Some(deadline));
+        assert_eq!(
+            exit.cancel_pending_launch_for_fatal(&mut host, now + Duration::from_secs(1)),
+            Some(deadline),
+            "repeated fatal events cannot extend the bounded exit deadline"
+        );
+        release_create_tx.send(()).unwrap();
+
+        let outcome = launch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled factory transaction rolls back once");
+        assert!(matches!(
+            host.accept_launch_outcome(outcome, |_| panic!("rollback has no cleanup worker")),
+            Ok(AcceptedLaunchOutcome::CancelledLaunchRolledBack(_))
+        ));
+        assert!(exit.launch_finished());
+        assert!(host.active.is_none());
+        assert_eq!(create_count.load(Ordering::Acquire), 1);
+        assert_eq!(drop_count.load(Ordering::Acquire), 1);
+        assert!(exit.should_exit(&host));
+    }
+
+    #[test]
+    fn fatal_after_started_is_queued_never_installs_ports_and_reclaims_once() {
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let mut host = test_host(
+            Arc::new(ObservedBlockingFactory {
+                create_count: create_count.clone(),
+                drop_count: drop_count.clone(),
+                create_entered: None,
+                release_create: Mutex::new(None),
+                worker_started: worker_started_tx,
+            }),
+            Arc::new(TestAudioFactory),
+        );
+        let session_id = SessionId::allocate();
+        let (_owner, permit) = reserve_session_start(session_id);
+        let (launch_tx, launch_rx) = mpsc::channel();
+        host.begin_launch(
+            permit,
+            TargetSystem::MacOs,
+            test_request(session_id),
+            move |outcome| launch_tx.send(outcome).unwrap(),
+        )
+        .expect("background launch starts");
+        let outcome = launch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Started is queued before the fatal transition");
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("real protocol resource is live");
+
+        let mut exit = ApplicationExitState::default();
+        assert!(exit
+            .cancel_pending_launch_for_fatal(&mut host, Instant::now())
+            .is_some());
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        assert!(matches!(
+            host.accept_launch_outcome(outcome, move |outcome| {
+                cleanup_tx.send(outcome).unwrap();
+            }),
+            Ok(AcceptedLaunchOutcome::CancelledStarted)
+        ));
+        assert!(exit.launch_finished());
+        assert!(host.active.is_none());
+        assert!(!exit.should_exit(&host));
+
+        let cleanup = cleanup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fatal cancellation reclaims the started resources");
+        let completion = host
+            .accept_cleanup_outcome(cleanup)
+            .expect("bounded cleanup completes");
+        assert_eq!(completion.session_id(), session_id);
+        assert_eq!(create_count.load(Ordering::Acquire), 1);
+        assert_eq!(drop_count.load(Ordering::Acquire), 1);
+        assert!(host.active.is_none());
+        assert!(exit.should_exit(&host));
     }
 
     #[test]
