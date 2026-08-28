@@ -168,3 +168,29 @@ fn narrow_login_card_stacks_fields_without_horizontal_clipping() {
     assert!(!metrics.use_paired_rows);
     assert!(metrics.card_width <= 460.0);
 }
+
+#[cfg(test)]
+#[test]
+fn explicit_protocol_disables_incompatible_target_in_multi_protocol_catalog() {
+    use frd_core::{ProtocolId, TargetSystem};
+    use frd_ui_model::ProtocolChoice;
+
+    let catalog =
+        frd_protocol_api::ProtocolCatalog::new([ProtocolId::apple_hpss_mvs(), ProtocolId::rdp()]);
+
+    assert!(connection::target_choice_is_supported(
+        &catalog,
+        TargetSystem::Windows,
+        &ProtocolChoice::Automatic,
+    ));
+    assert!(!connection::target_choice_is_supported(
+        &catalog,
+        TargetSystem::Windows,
+        &ProtocolChoice::Explicit(ProtocolId::apple_hpss_mvs()),
+    ));
+    assert!(connection::target_choice_is_supported(
+        &catalog,
+        TargetSystem::MacOs,
+        &ProtocolChoice::Explicit(ProtocolId::apple_hpss_mvs()),
+    ));
+}

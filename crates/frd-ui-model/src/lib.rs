@@ -120,6 +120,20 @@ impl ConnectionForm {
         self.errors.password = None;
     }
 
+    pub fn invalidate_loaded_secret_after_identity_edit(
+        &mut self,
+        original_identity: &ConnectionDraft,
+    ) -> bool {
+        if &self.draft == original_identity {
+            return false;
+        }
+        self.selected_profile = None;
+        self.password = SecretBuffer::new(Vec::new());
+        self.password_visible = false;
+        self.errors.password = None;
+        true
+    }
+
     pub fn set_profile_storage_error(&mut self, code: &'static str) {
         self.errors.profile = Some(code.to_owned());
     }
@@ -348,6 +362,76 @@ mod tests {
         assert!(submission.remember_on_this_device);
         assert_eq!(submission.selected_profile, Some(profile.key));
         assert!(!submission.password.is_empty());
+    }
+
+    #[test]
+    fn identity_edit_invalidates_loaded_profile_secret_before_submission() {
+        let profile = saved_profile();
+        let mut form = ConnectionForm::new(ConnectionDraft::default());
+        form.select_profile_metadata(&profile);
+        form.set_loaded_password(SecretBuffer::new(b"vault-password".to_vec()));
+        form.password_visible = true;
+        let original_identity = form.draft.clone();
+
+        form.draft.address = "edited.invalid".to_owned();
+        assert!(form.invalidate_loaded_secret_after_identity_edit(&original_identity));
+
+        assert!(form.selected_profile.is_none());
+        assert!(form.password_is_empty());
+        assert!(!form.password_visible);
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        assert!(form.take_submission(&catalog).is_none());
+        assert_eq!(form.errors().password.as_deref(), Some("password_required"));
+
+        form.set_password(SecretBuffer::new(b"new-password".to_vec()));
+        let submission = form
+            .take_submission(&catalog)
+            .expect("a newly entered password may submit the edited identity");
+        assert_eq!(submission.draft.address, "edited.invalid");
+        assert!(submission.selected_profile.is_none());
+        assert_eq!(submission.password.expose_text(), Some("new-password"));
+    }
+
+    #[test]
+    fn every_identity_field_edit_clears_profile_association_and_secret() {
+        let profile = saved_profile();
+        let base = ConnectionDraft {
+            target_system: Some(profile.target_system),
+            address: profile.key.address().to_owned(),
+            port: Some(profile.key.port()),
+            protocol: super::ProtocolChoice::Explicit(profile.key.protocol().clone()),
+            username: profile.key.username().to_owned(),
+        };
+        let mut edits = Vec::new();
+        let mut target = base.clone();
+        target.target_system = Some(TargetSystem::Custom);
+        edits.push(target);
+        let mut protocol = base.clone();
+        protocol.protocol = super::ProtocolChoice::Automatic;
+        edits.push(protocol);
+        let mut address = base.clone();
+        address.address = "edited.invalid".to_owned();
+        edits.push(address);
+        let mut port = base.clone();
+        port.port = Some(5902);
+        edits.push(port);
+        let mut username = base;
+        username.username = "edited-user".to_owned();
+        edits.push(username);
+
+        for edited_identity in edits {
+            let mut form = ConnectionForm::new(ConnectionDraft::default());
+            form.select_profile_metadata(&profile);
+            form.set_loaded_password(SecretBuffer::new(b"vault-password".to_vec()));
+            form.password_visible = true;
+            let original_identity = form.draft.clone();
+            form.draft = edited_identity;
+
+            assert!(form.invalidate_loaded_secret_after_identity_edit(&original_identity));
+            assert!(form.selected_profile.is_none());
+            assert!(form.password_is_empty());
+            assert!(!form.password_visible);
+        }
     }
 
     #[test]

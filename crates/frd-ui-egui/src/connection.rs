@@ -87,6 +87,7 @@ pub fn show_connection_form_with_state(
     let available_width = ui.available_width();
     let available_height = ui.available_height();
     let metrics = login_card_metrics(available_width);
+    let original_identity = form.draft.clone();
     let estimated_height = if metrics.use_paired_rows {
         560.0
     } else {
@@ -142,6 +143,7 @@ pub fn show_connection_form_with_state(
                         ui.add_space(12.0);
 
                         show_username_field(ui, form);
+                        form.invalidate_loaded_secret_after_identity_edit(&original_identity);
                         ui.add_space(12.0);
                         let password_input = show_password_field(ui, form);
                         ui.add_space(12.0);
@@ -273,10 +275,11 @@ fn show_recent_profiles(ui: &mut Ui, form: &ConnectionForm) -> Option<AppIntent>
 
 fn show_target_selector(ui: &mut Ui, form: &mut ConnectionForm, catalog: &ProtocolCatalog) {
     field_label(ui, "目标系统");
+    let protocol_choice = form.draft.protocol.clone();
     let selected = form
         .draft
         .target_system
-        .map(|target| target_option_label(target, catalog))
+        .map(|target| target_option_label(target, &protocol_choice, catalog))
         .unwrap_or_else(|| "请选择".to_owned());
     let response = ComboBox::from_id_salt("connection-target")
         .width(ui.available_width())
@@ -288,12 +291,12 @@ fn show_target_selector(ui: &mut Ui, form: &mut ConnectionForm, catalog: &Protoc
                 TargetSystem::Linux,
                 TargetSystem::Custom,
             ] {
-                let supported = target_is_supported(catalog, target);
+                let supported = target_choice_is_supported(catalog, target, &protocol_choice);
                 ui.add_enabled_ui(supported, |ui| {
                     ui.selectable_value(
                         &mut form.draft.target_system,
                         Some(target),
-                        target_option_label(target, catalog),
+                        target_option_label(target, &protocol_choice, catalog),
                     );
                 });
             }
@@ -488,17 +491,30 @@ fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).strong());
 }
 
-fn target_is_supported(catalog: &ProtocolCatalog, target: TargetSystem) -> bool {
-    catalog.descriptors().iter().any(|descriptor| {
-        catalog
-            .select(target, ProtocolSelection::Explicit(descriptor.id.clone()))
-            .is_ok()
-    })
+pub(crate) fn target_choice_is_supported(
+    catalog: &ProtocolCatalog,
+    target: TargetSystem,
+    protocol: &ProtocolChoice,
+) -> bool {
+    match protocol {
+        ProtocolChoice::Automatic => catalog.descriptors().iter().any(|descriptor| {
+            catalog
+                .select(target, ProtocolSelection::Explicit(descriptor.id.clone()))
+                .is_ok()
+        }),
+        ProtocolChoice::Explicit(protocol) => catalog
+            .select(target, ProtocolSelection::Explicit(protocol.clone()))
+            .is_ok(),
+    }
 }
 
-fn target_option_label(target: TargetSystem, catalog: &ProtocolCatalog) -> String {
+fn target_option_label(
+    target: TargetSystem,
+    protocol: &ProtocolChoice,
+    catalog: &ProtocolCatalog,
+) -> String {
     let label = target_label(Some(target));
-    if target_is_supported(catalog, target) {
+    if target_choice_is_supported(catalog, target, protocol) {
         label.to_owned()
     } else {
         format!("{label}（即将支持）")
