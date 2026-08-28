@@ -17,6 +17,7 @@ members = [
     "crates/frd-platform-api",
     "crates/frd-app",
     "crates/frd-protocol-apple",
+    "crates/frd-protocol-rdp",
     "crates/frd-render-wgpu",
     "crates/frd-compositor-wgpu",
     "crates/frd-platform-windows",
