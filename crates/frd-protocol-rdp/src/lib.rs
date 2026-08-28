@@ -1,11 +1,14 @@
 //! Windows RDP protocol adapter boundary.
 
+mod active_session;
+mod baseline;
 mod config;
 mod connector;
 mod error;
 mod factory;
 mod runtime;
 mod server_identity;
+mod surface;
 mod tls;
 mod upstream;
 

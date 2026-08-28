@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
 frd-protocol-api = { path = "../frd-protocol-api" }
 ironrdp = { version = "=0.17.0", default-features = false, features = ["connector", "session", "graphics", "input", "pdu"] }
 ironrdp-blocking = "=0.10.0"
@@ -17,5 +18,4 @@ x509-cert = "0.2"
 zeroize = "1"
 
 [dev-dependencies]
-frd-frame = { path = "../frd-frame" }
 rcgen = "0.13"

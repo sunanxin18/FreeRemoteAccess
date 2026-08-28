@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use frd_protocol_api::{ProtocolError, ProtocolExit, ProtocolRuntime, SessionCommand};
 
+use crate::active_session::run_active_session;
 use crate::config::RdpConnectionConfig;
-use crate::connector::{connect_and_activate, ActivatedRdpSession};
+use crate::connector::connect_and_activate;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_CANCELLED};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -103,6 +104,7 @@ pub(crate) fn run_protocol_session(
     mut config: RdpConnectionConfig,
     mut runtime: ProtocolRuntime,
 ) -> ProtocolExit {
+    let session_id = config.request.session_id;
     let executor = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -112,26 +114,9 @@ pub(crate) fn run_protocol_session(
     };
 
     match executor.block_on(connect_and_activate(&mut config, &mut runtime)) {
-        Ok(session) => executor.block_on(wait_for_disconnect(session, &mut runtime)),
+        Ok(session) => run_active_session(session, session_id, &mut runtime),
         Err(error) if error.code() == RDP_CANCELLED => ProtocolExit::Closed,
         Err(error) => ProtocolExit::Failed(error),
-    }
-}
-
-async fn wait_for_disconnect(
-    session: ActivatedRdpSession,
-    runtime: &mut ProtocolRuntime,
-) -> ProtocolExit {
-    loop {
-        if disconnect_requested(runtime) {
-            session.transport.shutdown();
-            return ProtocolExit::Closed;
-        }
-        if runtime.requires_shutdown() {
-            session.transport.shutdown();
-            return ProtocolExit::Failed(ProtocolError::Terminal);
-        }
-        tokio::time::sleep(COMMAND_POLL_INTERVAL).await;
     }
 }
 

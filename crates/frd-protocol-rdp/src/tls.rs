@@ -39,6 +39,7 @@ impl VerifiedTlsTransport {
         }
     }
 
+    #[allow(dead_code)] // Task 5 replaces the provisional active-stage shutdown path.
     pub(crate) fn shutdown(&self) {
         let _ = self
             .stream
