@@ -65,3 +65,12 @@ README 平台矩阵标记为 **开发中**：Windows 自动化状态机、本机
 RED：新增回归最初因缺少 `RemoteSession.diagnostics`、`profile_persistence_warning` 和 `finish_session_cleanup_with_stores` 而编译失败。GREEN：共享工作树的 `cargo +stable test -p frd-app` 为 69/69 通过；`cargo +stable test -p frd-ui-model` 为 7/7，`cargo +stable test -p frd-ui-egui` 为 19/19，`cargo +stable test -p frd-shell-desktop` 为 47/47，且 `cargo +stable fmt -- --check` 通过。精确 Git 暂存区快照排除标题栏/图标脏改动后，`frd-app` 66/66、`frd-ui-model` 7/7、`frd-ui-egui` 12/12、`frd-shell-desktop` 35/35，以及 Windows 二进制 11/11 和依赖边界 2/2 均通过；该快照的全 workspace fmt 仅被本轮未暂存的两处既有格式差异阻断（Windows `main.rs` 导入与 shell `lib.rs` re-export）。
 
 本轮没有改变 README 状态：授权 Mac GUI 的 TransportReady 提交和取消保存后重连删除仍未实测，平台矩阵继续保持 **开发中**。
+
+## Scoped re-review：提交部分失败与动作相关警告
+
+- Windows Credential Manager 的 `commit` 会先写正式 `profile/` 凭据，再删除 `pending/`；因此 pending 删除失败时虽然返回错误，正式凭据也可能已经改变。控制器现在在 `commit` 返回错误时同样执行提交前快照补偿：新建连接删除不确定的新凭据，覆盖连接先清除新值再恢复旧密码。
+- 回归 store 精确模拟“正式写入成功、pending 删除失败”。新建测试证明没有孤立正式凭据或 pending；覆盖测试让原始提交和恢复提交连续两次在写入后返回错误，证明恢复后的旧密码不会被错误地再次删除。
+- 会话状态不再使用单一布尔值，而是 `ProfilePersistenceWarning`：`SaveFailed`、`CredentialDeleteFailed`、`MetadataDeleteFailed`。对应中文分别说明保存失败、登录信息仍保留，以及密码已删除但最近连接记录清理失败；不会显示内部英文码。
+- 强类型警告继续跨 surface generation 和首个完整帧进入远程会话保留，并在断开时清除。README 仍保持 **开发中**，Mac GUI 端到端未运行项不变。
+
+RED/GREEN：强类型测试最初因 `ProfilePersistenceWarning` 不存在而编译失败；连续两次 post-write commit 失败测试随后以旧密码变为 `None` 正确失败。实现后聚焦 commit 补偿、取消保存三态和中文映射测试通过；共享工作树 `cargo +stable fmt -- --check`、`frd-ui-model` 8/8、`frd-app` 72/72、`frd-ui-egui` 19/19、`frd-shell-desktop` 47/47，以及 Windows 二进制 12/12、依赖边界 2/2、图标资源 2/2 均通过。排除无关脏改动的精确 Git 暂存区快照也通过 fmt，并通过 `frd-ui-model` 8/8、`frd-app` 69/69、`frd-ui-egui` 12/12，以及 Windows 二进制 11/11 和依赖边界 2/2。

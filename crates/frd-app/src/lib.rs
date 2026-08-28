@@ -985,7 +985,44 @@ mod tests {
         assert!(!fixture.profile_exists());
         assert_eq!(
             fixture.profile_persistence_warning(),
-            Some("登录信息未能安全保存；本次连接仍可继续，请稍后重试。")
+            Some(frd_ui_model::ProfilePersistenceWarning::SaveFailed)
+        );
+    }
+
+    #[test]
+    fn commit_error_after_writing_new_credential_removes_the_orphan() {
+        let fixture = RememberFixture::without_saved_profiles();
+        fixture.credentials.fail_commits_after_write(1);
+
+        let session = fixture.submit_new_remembered("new-password");
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+
+        assert_eq!(fixture.committed_password(), None);
+        assert!(!fixture.pending_exists(session));
+        assert!(!fixture.profile_exists());
+        assert_eq!(
+            fixture.profile_persistence_warning(),
+            Some(frd_ui_model::ProfilePersistenceWarning::SaveFailed)
+        );
+    }
+
+    #[test]
+    fn commit_error_after_overwrite_restores_the_previous_credential() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        fixture.credentials.fail_commits_after_write(2);
+
+        let session = fixture.submit_remembered("new-password");
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+        assert!(fixture.profile_exists());
+        assert_eq!(
+            fixture.profile_persistence_warning(),
+            Some(frd_ui_model::ProfilePersistenceWarning::SaveFailed)
         );
     }
 
@@ -1017,6 +1054,26 @@ mod tests {
             fixture.committed_password(),
             Some("old-password".to_owned())
         );
+        assert_eq!(
+            fixture.profile_persistence_warning(),
+            Some(frd_ui_model::ProfilePersistenceWarning::CredentialDeleteFailed)
+        );
+    }
+
+    #[test]
+    fn unremember_reports_metadata_cleanup_failure_after_deleting_credential() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        fixture.profiles.fail_next_delete();
+
+        let session = fixture.submit_without_remembering("old-password");
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+
+        assert!(fixture.profile_exists());
+        assert_eq!(fixture.committed_password(), None);
+        assert_eq!(
+            fixture.profile_persistence_warning(),
+            Some(frd_ui_model::ProfilePersistenceWarning::MetadataDeleteFailed)
+        );
     }
 
     #[test]
@@ -1034,7 +1091,10 @@ mod tests {
                 size: PixelSize::new(800, 600).expect("valid surface"),
             },
         );
-        assert!(fixture.profile_persistence_warning().is_some());
+        assert_eq!(
+            fixture.profile_persistence_warning(),
+            Some(frd_ui_model::ProfilePersistenceWarning::SaveFailed)
+        );
         fixture
             .controller
             .lock()
@@ -1482,7 +1542,7 @@ mod tests {
                 .to_owned()
         }
 
-        fn profile_persistence_warning(&self) -> Option<&'static str> {
+        fn profile_persistence_warning(&self) -> Option<frd_ui_model::ProfilePersistenceWarning> {
             self.controller
                 .lock()
                 .expect("controller lock")
@@ -1493,6 +1553,7 @@ mod tests {
     struct MemoryProfileStore {
         profiles: Mutex<Vec<SavedConnectionProfile>>,
         fail_upsert: Mutex<bool>,
+        fail_delete: Mutex<bool>,
     }
 
     impl MemoryProfileStore {
@@ -1500,11 +1561,16 @@ mod tests {
             Self {
                 profiles: Mutex::new(profiles),
                 fail_upsert: Mutex::new(false),
+                fail_delete: Mutex::new(false),
             }
         }
 
         fn fail_next_upsert(&self) {
             *self.fail_upsert.lock().expect("failure lock") = true;
+        }
+
+        fn fail_next_delete(&self) {
+            *self.fail_delete.lock().expect("failure lock") = true;
         }
 
         fn contains(&self, key: &ConnectionProfileKey) -> bool {
@@ -1538,6 +1604,9 @@ mod tests {
         }
 
         fn delete(&self, key: &ConnectionProfileKey) -> Result<(), PlatformError> {
+            if std::mem::take(&mut *self.fail_delete.lock().expect("failure lock")) {
+                return Err(PlatformError::Unavailable);
+            }
             self.profiles
                 .lock()
                 .expect("profile lock")
@@ -1551,6 +1620,7 @@ mod tests {
         pending: Mutex<Vec<(SessionId, ConnectionProfileKey, String)>>,
         loads: Mutex<Vec<ConnectionProfileKey>>,
         fail_delete: Mutex<bool>,
+        fail_commit_after_write: Mutex<usize>,
     }
 
     impl MemoryCredentialStore {
@@ -1560,11 +1630,16 @@ mod tests {
                 pending: Mutex::new(Vec::new()),
                 loads: Mutex::new(Vec::new()),
                 fail_delete: Mutex::new(false),
+                fail_commit_after_write: Mutex::new(0),
             }
         }
 
         fn fail_next_delete(&self) {
             *self.fail_delete.lock().expect("failure lock") = true;
+        }
+
+        fn fail_commits_after_write(&self, count: usize) {
+            *self.fail_commit_after_write.lock().expect("failure lock") = count;
         }
 
         fn committed(&self, key: &ConnectionProfileKey) -> Option<String> {
@@ -1605,10 +1680,16 @@ mod tests {
                 .expose_text()
                 .expect("fixture passwords are valid UTF-8")
                 .to_owned();
-            self.pending
-                .lock()
-                .expect("pending lock")
-                .push((session, key.clone(), password));
+            let mut pending = self.pending.lock().expect("pending lock");
+            if let Some((_, stored_key, stored_password)) = pending
+                .iter_mut()
+                .find(|(stored_session, _, _)| *stored_session == session)
+            {
+                *stored_key = key.clone();
+                *stored_password = password;
+            } else {
+                pending.push((session, key.clone(), password));
+            }
             Ok(())
         }
 
@@ -1618,14 +1699,14 @@ mod tests {
             key: &ConnectionProfileKey,
         ) -> Result<(), PlatformError> {
             let password = {
-                let mut pending = self.pending.lock().expect("pending lock");
-                let index = pending
+                let pending = self.pending.lock().expect("pending lock");
+                pending
                     .iter()
-                    .position(|(stored_session, stored_key, _)| {
+                    .find(|(stored_session, stored_key, _)| {
                         *stored_session == session && stored_key == key
                     })
-                    .ok_or(PlatformError::CredentialNotFound)?;
-                pending.remove(index).2
+                    .map(|(_, _, password)| password.clone())
+                    .ok_or(PlatformError::CredentialNotFound)?
             };
             let mut committed = self.committed.lock().expect("credential lock");
             if let Some((_, stored_password)) = committed
@@ -1636,6 +1717,17 @@ mod tests {
             } else {
                 committed.push((key.clone(), password));
             }
+            drop(committed);
+            let mut failures = self.fail_commit_after_write.lock().expect("failure lock");
+            if *failures != 0 {
+                *failures -= 1;
+                return Err(PlatformError::StorageFailed);
+            }
+            drop(failures);
+            self.pending
+                .lock()
+                .expect("pending lock")
+                .retain(|(stored_session, _, _)| *stored_session != session);
             Ok(())
         }
 

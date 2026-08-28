@@ -254,6 +254,27 @@ pub struct ConnectionSubmission {
     pub selected_profile: Option<ConnectionProfileKey>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfilePersistenceWarning {
+    SaveFailed,
+    CredentialDeleteFailed,
+    MetadataDeleteFailed,
+}
+
+impl ProfilePersistenceWarning {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::SaveFailed => "登录信息未能安全保存；本次连接仍可继续，请稍后重试。",
+            Self::CredentialDeleteFailed => {
+                "无法删除保存在此设备上的登录信息；登录信息仍保留，请稍后重试。"
+            }
+            Self::MetadataDeleteFailed => {
+                "密码已从系统凭据库删除，但最近连接记录清理失败；请稍后重试。"
+            }
+        }
+    }
+}
+
 pub enum Page {
     ConnectionForm(ConnectionForm),
     Connecting {
@@ -303,7 +324,30 @@ mod tests {
     use frd_platform_api::{ConnectionProfileKey, SavedConnectionProfile};
     use frd_protocol_api::{ProtocolCatalog, ProtocolId};
 
-    use super::{ConnectionDraft, ConnectionForm, Page};
+    use super::{ConnectionDraft, ConnectionForm, Page, ProfilePersistenceWarning};
+
+    #[test]
+    fn profile_persistence_warnings_have_action_specific_safe_chinese_messages() {
+        let cases = [
+            (
+                ProfilePersistenceWarning::SaveFailed,
+                "登录信息未能安全保存；本次连接仍可继续，请稍后重试。",
+            ),
+            (
+                ProfilePersistenceWarning::CredentialDeleteFailed,
+                "无法删除保存在此设备上的登录信息；登录信息仍保留，请稍后重试。",
+            ),
+            (
+                ProfilePersistenceWarning::MetadataDeleteFailed,
+                "密码已从系统凭据库删除，但最近连接记录清理失败；请稍后重试。",
+            ),
+        ];
+
+        for (warning, expected) in cases {
+            assert_eq!(warning.message(), expected);
+            assert!(!warning.message().contains("profile_persistence"));
+        }
+    }
 
     fn saved_profile() -> SavedConnectionProfile {
         SavedConnectionProfile {
