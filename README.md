@@ -65,10 +65,10 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 账号密码认证 | CredSSP/NLA | **开发中** | 私有 adapter 已实现只允许 NLA/TLS 的 CredSSP、licensing 与 activation 基线；2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录或会话证明。凭据不得进入 argv、普通配置、日志或抓包 |
 | 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 设计为 BGRX 脏矩形发布；尚无产品构建或真机首帧证据 |
 | 鼠标与键盘 | RDP fast-path input | **开发中** | 设计包含 scan code、Unicode、鼠标、滚轮和失焦 `ReleaseAll`；尚未完成产品互操作 |
-| 动态分辨率与多显示器 | Display Control DVC | **计划中** | 第一阶段固定初始远端尺寸；服务端确认新布局前不得切换 generation |
+| 动态分辨率与多显示器 | Display Control DVC | **开发中** | 已通过现有 viewport 接口实现单主显示器 latest-only 调整，仅在 DVC 打开且服务端能力就绪后宣告，并在精确 reactivation 尺寸确认后切换 generation；多显示器仍不支持。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 现代图形 | EGFX、ZGFX、AVC420 | **计划中** | 只允许作为 RDP adapter 内部解码路径发布现有 `SurfaceUpdate`，不新增 UI；不得宣告 IronRDP 0.17.0 尚未实现的 AVC444/AVC444v2 |
-| 文本剪贴板 | CLIPRDR | **计划中** | 只复用当前剪贴板按钮、能力和事件接口；文件复制不在当前 RDP 开发范围 |
-| Windows→客户端音频 | RDPSND | **计划中** | 通过协议中立媒体端口接入，不允许 RDP adapter 直接打开平台音频设备 |
+| 文本剪贴板 | CLIPRDR | **开发中** | 已复用现有剪贴板能力和事件接口适配 Unicode 文本，读写方向按实际协商分别宣告；文件能力保持关闭。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
+| Windows→客户端音频 | RDPSND | **开发中** | 已将共同协商的 48 kHz 双声道 16-bit PCM 通过协议中立 `MediaFrame` 端口发布，媒体背压只降级音频，RDP adapter 不打开平台音频设备。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 客户端麦克风、文件、磁盘与设备 | RDPEAI、CLIPRDR 文件、RDPDR | **计划中** | 不在当前 RDP 开发范围，也不新增入口或公共接口；未来必须单独设计并获得批准 |
 
 当前 RDP 开发只适配 FreeRemoteDesk 已有的统一登录、证书确认、画面、键鼠、

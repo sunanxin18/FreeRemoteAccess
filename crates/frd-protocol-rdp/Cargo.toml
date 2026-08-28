@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 frd-core = { path = "../frd-core" }
 frd-frame = { path = "../frd-frame" }
+frd-media-api = { path = "../frd-media-api" }
 frd-protocol-api = { path = "../frd-protocol-api" }
-ironrdp = { version = "=0.17.0", default-features = false, features = ["connector", "core", "session", "graphics", "input", "pdu"] }
+ironrdp = { version = "=0.17.0", default-features = false, features = ["cliprdr", "connector", "core", "displaycontrol", "dvc", "session", "graphics", "input", "pdu", "rdpsnd", "svc"] }
 ironrdp-blocking = "=0.10.0"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 rustls-platform-verifier = "=0.7.0"

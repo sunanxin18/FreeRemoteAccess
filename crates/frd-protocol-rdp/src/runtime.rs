@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use frd_protocol_api::{ProtocolError, ProtocolExit, ProtocolRuntime, SessionCommand};
+use frd_core::PhysicalViewport;
+use frd_protocol_api::{
+    ClipboardPayload, ProtocolError, ProtocolExit, ProtocolRuntime, SessionCommand,
+};
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 
 use crate::active_session::run_active_session;
@@ -22,9 +25,15 @@ const NETWORK_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVE_COMMAND_BUDGET: usize = 64;
 const ACTIVE_EVENT_BUDGET: usize = 255;
 
+pub(crate) enum ActiveOptionalCommand {
+    ViewportChanged(PhysicalViewport),
+    ClipboardWrite(ClipboardPayload),
+}
+
 pub(crate) enum ActiveCommandBatch {
     Continue {
         events: Vec<FastPathInputEvent>,
+        optional_commands: Vec<ActiveOptionalCommand>,
         pending: bool,
     },
     Disconnect(Vec<FastPathInputEvent>),
@@ -73,10 +82,12 @@ pub(crate) fn drain_active_commands(
         let events = drain.take_batch();
         return Ok(ActiveCommandBatch::Continue {
             events,
+            optional_commands: Vec::new(),
             pending: !drain.pending_events.is_empty(),
         });
     }
 
+    let mut optional_commands = Vec::new();
     for _ in 0..ACTIVE_COMMAND_BUDGET {
         let Some(command) = runtime.try_next_command() else {
             break;
@@ -95,14 +106,19 @@ pub(crate) fn drain_active_commands(
                 events.extend(input.stop());
                 return Ok(ActiveCommandBatch::Disconnect(events));
             }
-            SessionCommand::ViewportChanged { .. }
-            | SessionCommand::ResolveServerIdentity { .. }
-            | SessionCommand::ClipboardWrite(_) => {}
+            SessionCommand::ViewportChanged { viewport, .. } => {
+                optional_commands.push(ActiveOptionalCommand::ViewportChanged(viewport));
+            }
+            SessionCommand::ClipboardWrite(payload) => {
+                optional_commands.push(ActiveOptionalCommand::ClipboardWrite(payload));
+            }
+            SessionCommand::ResolveServerIdentity { .. } => {}
         }
     }
     let events = drain.take_batch();
     Ok(ActiveCommandBatch::Continue {
         events,
+        optional_commands,
         pending: !drain.pending_events.is_empty(),
     })
 }
@@ -434,12 +450,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use frd_core::{
-        InputEvent, KeyState, Modifiers, PhysicalKeyCode, SecretBuffer, SessionId, SessionInput,
+        InputEvent, KeyState, Modifiers, PhysicalKeyCode, PhysicalViewport, PixelRect, PixelSize,
+        SecretBuffer, SessionId, SessionInput,
     };
     use frd_protocol_api::{
-        ConnectRequest, ConnectionStage, Credentials, Endpoint, ProtocolError, ProtocolExit,
-        ProtocolId, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand, SessionEvent,
-        SurfacePublisher,
+        ClipboardPayload, ConnectRequest, ConnectionStage, Credentials, Endpoint, ProtocolError,
+        ProtocolExit, ProtocolId, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand,
+        SessionEvent, SurfacePublisher,
     };
 
     use crate::config::RdpConnectionConfig;
@@ -449,7 +466,7 @@ mod tests {
     use super::{
         drain_active_commands, drain_reactivation_commands, run_protocol_session,
         wait_for_blocking, wait_for_blocking_with_timeout, wait_for_network_future,
-        ActiveCommandBatch, ActiveCommandDrain, CancellationCheckedIo,
+        ActiveCommandBatch, ActiveCommandDrain, ActiveOptionalCommand, CancellationCheckedIo,
     };
 
     static WORKER_TEST_SERIAL: Mutex<()> = Mutex::new(());
@@ -514,6 +531,78 @@ mod tests {
     }
 
     #[test]
+    fn optional_active_commands_reach_the_negotiated_channel_adapters() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize::new(1280, 720).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        let drawable = PixelSize {
+            width: 1600,
+            height: 900,
+        };
+        commands
+            .send(SessionCommand::ViewportChanged {
+                session_id,
+                generation: 1,
+                viewport: PhysicalViewport::new(
+                    drawable,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1600,
+                        height: 900,
+                    },
+                    PixelSize {
+                        width: 1280,
+                        height: 720,
+                    },
+                )
+                .expect("valid viewport"),
+            })
+            .expect("viewport command sends");
+        commands
+            .send(SessionCommand::ClipboardWrite(ClipboardPayload::new(
+                b"text".to_vec(),
+            )))
+            .expect("clipboard command sends");
+        let mut input = RdpInputState::new();
+        let mut drain = ActiveCommandDrain::new();
+
+        let ActiveCommandBatch::Continue {
+            optional_commands, ..
+        } = drain_active_commands(&mut runtime, &mut input, &mut drain)
+            .expect("optional commands drain")
+        else {
+            panic!("no shutdown command was queued")
+        };
+
+        assert_eq!(optional_commands.len(), 2);
+        assert!(matches!(
+            &optional_commands[0],
+            ActiveOptionalCommand::ViewportChanged(viewport) if viewport.content.width == 1600
+        ));
+        assert!(matches!(
+            &optional_commands[1],
+            ActiveOptionalCommand::ClipboardWrite(payload) if payload.as_bytes() == b"text"
+        ));
+    }
+
+    #[test]
     fn input_large_text_batch_yields_at_the_fast_path_event_budget() {
         let session_id = SessionId::allocate();
         let (commands, command_rx) = mpsc::channel();
@@ -549,6 +638,7 @@ mod tests {
         let ActiveCommandBatch::Continue {
             events: first,
             pending: true,
+            ..
         } = drain_active_commands(&mut runtime, &mut input, &mut drain)
             .expect("first bounded batch translates")
         else {
@@ -557,6 +647,7 @@ mod tests {
         let ActiveCommandBatch::Continue {
             events: second,
             pending: false,
+            ..
         } = drain_active_commands(&mut runtime, &mut input, &mut drain)
             .expect("second bounded batch translates")
         else {

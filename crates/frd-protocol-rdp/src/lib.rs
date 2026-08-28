@@ -1,9 +1,12 @@
 //! Windows RDP protocol adapter boundary.
 
 mod active_session;
+mod audio;
 mod baseline;
+mod clipboard;
 mod config;
 mod connector;
+mod display;
 mod error;
 mod factory;
 mod input;

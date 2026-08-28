@@ -10,18 +10,23 @@ use ironrdp::connector::connection_activation::{
 };
 use ironrdp::connector::{ConnectionResult, DesktopSize, Sequence as _};
 use ironrdp::core::WriteBuf;
+use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::graphics::image_processing::PixelFormat as IronPixelFormat;
 use ironrdp::pdu::geometry::InclusiveRectangle;
+use ironrdp::rdpsnd::client::Rdpsnd;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 
+use crate::audio::{self, RdpAudioAdapter};
 use crate::baseline::RdpBaseline;
+use crate::clipboard::{self, ClipboardServiceAction};
 use crate::connector::ActivatedRdpSession;
+use crate::display::{DisplayControlAdapter, ResizeConfirmation};
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED};
 use crate::input::RdpInputState;
 use crate::runtime::{
     drain_active_commands, drain_reactivation_commands, ActiveCommandBatch, ActiveCommandDrain,
-    ReactivationCommand,
+    ActiveOptionalCommand, ReactivationCommand,
 };
 use crate::surface::validate_negotiated_size;
 use crate::tls::TlsStream;
@@ -49,6 +54,7 @@ fn run_active_session_inner(
     let ActivatedRdpSession {
         connection,
         transport,
+        audio,
     } = session;
     let (framed, _server_public_key) = transport.into_parts();
     let mut writer = OrderedRdpWriter::new(framed);
@@ -108,6 +114,11 @@ fn run_active_session_inner(
         return Err(error);
     }
     let mut generation = 1;
+    let mut display = DisplayControlAdapter::new(negotiated_size);
+    let mut published_capabilities = SessionCapabilities {
+        text_input: true,
+        ..SessionCapabilities::default()
+    };
 
     let result = run_active_loop(
         runtime,
@@ -117,6 +128,9 @@ fn run_active_session_inner(
         &mut baseline,
         &mut input,
         &mut generation,
+        &mut display,
+        &audio,
+        &mut published_capabilities,
         &activation_factory,
     );
     best_effort_release_held_input(
@@ -141,14 +155,28 @@ fn run_active_loop(
     baseline: &mut RdpBaseline,
     input: &mut RdpInputState,
     generation: &mut u64,
+    display: &mut DisplayControlAdapter,
+    audio: &RdpAudioAdapter,
+    published_capabilities: &mut SessionCapabilities,
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<(), ProtocolError> {
     let mut command_drain = ActiveCommandDrain::new();
     loop {
+        refresh_optional_capabilities(
+            active_stage,
+            display,
+            audio,
+            runtime,
+            published_capabilities,
+        )?;
         match drain_active_commands(runtime, input, &mut command_drain)
             .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?
         {
-            ActiveCommandBatch::Continue { events, pending } => {
+            ActiveCommandBatch::Continue {
+                events,
+                optional_commands,
+                pending,
+            } => {
                 if route_input_events(
                     active_stage,
                     image,
@@ -161,6 +189,21 @@ fn run_active_loop(
                 {
                     return Err(rdp_error(RDP_ACTIVATION_FAILED));
                 }
+                service_optional_channels(
+                    active_stage,
+                    writer,
+                    runtime,
+                    display,
+                    audio,
+                    optional_commands,
+                )?;
+                refresh_optional_capabilities(
+                    active_stage,
+                    display,
+                    audio,
+                    runtime,
+                    published_capabilities,
+                )?;
                 if pending {
                     continue;
                 }
@@ -217,6 +260,7 @@ fn run_active_loop(
             ActiveOutputControl::Terminate => return Ok(()),
             ActiveOutputControl::Deactivate => {
                 let releases = suspend_active_input_capabilities(runtime, input)?;
+                *published_capabilities = SessionCapabilities::default();
                 if route_input_events(
                     active_stage,
                     image,
@@ -236,16 +280,135 @@ fn run_active_loop(
                     image,
                     baseline,
                     generation,
+                    display,
                     input,
                     activation_factory,
                 )? {
-                    ReactivationOutcome::Continue => {}
+                    ReactivationOutcome::Continue => {
+                        *published_capabilities = SessionCapabilities {
+                            text_input: true,
+                            ..SessionCapabilities::default()
+                        };
+                    }
                     ReactivationOutcome::Disconnect => return Ok(()),
                     ReactivationOutcome::Terminal => return Err(ProtocolError::Terminal),
                 }
             }
         }
+        service_optional_channels(active_stage, writer, runtime, display, audio, Vec::new())?;
     }
+}
+
+fn refresh_optional_capabilities(
+    active_stage: &mut ActiveStage,
+    display: &mut DisplayControlAdapter,
+    audio_adapter: &RdpAudioAdapter,
+    runtime: &mut ProtocolRuntime,
+    published: &mut SessionCapabilities,
+) -> Result<(), ProtocolError> {
+    let display_ready = active_stage
+        .get_dvc::<DisplayControlClient>()
+        .and_then(|channel| channel.channel_processor_downcast_ref::<DisplayControlClient>())
+        .is_some_and(DisplayControlClient::ready);
+    if display.dynamic_resolution() != display_ready {
+        display.set_negotiated(display_ready);
+    }
+
+    if let Some(rdpsnd) = active_stage.get_svc_processor::<Rdpsnd>() {
+        audio::observe_negotiation(rdpsnd, audio_adapter);
+    }
+    let clipboard_capabilities = active_stage
+        .get_svc_processor::<ironrdp::cliprdr::CliprdrClient>()
+        .map(clipboard::capabilities)
+        .unwrap_or_default();
+    let audio_capabilities = audio::capabilities(audio_adapter);
+    let desired = SessionCapabilities {
+        dynamic_resolution: display.dynamic_resolution(),
+        clipboard_read: clipboard_capabilities.clipboard_read,
+        clipboard_write: clipboard_capabilities.clipboard_write,
+        remote_audio: audio_capabilities.remote_audio,
+        text_input: true,
+    };
+    if desired == *published {
+        return Ok(());
+    }
+    let audio_started = !published.remote_audio && desired.remote_audio;
+    runtime.publish_event(SessionEvent::CapabilitiesChanged(desired))?;
+    *published = desired;
+    if audio_started {
+        runtime.publish_event(SessionEvent::AudioState(
+            frd_protocol_api::AudioState::Starting,
+        ))?;
+    }
+    Ok(())
+}
+
+fn service_optional_channels(
+    active_stage: &mut ActiveStage,
+    writer: &mut OrderedRdpWriter<TlsStream>,
+    runtime: &mut ProtocolRuntime,
+    display: &mut DisplayControlAdapter,
+    audio_adapter: &RdpAudioAdapter,
+    commands: Vec<ActiveOptionalCommand>,
+) -> Result<(), ProtocolError> {
+    for command in commands {
+        match command {
+            ActiveOptionalCommand::ViewportChanged(viewport) => {
+                display.observe_viewport(viewport);
+            }
+            ActiveOptionalCommand::ClipboardWrite(payload) => {
+                let messages = active_stage
+                    .get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>()
+                    .map(|cliprdr| clipboard::write_text(cliprdr, payload))
+                    .transpose()
+                    .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?
+                    .flatten();
+                if let Some(messages) = messages {
+                    let frame = active_stage
+                        .process_svc_processor_messages(messages)
+                        .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+                    writer
+                        .write_frame(&frame)
+                        .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+                }
+            }
+        }
+    }
+
+    loop {
+        let action = active_stage
+            .get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>()
+            .map(clipboard::next_service_action)
+            .transpose()
+            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?
+            .flatten();
+        match action {
+            Some(ClipboardServiceAction::Wire(messages)) => {
+                let frame = active_stage
+                    .process_svc_processor_messages(messages)
+                    .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+                writer
+                    .write_frame(&frame)
+                    .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+            }
+            Some(ClipboardServiceAction::Publish(payload)) => {
+                runtime.publish_event(SessionEvent::Clipboard(payload))?;
+            }
+            None => break,
+        }
+    }
+
+    if let Some(target) = display.take_resize_request() {
+        let frame = active_stage
+            .encode_resize(target.width, target.height, None, None)
+            .ok_or_else(|| rdp_error(RDP_ACTIVATION_FAILED))?
+            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+        writer
+            .write_frame(&frame)
+            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+    }
+
+    audio_adapter.drain_to_runtime(runtime)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,6 +502,7 @@ fn drive_reactivation(
     image: &mut DecodedImage,
     baseline: &mut RdpBaseline,
     generation: &mut u64,
+    display: &mut DisplayControlAdapter,
     input: &mut RdpInputState,
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<ReactivationOutcome, ProtocolError> {
@@ -394,6 +558,11 @@ fn drive_reactivation(
             pointer_software_rendering,
         } = activation.connection_activation_state()
         {
+            let observed_size = validate_negotiated_size(desktop_size.width, desktop_size.height)
+                .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+            if display.confirm_reactivation(observed_size) == ResizeConfirmation::Mismatch {
+                return Err(rdp_error(RDP_ACTIVATION_FAILED));
+            }
             *generation =
                 commit_reactivated_surface(runtime, baseline, image, *generation, desktop_size)?;
             active_stage.set_fastpath_processor(

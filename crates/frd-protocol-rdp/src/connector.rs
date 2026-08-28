@@ -9,11 +9,15 @@ use ironrdp::connector::{
     self, BitmapConfig, ClientConnector, ClientConnectorState, ConnectionResult, ConnectorError,
     ConnectorErrorKind, Credentials, DesktopSize, ServerName,
 };
+use ironrdp::displaycontrol::client::DisplayControlClient;
+use ironrdp::dvc::DrdynvcClient;
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, MajorPlatformType};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_blocking::{Framed, ShouldUpgrade};
 
+use crate::audio::{new_rdpsnd, RdpAudioAdapter};
+use crate::clipboard::new_cliprdr;
 use crate::config::RdpConnectionConfig;
 use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
@@ -33,12 +37,14 @@ pub(crate) struct ActivatedRdpSession {
     #[allow(dead_code)] // Task 4 consumes the negotiated connector result.
     pub(crate) connection: ConnectionResult,
     pub(crate) transport: VerifiedTlsTransport,
+    pub(crate) audio: RdpAudioAdapter,
 }
 
 struct NegotiatedTcp {
     connector: ClientConnector,
     transport: TcpStream,
     upgrade: ShouldUpgrade,
+    audio: RdpAudioAdapter,
 }
 
 pub(crate) async fn connect_and_activate(
@@ -54,6 +60,7 @@ pub(crate) async fn connect_and_activate(
         connector: _,
         transport: preflight_transport,
         upgrade: _,
+        audio: _,
     } = negotiate_enhanced_security(&addresses, runtime).await?;
     let preflight_shutdown = preflight_transport
         .try_clone()
@@ -74,6 +81,7 @@ pub(crate) async fn connect_and_activate(
     .ok_or_else(|| rdp_error(crate::error::RDP_CANCELLED))?;
 
     let mut negotiated = negotiate_enhanced_security(&addresses, runtime).await?;
+    let audio = negotiated.audio.clone();
     let verified_shutdown = negotiated
         .transport
         .try_clone()
@@ -178,6 +186,7 @@ pub(crate) async fn connect_and_activate(
     Ok(ActivatedRdpSession {
         connection,
         transport,
+        audio,
     })
 }
 
@@ -228,7 +237,7 @@ async fn negotiate_enhanced_security(
         let shutdown = stream.try_clone().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
         let negotiated = wait_for_blocking(runtime, shutdown, RDP_TLS_FAILED, move |_| {
             let mut framed = Framed::new(stream);
-            let mut connector = baseline_connector(
+            let (mut connector, audio) = baseline_connector(
                 Credentials::SmartCard {
                     pin: String::new(),
                     config: None,
@@ -242,6 +251,7 @@ async fn negotiate_enhanced_security(
                 connector,
                 transport: framed.into_inner_no_leftover(),
                 upgrade,
+                audio,
             })
         })
         .await?;
@@ -366,8 +376,11 @@ fn baseline_connector(
     domain: Option<String>,
     desktop_size: DesktopSize,
     client_addr: SocketAddr,
-) -> ClientConnector {
-    ClientConnector::new(
+) -> (ClientConnector, RdpAudioAdapter) {
+    let audio = RdpAudioAdapter::new();
+    let dynamic_channels = DrdynvcClient::new()
+        .with_dynamic_channel(DisplayControlClient::new(|_capabilities| Ok(Vec::new())));
+    let connector = ClientConnector::new(
         connector::Config {
             credentials,
             domain,
@@ -392,7 +405,7 @@ fn baseline_connector(
             enable_server_pointer: true,
             request_data: None,
             autologon: false,
-            enable_audio_playback: false,
+            enable_audio_playback: true,
             compression_type: None,
             pointer_software_rendering: false,
             multitransport_flags: None,
@@ -406,6 +419,10 @@ fn baseline_connector(
         },
         client_addr,
     )
+    .with_static_channel(dynamic_channels)
+    .with_static_channel(new_cliprdr())
+    .with_static_channel(new_rdpsnd(&audio));
+    (connector, audio)
 }
 
 #[cfg(windows)]
@@ -446,12 +463,13 @@ fn client_platform() -> MajorPlatformType {
 #[cfg(test)]
 mod tests {
     use ironrdp::connector::{Credentials, DesktopSize};
+    use ironrdp::dvc::DrdynvcClient;
 
     use super::baseline_connector;
 
     #[test]
     fn connector_requires_credssp_and_refuses_tls_only_downgrade() {
-        let connector = baseline_connector(
+        let (connector, _audio) = baseline_connector(
             Credentials::UsernamePassword {
                 username: "alice".to_owned(),
                 password: String::new(),
@@ -469,8 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn connector_baseline_is_single_monitor_32_bit_without_optional_channels() {
-        let connector = baseline_connector(
+    fn connector_offers_only_approved_optional_channels() {
+        let (mut connector, _audio) = baseline_connector(
             Credentials::UsernamePassword {
                 username: "alice".to_owned(),
                 password: String::new(),
@@ -493,9 +511,18 @@ mod tests {
         assert_eq!(bitmap.color_depth, 32);
         assert!(connector.config.enable_server_pointer);
         assert!(!connector.config.pointer_software_rendering);
-        assert!(!connector.config.enable_audio_playback);
+        assert!(connector.config.enable_audio_playback);
         assert!(connector.config.multitransport_flags.is_none());
         assert!(connector.config.license_cache.is_none());
-        assert_eq!(connector.static_channels.iter().count(), 0);
+        assert_eq!(connector.static_channels.iter().count(), 3);
+        assert!(connector
+            .get_static_channel_processor::<DrdynvcClient>()
+            .is_some());
+        assert!(connector
+            .get_static_channel_processor::<ironrdp::cliprdr::CliprdrClient>()
+            .is_some());
+        assert!(connector
+            .get_static_channel_processor::<ironrdp::rdpsnd::client::Rdpsnd>()
+            .is_some());
     }
 }
