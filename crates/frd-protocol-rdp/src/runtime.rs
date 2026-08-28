@@ -1,5 +1,7 @@
 use std::future::Future;
 use std::net::{Shutdown, TcpStream};
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use frd_protocol_api::{ProtocolError, ProtocolExit, ProtocolRuntime, SessionCommand};
@@ -47,28 +49,50 @@ async fn wait_for_disconnect(
     }
 }
 
-pub(crate) async fn wait_for_network_future<T, E>(
+pub(crate) async fn wait_for_network_future<T, E, F>(
     runtime: &mut ProtocolRuntime,
-    future: impl Future<Output = Result<T, E>>,
+    future: F,
     failure_code: &'static str,
-) -> Result<T, ProtocolError> {
-    let mut future = Box::pin(future);
+) -> Result<T, ProtocolError>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: Future<Output = Result<T, E>> + Send + 'static,
+{
+    if disconnect_requested(runtime) {
+        return Err(cancelled());
+    }
+
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("frd-rdp-network-stage".to_owned())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|executor| executor.block_on(future));
+            let _ = result_tx.send(result);
+        })
+        .map_err(|_| rdp_error(failure_code))?;
     let deadline = Instant::now() + NETWORK_STAGE_TIMEOUT;
 
     loop {
         if disconnect_requested(runtime) {
             return Err(cancelled());
         }
+        match result_rx.try_recv() {
+            Ok(Ok(Ok(value))) => return Ok(value),
+            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                return Err(rdp_error(failure_code));
+            }
+            Err(TryRecvError::Empty) => {}
+        }
         let now = Instant::now();
         if now >= deadline {
             return Err(rdp_error(failure_code));
         }
         let wait = COMMAND_POLL_INTERVAL.min(deadline.duration_since(now));
-        match tokio::time::timeout(wait, future.as_mut()).await {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(_)) => return Err(rdp_error(failure_code)),
-            Err(_) => {}
-        }
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -81,31 +105,56 @@ pub(crate) async fn wait_for_blocking<T>(
 where
     T: Send + 'static,
 {
+    wait_for_blocking_with_timeout(
+        runtime,
+        shutdown,
+        failure_code,
+        NETWORK_STAGE_TIMEOUT,
+        operation,
+    )
+    .await
+}
+
+async fn wait_for_blocking_with_timeout<T>(
+    runtime: &mut ProtocolRuntime,
+    shutdown: TcpStream,
+    failure_code: &'static str,
+    timeout: Duration,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ProtocolError>
+where
+    T: Send + 'static,
+{
     if disconnect_requested(runtime) {
         let _ = shutdown.shutdown(Shutdown::Both);
         return Err(cancelled());
     }
 
-    let mut task = tokio::task::spawn_blocking(operation);
-    let deadline = Instant::now() + NETWORK_STAGE_TIMEOUT;
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("frd-rdp-blocking-stage".to_owned())
+        .spawn(move || {
+            let _ = result_tx.send(operation());
+        })
+        .map_err(|_| rdp_error(failure_code))?;
+    let deadline = Instant::now() + timeout;
     loop {
+        if disconnect_requested(runtime) {
+            let _ = shutdown.shutdown(Shutdown::Both);
+            return Err(cancelled());
+        }
+        match result_rx.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(TryRecvError::Disconnected) => return Err(rdp_error(failure_code)),
+            Err(TryRecvError::Empty) => {}
+        }
         let now = Instant::now();
         if now >= deadline {
             let _ = shutdown.shutdown(Shutdown::Both);
-            let _ = task.await;
             return Err(rdp_error(failure_code));
         }
         let wait = COMMAND_POLL_INTERVAL.min(deadline.duration_since(now));
-        match tokio::time::timeout(wait, &mut task).await {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(_)) => return Err(rdp_error(failure_code)),
-            Err(_) if disconnect_requested(runtime) => {
-                let _ = shutdown.shutdown(Shutdown::Both);
-                let _ = task.await;
-                return Err(cancelled());
-            }
-            Err(_) => {}
-        }
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -124,7 +173,10 @@ fn cancelled() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use frd_core::{SecretBuffer, SessionId};
     use frd_protocol_api::{
@@ -134,8 +186,199 @@ mod tests {
     };
 
     use crate::config::RdpConnectionConfig;
+    use crate::error::{RDP_DNS_FAILED, RDP_TLS_FAILED};
 
-    use super::run_protocol_session;
+    use super::{
+        run_protocol_session, wait_for_blocking, wait_for_blocking_with_timeout,
+        wait_for_network_future,
+    };
+
+    #[test]
+    fn lifecycle_in_flight_dns_cancellation_does_not_wait_for_lookup_cleanup() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RejectingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let controller = thread::spawn(move || {
+            started_rx
+                .recv()
+                .expect("blocking lookup must enter its in-flight state");
+            commands
+                .send(SessionCommand::Disconnect)
+                .expect("runtime command receiver remains open");
+            thread::sleep(Duration::from_millis(600));
+            release_tx
+                .send(())
+                .expect("blocking lookup remains alive until released");
+        });
+        let lookup = async move {
+            tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("test controller remains open");
+                release_rx.recv().expect("test release remains open");
+                finished_tx.send(()).expect("test observer remains open");
+            })
+            .await
+            .map_err(|_| ())
+        };
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let started_at = Instant::now();
+        let result = executor.block_on(wait_for_network_future(
+            &mut runtime,
+            lookup,
+            RDP_DNS_FAILED,
+        ));
+        drop(executor);
+        let return_bound = started_at.elapsed();
+        controller.join().expect("test controller exits");
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached lookup cleanup eventually completes");
+
+        let error = result.expect_err("Disconnect must cancel in-flight DNS");
+        assert_eq!(error.code(), "rdp_cancelled");
+        assert!(
+            return_bound < Duration::from_millis(300),
+            "cancellation waited for blocking DNS cleanup: {return_bound:?}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_in_flight_blocking_stage_cancellation_does_not_wait_for_cleanup() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RejectingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let client = TcpStream::connect(listener.local_addr().expect("test listener address"))
+            .expect("connect test stream");
+        let (_server, _) = listener.accept().expect("accept test stream");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let controller = thread::spawn(move || {
+            started_rx
+                .recv()
+                .expect("blocking stage must enter its in-flight state");
+            commands
+                .send(SessionCommand::Disconnect)
+                .expect("runtime command receiver remains open");
+            thread::sleep(Duration::from_millis(600));
+            release_tx
+                .send(())
+                .expect("blocking stage remains alive until released");
+        });
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let started_at = Instant::now();
+        let result = executor.block_on(wait_for_blocking(
+            &mut runtime,
+            client,
+            RDP_TLS_FAILED,
+            move || {
+                started_tx.send(()).expect("test controller remains open");
+                release_rx.recv().expect("test release remains open");
+                finished_tx.send(()).expect("test observer remains open");
+            },
+        ));
+        drop(executor);
+        let return_bound = started_at.elapsed();
+        controller.join().expect("test controller exits");
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached blocking-stage cleanup eventually completes");
+
+        let error = result.expect_err("Disconnect must cancel the in-flight blocking stage");
+        assert_eq!(error.code(), "rdp_cancelled");
+        assert!(
+            return_bound < Duration::from_millis(300),
+            "cancellation waited for blocking-stage cleanup: {return_bound:?}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_in_flight_blocking_stage_timeout_does_not_wait_for_cleanup() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RejectingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let client = TcpStream::connect(listener.local_addr().expect("test listener address"))
+            .expect("connect test stream");
+        let (_server, _) = listener.accept().expect("accept test stream");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let controller = thread::spawn(move || {
+            started_rx
+                .recv()
+                .expect("blocking stage must enter its in-flight state");
+            thread::sleep(Duration::from_millis(600));
+            release_tx
+                .send(())
+                .expect("blocking stage remains alive until released");
+        });
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let started_at = Instant::now();
+        let result = executor.block_on(wait_for_blocking_with_timeout(
+            &mut runtime,
+            client,
+            RDP_TLS_FAILED,
+            Duration::from_millis(50),
+            move || {
+                started_tx.send(()).expect("test controller remains open");
+                release_rx.recv().expect("test release remains open");
+                finished_tx.send(()).expect("test observer remains open");
+            },
+        ));
+        drop(executor);
+        let return_bound = started_at.elapsed();
+        controller.join().expect("test controller exits");
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached blocking-stage cleanup eventually completes");
+
+        let error = result.expect_err("stage deadline must fail the in-flight blocking stage");
+        assert_eq!(error.code(), "rdp_tls_failed");
+        assert!(
+            return_bound < Duration::from_millis(300),
+            "timeout waited for blocking-stage cleanup: {return_bound:?}"
+        );
+    }
 
     #[test]
     fn lifecycle_disconnect_before_network_returns_closed() {

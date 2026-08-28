@@ -37,7 +37,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
 |---|---|---|---|---|
 | macOS | Screen Sharing / Remote Management | Apple HPSS、RFB 线协议、MVS、Apple UDP 媒体 | Windows | **受限验证**；账号密码登录、画面、输入和 Mac→PC 音频已有有界真机证据 |
-| Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；基础 TLS/NLA、传统位图与输入尚未接入产品，且必须先解决下述服务器证书验证阻断；不得要求安装 FreeRemoteDesk 服务端 |
+| Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；私有 adapter 已实现服务器身份验证、TLS、CredSSP/NLA、licensing 与 activation，2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录、首帧或输入互操作；不得要求安装 FreeRemoteDesk 服务端 |
 | Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
 
 ### Windows 客户端连接 macOS 功能明细
@@ -61,8 +61,8 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
-| 服务器身份与 TLS | RDP TLS + 系统信任链 + SHA-256 pin | **开发中** | **发布阻断项：** IronRDP 0.17.0 示例/默认 TLS backend 接受无效证书，FreeRemoteDesk 禁止原样使用。必须在发送任何 CredSSP 凭据前完成系统信任链、主机名和有效期校验；未知自签名证书走现有显式信任页面并重新连接，已保存指纹变化必须 fail-closed。见 `docs/superpowers/specs/2026-08-29-windows-native-rdp-design.md` |
-| 账号密码认证 | CredSSP/NLA | **开发中** | 只支持要求 NLA/TLS 的现代 Windows 基线；凭据不得进入 argv、普通配置、日志或抓包 |
+| 服务器身份与 TLS | RDP TLS + 系统信任链 + SHA-256 pin | **开发中** | 已实现系统信任链、主机名、有效期、未知证书显式确认、精确 pin 重连和指纹变化 fail-closed；身份确认及第二次 TLS 验证前不读取用户名/密码。2026-08-29 证据仅限 `frd-protocol-rdp` 单元测试与 workspace 测试，尚无 Windows 真机证书互操作证明 |
+| 账号密码认证 | CredSSP/NLA | **开发中** | 私有 adapter 已实现只允许 NLA/TLS 的 CredSSP、licensing 与 activation 基线；2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录或会话证明。凭据不得进入 argv、普通配置、日志或抓包 |
 | 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 设计为 BGRX 脏矩形发布；尚无产品构建或真机首帧证据 |
 | 鼠标与键盘 | RDP fast-path input | **开发中** | 设计包含 scan code、Unicode、鼠标、滚轮和失焦 `ReleaseAll`；尚未完成产品互操作 |
 | 动态分辨率与多显示器 | Display Control DVC | **计划中** | 第一阶段固定初始远端尺寸；服务端确认新布局前不得切换 generation |

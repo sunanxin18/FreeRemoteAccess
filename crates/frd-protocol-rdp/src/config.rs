@@ -65,7 +65,6 @@ impl ParsedUsername {
 
 pub struct RdpConnectionConfig {
     pub(crate) request: ConnectRequest,
-    pub(crate) username: ParsedUsername,
 }
 
 pub(crate) struct ConnectorCredentials {
@@ -83,22 +82,23 @@ impl RdpConnectionConfig {
             .credentials
             .take()
             .ok_or_else(|| rdp_error(RDP_CREDENTIALS_REQUIRED))?;
+        let username = ParsedUsername::parse(&credentials.username)
+            .map_err(|()| rdp_error(RDP_INVALID_USERNAME))?;
         if credentials.password.expose().is_empty() {
             return Err(rdp_error(RDP_CREDENTIALS_REQUIRED));
         }
         let password = std::str::from_utf8(credentials.password.expose())
             .map(str::to_owned)
             .map_err(|_| rdp_error(crate::error::RDP_NLA_FAILED))?;
-        let username = self
-            .username
+        let connector_username = username
             .upn()
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| self.username.account().to_owned());
+            .unwrap_or_else(|| username.account().to_owned());
 
         Ok(ConnectorCredentials {
-            username,
+            username: connector_username,
             password,
-            domain: self.username.domain().map(ToOwned::to_owned),
+            domain: username.domain().map(ToOwned::to_owned),
         })
     }
 }
@@ -110,13 +110,10 @@ impl TryFrom<ConnectRequest> for RdpConnectionConfig {
         if request.protocol_id != ProtocolId::rdp() {
             return Err(rdp_error(RDP_PROTOCOL_MISMATCH));
         }
-        let credentials = request
-            .credentials
-            .as_ref()
-            .ok_or_else(|| rdp_error(RDP_CREDENTIALS_REQUIRED))?;
-        let username = ParsedUsername::parse(&credentials.username)
-            .map_err(|()| rdp_error(RDP_INVALID_USERNAME))?;
-        Ok(Self { request, username })
+        if request.credentials.is_none() {
+            return Err(rdp_error(RDP_CREDENTIALS_REQUIRED));
+        }
+        Ok(Self { request })
     }
 }
 
@@ -126,6 +123,26 @@ mod tests {
     use frd_protocol_api::{ConnectRequest, Credentials, Endpoint, ProtocolId};
 
     use super::RdpConnectionConfig;
+
+    #[test]
+    fn factory_construction_defers_invalid_username_until_worker_extraction() {
+        let mut config = RdpConnectionConfig::try_from(ConnectRequest {
+            session_id: SessionId::allocate(),
+            endpoint: Endpoint::new("rdp.example", 3389).expect("valid endpoint"),
+            protocol_id: ProtocolId::rdp(),
+            credentials: Some(Credentials {
+                username: " alice".to_owned(),
+                password: SecretBuffer::new(vec![0x01]).take(),
+            }),
+            saved_server_pin: None,
+        })
+        .expect("factory construction must not read or parse the username");
+
+        match config.take_connector_credentials() {
+            Err(error) => assert_eq!(error.code(), "rdp_invalid_username"),
+            Ok(_) => panic!("worker extraction must reject the invalid username"),
+        }
+    }
 
     #[test]
     fn connector_secret_validation_is_deferred_until_worker_extraction() {
