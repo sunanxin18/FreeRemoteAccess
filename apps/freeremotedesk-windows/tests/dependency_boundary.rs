@@ -142,6 +142,80 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
     );
 }
 
+#[test]
+fn windows_composition_wires_each_store_once_and_purges_before_app_launch() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Windows app is nested under the workspace");
+    let main_source =
+        std::fs::read_to_string(workspace.join("apps/freeremotedesk-windows/src/main.rs"))
+            .expect("Windows composition root source is readable");
+
+    verify_windows_store_composition(&main_source)
+        .expect("the product composition matches the secure-store ledger");
+
+    let without_purge = main_source.replacen(
+        "purge_pending_credentials(credentials.as_ref())",
+        "purge_pending_credentials_disabled(credentials.as_ref())",
+        1,
+    );
+    assert!(verify_windows_store_composition(&without_purge).is_err());
+
+    let duplicated_credential_store = main_source.replacen(
+        "let credentials = Arc::new(WindowsCredentialStore::new());",
+        "let credentials = Arc::new(WindowsCredentialStore::new());\n    let duplicate_credentials = Arc::new(WindowsCredentialStore::new());",
+        1,
+    );
+    assert!(verify_windows_store_composition(&duplicated_credential_store).is_err());
+}
+
+fn verify_windows_store_composition(source: &str) -> Result<(), String> {
+    let required_once = [
+        "DpapiServerIdentityStore::current_user_default()",
+        "WindowsConnectionProfileStore::current_user_default()",
+        "WindowsCredentialStore::new()",
+        "purge_pending_credentials(credentials.as_ref())",
+        "let credentials = credentials as Arc<dyn SecureCredentialStore>;",
+        "DesktopPlatformStores::new(server_identities, profiles, credentials)",
+        "AppLaunch::new_with_stores(",
+        "stores.as_app_stores()",
+    ];
+    for needle in required_once {
+        let count = source.matches(needle).count();
+        if count != 1 {
+            return Err(format!(
+                "composition marker must occur once: {needle} ({count})"
+            ));
+        }
+    }
+
+    let position = |needle: &str| {
+        source
+            .find(needle)
+            .ok_or_else(|| format!("missing composition marker: {needle}"))
+    };
+    let credential_constructor = position("WindowsCredentialStore::new()")?;
+    let purge = position("purge_pending_credentials(credentials.as_ref())")?;
+    let credential_erasure =
+        position("let credentials = credentials as Arc<dyn SecureCredentialStore>;")?;
+    let store_bundle =
+        position("DesktopPlatformStores::new(server_identities, profiles, credentials)")?;
+    let app_launch = position("AppLaunch::new_with_stores(")?;
+    let launch_stores = position("stores.as_app_stores()")?;
+
+    if !(credential_constructor < purge
+        && purge < credential_erasure
+        && credential_erasure < store_bundle
+        && store_bundle < app_launch
+        && app_launch < launch_stores)
+    {
+        return Err("credential purge and store bundle must precede AppLaunch".to_owned());
+    }
+
+    Ok(())
+}
+
 fn collect_concrete_imports(
     directory: &std::path::Path,
     workspace: &std::path::Path,

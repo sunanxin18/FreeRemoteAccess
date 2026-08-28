@@ -54,7 +54,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | UDP 媒体传输 | Apple Message 1/2、`0x1c`、SRTP/SRTCP | **受限验证** | 音频和视频 socket 已完成有界真机互操作；长时间网络稳定性未覆盖 |
 | Windows→Mac 麦克风 | Apple Audio Chat / IDS 路径 | **不支持** | 原生用户名密码 HPSS 会话没有已恢复的 Audio Chat 分支；Apple ID 与服务端助手均超出产品边界 |
 | 剪贴板 | 能力边界已预留 | **计划中** | 当前 Windows 产品未完成端到端剪贴板集成 |
-| 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **受限验证** | 自动化状态机、非敏感元数据及本机进程唯一凭据库往返已通过；未执行授权 Mac 端到端 GUI 保存/取消保存，见 `docs/validation/windows-secure-login.md` |
+| 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **开发中** | 自动化状态机、非敏感元数据及本机进程唯一凭据库往返已通过；按本矩阵定义，授权 Mac GUI 的 TransportReady 提交与取消保存删除链路尚未完成有界真机验证，见 `docs/validation/windows-secure-login.md` |
 | 文件传输 | 未选择 | **计划中** | 需先确认各原生服务端支持的协议与安全边界 |
 
 ### 客户端与服务端组合
