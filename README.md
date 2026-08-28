@@ -26,7 +26,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
 |---|---|---|---|---|---|
-| Windows | winit + egui + wgpu | 键盘、鼠标 | Windows Release/ICO 资源开发中 | macOS | **开发中**；Windows-first 重构见 `docs/superpowers/specs/2026-08-27-winit-wgpu-windows-first-architecture-design.md` |
+| Windows | winit + egui + wgpu | 键盘、鼠标 | Windows Release/ICO 资源开发中 | macOS；Windows RDP 开发中 | **开发中**；Windows-first 重构见 `docs/superpowers/specs/2026-08-27-winit-wgpu-windows-first-architecture-design.md`，Windows RDP 尚未接入产品 |
 | macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；必须保留 macOS 原生标题栏、字体和 Keychain 适配 |
 | Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；需实现窗口管理器适配与 Secret Service |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
@@ -37,7 +37,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
 |---|---|---|---|---|
 | macOS | Screen Sharing / Remote Management | Apple HPSS、RFB 线协议、MVS、Apple UDP 媒体 | Windows | **受限验证**；账号密码登录、画面、输入和 Mac→PC 音频已有有界真机证据 |
-| Windows | Remote Desktop Services | RDP，计划采用纯 Rust 协议适配 | 尚无 | **计划中**；不得要求安装 FreeRemoteDesk 服务端 |
+| Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；基础 TLS/NLA、传统位图与输入尚未接入产品，且必须先解决下述服务器证书验证阻断；不得要求安装 FreeRemoteDesk 服务端 |
 | Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
 
 ### Windows 客户端连接 macOS 功能明细
@@ -57,11 +57,29 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **开发中** | 自动化状态机、非敏感元数据及本机进程唯一凭据库往返已通过；按本矩阵定义，授权 Mac GUI 的 TransportReady 提交与取消保存删除链路尚未完成有界真机验证，见 `docs/validation/windows-secure-login.md` |
 | 文件传输 | 未选择 | **计划中** | 需先确认各原生服务端支持的协议与安全边界 |
 
+### Windows 客户端连接 Windows 功能明细
+
+| 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
+|---|---|---|---|
+| 服务器身份与 TLS | RDP TLS + 系统信任链 + SHA-256 pin | **开发中** | **发布阻断项：** IronRDP 0.17.0 示例/默认 TLS backend 接受无效证书，FreeRemoteDesk 禁止原样使用。必须在发送任何 CredSSP 凭据前完成系统信任链、主机名和有效期校验；未知自签名证书走现有显式信任页面并重新连接，已保存指纹变化必须 fail-closed。见 `docs/superpowers/specs/2026-08-29-windows-native-rdp-design.md` |
+| 账号密码认证 | CredSSP/NLA | **开发中** | 只支持要求 NLA/TLS 的现代 Windows 基线；凭据不得进入 argv、普通配置、日志或抓包 |
+| 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 设计为 BGRX 脏矩形发布；尚无产品构建或真机首帧证据 |
+| 鼠标与键盘 | RDP fast-path input | **开发中** | 设计包含 scan code、Unicode、鼠标、滚轮和失焦 `ReleaseAll`；尚未完成产品互操作 |
+| 动态分辨率与多显示器 | Display Control DVC | **计划中** | 第一阶段固定初始远端尺寸；服务端确认新布局前不得切换 generation |
+| 现代图形 | EGFX、ZGFX、AVC420 | **计划中** | 只允许作为 RDP adapter 内部解码路径发布现有 `SurfaceUpdate`，不新增 UI；不得宣告 IronRDP 0.17.0 尚未实现的 AVC444/AVC444v2 |
+| 文本剪贴板 | CLIPRDR | **计划中** | 只复用当前剪贴板按钮、能力和事件接口；文件复制不在当前 RDP 开发范围 |
+| Windows→客户端音频 | RDPSND | **计划中** | 通过协议中立媒体端口接入，不允许 RDP adapter 直接打开平台音频设备 |
+| 客户端麦克风、文件、磁盘与设备 | RDPEAI、CLIPRDR 文件、RDPDR | **计划中** | 不在当前 RDP 开发范围，也不新增入口或公共接口；未来必须单独设计并获得批准 |
+
+当前 RDP 开发只适配 FreeRemoteDesk 已有的统一登录、证书确认、画面、键鼠、
+动态分辨率、文本剪贴板、远程音频、状态与断开接口。不得为了暴露 IronRDP 的
+其他能力扩展当前 UI 或影响 Apple adapter；未纳入现有公共接口的能力保持隐藏。
+
 ### 客户端与服务端组合
 
 | 客户端 \ 服务端 | macOS 原生服务 | Windows 原生服务 | Linux 原生服务 |
 |---|---|---|---|
-| Windows | **受限验证** | **计划中** | **计划中** |
+| Windows | **受限验证** | **开发中** | **计划中** |
 | macOS | **计划中** | **计划中** | **计划中** |
 | Linux | **计划中** | **计划中** | **计划中** |
 | Android | **计划中** | **计划中** | **计划中** |
