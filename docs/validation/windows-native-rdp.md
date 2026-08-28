@@ -9,9 +9,10 @@ Display Control 互操作证明。因此 README 中 Windows RDP 仍为 **开发�
 已实现并纳入离线门禁的适配器边界包括：系统信任链和显式证书确认/精确 pin、仅
 CredSSP/NLA 的连接路径、licensing/activation 基线、BGRX 脏矩形发布、fast-path
 键鼠、单主显示器 Display Control、Unicode 文本 CLIPRDR，以及 48 kHz 双声道 PCM
-RDPSND 发布。未纳入当前范围的能力仍为：RDPDR/文件/磁盘/设备、AUDIN/客户端
-麦克风、网关、智能卡、打印机、多显示器，以及 EGFX/ZGFX/AVC420 之外的现代图形
-互操作；它们没有因此次构建而获得任何声明。
+RDPSND 发布。离线基线图形仅为 Raw、Interleaved RLE、RDP 6 Bitmap 和 RemoteFX。
+EGFX、ZGFX、AVC/AVC420 与 AVC444 均未实现或验证，不得因本次构建而作出支持声明。
+未纳入当前范围的其他能力仍为：RDPDR/文件/磁盘/设备、AUDIN/客户端麦克风、网关、
+智能卡、打印机和多显示器。
 
 ## 工具链
 
