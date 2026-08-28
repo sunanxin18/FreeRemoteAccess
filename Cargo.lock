@@ -995,6 +995,8 @@ dependencies = [
  "frd-core",
  "frd-media-api",
  "frd-platform-api",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "windows-sys 0.59.0",
