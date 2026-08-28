@@ -74,6 +74,26 @@
   agent on the Mac requires separate explicit authorization and never counts as
   a production implementation path.
 
+## Remote-Content UI Boundary
+
+- Maximize the usable remote-desktop surface on desktop clients. The login and
+  required authentication-decision flow may use the client area; after a
+  connection attempt starts, persistent application controls, status text,
+  diagnostics, audio state, clipboard state, cancel, and disconnect actions
+  must live in the title-bar/chrome region and must not overlay or reserve an
+  additional toolbar inside the remote-content area.
+- Preserve each platform's native window conventions: macOS keeps the native
+  traffic-light controls on the left, while Windows and Linux follow their
+  platform/window-manager control placement. FreeRemoteDesk-owned session
+  controls remain geometrically centered independently of those controls.
+- Prefer recognizable, resolution-independent glyphs for title-bar actions and
+  states. Every glyph must expose a tooltip, accessible label, keyboard focus,
+  and a non-color-only distinction for unavailable, active, and failed states.
+- The renderer and input mapper must consume the same content rectangle below
+  the effective title bar. Window chrome must remain a platform-shell concern;
+  protocol, decoder, framebuffer, and renderer-core modules must not depend on
+  platform title-bar APIs.
+
 ## Project Structure & Module Organization
 FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
 
