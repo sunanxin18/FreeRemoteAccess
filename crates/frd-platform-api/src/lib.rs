@@ -86,6 +86,14 @@ impl ConnectionProfileKey {
     }
 }
 
+/// Public profile metadata deliberately excludes credentials.
+///
+/// ```compile_fail
+/// # use frd_platform_api::SavedConnectionProfile;
+/// # fn read_password(profile: &SavedConnectionProfile) {
+/// let _password = &profile.password;
+/// # }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedConnectionProfile {
     pub key: ConnectionProfileKey,
@@ -148,15 +156,5 @@ mod tests {
         let mut profiles = vec![older, newer.clone()];
         SavedConnectionProfile::sort_most_recent(&mut profiles);
         assert_eq!(profiles[0], newer);
-    }
-
-    #[test]
-    fn saved_profile_has_no_password_field() {
-        let profile = test_profile(1);
-        let _ = (
-            profile.key,
-            profile.target_system,
-            profile.last_success_order,
-        );
     }
 }
