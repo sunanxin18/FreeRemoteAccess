@@ -5,11 +5,13 @@ use egui::{FontData, FontDefinitions, FontFamily};
 const CJK_FALLBACK_NAME: &str = "frd-cjk-fallback";
 
 pub(crate) fn system_font_definitions() -> FontDefinitions {
-    system_cjk_font_paths()
+    let mut definitions = system_cjk_font_paths()
         .into_iter()
         .find_map(|path| std::fs::read(path).ok().filter(|bytes| !bytes.is_empty()))
         .map(definitions_with_cjk_fallback)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    frd_ui_egui::install_login_icons_font(&mut definitions);
+    definitions
 }
 
 fn definitions_with_cjk_fallback(bytes: Vec<u8>) -> FontDefinitions {

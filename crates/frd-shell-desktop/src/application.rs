@@ -1306,6 +1306,7 @@ impl DesktopApplication {
         }
         let raw_input = window.egui_state.take_egui_input(&window.window);
         let egui_context = window.egui_context.clone();
+        let connection_busy = self.sessions.is_active();
         let mode = &mut self.mode;
         let controller = self.launch.controller_mut();
         let catalog = &self.catalog;
@@ -1314,7 +1315,12 @@ impl DesktopApplication {
             DesktopMode::Product => {
                 if let Some(form) = controller.connection_form_mut() {
                     egui::CentralPanel::default_margins().show(root_ui, |ui| {
-                        intent = frd_ui_egui::show_connection_form(ui, form, catalog);
+                        intent = frd_ui_egui::show_connection_form_with_state(
+                            ui,
+                            form,
+                            catalog,
+                            connection_busy,
+                        );
                     });
                 } else if matches!(controller.page(), AppPage::RemoteSession { .. }) {
                     egui::Panel::top("remote-toolbar").show(root_ui, |ui| {
