@@ -4,12 +4,7 @@ use frd_protocol_api::{
 };
 
 use crate::config::RdpConnectionConfig;
-
-const RDP_SESSION_NOT_IMPLEMENTED: &str = "rdp_session_not_implemented";
-
-fn rdp_error(code: &'static str) -> ProtocolError {
-    ProtocolError::adapter(ProtocolId::rdp(), code)
-}
+use crate::runtime::run_protocol_session;
 
 pub struct RdpProtocolFactory;
 
@@ -36,9 +31,7 @@ pub struct RdpProtocolSession {
 impl ProtocolSession for RdpProtocolSession {
     fn run(self: Box<Self>) -> ProtocolExit {
         let Self { config, runtime } = *self;
-        let RdpConnectionConfig { request, username } = config;
-        let _ = (request, username, runtime);
-        ProtocolExit::Failed(rdp_error(RDP_SESSION_NOT_IMPLEMENTED))
+        run_protocol_session(config, runtime)
     }
 }
 

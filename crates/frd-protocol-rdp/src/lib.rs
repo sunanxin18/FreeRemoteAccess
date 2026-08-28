@@ -1,8 +1,10 @@
 //! Windows RDP protocol adapter boundary.
 
 mod config;
+mod connector;
 mod error;
 mod factory;
+mod runtime;
 mod server_identity;
 mod tls;
 mod upstream;

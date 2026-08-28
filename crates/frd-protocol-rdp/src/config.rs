@@ -68,6 +68,41 @@ pub struct RdpConnectionConfig {
     pub(crate) username: ParsedUsername,
 }
 
+pub(crate) struct ConnectorCredentials {
+    pub(crate) username: String,
+    pub(crate) password: String,
+    pub(crate) domain: Option<String>,
+}
+
+impl RdpConnectionConfig {
+    pub(crate) fn take_connector_credentials(
+        &mut self,
+    ) -> Result<ConnectorCredentials, ProtocolError> {
+        let credentials = self
+            .request
+            .credentials
+            .take()
+            .ok_or_else(|| rdp_error(RDP_CREDENTIALS_REQUIRED))?;
+        if credentials.password.expose().is_empty() {
+            return Err(rdp_error(RDP_CREDENTIALS_REQUIRED));
+        }
+        let password = std::str::from_utf8(credentials.password.expose())
+            .map(str::to_owned)
+            .map_err(|_| rdp_error(crate::error::RDP_NLA_FAILED))?;
+        let username = self
+            .username
+            .upn()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.username.account().to_owned());
+
+        Ok(ConnectorCredentials {
+            username,
+            password,
+            domain: self.username.domain().map(ToOwned::to_owned),
+        })
+    }
+}
+
 impl TryFrom<ConnectRequest> for RdpConnectionConfig {
     type Error = ProtocolError;
 
@@ -79,11 +114,36 @@ impl TryFrom<ConnectRequest> for RdpConnectionConfig {
             .credentials
             .as_ref()
             .ok_or_else(|| rdp_error(RDP_CREDENTIALS_REQUIRED))?;
-        if credentials.password.expose().is_empty() {
-            return Err(rdp_error(RDP_CREDENTIALS_REQUIRED));
-        }
         let username = ParsedUsername::parse(&credentials.username)
             .map_err(|()| rdp_error(RDP_INVALID_USERNAME))?;
         Ok(Self { request, username })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use frd_core::{SecretBuffer, SessionId};
+    use frd_protocol_api::{ConnectRequest, Credentials, Endpoint, ProtocolId};
+
+    use super::RdpConnectionConfig;
+
+    #[test]
+    fn connector_secret_validation_is_deferred_until_worker_extraction() {
+        let mut config = RdpConnectionConfig::try_from(ConnectRequest {
+            session_id: SessionId::allocate(),
+            endpoint: Endpoint::new("rdp.example", 3389).expect("valid endpoint"),
+            protocol_id: ProtocolId::rdp(),
+            credentials: Some(Credentials {
+                username: "alice".to_owned(),
+                password: SecretBuffer::new(Vec::new()).take(),
+            }),
+            saved_server_pin: None,
+        })
+        .expect("factory construction must not inspect the secret bytes");
+
+        match config.take_connector_credentials() {
+            Err(error) => assert_eq!(error.code(), "rdp_credentials_required"),
+            Ok(_) => panic!("the worker must reject an empty secret"),
+        }
     }
 }

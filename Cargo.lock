@@ -1963,8 +1963,10 @@ name = "frd-protocol-rdp"
 version = "0.1.0"
 dependencies = [
  "frd-core",
+ "frd-frame",
  "frd-protocol-api",
  "ironrdp",
+ "ironrdp-blocking",
  "rcgen",
  "rustls",
  "rustls-platform-verifier",
@@ -2640,7 +2642,21 @@ dependencies = [
  "ironrdp-connector",
  "ironrdp-graphics",
  "ironrdp-input",
+ "ironrdp-pdu",
  "ironrdp-session",
+]
+
+[[package]]
+name = "ironrdp-blocking"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11f69f98a65a1aaf7b359ccec058a8dc8a227f8905d4e472a757b2b701f74071"
+dependencies = [
+ "bytes",
+ "ironrdp-connector",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "tracing",
 ]
 
 [[package]]

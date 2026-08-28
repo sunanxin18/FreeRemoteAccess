@@ -2,6 +2,7 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
 use frd_protocol_api::{Endpoint, ProtocolError};
+use ironrdp_blocking::Framed;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ClientConfig, ClientConnection, Resumption};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -17,18 +18,34 @@ use crate::server_identity::{
     SanitizedCertificateNames,
 };
 
-type TlsStream = StreamOwned<ClientConnection, TcpStream>;
+pub(crate) type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
 #[allow(dead_code)] // Task 3 consumes the stream and CredSSP public key.
 pub(crate) struct VerifiedTlsTransport {
-    stream: TlsStream,
+    stream: Framed<TlsStream>,
     server_public_key: Vec<u8>,
 }
 
 impl VerifiedTlsTransport {
     #[allow(dead_code)] // Task 3 consumes this seam.
-    pub(crate) fn into_parts(self) -> (TlsStream, Vec<u8>) {
+    pub(crate) fn into_parts(self) -> (Framed<TlsStream>, Vec<u8>) {
         (self.stream, self.server_public_key)
+    }
+
+    pub(crate) fn from_parts(stream: Framed<TlsStream>, server_public_key: Vec<u8>) -> Self {
+        Self {
+            stream,
+            server_public_key,
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _ = self
+            .stream
+            .get_inner()
+            .0
+            .sock
+            .shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -217,7 +234,7 @@ pub(crate) fn establish_verified_tls(
         .ok_or_else(tls_error)?;
     let server_public_key = extract_server_public_key(leaf.as_ref())?;
     Ok(VerifiedTlsTransport {
-        stream: tls,
+        stream: Framed::new(tls),
         server_public_key,
     })
 }
