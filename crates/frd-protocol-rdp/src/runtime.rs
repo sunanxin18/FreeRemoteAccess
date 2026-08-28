@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -18,11 +19,37 @@ use crate::input::{RdpInputError, RdpInputState};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const NETWORK_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACTIVE_COMMAND_BUDGET: usize = 64;
+const ACTIVE_EVENT_BUDGET: usize = 255;
 
 pub(crate) enum ActiveCommandBatch {
-    Continue(Vec<FastPathInputEvent>),
+    Continue {
+        events: Vec<FastPathInputEvent>,
+        pending: bool,
+    },
     Disconnect(Vec<FastPathInputEvent>),
     Terminal(Vec<FastPathInputEvent>),
+}
+
+pub(crate) struct ActiveCommandDrain {
+    pending_events: VecDeque<FastPathInputEvent>,
+}
+
+impl ActiveCommandDrain {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending_events: VecDeque::new(),
+        }
+    }
+
+    fn take_batch(&mut self) -> Vec<FastPathInputEvent> {
+        let count = self.pending_events.len().min(ACTIVE_EVENT_BUDGET);
+        self.pending_events.drain(..count).collect()
+    }
+
+    fn take_all(&mut self) -> Vec<FastPathInputEvent> {
+        self.pending_events.drain(..).collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,18 +62,36 @@ pub(crate) enum ReactivationCommand {
 pub(crate) fn drain_active_commands(
     runtime: &mut ProtocolRuntime,
     input: &mut RdpInputState,
+    drain: &mut ActiveCommandDrain,
 ) -> Result<ActiveCommandBatch, RdpInputError> {
     if runtime.requires_shutdown() {
-        return Ok(ActiveCommandBatch::Terminal(input.stop()));
+        let mut events = drain.take_all();
+        events.extend(input.stop());
+        return Ok(ActiveCommandBatch::Terminal(events));
+    }
+    if !drain.pending_events.is_empty() {
+        let events = drain.take_batch();
+        return Ok(ActiveCommandBatch::Continue {
+            events,
+            pending: !drain.pending_events.is_empty(),
+        });
     }
 
-    let mut events = Vec::new();
-    while let Some(command) = runtime.try_next_command() {
+    for _ in 0..ACTIVE_COMMAND_BUDGET {
+        let Some(command) = runtime.try_next_command() else {
+            break;
+        };
         match command {
             SessionCommand::Input(session_input) => {
-                events.extend(input.translate(session_input.event)?);
+                drain
+                    .pending_events
+                    .extend(input.translate(session_input.event)?);
+                if drain.pending_events.len() >= ACTIVE_EVENT_BUDGET {
+                    break;
+                }
             }
             SessionCommand::Disconnect => {
+                let mut events = drain.take_all();
                 events.extend(input.stop());
                 return Ok(ActiveCommandBatch::Disconnect(events));
             }
@@ -55,14 +100,21 @@ pub(crate) fn drain_active_commands(
             | SessionCommand::ClipboardWrite(_) => {}
         }
     }
-    Ok(ActiveCommandBatch::Continue(events))
+    let events = drain.take_batch();
+    Ok(ActiveCommandBatch::Continue {
+        events,
+        pending: !drain.pending_events.is_empty(),
+    })
 }
 
 pub(crate) fn drain_reactivation_commands(runtime: &mut ProtocolRuntime) -> ReactivationCommand {
     if runtime.requires_shutdown() {
         return ReactivationCommand::Terminal;
     }
-    while let Some(command) = runtime.try_next_command() {
+    for _ in 0..ACTIVE_COMMAND_BUDGET {
+        let Some(command) = runtime.try_next_command() else {
+            return ReactivationCommand::Continue;
+        };
         if matches!(command, SessionCommand::Disconnect) {
             return ReactivationCommand::Disconnect;
         }
@@ -397,7 +449,7 @@ mod tests {
     use super::{
         drain_active_commands, drain_reactivation_commands, run_protocol_session,
         wait_for_blocking, wait_for_blocking_with_timeout, wait_for_network_future,
-        ActiveCommandBatch, CancellationCheckedIo,
+        ActiveCommandBatch, ActiveCommandDrain, CancellationCheckedIo,
     };
 
     static WORKER_TEST_SERIAL: Mutex<()> = Mutex::new(());
@@ -444,9 +496,11 @@ mod tests {
             }))
             .expect("runtime command receiver remains open");
         let mut input = RdpInputState::new();
+        let mut drain = ActiveCommandDrain::new();
 
-        let ActiveCommandBatch::Continue(events) =
-            drain_active_commands(&mut runtime, &mut input).expect("current input translates")
+        let ActiveCommandBatch::Continue { events, .. } =
+            drain_active_commands(&mut runtime, &mut input, &mut drain)
+                .expect("current input translates")
         else {
             panic!("no shutdown command was queued");
         };
@@ -457,6 +511,150 @@ mod tests {
             ironrdp::pdu::input::fast_path::FastPathInputEvent::KeyboardEvent(flags, 0x30)
                 if flags.is_empty()
         ));
+    }
+
+    #[test]
+    fn input_large_text_batch_yields_at_the_fast_path_event_budget() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                frd_core::PixelSize::new(2, 2).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        commands
+            .send(SessionCommand::Input(SessionInput {
+                session_id,
+                generation: 1,
+                event: InputEvent::Text {
+                    utf8: "a".repeat(128),
+                },
+            }))
+            .expect("large text sends");
+        let mut input = RdpInputState::new();
+        let mut drain = ActiveCommandDrain::new();
+
+        let ActiveCommandBatch::Continue {
+            events: first,
+            pending: true,
+        } = drain_active_commands(&mut runtime, &mut input, &mut drain)
+            .expect("first bounded batch translates")
+        else {
+            panic!("large text remains active input");
+        };
+        let ActiveCommandBatch::Continue {
+            events: second,
+            pending: false,
+        } = drain_active_commands(&mut runtime, &mut input, &mut drain)
+            .expect("second bounded batch translates")
+        else {
+            panic!("large text remains active input");
+        };
+
+        assert_eq!((first.len(), second.len()), (255, 1));
+    }
+
+    #[test]
+    fn lifecycle_active_drain_yields_with_a_sustained_command_backlog() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                frd_core::PixelSize::new(2048, 2).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        for x in 0..1024 {
+            commands
+                .send(SessionCommand::Input(SessionInput {
+                    session_id,
+                    generation: 1,
+                    event: InputEvent::PointerMove {
+                        remote: frd_core::PixelPoint { x, y: 1 },
+                    },
+                }))
+                .expect("backlogged input sends");
+        }
+        commands
+            .send(SessionCommand::Disconnect)
+            .expect("ordered disconnect sends");
+        let mut input = RdpInputState::new();
+        let mut drain = ActiveCommandDrain::new();
+
+        let ActiveCommandBatch::Continue { events: first, .. } =
+            drain_active_commands(&mut runtime, &mut input, &mut drain)
+                .expect("bounded drain succeeds")
+        else {
+            panic!("first drain must yield before the queued disconnect");
+        };
+
+        assert!(!first.is_empty());
+        assert!(first.len() <= 255);
+    }
+
+    #[test]
+    fn lifecycle_reactivation_yields_with_a_sustained_command_backlog() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                frd_core::PixelSize::new(2048, 2).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        for x in 0..1024 {
+            commands
+                .send(SessionCommand::Input(SessionInput {
+                    session_id,
+                    generation: 1,
+                    event: InputEvent::PointerMove {
+                        remote: frd_core::PixelPoint { x, y: 1 },
+                    },
+                }))
+                .expect("backlogged reactivation input sends");
+        }
+        commands
+            .send(SessionCommand::Disconnect)
+            .expect("ordered disconnect sends");
+
+        assert_eq!(
+            drain_reactivation_commands(&mut runtime),
+            super::ReactivationCommand::Continue
+        );
     }
 
     #[test]
@@ -488,16 +686,18 @@ mod tests {
             }))
             .expect("runtime command receiver remains open");
         let mut input = RdpInputState::new();
+        let mut drain = ActiveCommandDrain::new();
         assert!(matches!(
-            drain_active_commands(&mut runtime, &mut input),
-            Ok(ActiveCommandBatch::Continue(events)) if events.len() == 1
+            drain_active_commands(&mut runtime, &mut input, &mut drain),
+            Ok(ActiveCommandBatch::Continue { events, .. }) if events.len() == 1
         ));
 
         commands
             .send(SessionCommand::Disconnect)
             .expect("runtime command receiver remains open");
         let ActiveCommandBatch::Disconnect(releases) =
-            drain_active_commands(&mut runtime, &mut input).expect("disconnect cannot fail")
+            drain_active_commands(&mut runtime, &mut input, &mut drain)
+                .expect("disconnect cannot fail")
         else {
             panic!("disconnect must stop the active input batch");
         };
@@ -550,9 +750,10 @@ mod tests {
             .send(SessionCommand::Disconnect)
             .expect("disconnect sends");
         let mut input = RdpInputState::new();
+        let mut drain = ActiveCommandDrain::new();
 
         let ActiveCommandBatch::Disconnect(events) =
-            drain_active_commands(&mut runtime, &mut input).expect("batch translates")
+            drain_active_commands(&mut runtime, &mut input, &mut drain).expect("batch translates")
         else {
             panic!("disconnect must finish the batch");
         };

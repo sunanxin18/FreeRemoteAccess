@@ -18,13 +18,15 @@ use crate::connector::ActivatedRdpSession;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED};
 use crate::input::RdpInputState;
 use crate::runtime::{
-    drain_active_commands, drain_reactivation_commands, ActiveCommandBatch, ReactivationCommand,
+    drain_active_commands, drain_reactivation_commands, ActiveCommandBatch, ActiveCommandDrain,
+    ReactivationCommand,
 };
 use crate::surface::validate_negotiated_size;
 use crate::tls::TlsStream;
 use crate::writer::OrderedRdpWriter;
 
 const ACTIVE_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_FAST_PATH_INPUT_EVENTS: usize = 255;
 
 pub(crate) fn run_active_session(
     session: ActivatedRdpSession,
@@ -135,9 +137,12 @@ fn run_active_loop(
     generation: &mut u64,
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<(), ProtocolError> {
+    let mut command_drain = ActiveCommandDrain::new();
     loop {
-        match drain_active_commands(runtime, input).map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))? {
-            ActiveCommandBatch::Continue(events) => {
+        match drain_active_commands(runtime, input, &mut command_drain)
+            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?
+        {
+            ActiveCommandBatch::Continue { events, pending } => {
                 if route_input_events(
                     active_stage,
                     image,
@@ -149,6 +154,9 @@ fn run_active_loop(
                 )? != ActiveOutputControl::Continue
                 {
                     return Err(rdp_error(RDP_ACTIVATION_FAILED));
+                }
+                if pending {
+                    continue;
                 }
             }
             ActiveCommandBatch::Disconnect(events) => {
@@ -287,10 +295,27 @@ fn route_input_events(
     if events.is_empty() || !writer.is_writable() {
         return Ok(ActiveOutputControl::Continue);
     }
-    let outputs = active_stage
-        .process_fastpath_input(image, events)
-        .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
-    route_active_outputs(outputs, writer, runtime, baseline, image, generation)
+    let mut control = ActiveOutputControl::Continue;
+    for batch in fast_path_input_batches(events) {
+        let outputs = active_stage
+            .process_fastpath_input(image, batch)
+            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+        match route_active_outputs(outputs, writer, runtime, baseline, image, generation)? {
+            ActiveOutputControl::Continue => {}
+            ActiveOutputControl::Deactivate if control != ActiveOutputControl::Terminate => {
+                control = ActiveOutputControl::Deactivate;
+            }
+            ActiveOutputControl::Deactivate => {}
+            ActiveOutputControl::Terminate => control = ActiveOutputControl::Terminate,
+        }
+    }
+    Ok(control)
+}
+
+fn fast_path_input_batches(
+    events: &[ironrdp::pdu::input::fast_path::FastPathInputEvent],
+) -> std::slice::Chunks<'_, ironrdp::pdu::input::fast_path::FastPathInputEvent> {
+    events.chunks(MAX_FAST_PATH_INPUT_EVENTS)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -445,7 +470,7 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::sync::{mpsc, Arc, Mutex};
 
-    use frd_core::{PixelSize, SessionId};
+    use frd_core::{InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelSize, SessionId};
     use frd_frame::{FrameCompleteness, SurfaceUpdate};
     use frd_protocol_api::{
         ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent,
@@ -459,11 +484,12 @@ mod tests {
     use ironrdp_blocking::Framed;
 
     use crate::baseline::RdpBaseline;
+    use crate::input::RdpInputState;
     use crate::writer::OrderedRdpWriter;
 
     use super::{
-        commit_reactivated_surface, publish_graphics_update, route_active_outputs,
-        ActiveOutputControl,
+        commit_reactivated_surface, fast_path_input_batches, publish_graphics_update,
+        route_active_outputs, ActiveOutputControl,
     };
 
     #[test]
@@ -635,6 +661,63 @@ mod tests {
         assert_eq!(
             writer.into_framed().into_inner_no_leftover().written,
             b"beforeafter"
+        );
+    }
+
+    #[test]
+    fn input_large_text_is_split_into_valid_ordered_fast_path_batches() {
+        let mut input = RdpInputState::new();
+        let events = input
+            .translate(InputEvent::Text {
+                utf8: "a".repeat(128),
+            })
+            .expect("large text remains valid input");
+
+        let batches = fast_path_input_batches(&events).collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 256);
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [255, 1]
+        );
+        assert_eq!(
+            batches.into_iter().flatten().collect::<Vec<_>>(),
+            events.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lifecycle_large_release_is_split_after_database_state_is_cleared() {
+        let mut input = RdpInputState::new();
+        for code in 1..=255 {
+            input
+                .translate(InputEvent::PhysicalKey {
+                    code: PhysicalKeyCode(code),
+                    state: KeyState::Pressed,
+                    modifiers: Modifiers::default(),
+                })
+                .expect("normal scan code is valid");
+        }
+        input
+            .translate(InputEvent::PhysicalKey {
+                code: PhysicalKeyCode(0xe001),
+                state: KeyState::Pressed,
+                modifiers: Modifiers::default(),
+            })
+            .expect("extended scan code is valid");
+
+        let releases = input.stop();
+        let batches = fast_path_input_batches(&releases).collect::<Vec<_>>();
+
+        assert_eq!(releases.len(), 256);
+        assert!(input.stop().is_empty(), "database state is cleared once");
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [255, 1]
+        );
+        assert_eq!(
+            batches.into_iter().flatten().collect::<Vec<_>>(),
+            releases.iter().collect::<Vec<_>>()
         );
     }
 

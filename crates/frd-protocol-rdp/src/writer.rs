@@ -49,7 +49,11 @@ impl<S: Write> OrderedRdpWriter<S> {
                 "RDP writer is closed",
             ));
         }
-        if let Err(error) = self.framed.write_all(frame) {
+        let result = self
+            .framed
+            .write_all(frame)
+            .and_then(|()| self.framed.get_inner_mut().0.flush());
+        if let Err(error) = result {
             self.writable = false;
             return Err(error);
         }
@@ -107,6 +111,22 @@ mod tests {
         assert_eq!(io.attempts, 1);
     }
 
+    #[test]
+    fn writer_disarms_when_rustls_style_flush_reports_deferred_failure() {
+        let framed = Framed::new(DeferredFailureIo::default());
+        let mut writer = OrderedRdpWriter::new(framed);
+
+        let error = writer
+            .write_frame(b"accepted plaintext")
+            .expect_err("flush must surface the deferred transport failure");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(!writer.is_writable());
+        assert!(writer.write_frame(b"must not be retried").is_err());
+
+        let io = writer.into_framed().into_inner_no_leftover();
+        assert_eq!((io.writes, io.flushes), (1, 1));
+    }
+
     #[derive(Default)]
     struct RecordingIo {
         written: Vec<u8>,
@@ -132,6 +152,33 @@ mod tests {
     #[derive(Default)]
     struct FailingIo {
         attempts: usize,
+    }
+
+    #[derive(Default)]
+    struct DeferredFailureIo {
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Read for DeferredFailureIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for DeferredFailureIo {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "deferred TLS transport failure",
+            ))
+        }
     }
 
     impl Read for FailingIo {
