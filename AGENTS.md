@@ -128,6 +128,22 @@
   when no IME composition or connection attempt is active. It must use the same
   intent and validation path as the primary Connect button.
 
+## Agent-Driven Development Workflow
+
+- Implement product features, behavior changes, bug fixes, and non-trivial
+  refactors with subagents by default. The primary agent owns architecture,
+  task boundaries, review, integration, and final verification; subagents receive
+  concrete, bounded implementation or read-only audit tasks.
+- Do not assign overlapping write scopes concurrently. Tasks that share files,
+  public interfaces, generated assets, or state-machine transitions must run in
+  dependency order, with the earlier diff reviewed before the next task starts.
+- Keep protocol families and client-platform adapters in separate subagent
+  scopes so one implementation cannot leak platform or wire assumptions into
+  another. The primary agent performs the cross-layer integration review.
+- Small documentation or configuration-only edits may remain inline. Follow an
+  explicit user request for inline execution, a specific agent arrangement, or
+  no delegation instead of this default.
+
 ## Project Structure & Module Organization
 FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
 
