@@ -61,9 +61,10 @@ impl ActiveCommandDrain {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReactivationCommand {
-    Continue,
+    Continue {
+        latest_viewport: Option<PhysicalViewport>,
+    },
     Disconnect,
     Terminal,
 }
@@ -127,18 +128,25 @@ pub(crate) fn drain_reactivation_commands(runtime: &mut ProtocolRuntime) -> Reac
     if runtime.requires_shutdown() {
         return ReactivationCommand::Terminal;
     }
+    let mut latest_viewport = None;
     for _ in 0..ACTIVE_COMMAND_BUDGET {
         let Some(command) = runtime.try_next_command() else {
-            return ReactivationCommand::Continue;
+            return ReactivationCommand::Continue { latest_viewport };
         };
-        if matches!(command, SessionCommand::Disconnect) {
-            return ReactivationCommand::Disconnect;
+        match command {
+            SessionCommand::Disconnect => return ReactivationCommand::Disconnect,
+            SessionCommand::ViewportChanged { viewport, .. } => {
+                latest_viewport = Some(viewport);
+            }
+            SessionCommand::Input(_)
+            | SessionCommand::ResolveServerIdentity { .. }
+            | SessionCommand::ClipboardWrite(_) => {}
         }
     }
     if runtime.requires_shutdown() {
         ReactivationCommand::Terminal
     } else {
-        ReactivationCommand::Continue
+        ReactivationCommand::Continue { latest_viewport }
     }
 }
 
@@ -742,10 +750,12 @@ mod tests {
             .send(SessionCommand::Disconnect)
             .expect("ordered disconnect sends");
 
-        assert_eq!(
+        assert!(matches!(
             drain_reactivation_commands(&mut runtime),
-            super::ReactivationCommand::Continue
-        );
+            super::ReactivationCommand::Continue {
+                latest_viewport: None
+            }
+        ));
     }
 
     #[test]
@@ -892,11 +902,70 @@ mod tests {
             }))
             .expect("input command sends");
 
-        assert_eq!(
+        assert!(matches!(
             drain_reactivation_commands(&mut runtime),
-            super::ReactivationCommand::Continue
-        );
+            super::ReactivationCommand::Continue {
+                latest_viewport: None
+            }
+        ));
         assert!(runtime.try_next_command().is_none());
+    }
+
+    #[test]
+    fn lifecycle_reactivation_preserves_only_the_latest_current_viewport() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize::new(1280, 720).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        for (width, height) in [(1600, 900), (1920, 1080)] {
+            commands
+                .send(SessionCommand::ViewportChanged {
+                    session_id,
+                    generation: 1,
+                    viewport: PhysicalViewport::new(
+                        PixelSize { width, height },
+                        PixelRect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        },
+                        PixelSize {
+                            width: 1280,
+                            height: 720,
+                        },
+                    )
+                    .expect("valid viewport"),
+                })
+                .expect("viewport sends during reactivation");
+        }
+
+        assert!(matches!(
+            drain_reactivation_commands(&mut runtime),
+            super::ReactivationCommand::Continue {
+                latest_viewport: Some(viewport)
+            } if viewport.content == PixelRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }
+        ));
     }
 
     fn key_event(usage: u16, state: KeyState) -> InputEvent {

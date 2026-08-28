@@ -36,14 +36,13 @@ impl DisplayControlAdapter {
 
     pub(crate) fn set_negotiated(&mut self, negotiated: bool) {
         self.negotiated = negotiated;
-        if !negotiated {
+        if !negotiated && self.in_flight.is_none() {
             self.queued = None;
-            self.in_flight = None;
         }
     }
 
     pub(crate) fn observe_viewport(&mut self, viewport: PhysicalViewport) {
-        if !self.negotiated {
+        if !self.negotiated && self.in_flight.is_none() {
             return;
         }
         let (width, height) = MonitorLayoutEntry::adjust_display_size(
@@ -51,7 +50,9 @@ impl DisplayControlAdapter {
             viewport.content.height,
         );
         let target = PixelSize { width, height };
-        if target == self.confirmed_size || Some(target) == self.in_flight {
+        if let Some(in_flight) = self.in_flight {
+            self.queued = (target != in_flight).then_some(target);
+        } else if target == self.confirmed_size {
             self.queued = None;
         } else {
             self.queued = Some(target);
@@ -195,5 +196,61 @@ mod tests {
             ResizeConfirmation::Confirmed
         );
         assert_eq!(adapter.take_resize_request(), None);
+    }
+
+    #[test]
+    fn display_return_to_preflight_size_remains_a_follow_up_after_exact_commit() {
+        let initial = PixelSize {
+            width: 1280,
+            height: 720,
+        };
+        let mut adapter = DisplayControlAdapter::new(initial);
+        adapter.set_negotiated(true);
+        adapter.observe_viewport(viewport(1600, 900));
+        assert_eq!(
+            adapter.take_resize_request(),
+            Some(PixelSize {
+                width: 1600,
+                height: 900,
+            })
+        );
+
+        adapter.observe_viewport(viewport(1280, 720));
+        assert_eq!(
+            adapter.confirm_reactivation(PixelSize {
+                width: 1600,
+                height: 900,
+            }),
+            ResizeConfirmation::Confirmed
+        );
+        assert_eq!(adapter.take_resize_request(), Some(initial));
+    }
+
+    #[test]
+    fn display_dvc_loss_preserves_the_exact_in_flight_ack_guard() {
+        let initial = PixelSize {
+            width: 1280,
+            height: 720,
+        };
+        let mut adapter = DisplayControlAdapter::new(initial);
+        adapter.set_negotiated(true);
+        adapter.observe_viewport(viewport(1600, 900));
+        assert_eq!(
+            adapter.take_resize_request(),
+            Some(PixelSize {
+                width: 1600,
+                height: 900,
+            })
+        );
+
+        adapter.set_negotiated(false);
+        assert_eq!(
+            adapter.confirm_reactivation(PixelSize {
+                width: 1280,
+                height: 720,
+            }),
+            ResizeConfirmation::Mismatch
+        );
+        assert_eq!(adapter.confirmed_size(), initial);
     }
 }

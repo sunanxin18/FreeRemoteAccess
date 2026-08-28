@@ -133,6 +133,10 @@ fn run_active_session_inner(
         &mut published_capabilities,
         &activation_factory,
     );
+    let audio_cleanup = stop_and_drain_audio(runtime, &audio);
+    if let Some(cliprdr) = active_stage.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+        clipboard::reset(cliprdr);
+    }
     best_effort_release_held_input(
         runtime,
         &mut writer,
@@ -143,7 +147,7 @@ fn run_active_session_inner(
         generation,
     );
     writer.shutdown();
-    result
+    result.and(audio_cleanup)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -259,6 +263,7 @@ fn run_active_loop(
             ActiveOutputControl::Continue => {}
             ActiveOutputControl::Terminate => return Ok(()),
             ActiveOutputControl::Deactivate => {
+                stop_and_drain_audio(runtime, audio)?;
                 let releases = suspend_active_input_capabilities(runtime, input)?;
                 *published_capabilities = SessionCapabilities::default();
                 if route_input_events(
@@ -510,7 +515,11 @@ fn drive_reactivation(
     let mut buffer = WriteBuf::new();
     loop {
         match drain_reactivation_commands(runtime) {
-            ReactivationCommand::Continue => {}
+            ReactivationCommand::Continue { latest_viewport } => {
+                if let Some(viewport) = latest_viewport {
+                    display.observe_viewport(viewport);
+                }
+            }
             ReactivationCommand::Disconnect => return Ok(ReactivationOutcome::Disconnect),
             ReactivationCommand::Terminal => return Ok(ReactivationOutcome::Terminal),
         }
@@ -625,6 +634,14 @@ fn publish_active_input_capabilities(runtime: &mut ProtocolRuntime) -> Result<()
     }))
 }
 
+fn stop_and_drain_audio(
+    runtime: &mut ProtocolRuntime,
+    audio: &RdpAudioAdapter,
+) -> Result<(), ProtocolError> {
+    audio.stop();
+    audio.drain_to_runtime(runtime)
+}
+
 fn suspend_active_input_capabilities(
     runtime: &mut ProtocolRuntime,
     input: &mut RdpInputState,
@@ -673,6 +690,7 @@ mod tests {
 
     use frd_core::{InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelSize, SessionId};
     use frd_frame::{FrameCompleteness, SurfaceUpdate};
+    use frd_media_api::{MediaFrame, MediaPublishError, MediaPublisher};
     use frd_protocol_api::{
         ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCapabilities,
         SessionEvent, SurfacePublisher,
@@ -684,6 +702,7 @@ mod tests {
     use ironrdp::session::ActiveStageOutput;
     use ironrdp_blocking::Framed;
 
+    use crate::audio::RdpAudioAdapter;
     use crate::baseline::RdpBaseline;
     use crate::input::RdpInputState;
     use crate::writer::OrderedRdpWriter;
@@ -691,7 +710,7 @@ mod tests {
     use super::{
         commit_reactivated_surface, fast_path_input_batches, publish_active_input_capabilities,
         publish_graphics_update, resume_active_input_capabilities, route_active_outputs,
-        suspend_active_input_capabilities, ActiveOutputControl,
+        stop_and_drain_audio, suspend_active_input_capabilities, ActiveOutputControl,
     };
 
     #[test]
@@ -805,6 +824,39 @@ mod tests {
                 "{terminal_outcome} reactivation must not restore input capabilities"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_audio_stop_clears_queued_pcm_and_publishes_stopped_before_reactivation() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let (events, event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RecordingFrames(Arc::new(Mutex::new(Vec::new())))),
+            Some(Box::new(AcceptingMedia)),
+            Box::new(NoopWake),
+        );
+        let audio = RdpAudioAdapter::new();
+        let epoch = audio
+            .begin_server_offer()
+            .expect("server offer begins an epoch");
+        assert!(audio.observe_server_offer(epoch, 48_000, 2, 16));
+        audio.accept_wave(0, &[0x01, 0x00, 0x02, 0x00]);
+
+        stop_and_drain_audio(&mut runtime, &audio).expect("audio lifecycle stop publishes");
+
+        assert!(!audio.remote_audio());
+        assert!(audio.take_frame().is_none());
+        assert!(!runtime.requires_shutdown());
+        assert_eq!(
+            event_rx.try_iter().collect::<Vec<_>>(),
+            vec![SessionEvent::AudioState(
+                frd_protocol_api::AudioState::Stopped
+            )]
+        );
     }
 
     #[test]
@@ -1081,6 +1133,14 @@ mod tests {
 
     impl RuntimeWake for NoopWake {
         fn wake(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct AcceptingMedia;
+
+    impl MediaPublisher for AcceptingMedia {
+        fn publish(&self, _: MediaFrame) -> Result<(), MediaPublishError> {
             Ok(())
         }
     }
