@@ -8,7 +8,8 @@ mod ui_fonts;
 
 pub use application::{
     AudioOutputFactory, BackgroundLaunchOutcome, DesktopApplication, DesktopPlatformStores,
-    DesktopUserEvent, PresentationFailure, SessionHost, SessionHostError, TestTextureOptions, WakeSink,
+    DesktopUserEvent, PresentationFailure, SessionHost, SessionHostError, TestTextureOptions,
+    WakeSink,
 };
 pub use cleanup::{BackgroundCleanupFailure, BackgroundCleanupOutcome};
 pub use fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};

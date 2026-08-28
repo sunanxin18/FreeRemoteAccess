@@ -246,8 +246,7 @@ mod tests {
     use frd_shell_desktop::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 
     use super::{
-        finish_event_loop, purge_pending_credentials, runner_decision, RunnerFailure,
-        RunnerOutcome,
+        finish_event_loop, purge_pending_credentials, runner_decision, RunnerFailure, RunnerOutcome,
     };
 
     struct TestCredentialStore {
