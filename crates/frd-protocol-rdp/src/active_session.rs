@@ -2,7 +2,9 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 use frd_core::SessionId;
-use frd_protocol_api::{ProtocolError, ProtocolExit, ProtocolRuntime};
+use frd_protocol_api::{
+    ProtocolError, ProtocolExit, ProtocolRuntime, SessionCapabilities, SessionEvent,
+};
 use ironrdp::connector::connection_activation::{
     ConnectionActivationFactory, ConnectionActivationState,
 };
@@ -101,6 +103,10 @@ fn run_active_session_inner(
     }
     .build();
     let mut input = RdpInputState::new();
+    if let Err(error) = publish_active_input_capabilities(runtime) {
+        writer.shutdown();
+        return Err(error);
+    }
     let mut generation = 1;
 
     let result = run_active_loop(
@@ -210,7 +216,7 @@ fn run_active_loop(
             ActiveOutputControl::Continue => {}
             ActiveOutputControl::Terminate => return Ok(()),
             ActiveOutputControl::Deactivate => {
-                let releases = input.stop();
+                let releases = suspend_active_input_capabilities(runtime, input)?;
                 if route_input_events(
                     active_stage,
                     image,
@@ -403,7 +409,7 @@ fn drive_reactivation(
             );
             active_stage.set_share_id(share_id);
             active_stage.set_enable_server_pointer(enable_server_pointer);
-            input.resume();
+            resume_active_input_capabilities(runtime, input)?;
             return Ok(ReactivationOutcome::Continue);
         }
     }
@@ -443,6 +449,32 @@ fn publish_graphics_update(
     baseline.publish(runtime, image, generation, region)
 }
 
+fn publish_active_input_capabilities(runtime: &mut ProtocolRuntime) -> Result<(), ProtocolError> {
+    runtime.publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
+        text_input: true,
+        ..SessionCapabilities::default()
+    }))
+}
+
+fn suspend_active_input_capabilities(
+    runtime: &mut ProtocolRuntime,
+    input: &mut RdpInputState,
+) -> Result<Vec<ironrdp::pdu::input::fast_path::FastPathInputEvent>, ProtocolError> {
+    let releases = input.stop();
+    runtime.publish_event(SessionEvent::CapabilitiesChanged(
+        SessionCapabilities::default(),
+    ))?;
+    Ok(releases)
+}
+
+fn resume_active_input_capabilities(
+    runtime: &mut ProtocolRuntime,
+    input: &mut RdpInputState,
+) -> Result<(), ProtocolError> {
+    input.resume();
+    publish_active_input_capabilities(runtime)
+}
+
 fn commit_reactivated_surface(
     runtime: &mut ProtocolRuntime,
     baseline: &mut RdpBaseline,
@@ -473,8 +505,8 @@ mod tests {
     use frd_core::{InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelSize, SessionId};
     use frd_frame::{FrameCompleteness, SurfaceUpdate};
     use frd_protocol_api::{
-        ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent,
-        SurfacePublisher,
+        ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCapabilities,
+        SessionEvent, SurfacePublisher,
     };
     use ironrdp::connector::DesktopSize;
     use ironrdp::graphics::image_processing::PixelFormat as IronPixelFormat;
@@ -488,9 +520,123 @@ mod tests {
     use crate::writer::OrderedRdpWriter;
 
     use super::{
-        commit_reactivated_surface, fast_path_input_batches, publish_graphics_update,
-        route_active_outputs, ActiveOutputControl,
+        commit_reactivated_surface, fast_path_input_batches, publish_active_input_capabilities,
+        publish_graphics_update, resume_active_input_capabilities, route_active_outputs,
+        suspend_active_input_capabilities, ActiveOutputControl,
     };
+
+    #[test]
+    fn active_rdp_input_publishes_only_text_input_capability() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let (events, event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RecordingFrames(Arc::new(Mutex::new(Vec::new())))),
+            None,
+            Box::new(NoopWake),
+        );
+
+        publish_active_input_capabilities(&mut runtime).expect("active input capabilities publish");
+
+        assert_eq!(
+            event_rx.recv().expect("one active capability event"),
+            SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                dynamic_resolution: false,
+                clipboard_read: false,
+                clipboard_write: false,
+                remote_audio: false,
+                text_input: true,
+            })
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn deactivate_all_clears_input_capabilities_before_successful_reactivation() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let (events, event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RecordingFrames(Arc::new(Mutex::new(Vec::new())))),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut input = RdpInputState::new();
+
+        publish_active_input_capabilities(&mut runtime)
+            .expect("initial input capabilities publish");
+        let _releases = suspend_active_input_capabilities(&mut runtime, &mut input)
+            .expect("deactivation clears input capabilities");
+        assert_eq!(
+            input.translate(InputEvent::Text {
+                utf8: "a".to_owned(),
+            }),
+            Err(crate::input::RdpInputError::Stopped)
+        );
+        resume_active_input_capabilities(&mut runtime, &mut input)
+            .expect("successful reactivation resumes input capabilities");
+        assert!(input
+            .translate(InputEvent::Text {
+                utf8: "a".to_owned(),
+            })
+            .is_ok());
+
+        assert_eq!(
+            event_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                    text_input: true,
+                    ..SessionCapabilities::default()
+                }),
+                SessionEvent::CapabilitiesChanged(SessionCapabilities::default()),
+                SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                    text_input: true,
+                    ..SessionCapabilities::default()
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_or_disconnected_reactivation_never_republishes_input_capabilities() {
+        for terminal_outcome in ["failure", "disconnect"] {
+            let session_id = SessionId::allocate();
+            let (_commands, command_rx) = mpsc::channel();
+            let (events, event_rx) = mpsc::channel();
+            let mut runtime = ProtocolRuntime::new(
+                session_id,
+                command_rx,
+                Box::new(RecordingEvents(events)),
+                Box::new(RecordingFrames(Arc::new(Mutex::new(Vec::new())))),
+                None,
+                Box::new(NoopWake),
+            );
+            let mut input = RdpInputState::new();
+
+            publish_active_input_capabilities(&mut runtime)
+                .expect("initial input capabilities publish");
+            let _releases = suspend_active_input_capabilities(&mut runtime, &mut input)
+                .expect("deactivation clears input capabilities");
+
+            assert_eq!(
+                event_rx.try_iter().collect::<Vec<_>>(),
+                vec![
+                    SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                        text_input: true,
+                        ..SessionCapabilities::default()
+                    }),
+                    SessionEvent::CapabilitiesChanged(SessionCapabilities::default()),
+                ],
+                "{terminal_outcome} reactivation must not restore input capabilities"
+            );
+        }
+    }
 
     #[test]
     fn active_session_graphics_output_publishes_one_damage_and_one_boundary() {
@@ -741,6 +887,16 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct RecordingEvents(mpsc::Sender<SessionEvent>);
+
+    impl RuntimeEventSink for RecordingEvents {
+        fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
+            self.0
+                .send(event)
+                .map_err(|_| ProtocolError::EventPortClosed)
         }
     }
 
