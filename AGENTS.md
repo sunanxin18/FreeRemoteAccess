@@ -190,6 +190,29 @@
   explicit user request for inline execution, a specific agent arrangement, or
   no delegation instead of this default.
 
+## Platform Feature Tracking
+
+- Keep the top-level `README.md` platform matrix current for every product
+  feature. Track client runtime platforms and target server operating systems as
+  separate axes; never use a single generic "cross-platform" status that hides
+  which client/server combinations actually work.
+- Use only these implementation states: `已验证`, `受限验证`, `实验性`,
+  `开发中`, `计划中`, and `不支持`. Each non-planned state must name the
+  protocol or subsystem, the validation scope or exact blocker, and the most
+  recent evidence date or repository evidence path.
+- Distinguish compilation, package generation, local UI execution, protocol
+  implementation, and live interoperability. A successful build or unit test
+  must not be presented as proof that one client platform can control a target
+  server platform.
+- Update the matrix in the same change that adds, removes, gates, or materially
+  changes a feature, protocol, platform adapter, package target, or verification
+  result. Reviewers must treat a stale or overstated matrix as an incomplete
+  feature change.
+- Record native-service limitations explicitly. A feature blocked by the stock
+  server protocol, credentials, entitlement, or client-only product boundary is
+  `不支持` or `计划中` with the blocker; never replace it with a custom server
+  component or silently leave the cell blank.
+
 ## Project Structure & Module Organization
 FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
 

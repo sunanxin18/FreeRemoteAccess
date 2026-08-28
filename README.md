@@ -1,11 +1,75 @@
-# FreeRemoteDesk — ARP 发现 + VNC 连接 macOS
+# FreeRemoteDesk
 
-纯 Rust 实现的局域网远程桌面客户端（Windows），复刻 Remote Desktop Manager 连接 Mac mini 的关键链路：
+FreeRemoteDesk 是纯 Rust 远程登录客户端。当前产品优先实现 Windows
+客户端，通过 Apple 原生远程登录服务连接 macOS；后续客户端目标为 macOS、
+Linux、Android 和 HarmonyOS NEXT，后续服务端目标为 Windows 原生 RDP 与
+Linux 原生 RFB/VNC。项目不要求或部署任何自定义服务端组件。
 
-1. **ARP 发现**：扫描局域网，找出在线设备并识别 Apple 设备；
-2. **VNC(RFB) 连接**：与 macOS 内置"屏幕共享"（Screen Sharing，本质是 VNC 服务端，TCP 5900）完成协议握手、DES 密码认证，支持查看 / 截图 / 键鼠控制。
+本文后半部分保留早期 ARP/VNC CLI 的协议说明作为历史实现资料；当前产品
+GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/specs/`
+中的现行设计为准。
 
-不依赖 Npcap、不需要管理员权限、不需要任何 VNC 第三方库——ARP 用 Windows 内核 `SendARP`，RFB 协议全部手写。
+## 平台与功能实现状态
+
+状态定义：
+
+| 状态 | 含义 |
+|---|---|
+| **已验证** | 已实现，并在对应客户端与原生服务端组合上完成真机互操作验证 |
+| **受限验证** | 已实现并完成有边界的真机验证，但尚未覆盖长时间运行或全部网络条件 |
+| **实验性** | 代码存在且默认关闭，协议证据或互操作范围仍不足 |
+| **开发中** | 当前分支正在实现，不能作为可交付功能宣称 |
+| **计划中** | 架构已预留或列入路线图，尚无可运行实现 |
+| **不支持** | 原生协议或产品边界不允许，或已明确决定不实现 |
+
+### 客户端运行平台
+
+| 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
+|---|---|---|---|---|---|
+| Windows | winit + egui + wgpu | 键盘、鼠标 | Windows Release/ICO 资源开发中 | macOS | **开发中**；Windows-first 重构见 `docs/superpowers/specs/2026-08-27-winit-wgpu-windows-first-architecture-design.md` |
+| macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；必须保留 macOS 原生标题栏、字体和 Keychain 适配 |
+| Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；需实现窗口管理器适配与 Secret Service |
+| Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
+| HarmonyOS NEXT 手机/PC | ArkUI/HUKS 边界设计 | 触控/键鼠计划中 | 计划中 | 尚无 | **计划中**；不是 Android 兼容层，须单独完成 ArkUI、HUKS 和构建 POC |
+
+### 原生服务端目标
+
+| 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
+|---|---|---|---|---|
+| macOS | Screen Sharing / Remote Management | Apple HPSS、RFB 线协议、MVS、Apple UDP 媒体 | Windows | **受限验证**；账号密码登录、画面、输入和 Mac→PC 音频已有有界真机证据 |
+| Windows | Remote Desktop Services | RDP，计划采用纯 Rust 协议适配 | 尚无 | **计划中**；不得要求安装 FreeRemoteDesk 服务端 |
+| Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
+
+### Windows 客户端连接 macOS 功能明细
+
+| 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
+|---|---|---|---|
+| Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
+| 完整桌面画面 | Apple HPSS + MVS type-0 | **已验证** | 真机可显示并完成键鼠交互；现行 GUI 重构仍需持续回归 |
+| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；见 `AGENTS.md` P2 |
+| 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
+| 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |
+| 动态分辨率 | 实验性 resized `0x09` + generation 切换 | **实验性** | 默认关闭；尚无足够 Apple 线协议互操作证据，见 `AGENTS.md` P1 |
+| Mac→Windows 音频 | Apple UDP/SRTP + AAC-ELD | **受限验证** | 已认证、解码非静音 48 kHz 双声道并通过 Windows 输出；未宣称任意丢包与长时间 rollover |
+| UDP 媒体传输 | Apple Message 1/2、`0x1c`、SRTP/SRTCP | **受限验证** | 音频和视频 socket 已完成有界真机互操作；长时间网络稳定性未覆盖 |
+| Windows→Mac 麦克风 | Apple Audio Chat / IDS 路径 | **不支持** | 原生用户名密码 HPSS 会话没有已恢复的 Audio Chat 分支；Apple ID 与服务端助手均超出产品边界 |
+| 剪贴板 | 能力边界已预留 | **计划中** | 当前 Windows 产品未完成端到端剪贴板集成 |
+| 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **开发中** | 密码仅进入系统安全凭据库；实现计划见 `docs/superpowers/plans/2026-08-28-login-experience-secure-profiles.md` |
+| 文件传输 | 未选择 | **计划中** | 需先确认各原生服务端支持的协议与安全边界 |
+
+### 客户端与服务端组合
+
+| 客户端 \ 服务端 | macOS 原生服务 | Windows 原生服务 | Linux 原生服务 |
+|---|---|---|---|
+| Windows | **受限验证** | **计划中** | **计划中** |
+| macOS | **计划中** | **计划中** | **计划中** |
+| Linux | **计划中** | **计划中** | **计划中** |
+| Android | **计划中** | **计划中** | **计划中** |
+| HarmonyOS NEXT 手机/PC | **计划中** | **计划中** | **计划中** |
+
+矩阵只记录已完成的实际层级：编译通过、安装包生成、客户端本地运行、协议
+实现和真机互操作必须分别验证，不能相互替代。任何新增功能或平台改动都必须
+在同一提交中更新本节。
 
 ---
 
