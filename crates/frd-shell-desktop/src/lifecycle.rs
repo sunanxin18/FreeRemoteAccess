@@ -15,6 +15,13 @@ pub(crate) enum PresentFailureAction {
     Fatal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationOperation {
+    Redraw,
+    Resize,
+    OcclusionResume,
+}
+
 pub(crate) struct PresentationLifecycle {
     committed_size: PixelSize,
     occluded: bool,
@@ -38,12 +45,13 @@ impl PresentationLifecycle {
         &mut self,
         requested: PixelSize,
         result: Result<(), PresentError>,
-    ) -> bool {
-        if self.destroyed || result.is_err() {
-            return false;
+    ) -> Result<(), PresentError> {
+        result?;
+        if self.destroyed {
+            return Err(PresentError::SurfaceDetached);
         }
         self.committed_size = requested;
-        true
+        Ok(())
     }
 
     pub(crate) fn set_occluded(&mut self, occluded: bool) -> OcclusionAction {
@@ -71,7 +79,10 @@ impl PresentationLifecycle {
         !self.destroyed && !self.occluded
     }
 
-    pub(crate) fn classify_present_error(error: PresentError) -> PresentFailureAction {
+    pub(crate) fn classify_present_error(
+        _operation: PresentationOperation,
+        error: PresentError,
+    ) -> PresentFailureAction {
         match error {
             PresentError::ContextMismatch => PresentFailureAction::RecoverGpu,
             PresentError::GpuFault(fault)
@@ -101,7 +112,9 @@ mod tests {
     use frd_core::PixelSize;
     use frd_render_wgpu::GpuFaultClass;
 
-    use super::{OcclusionAction, PresentFailureAction, PresentationLifecycle};
+    use super::{
+        OcclusionAction, PresentFailureAction, PresentationLifecycle, PresentationOperation,
+    };
 
     #[test]
     fn failed_resize_keeps_the_committed_drawable_and_suppresses_viewport_commit() {
@@ -109,10 +122,64 @@ mod tests {
         let requested = PixelSize::new(1200, 700).unwrap();
         let mut lifecycle = PresentationLifecycle::new(initial);
 
-        assert!(!lifecycle.finish_resize(requested, Err(PresentError::SurfaceDetached)));
+        assert_eq!(
+            lifecycle.finish_resize(requested, Err(PresentError::SurfaceDetached)),
+            Err(PresentError::SurfaceDetached)
+        );
         assert_eq!(lifecycle.committed_size(), initial);
-        assert!(lifecycle.finish_resize(requested, Ok(())));
+        assert_eq!(lifecycle.finish_resize(requested, Ok(())), Ok(()));
         assert_eq!(lifecycle.committed_size(), requested);
+    }
+
+    #[test]
+    fn recoverable_and_fatal_resize_errors_preserve_error_without_geometry_commit() {
+        let initial = PixelSize::new(800, 600).unwrap();
+        let requested = PixelSize::new(1200, 700).unwrap();
+        let mut lifecycle = PresentationLifecycle::new(initial);
+        let recoverable = PresentError::GpuFault(GpuFaultClass::DeviceLost);
+        let fatal = PresentError::GpuFault(GpuFaultClass::Validation);
+
+        assert_eq!(
+            lifecycle.finish_resize(requested, Err(recoverable)),
+            Err(recoverable)
+        );
+        assert_eq!(lifecycle.committed_size(), initial);
+        assert_eq!(
+            PresentationLifecycle::classify_present_error(
+                PresentationOperation::Resize,
+                recoverable,
+            ),
+            PresentFailureAction::RecoverGpu
+        );
+        assert_eq!(lifecycle.finish_resize(requested, Err(fatal)), Err(fatal));
+        assert_eq!(lifecycle.committed_size(), initial);
+        assert_eq!(
+            PresentationLifecycle::classify_present_error(PresentationOperation::Resize, fatal),
+            PresentFailureAction::Fatal
+        );
+    }
+
+    #[test]
+    fn recoverable_and_fatal_resume_errors_use_the_same_classifier_and_keep_the_error() {
+        let recoverable = PresentError::GpuFault(GpuFaultClass::Internal);
+        let fatal = PresentError::SurfaceDetached;
+
+        assert_eq!(
+            PresentationLifecycle::classify_present_error(
+                PresentationOperation::OcclusionResume,
+                recoverable,
+            ),
+            PresentFailureAction::RecoverGpu
+        );
+        assert_eq!(
+            PresentationLifecycle::classify_present_error(
+                PresentationOperation::OcclusionResume,
+                fatal,
+            ),
+            PresentFailureAction::Fatal
+        );
+        assert_eq!(recoverable, PresentError::GpuFault(GpuFaultClass::Internal));
+        assert_eq!(fatal, PresentError::SurfaceDetached);
     }
 
     #[test]
@@ -142,23 +209,31 @@ mod tests {
     #[test]
     fn present_faults_select_recovery_only_for_recoverable_gpu_classes() {
         assert_eq!(
-            PresentationLifecycle::classify_present_error(PresentError::GpuFault(
-                GpuFaultClass::DeviceLost,
-            )),
+            PresentationLifecycle::classify_present_error(
+                PresentationOperation::Redraw,
+                PresentError::GpuFault(GpuFaultClass::DeviceLost),
+            ),
             PresentFailureAction::RecoverGpu
         );
         assert_eq!(
-            PresentationLifecycle::classify_present_error(PresentError::ContextMismatch),
+            PresentationLifecycle::classify_present_error(
+                PresentationOperation::Redraw,
+                PresentError::ContextMismatch,
+            ),
             PresentFailureAction::RecoverGpu
         );
         assert_eq!(
-            PresentationLifecycle::classify_present_error(PresentError::GpuFault(
-                GpuFaultClass::Validation,
-            )),
+            PresentationLifecycle::classify_present_error(
+                PresentationOperation::Redraw,
+                PresentError::GpuFault(GpuFaultClass::Validation),
+            ),
             PresentFailureAction::Fatal
         );
         assert_eq!(
-            PresentationLifecycle::classify_present_error(PresentError::SurfaceDetached),
+            PresentationLifecycle::classify_present_error(
+                PresentationOperation::Redraw,
+                PresentError::SurfaceDetached,
+            ),
             PresentFailureAction::Fatal
         );
     }

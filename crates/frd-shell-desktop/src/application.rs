@@ -1,4 +1,6 @@
+use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -37,13 +39,16 @@ use crate::cleanup::{
     spawn_cleanup, BackgroundCleanupFailure, BackgroundCleanupOutcome, CleanupPolicy,
     PendingCleanup,
 };
-use crate::lifecycle::{OcclusionAction, PresentFailureAction, PresentationLifecycle};
+use crate::lifecycle::{
+    OcclusionAction, PresentFailureAction, PresentationLifecycle, PresentationOperation,
+};
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::{InputGate, InputOwnership, InputRouter};
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
 const FRAME_MAILBOX_PIXEL_LIMIT: usize = 64 * 1024 * 1024;
 const MEDIA_MAILBOX_ENTRY_LIMIT: usize = 16;
+const PENDING_LAUNCH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub trait WakeSink: Send + Sync {
     fn wake(&self) -> Result<(), ProtocolError>;
@@ -53,9 +58,59 @@ pub trait AudioOutputFactory: Send + Sync {
     fn open(&self) -> Result<Box<dyn AudioOutput>, AudioOutputError>;
 }
 
-pub enum ProductLaunchOutcome {
+#[cfg(test)]
+enum TestLaunchOutcome {
     Started,
     LaunchRolledBack(SessionStartFailure),
+}
+
+pub enum AcceptedLaunchOutcome {
+    Started,
+    LaunchRolledBack(SessionStartFailure),
+    CancelledStarted,
+    CancelledLaunchRolledBack(SessionStartFailure),
+}
+
+pub struct BackgroundLaunchOutcome {
+    coordinator: SessionCoordinator,
+    result: BackgroundLaunchResult,
+    cancelled_before_publish: bool,
+}
+
+enum BackgroundLaunchResult {
+    Started {
+        cleanup_handle: SessionCleanupHandle,
+        ports: LiveSessionPorts,
+    },
+    LaunchRolledBack(SessionStartFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerKind {
+    Audio,
+    Protocol,
+}
+
+trait WorkerSpawner: Send + Sync {
+    fn spawn(
+        &self,
+        kind: WorkerKind,
+        name: String,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> io::Result<JoinHandle<()>>;
+}
+
+struct SystemWorkerSpawner;
+
+impl WorkerSpawner for SystemWorkerSpawner {
+    fn spawn(
+        &self,
+        _kind: WorkerKind,
+        name: String,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> io::Result<JoinHandle<()>> {
+        std::thread::Builder::new().name(name).spawn(work)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +215,9 @@ pub struct SessionHost {
     coordinator: Option<SessionCoordinator>,
     wake: Arc<dyn WakeSink>,
     audio_factory: Arc<dyn AudioOutputFactory>,
+    worker_spawner: Arc<dyn WorkerSpawner>,
+    launch_in_flight: bool,
+    launch_cancelled: Arc<AtomicBool>,
     active: Option<LiveSessionPorts>,
     cleanup_handle: Option<SessionCleanupHandle>,
     cleanup_in_flight: bool,
@@ -171,6 +229,20 @@ impl SessionHost {
         wake: Arc<dyn WakeSink>,
         audio_factory: Arc<dyn AudioOutputFactory>,
     ) -> Self {
+        Self::new_with_spawner(
+            factories,
+            wake,
+            audio_factory,
+            Arc::new(SystemWorkerSpawner),
+        )
+    }
+
+    fn new_with_spawner(
+        factories: impl IntoIterator<Item = Arc<dyn ProtocolFactory>>,
+        wake: Arc<dyn WakeSink>,
+        audio_factory: Arc<dyn AudioOutputFactory>,
+        worker_spawner: Arc<dyn WorkerSpawner>,
+    ) -> Self {
         let factories = factories.into_iter().collect::<Vec<_>>();
         let catalog = ProtocolCatalog::new(factories.iter().map(|factory| factory.descriptor().id));
         Self {
@@ -178,45 +250,163 @@ impl SessionHost {
             coordinator: Some(SessionCoordinator::new(catalog)),
             wake,
             audio_factory,
+            worker_spawner,
+            launch_in_flight: false,
+            launch_cancelled: Arc::new(AtomicBool::new(false)),
             active: None,
             cleanup_handle: None,
             cleanup_in_flight: false,
         }
     }
 
-    pub fn launch(
+    pub fn begin_launch(
         &mut self,
         permit: SessionStartPermit,
         target: TargetSystem,
         request: ConnectRequest,
-    ) -> ProductLaunchOutcome {
+        notify: impl Fn(BackgroundLaunchOutcome) + Send + Sync + 'static,
+    ) -> Result<bool, SessionHostError> {
+        if self.launch_in_flight || self.cleanup_handle.is_some() || self.cleanup_in_flight {
+            return Ok(false);
+        }
         let selected_factory = self
             .factories
             .iter()
             .find(|factory| factory.descriptor().id == request.protocol_id)
             .cloned();
+        let pending = PendingLaunch {
+            coordinator: self
+                .coordinator
+                .take()
+                .expect("idle session host owns its coordinator"),
+            permit,
+            target,
+            request,
+        };
+        let pending = Arc::new(Mutex::new(Some(pending)));
+        let thread_pending = pending.clone();
         let wake = self.wake.clone();
         let audio_factory = self.audio_factory.clone();
-        let mut launched_ports = None;
-        let outcome = self
-            .coordinator
-            .as_mut()
-            .expect("app slot prevents launch during cleanup")
-            .start(permit, target, request, |request| {
-                let factory = selected_factory.ok_or(ProtocolError::UnregisteredProtocol)?;
-                let (cleanup, ports) = launch_live_session(factory, wake, audio_factory, request)?;
-                launched_ports = Some(ports);
-                Ok(Box::new(cleanup) as Box<dyn CleanupOperations>)
+        let worker_spawner = self.worker_spawner.clone();
+        let cancelled = self.launch_cancelled.clone();
+        cancelled.store(false, Ordering::Release);
+        self.launch_in_flight = true;
+        let notify = Arc::new(notify);
+        let thread_notify = notify.clone();
+        let thread_cancelled = cancelled.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("frd-session-launch".to_owned())
+            .spawn(move || {
+                let pending = take_pending_launch(&thread_pending);
+                let outcome = run_background_launch(
+                    pending,
+                    selected_factory,
+                    wake,
+                    audio_factory,
+                    worker_spawner,
+                    thread_cancelled,
+                );
+                thread_notify(outcome);
             });
-        match outcome {
-            SessionStartOutcome::Started(handle) => {
-                self.active = launched_ports;
-                self.cleanup_handle = Some(handle);
-                ProductLaunchOutcome::Started
+        if spawn_result.is_err() {
+            let pending = take_pending_launch(&pending);
+            notify(rollback_without_resources(
+                pending,
+                cancelled.load(Ordering::Acquire),
+            ));
+        }
+        Ok(true)
+    }
+
+    pub fn cancel_pending_launch(&mut self) -> bool {
+        if !self.launch_in_flight {
+            return false;
+        }
+        self.launch_cancelled.store(true, Ordering::Release);
+        true
+    }
+
+    pub fn launch_is_pending(&self) -> bool {
+        self.launch_in_flight
+    }
+
+    pub fn accept_launch_outcome(
+        &mut self,
+        outcome: BackgroundLaunchOutcome,
+        notify_cleanup: impl FnOnce(BackgroundCleanupOutcome) + Send + 'static,
+    ) -> Result<AcceptedLaunchOutcome, SessionHostError> {
+        if !self.launch_in_flight {
+            return Err(SessionHostError::NoActiveSession);
+        }
+        self.launch_in_flight = false;
+        let cancelled =
+            outcome.cancelled_before_publish || self.launch_cancelled.swap(false, Ordering::AcqRel);
+        match outcome.result {
+            BackgroundLaunchResult::LaunchRolledBack(failure) => {
+                self.coordinator = Some(outcome.coordinator);
+                if cancelled {
+                    Ok(AcceptedLaunchOutcome::CancelledLaunchRolledBack(failure))
+                } else {
+                    Ok(AcceptedLaunchOutcome::LaunchRolledBack(failure))
+                }
             }
-            SessionStartOutcome::LaunchRolledBack(failure) => {
-                debug_assert!(launched_ports.is_none());
-                ProductLaunchOutcome::LaunchRolledBack(failure)
+            BackgroundLaunchResult::Started {
+                cleanup_handle,
+                ports,
+            } if !cancelled => {
+                self.coordinator = Some(outcome.coordinator);
+                self.active = Some(ports);
+                self.cleanup_handle = Some(cleanup_handle);
+                Ok(AcceptedLaunchOutcome::Started)
+            }
+            BackgroundLaunchResult::Started {
+                cleanup_handle,
+                ports,
+            } => {
+                drop(ports);
+                self.cleanup_in_flight = true;
+                match spawn_cleanup(
+                    PendingCleanup::new(outcome.coordinator, cleanup_handle),
+                    CleanupPolicy::new(500, std::time::Duration::from_millis(10)),
+                    notify_cleanup,
+                ) {
+                    Ok(()) => Ok(AcceptedLaunchOutcome::CancelledStarted),
+                    Err(failure) => {
+                        self.cleanup_in_flight = false;
+                        Err(SessionHostError::CleanupFatal(failure))
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn complete_test_launch(
+        &mut self,
+        permit: SessionStartPermit,
+        target: TargetSystem,
+        request: ConnectRequest,
+    ) -> TestLaunchOutcome {
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        assert!(self
+            .begin_launch(permit, target, request, move |outcome| {
+                outcome_tx.send(outcome).unwrap();
+            })
+            .expect("test background launch starts"));
+        let outcome = outcome_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("test background launch completes");
+        match self
+            .accept_launch_outcome(outcome, |_| panic!("normal launch cannot start cleanup"))
+            .expect("test launch outcome is current")
+        {
+            AcceptedLaunchOutcome::Started => TestLaunchOutcome::Started,
+            AcceptedLaunchOutcome::LaunchRolledBack(failure) => {
+                TestLaunchOutcome::LaunchRolledBack(failure)
+            }
+            AcceptedLaunchOutcome::CancelledStarted
+            | AcceptedLaunchOutcome::CancelledLaunchRolledBack(_) => {
+                panic!("test launch was not cancelled")
             }
         }
     }
@@ -252,14 +442,14 @@ impl SessionHost {
     }
 
     pub fn is_active(&self) -> bool {
-        self.cleanup_handle.is_some() || self.cleanup_in_flight
+        self.launch_in_flight || self.cleanup_handle.is_some() || self.cleanup_in_flight
     }
 
     pub fn begin_cleanup(
         &mut self,
         notify: impl FnOnce(BackgroundCleanupOutcome) + Send + 'static,
     ) -> Result<bool, BackgroundCleanupFailure> {
-        if self.cleanup_in_flight {
+        if self.cleanup_in_flight || self.launch_in_flight {
             return Ok(false);
         }
         let Some(handle) = self.cleanup_handle.take() else {
@@ -306,9 +496,96 @@ impl SessionHost {
 
 impl Drop for SessionHost {
     fn drop(&mut self) {
+        self.launch_cancelled.store(true, Ordering::Release);
         if let Some(active) = self.active.as_ref() {
             let _ = active.commands.send(SessionCommand::Disconnect);
         }
+    }
+}
+
+struct PendingLaunch {
+    coordinator: SessionCoordinator,
+    permit: SessionStartPermit,
+    target: TargetSystem,
+    request: ConnectRequest,
+}
+
+fn take_pending_launch(pending: &Mutex<Option<PendingLaunch>>) -> PendingLaunch {
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("exactly one launch worker consumes the transaction")
+}
+
+fn run_background_launch(
+    pending: PendingLaunch,
+    selected_factory: Option<Arc<dyn ProtocolFactory>>,
+    wake: Arc<dyn WakeSink>,
+    audio_factory: Arc<dyn AudioOutputFactory>,
+    worker_spawner: Arc<dyn WorkerSpawner>,
+    cancelled: Arc<AtomicBool>,
+) -> BackgroundLaunchOutcome {
+    let PendingLaunch {
+        mut coordinator,
+        permit,
+        target,
+        request,
+    } = pending;
+    let mut launched_ports = None;
+    let outcome = coordinator.start(permit, target, request, |request| {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ProtocolError::Terminal);
+        }
+        let factory = selected_factory.ok_or(ProtocolError::UnregisteredProtocol)?;
+        let (cleanup, ports) = launch_live_session(
+            factory,
+            wake,
+            audio_factory,
+            worker_spawner,
+            cancelled.clone(),
+            request,
+        )?;
+        launched_ports = Some(ports);
+        Ok(Box::new(cleanup) as Box<dyn CleanupOperations>)
+    });
+    let cancelled_before_publish = cancelled.load(Ordering::Acquire);
+    let result = match outcome {
+        SessionStartOutcome::Started(cleanup_handle) => BackgroundLaunchResult::Started {
+            cleanup_handle,
+            ports: launched_ports.expect("started transaction owns live ports"),
+        },
+        SessionStartOutcome::LaunchRolledBack(failure) => {
+            debug_assert!(launched_ports.is_none());
+            BackgroundLaunchResult::LaunchRolledBack(failure)
+        }
+    };
+    BackgroundLaunchOutcome {
+        coordinator,
+        result,
+        cancelled_before_publish,
+    }
+}
+
+fn rollback_without_resources(
+    pending: PendingLaunch,
+    cancelled_before_publish: bool,
+) -> BackgroundLaunchOutcome {
+    let PendingLaunch {
+        mut coordinator,
+        permit,
+        target,
+        request,
+    } = pending;
+    let SessionStartOutcome::LaunchRolledBack(failure) =
+        coordinator.start(permit, target, request, |_| Err(ProtocolError::Terminal))
+    else {
+        unreachable!("resource-free launch failure cannot start a session");
+    };
+    BackgroundLaunchOutcome {
+        coordinator,
+        result: BackgroundLaunchResult::LaunchRolledBack(failure),
+        cancelled_before_publish,
     }
 }
 
@@ -316,6 +593,8 @@ fn launch_live_session(
     factory: Arc<dyn ProtocolFactory>,
     wake: Arc<dyn WakeSink>,
     audio_factory: Arc<dyn AudioOutputFactory>,
+    worker_spawner: Arc<dyn WorkerSpawner>,
+    cancelled: Arc<AtomicBool>,
     request: ConnectRequest,
 ) -> Result<(LiveSessionCleanup, LiveSessionPorts), ProtocolError> {
     let session_id = request.session_id;
@@ -335,44 +614,63 @@ fn launch_live_session(
         Box::new(SharedWake(wake.clone())),
     );
     let session = factory.create(request, runtime)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProtocolError::Terminal);
+    }
 
+    let (audio_start_tx, audio_start_rx) = mpsc::channel();
     let audio_events = event_tx.clone();
     let audio_wake = wake.clone();
-    let audio_worker = std::thread::Builder::new()
-        .name(format!("frd-audio-{}", session_id.get()))
-        .spawn(move || {
-            let degraded = match catch_unwind(AssertUnwindSafe(|| {
-                run_audio_worker(audio_factory, media_rx)
-            })) {
-                Ok(AudioWorkerExit::Closed) => false,
-                Ok(AudioWorkerExit::Failed) | Err(_) => true,
-            };
-            if degraded {
-                let _ = audio_events.send(SessionEvent::AudioState(
-                    frd_protocol_api::AudioState::Failed,
-                ));
-                let _ = audio_wake.wake();
-            }
-        })
+    let audio_worker = worker_spawner
+        .spawn(
+            WorkerKind::Audio,
+            format!("frd-audio-{}", session_id.get()),
+            Box::new(move || {
+                if audio_start_rx.recv().is_err() {
+                    return;
+                }
+                let degraded = match catch_unwind(AssertUnwindSafe(|| {
+                    run_audio_worker(audio_factory, media_rx)
+                })) {
+                    Ok(AudioWorkerExit::Closed) => false,
+                    Ok(AudioWorkerExit::Failed) | Err(_) => true,
+                };
+                if degraded {
+                    let _ = audio_events.send(SessionEvent::AudioState(
+                        frd_protocol_api::AudioState::Failed,
+                    ));
+                    let _ = audio_wake.wake();
+                }
+            }),
+        )
         .map_err(|_| ProtocolError::Terminal)?;
+    if cancelled.load(Ordering::Acquire) {
+        drop(audio_start_tx);
+        let _ = audio_worker.join();
+        return Err(ProtocolError::Terminal);
+    }
     let final_events = event_tx;
     let final_wake = wake;
-    let protocol_worker = match std::thread::Builder::new()
-        .name(format!("frd-session-{}", session_id.get()))
-        .spawn(move || {
+    let protocol_worker = match worker_spawner.spawn(
+        WorkerKind::Protocol,
+        format!("frd-session-{}", session_id.get()),
+        Box::new(move || {
             let exit = catch_unwind(AssertUnwindSafe(|| session.run()))
                 .unwrap_or(ProtocolExit::Failed(ProtocolError::Terminal));
             let _ = final_events.send(SessionEvent::Closed(exit));
             let _ = final_wake.wake();
-        }) {
+        }),
+    ) {
         Ok(worker) => worker,
         Err(_) => {
-            // Dropping the unstarted session closes its runtime media sender, so the
-            // already-created audio worker exits before rollback is reported.
+            // The protocol closure (and its runtime media sender) has been dropped.
+            // The audio start barrier is then aborted, so no platform open can run.
+            drop(audio_start_tx);
             let _ = audio_worker.join();
             return Err(ProtocolError::Terminal);
         }
     };
+    let _ = audio_start_tx.send(());
 
     Ok((
         LiveSessionCleanup {
@@ -423,10 +721,19 @@ fn run_audio_worker(
 pub enum DesktopUserEvent {
     Wake,
     Repaint,
+    LaunchFinished(BackgroundLaunchOutcome),
     CleanupFinished(BackgroundCleanupOutcome),
-    PresentationFatal,
+    PresentationFatal(PresentationFailure),
+    ApplicationFatal,
     ResizeTestTexture,
     ExitTestTexture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PresentationFailure {
+    pub operation: PresentationOperation,
+    pub source: PresentError,
+    pub recovery: Option<PresentError>,
 }
 
 struct EventLoopWake(EventLoopProxy<DesktopUserEvent>);
@@ -500,6 +807,8 @@ pub struct DesktopApplication {
     window: Option<DesktopWindowState>,
     mode: DesktopMode,
     exit_when_clean: bool,
+    return_to_form_after_cancelled_launch: bool,
+    pending_launch_shutdown_deadline: Option<std::time::Instant>,
     repaint_scheduler: RepaintScheduler,
     armed_repaint: Option<RepaintPlan>,
 }
@@ -525,6 +834,8 @@ impl DesktopApplication {
             window: None,
             mode: DesktopMode::Product,
             exit_when_clean: false,
+            return_to_form_after_cancelled_launch: false,
+            pending_launch_shutdown_deadline: None,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
         }
@@ -558,6 +869,8 @@ impl DesktopApplication {
                 driver_started: false,
             },
             exit_when_clean: false,
+            return_to_form_after_cancelled_launch: false,
+            pending_launch_shutdown_deadline: None,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
         }
@@ -638,8 +951,15 @@ impl DesktopApplication {
     }
 
     fn dispatch_intent(&mut self, intent: AppIntent) {
-        if matches!(intent, AppIntent::CancelConnect | AppIntent::Disconnect) {
+        let cancelling = matches!(intent, AppIntent::CancelConnect | AppIntent::Disconnect);
+        if cancelling {
             self.block_and_release_input();
+        }
+        if cancelling && self.sessions.launch_is_pending() {
+            self.return_to_form_after_cancelled_launch = true;
+            let _ = self.sessions.cancel_pending_launch();
+            self.request_redraw();
+            return;
         }
         let action = match self.launch.controller_mut().handle_intent(
             intent,
@@ -667,16 +987,16 @@ impl DesktopApplication {
                     .retained_draft()
                     .target_system
                     .expect("validated connection retains a target system");
-                match self.sessions.launch(permit, target, request) {
-                    ProductLaunchOutcome::Started => {}
-                    ProductLaunchOutcome::LaunchRolledBack(failure) => {
-                        if let Err(error) = self
-                            .launch
-                            .controller_mut()
-                            .consume_launch_rollback(&failure)
-                        {
-                            eprintln!("会话启动回滚能力不匹配：{error:?}");
-                        }
+                let proxy = self.proxy.clone();
+                match self
+                    .sessions
+                    .begin_launch(permit, target, request, move |outcome| {
+                        let _ = proxy.send_event(DesktopUserEvent::LaunchFinished(outcome));
+                    }) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        eprintln!("后台会话启动状态无效");
+                        let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
                     }
                 }
             }
@@ -927,8 +1247,7 @@ impl DesktopApplication {
             window.egui_renderer.free_texture(id);
         }
 
-        let mut presentation_fatal = false;
-        match render_result {
+        let presentation_error = match render_result {
             Ok(Some(event)) => {
                 let (session_id, generation, completeness) = match &event {
                     frd_protocol_api::PresentationEvent::FramePresented {
@@ -953,35 +1272,14 @@ impl DesktopApplication {
                     self.send_viewport_changed();
                     self.request_redraw();
                 }
+                None
             }
-            Ok(None) => {}
-            Err(error) => match PresentationLifecycle::classify_present_error(error) {
-                PresentFailureAction::RecoverGpu => match recover_window_gpu(window) {
-                    Ok(None) => window.window.request_redraw(),
-                    Ok(Some(RecoveryRequirement::ResetAndFullSnapshot { .. })) => {
-                        let test_session_id = match &self.mode {
-                            DesktopMode::TestTexture { session_id, .. } => Some(*session_id),
-                            DesktopMode::Product => None,
-                        };
-                        if let Some(session_id) = test_session_id {
-                            for update in test_texture_updates(session_id) {
-                                let _ = window.renderer.apply_update(update);
-                            }
-                            window.window.request_redraw();
-                        } else {
-                            presentation_fatal = true;
-                        }
-                    }
-                    Err(recovery_error) => {
-                        eprintln!("GPU 恢复失败：{recovery_error:?}");
-                        presentation_fatal = true;
-                    }
-                },
-                PresentFailureAction::Fatal => {
-                    eprintln!("窗口合成进入不可恢复状态：{error:?}");
-                    presentation_fatal = true;
-                }
-            },
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+
+        if let Some(error) = presentation_error {
+            self.transition_presentation_error(PresentationOperation::Redraw, error);
         }
 
         if let Some(intent) = intent {
@@ -1009,9 +1307,79 @@ impl DesktopApplication {
                 self.request_redraw();
             }
         }
-        if presentation_fatal {
-            let _ = self.proxy.send_event(DesktopUserEvent::PresentationFatal);
+    }
+
+    fn transition_presentation_error(
+        &mut self,
+        operation: PresentationOperation,
+        source: PresentError,
+    ) {
+        if PresentationLifecycle::classify_present_error(operation, source)
+            == PresentFailureAction::Fatal
+        {
+            let _ =
+                self.proxy
+                    .send_event(DesktopUserEvent::PresentationFatal(PresentationFailure {
+                        operation,
+                        source,
+                        recovery: None,
+                    }));
+            return;
         }
+
+        let test_session_id = match &self.mode {
+            DesktopMode::TestTexture { session_id, .. } => Some(*session_id),
+            DesktopMode::Product => None,
+        };
+        let recovery = self
+            .window
+            .as_mut()
+            .map(recover_window_gpu)
+            .unwrap_or(Err(PresentError::SurfaceDetached));
+        match recovery {
+            Ok(None) => self.request_redraw(),
+            Ok(Some(RecoveryRequirement::ResetAndFullSnapshot { .. })) => {
+                if let Some(session_id) = test_session_id {
+                    let restore = self.window.as_mut().map(|window| {
+                        for update in test_texture_updates(session_id) {
+                            window.renderer.apply_update(update)?;
+                        }
+                        Ok::<(), PresentError>(())
+                    });
+                    match restore {
+                        Some(Ok(())) => self.request_redraw(),
+                        Some(Err(recovery)) => {
+                            self.publish_presentation_fatal(operation, source, Some(recovery))
+                        }
+                        None => self.publish_presentation_fatal(
+                            operation,
+                            source,
+                            Some(PresentError::SurfaceDetached),
+                        ),
+                    }
+                } else {
+                    self.publish_presentation_fatal(operation, source, None);
+                }
+            }
+            Err(recovery) => {
+                self.publish_presentation_fatal(operation, source, Some(recovery));
+            }
+        }
+    }
+
+    fn publish_presentation_fatal(
+        &self,
+        operation: PresentationOperation,
+        source: PresentError,
+        recovery: Option<PresentError>,
+    ) {
+        let _ = self
+            .proxy
+            .send_event(DesktopUserEvent::PresentationFatal(PresentationFailure {
+                operation,
+                source,
+                recovery,
+            }));
     }
 
     fn handle_remote_window_event(&mut self, event: &WindowEvent, consumed_by_egui: bool) {
@@ -1069,6 +1437,14 @@ impl DesktopApplication {
 
     fn begin_shutdown(&mut self, event_loop: &ActiveEventLoop) {
         self.block_and_release_input();
+        if self.sessions.launch_is_pending() {
+            self.exit_when_clean = true;
+            let _ = self.sessions.cancel_pending_launch();
+            let deadline = std::time::Instant::now() + PENDING_LAUNCH_SHUTDOWN_TIMEOUT;
+            self.pending_launch_shutdown_deadline = Some(deadline);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
+        }
         if self.sessions.is_active() {
             self.exit_when_clean = true;
             if !matches!(self.launch.controller().page(), Page::Disconnecting { .. }) {
@@ -1089,6 +1465,77 @@ impl DesktopApplication {
                 BackgroundCleanupOutcome::Fatal(failure),
             ));
         }
+    }
+
+    fn handle_launch_finished(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        outcome: BackgroundLaunchOutcome,
+    ) {
+        self.pending_launch_shutdown_deadline = None;
+        let proxy = self.proxy.clone();
+        let accepted = self
+            .sessions
+            .accept_launch_outcome(outcome, move |outcome| {
+                let _ = proxy.send_event(DesktopUserEvent::CleanupFinished(outcome));
+            });
+        match accepted {
+            Ok(AcceptedLaunchOutcome::Started) => {}
+            Ok(AcceptedLaunchOutcome::LaunchRolledBack(failure)) => {
+                if let Err(error) = self
+                    .launch
+                    .controller_mut()
+                    .consume_launch_rollback(&failure)
+                {
+                    eprintln!("会话启动回滚能力不匹配：{error:?}");
+                }
+            }
+            Ok(AcceptedLaunchOutcome::CancelledStarted) => {
+                match self.launch.controller_mut().handle_intent(
+                    AppIntent::CancelConnect,
+                    &self.catalog,
+                    self.store.as_ref(),
+                ) {
+                    Ok(Some(AppAction::SessionCommand(_))) | Ok(None) => {}
+                    Ok(Some(AppAction::StartSession(_, _))) | Err(_) => {
+                        let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
+                    }
+                }
+                self.return_to_form_after_cancelled_launch = false;
+            }
+            Ok(AcceptedLaunchOutcome::CancelledLaunchRolledBack(failure)) => {
+                if let Err(error) = self
+                    .launch
+                    .controller_mut()
+                    .consume_launch_rollback(&failure)
+                {
+                    eprintln!("已取消启动的回滚能力不匹配：{error:?}");
+                    let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
+                    return;
+                }
+                if self.return_to_form_after_cancelled_launch && !self.exit_when_clean {
+                    let _ = self.launch.controller_mut().handle_intent(
+                        AppIntent::ReturnToConnection,
+                        &self.catalog,
+                        self.store.as_ref(),
+                    );
+                }
+                self.return_to_form_after_cancelled_launch = false;
+            }
+            Err(SessionHostError::CleanupFatal(failure)) => {
+                let _ = self.proxy.send_event(DesktopUserEvent::CleanupFinished(
+                    BackgroundCleanupOutcome::Fatal(failure),
+                ));
+                return;
+            }
+            Err(error) => {
+                eprintln!("后台会话启动结果无效：{error:?}");
+                let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
+                return;
+            }
+        }
+        self.maybe_finish_exit(event_loop);
+        self.request_redraw();
     }
 
     fn handle_cleanup_finished(
@@ -1136,7 +1583,19 @@ impl DesktopApplication {
         }
     }
 
-    fn handle_presentation_fatal(&mut self, event_loop: &ActiveEventLoop) {
+    fn handle_presentation_fatal(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        failure: PresentationFailure,
+    ) {
+        eprintln!(
+            "窗口合成进入不可恢复状态：operation={:?}, source={:?}, recovery={:?}",
+            failure.operation, failure.source, failure.recovery
+        );
+        self.handle_application_fatal(event_loop);
+    }
+
+    fn handle_application_fatal(&mut self, event_loop: &ActiveEventLoop) {
         self.block_and_release_input();
         self.launch
             .controller_mut()
@@ -1213,10 +1672,16 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 self.maybe_finish_exit(event_loop);
             }
             DesktopUserEvent::Repaint => self.synchronize_repaint_deadline(event_loop),
+            DesktopUserEvent::LaunchFinished(outcome) => {
+                self.handle_launch_finished(event_loop, outcome)
+            }
             DesktopUserEvent::CleanupFinished(outcome) => {
                 self.handle_cleanup_finished(event_loop, outcome)
             }
-            DesktopUserEvent::PresentationFatal => self.handle_presentation_fatal(event_loop),
+            DesktopUserEvent::PresentationFatal(failure) => {
+                self.handle_presentation_fatal(event_loop, failure)
+            }
+            DesktopUserEvent::ApplicationFatal => self.handle_application_fatal(event_loop),
             DesktopUserEvent::ResizeTestTexture => {
                 if matches!(self.mode, DesktopMode::TestTexture { .. }) {
                     if let Some(window) = self.window.as_ref() {
@@ -1273,18 +1738,22 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             WindowEvent::Resized(size) => {
                 if let Some(size) = PixelSize::new(size.width, size.height) {
                     let mut committed = false;
+                    let mut presentation_error = None;
                     if let Some(window) = self.window.as_mut() {
                         let result = window.compositor.resize(size);
-                        if window.lifecycle.finish_resize(size, result) {
-                            window.physical_size = size;
-                            committed = true;
-                        } else {
-                            eprintln!("窗口尺寸更新失败：{result:?}");
+                        match window.lifecycle.finish_resize(size, result) {
+                            Ok(()) => {
+                                window.physical_size = size;
+                                committed = true;
+                            }
+                            Err(error) => presentation_error = Some(error),
                         }
                     }
                     if committed {
                         self.send_viewport_changed();
                         self.request_redraw();
+                    } else if let Some(error) = presentation_error {
+                        self.transition_presentation_error(PresentationOperation::Resize, error);
                     }
                 } else if let Some(window) = self.window.as_mut() {
                     window.compositor.pause_presenting();
@@ -1304,16 +1773,19 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                         }
                     }
                     OcclusionAction::ResumeAndRedraw => {
-                        let resumed = self.window.as_mut().is_some_and(|window| {
-                            window
-                                .compositor
-                                .resize(window.lifecycle.committed_size())
-                                .is_ok()
-                        });
-                        if resumed {
-                            self.request_redraw();
-                        } else {
-                            let _ = self.proxy.send_event(DesktopUserEvent::PresentationFatal);
+                        let result = self
+                            .window
+                            .as_mut()
+                            .map(|window| {
+                                window.compositor.resize(window.lifecycle.committed_size())
+                            })
+                            .unwrap_or(Err(PresentError::SurfaceDetached));
+                        match result {
+                            Ok(()) => self.request_redraw(),
+                            Err(error) => self.transition_presentation_error(
+                                PresentationOperation::OcclusionResume,
+                                error,
+                            ),
                         }
                     }
                 }
@@ -1340,19 +1812,38 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(plan) = self.armed_repaint else {
-            return;
-        };
         let now = std::time::Instant::now();
-        if now < plan.deadline {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(plan.deadline));
+        if self
+            .pending_launch_shutdown_deadline
+            .is_some_and(|deadline| now >= deadline && self.sessions.launch_is_pending())
+        {
+            eprintln!("后台会话启动取消超过有界等待策略");
+            self.launch
+                .controller_mut()
+                .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
+            self.detach_window();
+            event_loop.exit();
             return;
         }
-        self.armed_repaint = None;
-        if self.repaint_scheduler.fire(plan, now) {
-            self.request_redraw();
+        if let Some(plan) = self.armed_repaint {
+            if now >= plan.deadline {
+                self.armed_repaint = None;
+                if self.repaint_scheduler.fire(plan, now) {
+                    self.request_redraw();
+                }
+            }
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
+        let next_deadline = self
+            .armed_repaint
+            .map(|plan| plan.deadline)
+            .into_iter()
+            .chain(self.pending_launch_shutdown_deadline)
+            .min();
+        event_loop.set_control_flow(
+            next_deadline
+                .map(ControlFlow::WaitUntil)
+                .unwrap_or(ControlFlow::Wait),
+        );
     }
 }
 
@@ -1548,9 +2039,10 @@ impl AudioOutputFactory for UnavailableAudioFactory {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::mpsc;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     use frd_app::{AppAction, AppController, AppIntent, PresentationEvent, ProductPolicy};
@@ -1569,7 +2061,10 @@ mod tests {
     use frd_session::reserve_session_start;
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
 
-    use super::{AudioOutputFactory, ProductLaunchOutcome, SessionHost, WakeSink};
+    use super::{
+        AcceptedLaunchOutcome, AudioOutputFactory, SessionHost, TestLaunchOutcome, WakeSink,
+        WorkerKind, WorkerSpawner,
+    };
 
     struct CountingWake(AtomicUsize);
 
@@ -1585,6 +2080,51 @@ mod tests {
     impl AudioOutputFactory for TestAudioFactory {
         fn open(&self) -> Result<Box<dyn AudioOutput>, AudioOutputError> {
             Ok(Box::new(TestAudioOutput))
+        }
+    }
+
+    struct CountingAudioFactory(AtomicUsize);
+
+    impl AudioOutputFactory for CountingAudioFactory {
+        fn open(&self) -> Result<Box<dyn AudioOutput>, AudioOutputError> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(TestAudioOutput))
+        }
+    }
+
+    struct InjectedProtocolSpawnFailure {
+        live_workers: Arc<AtomicUsize>,
+        audio_spawned: mpsc::Sender<()>,
+        allow_audio_reclaim: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl WorkerSpawner for InjectedProtocolSpawnFailure {
+        fn spawn(
+            &self,
+            kind: WorkerKind,
+            name: String,
+            work: Box<dyn FnOnce() + Send>,
+        ) -> io::Result<JoinHandle<()>> {
+            match kind {
+                WorkerKind::Protocol => Err(io::Error::other("injected protocol spawn failure")),
+                WorkerKind::Audio => {
+                    let live_workers = self.live_workers.clone();
+                    let audio_spawned = self.audio_spawned.clone();
+                    let allow_audio_reclaim = self
+                        .allow_audio_reclaim
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("one audio worker is spawned");
+                    std::thread::Builder::new().name(name).spawn(move || {
+                        live_workers.fetch_add(1, Ordering::AcqRel);
+                        audio_spawned.send(()).unwrap();
+                        work();
+                        allow_audio_reclaim.recv().unwrap();
+                        live_workers.fetch_sub(1, Ordering::AcqRel);
+                    })
+                }
+            }
         }
     }
 
@@ -1905,9 +2445,9 @@ mod tests {
         };
 
         let before = Instant::now();
-        let outcome = host.launch(permit, TargetSystem::MacOs, request);
+        let outcome = host.complete_test_launch(permit, TargetSystem::MacOs, request);
         assert!(before.elapsed() < Duration::from_millis(250));
-        assert!(matches!(outcome, ProductLaunchOutcome::Started));
+        assert!(matches!(outcome, TestLaunchOutcome::Started));
         worker_started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("protocol worker starts asynchronously");
@@ -1920,6 +2460,113 @@ mod tests {
         );
         assert_eq!(cleanup.session_id(), session_id);
         assert!(wake.0.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn protocol_spawn_failure_returns_from_dispatch_before_off_loop_rollback_reclaims_audio() {
+        let (audio_spawned_tx, audio_spawned_rx) = mpsc::channel();
+        let (allow_audio_reclaim_tx, allow_audio_reclaim_rx) = mpsc::channel();
+        let live_workers = Arc::new(AtomicUsize::new(0));
+        let audio_factory = Arc::new(CountingAudioFactory(AtomicUsize::new(0)));
+        let mut host = SessionHost::new_with_spawner(
+            [Arc::new(BlockingFactory {
+                worker_started: mpsc::channel().0,
+            }) as Arc<dyn ProtocolFactory>],
+            Arc::new(CountingWake(AtomicUsize::new(0))),
+            audio_factory.clone(),
+            Arc::new(InjectedProtocolSpawnFailure {
+                live_workers: live_workers.clone(),
+                audio_spawned: audio_spawned_tx,
+                allow_audio_reclaim: Mutex::new(Some(allow_audio_reclaim_rx)),
+            }),
+        );
+        let session_id = SessionId::allocate();
+        let (_owner, permit) = reserve_session_start(session_id);
+        let request = test_request(session_id);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+
+        let before = Instant::now();
+        assert!(host
+            .begin_launch(permit, TargetSystem::MacOs, request, move |outcome| {
+                outcome_tx.send(outcome).unwrap();
+            })
+            .expect("background launch thread starts"));
+        assert!(
+            before.elapsed() < Duration::from_millis(250),
+            "ApplicationHandler dispatch must not wait for partial rollback"
+        );
+        audio_spawned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the injected partial audio worker starts");
+        assert_eq!(live_workers.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            audio_factory.0.load(Ordering::Acquire),
+            0,
+            "the start barrier forbids platform audio open before protocol spawn succeeds"
+        );
+
+        allow_audio_reclaim_tx.send(()).unwrap();
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rollback is published after partial resources are reclaimed");
+        assert_eq!(live_workers.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            host.accept_launch_outcome(outcome, |_| panic!("rollback has no cleanup worker")),
+            Ok(AcceptedLaunchOutcome::LaunchRolledBack(_))
+        ));
+        assert!(!host.is_active());
+    }
+
+    #[test]
+    fn close_after_started_outcome_but_before_acceptance_never_installs_stale_active_ports() {
+        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let mut host = test_host(
+            Arc::new(BlockingFactory {
+                worker_started: worker_started_tx,
+            }),
+            Arc::new(TestAudioFactory),
+        );
+        let session_id = SessionId::allocate();
+        let (_owner, permit) = reserve_session_start(session_id);
+        let (launch_tx, launch_rx) = mpsc::channel();
+        host.begin_launch(
+            permit,
+            TargetSystem::MacOs,
+            test_request(session_id),
+            move |outcome| launch_tx.send(outcome).unwrap(),
+        )
+        .expect("background launch starts");
+        let outcome = launch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("launch outcome reaches the event loop");
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("protocol worker is live before close");
+
+        assert!(host.cancel_pending_launch());
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        assert!(matches!(
+            host.accept_launch_outcome(outcome, move |outcome| {
+                cleanup_tx.send(outcome).unwrap();
+            }),
+            Ok(AcceptedLaunchOutcome::CancelledStarted)
+        ));
+        assert!(
+            host.active.is_none(),
+            "stale ports must never become active"
+        );
+        let cleanup = cleanup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled start is reclaimed by the bounded cleanup worker");
+        let completion = host
+            .accept_cleanup_outcome(cleanup)
+            .expect("cancelled launch cleanup completes");
+        assert_eq!(completion.session_id(), session_id);
+        assert!(!host.is_active());
     }
 
     #[test]
@@ -1945,8 +2592,8 @@ mod tests {
             }),
             saved_server_pin: None,
         };
-        let ProductLaunchOutcome::LaunchRolledBack(failure) =
-            host.launch(first_permit, TargetSystem::MacOs, first_request)
+        let TestLaunchOutcome::LaunchRolledBack(failure) =
+            host.complete_test_launch(first_permit, TargetSystem::MacOs, first_request)
         else {
             panic!("factory failure must return only after rollback");
         };
@@ -2012,8 +2659,8 @@ mod tests {
             Arc::new(TestAudioFactory),
         );
         assert!(matches!(
-            host.launch(permit, TargetSystem::MacOs, request),
-            ProductLaunchOutcome::Started
+            host.complete_test_launch(permit, TargetSystem::MacOs, request),
+            TestLaunchOutcome::Started
         ));
 
         let events = wait_for_event(&mut host, |event| {
@@ -2153,18 +2800,22 @@ mod tests {
     fn launch_test_session(host: &mut SessionHost) -> SessionId {
         let session_id = SessionId::allocate();
         let (_owner, permit) = reserve_session_start(session_id);
-        let request = ConnectRequest {
+        let request = test_request(session_id);
+        assert!(matches!(
+            host.complete_test_launch(permit, TargetSystem::MacOs, request),
+            TestLaunchOutcome::Started
+        ));
+        session_id
+    }
+
+    fn test_request(session_id: SessionId) -> ConnectRequest {
+        ConnectRequest {
             session_id,
             endpoint: Endpoint::new("test.invalid", 5900).expect("valid test endpoint"),
             protocol_id: ProtocolId::apple_hpss_mvs(),
             credentials: None,
             saved_server_pin: None,
-        };
-        assert!(matches!(
-            host.launch(permit, TargetSystem::MacOs, request),
-            ProductLaunchOutcome::Started
-        ));
-        session_id
+        }
     }
 
     fn wait_for_event(
