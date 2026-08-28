@@ -63,7 +63,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 |---|---|---|---|
 | 服务器身份与 TLS | RDP TLS + 系统信任链 + SHA-256 pin | **开发中** | 已实现系统信任链、主机名、有效期、未知证书显式确认、精确 pin 重连和指纹变化 fail-closed；身份确认及第二次 TLS 验证前不读取用户名/密码。2026-08-29 证据仅限 `frd-protocol-rdp` 单元测试与 workspace 测试，尚无 Windows 真机证书互操作证明 |
 | 账号密码认证 | CredSSP/NLA | **开发中** | 私有 adapter 已实现只允许 NLA/TLS 的 CredSSP、licensing 与 activation 基线；2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录或会话证明。凭据不得进入 argv、普通配置、日志或抓包 |
-| 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 设计为 BGRX 脏矩形发布；尚无产品构建或真机首帧证据 |
+| 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 已有 `freeremotedesk-windows` Release 构建，设计为 BGRX 脏矩形发布；尚无 Windows 真机首帧证据 |
 | 鼠标与键盘 | RDP fast-path input | **开发中** | 设计包含 scan code、Unicode、鼠标、滚轮和失焦 `ReleaseAll`；尚未完成产品互操作 |
 | 动态分辨率与多显示器 | Display Control DVC | **开发中** | 已通过现有 viewport 接口实现单主显示器 latest-only 调整，仅在 DVC 打开且服务端能力就绪后宣告，并在精确 reactivation 尺寸确认后切换 generation；多显示器仍不支持。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 现代图形 | EGFX、ZGFX、AVC/AVC420、AVC444 | **计划中** | 均未实现或验证，不得宣告支持；未来只允许作为 RDP adapter 内部解码路径发布现有 `SurfaceUpdate`，不新增 UI |
