@@ -94,6 +94,40 @@
   protocol, decoder, framebuffer, and renderer-core modules must not depend on
   platform title-bar APIs.
 
+## Cross-Platform Product UI Rules
+
+- The login page may use the client area, but it must use one responsive,
+  centered form hierarchy that remains usable on desktop and future mobile
+  shells. Preserve native window controls and platform font conventions; adapt
+  spacing, density, and color tokens without changing the product workflow.
+- Use only the official Google Material Symbols Rounded family for
+  FreeRemoteDesk-owned functional glyphs. Vendor a pinned, deterministic subset
+  with its Apache-2.0 license and provenance; do not mix Emoji, improvised
+  Unicode symbols, hand-drawn substitutes, or a second interface-icon family.
+- Every icon-only action must expose a concise Simplified-Chinese tooltip,
+  accessible name, keyboard focus, and distinct hover, pressed, disabled, and
+  active states. A tooltip explains a hovered or focused control; a toast or
+  snackbar reports a short-lived operation result and must never replace an
+  inline or persistent error.
+- Keep interactive targets at least 44 by 44 logical points on desktop and 48
+  by 48 density-independent pixels on Android-class touch shells. Do not make
+  the visible glyph itself fill the entire target.
+- Platform application icons must be generated from the common product mark
+  using platform-native packaging rules. Apple assets use unmasked square
+  layers and let the system apply its mask; Android assets provide foreground,
+  background, and monochrome adaptive-icon layers. Never pre-bake a universal
+  rounded-rectangle mask into every platform asset.
+- Saved connection metadata and passwords are separate platform services.
+  Non-secret profile metadata may use the current user's application-data
+  directory; passwords and tokens must use the OS secure credential store
+  (Windows Credential Manager, macOS Keychain, Linux Secret Service, Android
+  Keystore, or HarmonyOS HUKS). Secrets must never enter ordinary configuration,
+  logs, command-line arguments, analytics, diagnostics, or protocol-neutral UI
+  snapshots.
+- Pressing Enter in the focused password field submits exactly one valid form
+  when no IME composition or connection attempt is active. It must use the same
+  intent and validation path as the primary Connect button.
+
 ## Project Structure & Module Organization
 FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
 
