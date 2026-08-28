@@ -63,6 +63,10 @@ impl RunnerOutcome {
                 FatalOperation::IdentityStore,
                 FatalReason::IdentityStoreUnavailable,
             ),
+            RunnerFailure::CredentialStore => (
+                FatalOperation::CredentialStore,
+                FatalReason::CredentialStoreUnavailable,
+            ),
             RunnerFailure::EventLoopRun => (
                 FatalOperation::EventLoopRun,
                 FatalReason::EventLoopRunFailed,
@@ -84,6 +88,7 @@ enum RunnerFailure {
     CommandLineOptions,
     CommandLineOutput,
     IdentityStore,
+    CredentialStore,
     EventLoopRun,
 }
 
@@ -159,7 +164,11 @@ fn run(cli: Cli) -> RunnerOutcome {
         Ok(store) => Arc::new(store) as Arc<dyn ConnectionProfileStore>,
         Err(_) => return RunnerOutcome::from_failure(RunnerFailure::IdentityStore),
     };
-    let credentials = Arc::new(WindowsCredentialStore::new()) as Arc<dyn SecureCredentialStore>;
+    let credentials = Arc::new(WindowsCredentialStore::new());
+    if let Err(failure) = purge_pending_credentials(credentials.as_ref()) {
+        return RunnerOutcome::from_failure(failure);
+    }
+    let credentials = credentials as Arc<dyn SecureCredentialStore>;
     let stores = DesktopPlatformStores::new(server_identities, profiles, credentials);
     let mut launch =
         AppLaunch::new_with_stores(launch_options, &provider, &catalog, stores.as_app_stores());
@@ -188,6 +197,12 @@ fn run(cli: Cli) -> RunnerOutcome {
     );
     let run_result = event_loop.run_app(&mut application);
     finish_event_loop(run_result, application.runner_result())
+}
+
+fn purge_pending_credentials(credentials: &dyn SecureCredentialStore) -> Result<(), RunnerFailure> {
+    credentials
+        .purge_pending()
+        .map_err(|_| RunnerFailure::CredentialStore)
 }
 
 fn finish_event_loop<E>(
@@ -225,10 +240,104 @@ fn emit_runner_outcome(outcome: RunnerOutcome) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::process::ExitCode;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use frd_platform_api::{ConnectionProfileKey, PlatformError, SecureCredentialStore};
     use frd_shell_desktop::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 
-    use super::{finish_event_loop, runner_decision, RunnerFailure, RunnerOutcome};
+    use super::{
+        finish_event_loop, purge_pending_credentials, runner_decision, RunnerFailure,
+        RunnerOutcome,
+    };
+
+    struct TestCredentialStore {
+        fail_purge: bool,
+        purged: AtomicBool,
+    }
+
+    impl TestCredentialStore {
+        fn successful() -> Self {
+            Self {
+                fail_purge: false,
+                purged: AtomicBool::new(false),
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                fail_purge: true,
+                purged: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl SecureCredentialStore for TestCredentialStore {
+        fn load(
+            &self,
+            _key: &ConnectionProfileKey,
+        ) -> Result<Option<frd_core::SecretBuffer>, PlatformError> {
+            unreachable!("startup purge does not load a profile credential")
+        }
+
+        fn stage(
+            &self,
+            _session: frd_core::SessionId,
+            _key: &ConnectionProfileKey,
+            _password: &frd_core::SecretBuffer,
+        ) -> Result<(), PlatformError> {
+            unreachable!("startup purge does not stage a profile credential")
+        }
+
+        fn commit(
+            &self,
+            _session: frd_core::SessionId,
+            _key: &ConnectionProfileKey,
+        ) -> Result<(), PlatformError> {
+            unreachable!("startup purge does not commit a profile credential")
+        }
+
+        fn discard(&self, _session: frd_core::SessionId) -> Result<(), PlatformError> {
+            unreachable!("startup purge does not discard one session")
+        }
+
+        fn delete(&self, _key: &ConnectionProfileKey) -> Result<(), PlatformError> {
+            unreachable!("startup purge does not delete a committed credential")
+        }
+
+        fn purge_pending(&self) -> Result<(), PlatformError> {
+            self.purged.store(true, Ordering::SeqCst);
+            if self.fail_purge {
+                Err(PlatformError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn startup_purges_pending_credentials_before_app_launch_construction() {
+        let credentials = TestCredentialStore::successful();
+
+        assert_eq!(purge_pending_credentials(&credentials), Ok(()));
+        assert!(credentials.purged.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn startup_pending_purge_failure_uses_the_closed_runner_taxonomy() {
+        let credentials = TestCredentialStore::unavailable();
+
+        assert_eq!(
+            purge_pending_credentials(&credentials),
+            Err(RunnerFailure::CredentialStore)
+        );
+        let decision = runner_decision(RunnerOutcome::from_failure(RunnerFailure::CredentialStore));
+        assert_eq!(
+            decision.stderr.as_deref(),
+            Some(
+                "FRD-WIN-FATAL-001 component=application operation=credential_store reason=credential_store_unavailable details=none\n"
+            )
+        );
+    }
 
     #[test]
     fn fatal_runner_decision_is_one_exact_display_line_and_a_failure_exit() {

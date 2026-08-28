@@ -35,6 +35,46 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
         })
         .collect::<BTreeMap<_, _>>();
 
+    let credential_feature_owners = packages
+        .iter()
+        .filter(|package| {
+            package["dependencies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|dependency| {
+                    dependency["name"] == "windows-sys"
+                        && dependency["features"].as_array().is_some_and(|features| {
+                            features
+                                .iter()
+                                .any(|feature| feature == "Win32_Security_Credentials")
+                        })
+                })
+        })
+        .map(|package| package["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        credential_feature_owners,
+        vec!["frd-platform-windows"],
+        "only the Windows platform adapter may enable Win32 credential APIs"
+    );
+
+    for neutral in [
+        "frd-wire-rfb",
+        "frd-protocol-api",
+        "frd-protocol-apple",
+        "frd-render-wgpu",
+        "frd-compositor-wgpu",
+    ] {
+        let direct = dependencies.get(neutral).expect("neutral package exists");
+        assert!(
+            !direct
+                .iter()
+                .any(|dependency| dependency == "frd-platform-windows"),
+            "{neutral} must not depend on the profile or secure-store implementation: {direct:?}"
+        );
+    }
+
     for neutral in [
         "frd-core",
         "frd-frame",
