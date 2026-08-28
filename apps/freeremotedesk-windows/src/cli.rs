@@ -29,6 +29,8 @@ pub(crate) struct Cli {
     test_texture: bool,
     #[arg(long, hide = true, requires = "test_texture")]
     test_texture_exit_after_ms: Option<u64>,
+    #[arg(long, hide = true, requires = "test_texture")]
+    test_texture_resize_after_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -59,6 +61,7 @@ impl Cli {
     pub(crate) fn test_texture_options(&self) -> Option<TestTextureOptions> {
         self.test_texture.then(|| TestTextureOptions {
             exit_after: self.test_texture_exit_after_ms.map(Duration::from_millis),
+            resize_after: self.test_texture_resize_after_ms.map(Duration::from_millis),
         })
     }
 }
@@ -84,6 +87,8 @@ fn provider_id(value: Option<&String>) -> Result<Option<CredentialProviderId>, &
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser;
     use frd_app::{AppLaunch, AppPage};
     use frd_core::{CredentialProviderId, SecretBuffer, TargetSystem};
@@ -169,6 +174,35 @@ mod tests {
         .expect_err("clap must reject every literal password argument");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn offline_test_texture_resize_hook_requires_the_single_test_window() {
+        let error = Cli::try_parse_from([
+            "freeremotedesk-windows",
+            "--test-texture-resize-after-ms",
+            "20",
+        ])
+        .expect_err("resize hook cannot launch outside offline texture mode");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let cli = Cli::try_parse_from([
+            "freeremotedesk-windows",
+            "--test-texture",
+            "--test-texture-resize-after-ms",
+            "20",
+            "--test-texture-exit-after-ms",
+            "80",
+        ])
+        .expect("one offline window may own resize and exit deadlines");
+        let options = cli
+            .test_texture_options()
+            .expect("offline mode options exist");
+        assert_eq!(options.resize_after, Some(Duration::from_millis(20)));
+        assert_eq!(options.exit_after, Some(Duration::from_millis(80)));
     }
 
     fn complete_cli(connect: bool) -> Cli {

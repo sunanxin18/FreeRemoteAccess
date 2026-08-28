@@ -23,7 +23,7 @@ pub enum CleanupError {
 }
 
 /// 会话资源回收的协议中立操作。所有步骤都必须完成才能释放活动会话槽。
-pub trait CleanupOperations {
+pub trait CleanupOperations: Send {
     fn cancel(&mut self) -> Result<(), CleanupError>;
     fn shutdown_writer(&mut self) -> Result<(), CleanupError>;
     fn join_workers_and_audio(&mut self) -> Result<(), CleanupError>;

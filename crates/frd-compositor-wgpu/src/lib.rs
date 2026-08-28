@@ -4,7 +4,8 @@ mod surface;
 use frd_core::PixelSize;
 use frd_protocol_api::PresentationEvent;
 use frd_render_wgpu::{
-    GpuCleanToken, GpuContext, GpuFaultClass, RecoveryRequirement, RemoteRenderer, RendererError,
+    GpuCleanToken, GpuContext, GpuContextError, GpuFaultClass, RecoveryRequirement, RemoteRenderer,
+    RendererError,
 };
 
 use state::{
@@ -23,6 +24,7 @@ pub enum PresentError {
     SurfaceDetached,
     InvalidPhysicalSize,
     ContextMismatch,
+    GpuUnavailable,
     GpuFault(GpuFaultClass),
     Renderer(RendererError),
 }
@@ -36,6 +38,12 @@ impl From<RendererError> for PresentError {
 impl From<GpuFaultClass> for PresentError {
     fn from(value: GpuFaultClass) -> Self {
         Self::GpuFault(value)
+    }
+}
+
+impl From<GpuContextError> for PresentError {
+    fn from(_value: GpuContextError) -> Self {
+        Self::GpuUnavailable
     }
 }
 
@@ -73,23 +81,30 @@ impl PresentationCompositor {
     }
 
     pub fn resize(&mut self, size: PixelSize) -> Result<(), PresentError> {
-        match self.size_state.resize(size) {
-            SurfaceSizeAction::Pause => {}
-            SurfaceSizeAction::Configure(size) => {
-                if let Some(mut configuration) = self.configuration.clone() {
-                    configuration.width = size.width;
-                    configuration.height = size.height;
-                    let token = self.configure_existing_with(&configuration)?;
-                    let context = self.context.clone();
-                    context.commit_if_unchanged(token, || {
-                        self.configuration = Some(configuration);
-                    })?;
-                } else {
-                    self.configure_surface()?;
+        let previous = self.size_state;
+        let result = (|| {
+            match self.size_state.resize(size) {
+                SurfaceSizeAction::Pause => {}
+                SurfaceSizeAction::Configure(size) => {
+                    if let Some(mut configuration) = self.configuration.clone() {
+                        configuration.width = size.width;
+                        configuration.height = size.height;
+                        let token = self.configure_existing_with(&configuration)?;
+                        let context = self.context.clone();
+                        context.commit_if_unchanged(token, || {
+                            self.configuration = Some(configuration);
+                        })?;
+                    } else {
+                        self.configure_surface()?;
+                    }
                 }
             }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.size_state = previous;
         }
-        Ok(())
+        result
     }
 
     pub fn pause_presenting(&mut self) {
@@ -217,6 +232,19 @@ impl PresentationCompositor {
         debug_assert!(context_pair.matches());
         debug_assert_eq!(self.context.context_id(), remote.context_id());
         Ok(requirement)
+    }
+
+    pub async fn recover_gpu_with_new_instance(
+        &mut self,
+        remote: &mut RemoteRenderer,
+        instance: wgpu::Instance,
+    ) -> Result<(Option<RecoveryRequirement>, GpuContext), PresentError> {
+        let candidate = self.presentation.create_candidate(&instance)?;
+        let context = GpuContext::request(instance, Some(&candidate)).await?;
+        drop(candidate);
+        let shell_context = context.clone();
+        let requirement = self.recover_gpu(remote, context)?;
+        Ok((requirement, shell_context))
     }
 
     pub fn detach(&mut self) {
@@ -371,6 +399,16 @@ mod api_tests {
         compositor.recover_gpu(renderer, context)
     }
 
+    async fn new_instance_recovery_contract(
+        compositor: &mut PresentationCompositor,
+        renderer: &mut RemoteRenderer,
+        instance: wgpu::Instance,
+    ) -> Result<(Option<RecoveryRequirement>, GpuContext), PresentError> {
+        compositor
+            .recover_gpu_with_new_instance(renderer, instance)
+            .await
+    }
+
     #[test]
     fn public_compositor_boundary_keeps_surface_ownership_and_overlay_recording_local() {
         let _ = create_surface_contract;
@@ -378,6 +416,7 @@ mod api_tests {
         let _ = render_contract;
         let _ = resize_contract;
         let _ = coordinated_recovery_contract;
+        let _ = new_instance_recovery_contract;
     }
 
     #[test]

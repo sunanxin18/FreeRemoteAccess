@@ -33,7 +33,10 @@ impl From<ConnectionSubmission> for AppIntent {
 mod tests {
     use std::sync::Mutex;
 
-    use frd_core::{CredentialProviderId, PixelSize, SecretBuffer, SessionId, TargetSystem};
+    use frd_core::{
+        CredentialProviderId, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelSize,
+        SecretBuffer, SessionId, TargetSystem,
+    };
     use frd_frame::FrameCompleteness;
     use frd_platform_api::{
         CredentialProvider, PlatformCapabilities, PlatformError, ServerIdentityStore,
@@ -178,6 +181,100 @@ mod tests {
                 text_input: false,
             }
         );
+    }
+
+    #[test]
+    fn presented_session_drops_physical_keys_and_text_when_text_input_is_not_negotiated() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        controller.set_platform_capabilities(PlatformCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: false,
+            clipboard_write: false,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.set_product_policy(ProductPolicy {
+            dynamic_resolution: true,
+            clipboard_read: false,
+            clipboard_write: false,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.handle_session_event(SessionEvent::CapabilitiesChanged(
+            frd_protocol_api::SessionCapabilities {
+                dynamic_resolution: true,
+                clipboard_read: false,
+                clipboard_write: false,
+                remote_audio: true,
+                text_input: false,
+            },
+        ));
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+
+        assert!(controller
+            .route_input(InputEvent::PhysicalKey {
+                code: PhysicalKeyCode(30),
+                state: KeyState::Pressed,
+                modifiers: Modifiers::default(),
+            })
+            .is_none());
+        assert!(controller
+            .route_input(InputEvent::Text {
+                utf8: "x".to_owned(),
+            })
+            .is_none());
+        assert!(controller.route_input(InputEvent::ReleaseAll).is_some());
+    }
+
+    #[test]
+    fn failed_audio_output_downgrades_the_presented_platform_capability() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        controller.set_platform_capabilities(PlatformCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: false,
+            clipboard_write: false,
+            remote_audio: true,
+            text_input: false,
+        });
+        controller.set_product_policy(ProductPolicy {
+            dynamic_resolution: true,
+            clipboard_read: false,
+            clipboard_write: false,
+            remote_audio: true,
+            text_input: false,
+        });
+        controller.handle_session_event(SessionEvent::CapabilitiesChanged(
+            frd_protocol_api::SessionCapabilities {
+                dynamic_resolution: true,
+                clipboard_read: false,
+                clipboard_write: false,
+                remote_audio: true,
+                text_input: false,
+            },
+        ));
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        assert!(controller.effective_capabilities().remote_audio);
+
+        controller.handle_session_event(SessionEvent::AudioState(AudioState::Failed));
+
+        assert_eq!(controller.audio_state(), &AudioState::Failed);
+        assert!(!controller.effective_capabilities().remote_audio);
+        let AppPage::RemoteSession { capabilities, .. } = controller.page() else {
+            panic!("audio degradation must keep the desktop session visible");
+        };
+        assert!(!capabilities.remote_audio);
     }
 
     #[test]

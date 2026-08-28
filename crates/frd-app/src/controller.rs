@@ -498,6 +498,10 @@ impl AppController {
                 self.inbound_clipboard = Some(payload);
             }
             SessionEvent::AudioState(state) => {
+                if state == AudioState::Failed {
+                    self.platform_capabilities.remote_audio = false;
+                    self.refresh_presented_capabilities();
+                }
                 self.audio_state = state;
             }
             SessionEvent::SurfaceGenerationChanged {
@@ -591,6 +595,13 @@ impl AppController {
     /// AppIntent 不承载热路径输入；仅当前已呈现会话可路由 protocol-neutral 输入。
     pub fn route_input(&self, event: InputEvent) -> Option<SessionCommand> {
         let session_id = self.session_id?;
+        if matches!(
+            event,
+            InputEvent::PhysicalKey { .. } | InputEvent::Text { .. }
+        ) && !self.effective_capabilities().text_input
+        {
+            return None;
+        }
         matches!(self.page, Page::RemoteSession { .. }).then_some(SessionCommand::Input(
             SessionInput {
                 session_id,
