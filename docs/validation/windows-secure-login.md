@@ -8,25 +8,25 @@
 ## 构建产物
 
 - 文件：`target/release/freeremotedesk-windows.exe`
-- SHA-256：`B3D1090B88ED65276156CDDB390E4067A692241082C26BB7BB69FC659705A6ED`
+- SHA-256：`31B0EBB9FE655928F4549BA28FBB156D211C4D57D02989C40EEE2AB2176C4203`
 - 构建命令：`cargo +stable build --release -p freeremotedesk-windows`
 - 结果：成功，release profile 完成，无编译警告。
-- 说明：该 SHA-256 对应本次实际启动的共享工作树产物；工作树还含已有、未暂存的标题栏/图标改动。另以 Git 暂存区精确快照独立验证本任务提交内容。
+- 说明：该 SHA-256 来自主代理在提交 `7409d65` 的全新 clean detached worktree 构建，不含共享工作树未提交改动。下述本机界面观察来自此前实际启动，未把该人工观察错误归因于这份未启动的 clean-build 哈希产物。
 
 ## 自动化验证
 
 | 命令 | 结果 | 证据摘要 |
 |---|---|---|
-| `cargo +stable fmt -- --check` | 通过 | 最终重跑退出码 0；首次预检仅发现本任务新增代码的 rustfmt 布局差异，修正后从矩阵起点重跑。 |
+| `cargo +stable fmt --all -- --check` | 通过 | 全新 clean detached worktree、提交 `7409d65`，退出码 0。 |
 | `cargo +stable test -p frd-platform-api` | 通过 | 2 个单元测试和 1 个 compile-fail 文档测试通过。 |
 | `cargo +stable test -p frd-platform-windows -- --test-threads=1` | 通过 | 18 个测试通过；包含进程唯一 Windows Credential Manager 暂存、提交、读取、丢弃、删除及清理保护。 |
 | `cargo +stable test -p frd-ui-model` | 通过 | 7 个测试通过。 |
 | `cargo +stable test -p frd-app` | 通过 | 63 个测试通过；覆盖暂存/提交/回滚、成功后取消保存和单次连接意图。 |
 | `cargo +stable test -p frd-ui-egui` | 通过 | 19 个测试通过；覆盖窄屏布局、图标帮助文本、密码 Enter 单次提交、IME 与重复键过滤。 |
 | `cargo +stable test -p freeremotedesk-windows` | 通过 | 当前共享工作树为 12 个二进制单元测试、2 个依赖边界测试、2 个图标资源测试；精确暂存区快照为 11 个二进制单元测试和 2 个依赖边界测试，均通过。 |
-| `cargo +stable test --workspace` | 通过 | 工作区测试及文档测试退出码 0；需要未公开授权 fixture 的既有测试保持 ignored。 |
-| `cargo +stable clippy --workspace --all-targets -- -D warnings` | **阻断** | 既有已提交文件 `crates/frd-frame/src/surface.rs:35` 触发 `clippy::len_without_is_empty`；该文件不属于本功能且工作树中未修改，按任务边界未扩展修复。 |
-| `cargo +stable build --release -p freeremotedesk-windows` | 通过 | 退出码 0，耗时 47.17 秒。 |
+| `cargo +stable test --workspace -- --test-threads=1` | 通过 | 全新 clean detached worktree、提交 `7409d65`；工作区测试及文档测试退出码 0，需要未公开授权 fixture 的既有测试保持 ignored。 |
+| `cargo +stable clippy --workspace --all-targets -- -D warnings` | **阻断** | clean `7409d65` 仍仅在既有已提交文件 `crates/frd-frame/src/surface.rs:35` 触发 `clippy::len_without_is_empty`；该文件不属于本功能，按任务边界未扩展修复。 |
+| `cargo +stable build --release -p freeremotedesk-windows` | 通过 | 全新 clean detached worktree、提交 `7409d65`，退出码 0；产物哈希见上。 |
 
 补充 RED/GREEN：新增启动清理测试最初因缺少
 `purge_pending_credentials` 和 `RunnerFailure::CredentialStore` 编译失败；实现后两个精确测试均为 1 passed。依赖边界扩展在实现前已通过，因为 Task 4 已经完成 Windows 三类 store 的产品组合，本任务没有重复该接线。
@@ -62,7 +62,7 @@ README 平台矩阵标记为 **开发中**：Windows 自动化状态机、本机
 - `profile_persistence_failed` 不再作为可直接显示的内部英文码；控制器保存独立的会话级失败标记，界面展示“登录信息未能安全保存；本次连接仍可继续，请稍后重试。”。该警告跨 surface generation 和首个完整帧进入远程会话保留，并在断开时清除。
 - 正常清理完成通过产品 stores 重新读取并按最近成功顺序排列连接；错误页返回连接页也走同一路径。无 store 的 cleanup 入口仅保留为 `frd-app` 单元测试辅助，不是产品 API。
 
-RED：新增回归最初因缺少 `RemoteSession.diagnostics`、`profile_persistence_warning` 和 `finish_session_cleanup_with_stores` 而编译失败。GREEN：共享工作树的 `cargo +stable test -p frd-app` 为 69/69 通过；`cargo +stable test -p frd-ui-model` 为 7/7，`cargo +stable test -p frd-ui-egui` 为 19/19，`cargo +stable test -p frd-shell-desktop` 为 47/47，且 `cargo +stable fmt -- --check` 通过。精确 Git 暂存区快照排除标题栏/图标脏改动后，`frd-app` 66/66、`frd-ui-model` 7/7、`frd-ui-egui` 12/12、`frd-shell-desktop` 35/35，以及 Windows 二进制 11/11 和依赖边界 2/2 均通过；该快照的全 workspace fmt 仅被本轮未暂存的两处既有格式差异阻断（Windows `main.rs` 导入与 shell `lib.rs` re-export）。
+RED：新增回归最初因缺少 `RemoteSession.diagnostics`、`profile_persistence_warning` 和 `finish_session_cleanup_with_stores` 而编译失败。GREEN：共享工作树的 `cargo +stable test -p frd-app` 为 69/69 通过；`cargo +stable test -p frd-ui-model` 为 7/7，`cargo +stable test -p frd-ui-egui` 为 19/19，`cargo +stable test -p frd-shell-desktop` 为 47/47，且 `cargo +stable fmt -- --check` 通过。精确 Git 暂存区快照排除标题栏/图标脏改动后，`frd-app` 66/66、`frd-ui-model` 7/7、`frd-ui-egui` 12/12、`frd-shell-desktop` 35/35，以及 Windows 二进制 11/11 和依赖边界 2/2 均通过。随后提交 `7409d65` 机械修正 Windows `main.rs` 与 shell `lib.rs` 的 rustfmt 换行；主代理在该提交的 clean detached worktree 复核全 workspace fmt 与串行 workspace 测试均通过。
 
 本轮没有改变 README 状态：授权 Mac GUI 的 TransportReady 提交和取消保存后重连删除仍未实测，平台矩阵继续保持 **开发中**。
 
