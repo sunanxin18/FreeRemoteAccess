@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use frd_core::PhysicalViewport;
+use frd_core::{PhysicalViewport, SessionId};
 use frd_protocol_api::{
     ClipboardPayload, ProtocolError, ProtocolExit, ProtocolRuntime, SessionCommand,
 };
@@ -124,7 +124,11 @@ pub(crate) fn drain_active_commands(
     })
 }
 
-pub(crate) fn drain_reactivation_commands(runtime: &mut ProtocolRuntime) -> ReactivationCommand {
+pub(crate) fn drain_reactivation_commands(
+    runtime: &mut ProtocolRuntime,
+    session_id: SessionId,
+    generation: u64,
+) -> ReactivationCommand {
     if runtime.requires_shutdown() {
         return ReactivationCommand::Terminal;
     }
@@ -135,9 +139,14 @@ pub(crate) fn drain_reactivation_commands(runtime: &mut ProtocolRuntime) -> Reac
         };
         match command {
             SessionCommand::Disconnect => return ReactivationCommand::Disconnect,
-            SessionCommand::ViewportChanged { viewport, .. } => {
+            SessionCommand::ViewportChanged {
+                session_id: command_session,
+                generation: command_generation,
+                viewport,
+            } if command_session == session_id && command_generation == generation => {
                 latest_viewport = Some(viewport);
             }
+            SessionCommand::ViewportChanged { .. } => {}
             SessionCommand::Input(_)
             | SessionCommand::ResolveServerIdentity { .. }
             | SessionCommand::ClipboardWrite(_) => {}
@@ -751,7 +760,7 @@ mod tests {
             .expect("ordered disconnect sends");
 
         assert!(matches!(
-            drain_reactivation_commands(&mut runtime),
+            drain_reactivation_commands(&mut runtime, session_id, 1),
             super::ReactivationCommand::Continue {
                 latest_viewport: None
             }
@@ -903,7 +912,7 @@ mod tests {
             .expect("input command sends");
 
         assert!(matches!(
-            drain_reactivation_commands(&mut runtime),
+            drain_reactivation_commands(&mut runtime, session_id, 1),
             super::ReactivationCommand::Continue {
                 latest_viewport: None
             }
@@ -956,7 +965,7 @@ mod tests {
         }
 
         assert!(matches!(
-            drain_reactivation_commands(&mut runtime),
+            drain_reactivation_commands(&mut runtime, session_id, 1),
             super::ReactivationCommand::Continue {
                 latest_viewport: Some(viewport)
             } if viewport.content == PixelRect {
@@ -964,6 +973,101 @@ mod tests {
                 y: 0,
                 width: 1920,
                 height: 1080,
+            }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_reactivation_rejects_viewport_outside_the_driven_session() {
+        let runtime_session = SessionId::allocate();
+        let driven_session = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            runtime_session,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                runtime_session,
+                1,
+                PixelSize::new(1280, 720).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        commands
+            .send(SessionCommand::ViewportChanged {
+                session_id: runtime_session,
+                generation: 1,
+                viewport: PhysicalViewport::new(
+                    PixelSize::new(1600, 900).expect("valid content size"),
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1600,
+                        height: 900,
+                    },
+                    PixelSize::new(1280, 720).expect("valid remote size"),
+                )
+                .expect("valid viewport"),
+            })
+            .expect("viewport sends");
+
+        assert!(matches!(
+            drain_reactivation_commands(&mut runtime, driven_session, 1),
+            super::ReactivationCommand::Continue {
+                latest_viewport: None
+            }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_reactivation_rejects_viewport_outside_the_driven_generation() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize::new(1280, 720).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        commands
+            .send(SessionCommand::ViewportChanged {
+                session_id,
+                generation: 1,
+                viewport: PhysicalViewport::new(
+                    PixelSize::new(1600, 900).expect("valid content size"),
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1600,
+                        height: 900,
+                    },
+                    PixelSize::new(1280, 720).expect("valid remote size"),
+                )
+                .expect("valid viewport"),
+            })
+            .expect("viewport sends");
+
+        assert!(matches!(
+            drain_reactivation_commands(&mut runtime, session_id, 2),
+            super::ReactivationCommand::Continue {
+                latest_viewport: None
             }
         ));
     }

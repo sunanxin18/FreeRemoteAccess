@@ -22,17 +22,30 @@ struct LocalText {
     value: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemoteOffer {
+    generation: u64,
+    has_unicode: bool,
+}
+
+#[derive(Debug, Default)]
+struct RemoteResponseOutcome {
+    payload: Option<ClipboardPayload>,
+    follow_up_generation: Option<u64>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ClipboardAdapter {
     channel_ready: bool,
     remote_unicode: bool,
     write_direction_ready: bool,
     next_generation: u64,
-    remote_generation: Option<u64>,
-    outstanding_remote_request: Option<u64>,
+    pending_remote_offer: Option<RemoteOffer>,
+    outstanding_remote_request: Option<RemoteOffer>,
     pending_local_offer: Option<LocalOffer>,
-    accepted_local_generation: Option<u64>,
-    local_text: Option<LocalText>,
+    pending_local_text: Option<LocalText>,
+    accepted_local_text: Option<LocalText>,
+    queued_local_text: Option<String>,
 }
 
 impl Default for ClipboardAdapter {
@@ -42,11 +55,12 @@ impl Default for ClipboardAdapter {
             remote_unicode: false,
             write_direction_ready: false,
             next_generation: 1,
-            remote_generation: None,
+            pending_remote_offer: None,
             outstanding_remote_request: None,
             pending_local_offer: None,
-            accepted_local_generation: None,
-            local_text: None,
+            pending_local_text: None,
+            accepted_local_text: None,
+            queued_local_text: None,
         }
     }
 }
@@ -54,6 +68,7 @@ impl Default for ClipboardAdapter {
 #[derive(Debug)]
 enum ClipboardAction {
     AdvertiseInitial,
+    AdvertiseQueuedLocal,
     RequestUnicode(u64),
     RespondUnicode(u64),
     RespondError,
@@ -102,7 +117,10 @@ impl CliprdrBackend for RdpClipboardBackend {
     }
 
     fn on_format_list_response(&mut self, accepted: bool) {
-        self.adapter.observe_local_format_response(accepted);
+        if self.adapter.observe_local_format_response(accepted) {
+            self.actions
+                .push_back(ClipboardAction::AdvertiseQueuedLocal);
+        }
     }
 
     fn on_process_negotiated_capabilities(
@@ -133,8 +151,13 @@ impl CliprdrBackend for RdpClipboardBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-        if let Some(payload) = self.adapter.accept_remote_response(response) {
+        let outcome = self.adapter.accept_remote_response(response);
+        if let Some(payload) = outcome.payload {
             self.actions.push_back(ClipboardAction::Publish(payload));
+        }
+        if let Some(generation) = outcome.follow_up_generation {
+            self.actions
+                .push_back(ClipboardAction::RequestUnicode(generation));
         }
     }
 
@@ -207,6 +230,24 @@ pub(crate) fn next_service_action(
             .initiate_copy(&[])
             .map(ClipboardServiceAction::Wire)
             .map(Some),
+        ClipboardAction::AdvertiseQueuedLocal => {
+            let generation = cliprdr
+                .downcast_backend_mut::<RdpClipboardBackend>()
+                .and_then(|backend| backend.adapter.begin_queued_local_offer());
+            let Some(generation) = generation else {
+                return Ok(None);
+            };
+            let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+            match cliprdr.initiate_copy(&formats) {
+                Ok(messages) => Ok(Some(ClipboardServiceAction::Wire(messages))),
+                Err(error) => {
+                    if let Some(backend) = cliprdr.downcast_backend_mut::<RdpClipboardBackend>() {
+                        backend.adapter.reject_local_offer(generation);
+                    }
+                    Err(error)
+                }
+            }
+        }
         ClipboardAction::RequestUnicode(generation) => {
             let can_request = cliprdr
                 .downcast_backend::<RdpClipboardBackend>()
@@ -262,8 +303,9 @@ impl ClipboardAdapter {
             generation,
             has_text: false,
         });
-        self.accepted_local_generation = None;
-        self.local_text = None;
+        self.pending_local_text = None;
+        self.accepted_local_text = None;
+        self.queued_local_text = None;
         generation
     }
 
@@ -271,27 +313,35 @@ impl ClipboardAdapter {
         self.channel_ready = true;
     }
 
-    pub(crate) fn observe_local_format_response(&mut self, accepted: bool) {
+    pub(crate) fn observe_local_format_response(&mut self, accepted: bool) -> bool {
         let Some(offer) = self.pending_local_offer.take() else {
-            return;
+            return false;
         };
+        let pending_text = self.pending_local_text.take();
         if accepted && self.channel_ready {
             self.write_direction_ready = true;
-            self.accepted_local_generation = offer.has_text.then_some(offer.generation);
+            self.accepted_local_text =
+                pending_text.filter(|text| offer.has_text && text.generation == offer.generation);
         } else {
-            self.accepted_local_generation = None;
-            self.local_text = None;
+            self.accepted_local_text = None;
         }
+        self.queued_local_text.is_some()
     }
 
     pub(crate) fn observe_remote_formats(&mut self, formats: &[ClipboardFormat]) -> Option<u64> {
         let generation = self.allocate_generation();
-        self.remote_generation = Some(generation);
-        self.outstanding_remote_request = None;
         self.remote_unicode = formats
             .iter()
             .any(|format| format.id() == ClipboardFormatId::CF_UNICODETEXT);
-        self.remote_unicode.then_some(generation)
+        self.pending_remote_offer = Some(RemoteOffer {
+            generation,
+            has_unicode: self.remote_unicode,
+        });
+        if self.outstanding_remote_request.is_some() {
+            None
+        } else {
+            self.remote_unicode.then_some(generation)
+        }
     }
 
     pub(crate) fn accept_local_payload(&mut self, payload: ClipboardPayload) -> Option<u64> {
@@ -304,17 +354,33 @@ impl ClipboardAdapter {
         if text.contains('\0') {
             return None;
         }
+        if self.pending_local_offer.is_some() || self.queued_local_text.is_some() {
+            self.queued_local_text = Some(text.to_owned());
+            return None;
+        }
+        Some(self.begin_local_text_offer(text.to_owned()))
+    }
+
+    fn begin_local_text_offer(&mut self, text: String) -> u64 {
         let generation = self.allocate_generation();
         self.pending_local_offer = Some(LocalOffer {
             generation,
             has_text: true,
         });
-        self.accepted_local_generation = None;
-        self.local_text = Some(LocalText {
+        self.pending_local_text = Some(LocalText {
             generation,
-            value: text.to_owned(),
+            value: text,
         });
-        Some(generation)
+        self.accepted_local_text = None;
+        generation
+    }
+
+    fn begin_queued_local_offer(&mut self) -> Option<u64> {
+        if self.pending_local_offer.is_some() {
+            return None;
+        }
+        let text = self.queued_local_text.take()?;
+        Some(self.begin_local_text_offer(text))
     }
 
     pub(crate) fn reject_local_offer(&mut self, generation: u64) {
@@ -323,17 +389,15 @@ impl ClipboardAdapter {
             .is_some_and(|offer| offer.generation == generation)
         {
             self.pending_local_offer = None;
-            self.accepted_local_generation = None;
-            self.local_text = None;
+            self.pending_local_text = None;
+            self.accepted_local_text = None;
         }
     }
 
     pub(crate) fn accepted_local_generation(&self) -> Option<u64> {
-        let generation = self.accepted_local_generation?;
-        self.local_text
+        self.accepted_local_text
             .as_ref()
-            .filter(|text| text.generation == generation)
-            .map(|_| generation)
+            .map(|text| text.generation)
     }
 
     pub(crate) fn local_unicode_response(
@@ -343,16 +407,17 @@ impl ClipboardAdapter {
         if self.accepted_local_generation() != Some(generation) {
             return None;
         }
-        let text = self.local_text.as_ref()?;
+        let text = self.accepted_local_text.as_ref()?;
         Some(FormatDataResponse::new_unicode_string(&text.value))
     }
 
     pub(crate) fn remote_request_generation(&self) -> Option<u64> {
-        if !self.channel_ready || !self.remote_unicode || self.outstanding_remote_request.is_some()
-        {
+        if !self.channel_ready || self.outstanding_remote_request.is_some() {
             return None;
         }
-        self.remote_generation
+        self.pending_remote_offer
+            .filter(|offer| offer.has_unicode)
+            .map(|offer| offer.generation)
     }
 
     pub(crate) fn can_begin_remote_request(&self, generation: u64) -> bool {
@@ -363,23 +428,39 @@ impl ClipboardAdapter {
         if !self.can_begin_remote_request(generation) {
             return false;
         }
-        self.outstanding_remote_request = Some(generation);
+        self.outstanding_remote_request = self.pending_remote_offer.take();
         true
     }
 
-    pub(crate) fn accept_remote_response(
+    fn accept_remote_response(
         &mut self,
         response: FormatDataResponse<'_>,
-    ) -> Option<ClipboardPayload> {
-        let generation = self.outstanding_remote_request.take()?;
-        if self.remote_generation != Some(generation)
-            || !self.capabilities().clipboard_read
-            || response.is_error()
-        {
-            return None;
+    ) -> RemoteResponseOutcome {
+        let Some(owner) = self.outstanding_remote_request.take() else {
+            return RemoteResponseOutcome::default();
+        };
+        if let Some(follow_up) = self.pending_remote_offer {
+            let follow_up_generation = if self.channel_ready && follow_up.has_unicode {
+                Some(follow_up.generation)
+            } else {
+                self.pending_remote_offer = None;
+                None
+            };
+            return RemoteResponseOutcome {
+                payload: None,
+                follow_up_generation,
+            };
         }
-        let text = decode_strict_unicode_text(response.data())?;
-        Some(ClipboardPayload::new(text.into_bytes()))
+        let payload = if owner.has_unicode && !response.is_error() {
+            decode_strict_unicode_text(response.data())
+                .map(|text| ClipboardPayload::new(text.into_bytes()))
+        } else {
+            None
+        };
+        RemoteResponseOutcome {
+            payload,
+            follow_up_generation: None,
+        }
     }
 
     pub(crate) fn reset(&mut self) {
@@ -415,7 +496,8 @@ mod tests {
     use ironrdp::svc::SvcProcessor;
 
     use super::{
-        capabilities, new_cliprdr, next_service_action, ClipboardAdapter, ClipboardServiceAction,
+        capabilities, new_cliprdr, next_service_action, write_text, ClipboardAdapter,
+        ClipboardServiceAction, RdpClipboardBackend,
     };
 
     fn process_server_clipboard_pdu(
@@ -498,6 +580,7 @@ mod tests {
         assert!(adapter.begin_remote_request(remote_generation));
         let remote = adapter
             .accept_remote_response(FormatDataResponse::new_unicode_string("远程文本"))
+            .payload
             .expect("Unicode text is published");
         assert_eq!(remote.as_bytes(), "远程文本".as_bytes());
     }
@@ -514,13 +597,16 @@ mod tests {
             .expect("remote Unicode offer generation");
         assert!(adapter
             .accept_remote_response(FormatDataResponse::new_unicode_string("unsolicited"))
+            .payload
             .is_none());
         assert!(adapter.begin_remote_request(remote_generation));
         assert!(adapter
             .accept_remote_response(FormatDataResponse::new_unicode_string("owned"))
+            .payload
             .is_some());
         assert!(adapter
             .accept_remote_response(FormatDataResponse::new_unicode_string("replayed"))
+            .payload
             .is_none());
 
         let first_local = adapter
@@ -562,6 +648,7 @@ mod tests {
             assert!(adapter.begin_remote_request(generation));
             assert!(adapter
                 .accept_remote_response(FormatDataResponse::new_data(malformed))
+                .payload
                 .is_none());
         }
     }
@@ -623,5 +710,142 @@ mod tests {
                 .is_none(),
             "a response without an outstanding adapter request must not publish"
         );
+    }
+
+    #[test]
+    fn clipboard_real_processor_serializes_crossed_local_offers() {
+        let mut cliprdr = new_cliprdr();
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::Capabilities(Capabilities::new(
+                ClipboardProtocolVersion::V2,
+                ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+            )),
+        );
+        process_server_clipboard_pdu(&mut cliprdr, ClipboardPdu::MonitorReady);
+        assert!(matches!(
+            next_service_action(&mut cliprdr).expect("initial offer encodes"),
+            Some(ClipboardServiceAction::Wire(_))
+        ));
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::FormatListResponse(FormatListResponse::Ok),
+        );
+
+        assert!(
+            write_text(&mut cliprdr, ClipboardPayload::new(b"offer A".to_vec()))
+                .expect("offer A encodes")
+                .is_some()
+        );
+        let owner_a = cliprdr
+            .downcast_backend::<RdpClipboardBackend>()
+            .and_then(|backend| backend.adapter.pending_local_offer)
+            .expect("offer A owns the wire exchange")
+            .generation;
+        assert!(
+            write_text(&mut cliprdr, ClipboardPayload::new(b"offer B".to_vec()))
+                .expect("offer B queues")
+                .is_none(),
+            "offer B must not be sent while offer A awaits its response"
+        );
+
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::FormatListResponse(FormatListResponse::Ok),
+        );
+        let accepted_a = cliprdr
+            .downcast_backend::<RdpClipboardBackend>()
+            .and_then(|backend| backend.adapter.local_unicode_response(owner_a))
+            .expect("A response accepts only offer A");
+        assert_eq!(
+            accepted_a.to_unicode_string().expect("offer A Unicode"),
+            "offer A"
+        );
+        assert!(matches!(
+            next_service_action(&mut cliprdr).expect("queued B starts after A response"),
+            Some(ClipboardServiceAction::Wire(_))
+        ));
+
+        let owner_b = cliprdr
+            .downcast_backend::<RdpClipboardBackend>()
+            .and_then(|backend| backend.adapter.pending_local_offer)
+            .expect("offer B now owns the wire exchange")
+            .generation;
+        assert_ne!(owner_a, owner_b);
+        assert!(cliprdr
+            .downcast_backend::<RdpClipboardBackend>()
+            .and_then(|backend| backend.adapter.local_unicode_response(owner_b))
+            .is_none());
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::FormatListResponse(FormatListResponse::Ok),
+        );
+        let accepted_b = cliprdr
+            .downcast_backend::<RdpClipboardBackend>()
+            .and_then(|backend| backend.adapter.local_unicode_response(owner_b))
+            .expect("B response accepts offer B");
+        assert_eq!(
+            accepted_b.to_unicode_string().expect("offer B Unicode"),
+            "offer B"
+        );
+    }
+
+    #[test]
+    fn clipboard_real_processor_serializes_crossed_remote_requests() {
+        let mut cliprdr = new_cliprdr();
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::Capabilities(Capabilities::new(
+                ClipboardProtocolVersion::V2,
+                ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+            )),
+        );
+        process_server_clipboard_pdu(&mut cliprdr, ClipboardPdu::MonitorReady);
+        assert!(matches!(
+            next_service_action(&mut cliprdr).expect("initial offer encodes"),
+            Some(ClipboardServiceAction::Wire(_))
+        ));
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::FormatListResponse(FormatListResponse::Ok),
+        );
+
+        let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        let remote_offer = || {
+            ClipboardPdu::FormatList(
+                FormatList::new_unicode(&formats, true).expect("format list encodes"),
+            )
+        };
+        process_server_clipboard_pdu(&mut cliprdr, remote_offer());
+        assert!(matches!(
+            next_service_action(&mut cliprdr).expect("request A encodes"),
+            Some(ClipboardServiceAction::Wire(_))
+        ));
+
+        process_server_clipboard_pdu(&mut cliprdr, remote_offer());
+        assert!(
+            next_service_action(&mut cliprdr)
+                .expect("offer B is coalesced behind request A")
+                .is_none(),
+            "request B must not be sent before response A"
+        );
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::FormatDataResponse(FormatDataResponse::new_unicode_string("response A")),
+        );
+        assert!(matches!(
+            next_service_action(&mut cliprdr).expect("request B starts after response A"),
+            Some(ClipboardServiceAction::Wire(_))
+        ));
+        process_server_clipboard_pdu(
+            &mut cliprdr,
+            ClipboardPdu::FormatDataResponse(FormatDataResponse::new_unicode_string("response B")),
+        );
+        let Some(ClipboardServiceAction::Publish(payload)) =
+            next_service_action(&mut cliprdr).expect("response B publishes")
+        else {
+            panic!("only the response owned by request B may publish")
+        };
+        assert_eq!(payload.as_bytes(), b"response B");
     }
 }

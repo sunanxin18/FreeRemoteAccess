@@ -121,6 +121,7 @@ fn run_active_session_inner(
     };
 
     let result = run_active_loop(
+        session_id,
         runtime,
         &mut writer,
         &mut active_stage,
@@ -152,6 +153,7 @@ fn run_active_session_inner(
 
 #[allow(clippy::too_many_arguments)]
 fn run_active_loop(
+    session_id: SessionId,
     runtime: &mut ProtocolRuntime,
     writer: &mut OrderedRdpWriter<TlsStream>,
     active_stage: &mut ActiveStage,
@@ -279,6 +281,7 @@ fn run_active_loop(
                     return Err(rdp_error(RDP_ACTIVATION_FAILED));
                 }
                 match drive_reactivation(
+                    session_id,
                     runtime,
                     writer,
                     active_stage,
@@ -501,6 +504,7 @@ enum ReactivationOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn drive_reactivation(
+    session_id: SessionId,
     runtime: &mut ProtocolRuntime,
     writer: &mut OrderedRdpWriter<TlsStream>,
     active_stage: &mut ActiveStage,
@@ -514,7 +518,7 @@ fn drive_reactivation(
     let mut activation = activation_factory.create();
     let mut buffer = WriteBuf::new();
     loop {
-        match drain_reactivation_commands(runtime) {
+        match drain_reactivation_commands(runtime, session_id, *generation) {
             ReactivationCommand::Continue { latest_viewport } => {
                 if let Some(viewport) = latest_viewport {
                     display.observe_viewport(viewport);
