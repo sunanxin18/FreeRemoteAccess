@@ -7,6 +7,7 @@ use frd_protocol_api::{
     ServerIdentityChallenge, ServerIdentityDecision, SessionCommand, SessionEvent,
 };
 use sha2::{Digest, Sha256};
+use unicode_general_category::{get_general_category, GeneralCategory};
 
 use crate::error::{rdp_error, RDP_SERVER_IDENTITY_CHANGED, RDP_SERVER_IDENTITY_REJECTED};
 
@@ -177,19 +178,20 @@ fn sanitize_certificate_name(value: &str) -> String {
     let mut pending_space = false;
 
     for character in value.chars() {
+        if get_general_category(character) == GeneralCategory::Format {
+            continue;
+        }
         if character.is_control() || character.is_whitespace() {
             pending_space = !sanitized.is_empty();
             continue;
         }
+        let separator_bytes = usize::from(pending_space);
+        if sanitized.len() + separator_bytes + character.len_utf8() > MAX_CERTIFICATE_NAME_BYTES {
+            break;
+        }
         if pending_space {
-            if sanitized.len() + 1 > MAX_CERTIFICATE_NAME_BYTES {
-                break;
-            }
             sanitized.push(' ');
             pending_space = false;
-        }
-        if sanitized.len() + character.len_utf8() > MAX_CERTIFICATE_NAME_BYTES {
-            break;
         }
         sanitized.push(character);
     }
@@ -361,6 +363,33 @@ mod tests {
         assert_eq!(names.subject.trim(), names.subject);
         assert!(!names.subject.chars().any(char::is_control));
         assert_eq!(names.issuer, "未知");
+    }
+
+    #[test]
+    fn server_identity_certificate_names_strip_bidi_and_invisible_format_characters() {
+        let names = SanitizedCertificateNames::new(
+            "CN=\u{202e}evil\u{2066}\u{200b}peer\u{feff}",
+            "CN=issuer.test",
+        );
+
+        assert_eq!(names.subject, "CN=evilpeer");
+    }
+
+    #[test]
+    fn server_identity_certificate_names_format_only_fall_back_to_unknown() {
+        let names = SanitizedCertificateNames::new("\u{202e}\u{2066}\u{200b}\u{feff}", "\u{200b}");
+
+        assert_eq!(names.subject, "未知");
+        assert_eq!(names.issuer, "未知");
+    }
+
+    #[test]
+    fn server_identity_certificate_names_do_not_commit_a_boundary_separator() {
+        let untrusted = format!("{} 远", "a".repeat(255));
+        let names = SanitizedCertificateNames::new(&untrusted, "CN=issuer.test");
+
+        assert_eq!(names.subject, "a".repeat(255));
+        assert!(!names.subject.ends_with(' '));
     }
 
     #[test]

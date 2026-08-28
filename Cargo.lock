@@ -1970,6 +1970,7 @@ dependencies = [
  "rustls-platform-verifier",
  "sha2 0.10.9",
  "tokio",
+ "unicode-general-category",
  "x509-cert",
  "zeroize",
 ]
