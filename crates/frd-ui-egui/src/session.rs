@@ -44,7 +44,14 @@ pub fn show_session_page(
             ui.label("正在清理会话资源，请稍候。");
             None
         }
-        AppPage::RemoteSession { capabilities, .. } => {
+        AppPage::RemoteSession {
+            capabilities,
+            diagnostics,
+            ..
+        } => {
+            if let Some(diagnostics) = diagnostics {
+                ui.colored_label(ui.visuals().warn_fg_color, diagnostics);
+            }
             ui.horizontal(|ui| {
                 ui.label(if capabilities.remote_audio {
                     "远端音频可用"

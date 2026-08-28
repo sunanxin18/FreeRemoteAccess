@@ -272,6 +272,7 @@ pub enum Page {
     RemoteSession {
         draft: ConnectionDraft,
         capabilities: SessionCapabilities,
+        diagnostics: Option<String>,
     },
     Failed {
         draft: ConnectionDraft,

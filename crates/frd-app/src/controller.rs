@@ -19,6 +19,8 @@ use frd_ui_model::{
 
 use crate::AppIntent;
 
+const PROFILE_PERSISTENCE_WARNING: &str = "登录信息未能安全保存；本次连接仍可继续，请稍后重试。";
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProductPolicy {
     pub dynamic_resolution: bool,
@@ -186,6 +188,7 @@ pub struct AppController {
     inbound_clipboard: Option<ClipboardPayload>,
     audio_state: AudioState,
     pending_profile: Option<PendingProfileTransaction>,
+    profile_persistence_failed: bool,
 }
 
 impl AppController {
@@ -202,6 +205,7 @@ impl AppController {
             inbound_clipboard: None,
             audio_state: AudioState::Unavailable,
             pending_profile: None,
+            profile_persistence_failed: false,
         }
     }
 
@@ -256,6 +260,7 @@ impl AppController {
                 inbound_clipboard: None,
                 audio_state: AudioState::Unavailable,
                 pending_profile: None,
+                profile_persistence_failed: false,
             },
             permit,
         )
@@ -286,17 +291,40 @@ impl AppController {
         self.challenge.as_ref()
     }
 
-    pub fn finish_session_cleanup(
+    #[cfg(test)]
+    pub(crate) fn finish_session_cleanup(
         &mut self,
         cleanup: CleanupComplete,
+    ) -> Result<(), ActiveSessionError> {
+        self.finish_session_cleanup_internal(cleanup, None)
+    }
+
+    pub fn finish_session_cleanup_with_stores(
+        &mut self,
+        cleanup: CleanupComplete,
+        stores: AppPlatformStores<'_>,
+    ) -> Result<(), ActiveSessionError> {
+        self.finish_session_cleanup_internal(cleanup, Some(stores))
+    }
+
+    fn finish_session_cleanup_internal(
+        &mut self,
+        cleanup: CleanupComplete,
+        stores: Option<AppPlatformStores<'_>>,
     ) -> Result<(), ActiveSessionError> {
         let session_id = cleanup.session_id();
         self.session_slot.finish_cleanup(&cleanup)?;
         if self.session_id == Some(session_id) {
+            let draft = self.page.retained_draft();
+            let return_to_connection = matches!(self.page, Page::Disconnecting { .. });
             self.session_id = None;
             self.reset_session_bound_state();
-            if matches!(self.page, Page::Disconnecting { .. }) {
-                self.page = Page::ConnectionForm(ConnectionForm::new(self.page.retained_draft()));
+            if return_to_connection {
+                let mut form = ConnectionForm::new(draft);
+                if let Some(stores) = stores {
+                    Self::load_profiles_into_form(&mut form, stores.profiles);
+                }
+                self.page = Page::ConnectionForm(form);
             }
         }
         Ok(())
@@ -621,6 +649,7 @@ impl AppController {
         self.protocol_capabilities = SessionCapabilities::default();
         self.inbound_clipboard = None;
         self.audio_state = AudioState::Unavailable;
+        self.profile_persistence_failed = false;
     }
 
     /// 取走最新的入站剪贴板；数据只在内存中短暂聚合，不持久化。
@@ -630,6 +659,11 @@ impl AppController {
 
     pub fn audio_state(&self) -> &AudioState {
         &self.audio_state
+    }
+
+    pub fn profile_persistence_warning(&self) -> Option<&'static str> {
+        self.profile_persistence_failed
+            .then_some(PROFILE_PERSISTENCE_WARNING)
     }
 
     #[cfg(test)]
@@ -682,13 +716,14 @@ impl AppController {
                 if matches!(self.page, Page::RemoteSession { .. }) {
                     return;
                 }
-                let persistence_warning = if stage == ConnectionStage::TransportReady {
+                let persistence_failed = if stage == ConnectionStage::TransportReady {
                     self.session_id.and_then(|session_id| {
                         stores.and_then(|stores| self.finish_pending_profile(session_id, stores))
                     })
                 } else {
                     None
                 };
+                self.profile_persistence_failed |= persistence_failed.unwrap_or(false);
                 if stage == ConnectionStage::TransportReady {
                     if let Some(session_id) = self.session_id {
                         let _ = self.session_slot.mark_active(session_id);
@@ -699,13 +734,13 @@ impl AppController {
                     Page::AwaitingFirstFrame {
                         draft,
                         stage,
-                        diagnostics: persistence_warning.map(str::to_owned),
+                        diagnostics: self.profile_persistence_warning().map(str::to_owned),
                     }
                 } else {
                     Page::Connecting {
                         draft,
                         stage,
-                        diagnostics: None,
+                        diagnostics: self.profile_persistence_warning().map(str::to_owned),
                     }
                 };
             }
@@ -732,7 +767,7 @@ impl AppController {
                 self.page = Page::AwaitingFirstFrame {
                     draft: self.page.retained_draft(),
                     stage: ConnectionStage::TransportReady,
-                    diagnostics: None,
+                    diagnostics: self.profile_persistence_warning().map(str::to_owned),
                 };
             }
             SessionEvent::ServerIdentityChallenge(challenge) => {
@@ -770,7 +805,7 @@ impl AppController {
         &mut self,
         session_id: SessionId,
         stores: AppPlatformStores<'_>,
-    ) -> Option<&'static str> {
+    ) -> Option<bool> {
         let Some(pending) = self.pending_profile.take() else {
             return None;
         };
@@ -791,25 +826,56 @@ impl AppController {
                     Some(order) => order,
                     None => {
                         let _ = stores.credentials.discard(session_id);
-                        return Some("profile_persistence_failed");
+                        return Some(true);
                     }
                 };
                 profile.last_success_order = next_order;
+                let previous_credential = match stores.credentials.load(&profile.key) {
+                    Ok(previous) => previous,
+                    Err(_) => {
+                        let _ = stores.credentials.discard(session_id);
+                        return Some(true);
+                    }
+                };
                 if stores.credentials.commit(session_id, &profile.key).is_err() {
                     let _ = stores.credentials.discard(session_id);
-                    return Some("profile_persistence_failed");
+                    return Some(true);
                 }
                 if stores.profiles.upsert(&profile).is_err() {
-                    return Some("profile_persistence_failed");
+                    // 该补偿只覆盖本进程内的部分失败；进程崩溃恢复需要独立事务日志。
+                    Self::compensate_credential_commit(
+                        session_id,
+                        &profile.key,
+                        previous_credential,
+                        stores.credentials,
+                    );
+                    return Some(true);
                 }
-                None
+                Some(false)
             }
             PendingProfileAction::Delete(key) => {
-                let credential_deleted = stores.credentials.delete(&key).is_ok();
-                let profile_deleted = stores.profiles.delete(&key).is_ok();
-                (!credential_deleted || !profile_deleted).then_some("profile_persistence_failed")
+                if stores.credentials.delete(&key).is_err() {
+                    return Some(true);
+                }
+                Some(stores.profiles.delete(&key).is_err())
             }
         }
+    }
+
+    fn compensate_credential_commit(
+        session_id: SessionId,
+        key: &ConnectionProfileKey,
+        previous_credential: Option<frd_core::SecretBuffer>,
+        credentials: &dyn SecureCredentialStore,
+    ) {
+        let restored = previous_credential.is_some_and(|previous| {
+            credentials.stage(session_id, key, &previous).is_ok()
+                && credentials.commit(session_id, key).is_ok()
+        });
+        if !restored {
+            let _ = credentials.delete(key);
+        }
+        let _ = credentials.discard(session_id);
     }
 
     fn discard_pending_profile(
@@ -877,6 +943,7 @@ impl AppController {
             self.page = Page::RemoteSession {
                 draft: self.page.retained_draft(),
                 capabilities: self.effective_capabilities(),
+                diagnostics: self.profile_persistence_warning().map(str::to_owned),
             };
         }
     }

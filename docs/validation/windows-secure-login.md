@@ -54,3 +54,14 @@
 ## 结论与状态
 
 README 平台矩阵标记为 **开发中**：Windows 自动化状态机、本机真实凭据库原语和浅色登录页启动均有证据，但该矩阵要求原生服务端有界真机互操作；授权 Mac GUI 的 TransportReady 提交与取消保存后成功重连删除链路尚未执行，不能升级为“受限验证”。clippy 仍受一个无关既有告警阻断，深色视觉证据也尚未执行。
+
+## 最终跨层审计修复轮次
+
+- 保存事务在提交前读取旧凭据。元数据写入失败时，新建连接删除已提交的新凭据，覆盖连接恢复旧凭据；若恢复本身失败，则删除新值并清理该会话的暂存项。该补偿仅覆盖进程内部分失败，不宣称具备崩溃恢复事务日志。
+- 取消保存现在仅在凭据删除成功后删除非敏感元数据，避免凭据删除失败却让配置变成不可见孤儿。
+- `profile_persistence_failed` 不再作为可直接显示的内部英文码；控制器保存独立的会话级失败标记，界面展示“登录信息未能安全保存；本次连接仍可继续，请稍后重试。”。该警告跨 surface generation 和首个完整帧进入远程会话保留，并在断开时清除。
+- 正常清理完成通过产品 stores 重新读取并按最近成功顺序排列连接；错误页返回连接页也走同一路径。无 store 的 cleanup 入口仅保留为 `frd-app` 单元测试辅助，不是产品 API。
+
+RED：新增回归最初因缺少 `RemoteSession.diagnostics`、`profile_persistence_warning` 和 `finish_session_cleanup_with_stores` 而编译失败。GREEN：共享工作树的 `cargo +stable test -p frd-app` 为 69/69 通过；`cargo +stable test -p frd-ui-model` 为 7/7，`cargo +stable test -p frd-ui-egui` 为 19/19，`cargo +stable test -p frd-shell-desktop` 为 47/47，且 `cargo +stable fmt -- --check` 通过。精确 Git 暂存区快照排除标题栏/图标脏改动后，`frd-app` 66/66、`frd-ui-model` 7/7、`frd-ui-egui` 12/12、`frd-shell-desktop` 35/35，以及 Windows 二进制 11/11 和依赖边界 2/2 均通过；该快照的全 workspace fmt 仅被本轮未暂存的两处既有格式差异阻断（Windows `main.rs` 导入与 shell `lib.rs` re-export）。
+
+本轮没有改变 README 状态：授权 Mac GUI 的 TransportReady 提交和取消保存后重连删除仍未实测，平台矩阵继续保持 **开发中**。

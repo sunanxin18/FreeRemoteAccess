@@ -1778,7 +1778,7 @@ impl DesktopApplication {
                 if self
                     .launch
                     .controller_mut()
-                    .finish_session_cleanup(completion)
+                    .finish_session_cleanup_with_stores(completion, self.stores.as_app_stores())
                     .is_err()
                 {
                     self.handle_application_fatal(
@@ -3298,7 +3298,7 @@ mod tests {
             .expect("disconnect reaches the worker");
         let completion = complete_background_cleanup(&mut host);
         controller
-            .finish_session_cleanup(completion)
+            .finish_session_cleanup_with_stores(completion, stores)
             .expect("shared cleanup token releases the controller slot");
     }
 

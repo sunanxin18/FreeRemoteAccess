@@ -974,6 +974,156 @@ mod tests {
     }
 
     #[test]
+    fn new_profile_metadata_failure_removes_the_newly_committed_credential() {
+        let fixture = RememberFixture::without_saved_profiles();
+        fixture.profiles.fail_next_upsert();
+
+        let session = fixture.submit_new_remembered("new-password");
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+
+        assert_eq!(fixture.committed_password(), None);
+        assert!(!fixture.profile_exists());
+        assert_eq!(
+            fixture.profile_persistence_warning(),
+            Some("登录信息未能安全保存；本次连接仍可继续，请稍后重试。")
+        );
+    }
+
+    #[test]
+    fn overwritten_profile_metadata_failure_restores_the_previous_credential() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        fixture.profiles.fail_next_upsert();
+
+        let session = fixture.submit_remembered("new-password");
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(fixture.profile_exists());
+    }
+
+    #[test]
+    fn unremember_keeps_profile_metadata_when_credential_delete_fails() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        fixture.credentials.fail_next_delete();
+
+        let session = fixture.submit_without_remembering("old-password");
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+
+        assert!(fixture.profile_exists());
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+    }
+
+    #[test]
+    fn profile_persistence_warning_survives_generation_and_presentation_until_disconnect() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        fixture.profiles.fail_next_upsert();
+        let session = fixture.submit_remembered("new-password");
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+
+        fixture.publish_event(
+            session,
+            SessionEvent::SurfaceGenerationChanged {
+                session_id: session,
+                generation: 1,
+                size: PixelSize::new(800, 600).expect("valid surface"),
+            },
+        );
+        assert!(fixture.profile_persistence_warning().is_some());
+        fixture
+            .controller
+            .lock()
+            .expect("controller lock")
+            .handle_presentation(PresentationEvent::FramePresented {
+                session_id: session,
+                generation: 1,
+                revision: 1,
+                completeness: FrameCompleteness::FullBaseline,
+            });
+        assert!(matches!(
+            fixture.controller.lock().expect("controller lock").page(),
+            AppPage::RemoteSession { diagnostics: Some(message), .. }
+                if message == "登录信息未能安全保存；本次连接仍可继续，请稍后重试。"
+        ));
+
+        fixture
+            .controller
+            .lock()
+            .expect("controller lock")
+            .handle_intent_with_stores(AppIntent::Disconnect, &fixture.catalog, fixture.stores())
+            .expect("disconnect starts");
+        assert_eq!(fixture.profile_persistence_warning(), None);
+    }
+
+    #[test]
+    fn successful_save_is_reloaded_as_the_most_recent_profile_after_cleanup() {
+        let fixture = RememberFixture::with_two_profiles();
+        let AppAction::StartSession(request, permit) =
+            fixture.submit_remembered_action("updated-password")
+        else {
+            panic!("remembered submission starts a session");
+        };
+        let session = request.session_id;
+        let mut lifecycle =
+            StartedTestSession::from_request(permit, request, RecordingCleanup::default());
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+        fixture.cancel_connect();
+
+        fixture
+            .controller
+            .lock()
+            .expect("controller lock")
+            .finish_session_cleanup_with_stores(
+                lifecycle.complete().expect("cleanup completes"),
+                fixture.stores(),
+            )
+            .expect("cleanup reloads the connection form");
+
+        let controller = fixture.controller.lock().expect("controller lock");
+        let AppPage::ConnectionForm(form) = controller.page() else {
+            panic!("cleanup returns to the connection form");
+        };
+        assert_eq!(form.profiles[0].key, fixture.profile_key(0));
+    }
+
+    #[test]
+    fn failed_session_return_reloads_and_sorts_profiles_from_the_store() {
+        let fixture = RememberFixture::with_two_profiles();
+        let session = fixture.submit_remembered("wrong-password");
+        fixture.publish_failure(session, "authentication_failed");
+        fixture
+            .profiles
+            .upsert(&SavedConnectionProfile {
+                key: fixture.profile_key(1),
+                target_system: TargetSystem::MacOs,
+                last_success_order: 99,
+            })
+            .expect("external profile update succeeds");
+
+        fixture
+            .controller
+            .lock()
+            .expect("controller lock")
+            .handle_intent_with_stores(
+                AppIntent::ReturnToConnection,
+                &fixture.catalog,
+                fixture.stores(),
+            )
+            .expect("failed page returns through stores");
+
+        let controller = fixture.controller.lock().expect("controller lock");
+        let AppPage::ConnectionForm(form) = controller.page() else {
+            panic!("failure returns to the connection form");
+        };
+        assert_eq!(form.profiles[0].key, fixture.profile_key(1));
+    }
+
+    #[test]
     fn authentication_failure_discards_pending_without_overwriting_committed() {
         let fixture = RememberFixture::with_saved_password("old-password");
         let session = fixture.submit_remembered("wrong-password");
@@ -1124,6 +1274,20 @@ mod tests {
     }
 
     impl RememberFixture {
+        fn without_saved_profiles() -> Self {
+            let mut fixture = Self::new(&[]);
+            fixture.keys.push(
+                ConnectionProfileKey::new(
+                    ProtocolId::apple_hpss_mvs(),
+                    "new.invalid",
+                    5900,
+                    "new-user",
+                )
+                .expect("new fixture profile key is valid"),
+            );
+            fixture
+        }
+
         fn with_saved_password(password: &str) -> Self {
             Self::new(&[("remembered.invalid", "remembered-user", password, 1)])
         }
@@ -1208,6 +1372,21 @@ mod tests {
         fn submit_remembered_action(&self, password: &str) -> AppAction {
             self.select_profile(0);
             self.submit_action(password, true)
+        }
+
+        fn submit_new_remembered(&self, password: &str) -> SessionId {
+            {
+                let mut controller = self.controller.lock().expect("controller lock");
+                let form = controller
+                    .connection_form_mut()
+                    .expect("fixture is on connection form");
+                form.draft.target_system = Some(TargetSystem::MacOs);
+                form.draft.address = "new.invalid".to_owned();
+                form.draft.port = Some(5900);
+                form.draft.protocol = ProtocolChoice::Automatic;
+                form.draft.username = "new-user".to_owned();
+            }
+            self.submit(password, true)
         }
 
         fn submit_without_remembering(&self, password: &str) -> SessionId {
@@ -1302,17 +1481,30 @@ mod tests {
                 .expect("fixture password is valid UTF-8")
                 .to_owned()
         }
+
+        fn profile_persistence_warning(&self) -> Option<&'static str> {
+            self.controller
+                .lock()
+                .expect("controller lock")
+                .profile_persistence_warning()
+        }
     }
 
     struct MemoryProfileStore {
         profiles: Mutex<Vec<SavedConnectionProfile>>,
+        fail_upsert: Mutex<bool>,
     }
 
     impl MemoryProfileStore {
         fn new(profiles: Vec<SavedConnectionProfile>) -> Self {
             Self {
                 profiles: Mutex::new(profiles),
+                fail_upsert: Mutex::new(false),
             }
+        }
+
+        fn fail_next_upsert(&self) {
+            *self.fail_upsert.lock().expect("failure lock") = true;
         }
 
         fn contains(&self, key: &ConnectionProfileKey) -> bool {
@@ -1330,6 +1522,9 @@ mod tests {
         }
 
         fn upsert(&self, profile: &SavedConnectionProfile) -> Result<(), PlatformError> {
+            if std::mem::take(&mut *self.fail_upsert.lock().expect("failure lock")) {
+                return Err(PlatformError::Unavailable);
+            }
             let mut profiles = self.profiles.lock().expect("profile lock");
             if let Some(existing) = profiles
                 .iter_mut()
@@ -1355,6 +1550,7 @@ mod tests {
         committed: Mutex<Vec<(ConnectionProfileKey, String)>>,
         pending: Mutex<Vec<(SessionId, ConnectionProfileKey, String)>>,
         loads: Mutex<Vec<ConnectionProfileKey>>,
+        fail_delete: Mutex<bool>,
     }
 
     impl MemoryCredentialStore {
@@ -1363,7 +1559,12 @@ mod tests {
                 committed: Mutex::new(committed),
                 pending: Mutex::new(Vec::new()),
                 loads: Mutex::new(Vec::new()),
+                fail_delete: Mutex::new(false),
             }
+        }
+
+        fn fail_next_delete(&self) {
+            *self.fail_delete.lock().expect("failure lock") = true;
         }
 
         fn committed(&self, key: &ConnectionProfileKey) -> Option<String> {
@@ -1447,6 +1648,9 @@ mod tests {
         }
 
         fn delete(&self, key: &ConnectionProfileKey) -> Result<(), PlatformError> {
+            if std::mem::take(&mut *self.fail_delete.lock().expect("failure lock")) {
+                return Err(PlatformError::Unavailable);
+            }
             self.committed
                 .lock()
                 .expect("credential lock")
