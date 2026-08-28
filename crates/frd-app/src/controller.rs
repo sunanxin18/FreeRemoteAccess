@@ -1,7 +1,8 @@
 use frd_core::{InputEvent, SessionId, SessionInput};
 use frd_frame::FrameCompleteness;
 use frd_platform_api::{
-    CredentialProvider, PlatformCapabilities, PlatformError, ServerIdentityStore,
+    ConnectionProfileKey, ConnectionProfileStore, CredentialProvider, PlatformCapabilities,
+    PlatformError, SavedConnectionProfile, SecureCredentialStore, ServerIdentityStore,
 };
 use frd_protocol_api::{
     AudioState, ClipboardPayload, ConnectRequest, ConnectionStage, Credentials, PresentationEvent,
@@ -61,6 +62,23 @@ pub enum IdentityDecisionError {
 pub enum AppAction {
     StartSession(ConnectRequest, SessionStartPermit),
     SessionCommand(SessionCommand),
+}
+
+#[derive(Clone, Copy)]
+pub struct AppPlatformStores<'a> {
+    pub server_identities: &'a dyn ServerIdentityStore,
+    pub profiles: &'a dyn ConnectionProfileStore,
+    pub credentials: &'a dyn SecureCredentialStore,
+}
+
+struct PendingProfileTransaction {
+    session_id: SessionId,
+    action: PendingProfileAction,
+}
+
+enum PendingProfileAction {
+    Remember(SavedConnectionProfile),
+    Delete(ConnectionProfileKey),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +148,19 @@ impl AppLaunch {
         }
     }
 
+    pub fn new_with_stores(
+        options: LaunchOptions,
+        provider: &dyn CredentialProvider,
+        catalog: &ProtocolCatalog,
+        stores: AppPlatformStores<'_>,
+    ) -> Self {
+        let mut launch = Self::new(options, provider, catalog);
+        if let Some(form) = launch.controller.connection_form_mut() {
+            AppController::load_profiles_into_form(form, stores.profiles);
+        }
+        launch
+    }
+
     pub fn take_connect_intent(&mut self) -> Option<AppIntent> {
         self.pending_connect.take()
     }
@@ -154,6 +185,7 @@ pub struct AppController {
     challenge: Option<ServerIdentityChallenge>,
     inbound_clipboard: Option<ClipboardPayload>,
     audio_state: AudioState,
+    pending_profile: Option<PendingProfileTransaction>,
 }
 
 impl AppController {
@@ -169,7 +201,16 @@ impl AppController {
             challenge: None,
             inbound_clipboard: None,
             audio_state: AudioState::Unavailable,
+            pending_profile: None,
         }
+    }
+
+    pub fn connection_form_with_stores(
+        mut form: ConnectionForm,
+        stores: AppPlatformStores<'_>,
+    ) -> Self {
+        Self::load_profiles_into_form(&mut form, stores.profiles);
+        Self::connection_form(form)
     }
 
     #[cfg(test)]
@@ -214,6 +255,7 @@ impl AppController {
                 challenge: None,
                 inbound_clipboard: None,
                 audio_state: AudioState::Unavailable,
+                pending_profile: None,
             },
             permit,
         )
@@ -227,6 +269,16 @@ impl AppController {
         match &mut self.page {
             Page::ConnectionForm(form) => Some(form),
             _ => None,
+        }
+    }
+
+    fn load_profiles_into_form(form: &mut ConnectionForm, profiles: &dyn ConnectionProfileStore) {
+        match profiles.list() {
+            Ok(mut saved) => {
+                SavedConnectionProfile::sort_most_recent(&mut saved);
+                form.set_profiles(saved);
+            }
+            Err(_) => form.set_profile_storage_error("profile_storage_failed"),
         }
     }
 
@@ -255,6 +307,22 @@ impl AppController {
         &mut self,
         failure: &SessionStartFailure,
     ) -> Result<(), ActiveSessionError> {
+        self.consume_launch_rollback_internal(failure, None)
+    }
+
+    pub fn consume_launch_rollback_with_stores(
+        &mut self,
+        failure: &SessionStartFailure,
+        stores: AppPlatformStores<'_>,
+    ) -> Result<(), ActiveSessionError> {
+        self.consume_launch_rollback_internal(failure, Some(stores))
+    }
+
+    fn consume_launch_rollback_internal(
+        &mut self,
+        failure: &SessionStartFailure,
+        stores: Option<AppPlatformStores<'_>>,
+    ) -> Result<(), ActiveSessionError> {
         if !matches!(self.page, Page::Connecting { .. }) {
             return Err(ActiveSessionError::InvalidTransition);
         }
@@ -263,6 +331,9 @@ impl AppController {
             return Err(ActiveSessionError::InvalidTransition);
         }
         self.session_slot.abort_connect(failure.abort())?;
+        if let Some(stores) = stores {
+            self.discard_pending_profile(session_id, stores.credentials);
+        }
         let draft = self.page.retained_draft();
         self.session_id = None;
         self.reset_session_bound_state();
@@ -279,9 +350,41 @@ impl AppController {
         catalog: &ProtocolCatalog,
         store: &dyn ServerIdentityStore,
     ) -> Result<Option<AppAction>, AppControllerError> {
-        match intent.into() {
-            AppIntent::Connect(submission) => {
-                self.start_connection(submission, catalog, store).map(Some)
+        self.handle_intent_internal(intent.into(), catalog, store, None)
+    }
+
+    pub fn handle_intent_with_stores<I: Into<AppIntent>>(
+        &mut self,
+        intent: I,
+        catalog: &ProtocolCatalog,
+        stores: AppPlatformStores<'_>,
+    ) -> Result<Option<AppAction>, AppControllerError> {
+        self.handle_intent_internal(
+            intent.into(),
+            catalog,
+            stores.server_identities,
+            Some(stores),
+        )
+    }
+
+    fn handle_intent_internal(
+        &mut self,
+        intent: AppIntent,
+        catalog: &ProtocolCatalog,
+        store: &dyn ServerIdentityStore,
+        stores: Option<AppPlatformStores<'_>>,
+    ) -> Result<Option<AppAction>, AppControllerError> {
+        match intent {
+            AppIntent::Connect(submission) => self
+                .start_connection(submission, catalog, store, stores)
+                .map(Some),
+            AppIntent::SelectSavedProfile(key) => {
+                if let Some(stores) = stores {
+                    self.select_saved_profile(key, stores.credentials);
+                } else if let Some(form) = self.connection_form_mut() {
+                    form.set_profile_storage_error("profile_storage_unavailable");
+                }
+                Ok(None)
             }
             AppIntent::CancelConnect | AppIntent::Disconnect => {
                 let session_id = self.session_id.ok_or(AppControllerError::NoActiveSession)?;
@@ -292,6 +395,9 @@ impl AppController {
                 if transition == DisconnectTransition::AlreadyInProgress {
                     return Ok(None);
                 }
+                if let Some(stores) = stores {
+                    self.discard_pending_profile(session_id, stores.credentials);
+                }
                 let draft = self.page.retained_draft();
                 self.reset_session_bound_state();
                 self.page = Page::Disconnecting { draft };
@@ -299,7 +405,11 @@ impl AppController {
             }
             AppIntent::ReturnToConnection => {
                 let draft = self.page.retained_draft();
-                self.page = Page::ConnectionForm(ConnectionForm::new(draft));
+                let mut form = ConnectionForm::new(draft);
+                if let Some(stores) = stores {
+                    Self::load_profiles_into_form(&mut form, stores.profiles);
+                }
+                self.page = Page::ConnectionForm(form);
                 Ok(None)
             }
             AppIntent::ResolveServerIdentity {
@@ -319,6 +429,7 @@ impl AppController {
         mut submission: ConnectionSubmission,
         catalog: &ProtocolCatalog,
         store: &dyn ServerIdentityStore,
+        stores: Option<AppPlatformStores<'_>>,
     ) -> Result<AppAction, AppControllerError> {
         if self.session_slot.is_occupied() {
             return Err(AppControllerError::SessionAlreadyActive);
@@ -363,10 +474,53 @@ impl AppController {
             .load_pin(&protocol_id, &endpoint)
             .map_err(AppControllerError::Platform)?;
         let session_id = SessionId::allocate();
-        let permit = self
-            .session_slot
-            .begin_connect(session_id)
-            .map_err(|_| AppControllerError::SessionAlreadyActive)?;
+        let pending_profile = if submission.remember_on_this_device {
+            let Some(stores) = stores else {
+                return self.reject_submission(submission, "profile_storage_unavailable");
+            };
+            let Some(key) = ConnectionProfileKey::new(
+                protocol_id.clone(),
+                submission.draft.address.clone(),
+                submission.draft.port.unwrap_or(0),
+                submission.draft.username.clone(),
+            ) else {
+                return self.reject_submission(submission, "invalid_profile");
+            };
+            if stores
+                .credentials
+                .stage(session_id, &key, &submission.password)
+                .is_err()
+            {
+                return self.reject_submission(submission, "credential_storage_failed");
+            }
+            Some(PendingProfileTransaction {
+                session_id,
+                action: PendingProfileAction::Remember(SavedConnectionProfile {
+                    key,
+                    target_system: target,
+                    last_success_order: 0,
+                }),
+            })
+        } else if let Some(key) = submission.selected_profile.clone() {
+            if stores.is_none() {
+                return self.reject_submission(submission, "profile_storage_unavailable");
+            }
+            Some(PendingProfileTransaction {
+                session_id,
+                action: PendingProfileAction::Delete(key),
+            })
+        } else {
+            None
+        };
+        let permit = match self.session_slot.begin_connect(session_id) {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let (Some(stores), Some(_)) = (stores, pending_profile.as_ref()) {
+                    let _ = stores.credentials.discard(session_id);
+                }
+                return Err(AppControllerError::SessionAlreadyActive);
+            }
+        };
 
         let draft = submission.draft.clone();
         let request = ConnectRequest {
@@ -380,6 +534,7 @@ impl AppController {
             saved_server_pin,
         };
         self.session_id = Some(session_id);
+        self.pending_profile = pending_profile;
         self.reset_session_bound_state();
         self.page = Page::Connecting {
             draft,
@@ -389,12 +544,46 @@ impl AppController {
         Ok(AppAction::StartSession(request, permit))
     }
 
+    fn select_saved_profile(
+        &mut self,
+        key: ConnectionProfileKey,
+        credentials: &dyn SecureCredentialStore,
+    ) {
+        let Some(form) = self.connection_form_mut() else {
+            return;
+        };
+        let Some(profile) = form
+            .profiles
+            .iter()
+            .find(|profile| profile.key == key)
+            .cloned()
+        else {
+            form.set_profile_storage_error("saved_profile_not_found");
+            return;
+        };
+        form.select_profile_metadata(&profile);
+        match credentials.load(&key) {
+            Ok(Some(password)) => form.set_loaded_password(password),
+            Ok(None) => form.set_password_error("saved_credential_unavailable"),
+            Err(_) => form.set_password_error("credential_storage_failed"),
+        }
+    }
+
     fn reject_submission(
         &mut self,
         submission: ConnectionSubmission,
         code: &'static str,
     ) -> Result<AppAction, AppControllerError> {
+        let profiles = match &mut self.page {
+            Page::ConnectionForm(form) => std::mem::take(&mut form.profiles),
+            _ => Vec::new(),
+        };
+        let remember_on_this_device = submission.remember_on_this_device;
+        let selected_profile = submission.selected_profile.clone();
         let mut form = ConnectionForm::new(submission.draft);
+        form.set_profiles(profiles);
+        form.remember_on_this_device = remember_on_this_device;
+        form.selected_profile = selected_profile;
         form.set_password(submission.password);
         form.set_validation_error(code);
         self.page = Page::ConnectionForm(form);
@@ -442,15 +631,31 @@ impl AppController {
     }
 
     pub fn handle_session_event(&mut self, event: SessionEvent) {
+        self.handle_session_event_internal(event, None);
+    }
+
+    pub fn handle_session_event_with_stores(
+        &mut self,
+        event: SessionEvent,
+        stores: AppPlatformStores<'_>,
+    ) {
+        self.handle_session_event_internal(event, Some(stores));
+    }
+
+    fn handle_session_event_internal(
+        &mut self,
+        event: SessionEvent,
+        stores: Option<AppPlatformStores<'_>>,
+    ) {
         if let SessionEvent::Error(error) = &event {
-            self.handle_terminal_failure(error.code());
+            self.handle_terminal_failure(error.code(), stores);
             return;
         }
         if let SessionEvent::Closed(exit) = &event {
             match exit {
-                frd_protocol_api::ProtocolExit::Closed => self.handle_normal_close(),
+                frd_protocol_api::ProtocolExit::Closed => self.handle_normal_close(stores),
                 frd_protocol_api::ProtocolExit::Failed(error) => {
-                    self.handle_terminal_failure(error.code())
+                    self.handle_terminal_failure(error.code(), stores)
                 }
             }
             return;
@@ -464,12 +669,19 @@ impl AppController {
         match event {
             SessionEvent::StageChanged(stage) => {
                 if stage == ConnectionStage::Disconnecting {
-                    self.handle_disconnect_stage();
+                    self.handle_disconnect_stage(stores);
                     return;
                 }
                 if matches!(self.page, Page::RemoteSession { .. }) {
                     return;
                 }
+                let persistence_warning = if stage == ConnectionStage::TransportReady {
+                    self.session_id.and_then(|session_id| {
+                        stores.and_then(|stores| self.finish_pending_profile(session_id, stores))
+                    })
+                } else {
+                    None
+                };
                 if stage == ConnectionStage::TransportReady {
                     if let Some(session_id) = self.session_id {
                         let _ = self.session_slot.mark_active(session_id);
@@ -480,7 +692,7 @@ impl AppController {
                     Page::AwaitingFirstFrame {
                         draft,
                         stage,
-                        diagnostics: None,
+                        diagnostics: persistence_warning.map(str::to_owned),
                     }
                 } else {
                     Page::Connecting {
@@ -526,12 +738,15 @@ impl AppController {
         }
     }
 
-    fn handle_terminal_failure(&mut self, code: &str) {
+    fn handle_terminal_failure(&mut self, code: &str, stores: Option<AppPlatformStores<'_>>) {
         let Some(session_id) = self.session_id else {
             return;
         };
         if self.session_slot.begin_terminal(session_id).is_err() {
             return;
+        }
+        if let Some(stores) = stores {
+            self.discard_pending_profile(session_id, stores.credentials);
         }
         let draft = self.page.retained_draft();
         let already_failed = matches!(self.page, Page::Failed { .. });
@@ -544,12 +759,76 @@ impl AppController {
         }
     }
 
-    fn handle_normal_close(&mut self) {
+    fn finish_pending_profile(
+        &mut self,
+        session_id: SessionId,
+        stores: AppPlatformStores<'_>,
+    ) -> Option<&'static str> {
+        let Some(pending) = self.pending_profile.take() else {
+            return None;
+        };
+        if pending.session_id != session_id {
+            self.pending_profile = Some(pending);
+            return None;
+        }
+        match pending.action {
+            PendingProfileAction::Remember(mut profile) => {
+                let next_order = match stores.profiles.list().ok().and_then(|profiles| {
+                    profiles
+                        .iter()
+                        .map(|profile| profile.last_success_order)
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                }) {
+                    Some(order) => order,
+                    None => {
+                        let _ = stores.credentials.discard(session_id);
+                        return Some("profile_persistence_failed");
+                    }
+                };
+                profile.last_success_order = next_order;
+                if stores.credentials.commit(session_id, &profile.key).is_err() {
+                    let _ = stores.credentials.discard(session_id);
+                    return Some("profile_persistence_failed");
+                }
+                if stores.profiles.upsert(&profile).is_err() {
+                    return Some("profile_persistence_failed");
+                }
+                None
+            }
+            PendingProfileAction::Delete(key) => {
+                let credential_deleted = stores.credentials.delete(&key).is_ok();
+                let profile_deleted = stores.profiles.delete(&key).is_ok();
+                (!credential_deleted || !profile_deleted).then_some("profile_persistence_failed")
+            }
+        }
+    }
+
+    fn discard_pending_profile(
+        &mut self,
+        session_id: SessionId,
+        credentials: &dyn SecureCredentialStore,
+    ) {
+        let Some(pending) = self.pending_profile.take() else {
+            return;
+        };
+        if pending.session_id != session_id {
+            self.pending_profile = Some(pending);
+            return;
+        }
+        let _ = credentials.discard(session_id);
+    }
+
+    fn handle_normal_close(&mut self, stores: Option<AppPlatformStores<'_>>) {
         let Some(session_id) = self.session_id else {
             return;
         };
         if self.session_slot.begin_terminal(session_id).is_err() {
             return;
+        }
+        if let Some(stores) = stores {
+            self.discard_pending_profile(session_id, stores.credentials);
         }
         if matches!(self.page, Page::Failed { .. }) {
             return;
@@ -559,12 +838,15 @@ impl AppController {
         self.page = Page::Disconnecting { draft };
     }
 
-    fn handle_disconnect_stage(&mut self) {
+    fn handle_disconnect_stage(&mut self, stores: Option<AppPlatformStores<'_>>) {
         let Some(session_id) = self.session_id else {
             return;
         };
         if self.session_slot.begin_disconnect(session_id).is_err() {
             return;
+        }
+        if let Some(stores) = stores {
+            self.discard_pending_profile(session_id, stores.credentials);
         }
         let draft = self.page.retained_draft();
         self.reset_session_bound_state();

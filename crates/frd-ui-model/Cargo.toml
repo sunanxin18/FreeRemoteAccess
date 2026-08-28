@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 frd-core = { path = "../frd-core" }
+frd-platform-api = { path = "../frd-platform-api" }
 frd-protocol-api = { path = "../frd-protocol-api" }

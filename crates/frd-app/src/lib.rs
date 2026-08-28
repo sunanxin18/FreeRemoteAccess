@@ -2,9 +2,10 @@ mod controller;
 
 pub use controller::{
     ActiveSessionError, ActiveSessionSlot, AppAction, AppController, AppControllerError, AppLaunch,
-    DisconnectTransition, IdentityDecisionError, ProductPolicy,
+    AppPlatformStores, DisconnectTransition, IdentityDecisionError, ProductPolicy,
 };
 use frd_core::SessionId;
+use frd_platform_api::ConnectionProfileKey;
 pub use frd_protocol_api::PresentationEvent;
 use frd_protocol_api::ServerIdentityDecision;
 use frd_ui_model::ConnectionSubmission;
@@ -13,6 +14,7 @@ pub use frd_ui_model::Page as AppPage;
 /// UI 只在此低频语义边界驱动会话；不包含输入或帧数据。
 pub enum AppIntent {
     Connect(ConnectionSubmission),
+    SelectSavedProfile(ConnectionProfileKey),
     CancelConnect,
     Disconnect,
     ReturnToConnection,
@@ -39,7 +41,8 @@ mod tests {
     };
     use frd_frame::FrameCompleteness;
     use frd_platform_api::{
-        CredentialProvider, PlatformCapabilities, PlatformError, ServerIdentityStore,
+        ConnectionProfileKey, ConnectionProfileStore, CredentialProvider, PlatformCapabilities,
+        PlatformError, SavedConnectionProfile, SecureCredentialStore, ServerIdentityStore,
     };
 
     use frd_protocol_api::{
@@ -56,7 +59,7 @@ mod tests {
 
     use super::{
         ActiveSessionSlot, AppAction, AppController, AppControllerError, AppIntent, AppLaunch,
-        AppPage, PresentationEvent, ProductPolicy,
+        AppPage, AppPlatformStores, PresentationEvent, ProductPolicy,
     };
 
     #[test]
@@ -373,6 +376,8 @@ mod tests {
             },
             resolved_protocol: ProtocolId::apple_hpss_mvs(),
             password: SecretBuffer::new(b"retained-password".to_vec()),
+            remember_on_this_device: false,
+            selected_profile: None,
         };
 
         assert_eq!(
@@ -410,6 +415,8 @@ mod tests {
             },
             resolved_protocol: ProtocolId::apple_hpss_mvs(),
             password: SecretBuffer::new(Vec::new()),
+            remember_on_this_device: false,
+            selected_profile: None,
         };
 
         assert_eq!(
@@ -438,6 +445,8 @@ mod tests {
             },
             resolved_protocol: ProtocolId::apple_hpss_mvs(),
             password: SecretBuffer::new(b"test-password".to_vec()),
+            remember_on_this_device: false,
+            selected_profile: None,
         };
 
         assert_eq!(
@@ -472,6 +481,8 @@ mod tests {
             },
             resolved_protocol: ProtocolId::new("unregistered-test").expect("valid protocol id"),
             password: SecretBuffer::new(b"test-password".to_vec()),
+            remember_on_this_device: false,
+            selected_profile: None,
         };
 
         assert_eq!(
@@ -942,6 +953,372 @@ mod tests {
             } else {
                 Ok(SecretBuffer::new(b"provider-password".to_vec()))
             }
+        }
+    }
+
+    #[test]
+    fn remembered_password_commits_only_after_transport_ready() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let session = fixture.submit_remembered("new-password");
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(fixture.pending_exists(session));
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+        assert_eq!(
+            fixture.committed_password(),
+            Some("new-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+    }
+
+    #[test]
+    fn authentication_failure_discards_pending_without_overwriting_committed() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let session = fixture.submit_remembered("wrong-password");
+        fixture.publish_failure(session, "apple_hpss_session_failed");
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+    }
+
+    #[test]
+    fn successful_unremembered_login_deletes_selected_profile() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let session = fixture.submit_without_remembering("old-password");
+        assert!(fixture.profile_exists());
+        fixture.publish_stage(session, ConnectionStage::TransportReady);
+        assert!(!fixture.profile_exists());
+        assert_eq!(fixture.committed_password(), None);
+    }
+
+    #[test]
+    fn selecting_profile_loads_only_its_credential() {
+        let fixture = RememberFixture::with_two_profiles();
+        fixture.select_profile(1);
+        assert_eq!(fixture.credential_loads(), vec![fixture.profile_key(1)]);
+        assert_eq!(fixture.form_password(), "selected-password");
+    }
+
+    struct RememberFixture {
+        catalog: ProtocolCatalog,
+        controller: Mutex<AppController>,
+        identities: RecordingStore,
+        profiles: MemoryProfileStore,
+        credentials: MemoryCredentialStore,
+        keys: Vec<ConnectionProfileKey>,
+    }
+
+    impl RememberFixture {
+        fn with_saved_password(password: &str) -> Self {
+            Self::new(&[("remembered.invalid", "remembered-user", password, 1)])
+        }
+
+        fn with_two_profiles() -> Self {
+            Self::new(&[
+                ("other.invalid", "other-user", "other-password", 1),
+                ("selected.invalid", "selected-user", "selected-password", 2),
+            ])
+        }
+
+        fn new(entries: &[(&str, &str, &str, u64)]) -> Self {
+            let identities = RecordingStore::default();
+            let mut saved = Vec::new();
+            let mut committed = Vec::new();
+            let mut keys = Vec::new();
+            for (address, username, password, order) in entries {
+                let key = ConnectionProfileKey::new(
+                    ProtocolId::apple_hpss_mvs(),
+                    *address,
+                    5900,
+                    *username,
+                )
+                .expect("fixture profile key is valid");
+                saved.push(SavedConnectionProfile {
+                    key: key.clone(),
+                    target_system: TargetSystem::MacOs,
+                    last_success_order: *order,
+                });
+                committed.push((key.clone(), (*password).to_owned()));
+                keys.push(key);
+            }
+            let profiles = MemoryProfileStore::new(saved);
+            let credentials = MemoryCredentialStore::new(committed);
+            let stores = AppPlatformStores {
+                server_identities: &identities,
+                profiles: &profiles,
+                credentials: &credentials,
+            };
+            let controller = AppController::connection_form_with_stores(
+                ConnectionForm::new(ConnectionDraft::default()),
+                stores,
+            );
+            Self {
+                catalog: ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]),
+                controller: Mutex::new(controller),
+                identities,
+                profiles,
+                credentials,
+                keys,
+            }
+        }
+
+        fn stores(&self) -> AppPlatformStores<'_> {
+            AppPlatformStores {
+                server_identities: &self.identities,
+                profiles: &self.profiles,
+                credentials: &self.credentials,
+            }
+        }
+
+        fn select_profile(&self, index: usize) {
+            self.controller
+                .lock()
+                .expect("controller lock")
+                .handle_intent_with_stores(
+                    AppIntent::SelectSavedProfile(self.profile_key(index)),
+                    &self.catalog,
+                    self.stores(),
+                )
+                .expect("saved profile selection succeeds");
+        }
+
+        fn submit_remembered(&self, password: &str) -> SessionId {
+            self.select_profile(0);
+            self.submit(password, true)
+        }
+
+        fn submit_without_remembering(&self, password: &str) -> SessionId {
+            self.select_profile(0);
+            self.submit(password, false)
+        }
+
+        fn submit(&self, password: &str, remember_on_this_device: bool) -> SessionId {
+            let mut controller = self.controller.lock().expect("controller lock");
+            let form = controller
+                .connection_form_mut()
+                .expect("fixture is on connection form");
+            form.set_password(SecretBuffer::new(password.as_bytes().to_vec()));
+            form.remember_on_this_device = remember_on_this_device;
+            let submission = form
+                .take_submission(&self.catalog)
+                .expect("fixture form is complete");
+            let action = controller
+                .handle_intent_with_stores(submission, &self.catalog, self.stores())
+                .expect("fixture submission succeeds")
+                .expect("fixture submission launches a session");
+            let AppAction::StartSession(request, _) = action else {
+                panic!("fixture submission must start a session");
+            };
+            request.session_id
+        }
+
+        fn publish_stage(&self, _session: SessionId, stage: ConnectionStage) {
+            self.controller
+                .lock()
+                .expect("controller lock")
+                .handle_session_event_with_stores(SessionEvent::StageChanged(stage), self.stores());
+        }
+
+        fn publish_failure(&self, session: SessionId, code: &'static str) {
+            assert!(self.pending_exists(session));
+            self.controller
+                .lock()
+                .expect("controller lock")
+                .handle_session_event_with_stores(
+                    SessionEvent::Error(ProtocolError::adapter(ProtocolId::apple_hpss_mvs(), code)),
+                    self.stores(),
+                );
+        }
+
+        fn committed_password(&self) -> Option<String> {
+            self.credentials.committed(&self.keys[0])
+        }
+
+        fn pending_exists(&self, session: SessionId) -> bool {
+            self.credentials.pending_exists(session)
+        }
+
+        fn profile_exists(&self) -> bool {
+            self.profiles.contains(&self.keys[0])
+        }
+
+        fn credential_loads(&self) -> Vec<ConnectionProfileKey> {
+            self.credentials.loads()
+        }
+
+        fn profile_key(&self, index: usize) -> ConnectionProfileKey {
+            self.keys[index].clone()
+        }
+
+        fn form_password(&self) -> String {
+            let mut controller = self.controller.lock().expect("controller lock");
+            let Some(form) = controller.connection_form_mut() else {
+                panic!("fixture must remain on the connection form");
+            };
+            form.password_mut()
+                .expose_text()
+                .expect("fixture password is valid UTF-8")
+                .to_owned()
+        }
+    }
+
+    struct MemoryProfileStore {
+        profiles: Mutex<Vec<SavedConnectionProfile>>,
+    }
+
+    impl MemoryProfileStore {
+        fn new(profiles: Vec<SavedConnectionProfile>) -> Self {
+            Self {
+                profiles: Mutex::new(profiles),
+            }
+        }
+
+        fn contains(&self, key: &ConnectionProfileKey) -> bool {
+            self.profiles
+                .lock()
+                .expect("profile lock")
+                .iter()
+                .any(|profile| &profile.key == key)
+        }
+    }
+
+    impl ConnectionProfileStore for MemoryProfileStore {
+        fn list(&self) -> Result<Vec<SavedConnectionProfile>, PlatformError> {
+            Ok(self.profiles.lock().expect("profile lock").clone())
+        }
+
+        fn upsert(&self, profile: &SavedConnectionProfile) -> Result<(), PlatformError> {
+            let mut profiles = self.profiles.lock().expect("profile lock");
+            if let Some(existing) = profiles
+                .iter_mut()
+                .find(|existing| existing.key == profile.key)
+            {
+                *existing = profile.clone();
+            } else {
+                profiles.push(profile.clone());
+            }
+            Ok(())
+        }
+
+        fn delete(&self, key: &ConnectionProfileKey) -> Result<(), PlatformError> {
+            self.profiles
+                .lock()
+                .expect("profile lock")
+                .retain(|profile| &profile.key != key);
+            Ok(())
+        }
+    }
+
+    struct MemoryCredentialStore {
+        committed: Mutex<Vec<(ConnectionProfileKey, String)>>,
+        pending: Mutex<Vec<(SessionId, ConnectionProfileKey, String)>>,
+        loads: Mutex<Vec<ConnectionProfileKey>>,
+    }
+
+    impl MemoryCredentialStore {
+        fn new(committed: Vec<(ConnectionProfileKey, String)>) -> Self {
+            Self {
+                committed: Mutex::new(committed),
+                pending: Mutex::new(Vec::new()),
+                loads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn committed(&self, key: &ConnectionProfileKey) -> Option<String> {
+            self.committed
+                .lock()
+                .expect("credential lock")
+                .iter()
+                .find(|(stored_key, _)| stored_key == key)
+                .map(|(_, password)| password.clone())
+        }
+
+        fn pending_exists(&self, session: SessionId) -> bool {
+            self.pending
+                .lock()
+                .expect("pending lock")
+                .iter()
+                .any(|(stored_session, _, _)| *stored_session == session)
+        }
+
+        fn loads(&self) -> Vec<ConnectionProfileKey> {
+            self.loads.lock().expect("load lock").clone()
+        }
+    }
+
+    impl SecureCredentialStore for MemoryCredentialStore {
+        fn load(&self, key: &ConnectionProfileKey) -> Result<Option<SecretBuffer>, PlatformError> {
+            self.loads.lock().expect("load lock").push(key.clone());
+            Ok(self.committed(key).map(SecretBuffer::from_text))
+        }
+
+        fn stage(
+            &self,
+            session: SessionId,
+            key: &ConnectionProfileKey,
+            password: &SecretBuffer,
+        ) -> Result<(), PlatformError> {
+            let password = password
+                .expose_text()
+                .expect("fixture passwords are valid UTF-8")
+                .to_owned();
+            self.pending
+                .lock()
+                .expect("pending lock")
+                .push((session, key.clone(), password));
+            Ok(())
+        }
+
+        fn commit(
+            &self,
+            session: SessionId,
+            key: &ConnectionProfileKey,
+        ) -> Result<(), PlatformError> {
+            let password = {
+                let mut pending = self.pending.lock().expect("pending lock");
+                let index = pending
+                    .iter()
+                    .position(|(stored_session, stored_key, _)| {
+                        *stored_session == session && stored_key == key
+                    })
+                    .ok_or(PlatformError::CredentialNotFound)?;
+                pending.remove(index).2
+            };
+            let mut committed = self.committed.lock().expect("credential lock");
+            if let Some((_, stored_password)) = committed
+                .iter_mut()
+                .find(|(stored_key, _)| stored_key == key)
+            {
+                *stored_password = password;
+            } else {
+                committed.push((key.clone(), password));
+            }
+            Ok(())
+        }
+
+        fn discard(&self, session: SessionId) -> Result<(), PlatformError> {
+            self.pending
+                .lock()
+                .expect("pending lock")
+                .retain(|(stored_session, _, _)| *stored_session != session);
+            Ok(())
+        }
+
+        fn delete(&self, key: &ConnectionProfileKey) -> Result<(), PlatformError> {
+            self.committed
+                .lock()
+                .expect("credential lock")
+                .retain(|(stored_key, _)| stored_key != key);
+            Ok(())
+        }
+
+        fn purge_pending(&self) -> Result<(), PlatformError> {
+            self.pending.lock().expect("pending lock").clear();
+            Ok(())
         }
     }
 

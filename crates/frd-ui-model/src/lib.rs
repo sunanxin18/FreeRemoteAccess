@@ -1,6 +1,7 @@
 //! 单窗口 UI 可展示状态与低频连接提交 DTO。
 
 use frd_core::{CredentialProviderId, SecretBuffer, TargetSystem};
+use frd_platform_api::{ConnectionProfileKey, SavedConnectionProfile};
 use frd_protocol_api::{
     ConnectionStage, ProtocolCatalog, ProtocolId, ProtocolSelection, SessionCapabilities,
 };
@@ -45,6 +46,7 @@ pub enum ProtocolChoice {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConnectionFormErrors {
+    pub profile: Option<String>,
     pub target_system: Option<String>,
     pub address: Option<String>,
     pub port: Option<String>,
@@ -55,7 +57,8 @@ pub struct ConnectionFormErrors {
 
 impl ConnectionFormErrors {
     pub fn is_empty(&self) -> bool {
-        self.target_system.is_none()
+        self.profile.is_none()
+            && self.target_system.is_none()
             && self.address.is_none()
             && self.port.is_none()
             && self.protocol.is_none()
@@ -67,6 +70,10 @@ impl ConnectionFormErrors {
 /// 可编辑的连接页状态。密码与可复制草稿分离，且本结构不能 Clone 或 Debug。
 pub struct ConnectionForm {
     pub draft: ConnectionDraft,
+    pub profiles: Vec<SavedConnectionProfile>,
+    pub selected_profile: Option<ConnectionProfileKey>,
+    pub remember_on_this_device: bool,
+    pub password_visible: bool,
     password: SecretBuffer,
     errors: ConnectionFormErrors,
 }
@@ -75,6 +82,10 @@ impl ConnectionForm {
     pub fn new(draft: ConnectionDraft) -> Self {
         Self {
             draft,
+            profiles: Vec::new(),
+            selected_profile: None,
+            remember_on_this_device: false,
+            password_visible: false,
             password: SecretBuffer::new(Vec::new()),
             errors: ConnectionFormErrors::default(),
         }
@@ -82,6 +93,35 @@ impl ConnectionForm {
 
     pub fn set_password(&mut self, password: SecretBuffer) {
         self.password = password;
+    }
+
+    pub fn set_profiles(&mut self, profiles: Vec<SavedConnectionProfile>) {
+        self.profiles = profiles;
+    }
+
+    pub fn select_profile_metadata(&mut self, profile: &SavedConnectionProfile) {
+        self.draft = ConnectionDraft {
+            target_system: Some(profile.target_system),
+            address: profile.key.address().to_owned(),
+            port: Some(profile.key.port()),
+            protocol: ProtocolChoice::Explicit(profile.key.protocol().clone()),
+            username: profile.key.username().to_owned(),
+        };
+        self.password = SecretBuffer::new(Vec::new());
+        self.selected_profile = Some(profile.key.clone());
+        self.remember_on_this_device = true;
+        self.password_visible = false;
+        self.errors.password = None;
+        self.errors.profile = None;
+    }
+
+    pub fn set_loaded_password(&mut self, password: SecretBuffer) {
+        self.password = password;
+        self.errors.password = None;
+    }
+
+    pub fn set_profile_storage_error(&mut self, code: &'static str) {
+        self.errors.profile = Some(code.to_owned());
     }
 
     pub fn password_mut(&mut self) -> &mut SecretBuffer {
@@ -106,6 +146,12 @@ impl ConnectionForm {
 
     pub fn set_validation_error(&mut self, code: &'static str) {
         match code {
+            "profile_storage_unavailable" | "profile_storage_failed" | "invalid_profile" => {
+                self.errors.profile = Some(code.to_owned())
+            }
+            "credential_storage_failed" | "saved_credential_unavailable" => {
+                self.errors.password = Some(code.to_owned())
+            }
             "target_system_required" => self.errors.target_system = Some(code.to_owned()),
             "address_required" => self.errors.address = Some(code.to_owned()),
             "port_required" => self.errors.port = Some(code.to_owned()),
@@ -126,6 +172,8 @@ impl ConnectionForm {
             draft: self.draft.clone(),
             resolved_protocol,
             password,
+            remember_on_this_device: self.remember_on_this_device,
+            selected_profile: self.selected_profile.clone(),
         })
     }
 
@@ -188,6 +236,8 @@ pub struct ConnectionSubmission {
     pub draft: ConnectionDraft,
     pub resolved_protocol: ProtocolId,
     pub password: SecretBuffer,
+    pub remember_on_this_device: bool,
+    pub selected_profile: Option<ConnectionProfileKey>,
 }
 
 pub enum Page {
@@ -235,9 +285,70 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use frd_core::{SecretBuffer, TargetSystem};
+    use frd_platform_api::{ConnectionProfileKey, SavedConnectionProfile};
     use frd_protocol_api::{ProtocolCatalog, ProtocolId};
 
     use super::{ConnectionDraft, ConnectionForm, Page};
+
+    fn saved_profile() -> SavedConnectionProfile {
+        SavedConnectionProfile {
+            key: ConnectionProfileKey::new(
+                ProtocolId::apple_hpss_mvs(),
+                "remembered.invalid",
+                5901,
+                "remembered-user",
+            )
+            .expect("test profile key is valid"),
+            target_system: TargetSystem::MacOs,
+            last_success_order: 7,
+        }
+    }
+
+    #[test]
+    fn selecting_saved_profile_replaces_connection_draft() {
+        let profile = saved_profile();
+        let mut form = ConnectionForm::new(ConnectionDraft {
+            target_system: Some(TargetSystem::Custom),
+            address: "draft.invalid".to_owned(),
+            port: Some(3389),
+            protocol: super::ProtocolChoice::Automatic,
+            username: "draft-user".to_owned(),
+        });
+        form.set_password(SecretBuffer::new(b"stale-password".to_vec()));
+        form.password_visible = true;
+
+        form.select_profile_metadata(&profile);
+
+        assert_eq!(form.draft.target_system, Some(TargetSystem::MacOs));
+        assert_eq!(form.draft.address, "remembered.invalid");
+        assert_eq!(form.draft.port, Some(5901));
+        assert_eq!(
+            form.draft.protocol,
+            super::ProtocolChoice::Explicit(ProtocolId::apple_hpss_mvs())
+        );
+        assert_eq!(form.draft.username, "remembered-user");
+        assert_eq!(form.selected_profile.as_ref(), Some(&profile.key));
+        assert!(form.password_is_empty());
+        assert!(!form.password_visible);
+    }
+
+    #[test]
+    fn connection_submission_carries_remember_choice_and_selected_profile() {
+        let profile = saved_profile();
+        let mut form = ConnectionForm::new(ConnectionDraft::default());
+        form.select_profile_metadata(&profile);
+        form.set_loaded_password(SecretBuffer::new(b"loaded-password".to_vec()));
+        form.remember_on_this_device = true;
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+
+        let submission = form
+            .take_submission(&catalog)
+            .expect("selected saved profile is complete");
+
+        assert!(submission.remember_on_this_device);
+        assert_eq!(submission.selected_profile, Some(profile.key));
+        assert!(!submission.password.is_empty());
+    }
 
     #[test]
     fn connection_draft_starts_on_the_connection_form() {

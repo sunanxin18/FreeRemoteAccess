@@ -1096,6 +1096,7 @@ name = "frd-ui-model"
 version = "0.1.0"
 dependencies = [
  "frd-core",
+ "frd-platform-api",
  "frd-protocol-api",
 ]
 
