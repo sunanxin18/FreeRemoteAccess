@@ -96,10 +96,26 @@
 
 ## Cross-Platform Product UI Rules
 
+- Treat the current official Google Material Design 3 guidance and Apple Human
+  Interface Guidelines as mandatory GUI baselines. A cross-platform screen
+  keeps one product information architecture, but its shell, density, window
+  behavior, typography, focus treatment, and navigation must follow the host
+  platform's established conventions. Do not copy one platform's window chrome
+  or mobile navigation pattern unchanged onto another platform.
+- Before implementing or approving a GUI change, review the relevant official
+  component guidance at <https://m3.material.io/> and
+  <https://developer.apple.com/design/human-interface-guidelines/>. Record any
+  deliberate exception in the feature specification with its accessibility or
+  product reason; aesthetic preference alone is not sufficient.
 - The login page may use the client area, but it must use one responsive,
   centered form hierarchy that remains usable on desktop and future mobile
   shells. Preserve native window controls and platform font conventions; adapt
   spacing, density, and color tokens without changing the product workflow.
+- Title bars must preserve native minimize, maximize/full-screen, close, drag,
+  double-click, system-menu, safe-area, and traffic-light behavior. Product-owned
+  session controls remain visually centered independently of native controls,
+  never obscure the remote surface, and collapse by priority instead of
+  overlapping at narrow widths.
 - Use only the official Google Material Symbols Rounded family for
   FreeRemoteDesk-owned functional glyphs. Vendor a pinned, deterministic subset
   with its Apache-2.0 license and provenance; do not mix Emoji, improvised
@@ -112,11 +128,36 @@
 - Keep interactive targets at least 44 by 44 logical points on desktop and 48
   by 48 density-independent pixels on Android-class touch shells. Do not make
   the visible glyph itself fill the entire target.
+- Buttons must expose a clear hierarchy: one prominent primary action per task,
+  restrained secondary actions, and visually distinct destructive actions.
+  Every custom button needs hover where a pointer exists, pressed, keyboard
+  focus, disabled, loading, and selected states. Use text when an icon alone is
+  ambiguous; do not rely on color, tooltip, or position as the only explanation.
+- Follow platform input habits. Tab order follows visual order; Enter activates
+  the valid default action; Space activates a focused button or checkbox;
+  Escape or the platform Back action dismisses only a reversible transient
+  surface. Never require hover on touch platforms, hijack native system
+  shortcuts, or send remote input while the app window or remote surface lacks
+  the required focus.
+- Forms keep persistent field labels, use secure fields for passwords, place
+  actionable validation beside the affected control, preserve user input after
+  recoverable errors, and disable or explain unavailable actions. Progress and
+  failure states must be visible without depending on animation alone.
+- Layouts must support system light and dark appearances, DPI and text scaling,
+  localization expansion, keyboard-only operation, pointer operation, and touch
+  operation where applicable. Use platform fonts first and the vendored Noto
+  Sans SC family only as the configured missing-glyph fallback.
 - Platform application icons must be generated from the common product mark
   using platform-native packaging rules. Apple assets use unmasked square
   layers and let the system apply its mask; Android assets provide foreground,
   background, and monochrome adaptive-icon layers. Never pre-bake a universal
   rounded-rectangle mask into every platform asset.
+- Keep the product mark simple, centered inside each platform safe zone,
+  recognizable at the smallest shipped size, and free of screenshots, tiny
+  text, platform hardware replicas, or decorative detail that disappears when
+  scaled. Generate and visually inspect Apple icon layers, Android adaptive and
+  themed variants, Windows multi-resolution ICO, and Linux hicolor assets from
+  the same reviewed source artwork.
 - Saved connection metadata and passwords are separate platform services.
   Non-secret profile metadata may use the current user's application-data
   directory; passwords and tokens must use the OS secure credential store
@@ -127,6 +168,11 @@
 - Pressing Enter in the focused password field submits exactly one valid form
   when no IME composition or connection attempt is active. It must use the same
   intent and validation path as the primary Connect button.
+- GUI acceptance is not complete from compilation or unit tests alone. Review
+  the affected screen at supported desktop scale factors and light/dark themes,
+  verify keyboard focus and tooltips, and inspect packaged application icons at
+  small and large sizes. For future mobile shells, also verify portrait,
+  landscape, safe areas, touch targets, and Android adaptive-icon masks.
 
 ## Agent-Driven Development Workflow
 
