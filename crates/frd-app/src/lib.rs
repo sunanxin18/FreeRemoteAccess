@@ -1003,6 +1003,117 @@ mod tests {
         assert_eq!(fixture.form_password(), "selected-password");
     }
 
+    #[test]
+    fn explicit_cancel_discards_pending_without_overwriting_committed() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let session = fixture.submit_remembered("new-password");
+
+        fixture.cancel_connect();
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+    }
+
+    #[test]
+    fn disconnect_stage_discards_pending_without_overwriting_committed() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let session = fixture.submit_remembered("new-password");
+
+        fixture.publish_stage(session, ConnectionStage::Disconnecting);
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+    }
+
+    #[test]
+    fn normal_close_discards_pending_without_overwriting_committed() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let session = fixture.submit_remembered("new-password");
+
+        fixture.publish_event(
+            session,
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed),
+        );
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+    }
+
+    #[test]
+    fn failed_close_discards_pending_without_overwriting_committed() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let session = fixture.submit_remembered("wrong-password");
+
+        fixture.publish_event(
+            session,
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Failed(
+                ProtocolError::adapter(ProtocolId::apple_hpss_mvs(), "apple_hpss_session_failed"),
+            )),
+        );
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+    }
+
+    #[test]
+    fn launch_rollback_discards_pending_without_overwriting_committed() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let AppAction::StartSession(request, permit) =
+            fixture.submit_remembered_action("new-password")
+        else {
+            panic!("remembered submission starts a session");
+        };
+        let session = request.session_id;
+        let mut coordinator =
+            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let failure = match coordinator.start(permit, TargetSystem::MacOs, request, |_| {
+            Err(ProtocolError::Terminal)
+        }) {
+            SessionStartOutcome::Started(_) => panic!("fixture launch must roll back"),
+            SessionStartOutcome::LaunchRolledBack(failure) => failure,
+        };
+
+        fixture
+            .controller
+            .lock()
+            .expect("controller lock")
+            .consume_launch_rollback_with_stores(&failure, fixture.stores())
+            .expect("matching rollback is consumed");
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(!fixture.pending_exists(session));
+    }
+
+    #[test]
+    fn foreign_transport_ready_does_not_commit_current_pending_transaction() {
+        let fixture = RememberFixture::with_saved_password("old-password");
+        let current = fixture.submit_remembered("new-password");
+        let foreign = SessionId::allocate();
+
+        fixture.publish_stage(foreign, ConnectionStage::TransportReady);
+
+        assert_eq!(
+            fixture.committed_password(),
+            Some("old-password".to_owned())
+        );
+        assert!(fixture.pending_exists(current));
+    }
+
     struct RememberFixture {
         catalog: ProtocolCatalog,
         controller: Mutex<AppController>,
@@ -1087,8 +1198,16 @@ mod tests {
         }
 
         fn submit_remembered(&self, password: &str) -> SessionId {
+            let AppAction::StartSession(request, _) = self.submit_remembered_action(password)
+            else {
+                panic!("remembered submission starts a session");
+            };
+            request.session_id
+        }
+
+        fn submit_remembered_action(&self, password: &str) -> AppAction {
             self.select_profile(0);
-            self.submit(password, true)
+            self.submit_action(password, true)
         }
 
         fn submit_without_remembering(&self, password: &str) -> SessionId {
@@ -1097,6 +1216,15 @@ mod tests {
         }
 
         fn submit(&self, password: &str, remember_on_this_device: bool) -> SessionId {
+            let AppAction::StartSession(request, _) =
+                self.submit_action(password, remember_on_this_device)
+            else {
+                panic!("fixture submission must start a session");
+            };
+            request.session_id
+        }
+
+        fn submit_action(&self, password: &str, remember_on_this_device: bool) -> AppAction {
             let mut controller = self.controller.lock().expect("controller lock");
             let form = controller
                 .connection_form_mut()
@@ -1110,17 +1238,26 @@ mod tests {
                 .handle_intent_with_stores(submission, &self.catalog, self.stores())
                 .expect("fixture submission succeeds")
                 .expect("fixture submission launches a session");
-            let AppAction::StartSession(request, _) = action else {
-                panic!("fixture submission must start a session");
-            };
-            request.session_id
+            action
         }
 
-        fn publish_stage(&self, _session: SessionId, stage: ConnectionStage) {
+        fn cancel_connect(&self) {
             self.controller
                 .lock()
                 .expect("controller lock")
-                .handle_session_event_with_stores(SessionEvent::StageChanged(stage), self.stores());
+                .handle_intent_with_stores(AppIntent::CancelConnect, &self.catalog, self.stores())
+                .expect("cancel is accepted");
+        }
+
+        fn publish_stage(&self, session: SessionId, stage: ConnectionStage) {
+            self.publish_event(session, SessionEvent::StageChanged(stage));
+        }
+
+        fn publish_event(&self, session: SessionId, event: SessionEvent) {
+            self.controller
+                .lock()
+                .expect("controller lock")
+                .handle_session_event_with_stores(session, event, self.stores());
         }
 
         fn publish_failure(&self, session: SessionId, code: &'static str) {
@@ -1129,6 +1266,7 @@ mod tests {
                 .lock()
                 .expect("controller lock")
                 .handle_session_event_with_stores(
+                    session,
                     SessionEvent::Error(ProtocolError::adapter(ProtocolId::apple_hpss_mvs(), code)),
                     self.stores(),
                 );

@@ -5,16 +5,19 @@ use std::{io::Write, process::ExitCode, sync::Arc};
 use clap::{error::ErrorKind, Parser};
 use frd_app::{AppLaunch, ProductPolicy};
 use frd_media_api::{AudioOutput, AudioOutputError};
-use frd_platform_api::PlatformCapabilities;
+use frd_platform_api::{
+    ConnectionProfileStore, PlatformCapabilities, SecureCredentialStore, ServerIdentityStore,
+};
 use frd_platform_windows::{
     DpapiServerIdentityStore, EnvironmentCredentialProvider, WindowsAudioOutput,
-    WindowsSingleInstanceError, WindowsSingleInstanceGuard,
+    WindowsConnectionProfileStore, WindowsCredentialStore, WindowsSingleInstanceError,
+    WindowsSingleInstanceGuard,
 };
 use frd_protocol_api::{ProtocolCatalog, ProtocolFactory};
 use frd_protocol_apple::AppleProtocolFactory;
 use frd_shell_desktop::{
-    AudioOutputFactory, DesktopApplication, DesktopUserEvent, FatalComponent, FatalOperation,
-    FatalReason, FatalReport,
+    AudioOutputFactory, DesktopApplication, DesktopPlatformStores, DesktopUserEvent,
+    FatalComponent, FatalOperation, FatalReason, FatalReport,
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -148,7 +151,18 @@ fn run(cli: Cli) -> RunnerOutcome {
         Ok(options) => options,
         Err(_) => return RunnerOutcome::from_failure(RunnerFailure::CommandLineOptions),
     };
-    let mut launch = AppLaunch::new(launch_options, &provider, &catalog);
+    let server_identities = match DpapiServerIdentityStore::current_user_default() {
+        Ok(store) => Arc::new(store) as Arc<dyn ServerIdentityStore>,
+        Err(_) => return RunnerOutcome::from_failure(RunnerFailure::IdentityStore),
+    };
+    let profiles = match WindowsConnectionProfileStore::current_user_default() {
+        Ok(store) => Arc::new(store) as Arc<dyn ConnectionProfileStore>,
+        Err(_) => return RunnerOutcome::from_failure(RunnerFailure::IdentityStore),
+    };
+    let credentials = Arc::new(WindowsCredentialStore::new()) as Arc<dyn SecureCredentialStore>;
+    let stores = DesktopPlatformStores::new(server_identities, profiles, credentials);
+    let mut launch =
+        AppLaunch::new_with_stores(launch_options, &provider, &catalog, stores.as_app_stores());
     launch
         .controller_mut()
         .set_platform_capabilities(PlatformCapabilities {
@@ -165,14 +179,10 @@ fn run(cli: Cli) -> RunnerOutcome {
         remote_audio: true,
         text_input: true,
     });
-    let store = match DpapiServerIdentityStore::current_user_default() {
-        Ok(store) => Arc::new(store),
-        Err(_) => return RunnerOutcome::from_failure(RunnerFailure::IdentityStore),
-    };
     let mut application = DesktopApplication::new_product(
         launch,
         [factory],
-        store,
+        stores,
         Arc::new(WindowsAudioFactory),
         proxy,
     );

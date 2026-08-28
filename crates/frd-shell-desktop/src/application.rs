@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
-use frd_app::{AppAction, AppIntent, AppLaunch, AppPage};
+use frd_app::{AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
 use frd_compositor_wgpu::{
     PresentError, PresentationCompositor, PresentationHooks, PresentationSurface,
     PresentationSurfaceLease,
@@ -154,6 +154,7 @@ impl MediaPublisher for AudioMediaPublisher {
 }
 
 struct LiveSessionPorts {
+    session_id: SessionId,
     commands: mpsc::Sender<SessionCommand>,
     events: mpsc::Receiver<SessionEvent>,
     mailbox: Arc<Mutex<FrameMailbox>>,
@@ -423,10 +424,16 @@ impl SessionHost {
             .map_err(|_| SessionHostError::CommandClosed)
     }
 
-    pub fn drain_session_events(&mut self) -> Vec<SessionEvent> {
+    pub fn drain_session_events(&mut self) -> Vec<(SessionId, SessionEvent)> {
         self.active
             .as_mut()
-            .map(|active| active.events.try_iter().collect())
+            .map(|active| {
+                active
+                    .events
+                    .try_iter()
+                    .map(|event| (active.session_id, event))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -683,6 +690,7 @@ fn launch_live_session(
             mailbox: Some(mailbox.clone()),
         },
         LiveSessionPorts {
+            session_id,
             commands: command_tx,
             events: event_rx,
             mailbox,
@@ -860,10 +868,38 @@ impl ApplicationExitState {
     }
 }
 
+pub struct DesktopPlatformStores {
+    server_identities: Arc<dyn frd_platform_api::ServerIdentityStore>,
+    profiles: Arc<dyn frd_platform_api::ConnectionProfileStore>,
+    credentials: Arc<dyn frd_platform_api::SecureCredentialStore>,
+}
+
+impl DesktopPlatformStores {
+    pub fn new(
+        server_identities: Arc<dyn frd_platform_api::ServerIdentityStore>,
+        profiles: Arc<dyn frd_platform_api::ConnectionProfileStore>,
+        credentials: Arc<dyn frd_platform_api::SecureCredentialStore>,
+    ) -> Self {
+        Self {
+            server_identities,
+            profiles,
+            credentials,
+        }
+    }
+
+    pub fn as_app_stores(&self) -> AppPlatformStores<'_> {
+        AppPlatformStores {
+            server_identities: self.server_identities.as_ref(),
+            profiles: self.profiles.as_ref(),
+            credentials: self.credentials.as_ref(),
+        }
+    }
+}
+
 pub struct DesktopApplication {
     launch: AppLaunch,
     catalog: ProtocolCatalog,
-    store: Arc<dyn frd_platform_api::ServerIdentityStore>,
+    stores: DesktopPlatformStores,
     sessions: SessionHost,
     input: InputRouter,
     proxy: EventLoopProxy<DesktopUserEvent>,
@@ -883,7 +919,7 @@ impl DesktopApplication {
     pub fn new_product(
         launch: AppLaunch,
         factories: impl IntoIterator<Item = Arc<dyn ProtocolFactory>>,
-        store: Arc<dyn frd_platform_api::ServerIdentityStore>,
+        stores: DesktopPlatformStores,
         audio_factory: Arc<dyn AudioOutputFactory>,
         proxy: EventLoopProxy<DesktopUserEvent>,
     ) -> Self {
@@ -893,7 +929,7 @@ impl DesktopApplication {
         Self {
             launch,
             catalog,
-            store,
+            stores,
             sessions: SessionHost::new(factories, wake, audio_factory),
             input: InputRouter::default(),
             proxy,
@@ -917,7 +953,11 @@ impl DesktopApplication {
         Self {
             launch,
             catalog,
-            store: Arc::new(UnavailableIdentityStore),
+            stores: DesktopPlatformStores::new(
+                Arc::new(UnavailableIdentityStore),
+                Arc::new(UnavailableProfileStore),
+                Arc::new(UnavailableCredentialStore),
+            ),
             sessions: SessionHost::new(
                 std::iter::empty::<Arc<dyn ProtocolFactory>>(),
                 wake,
@@ -1063,10 +1103,11 @@ impl DesktopApplication {
             self.request_redraw();
             return;
         }
-        let action = match self.launch.controller_mut().handle_intent(
+        let stores = self.stores.as_app_stores();
+        let action = match self.launch.controller_mut().handle_intent_with_stores(
             intent,
             &self.catalog,
-            self.store.as_ref(),
+            stores,
         ) {
             Ok(action) => action,
             Err(error) => {
@@ -1116,7 +1157,7 @@ impl DesktopApplication {
         let events = self.sessions.drain_session_events();
         let mut cleanup_needed = false;
         let mut detach_remote = false;
-        for event in events {
+        for (session_id, event) in events {
             if matches!(
                 event,
                 SessionEvent::CapabilitiesChanged(frd_protocol_api::SessionCapabilities {
@@ -1144,7 +1185,9 @@ impl DesktopApplication {
                     | SessionEvent::Error(_)
                     | SessionEvent::Closed(_)
             );
-            self.launch.controller_mut().handle_session_event(event);
+            self.launch
+                .controller_mut()
+                .handle_session_event_with_stores(session_id, event, self.stores.as_app_stores());
         }
 
         if detach_remote {
@@ -1630,10 +1673,11 @@ impl DesktopApplication {
         match accepted {
             Ok(AcceptedLaunchOutcome::Started) => {}
             Ok(AcceptedLaunchOutcome::LaunchRolledBack(failure)) => {
+                let stores = self.stores.as_app_stores();
                 if self
                     .launch
                     .controller_mut()
-                    .consume_launch_rollback(&failure)
+                    .consume_launch_rollback_with_stores(&failure, stores)
                     .is_err()
                 {
                     self.handle_application_fatal(
@@ -1648,11 +1692,12 @@ impl DesktopApplication {
                 }
             }
             Ok(AcceptedLaunchOutcome::CancelledStarted) => {
+                let stores = self.stores.as_app_stores();
                 let cancel_failed = !matches!(
-                    self.launch.controller_mut().handle_intent(
+                    self.launch.controller_mut().handle_intent_with_stores(
                         AppIntent::CancelConnect,
                         &self.catalog,
-                        self.store.as_ref(),
+                        stores,
                     ),
                     Ok(Some(AppAction::SessionCommand(_))) | Ok(None)
                 );
@@ -1670,10 +1715,11 @@ impl DesktopApplication {
                 self.return_to_form_after_cancelled_launch = false;
             }
             Ok(AcceptedLaunchOutcome::CancelledLaunchRolledBack(failure)) => {
+                let stores = self.stores.as_app_stores();
                 if self
                     .launch
                     .controller_mut()
-                    .consume_launch_rollback(&failure)
+                    .consume_launch_rollback_with_stores(&failure, stores)
                     .is_err()
                 {
                     self.handle_application_fatal(
@@ -1687,10 +1733,11 @@ impl DesktopApplication {
                     return;
                 }
                 if self.return_to_form_after_cancelled_launch && !self.exit_state.when_clean {
-                    let _ = self.launch.controller_mut().handle_intent(
+                    let stores = self.stores.as_app_stores();
+                    let _ = self.launch.controller_mut().handle_intent_with_stores(
                         AppIntent::ReturnToConnection,
                         &self.catalog,
-                        self.store.as_ref(),
+                        stores,
                     );
                 }
                 self.return_to_form_after_cancelled_launch = false;
@@ -2278,6 +2325,74 @@ impl frd_platform_api::ServerIdentityStore for UnavailableIdentityStore {
     }
 }
 
+struct UnavailableProfileStore;
+
+impl frd_platform_api::ConnectionProfileStore for UnavailableProfileStore {
+    fn list(
+        &self,
+    ) -> Result<Vec<frd_platform_api::SavedConnectionProfile>, frd_platform_api::PlatformError>
+    {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+
+    fn upsert(
+        &self,
+        _profile: &frd_platform_api::SavedConnectionProfile,
+    ) -> Result<(), frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+
+    fn delete(
+        &self,
+        _key: &frd_platform_api::ConnectionProfileKey,
+    ) -> Result<(), frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+}
+
+struct UnavailableCredentialStore;
+
+impl frd_platform_api::SecureCredentialStore for UnavailableCredentialStore {
+    fn load(
+        &self,
+        _key: &frd_platform_api::ConnectionProfileKey,
+    ) -> Result<Option<frd_core::SecretBuffer>, frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+
+    fn stage(
+        &self,
+        _session: SessionId,
+        _key: &frd_platform_api::ConnectionProfileKey,
+        _password: &frd_core::SecretBuffer,
+    ) -> Result<(), frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+
+    fn commit(
+        &self,
+        _session: SessionId,
+        _key: &frd_platform_api::ConnectionProfileKey,
+    ) -> Result<(), frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+
+    fn discard(&self, _session: SessionId) -> Result<(), frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+
+    fn delete(
+        &self,
+        _key: &frd_platform_api::ConnectionProfileKey,
+    ) -> Result<(), frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+
+    fn purge_pending(&self) -> Result<(), frd_platform_api::PlatformError> {
+        Err(frd_platform_api::PlatformError::Unavailable)
+    }
+}
+
 struct UnavailableAudioFactory;
 
 impl AudioOutputFactory for UnavailableAudioFactory {
@@ -2294,7 +2409,9 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use frd_app::{AppAction, AppController, AppIntent, PresentationEvent, ProductPolicy};
+    use frd_app::{
+        AppAction, AppController, AppIntent, AppPlatformStores, PresentationEvent, ProductPolicy,
+    };
     use frd_core::{
         Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, ProtocolId, SecretBuffer,
         SessionId, TargetSystem,
@@ -2312,7 +2429,8 @@ mod tests {
 
     use super::{
         AcceptedLaunchOutcome, ApplicationExitState, AudioOutputFactory, SessionHost,
-        TestLaunchOutcome, WakeSink, WorkerKind, WorkerSpawner,
+        TestLaunchOutcome, UnavailableCredentialStore, UnavailableProfileStore, WakeSink,
+        WorkerKind, WorkerSpawner,
     };
 
     struct CountingWake(AtomicUsize);
@@ -2395,6 +2513,17 @@ mod tests {
             _pin: [u8; 32],
         ) -> Result<(), PlatformError> {
             Ok(())
+        }
+    }
+
+    static TEST_UNAVAILABLE_PROFILES: UnavailableProfileStore = UnavailableProfileStore;
+    static TEST_UNAVAILABLE_CREDENTIALS: UnavailableCredentialStore = UnavailableCredentialStore;
+
+    fn test_app_stores(identity: &TestIdentityStore) -> AppPlatformStores<'_> {
+        AppPlatformStores {
+            server_identities: identity,
+            profiles: &TEST_UNAVAILABLE_PROFILES,
+            credentials: &TEST_UNAVAILABLE_CREDENTIALS,
         }
     }
 
@@ -3103,8 +3232,10 @@ mod tests {
             .expect("connection form remains editable")
             .take_connect_intent(&catalog)
             .expect("complete form creates one connection intent");
+        let identity_store = TestIdentityStore;
+        let stores = test_app_stores(&identity_store);
         let AppAction::StartSession(request, permit) = controller
-            .handle_intent(intent, &catalog, &TestIdentityStore)
+            .handle_intent_with_stores(intent, &catalog, stores)
             .expect("controller accepts the connection")
             .expect("connection starts one session")
         else {
@@ -3123,8 +3254,8 @@ mod tests {
         let events = wait_for_event(&mut host, |event| {
             matches!(event, SessionEvent::SurfaceGenerationChanged { .. })
         });
-        for event in events {
-            controller.handle_session_event(event);
+        for (origin, event) in events {
+            controller.handle_session_event_with_stores(origin, event, stores);
         }
         controller.handle_presentation(PresentationEvent::FramePresented {
             session_id,
@@ -3147,12 +3278,12 @@ mod tests {
             !host
                 .drain_session_events()
                 .iter()
-                .any(|event| matches!(event, SessionEvent::Closed(_))),
+                .any(|(_, event)| matches!(event, SessionEvent::Closed(_))),
             "an unsupported key must not reach the fail-closed fake adapter"
         );
 
         let Some(AppAction::SessionCommand(disconnect)) = controller
-            .handle_intent(AppIntent::Disconnect, &catalog, &TestIdentityStore)
+            .handle_intent_with_stores(AppIntent::Disconnect, &catalog, stores)
             .expect("disconnect is valid while remote")
         else {
             panic!("disconnect must emit exactly one protocol command");
@@ -3179,13 +3310,23 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, SessionEvent::Closed(_)))
+                .filter(|(_, event)| matches!(event, SessionEvent::Closed(_)))
                 .count(),
             1
         );
 
         let completion = complete_background_cleanup(&mut host);
         assert_eq!(completion.session_id(), session_id);
+    }
+
+    #[test]
+    fn drained_session_events_retain_their_originating_session_id() {
+        let mut host = test_host(Arc::new(PanicFactory), Arc::new(TestAudioFactory));
+        let session_id = launch_test_session(&mut host);
+
+        let events = wait_for_event(&mut host, |event| matches!(event, SessionEvent::Closed(_)));
+
+        assert!(events.iter().all(|(origin, _event)| *origin == session_id));
     }
 
     #[test]
@@ -3222,7 +3363,7 @@ mod tests {
         assert_eq!(
             all_events
                 .iter()
-                .filter(|event| {
+                .filter(|(_, event)| {
                     matches!(
                         event,
                         SessionEvent::AudioState(frd_protocol_api::AudioState::Failed)
@@ -3237,7 +3378,7 @@ mod tests {
         );
         assert!(!all_events
             .iter()
-            .any(|event| matches!(event, SessionEvent::Closed(_))));
+            .any(|(_, event)| matches!(event, SessionEvent::Closed(_))));
 
         let completion = complete_background_cleanup(&mut host);
         assert_eq!(completion.session_id(), session_id);
@@ -3278,12 +3419,12 @@ mod tests {
     fn wait_for_event(
         host: &mut SessionHost,
         predicate: impl Fn(&SessionEvent) -> bool,
-    ) -> Vec<SessionEvent> {
+    ) -> Vec<(SessionId, SessionEvent)> {
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut observed = Vec::new();
         loop {
             observed.extend(host.drain_session_events());
-            if observed.iter().any(&predicate) {
+            if observed.iter().any(|(_, event)| predicate(event)) {
                 return observed;
             }
             assert!(

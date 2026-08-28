@@ -7,8 +7,8 @@ mod repaint;
 mod ui_fonts;
 
 pub use application::{
-    AudioOutputFactory, BackgroundLaunchOutcome, DesktopApplication, DesktopUserEvent,
-    PresentationFailure, SessionHost, SessionHostError, TestTextureOptions, WakeSink,
+    AudioOutputFactory, BackgroundLaunchOutcome, DesktopApplication, DesktopPlatformStores,
+    DesktopUserEvent, PresentationFailure, SessionHost, SessionHostError, TestTextureOptions, WakeSink,
 };
 pub use cleanup::{BackgroundCleanupFailure, BackgroundCleanupOutcome};
 pub use fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};

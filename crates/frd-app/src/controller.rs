@@ -303,7 +303,8 @@ impl AppController {
     }
 
     /// 消费 launcher 已回滚终态；只释放仍处于 Connecting 的同一 reservation。
-    pub fn consume_launch_rollback(
+    #[cfg(test)]
+    pub(crate) fn consume_launch_rollback(
         &mut self,
         failure: &SessionStartFailure,
     ) -> Result<(), ActiveSessionError> {
@@ -344,7 +345,8 @@ impl AppController {
         Ok(())
     }
 
-    pub fn handle_intent<I: Into<AppIntent>>(
+    #[cfg(test)]
+    pub(crate) fn handle_intent<I: Into<AppIntent>>(
         &mut self,
         intent: I,
         catalog: &ProtocolCatalog,
@@ -630,15 +632,20 @@ impl AppController {
         &self.audio_state
     }
 
-    pub fn handle_session_event(&mut self, event: SessionEvent) {
+    #[cfg(test)]
+    pub(crate) fn handle_session_event(&mut self, event: SessionEvent) {
         self.handle_session_event_internal(event, None);
     }
 
     pub fn handle_session_event_with_stores(
         &mut self,
+        session_id: SessionId,
         event: SessionEvent,
         stores: AppPlatformStores<'_>,
     ) {
+        if self.session_id != Some(session_id) {
+            return;
+        }
         self.handle_session_event_internal(event, Some(stores));
     }
 
