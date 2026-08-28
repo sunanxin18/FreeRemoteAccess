@@ -1142,7 +1142,6 @@ dependencies = [
 name = "freeremotedesk-windows"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
  "frd-app",
  "frd-core",

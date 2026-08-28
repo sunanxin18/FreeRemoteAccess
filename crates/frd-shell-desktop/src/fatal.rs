@@ -2,7 +2,9 @@ use std::fmt;
 
 use frd_compositor_wgpu::PresentError;
 use frd_render_wgpu::{GpuFaultClass, RendererError};
+use frd_session::CleanupError;
 
+use crate::cleanup::BackgroundCleanupFailure;
 use crate::lifecycle::PresentationOperation;
 
 const FATAL_CODE: &str = "FRD-WIN-FATAL-001";
@@ -18,6 +20,11 @@ pub enum FatalComponent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FatalOperation {
     Initialize,
+    SingleInstance,
+    EventLoopCreate,
+    EventLoopRun,
+    CliValidation,
+    IdentityStore,
     Launch,
     LaunchAccept,
     LaunchCancel,
@@ -28,6 +35,13 @@ pub enum FatalOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FatalReason {
     InvalidState,
+    InstanceAlreadyRunning,
+    SingleInstanceUnavailable,
+    EventLoopCreateFailed,
+    EventLoopRunFailed,
+    InvalidArguments,
+    CommandLineOutputFailed,
+    IdentityStoreUnavailable,
     WindowCreateFailed,
     WindowSizeInvalid,
     SurfaceCreateFailed,
@@ -35,6 +49,7 @@ pub enum FatalReason {
     CompositorConfigureFailed,
     RendererInitializeFailed,
     SurfaceFormatUnavailable,
+    CleanupWorkerSpawnFailed,
     CleanupPolicyExhausted,
     ShutdownTimeout,
 }
@@ -86,6 +101,36 @@ impl FatalReport {
         }
     }
 
+    pub(crate) fn cleanup(failure: BackgroundCleanupFailure) -> Self {
+        match failure {
+            BackgroundCleanupFailure::WorkerSpawn => Self::internal(
+                FatalComponent::Session,
+                FatalOperation::Cleanup,
+                FatalReason::CleanupWorkerSpawnFailed,
+            ),
+            BackgroundCleanupFailure::Exhausted {
+                last_error,
+                attempts,
+            } => {
+                let attempts = if attempts > 999 {
+                    "999_plus".to_owned()
+                } else {
+                    attempts.to_string()
+                };
+                Self {
+                    code: FATAL_CODE,
+                    component: "session",
+                    operation: "cleanup",
+                    reason: "cleanup_policy_exhausted",
+                    details: sanitize_safe_detail(&format!(
+                        "step={};attempts={attempts}",
+                        cleanup_error_code(last_error)
+                    )),
+                }
+            }
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -118,6 +163,11 @@ fn component_code(component: FatalComponent) -> &'static str {
 fn operation_code(operation: FatalOperation) -> &'static str {
     match operation {
         FatalOperation::Initialize => "initialize",
+        FatalOperation::SingleInstance => "single_instance",
+        FatalOperation::EventLoopCreate => "event_loop_create",
+        FatalOperation::EventLoopRun => "event_loop_run",
+        FatalOperation::CliValidation => "cli_validation",
+        FatalOperation::IdentityStore => "identity_store",
         FatalOperation::Launch => "launch",
         FatalOperation::LaunchAccept => "launch_accept",
         FatalOperation::LaunchCancel => "launch_cancel",
@@ -129,6 +179,13 @@ fn operation_code(operation: FatalOperation) -> &'static str {
 fn reason_code(reason: FatalReason) -> &'static str {
     match reason {
         FatalReason::InvalidState => "invalid_state",
+        FatalReason::InstanceAlreadyRunning => "instance_already_running",
+        FatalReason::SingleInstanceUnavailable => "single_instance_unavailable",
+        FatalReason::EventLoopCreateFailed => "event_loop_create_failed",
+        FatalReason::EventLoopRunFailed => "event_loop_run_failed",
+        FatalReason::InvalidArguments => "invalid_arguments",
+        FatalReason::CommandLineOutputFailed => "command_line_output_failed",
+        FatalReason::IdentityStoreUnavailable => "identity_store_unavailable",
         FatalReason::WindowCreateFailed => "window_create_failed",
         FatalReason::WindowSizeInvalid => "window_size_invalid",
         FatalReason::SurfaceCreateFailed => "surface_create_failed",
@@ -136,8 +193,20 @@ fn reason_code(reason: FatalReason) -> &'static str {
         FatalReason::CompositorConfigureFailed => "compositor_configure_failed",
         FatalReason::RendererInitializeFailed => "renderer_initialize_failed",
         FatalReason::SurfaceFormatUnavailable => "surface_format_unavailable",
+        FatalReason::CleanupWorkerSpawnFailed => "cleanup_worker_spawn_failed",
         FatalReason::CleanupPolicyExhausted => "cleanup_policy_exhausted",
         FatalReason::ShutdownTimeout => "shutdown_timeout",
+    }
+}
+
+fn cleanup_error_code(error: CleanupError) -> &'static str {
+    match error {
+        CleanupError::NoActiveSession => "no_active_session",
+        CleanupError::WrongSessionHandle => "wrong_session_handle",
+        CleanupError::Cancel => "cancel",
+        CleanupError::ShutdownWriter => "shutdown_writer",
+        CleanupError::JoinWorkersAndAudio => "join_workers_and_audio",
+        CleanupError::DisposeMailbox => "dispose_mailbox",
     }
 }
 
@@ -221,8 +290,10 @@ fn renderer_error_code(error: RendererError) -> &'static str {
 mod tests {
     use frd_compositor_wgpu::PresentError;
     use frd_render_wgpu::GpuFaultClass;
+    use frd_session::CleanupError;
 
     use super::{sanitize_safe_detail, FatalReport};
+    use crate::BackgroundCleanupFailure;
     use crate::PresentationOperation;
 
     #[test]
@@ -256,5 +327,39 @@ mod tests {
         assert!(!sanitized.contains(['\r', '\n', '\t']));
         assert!(sanitized.len() <= 160);
         assert!(sanitized.starts_with("safe  field "));
+    }
+
+    #[test]
+    fn cleanup_worker_spawn_failure_keeps_its_distinct_closed_reason() {
+        let report = FatalReport::cleanup(BackgroundCleanupFailure::WorkerSpawn);
+
+        assert_eq!(report.component(), "session");
+        assert_eq!(report.operation(), "cleanup");
+        assert_eq!(report.reason(), "cleanup_worker_spawn_failed");
+        assert_eq!(report.details(), "none");
+    }
+
+    #[test]
+    fn cleanup_policy_exhaustion_keeps_the_closed_step_and_bounded_attempts() {
+        let report = FatalReport::cleanup(BackgroundCleanupFailure::Exhausted {
+            last_error: CleanupError::JoinWorkersAndAudio,
+            attempts: 3,
+        });
+
+        assert_eq!(report.component(), "session");
+        assert_eq!(report.operation(), "cleanup");
+        assert_eq!(report.reason(), "cleanup_policy_exhausted");
+        assert_eq!(report.details(), "step=join_workers_and_audio;attempts=3");
+        assert!(report.to_string().len() <= 256);
+
+        let bounded = FatalReport::cleanup(BackgroundCleanupFailure::Exhausted {
+            last_error: CleanupError::JoinWorkersAndAudio,
+            attempts: usize::MAX,
+        });
+        assert_eq!(
+            bounded.details(),
+            "step=join_workers_and_audio;attempts=999_plus"
+        );
+        assert!(bounded.to_string().len() <= 256);
     }
 }

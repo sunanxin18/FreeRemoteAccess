@@ -1693,15 +1693,8 @@ impl DesktopApplication {
                 }
                 self.return_to_form_after_cancelled_launch = false;
             }
-            Err(SessionHostError::CleanupFatal(_)) => {
-                self.handle_application_fatal(
-                    event_loop,
-                    FatalReport::internal(
-                        FatalComponent::Session,
-                        FatalOperation::Cleanup,
-                        FatalReason::CleanupPolicyExhausted,
-                    ),
-                );
+            Err(SessionHostError::CleanupFatal(failure)) => {
+                self.handle_application_fatal(event_loop, FatalReport::cleanup(failure));
                 return;
             }
             Err(_) => {
@@ -1744,15 +1737,8 @@ impl DesktopApplication {
                     return;
                 }
             }
-            Err(SessionHostError::CleanupFatal(_)) => {
-                self.handle_application_fatal(
-                    event_loop,
-                    FatalReport::internal(
-                        FatalComponent::Session,
-                        FatalOperation::Cleanup,
-                        FatalReason::CleanupPolicyExhausted,
-                    ),
-                );
+            Err(SessionHostError::CleanupFatal(failure)) => {
+                self.handle_application_fatal(event_loop, FatalReport::cleanup(failure));
                 return;
             }
             Err(_) => {
