@@ -13,7 +13,7 @@ use frd_platform_windows::{
 };
 use frd_protocol_api::{ProtocolCatalog, ProtocolFactory};
 use frd_protocol_apple::AppleProtocolFactory;
-use frd_shell_desktop::{AudioOutputFactory, DesktopApplication, DesktopUserEvent};
+use frd_shell_desktop::{AudioOutputFactory, DesktopApplication, DesktopUserEvent, FatalReport};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 use crate::cli::Cli;
@@ -39,10 +39,12 @@ fn main() -> Result<()> {
 
     if let Some(options) = cli.test_texture_options() {
         let mut application = DesktopApplication::new_test_texture(proxy, options);
-        event_loop
-            .run_app(&mut application)
-            .context("离线测试纹理事件循环失败")?;
-        return Ok(());
+        let run_result = event_loop.run_app(&mut application);
+        return finish_run_result(
+            run_result,
+            application.runner_result(),
+            "离线测试纹理事件循环失败",
+        );
     }
 
     let factory = Arc::new(AppleProtocolFactory) as Arc<dyn ProtocolFactory>;
@@ -80,8 +82,48 @@ fn main() -> Result<()> {
         Arc::new(WindowsAudioFactory),
         proxy,
     );
-    event_loop
-        .run_app(&mut application)
-        .context("Windows 客户端事件循环失败")?;
-    Ok(())
+    let run_result = event_loop.run_app(&mut application);
+    finish_run_result(
+        run_result,
+        application.runner_result(),
+        "Windows 客户端事件循环失败",
+    )
+}
+
+fn finish_run_result<E>(
+    event_loop_result: std::result::Result<(), E>,
+    application_result: std::result::Result<(), FatalReport>,
+    event_loop_context: &'static str,
+) -> Result<()>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    application_result.map_err(anyhow::Error::new)?;
+    event_loop_result.context(event_loop_context)
+}
+
+#[cfg(test)]
+mod tests {
+    use frd_shell_desktop::{FatalComponent, FatalOperation, FatalReason, FatalReport};
+
+    use super::finish_run_result;
+
+    #[test]
+    fn latched_fatal_makes_a_successful_event_loop_return_an_error() {
+        let fatal = FatalReport::internal(
+            FatalComponent::Application,
+            FatalOperation::Launch,
+            FatalReason::InvalidState,
+        );
+
+        let error = finish_run_result(
+            Ok::<(), std::io::Error>(()),
+            Err(fatal.clone()),
+            "event loop failed",
+        )
+        .expect_err("fatal latch must become a nonzero main result");
+
+        assert_eq!(error.downcast_ref::<FatalReport>(), Some(&fatal));
+        assert_eq!(error.to_string(), fatal.to_string());
+    }
 }

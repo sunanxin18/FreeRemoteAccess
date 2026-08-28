@@ -39,6 +39,7 @@ use crate::cleanup::{
     spawn_cleanup, BackgroundCleanupFailure, BackgroundCleanupOutcome, CleanupPolicy,
     PendingCleanup,
 };
+use crate::fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 use crate::lifecycle::{
     execute_presentation_recovery, OcclusionAction, PresentationLifecycle, PresentationOperation,
     PresentationRecoveryBackend, PresentationRecoveryContext, PresentationRecoveryFailure,
@@ -725,7 +726,7 @@ pub enum DesktopUserEvent {
     LaunchFinished(BackgroundLaunchOutcome),
     CleanupFinished(BackgroundCleanupOutcome),
     PresentationFatal(PresentationFailure),
-    ApplicationFatal,
+    ApplicationFatal(FatalReport),
     ResizeTestTexture,
     ExitTestTexture,
 }
@@ -803,7 +804,7 @@ struct DesktopWindowState {
 struct ApplicationExitState {
     when_clean: bool,
     pending_launch_deadline: Option<std::time::Instant>,
-    fatal_pending_launch: bool,
+    fatal: Option<FatalReport>,
 }
 
 impl ApplicationExitState {
@@ -824,19 +825,8 @@ impl ApplicationExitState {
         Some(deadline)
     }
 
-    fn cancel_pending_launch_for_fatal(
-        &mut self,
-        sessions: &mut SessionHost,
-        now: std::time::Instant,
-    ) -> Option<std::time::Instant> {
-        let deadline = self.cancel_pending_launch(sessions, now)?;
-        self.fatal_pending_launch = true;
-        Some(deadline)
-    }
-
-    fn launch_finished(&mut self) -> bool {
+    fn launch_finished(&mut self) {
         self.pending_launch_deadline = None;
-        std::mem::take(&mut self.fatal_pending_launch)
     }
 
     fn wait_for_cleanup(&mut self) {
@@ -849,6 +839,23 @@ impl ApplicationExitState {
 
     fn should_exit(&self, sessions: &SessionHost) -> bool {
         self.when_clean && !sessions.is_active()
+    }
+
+    fn latch_fatal(&mut self, report: FatalReport) -> bool {
+        if self.fatal.is_some() {
+            return false;
+        }
+        self.pending_launch_deadline = None;
+        self.fatal = Some(report);
+        true
+    }
+
+    fn should_ignore_events(&self) -> bool {
+        self.fatal.is_some()
+    }
+
+    fn runner_result(&self) -> Result<(), FatalReport> {
+        self.fatal.clone().map_or(Ok(()), Err)
     }
 }
 
@@ -868,6 +875,10 @@ pub struct DesktopApplication {
 }
 
 impl DesktopApplication {
+    pub fn runner_result(&self) -> Result<(), FatalReport> {
+        self.exit_state.runner_result()
+    }
+
     pub fn new_product(
         launch: AppLaunch,
         factories: impl IntoIterator<Item = Arc<dyn ProtocolFactory>>,
@@ -928,7 +939,7 @@ impl DesktopApplication {
         }
     }
 
-    fn initialize_window(event_loop: &ActiveEventLoop) -> Result<DesktopWindowState, String> {
+    fn initialize_window(event_loop: &ActiveEventLoop) -> Result<DesktopWindowState, FatalReport> {
         let window = Arc::new(
             event_loop
                 .create_window(
@@ -937,24 +948,61 @@ impl DesktopApplication {
                         .with_inner_size(LogicalSize::new(1100.0, 720.0))
                         .with_resizable(true),
                 )
-                .map_err(|error| format!("window_create:{error}"))?,
+                .map_err(|_| {
+                    FatalReport::internal(
+                        FatalComponent::Window,
+                        FatalOperation::Initialize,
+                        FatalReason::WindowCreateFailed,
+                    )
+                })?,
         );
         let physical = window.inner_size();
-        let physical_size = PixelSize::new(physical.width, physical.height)
-            .ok_or_else(|| "window_zero_size".to_owned())?;
+        let physical_size = PixelSize::new(physical.width, physical.height).ok_or_else(|| {
+            FatalReport::internal(
+                FatalComponent::Window,
+                FatalOperation::Initialize,
+                FatalReason::WindowSizeInvalid,
+            )
+        })?;
         let instance = dx12_instance();
         let presentation =
             PresentationSurface::create(&instance, PresentationSurfaceLease::new(window.clone()))
-                .map_err(|error| format!("surface_create:{error:?}"))?;
-        let gpu = pollster::block_on(presentation.request_gpu_context(instance))
-            .map_err(|error| format!("gpu_context:{error:?}"))?;
+                .map_err(|_| {
+                FatalReport::internal(
+                    FatalComponent::Window,
+                    FatalOperation::Initialize,
+                    FatalReason::SurfaceCreateFailed,
+                )
+            })?;
+        let gpu = pollster::block_on(presentation.request_gpu_context(instance)).map_err(|_| {
+            FatalReport::internal(
+                FatalComponent::Window,
+                FatalOperation::Initialize,
+                FatalReason::GpuUnavailable,
+            )
+        })?;
         let compositor = PresentationCompositor::new(presentation, gpu.clone(), physical_size)
-            .map_err(|error| format!("compositor:{error:?}"))?;
-        let renderer =
-            RemoteRenderer::new(gpu.clone()).map_err(|error| format!("renderer:{error:?}"))?;
-        let target_format = compositor
-            .target_format()
-            .ok_or_else(|| "surface_format_unavailable".to_owned())?;
+            .map_err(|_| {
+                FatalReport::internal(
+                    FatalComponent::Window,
+                    FatalOperation::Initialize,
+                    FatalReason::CompositorConfigureFailed,
+                )
+            })?;
+        let renderer = RemoteRenderer::new(gpu.clone()).map_err(|_| {
+            FatalReport::internal(
+                FatalComponent::Window,
+                FatalOperation::Initialize,
+                FatalReason::RendererInitializeFailed,
+            )
+        })?;
+        let target_format = compositor.target_format().ok_or_else(|| {
+            FatalReport::internal(
+                FatalComponent::Window,
+                FatalOperation::Initialize,
+                FatalReason::SurfaceFormatUnavailable,
+            )
+        })?;
         let egui_context = egui::Context::default();
         let egui_state = egui_winit::State::new(
             egui_context.clone(),
@@ -1047,8 +1095,13 @@ impl DesktopApplication {
                     }) {
                     Ok(true) => {}
                     Ok(false) | Err(_) => {
-                        eprintln!("后台会话启动状态无效");
-                        let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
+                        let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal(
+                            FatalReport::internal(
+                                FatalComponent::Session,
+                                FatalOperation::Launch,
+                                FatalReason::InvalidState,
+                            ),
+                        ));
                     }
                 }
             }
@@ -1140,6 +1193,16 @@ impl DesktopApplication {
         if let Some(event) = self.input.set_gate(InputGate::Blocked) {
             self.send_input(event);
         }
+    }
+
+    fn block_and_release_input_for_fatal(&mut self) {
+        let Some(event) = self.input.set_gate(InputGate::Blocked) else {
+            return;
+        };
+        let Some(command) = self.launch.controller().route_input(event) else {
+            return;
+        };
+        let _ = self.sessions.send_command(command);
     }
 
     fn send_input(&mut self, event: frd_core::InputEvent) {
@@ -1555,7 +1618,7 @@ impl DesktopApplication {
         event_loop: &ActiveEventLoop,
         outcome: BackgroundLaunchOutcome,
     ) {
-        let fatal_pending_launch = self.exit_state.launch_finished();
+        self.exit_state.launch_finished();
         let proxy = self.proxy.clone();
         let accepted = self
             .sessions
@@ -1565,40 +1628,60 @@ impl DesktopApplication {
         match accepted {
             Ok(AcceptedLaunchOutcome::Started) => {}
             Ok(AcceptedLaunchOutcome::LaunchRolledBack(failure)) => {
-                if let Err(error) = self
+                if self
                     .launch
                     .controller_mut()
                     .consume_launch_rollback(&failure)
+                    .is_err()
                 {
-                    eprintln!("会话启动回滚能力不匹配：{error:?}");
+                    self.handle_application_fatal(
+                        event_loop,
+                        FatalReport::internal(
+                            FatalComponent::Application,
+                            FatalOperation::LaunchAccept,
+                            FatalReason::InvalidState,
+                        ),
+                    );
+                    return;
                 }
             }
             Ok(AcceptedLaunchOutcome::CancelledStarted) => {
-                match self.launch.controller_mut().handle_intent(
-                    AppIntent::CancelConnect,
-                    &self.catalog,
-                    self.store.as_ref(),
-                ) {
-                    Ok(Some(AppAction::SessionCommand(_))) | Ok(None) => {}
-                    Ok(Some(AppAction::StartSession(_, _))) | Err(_) => {
-                        let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
-                    }
-                }
-                if fatal_pending_launch {
-                    self.launch
-                        .controller_mut()
-                        .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
+                let cancel_failed = !matches!(
+                    self.launch.controller_mut().handle_intent(
+                        AppIntent::CancelConnect,
+                        &self.catalog,
+                        self.store.as_ref(),
+                    ),
+                    Ok(Some(AppAction::SessionCommand(_))) | Ok(None)
+                );
+                if cancel_failed {
+                    self.handle_application_fatal(
+                        event_loop,
+                        FatalReport::internal(
+                            FatalComponent::Application,
+                            FatalOperation::LaunchCancel,
+                            FatalReason::InvalidState,
+                        ),
+                    );
+                    return;
                 }
                 self.return_to_form_after_cancelled_launch = false;
             }
             Ok(AcceptedLaunchOutcome::CancelledLaunchRolledBack(failure)) => {
-                if let Err(error) = self
+                if self
                     .launch
                     .controller_mut()
                     .consume_launch_rollback(&failure)
+                    .is_err()
                 {
-                    eprintln!("已取消启动的回滚能力不匹配：{error:?}");
-                    let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
+                    self.handle_application_fatal(
+                        event_loop,
+                        FatalReport::internal(
+                            FatalComponent::Application,
+                            FatalOperation::LaunchCancel,
+                            FatalReason::InvalidState,
+                        ),
+                    );
                     return;
                 }
                 if self.return_to_form_after_cancelled_launch && !self.exit_state.when_clean {
@@ -1610,15 +1693,26 @@ impl DesktopApplication {
                 }
                 self.return_to_form_after_cancelled_launch = false;
             }
-            Err(SessionHostError::CleanupFatal(failure)) => {
-                let _ = self.proxy.send_event(DesktopUserEvent::CleanupFinished(
-                    BackgroundCleanupOutcome::Fatal(failure),
-                ));
+            Err(SessionHostError::CleanupFatal(_)) => {
+                self.handle_application_fatal(
+                    event_loop,
+                    FatalReport::internal(
+                        FatalComponent::Session,
+                        FatalOperation::Cleanup,
+                        FatalReason::CleanupPolicyExhausted,
+                    ),
+                );
                 return;
             }
-            Err(error) => {
-                eprintln!("后台会话启动结果无效：{error:?}");
-                let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal);
+            Err(_) => {
+                self.handle_application_fatal(
+                    event_loop,
+                    FatalReport::internal(
+                        FatalComponent::Session,
+                        FatalOperation::LaunchAccept,
+                        FatalReason::InvalidState,
+                    ),
+                );
                 return;
             }
         }
@@ -1633,28 +1727,44 @@ impl DesktopApplication {
     ) {
         match self.sessions.accept_cleanup_outcome(outcome) {
             Ok(completion) => {
-                if let Err(error) = self
+                if self
                     .launch
                     .controller_mut()
                     .finish_session_cleanup(completion)
+                    .is_err()
                 {
-                    eprintln!("会话清理完成能力不匹配：{error:?}");
-                    self.detach_window();
-                    event_loop.exit();
+                    self.handle_application_fatal(
+                        event_loop,
+                        FatalReport::internal(
+                            FatalComponent::Application,
+                            FatalOperation::Cleanup,
+                            FatalReason::InvalidState,
+                        ),
+                    );
+                    return;
                 }
             }
-            Err(SessionHostError::CleanupFatal(failure)) => {
-                eprintln!("会话资源清理超过有界策略：{failure:?}");
-                self.launch
-                    .controller_mut()
-                    .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
-                self.detach_window();
-                event_loop.exit();
+            Err(SessionHostError::CleanupFatal(_)) => {
+                self.handle_application_fatal(
+                    event_loop,
+                    FatalReport::internal(
+                        FatalComponent::Session,
+                        FatalOperation::Cleanup,
+                        FatalReason::CleanupPolicyExhausted,
+                    ),
+                );
+                return;
             }
-            Err(error) => {
-                eprintln!("会话资源清理状态无效：{error:?}");
-                self.detach_window();
-                event_loop.exit();
+            Err(_) => {
+                self.handle_application_fatal(
+                    event_loop,
+                    FatalReport::internal(
+                        FatalComponent::Session,
+                        FatalOperation::Cleanup,
+                        FatalReason::InvalidState,
+                    ),
+                );
+                return;
             }
         }
         self.maybe_finish_exit(event_loop);
@@ -1676,36 +1786,29 @@ impl DesktopApplication {
         event_loop: &ActiveEventLoop,
         failure: PresentationFailure,
     ) {
-        eprintln!(
-            "窗口合成进入不可恢复状态：operation={:?}, source={:?}, retry={:?}, recovery={:?}",
-            failure.operation, failure.source, failure.retry, failure.recovery
+        self.handle_application_fatal(
+            event_loop,
+            FatalReport::presentation(
+                failure.operation,
+                failure.source,
+                failure.retry,
+                failure.recovery,
+            ),
         );
-        self.handle_application_fatal(event_loop);
     }
 
-    fn handle_application_fatal(&mut self, event_loop: &ActiveEventLoop) {
-        self.block_and_release_input();
-        let pending_deadline = self
-            .exit_state
-            .cancel_pending_launch_for_fatal(&mut self.sessions, std::time::Instant::now());
-        if pending_deadline.is_none() {
-            self.launch
-                .controller_mut()
-                .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
-        }
-        // Fatal launch cancellation must become visible to the launch outcome
-        // acceptance path before the native presentation lease is detached.
-        self.detach_window();
-        if let Some(deadline) = pending_deadline {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+    fn handle_application_fatal(&mut self, event_loop: &ActiveEventLoop, report: FatalReport) {
+        if !self.exit_state.latch_fatal(report) {
+            event_loop.exit();
             return;
         }
-        if self.sessions.is_active() {
-            self.exit_state.wait_for_cleanup();
-            self.start_background_cleanup();
-        } else {
-            event_loop.exit();
-        }
+        // Fatal is monotonic. Latch first so no subsequent callback can install
+        // a queued launch result while teardown remains on this call stack.
+        self.block_and_release_input_for_fatal();
+        self.detach_window();
+        let _ = self.sessions.cancel_pending_launch();
+        let _ = self.sessions.send_command(SessionCommand::Disconnect);
+        event_loop.exit();
     }
 
     fn maybe_finish_exit(&self, event_loop: &ActiveEventLoop) {
@@ -1733,6 +1836,10 @@ impl DesktopApplication {
 
 impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_state.should_ignore_events() {
+            event_loop.exit();
+            return;
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
         if self.window.is_none() {
             match Self::initialize_window(event_loop) {
@@ -1742,9 +1849,8 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                     self.request_redraw();
                     self.dispatch_pending_connect();
                 }
-                Err(error) => {
-                    eprintln!("Windows 客户端初始化失败：{error}");
-                    event_loop.exit();
+                Err(report) => {
+                    self.handle_application_fatal(event_loop, report);
                     return;
                 }
             }
@@ -1764,6 +1870,10 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: DesktopUserEvent) {
+        if self.exit_state.should_ignore_events() {
+            event_loop.exit();
+            return;
+        }
         match event {
             DesktopUserEvent::Wake => {
                 self.drain_runtime();
@@ -1780,7 +1890,9 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             DesktopUserEvent::PresentationFatal(failure) => {
                 self.handle_presentation_fatal(event_loop, failure)
             }
-            DesktopUserEvent::ApplicationFatal => self.handle_application_fatal(event_loop),
+            DesktopUserEvent::ApplicationFatal(report) => {
+                self.handle_application_fatal(event_loop, report)
+            }
             DesktopUserEvent::ResizeTestTexture => {
                 if matches!(self.mode, DesktopMode::TestTexture { .. }) {
                     if let Some(window) = self.window.as_ref() {
@@ -1800,6 +1912,10 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.exit_state.should_ignore_events() {
+            event_loop.exit();
+            return;
+        }
         let Some(window) = self.window.as_mut() else {
             return;
         };
@@ -1922,18 +2038,24 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_state.should_ignore_events() {
+            event_loop.exit();
+            return;
+        }
         let now = std::time::Instant::now();
         if self
             .exit_state
             .pending_launch_deadline()
             .is_some_and(|deadline| now >= deadline && self.sessions.launch_is_pending())
         {
-            eprintln!("后台会话启动取消超过有界等待策略");
-            self.launch
-                .controller_mut()
-                .handle_session_event(SessionEvent::Error(ProtocolError::Terminal));
-            self.detach_window();
-            event_loop.exit();
+            self.handle_application_fatal(
+                event_loop,
+                FatalReport::internal(
+                    FatalComponent::Session,
+                    FatalOperation::Shutdown,
+                    FatalReason::ShutdownTimeout,
+                ),
+            );
             return;
         }
         if let Some(plan) = self.armed_repaint {
@@ -2348,6 +2470,7 @@ mod tests {
     struct ObservedBlockingFactory {
         create_count: Arc<AtomicUsize>,
         drop_count: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
         create_entered: Option<mpsc::Sender<()>>,
         release_create: Mutex<Option<mpsc::Receiver<()>>>,
         worker_started: mpsc::Sender<()>,
@@ -2379,6 +2502,7 @@ mod tests {
                 runtime,
                 worker_started: self.worker_started.clone(),
                 drop_count: self.drop_count.clone(),
+                stop: self.stop.clone(),
             }))
         }
     }
@@ -2387,6 +2511,7 @@ mod tests {
         runtime: ProtocolRuntime,
         worker_started: mpsc::Sender<()>,
         drop_count: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
     }
 
     impl Drop for ObservedBlockingSession {
@@ -2399,6 +2524,9 @@ mod tests {
         fn run(mut self: Box<Self>) -> ProtocolExit {
             self.worker_started.send(()).unwrap();
             loop {
+                if self.stop.load(Ordering::Acquire) {
+                    return ProtocolExit::Closed;
+                }
                 if matches!(
                     self.runtime.try_next_command(),
                     Some(SessionCommand::Disconnect)
@@ -2774,15 +2902,17 @@ mod tests {
     }
 
     #[test]
-    fn fatal_before_launch_finished_cancels_once_and_reaches_the_bounded_exit_path() {
+    fn fatal_while_launch_is_pending_latches_without_waiting_or_a_deadline() {
         let create_count = Arc::new(AtomicUsize::new(0));
         let drop_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
         let (create_entered_tx, create_entered_rx) = mpsc::channel();
         let (release_create_tx, release_create_rx) = mpsc::channel();
         let mut host = test_host(
             Arc::new(ObservedBlockingFactory {
                 create_count: create_count.clone(),
                 drop_count: drop_count.clone(),
+                stop,
                 create_entered: Some(create_entered_tx),
                 release_create: Mutex::new(Some(release_create_rx)),
                 worker_started: mpsc::channel().0,
@@ -2803,43 +2933,45 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("fatal is injected while factory creation owns the request");
 
-        let now = Instant::now();
         let mut exit = ApplicationExitState::default();
-        let deadline = exit
-            .cancel_pending_launch_for_fatal(&mut host, now)
-            .expect("fatal arms the pending-launch deadline");
-        assert_eq!(deadline, now + super::PENDING_LAUNCH_SHUTDOWN_TIMEOUT);
-        assert_eq!(exit.pending_launch_deadline(), Some(deadline));
-        assert_eq!(
-            exit.cancel_pending_launch_for_fatal(&mut host, now + Duration::from_secs(1)),
-            Some(deadline),
-            "repeated fatal events cannot extend the bounded exit deadline"
+        let report = crate::fatal::FatalReport::internal(
+            crate::fatal::FatalComponent::Application,
+            crate::fatal::FatalOperation::Launch,
+            crate::fatal::FatalReason::InvalidState,
         );
+        assert!(exit.latch_fatal(report.clone()));
+        assert!(exit.should_ignore_events());
+        assert_eq!(exit.pending_launch_deadline(), None);
+        assert!(host.cancel_pending_launch());
+        assert!(matches!(
+            launch_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(exit.runner_result(), Err(report));
+
         release_create_tx.send(()).unwrap();
 
         let outcome = launch_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("cancelled factory transaction rolls back once");
-        assert!(matches!(
-            host.accept_launch_outcome(outcome, |_| panic!("rollback has no cleanup worker")),
-            Ok(AcceptedLaunchOutcome::CancelledLaunchRolledBack(_))
-        ));
-        assert!(exit.launch_finished());
+            .expect("background transaction may finish after fatal exit is already selected");
+        assert!(exit.should_ignore_events());
+        drop(outcome);
         assert!(host.active.is_none());
         assert_eq!(create_count.load(Ordering::Acquire), 1);
         assert_eq!(drop_count.load(Ordering::Acquire), 1);
-        assert!(exit.should_exit(&host));
     }
 
     #[test]
-    fn fatal_after_started_is_queued_never_installs_ports_and_reclaims_once() {
+    fn fatal_after_started_is_queued_ignores_the_late_event_without_installing_ports() {
         let create_count = Arc::new(AtomicUsize::new(0));
         let drop_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
         let (worker_started_tx, worker_started_rx) = mpsc::channel();
         let mut host = test_host(
             Arc::new(ObservedBlockingFactory {
                 create_count: create_count.clone(),
                 drop_count: drop_count.clone(),
+                stop: stop.clone(),
                 create_entered: None,
                 release_create: Mutex::new(None),
                 worker_started: worker_started_tx,
@@ -2864,31 +2996,46 @@ mod tests {
             .expect("real protocol resource is live");
 
         let mut exit = ApplicationExitState::default();
-        assert!(exit
-            .cancel_pending_launch_for_fatal(&mut host, Instant::now())
-            .is_some());
-        let (cleanup_tx, cleanup_rx) = mpsc::channel();
-        assert!(matches!(
-            host.accept_launch_outcome(outcome, move |outcome| {
-                cleanup_tx.send(outcome).unwrap();
-            }),
-            Ok(AcceptedLaunchOutcome::CancelledStarted)
-        ));
-        assert!(exit.launch_finished());
+        let report = crate::fatal::FatalReport::internal(
+            crate::fatal::FatalComponent::Application,
+            crate::fatal::FatalOperation::Launch,
+            crate::fatal::FatalReason::InvalidState,
+        );
+        assert!(exit.latch_fatal(report.clone()));
+        assert!(host.cancel_pending_launch());
+        assert_eq!(exit.pending_launch_deadline(), None);
+        assert!(exit.should_ignore_events());
+        drop(outcome);
         assert!(host.active.is_none());
-        assert!(!exit.should_exit(&host));
-
-        let cleanup = cleanup_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("fatal cancellation reclaims the started resources");
-        let completion = host
-            .accept_cleanup_outcome(cleanup)
-            .expect("bounded cleanup completes");
-        assert_eq!(completion.session_id(), session_id);
         assert_eq!(create_count.load(Ordering::Acquire), 1);
-        assert_eq!(drop_count.load(Ordering::Acquire), 1);
-        assert!(host.active.is_none());
-        assert!(exit.should_exit(&host));
+        assert_eq!(exit.runner_result(), Err(report));
+
+        stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while drop_count.load(Ordering::Acquire) != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "test protocol worker did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn fatal_latch_discards_an_existing_graceful_shutdown_deadline() {
+        let now = Instant::now();
+        let mut exit = ApplicationExitState {
+            pending_launch_deadline: Some(now + Duration::from_secs(5)),
+            ..ApplicationExitState::default()
+        };
+        let report = crate::fatal::FatalReport::internal(
+            crate::fatal::FatalComponent::Application,
+            crate::fatal::FatalOperation::Shutdown,
+            crate::fatal::FatalReason::InvalidState,
+        );
+
+        assert!(exit.latch_fatal(report));
+        assert_eq!(exit.pending_launch_deadline(), None);
     }
 
     #[test]
