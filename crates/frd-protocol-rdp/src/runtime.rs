@@ -8,14 +8,71 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use frd_protocol_api::{ProtocolError, ProtocolExit, ProtocolRuntime, SessionCommand};
+use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 
 use crate::active_session::run_active_session;
 use crate::config::RdpConnectionConfig;
 use crate::connector::connect_and_activate;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_CANCELLED};
+use crate::input::{RdpInputError, RdpInputState};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const NETWORK_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) enum ActiveCommandBatch {
+    Continue(Vec<FastPathInputEvent>),
+    Disconnect(Vec<FastPathInputEvent>),
+    Terminal(Vec<FastPathInputEvent>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReactivationCommand {
+    Continue,
+    Disconnect,
+    Terminal,
+}
+
+pub(crate) fn drain_active_commands(
+    runtime: &mut ProtocolRuntime,
+    input: &mut RdpInputState,
+) -> Result<ActiveCommandBatch, RdpInputError> {
+    if runtime.requires_shutdown() {
+        return Ok(ActiveCommandBatch::Terminal(input.stop()));
+    }
+
+    let mut events = Vec::new();
+    while let Some(command) = runtime.try_next_command() {
+        match command {
+            SessionCommand::Input(session_input) => {
+                events.extend(input.translate(session_input.event)?);
+            }
+            SessionCommand::Disconnect => {
+                events.extend(input.stop());
+                return Ok(ActiveCommandBatch::Disconnect(events));
+            }
+            SessionCommand::ViewportChanged { .. }
+            | SessionCommand::ResolveServerIdentity { .. }
+            | SessionCommand::ClipboardWrite(_) => {}
+        }
+    }
+    Ok(ActiveCommandBatch::Continue(events))
+}
+
+pub(crate) fn drain_reactivation_commands(runtime: &mut ProtocolRuntime) -> ReactivationCommand {
+    if runtime.requires_shutdown() {
+        return ReactivationCommand::Terminal;
+    }
+    while let Some(command) = runtime.try_next_command() {
+        if matches!(command, SessionCommand::Disconnect) {
+            return ReactivationCommand::Disconnect;
+        }
+    }
+    if runtime.requires_shutdown() {
+        ReactivationCommand::Terminal
+    } else {
+        ReactivationCommand::Continue
+    }
+}
 
 struct TrackedWorker {
     cancellation: StageCancellation,
@@ -113,11 +170,14 @@ pub(crate) fn run_protocol_session(
         Err(_) => return ProtocolExit::Failed(rdp_error(RDP_ACTIVATION_FAILED)),
     };
 
-    match executor.block_on(connect_and_activate(&mut config, &mut runtime)) {
+    let result = match executor.block_on(connect_and_activate(&mut config, &mut runtime)) {
         Ok(session) => run_active_session(session, session_id, &mut runtime),
         Err(error) if error.code() == RDP_CANCELLED => ProtocolExit::Closed,
         Err(error) => ProtocolExit::Failed(error),
-    }
+    };
+    drop(config);
+    drop(executor);
+    result
 }
 
 pub(crate) async fn wait_for_network_future<T, E, F>(
@@ -321,7 +381,9 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use frd_core::{SecretBuffer, SessionId};
+    use frd_core::{
+        InputEvent, KeyState, Modifiers, PhysicalKeyCode, SecretBuffer, SessionId, SessionInput,
+    };
     use frd_protocol_api::{
         ConnectRequest, ConnectionStage, Credentials, Endpoint, ProtocolError, ProtocolExit,
         ProtocolId, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand, SessionEvent,
@@ -330,10 +392,12 @@ mod tests {
 
     use crate::config::RdpConnectionConfig;
     use crate::error::{RDP_DNS_FAILED, RDP_TLS_FAILED};
+    use crate::input::RdpInputState;
 
     use super::{
-        run_protocol_session, wait_for_blocking, wait_for_blocking_with_timeout,
-        wait_for_network_future, CancellationCheckedIo,
+        drain_active_commands, drain_reactivation_commands, run_protocol_session,
+        wait_for_blocking, wait_for_blocking_with_timeout, wait_for_network_future,
+        ActiveCommandBatch, CancellationCheckedIo,
     };
 
     static WORKER_TEST_SERIAL: Mutex<()> = Mutex::new(());
@@ -342,6 +406,213 @@ mod tests {
         WORKER_TEST_SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn input_active_command_batch_drops_stale_generation_before_translation() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                frd_core::PixelSize::new(2, 2).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        commands
+            .send(SessionCommand::Input(SessionInput {
+                session_id,
+                generation: 2,
+                event: key_event(0x1e, KeyState::Pressed),
+            }))
+            .expect("runtime command receiver remains open");
+        commands
+            .send(SessionCommand::Input(SessionInput {
+                session_id,
+                generation: 1,
+                event: key_event(0x30, KeyState::Pressed),
+            }))
+            .expect("runtime command receiver remains open");
+        let mut input = RdpInputState::new();
+
+        let ActiveCommandBatch::Continue(events) =
+            drain_active_commands(&mut runtime, &mut input).expect("current input translates")
+        else {
+            panic!("no shutdown command was queued");
+        };
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ironrdp::pdu::input::fast_path::FastPathInputEvent::KeyboardEvent(flags, 0x30)
+                if flags.is_empty()
+        ));
+    }
+
+    #[test]
+    fn lifecycle_disconnect_batch_releases_held_input_and_stops_acceptance() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                frd_core::PixelSize::new(2, 2).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        commands
+            .send(SessionCommand::Input(SessionInput {
+                session_id,
+                generation: 1,
+                event: key_event(0xe01d, KeyState::Pressed),
+            }))
+            .expect("runtime command receiver remains open");
+        let mut input = RdpInputState::new();
+        assert!(matches!(
+            drain_active_commands(&mut runtime, &mut input),
+            Ok(ActiveCommandBatch::Continue(events)) if events.len() == 1
+        ));
+
+        commands
+            .send(SessionCommand::Disconnect)
+            .expect("runtime command receiver remains open");
+        let ActiveCommandBatch::Disconnect(releases) =
+            drain_active_commands(&mut runtime, &mut input).expect("disconnect cannot fail")
+        else {
+            panic!("disconnect must stop the active input batch");
+        };
+
+        assert_eq!(
+            releases,
+            vec![
+                ironrdp::pdu::input::fast_path::FastPathInputEvent::KeyboardEvent(
+                    ironrdp::pdu::input::fast_path::KeyboardFlags::RELEASE
+                        | ironrdp::pdu::input::fast_path::KeyboardFlags::EXTENDED,
+                    0x1d,
+                )
+            ]
+        );
+        assert_eq!(
+            input.translate(InputEvent::ReleaseAll),
+            Err(crate::input::RdpInputError::Stopped)
+        );
+    }
+
+    #[test]
+    fn lifecycle_disconnect_preserves_queued_input_before_release_all() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                frd_core::PixelSize::new(2, 2).expect("valid size"),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        commands
+            .send(SessionCommand::Input(SessionInput {
+                session_id,
+                generation: 1,
+                event: key_event(0x1e, KeyState::Pressed),
+            }))
+            .expect("input sends");
+        commands
+            .send(SessionCommand::Disconnect)
+            .expect("disconnect sends");
+        let mut input = RdpInputState::new();
+
+        let ActiveCommandBatch::Disconnect(events) =
+            drain_active_commands(&mut runtime, &mut input).expect("batch translates")
+        else {
+            panic!("disconnect must finish the batch");
+        };
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ironrdp::pdu::input::fast_path::FastPathInputEvent::KeyboardEvent(press, 0x1e),
+                ironrdp::pdu::input::fast_path::FastPathInputEvent::KeyboardEvent(release, 0x1e),
+            ] if press.is_empty()
+                && *release == ironrdp::pdu::input::fast_path::KeyboardFlags::RELEASE
+        ));
+    }
+
+    #[test]
+    fn lifecycle_reactivation_drops_input_until_the_new_generation_is_ready() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                frd_core::PixelSize {
+                    width: 1280,
+                    height: 720,
+                },
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation begins");
+        commands
+            .send(SessionCommand::Input(SessionInput {
+                session_id,
+                generation: 1,
+                event: InputEvent::PointerMove {
+                    remote: frd_core::PixelPoint { x: 10, y: 20 },
+                },
+            }))
+            .expect("input command sends");
+
+        assert_eq!(
+            drain_reactivation_commands(&mut runtime),
+            super::ReactivationCommand::Continue
+        );
+        assert!(runtime.try_next_command().is_none());
+    }
+
+    fn key_event(code: u32, state: KeyState) -> InputEvent {
+        InputEvent::PhysicalKey {
+            code: PhysicalKeyCode(code),
+            state,
+            modifiers: Modifiers::default(),
+        }
     }
 
     #[test]
@@ -859,6 +1130,14 @@ mod tests {
     impl SurfacePublisher for RejectingFrames {
         fn publish(&self, _: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
             Err(ProtocolError::FramePortRejected)
+        }
+    }
+
+    struct AcceptingFrames;
+
+    impl SurfacePublisher for AcceptingFrames {
+        fn publish(&self, _: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
+            Ok(())
         }
     }
 

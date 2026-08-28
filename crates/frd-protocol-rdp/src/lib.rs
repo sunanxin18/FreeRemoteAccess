@@ -6,11 +6,13 @@ mod config;
 mod connector;
 mod error;
 mod factory;
+mod input;
 mod runtime;
 mod server_identity;
 mod surface;
 mod tls;
 mod upstream;
+mod writer;
 
 pub use config::{ParsedUsername, RdpConnectionConfig};
 pub use factory::{RdpProtocolFactory, RdpProtocolSession};

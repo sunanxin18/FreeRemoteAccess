@@ -187,7 +187,6 @@ impl RdpBaseline {
         })
     }
 
-    #[allow(dead_code)] // Task 5 uses this when deactivation/reactivation is completed.
     pub(crate) fn begin_next_generation(
         &mut self,
         runtime: &mut ProtocolRuntime,
