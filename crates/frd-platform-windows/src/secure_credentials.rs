@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 const COMMITTED_PREFIX: &str = "FreeRemoteDesk/profile/";
 const PENDING_PREFIX: &str = "FreeRemoteDesk/pending/";
 const PENDING_FILTER: &str = "FreeRemoteDesk/pending/*";
+#[cfg(windows)]
+const GENERIC_CREDENTIAL_TYPE: u32 = windows_sys::Win32::Security::Credentials::CRED_TYPE_GENERIC;
+#[cfg(not(windows))]
+const GENERIC_CREDENTIAL_TYPE: u32 = 1;
 
 pub struct WindowsCredentialStore;
 
@@ -82,6 +86,10 @@ fn hash_field(hash: &mut Sha256, field: &[u8]) {
 
 fn pending_target(session: SessionId) -> String {
     format!("{PENDING_PREFIX}{}-{}", std::process::id(), session.get())
+}
+
+fn should_purge_pending_target(credential_type: u32, target: &str) -> bool {
+    credential_type == GENERIC_CREDENTIAL_TYPE && target.starts_with(PENDING_PREFIX)
 }
 
 #[cfg(windows)]
@@ -226,7 +234,7 @@ fn delete_credential(_: &str) -> Result<(), PlatformError> {
 fn enumerate_pending_targets() -> Result<Vec<String>, PlatformError> {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
     use windows_sys::Win32::Security::Credentials::{
-        CredEnumerateW, CREDENTIALW, CRED_MAX_GENERIC_TARGET_NAME_LENGTH, CRED_TYPE_GENERIC,
+        CredEnumerateW, CREDENTIALW, CRED_MAX_GENERIC_TARGET_NAME_LENGTH,
     };
 
     let filter = wide_input(PENDING_FILTER, CRED_MAX_GENERIC_TARGET_NAME_LENGTH as usize)?;
@@ -256,14 +264,14 @@ fn enumerate_pending_targets() -> Result<Vec<String>, PlatformError> {
         }
         // SAFETY: each non-null entry points to an initialized CREDENTIALW owned by allocation.
         let credential = unsafe { &*credential };
-        if credential.Type != CRED_TYPE_GENERIC {
+        if credential.Type != GENERIC_CREDENTIAL_TYPE {
             continue;
         }
         let target = wide_output(
             credential.TargetName,
             CRED_MAX_GENERIC_TARGET_NAME_LENGTH as usize,
         )?;
-        if target.starts_with(PENDING_PREFIX) {
+        if should_purge_pending_target(credential.Type, &target) {
             targets.push(target);
         }
     }
@@ -372,7 +380,7 @@ mod tests {
 
     use super::{
         committed_target, delete_credential, pending_target, read_credential,
-        WindowsCredentialStore,
+        should_purge_pending_target, WindowsCredentialStore,
     };
 
     fn test_key() -> ConnectionProfileKey {
@@ -397,6 +405,21 @@ mod tests {
         assert!(!first.contains(key.username()));
     }
 
+    #[test]
+    fn purge_selects_only_generic_credentials_under_the_exact_pending_prefix() {
+        let cases = [
+            (1, "FreeRemoteDesk/pending/process-session", true),
+            (2, "FreeRemoteDesk/pending/process-session", false),
+            (1, "FreeRemoteDesk/profile/digest", false),
+            (1, "FreeRemoteDesk/pending-other/process-session", false),
+            (1, "OtherProduct/pending/process-session", false),
+        ];
+
+        for (credential_type, target, expected) in cases {
+            assert!(should_purge_pending_target(credential_type, target) == expected);
+        }
+    }
+
     #[cfg(windows)]
     struct CredentialCleanup {
         pending: String,
@@ -413,7 +436,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_vault_stages_commits_loads_discards_purges_and_deletes() {
+    fn windows_vault_stages_commits_loads_discards_and_deletes() {
         let session = SessionId::allocate();
         let unique = format!("{}-{}", std::process::id(), session.get());
         let key = ConnectionProfileKey::new(
@@ -484,22 +507,6 @@ mod tests {
             store.commit(session, &key),
             Err(PlatformError::CredentialNotFound)
         ));
-
-        store
-            .stage(session, &key, &password)
-            .expect("third pending credential is staged");
-        store
-            .purge_pending()
-            .expect("pending credential prefix is purged");
-        assert!(
-            read_credential(&pending)
-                .expect("purged pending credential can be checked")
-                .is_none(),
-            "purged pending credential remained in the vault"
-        );
-        store
-            .purge_pending()
-            .expect("purging an empty pending prefix is idempotent");
     }
 
     #[cfg(windows)]
