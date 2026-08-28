@@ -1,6 +1,9 @@
 use std::future::Future;
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +15,89 @@ use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_CANCELLED};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const NETWORK_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct TrackedWorker {
+    cancellation: StageCancellation,
+    handle: thread::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StageCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl StageCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) struct CancellationCheckedIo<S> {
+    inner: S,
+    cancellation: StageCancellation,
+}
+
+impl<S> CancellationCheckedIo<S> {
+    pub(crate) fn new(inner: S, cancellation: StageCancellation) -> Self {
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> S {
+        self.inner
+    }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.cancellation.is_cancelled() {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "RDP stage cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<S: Read> Read for CancellationCheckedIo<S> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.check_cancelled()?;
+        let result = self.inner.read(buffer);
+        self.check_cancelled()?;
+        result
+    }
+}
+
+impl<S: Write> Write for CancellationCheckedIo<S> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.check_cancelled()?;
+        let result = self.inner.write(buffer);
+        self.check_cancelled()?;
+        result
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.check_cancelled()?;
+        let result = self.inner.flush();
+        self.check_cancelled()?;
+        result
+    }
+}
+
+static BLOCKING_STAGE_WORKER: OnceLock<Mutex<Option<TrackedWorker>>> = OnceLock::new();
+static NETWORK_STAGE_WORKER: OnceLock<Mutex<Option<TrackedWorker>>> = OnceLock::new();
 
 pub(crate) fn run_protocol_session(
     mut config: RdpConnectionConfig,
@@ -63,32 +149,36 @@ where
         return Err(cancelled());
     }
 
-    let (result_tx, result_rx) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("frd-rdp-network-stage".to_owned())
-        .spawn(move || {
+    let result_rx =
+        start_tracked_worker(network_stage_worker(), "frd-rdp-network-stage", move |_| {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map(|executor| executor.block_on(future));
-            let _ = result_tx.send(result);
+            result
         })
-        .map_err(|_| rdp_error(failure_code))?;
+        .map_err(|()| rdp_error(failure_code))?;
     let deadline = Instant::now() + NETWORK_STAGE_TIMEOUT;
 
     loop {
         if disconnect_requested(runtime) {
+            cancel_tracked_worker(network_stage_worker());
             return Err(cancelled());
         }
         match result_rx.try_recv() {
-            Ok(Ok(Ok(value))) => return Ok(value),
+            Ok(Ok(Ok(value))) => {
+                finish_tracked_worker(network_stage_worker());
+                return Ok(value);
+            }
             Ok(Ok(Err(_))) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                finish_tracked_worker(network_stage_worker());
                 return Err(rdp_error(failure_code));
             }
             Err(TryRecvError::Empty) => {}
         }
         let now = Instant::now();
         if now >= deadline {
+            cancel_tracked_worker(network_stage_worker());
             return Err(rdp_error(failure_code));
         }
         let wait = COMMAND_POLL_INTERVAL.min(deadline.duration_since(now));
@@ -100,7 +190,7 @@ pub(crate) async fn wait_for_blocking<T>(
     runtime: &mut ProtocolRuntime,
     shutdown: TcpStream,
     failure_code: &'static str,
-    operation: impl FnOnce() -> T + Send + 'static,
+    operation: impl FnOnce(StageCancellation) -> T + Send + 'static,
 ) -> Result<T, ProtocolError>
 where
     T: Send + 'static,
@@ -120,7 +210,7 @@ async fn wait_for_blocking_with_timeout<T>(
     shutdown: TcpStream,
     failure_code: &'static str,
     timeout: Duration,
-    operation: impl FnOnce() -> T + Send + 'static,
+    operation: impl FnOnce(StageCancellation) -> T + Send + 'static,
 ) -> Result<T, ProtocolError>
 where
     T: Send + 'static,
@@ -130,31 +220,96 @@ where
         return Err(cancelled());
     }
 
-    let (result_tx, result_rx) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("frd-rdp-blocking-stage".to_owned())
-        .spawn(move || {
-            let _ = result_tx.send(operation());
-        })
-        .map_err(|_| rdp_error(failure_code))?;
+    let result_rx =
+        start_tracked_worker(blocking_stage_worker(), "frd-rdp-blocking-stage", operation)
+            .map_err(|()| rdp_error(failure_code))?;
     let deadline = Instant::now() + timeout;
     loop {
         if disconnect_requested(runtime) {
+            cancel_tracked_worker(blocking_stage_worker());
             let _ = shutdown.shutdown(Shutdown::Both);
             return Err(cancelled());
         }
         match result_rx.try_recv() {
-            Ok(value) => return Ok(value),
-            Err(TryRecvError::Disconnected) => return Err(rdp_error(failure_code)),
+            Ok(value) => {
+                finish_tracked_worker(blocking_stage_worker());
+                return Ok(value);
+            }
+            Err(TryRecvError::Disconnected) => {
+                finish_tracked_worker(blocking_stage_worker());
+                return Err(rdp_error(failure_code));
+            }
             Err(TryRecvError::Empty) => {}
         }
         let now = Instant::now();
         if now >= deadline {
+            cancel_tracked_worker(blocking_stage_worker());
             let _ = shutdown.shutdown(Shutdown::Both);
             return Err(rdp_error(failure_code));
         }
         let wait = COMMAND_POLL_INTERVAL.min(deadline.duration_since(now));
         tokio::time::sleep(wait).await;
+    }
+}
+
+fn blocking_stage_worker() -> &'static Mutex<Option<TrackedWorker>> {
+    BLOCKING_STAGE_WORKER.get_or_init(|| Mutex::new(None))
+}
+
+fn network_stage_worker() -> &'static Mutex<Option<TrackedWorker>> {
+    NETWORK_STAGE_WORKER.get_or_init(|| Mutex::new(None))
+}
+
+fn start_tracked_worker<T>(
+    registry: &'static Mutex<Option<TrackedWorker>>,
+    name: &'static str,
+    operation: impl FnOnce(StageCancellation) -> T + Send + 'static,
+) -> Result<Receiver<T>, ()>
+where
+    T: Send + 'static,
+{
+    let mut worker = registry.lock().map_err(|_| ())?;
+    if worker
+        .as_ref()
+        .is_some_and(|tracked| !tracked.handle.is_finished())
+    {
+        return Err(());
+    }
+    if let Some(finished) = worker.take() {
+        let _ = finished.handle.join();
+    }
+
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let cancellation = StageCancellation::new();
+    let worker_cancellation = cancellation.clone();
+    let handle = thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _ = result_tx.send(operation(worker_cancellation));
+        })
+        .map_err(|_| ())?;
+    *worker = Some(TrackedWorker {
+        cancellation,
+        handle,
+    });
+    Ok(result_rx)
+}
+
+fn cancel_tracked_worker(registry: &'static Mutex<Option<TrackedWorker>>) {
+    let Ok(worker) = registry.lock() else {
+        return;
+    };
+    if let Some(tracked) = worker.as_ref() {
+        tracked.cancellation.cancel();
+    }
+}
+
+fn finish_tracked_worker(registry: &'static Mutex<Option<TrackedWorker>>) {
+    let Ok(mut worker) = registry.lock() else {
+        return;
+    };
+    if let Some(finished) = worker.take() {
+        let _ = finished.handle.join();
     }
 }
 
@@ -173,8 +328,11 @@ fn cancelled() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -190,11 +348,295 @@ mod tests {
 
     use super::{
         run_protocol_session, wait_for_blocking, wait_for_blocking_with_timeout,
-        wait_for_network_future,
+        wait_for_network_future, CancellationCheckedIo,
     };
+
+    static WORKER_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn worker_test_guard() -> MutexGuard<'static, ()> {
+        WORKER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn lifecycle_cancelled_credential_transport_worker_is_tracked_single_flight() {
+        let _serial = worker_test_guard();
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RejectingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let transport = TcpStream::connect(listener.local_addr().expect("test listener address"))
+            .expect("connect test stream");
+        let (_server, _) = listener.accept().expect("accept test stream");
+        let shutdown = transport.try_clone().expect("clone test stream");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = CredentialTransportOwner {
+            _credential: "credential-canary".to_owned(),
+            _transport: transport,
+            dropped: dropped.clone(),
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let controller = thread::spawn(move || {
+            started_rx.recv().expect("credentialed worker must start");
+            commands
+                .send(SessionCommand::Disconnect)
+                .expect("runtime command receiver remains open");
+        });
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let first_starts = starts.clone();
+
+        let first = executor.block_on(wait_for_blocking(
+            &mut runtime,
+            shutdown,
+            RDP_TLS_FAILED,
+            move |_| {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).expect("test controller remains open");
+                release_rx.recv().expect("test release remains open");
+                drop(owner);
+            },
+        ));
+        controller.join().expect("test controller exits");
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        let mut repeated = Vec::new();
+        for _ in 0..3 {
+            let listener =
+                TcpListener::bind(("127.0.0.1", 0)).expect("bind repeated test listener");
+            let repeated_stream = TcpStream::connect(
+                listener
+                    .local_addr()
+                    .expect("repeated test listener address"),
+            )
+            .expect("connect repeated test stream");
+            let (_repeated_server, _) = listener.accept().expect("accept repeated test stream");
+            let repeated_starts = starts.clone();
+            repeated.push(executor.block_on(wait_for_blocking_with_timeout(
+                &mut runtime,
+                repeated_stream,
+                RDP_TLS_FAILED,
+                Duration::from_millis(50),
+                move |_| {
+                    repeated_starts.fetch_add(1, Ordering::SeqCst);
+                },
+            )));
+        }
+        release_tx
+            .send(())
+            .expect("tracked credentialed worker remains releasable");
+        let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+        while !dropped.load(Ordering::SeqCst) && Instant::now() < cleanup_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            first
+                .expect_err("Disconnect must cancel the first worker")
+                .code(),
+            "rdp_cancelled"
+        );
+        assert!(repeated.into_iter().all(|attempt| {
+            attempt
+                .expect_err("a tracked in-flight worker must reject every repeated start")
+                .code()
+                == "rdp_tls_failed"
+        }));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct CredentialTransportOwner {
+        _credential: String,
+        _transport: TcpStream,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for CredentialTransportOwner {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn lifecycle_cancelled_credential_stage_rejects_post_cancel_protocol_io() {
+        let _serial = worker_test_guard();
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RejectingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let shutdown = TcpStream::connect(listener.local_addr().expect("test listener address"))
+            .expect("connect test stream");
+        let (_server, _) = listener.accept().expect("accept test stream");
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let controller = thread::spawn(move || {
+            started_rx.recv().expect("credentialed worker must start");
+            commands
+                .send(SessionCommand::Disconnect)
+                .expect("runtime command receiver remains open");
+        });
+        let worker_writes = writes.clone();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let result = executor.block_on(wait_for_blocking(
+            &mut runtime,
+            shutdown,
+            RDP_TLS_FAILED,
+            move |cancellation| {
+                let mut io = CancellationCheckedIo::new(
+                    CountingWriter {
+                        writes: worker_writes,
+                    },
+                    cancellation,
+                );
+                started_tx.send(()).expect("test controller remains open");
+                release_rx.recv().expect("test release remains open");
+                let write_result = io.write_all(b"post-cancel protocol progress");
+                finished_tx
+                    .send(write_result)
+                    .expect("test observer remains open");
+            },
+        ));
+        controller.join().expect("test controller exits");
+        release_tx
+            .send(())
+            .expect("tracked credentialed worker remains releasable");
+        let write_error = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tracked credentialed worker eventually observes cancellation")
+            .expect_err("post-cancel protocol I/O must fail closed");
+
+        assert_eq!(
+            result.expect_err("Disconnect must cancel the stage").code(),
+            "rdp_cancelled"
+        );
+        assert_eq!(write_error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    struct CountingWriter {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lifecycle_cancelled_dns_worker_is_tracked_single_flight() {
+        let _serial = worker_test_guard();
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(RejectingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let controller = thread::spawn(move || {
+            started_rx.recv().expect("blocking lookup must start");
+            commands
+                .send(SessionCommand::Disconnect)
+                .expect("runtime command receiver remains open");
+        });
+        let first_starts = starts.clone();
+        let lookup = async move {
+            tokio::task::spawn_blocking(move || {
+                first_starts.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).expect("test controller remains open");
+                release_rx.recv().expect("test release remains open");
+                finished_tx.send(()).expect("test observer remains open");
+            })
+            .await
+            .map_err(|_| ())
+        };
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let first = executor.block_on(wait_for_network_future(
+            &mut runtime,
+            lookup,
+            RDP_DNS_FAILED,
+        ));
+        controller.join().expect("test controller exits");
+        let mut repeated = Vec::new();
+        for _ in 0..3 {
+            let repeated_starts = starts.clone();
+            repeated.push(executor.block_on(wait_for_network_future(
+                &mut runtime,
+                async move {
+                    repeated_starts.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>(())
+                },
+                RDP_DNS_FAILED,
+            )));
+        }
+        release_tx
+            .send(())
+            .expect("tracked lookup remains releasable");
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tracked lookup eventually finishes");
+
+        assert_eq!(
+            first.expect_err("Disconnect must cancel DNS").code(),
+            "rdp_cancelled"
+        );
+        assert!(repeated.into_iter().all(|attempt| {
+            attempt
+                .expect_err("a tracked in-flight lookup must reject every repeated start")
+                .code()
+                == "rdp_dns_failed"
+        }));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn lifecycle_in_flight_dns_cancellation_does_not_wait_for_lookup_cleanup() {
+        let _serial = worker_test_guard();
         let session_id = SessionId::allocate();
         let (commands, command_rx) = mpsc::channel();
         let (events, _) = mpsc::channel();
@@ -258,6 +700,7 @@ mod tests {
 
     #[test]
     fn lifecycle_in_flight_blocking_stage_cancellation_does_not_wait_for_cleanup() {
+        let _serial = worker_test_guard();
         let session_id = SessionId::allocate();
         let (commands, command_rx) = mpsc::channel();
         let (events, _) = mpsc::channel();
@@ -298,7 +741,7 @@ mod tests {
             &mut runtime,
             client,
             RDP_TLS_FAILED,
-            move || {
+            move |_| {
                 started_tx.send(()).expect("test controller remains open");
                 release_rx.recv().expect("test release remains open");
                 finished_tx.send(()).expect("test observer remains open");
@@ -321,6 +764,7 @@ mod tests {
 
     #[test]
     fn lifecycle_in_flight_blocking_stage_timeout_does_not_wait_for_cleanup() {
+        let _serial = worker_test_guard();
         let session_id = SessionId::allocate();
         let (_commands, command_rx) = mpsc::channel();
         let (events, _) = mpsc::channel();
@@ -359,7 +803,7 @@ mod tests {
             client,
             RDP_TLS_FAILED,
             Duration::from_millis(50),
-            move || {
+            move |_| {
                 started_tx.send(()).expect("test controller remains open");
                 release_rx.recv().expect("test release remains open");
                 finished_tx.send(()).expect("test observer remains open");

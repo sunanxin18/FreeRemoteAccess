@@ -19,7 +19,9 @@ use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
     RDP_NLA_FAILED, RDP_TCP_FAILED, RDP_TLS_FAILED,
 };
-use crate::runtime::{wait_for_blocking, wait_for_network_future};
+use crate::runtime::{
+    wait_for_blocking, wait_for_network_future, CancellationCheckedIo, StageCancellation,
+};
 use crate::tls::{credential_free_preflight, establish_verified_tls, VerifiedTlsTransport};
 
 const DEFAULT_DESKTOP_SIZE: DesktopSize = DesktopSize {
@@ -57,7 +59,7 @@ pub(crate) async fn connect_and_activate(
         .try_clone()
         .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
     let preflight_endpoint = endpoint.clone();
-    let observed = wait_for_blocking(runtime, preflight_shutdown, RDP_TLS_FAILED, move || {
+    let observed = wait_for_blocking(runtime, preflight_shutdown, RDP_TLS_FAILED, move |_| {
         credential_free_preflight(preflight_transport, &preflight_endpoint)
     })
     .await??;
@@ -77,7 +79,7 @@ pub(crate) async fn connect_and_activate(
         .try_clone()
         .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
     let verified_endpoint = endpoint.clone();
-    let verified = wait_for_blocking(runtime, verified_shutdown, RDP_TLS_FAILED, move || {
+    let verified = wait_for_blocking(runtime, verified_shutdown, RDP_TLS_FAILED, move |_| {
         establish_verified_tls(negotiated.transport, &verified_endpoint, &accepted_identity)
     })
     .await??;
@@ -100,13 +102,30 @@ pub(crate) async fn connect_and_activate(
         .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
     let server_name = ServerName::new(endpoint.host().to_owned());
     let credssp_key = server_public_key.clone();
-    let (next_connector, next_framed, credssp_result) =
-        wait_for_blocking(runtime, credssp_shutdown, RDP_NLA_FAILED, move || {
+    let (next_connector, next_framed, credssp_result) = wait_for_blocking(
+        runtime,
+        credssp_shutdown,
+        RDP_NLA_FAILED,
+        move |cancellation| {
             let mut connector = negotiated.connector;
-            let result = perform_credssp(&mut connector, &mut framed, server_name, credssp_key);
+            let (stream, leftover) = framed.into_inner();
+            let mut guarded_framed = Framed::new_with_leftover(
+                CancellationCheckedIo::new(stream, cancellation.clone()),
+                leftover,
+            );
+            let result = perform_credssp(
+                &mut connector,
+                &mut guarded_framed,
+                server_name,
+                credssp_key,
+                &cancellation,
+            );
+            let (stream, leftover) = guarded_framed.into_inner();
+            let framed = Framed::new_with_leftover(stream.into_inner(), leftover);
             (connector, framed, result)
-        })
-        .await?;
+        },
+    )
+    .await?;
     let mut connector = next_connector;
     framed = next_framed;
     credssp_result.map_err(map_credssp_error)?;
@@ -127,15 +146,24 @@ pub(crate) async fn connect_and_activate(
             .try_clone()
             .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
         let (next_connector, next_framed, step_result) =
-            wait_for_blocking(runtime, shutdown, failure_code, move || {
+            wait_for_blocking(runtime, shutdown, failure_code, move |cancellation| {
                 let mut connector = connector;
-                let mut framed = framed;
-                let mut scratch = Default::default();
-                let result = ironrdp_blocking::single_sequence_step(
-                    &mut framed,
-                    &mut connector,
-                    &mut scratch,
+                let (stream, leftover) = framed.into_inner();
+                let mut guarded_framed = Framed::new_with_leftover(
+                    CancellationCheckedIo::new(stream, cancellation.clone()),
+                    leftover,
                 );
+                let mut scratch = Default::default();
+                let result = ensure_stage_running(&cancellation).and_then(|()| {
+                    ironrdp_blocking::single_sequence_step(
+                        &mut guarded_framed,
+                        &mut connector,
+                        &mut scratch,
+                    )
+                });
+                let result = result.and_then(|()| ensure_stage_running(&cancellation));
+                let (stream, leftover) = guarded_framed.into_inner();
+                let framed = Framed::new_with_leftover(stream.into_inner(), leftover);
                 (connector, framed, result)
             })
             .await?;
@@ -198,7 +226,7 @@ async fn negotiate_enhanced_security(
             .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
         let client_addr = stream.local_addr().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
         let shutdown = stream.try_clone().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
-        let negotiated = wait_for_blocking(runtime, shutdown, RDP_TLS_FAILED, move || {
+        let negotiated = wait_for_blocking(runtime, shutdown, RDP_TLS_FAILED, move |_| {
             let mut framed = Framed::new(stream);
             let mut connector = baseline_connector(
                 Credentials::SmartCard {
@@ -227,10 +255,12 @@ fn perform_credssp<S>(
     framed: &mut Framed<S>,
     server_name: ServerName,
     server_public_key: Vec<u8>,
+    cancellation: &StageCancellation,
 ) -> Result<(), ConnectorError>
 where
     S: Read + Write,
 {
+    ensure_stage_running(cancellation)?;
     let selected_protocol = match connector.state {
         ClientConnectorState::Credssp { selected_protocol } => selected_protocol,
         _ => {
@@ -249,6 +279,7 @@ where
         None,
     )?;
     loop {
+        ensure_stage_running(cancellation)?;
         let client_state = {
             let mut generator = sequence.process_ts_request(request);
             match generator.start() {
@@ -267,6 +298,7 @@ where
         let mut scratch = Default::default();
         let written = sequence.handle_process_result(client_state, &mut scratch)?;
         if let Some(length) = written.size() {
+            ensure_stage_running(cancellation)?;
             framed.write_all(&scratch[..length]).map_err(|error| {
                 ConnectorError::new("CredSSP write", ConnectorErrorKind::Custom).with_source(error)
             })?;
@@ -275,9 +307,11 @@ where
         let Some(hint) = sequence.next_pdu_hint() else {
             break;
         };
+        ensure_stage_running(cancellation)?;
         let response = framed.read_by_hint(hint).map_err(|error| {
             ConnectorError::new("CredSSP read", ConnectorErrorKind::Custom).with_source(error)
         })?;
+        ensure_stage_running(cancellation)?;
         if let Some(next_request) = sequence.decode_server_message(&response)? {
             request = next_request;
         } else {
@@ -285,8 +319,20 @@ where
         }
     }
 
+    ensure_stage_running(cancellation)?;
     connector.mark_credssp_as_done();
     Ok(())
+}
+
+fn ensure_stage_running(cancellation: &StageCancellation) -> Result<(), ConnectorError> {
+    if cancellation.is_cancelled() {
+        Err(ConnectorError::new(
+            "cancelled RDP stage",
+            ConnectorErrorKind::General,
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn map_credssp_error(error: ConnectorError) -> ProtocolError {
