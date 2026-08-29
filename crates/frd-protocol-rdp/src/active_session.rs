@@ -21,7 +21,7 @@ use crate::audio::{self, RdpAudioAdapter};
 use crate::baseline::RdpBaseline;
 use crate::clipboard::{self, ClipboardServiceAction};
 use crate::connector::ActivatedRdpSession;
-use crate::display::{DisplayControlAdapter, ResizeConfirmation};
+use crate::display::{DisplayControlAdapter, DisplayControlCapabilityState, ResizeConfirmation};
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED};
 use crate::input::RdpInputState;
 use crate::runtime::{
@@ -56,6 +56,7 @@ fn run_active_session_inner(
         connection,
         transport,
         audio,
+        display_capabilities,
     } = session;
     let (framed, _server_public_key) = transport.into_parts();
     let mut writer = OrderedRdpWriter::new(framed);
@@ -134,6 +135,7 @@ fn run_active_session_inner(
         &mut input,
         &mut generation,
         &mut display,
+        &display_capabilities,
         &audio,
         &mut published_capabilities,
         &activation_factory,
@@ -166,6 +168,7 @@ fn run_active_loop(
     input: &mut RdpInputState,
     generation: &mut u64,
     display: &mut DisplayControlAdapter,
+    display_capabilities: &DisplayControlCapabilityState,
     audio: &RdpAudioAdapter,
     published_capabilities: &mut SessionCapabilities,
     activation_factory: &ConnectionActivationFactory,
@@ -175,6 +178,7 @@ fn run_active_loop(
         refresh_optional_capabilities(
             active_stage,
             display,
+            display_capabilities,
             audio,
             runtime,
             published_capabilities,
@@ -210,6 +214,7 @@ fn run_active_loop(
                 refresh_optional_capabilities(
                     active_stage,
                     display,
+                    display_capabilities,
                     audio,
                     runtime,
                     published_capabilities,
@@ -314,17 +319,17 @@ fn run_active_loop(
 fn refresh_optional_capabilities(
     active_stage: &mut ActiveStage,
     display: &mut DisplayControlAdapter,
+    display_capabilities: &DisplayControlCapabilityState,
     audio_adapter: &RdpAudioAdapter,
     runtime: &mut ProtocolRuntime,
     published: &mut SessionCapabilities,
 ) -> Result<(), ProtocolError> {
-    let display_ready = active_stage
+    let display_max_monitor_area = active_stage
         .get_dvc::<DisplayControlClient>()
         .and_then(|channel| channel.channel_processor_downcast_ref::<DisplayControlClient>())
-        .is_some_and(DisplayControlClient::ready);
-    if display.dynamic_resolution() != display_ready {
-        display.set_negotiated(display_ready);
-    }
+        .filter(|display_control| display_control.ready())
+        .and_then(|_| display_capabilities.max_monitor_area());
+    display.set_negotiated(display_max_monitor_area);
 
     if let Some(rdpsnd) = active_stage.get_svc_processor::<Rdpsnd>() {
         audio::observe_negotiation(rdpsnd, audio_adapter);

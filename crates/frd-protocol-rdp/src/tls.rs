@@ -149,9 +149,9 @@ impl ServerCertVerifier for ExactPinVerifier {
         &self,
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
+        server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         if fingerprint_sha256(end_entity.as_ref()) != self.fingerprint {
             self.mismatch.store(true, Ordering::Release);
@@ -159,6 +159,7 @@ impl ServerCertVerifier for ExactPinVerifier {
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
+        validate_untrusted_leaf_requirements(end_entity, server_name, now)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -382,13 +383,19 @@ fn tls_error() -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use rcgen::{date_time_ymd, CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
+    use rustls::client::danger::ServerCertVerifier as _;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{CertificateError, Error};
 
-    use super::validate_untrusted_leaf_requirements;
+    use super::{
+        configured_crypto_provider, validate_untrusted_leaf_requirements, ExactPinVerifier,
+    };
+    use crate::server_identity::fingerprint_sha256;
 
     const TEST_NOW: UnixTime = UnixTime::since_unix_epoch(Duration::from_secs(1_767_225_600));
 
@@ -468,6 +475,38 @@ mod tests {
             ),
             Err(Error::InvalidCertificate(CertificateError::InvalidPurpose))
         ));
+    }
+
+    #[test]
+    fn exact_pin_reconnect_rejects_leaf_that_expired_while_confirmation_was_pending() {
+        let certificate = certificate_fixture(
+            "rdp.test",
+            (2025, 1, 1),
+            (2026, 1, 2),
+            vec![ExtendedKeyUsagePurpose::ServerAuth],
+        );
+        let mismatch = Arc::new(AtomicBool::new(false));
+        let verifier = ExactPinVerifier {
+            fingerprint: fingerprint_sha256(certificate.as_ref()),
+            provider: configured_crypto_provider(),
+            mismatch: mismatch.clone(),
+        };
+        let server_name = ServerName::try_from("rdp.test").expect("valid server name");
+
+        assert!(verifier
+            .verify_server_cert(&certificate, &[], &server_name, &[], TEST_NOW)
+            .is_ok());
+
+        let after_confirmation =
+            UnixTime::since_unix_epoch(Duration::from_secs(TEST_NOW.as_secs() + 2 * 24 * 60 * 60));
+        assert!(matches!(
+            verifier.verify_server_cert(&certificate, &[], &server_name, &[], after_confirmation,),
+            Err(Error::InvalidCertificate(CertificateError::Expired))
+        ));
+        assert!(
+            !mismatch.load(Ordering::Acquire),
+            "a current validity failure is not an identity change"
+        );
     }
 
     fn certificate_fixture(

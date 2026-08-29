@@ -19,6 +19,7 @@ use ironrdp_blocking::{Framed, ShouldUpgrade};
 use crate::audio::{new_rdpsnd, RdpAudioAdapter};
 use crate::clipboard::new_cliprdr;
 use crate::config::RdpConnectionConfig;
+use crate::display::DisplayControlCapabilityState;
 use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
     RDP_NLA_FAILED, RDP_TCP_FAILED, RDP_TLS_FAILED,
@@ -38,6 +39,7 @@ pub(crate) struct ActivatedRdpSession {
     pub(crate) connection: ConnectionResult,
     pub(crate) transport: VerifiedTlsTransport,
     pub(crate) audio: RdpAudioAdapter,
+    pub(crate) display_capabilities: DisplayControlCapabilityState,
 }
 
 struct NegotiatedTcp {
@@ -45,6 +47,7 @@ struct NegotiatedTcp {
     transport: TcpStream,
     upgrade: ShouldUpgrade,
     audio: RdpAudioAdapter,
+    display_capabilities: DisplayControlCapabilityState,
 }
 
 pub(crate) async fn connect_and_activate(
@@ -61,6 +64,7 @@ pub(crate) async fn connect_and_activate(
         transport: preflight_transport,
         upgrade: _,
         audio: _,
+        display_capabilities: _,
     } = negotiate_enhanced_security(&addresses, runtime).await?;
     let preflight_shutdown = preflight_transport
         .try_clone()
@@ -82,6 +86,7 @@ pub(crate) async fn connect_and_activate(
 
     let mut negotiated = negotiate_enhanced_security(&addresses, runtime).await?;
     let audio = negotiated.audio.clone();
+    let display_capabilities = negotiated.display_capabilities.clone();
     let verified_shutdown = negotiated
         .transport
         .try_clone()
@@ -187,6 +192,7 @@ pub(crate) async fn connect_and_activate(
         connection,
         transport,
         audio,
+        display_capabilities,
     })
 }
 
@@ -237,7 +243,7 @@ async fn negotiate_enhanced_security(
         let shutdown = stream.try_clone().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
         let negotiated = wait_for_blocking(runtime, shutdown, RDP_TLS_FAILED, move |_| {
             let mut framed = Framed::new(stream);
-            let (mut connector, audio) = baseline_connector(
+            let (mut connector, audio, display_capabilities) = baseline_connector(
                 Credentials::SmartCard {
                     pin: String::new(),
                     config: None,
@@ -252,6 +258,7 @@ async fn negotiate_enhanced_security(
                 transport: framed.into_inner_no_leftover(),
                 upgrade,
                 audio,
+                display_capabilities,
             })
         })
         .await?;
@@ -376,10 +383,19 @@ fn baseline_connector(
     domain: Option<String>,
     desktop_size: DesktopSize,
     client_addr: SocketAddr,
-) -> (ClientConnector, RdpAudioAdapter) {
+) -> (
+    ClientConnector,
+    RdpAudioAdapter,
+    DisplayControlCapabilityState,
+) {
     let audio = RdpAudioAdapter::new();
-    let dynamic_channels = DrdynvcClient::new()
-        .with_dynamic_channel(DisplayControlClient::new(|_capabilities| Ok(Vec::new())));
+    let display_capabilities = DisplayControlCapabilityState::default();
+    let observed_display_capabilities = display_capabilities.clone();
+    let dynamic_channels =
+        DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(move |capabilities| {
+            observed_display_capabilities.record(&capabilities);
+            Ok(Vec::new())
+        }));
     let connector = ClientConnector::new(
         connector::Config {
             credentials,
@@ -423,7 +439,7 @@ fn baseline_connector(
     .with_static_channel(dynamic_channels)
     .with_static_channel(new_cliprdr())
     .with_static_channel(new_rdpsnd(&audio));
-    (connector, audio)
+    (connector, audio, display_capabilities)
 }
 
 #[cfg(windows)]
@@ -473,7 +489,7 @@ mod tests {
 
     #[test]
     fn connector_requires_credssp_and_refuses_tls_only_downgrade() {
-        let (connector, _audio) = baseline_connector(
+        let (connector, _audio, _display_capabilities) = baseline_connector(
             Credentials::UsernamePassword {
                 username: "alice".to_owned(),
                 password: String::new(),
@@ -492,7 +508,7 @@ mod tests {
 
     #[test]
     fn connector_offers_only_approved_optional_channels() {
-        let (mut connector, _audio) = baseline_connector(
+        let (mut connector, _audio, _display_capabilities) = baseline_connector(
             Credentials::UsernamePassword {
                 username: "alice".to_owned(),
                 password: String::new(),

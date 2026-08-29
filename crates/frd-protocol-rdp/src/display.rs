@@ -1,5 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use frd_core::{PhysicalViewport, PixelSize};
-use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
+use ironrdp::displaycontrol::pdu::{DisplayControlCapabilities, MonitorLayoutEntry};
 
 use crate::surface::validate_surface_size;
 
@@ -10,8 +12,30 @@ pub(crate) enum ResizeConfirmation {
     Mismatch,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DisplayControlCapabilityState {
+    max_monitor_area: Arc<Mutex<Option<u64>>>,
+}
+
+impl DisplayControlCapabilityState {
+    pub(crate) fn record(&self, capabilities: &DisplayControlCapabilities) {
+        *self
+            .max_monitor_area
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(capabilities.max_monitor_area());
+    }
+
+    pub(crate) fn max_monitor_area(&self) -> Option<u64> {
+        *self
+            .max_monitor_area
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 pub(crate) struct DisplayControlAdapter {
-    negotiated: bool,
+    max_monitor_area: Option<u64>,
     confirmed_size: PixelSize,
     queued: Option<PixelSize>,
     in_flight: Option<PixelSize>,
@@ -20,7 +44,7 @@ pub(crate) struct DisplayControlAdapter {
 impl DisplayControlAdapter {
     pub(crate) fn new(confirmed_size: PixelSize) -> Self {
         Self {
-            negotiated: false,
+            max_monitor_area: None,
             confirmed_size,
             queued: None,
             in_flight: None,
@@ -28,7 +52,7 @@ impl DisplayControlAdapter {
     }
 
     pub(crate) fn dynamic_resolution(&self) -> bool {
-        self.negotiated
+        self.max_monitor_area.is_some()
     }
 
     #[cfg(test)]
@@ -36,15 +60,21 @@ impl DisplayControlAdapter {
         self.confirmed_size
     }
 
-    pub(crate) fn set_negotiated(&mut self, negotiated: bool) {
-        self.negotiated = negotiated;
-        if !negotiated && self.in_flight.is_none() {
+    pub(crate) fn set_negotiated(&mut self, max_monitor_area: Option<u64>) {
+        self.max_monitor_area = max_monitor_area;
+        if max_monitor_area.is_none() && self.in_flight.is_none() {
+            self.queued = None;
+        }
+        if self
+            .queued
+            .is_some_and(|target| !self.within_server_area(target))
+        {
             self.queued = None;
         }
     }
 
     pub(crate) fn observe_viewport(&mut self, viewport: PhysicalViewport) {
-        if !self.negotiated && self.in_flight.is_none() {
+        if self.max_monitor_area.is_none() && self.in_flight.is_none() {
             return;
         }
         let (width, height) = MonitorLayoutEntry::adjust_display_size(
@@ -53,6 +83,13 @@ impl DisplayControlAdapter {
         );
         let target = PixelSize { width, height };
         if validate_surface_size(target).is_err() {
+            self.queued = None;
+            return;
+        }
+        if self
+            .max_monitor_area
+            .is_some_and(|_| !self.within_server_area(target))
+        {
             self.queued = None;
             return;
         }
@@ -66,12 +103,21 @@ impl DisplayControlAdapter {
     }
 
     pub(crate) fn take_resize_request(&mut self) -> Option<PixelSize> {
-        if !self.negotiated || self.in_flight.is_some() {
+        if self.max_monitor_area.is_none() || self.in_flight.is_some() {
             return None;
         }
         let target = self.queued.take()?;
+        if !self.within_server_area(target) {
+            return None;
+        }
         self.in_flight = Some(target);
         Some(target)
+    }
+
+    fn within_server_area(&self, target: PixelSize) -> bool {
+        self.max_monitor_area.is_some_and(|max_monitor_area| {
+            u64::from(target.width) * u64::from(target.height) <= max_monitor_area
+        })
     }
 
     pub(crate) fn confirm_reactivation(&mut self, observed: PixelSize) -> ResizeConfirmation {
@@ -135,7 +181,7 @@ mod tests {
             width: 1280,
             height: 720,
         });
-        adapter.set_negotiated(true);
+        adapter.set_negotiated(Some(u64::MAX));
         adapter.observe_viewport(viewport(1601, 900));
 
         assert_eq!(
@@ -183,7 +229,7 @@ mod tests {
             width: 1280,
             height: 720,
         });
-        adapter.set_negotiated(true);
+        adapter.set_negotiated(Some(u64::MAX));
         adapter.observe_viewport(viewport(1600, 900));
         assert_eq!(
             adapter.take_resize_request(),
@@ -211,7 +257,7 @@ mod tests {
             height: 720,
         };
         let mut adapter = DisplayControlAdapter::new(initial);
-        adapter.set_negotiated(true);
+        adapter.set_negotiated(Some(u64::MAX));
         adapter.observe_viewport(viewport(1600, 900));
         assert_eq!(
             adapter.take_resize_request(),
@@ -239,7 +285,7 @@ mod tests {
             height: 720,
         };
         let mut adapter = DisplayControlAdapter::new(initial);
-        adapter.set_negotiated(true);
+        adapter.set_negotiated(Some(u64::MAX));
         adapter.observe_viewport(viewport(1600, 900));
         assert_eq!(
             adapter.take_resize_request(),
@@ -249,7 +295,7 @@ mod tests {
             })
         );
 
-        adapter.set_negotiated(false);
+        adapter.set_negotiated(None);
         assert_eq!(
             adapter.confirm_reactivation(PixelSize {
                 width: 1280,
@@ -267,7 +313,7 @@ mod tests {
             height: 720,
         };
         let mut exact = DisplayControlAdapter::new(initial);
-        exact.set_negotiated(true);
+        exact.set_negotiated(Some(u64::MAX));
         exact.observe_viewport(viewport(8192, 2048));
         assert_eq!(
             exact.take_resize_request(),
@@ -278,9 +324,51 @@ mod tests {
         );
 
         let mut over_budget = DisplayControlAdapter::new(initial);
-        over_budget.set_negotiated(true);
+        over_budget.set_negotiated(Some(u64::MAX));
         over_budget.observe_viewport(viewport(8192, 2049));
         assert_eq!(over_budget.take_resize_request(), None);
         assert_eq!(over_budget.confirmed_size(), initial);
+    }
+
+    #[test]
+    fn display_server_area_accepts_a_layout_at_the_exact_limit() {
+        let mut adapter = DisplayControlAdapter::new(PixelSize {
+            width: 800,
+            height: 600,
+        });
+        adapter.set_negotiated(Some(1600 * 900));
+
+        adapter.observe_viewport(viewport(1600, 900));
+
+        assert_eq!(
+            adapter.take_resize_request(),
+            Some(PixelSize {
+                width: 1600,
+                height: 900,
+            })
+        );
+    }
+
+    #[test]
+    fn display_over_server_area_is_rejected_without_blocking_a_later_valid_viewport() {
+        let initial = PixelSize {
+            width: 800,
+            height: 600,
+        };
+        let mut adapter = DisplayControlAdapter::new(initial);
+        adapter.set_negotiated(Some(1600 * 900 - 1));
+
+        adapter.observe_viewport(viewport(1600, 900));
+        assert_eq!(adapter.take_resize_request(), None);
+        assert_eq!(adapter.confirmed_size(), initial);
+
+        adapter.observe_viewport(viewport(1280, 720));
+        assert_eq!(
+            adapter.take_resize_request(),
+            Some(PixelSize {
+                width: 1280,
+                height: 720,
+            })
+        );
     }
 }
