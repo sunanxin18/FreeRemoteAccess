@@ -2,6 +2,11 @@
 
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
+#[cfg(feature = "mvs-profile")]
+use std::{
+    cell::RefCell,
+    time::{Duration, Instant},
+};
 
 use crate::mvs::MAX_MVS_DECODE_PIXELS;
 use crate::mvs_bitstream::{decode_repeat_count, BitReader};
@@ -209,6 +214,142 @@ fn take_partial_order_trace() -> Vec<PartialOrderEvent> {
     PARTIAL_ORDER_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
 }
 
+// `mvs-profile` is intentionally a compile-time opt-in: none of these types,
+// TLS state, clocks, or stderr output exist in the default decoder build.
+#[cfg(feature = "mvs-profile")]
+const MVS_PROFILE_WINDOW: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "mvs-profile")]
+thread_local! {
+    static MVS_PROFILE: RefCell<MvsProfileWindow> = RefCell::new(MvsProfileWindow::new(Instant::now()));
+}
+
+#[cfg(feature = "mvs-profile")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MvsProfileSnapshot {
+    wall_ms: u128,
+    prepare_ms: u128,
+    render_ms: u128,
+    records: u64,
+    tiles: u64,
+    render_tiles: u64,
+}
+
+#[cfg(feature = "mvs-profile")]
+struct MvsProfileWindow {
+    started: Instant,
+    prepare_duration: Duration,
+    render_duration: Duration,
+    records: u64,
+    tiles: u64,
+    render_tiles: u64,
+}
+
+#[cfg(feature = "mvs-profile")]
+impl MvsProfileWindow {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            prepare_duration: Duration::ZERO,
+            render_duration: Duration::ZERO,
+            records: 0,
+            tiles: 0,
+            render_tiles: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        ended: Instant,
+        prepare_duration: Duration,
+        render_duration: Duration,
+        tiles: u64,
+        render_tiles: u64,
+    ) -> Option<MvsProfileSnapshot> {
+        self.prepare_duration = self.prepare_duration.saturating_add(prepare_duration);
+        self.render_duration = self.render_duration.saturating_add(render_duration);
+        self.records = self.records.saturating_add(1);
+        self.tiles = self.tiles.saturating_add(tiles);
+        self.render_tiles = self.render_tiles.saturating_add(render_tiles);
+
+        let wall_duration = ended.duration_since(self.started);
+        if wall_duration < MVS_PROFILE_WINDOW {
+            return None;
+        }
+
+        let snapshot = MvsProfileSnapshot {
+            wall_ms: wall_duration.as_millis(),
+            prepare_ms: self.prepare_duration.as_millis(),
+            render_ms: self.render_duration.as_millis(),
+            records: self.records,
+            tiles: self.tiles,
+            render_tiles: self.render_tiles,
+        };
+        *self = Self::new(ended);
+        Some(snapshot)
+    }
+}
+
+/// Per-type-0-prepare profiling scope. `records` includes every attempted
+/// `prepare_rect`, including errors; `tiles` is zero until its geometry has
+/// validated, then the declared tile count; `render_tiles` counts mode-5 render
+/// calls entered, including a call that later returns an error.
+#[cfg(feature = "mvs-profile")]
+struct MvsProfilePrepare {
+    started: Instant,
+    tiles: u64,
+    render_duration: Duration,
+    render_tiles: u64,
+}
+
+#[cfg(feature = "mvs-profile")]
+impl MvsProfilePrepare {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            tiles: 0,
+            render_duration: Duration::ZERO,
+            render_tiles: 0,
+        }
+    }
+
+    fn set_tiles(&mut self, tiles: usize) {
+        self.tiles = tiles as u64;
+    }
+
+    fn record_render(&mut self, duration: Duration) {
+        self.render_duration = self.render_duration.saturating_add(duration);
+        self.render_tiles = self.render_tiles.saturating_add(1);
+    }
+}
+
+#[cfg(feature = "mvs-profile")]
+impl Drop for MvsProfilePrepare {
+    fn drop(&mut self) {
+        let ended = Instant::now();
+        let prepare_duration = ended.duration_since(self.started);
+        MVS_PROFILE.with(|profile| {
+            if let Some(snapshot) = profile.borrow_mut().record(
+                ended,
+                prepare_duration,
+                self.render_duration,
+                self.tiles,
+                self.render_tiles,
+            ) {
+                eprintln!(
+                    "mvs_profile wall_ms={} prepare_ms={} render_ms={} records={} tiles={} render_tiles={}",
+                    snapshot.wall_ms,
+                    snapshot.prepare_ms,
+                    snapshot.render_ms,
+                    snapshot.records,
+                    snapshot.tiles,
+                    snapshot.render_tiles,
+                );
+            }
+        });
+    }
+}
+
 impl Default for ModeFiveCoefficients {
     fn default() -> Self {
         Self {
@@ -277,6 +418,9 @@ impl MvsFullDecoder {
         surface_width: usize,
         surface_height: usize,
     ) -> Result<PreparedMvsFull> {
+        #[cfg(feature = "mvs-profile")]
+        let mut profile = MvsProfilePrepare::new();
+
         let pixel_count = width
             .checked_mul(height)
             .context("MVS type-0 矩形像素数溢出")?;
@@ -323,6 +467,8 @@ impl MvsFullDecoder {
         let tile_count = tiles_x
             .checked_mul(tiles_y)
             .context("MVS type-0 tile 总数溢出")?;
+        #[cfg(feature = "mvs-profile")]
+        profile.set_tiles(tile_count);
         let surface_tiles_x = surface_width
             .checked_add(TILE_EDGE - 1)
             .context("MVS surface 横向 tile 数溢出")?
@@ -606,7 +752,9 @@ impl MvsFullDecoder {
                             record.scale_threshold_a,
                             record.scale_threshold_b,
                         )?;
-                        render_mode_five_tile(
+                        #[cfg(feature = "mvs-profile")]
+                        let render_started = Instant::now();
+                        let render_result = render_mode_five_tile(
                             &mut rgb,
                             width,
                             height,
@@ -614,7 +762,10 @@ impl MvsFullDecoder {
                             tile_y,
                             &tile_state.coefficients,
                             &self.tables,
-                        )?;
+                        );
+                        #[cfg(feature = "mvs-profile")]
+                        profile.record_render(render_started.elapsed());
+                        render_result?;
                         if let Some(seed) = tile_state.seed {
                             next_tile_state.coefficients = Some(seed);
                         }
@@ -639,7 +790,9 @@ impl MvsFullDecoder {
                         match lookup_cache_entry(&cache_state, cache_index) {
                             Ok(entry) => {
                                 let coefficients = cache_entry_coefficients(&entry);
-                                render_mode_five_tile(
+                                #[cfg(feature = "mvs-profile")]
+                                let render_started = Instant::now();
+                                let render_result = render_mode_five_tile(
                                     &mut rgb,
                                     width,
                                     height,
@@ -647,7 +800,10 @@ impl MvsFullDecoder {
                                     tile_y,
                                     &coefficients,
                                     &self.tables,
-                                )?;
+                                );
+                                #[cfg(feature = "mvs-profile")]
+                                profile.record_render(render_started.elapsed());
+                                render_result?;
                                 cache_state.previous_cache_index = cache_index;
                             }
                             Err(error) => {
@@ -4169,5 +4325,39 @@ mod tests {
         let surface = decoder.surface_state.as_ref().unwrap();
         assert_eq!(surface.rgb.as_ptr(), rgb_ptr);
         assert_eq!(surface.tiles.as_ptr(), tiles_ptr);
+    }
+
+    #[cfg(feature = "mvs-profile")]
+    #[test]
+    fn mvs_profile_window_aggregates_counts_until_five_second_boundary() {
+        let start = std::time::Instant::now();
+        let mut window = MvsProfileWindow::new(start);
+
+        assert!(window
+            .record(
+                start + std::time::Duration::from_secs(4),
+                std::time::Duration::from_millis(2),
+                std::time::Duration::from_millis(1),
+                3,
+                2,
+            )
+            .is_none());
+
+        let snapshot = window
+            .record(
+                start + std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(3),
+                std::time::Duration::from_millis(2),
+                2,
+                1,
+            )
+            .expect("the five-second boundary must emit one aggregate");
+
+        assert_eq!(snapshot.wall_ms, 5_000);
+        assert_eq!(snapshot.prepare_ms, 5);
+        assert_eq!(snapshot.render_ms, 3);
+        assert_eq!(snapshot.records, 2);
+        assert_eq!(snapshot.tiles, 5);
+        assert_eq!(snapshot.render_tiles, 3);
     }
 }
