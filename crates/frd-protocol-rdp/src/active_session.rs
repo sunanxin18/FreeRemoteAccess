@@ -1,7 +1,7 @@
 use std::io::ErrorKind;
 use std::time::Duration;
 
-use frd_core::SessionId;
+use frd_core::{PixelSize, SessionId};
 use frd_protocol_api::{
     ProtocolError, ProtocolExit, ProtocolRuntime, SessionCapabilities, SessionEvent,
 };
@@ -174,7 +174,7 @@ fn run_active_loop(
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<(), ProtocolError> {
     let mut command_drain = ActiveCommandDrain::new();
-    let mut display_retry_pending = false;
+    let mut display_retry = DisplayRetryState::default();
     loop {
         refresh_optional_capabilities(
             active_stage,
@@ -183,9 +183,9 @@ fn run_active_loop(
             audio,
             runtime,
             published_capabilities,
-            !display_retry_pending,
+            !display_retry.pending(),
         )?;
-        if display_retry_pending {
+        if display_retry.pending() {
             match drain_reactivation_commands(runtime, session_id, *generation) {
                 ReactivationCommand::Continue { latest_viewport } => {
                     if let Some(viewport) = latest_viewport {
@@ -292,7 +292,7 @@ fn run_active_loop(
             baseline,
             image,
             *generation,
-            !display_retry_pending,
+            display_retry.publish_graphics(),
         )? {
             ActiveOutputControl::Continue => {}
             ActiveOutputControl::Terminate => return Ok(()),
@@ -312,7 +312,7 @@ fn run_active_loop(
                 {
                     return Err(rdp_error(RDP_ACTIVATION_FAILED));
                 }
-                match drive_reactivation(
+                let outcome = drive_reactivation(
                     session_id,
                     runtime,
                     writer,
@@ -322,17 +322,16 @@ fn run_active_loop(
                     generation,
                     display,
                     display_capabilities,
-                    input,
                     activation_factory,
+                )?;
+                match apply_reactivation_outcome(
+                    outcome,
+                    &mut display_retry,
+                    runtime,
+                    input,
+                    published_capabilities,
                 )? {
-                    ReactivationOutcome::Continue => {
-                        display_retry_pending = false;
-                        *published_capabilities = SessionCapabilities {
-                            text_input: true,
-                            ..SessionCapabilities::default()
-                        };
-                    }
-                    ReactivationOutcome::RetryDisplay => display_retry_pending = true,
+                    ReactivationOutcome::Continue | ReactivationOutcome::RetryDisplay => {}
                     ReactivationOutcome::Disconnect => return Ok(()),
                     ReactivationOutcome::Terminal => return Err(ProtocolError::Terminal),
                 }
@@ -450,15 +449,12 @@ fn service_optional_channels(
         }
     }
 
-    if let Some(target) = display.take_resize_request() {
-        let frame = active_stage
+    send_pending_resize(display, writer, |target| {
+        active_stage
             .encode_resize(target.width, target.height, None, None)
             .ok_or_else(|| rdp_error(RDP_ACTIVATION_FAILED))?
-            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
-        writer
-            .write_frame(&frame)
-            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
-    }
+            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))
+    })?;
 
     audio_adapter.drain_to_runtime(runtime)
 }
@@ -549,6 +545,21 @@ enum ReactivationOutcome {
     Terminal,
 }
 
+#[derive(Default)]
+struct DisplayRetryState {
+    pending: bool,
+}
+
+impl DisplayRetryState {
+    fn pending(&self) -> bool {
+        self.pending
+    }
+
+    fn publish_graphics(&self) -> bool {
+        !self.pending
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReactivationSurfaceDisposition {
     Committed,
@@ -566,7 +577,6 @@ fn drive_reactivation(
     generation: &mut u64,
     display: &mut DisplayControlAdapter,
     display_capabilities: &DisplayControlCapabilityState,
-    input: &mut RdpInputState,
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<ReactivationOutcome, ProtocolError> {
     let mut activation = activation_factory.create();
@@ -650,16 +660,53 @@ fn drive_reactivation(
             active_stage.set_share_id(share_id);
             active_stage.set_enable_server_pointer(enable_server_pointer);
             return match disposition {
-                ReactivationSurfaceDisposition::Committed => {
-                    resume_active_input_capabilities(runtime, input)?;
-                    Ok(ReactivationOutcome::Continue)
-                }
+                ReactivationSurfaceDisposition::Committed => Ok(ReactivationOutcome::Continue),
                 ReactivationSurfaceDisposition::StaleCapability => {
                     Ok(ReactivationOutcome::RetryDisplay)
                 }
             };
         }
     }
+}
+
+fn apply_reactivation_outcome(
+    outcome: ReactivationOutcome,
+    retry: &mut DisplayRetryState,
+    runtime: &mut ProtocolRuntime,
+    input: &mut RdpInputState,
+    published_capabilities: &mut SessionCapabilities,
+) -> Result<ReactivationOutcome, ProtocolError> {
+    match outcome {
+        ReactivationOutcome::Continue => {
+            retry.pending = false;
+            resume_active_input_capabilities(runtime, input)?;
+            *published_capabilities = SessionCapabilities {
+                text_input: true,
+                ..SessionCapabilities::default()
+            };
+        }
+        ReactivationOutcome::RetryDisplay => retry.pending = true,
+        ReactivationOutcome::Disconnect | ReactivationOutcome::Terminal => {}
+    }
+    Ok(outcome)
+}
+
+fn send_pending_resize<S, E>(
+    display: &mut DisplayControlAdapter,
+    writer: &mut OrderedRdpWriter<S>,
+    encode: E,
+) -> Result<(), ProtocolError>
+where
+    S: std::io::Write,
+    E: FnOnce(PixelSize) -> Result<Vec<u8>, ProtocolError>,
+{
+    let Some(target) = display.take_resize_request() else {
+        return Ok(());
+    };
+    let frame = encode(target)?;
+    writer
+        .write_frame(&frame)
+        .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -811,10 +858,11 @@ mod tests {
     use crate::writer::OrderedRdpWriter;
 
     use super::{
-        commit_reactivated_surface, fast_path_input_batches, finalize_reactivated_surface,
-        publish_active_input_capabilities, publish_graphics_update,
-        resume_active_input_capabilities, route_active_outputs, stop_and_drain_audio,
-        suspend_active_input_capabilities, ActiveOutputControl, ReactivationSurfaceDisposition,
+        apply_reactivation_outcome, commit_reactivated_surface, fast_path_input_batches,
+        finalize_reactivated_surface, publish_active_input_capabilities, publish_graphics_update,
+        resume_active_input_capabilities, route_active_outputs, send_pending_resize,
+        stop_and_drain_audio, suspend_active_input_capabilities, ActiveOutputControl,
+        DisplayRetryState, ReactivationOutcome, ReactivationSurfaceDisposition,
     };
 
     #[test]
@@ -1111,6 +1159,11 @@ mod tests {
             RdpBaseline::begin(&mut runtime, session_id, initial).expect("generation begins");
         let mut image = DecodedImage::new(IronPixelFormat::RgbA32, 800, 600);
         let mut generation = 1;
+        let mut input = RdpInputState::new();
+        let _ = suspend_active_input_capabilities(&mut runtime, &mut input)
+            .expect("input suspends before reactivation");
+        let mut published_capabilities = SessionCapabilities::default();
+        let mut retry_state = DisplayRetryState::default();
         let mut display = DisplayControlAdapter::new(initial);
         display.set_negotiated(Some(1600 * 900));
         display.observe_viewport(viewport(1600, 900));
@@ -1138,6 +1191,25 @@ mod tests {
         .expect("stale capability is recoverable");
 
         assert_eq!(disposition, ReactivationSurfaceDisposition::StaleCapability);
+        assert_eq!(
+            apply_reactivation_outcome(
+                ReactivationOutcome::RetryDisplay,
+                &mut retry_state,
+                &mut runtime,
+                &mut input,
+                &mut published_capabilities,
+            )
+            .expect("stale retry transition is recoverable"),
+            ReactivationOutcome::RetryDisplay
+        );
+        assert!(retry_state.pending());
+        assert_eq!(
+            input.translate(InputEvent::Text {
+                utf8: "x".to_owned(),
+            }),
+            Err(crate::input::RdpInputError::Stopped),
+            "stale retry does not resume input"
+        );
         assert_eq!(generation, 1, "stale generation is not committed");
         assert_eq!((image.width(), image.height()), (1600, 900));
         assert_eq!(updates.lock().expect("frame log").len(), 1);
@@ -1158,24 +1230,39 @@ mod tests {
             &mut baseline,
             &image,
             generation,
-            false,
+            retry_state.publish_graphics(),
         )
         .expect("stale graphics remain quarantined while wire progress continues");
         assert_eq!(control, ActiveOutputControl::Continue);
+        let mut encoded_target = None;
+        send_pending_resize(&mut display, &mut writer, |target| {
+            encoded_target = Some(target);
+            Ok(b"resize".to_vec())
+        })
+        .expect("retained resize is encoded and sent");
         assert_eq!(
-            writer.into_framed().into_inner_no_leftover().written,
-            b"progress"
-        );
-        assert_eq!(updates.lock().expect("frame log").len(), 1);
-
-        assert_eq!(
-            display.take_resize_request(),
+            encoded_target,
             Some(PixelSize {
                 width: 1280,
                 height: 720,
-            }),
-            "latest viewport remains actionable in the same adapter/session"
+            })
         );
+        let control = route_active_outputs(
+            vec![ActiveStageOutput::DeactivateAll],
+            &mut writer,
+            &mut runtime,
+            &mut baseline,
+            &image,
+            generation,
+            retry_state.publish_graphics(),
+        )
+        .expect("next deactivate remains observable while quarantined");
+        assert_eq!(control, ActiveOutputControl::Deactivate);
+        assert_eq!(
+            writer.into_framed().into_inner_no_leftover().written,
+            b"progressresize"
+        );
+        assert_eq!(updates.lock().expect("frame log").len(), 1);
 
         let mut mismatch = DisplayControlAdapter::new(initial);
         mismatch.set_negotiated(Some(1600 * 900));
@@ -1210,6 +1297,23 @@ mod tests {
         )
         .expect("retained viewport can complete");
         assert_eq!(disposition, ReactivationSurfaceDisposition::Committed);
+        assert_eq!(
+            apply_reactivation_outcome(
+                ReactivationOutcome::Continue,
+                &mut retry_state,
+                &mut runtime,
+                &mut input,
+                &mut published_capabilities,
+            )
+            .expect("current exact reactivation restores the active state"),
+            ReactivationOutcome::Continue
+        );
+        assert!(!retry_state.pending());
+        assert!(input
+            .translate(InputEvent::Text {
+                utf8: "x".to_owned(),
+            })
+            .is_ok());
         assert_eq!(generation, 2);
         assert_eq!((image.width(), image.height()), (1280, 720));
     }
