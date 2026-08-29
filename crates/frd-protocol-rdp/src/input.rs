@@ -71,11 +71,9 @@ fn operations_for_event(
         InputEvent::PointerButton { button, state } => Ok(vec![button_operation(button, state)]),
         InputEvent::Wheel { delta_x, delta_y } => wheel_operations(delta_x, delta_y),
         InputEvent::PhysicalKey { code, state, .. } => {
-            let code = u16::try_from(code.0).map_err(|_| RdpInputError::InvalidScancode)?;
-            if code > 0x00ff && code & 0xff00 != 0xe000 {
-                return Err(RdpInputError::InvalidScancode);
-            }
-            let scancode = Scancode::from_u16(code);
+            let scancode = set1_scancode_from_hid_usage(code.usb_hid_usage())
+                .map(Scancode::from_u16)
+                .ok_or(RdpInputError::InvalidScancode)?;
             Ok(vec![match state {
                 KeyState::Pressed => Operation::KeyPressed(scancode),
                 KeyState::Released => Operation::KeyReleased(scancode),
@@ -91,6 +89,116 @@ fn operations_for_event(
         }
         InputEvent::ReleaseAll => unreachable!("ReleaseAll is handled before operation mapping"),
     }
+}
+
+fn set1_scancode_from_hid_usage(usage: u16) -> Option<u16> {
+    Some(match usage {
+        0x04 => 0x001e,
+        0x05 => 0x0030,
+        0x06 => 0x002e,
+        0x07 => 0x0020,
+        0x08 => 0x0012,
+        0x09 => 0x0021,
+        0x0a => 0x0022,
+        0x0b => 0x0023,
+        0x0c => 0x0017,
+        0x0d => 0x0024,
+        0x0e => 0x0025,
+        0x0f => 0x0026,
+        0x10 => 0x0032,
+        0x11 => 0x0031,
+        0x12 => 0x0018,
+        0x13 => 0x0019,
+        0x14 => 0x0010,
+        0x15 => 0x0013,
+        0x16 => 0x001f,
+        0x17 => 0x0014,
+        0x18 => 0x0016,
+        0x19 => 0x002f,
+        0x1a => 0x0011,
+        0x1b => 0x002d,
+        0x1c => 0x0015,
+        0x1d => 0x002c,
+        0x1e => 0x0002,
+        0x1f => 0x0003,
+        0x20 => 0x0004,
+        0x21 => 0x0005,
+        0x22 => 0x0006,
+        0x23 => 0x0007,
+        0x24 => 0x0008,
+        0x25 => 0x0009,
+        0x26 => 0x000a,
+        0x27 => 0x000b,
+        0x28 => 0x001c,
+        0x29 => 0x0001,
+        0x2a => 0x000e,
+        0x2b => 0x000f,
+        0x2c => 0x0039,
+        0x2d => 0x000c,
+        0x2e => 0x000d,
+        0x2f => 0x001a,
+        0x30 => 0x001b,
+        0x31 => 0x002b,
+        0x33 => 0x0027,
+        0x34 => 0x0028,
+        0x35 => 0x0029,
+        0x36 => 0x0033,
+        0x37 => 0x0034,
+        0x38 => 0x0035,
+        0x39 => 0x003a,
+        0x3a => 0x003b,
+        0x3b => 0x003c,
+        0x3c => 0x003d,
+        0x3d => 0x003e,
+        0x3e => 0x003f,
+        0x3f => 0x0040,
+        0x40 => 0x0041,
+        0x41 => 0x0042,
+        0x42 => 0x0043,
+        0x43 => 0x0044,
+        0x44 => 0x0057,
+        0x45 => 0x0058,
+        0x46 => 0xe037,
+        0x47 => 0x0046,
+        0x49 => 0xe052,
+        0x4a => 0xe047,
+        0x4b => 0xe049,
+        0x4c => 0xe053,
+        0x4d => 0xe04f,
+        0x4e => 0xe051,
+        0x4f => 0xe04d,
+        0x50 => 0xe04b,
+        0x51 => 0xe050,
+        0x52 => 0xe048,
+        0x53 => 0x0045,
+        0x54 => 0xe035,
+        0x55 => 0x0037,
+        0x56 => 0x004a,
+        0x57 => 0x004e,
+        0x58 => 0xe01c,
+        0x59 => 0x004f,
+        0x5a => 0x0050,
+        0x5b => 0x0051,
+        0x5c => 0x004b,
+        0x5d => 0x004c,
+        0x5e => 0x004d,
+        0x5f => 0x0047,
+        0x60 => 0x0048,
+        0x61 => 0x0049,
+        0x62 => 0x0052,
+        0x63 => 0x0053,
+        0x64 => 0x0056,
+        0x65 => 0xe05d,
+        0xe0 => 0x001d,
+        0xe1 => 0x002a,
+        0xe2 => 0x0038,
+        0xe3 => 0xe05b,
+        0xe4 => 0xe01d,
+        0xe5 => 0x0036,
+        0xe6 => 0xe038,
+        0xe7 => 0xe05c,
+        _ => return None,
+    })
 }
 
 fn operations_for_pointer_sample(
@@ -220,30 +328,42 @@ mod tests {
     use ironrdp::pdu::input::mouse::PointerFlags;
     use ironrdp::pdu::input::mouse_x::PointerXFlags;
 
-    use super::{translate_input, RdpInputError, RdpInputState};
+    use super::{set1_scancode_from_hid_usage, translate_input, RdpInputError, RdpInputState};
 
     #[test]
-    fn input_scan_code_press_and_release_preserve_key_state() {
+    fn hid_keys_map_to_set1_and_e0_scancodes() {
+        assert_eq!(set1_scancode_from_hid_usage(0x04), Some(0x001e)); // A
+        assert_eq!(set1_scancode_from_hid_usage(0x1e), Some(0x0002)); // 1
+        assert_eq!(set1_scancode_from_hid_usage(0x28), Some(0x001c)); // Enter
+        assert_eq!(set1_scancode_from_hid_usage(0xe0), Some(0x001d)); // Left Ctrl
+        assert_eq!(set1_scancode_from_hid_usage(0xe4), Some(0xe01d)); // Right Ctrl
+        assert_eq!(set1_scancode_from_hid_usage(0x52), Some(0xe048)); // Up
+        assert_eq!(set1_scancode_from_hid_usage(0x58), Some(0xe01c)); // Keypad Enter
+        assert_eq!(set1_scancode_from_hid_usage(0xffff), None);
+    }
+
+    #[test]
+    fn input_hid_a_press_and_release_translate_to_set1_key_state() {
         let mut database = Database::new();
 
         let pressed = translate_input(
             &mut database,
             InputEvent::PhysicalKey {
-                code: PhysicalKeyCode(0x001e),
+                code: PhysicalKeyCode::from_usb_hid_usage(0x04),
                 state: KeyState::Pressed,
                 modifiers: Modifiers::default(),
             },
         )
-        .expect("set-1 scan code is valid");
+        .expect("HID A is supported by RDP input");
         let released = translate_input(
             &mut database,
             InputEvent::PhysicalKey {
-                code: PhysicalKeyCode(0x001e),
+                code: PhysicalKeyCode::from_usb_hid_usage(0x04),
                 state: KeyState::Released,
                 modifiers: Modifiers::default(),
             },
         )
-        .expect("set-1 scan code is valid");
+        .expect("HID A is supported by RDP input");
 
         assert_eq!(
             pressed,
@@ -268,7 +388,7 @@ mod tests {
         let events = translate_input(
             &mut database,
             InputEvent::PhysicalKey {
-                code: PhysicalKeyCode(0xe01d),
+                code: PhysicalKeyCode::from_usb_hid_usage(0xe4),
                 state: KeyState::Pressed,
                 modifiers: Modifiers {
                     control: true,
@@ -288,14 +408,14 @@ mod tests {
     }
 
     #[test]
-    fn input_rejects_scan_codes_outside_the_windows_extended_domain() {
+    fn input_rejects_unsupported_hid_usage() {
         let mut database = Database::new();
 
         assert_eq!(
             translate_input(
                 &mut database,
                 InputEvent::PhysicalKey {
-                    code: PhysicalKeyCode(0x1_0000),
+                    code: PhysicalKeyCode::from_usb_hid_usage(0xffff),
                     state: KeyState::Pressed,
                     modifiers: Modifiers::default(),
                 },
@@ -516,7 +636,7 @@ mod tests {
         let mut state = RdpInputState::new();
         state
             .translate(InputEvent::PhysicalKey {
-                code: PhysicalKeyCode(0x001e),
+                code: PhysicalKeyCode::from_usb_hid_usage(0x04),
                 state: KeyState::Pressed,
                 modifiers: Modifiers::default(),
             })
@@ -550,7 +670,7 @@ mod tests {
         let mut state = RdpInputState::new();
         state
             .translate(InputEvent::PhysicalKey {
-                code: PhysicalKeyCode(0xe01d),
+                code: PhysicalKeyCode::from_usb_hid_usage(0xe4),
                 state: KeyState::Pressed,
                 modifiers: Modifiers::default(),
             })

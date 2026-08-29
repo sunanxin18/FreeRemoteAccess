@@ -687,30 +687,31 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_large_release_is_split_after_database_state_is_cleared() {
+    fn lifecycle_release_all_clears_database_state_once() {
         let mut input = RdpInputState::new();
-        for code in 1..=255 {
+        for usage in [0x04, 0xe4] {
             input
                 .translate(InputEvent::PhysicalKey {
-                    code: PhysicalKeyCode(code),
+                    code: PhysicalKeyCode::from_usb_hid_usage(usage),
                     state: KeyState::Pressed,
                     modifiers: Modifiers::default(),
                 })
-                .expect("normal scan code is valid");
+                .expect("HID key is supported");
         }
-        input
-            .translate(InputEvent::PhysicalKey {
-                code: PhysicalKeyCode(0xe001),
-                state: KeyState::Pressed,
-                modifiers: Modifiers::default(),
-            })
-            .expect("extended scan code is valid");
 
         let releases = input.stop();
+
+        assert_eq!(releases.len(), 2);
+        assert!(input.stop().is_empty(), "database state is cleared once");
+    }
+
+    #[test]
+    fn input_large_fast_path_batch_is_split_at_255_events() {
+        use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+
+        let releases = vec![FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 0x1e); 256];
         let batches = fast_path_input_batches(&releases).collect::<Vec<_>>();
 
-        assert_eq!(releases.len(), 256);
-        assert!(input.stop().is_empty(), "database state is cleared once");
         assert_eq!(
             batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
             [255, 1]

@@ -485,14 +485,14 @@ mod tests {
             .send(SessionCommand::Input(SessionInput {
                 session_id,
                 generation: 2,
-                event: key_event(0x1e, KeyState::Pressed),
+                event: key_event(0x04, KeyState::Pressed),
             }))
             .expect("runtime command receiver remains open");
         commands
             .send(SessionCommand::Input(SessionInput {
                 session_id,
                 generation: 1,
-                event: key_event(0x30, KeyState::Pressed),
+                event: key_event(0x05, KeyState::Pressed),
             }))
             .expect("runtime command receiver remains open");
         let mut input = RdpInputState::new();
@@ -682,7 +682,7 @@ mod tests {
             .send(SessionCommand::Input(SessionInput {
                 session_id,
                 generation: 1,
-                event: key_event(0xe01d, KeyState::Pressed),
+                event: key_event(0xe4, KeyState::Pressed),
             }))
             .expect("runtime command receiver remains open");
         let mut input = RdpInputState::new();
@@ -743,7 +743,7 @@ mod tests {
             .send(SessionCommand::Input(SessionInput {
                 session_id,
                 generation: 1,
-                event: key_event(0x1e, KeyState::Pressed),
+                event: key_event(0x04, KeyState::Pressed),
             }))
             .expect("input sends");
         commands
@@ -808,9 +808,9 @@ mod tests {
         assert!(runtime.try_next_command().is_none());
     }
 
-    fn key_event(code: u32, state: KeyState) -> InputEvent {
+    fn key_event(usage: u16, state: KeyState) -> InputEvent {
         InputEvent::PhysicalKey {
-            code: PhysicalKeyCode(code),
+            code: PhysicalKeyCode::from_usb_hid_usage(usage),
             state,
             modifiers: Modifiers::default(),
         }
