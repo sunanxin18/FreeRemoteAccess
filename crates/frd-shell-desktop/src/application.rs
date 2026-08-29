@@ -722,9 +722,26 @@ fn run_audio_worker(
     factory: Arc<dyn AudioOutputFactory>,
     media: mpsc::Receiver<MediaFrame>,
 ) -> AudioWorkerExit {
+    let (sample_rate_hz, channels, samples) = loop {
+        match media.recv() {
+            Ok(MediaFrame::Pcm {
+                sample_rate_hz,
+                channels,
+                samples,
+            }) => break (sample_rate_hz, channels, samples),
+            Ok(_) => {}
+            Err(_) => return AudioWorkerExit::Closed,
+        }
+    };
     let Ok(mut output) = factory.open() else {
         return AudioWorkerExit::Failed;
     };
+    if output
+        .enqueue_pcm(sample_rate_hz, channels, samples)
+        .is_err()
+    {
+        return AudioWorkerExit::Failed;
+    }
     while let Ok(frame) = media.recv() {
         if let MediaFrame::Pcm {
             sample_rate_hz,
@@ -2811,12 +2828,26 @@ mod tests {
         }
     }
 
-    struct CountingAudioFactory(AtomicUsize);
+    struct CountingAudioFactory(Arc<AtomicUsize>);
 
     impl AudioOutputFactory for CountingAudioFactory {
         fn open(&self) -> Result<Box<dyn AudioOutput>, AudioOutputError> {
             self.0.fetch_add(1, Ordering::AcqRel);
             Ok(Box::new(TestAudioOutput))
+        }
+    }
+
+    struct RecordingAudioFactory {
+        open_count: Arc<AtomicUsize>,
+        pcm_frames: Arc<Mutex<Vec<Vec<i16>>>>,
+    }
+
+    impl AudioOutputFactory for RecordingAudioFactory {
+        fn open(&self) -> Result<Box<dyn AudioOutput>, AudioOutputError> {
+            self.open_count.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(RecordingAudioOutput {
+                pcm_frames: self.pcm_frames.clone(),
+            }))
         }
     }
 
@@ -2897,6 +2928,22 @@ mod tests {
             _channels: u8,
             _samples: Box<[i16]>,
         ) -> Result<(), AudioOutputError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingAudioOutput {
+        pcm_frames: Arc<Mutex<Vec<Vec<i16>>>>,
+    }
+
+    impl AudioOutput for RecordingAudioOutput {
+        fn enqueue_pcm(
+            &mut self,
+            _sample_rate_hz: u32,
+            _channels: u8,
+            samples: Box<[i16]>,
+        ) -> Result<(), AudioOutputError> {
+            self.pcm_frames.lock().unwrap().push(samples.into_vec());
             Ok(())
         }
     }
@@ -3126,7 +3173,32 @@ mod tests {
         }
     }
 
+    struct NoMediaFactory;
+
+    impl ProtocolFactory for NoMediaFactory {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                id: ProtocolId::apple_hpss_mvs(),
+                display_name: "no-media-protocol".to_owned(),
+                default_port: 5900,
+                credential_requirements: CredentialRequirements::username_password(),
+            }
+        }
+
+        fn create(
+            &self,
+            _request: ConnectRequest,
+            runtime: ProtocolRuntime,
+        ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
+            Ok(Box::new(NoMediaSession { runtime }))
+        }
+    }
+
     struct MediaSession {
+        runtime: ProtocolRuntime,
+    }
+
+    struct NoMediaSession {
         runtime: ProtocolRuntime,
     }
 
@@ -3215,6 +3287,20 @@ mod tests {
         }
     }
 
+    impl ProtocolSession for NoMediaSession {
+        fn run(mut self: Box<Self>) -> ProtocolExit {
+            loop {
+                if matches!(
+                    self.runtime.try_next_command(),
+                    Some(SessionCommand::Disconnect)
+                ) {
+                    return ProtocolExit::Closed;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
     impl ProtocolSession for BlockingSession {
         fn run(mut self: Box<Self>) -> ProtocolExit {
             self.worker_started.send(()).expect("test observer alive");
@@ -3277,7 +3363,7 @@ mod tests {
         let (audio_spawned_tx, audio_spawned_rx) = mpsc::channel();
         let (allow_audio_reclaim_tx, allow_audio_reclaim_rx) = mpsc::channel();
         let live_workers = Arc::new(AtomicUsize::new(0));
-        let audio_factory = Arc::new(CountingAudioFactory(AtomicUsize::new(0)));
+        let audio_factory = Arc::new(CountingAudioFactory(Arc::new(AtomicUsize::new(0))));
         let mut host = SessionHost::new_with_spawner(
             [Arc::new(BlockingFactory {
                 worker_started: mpsc::channel().0,
@@ -3707,6 +3793,107 @@ mod tests {
         assert_audio_degradation_and_cleanup(Arc::new(FailingAudioFactory(
             FailingAudioMode::Panic,
         )));
+    }
+
+    #[test]
+    fn audio_worker_opens_device_only_after_first_frame() {
+        let no_media_opens = Arc::new(AtomicUsize::new(0));
+        let mut no_media_host = test_host(
+            Arc::new(NoMediaFactory),
+            Arc::new(CountingAudioFactory(no_media_opens.clone())),
+        );
+        let no_media_session = launch_test_session(&mut no_media_host);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            no_media_opens.load(Ordering::Acquire),
+            0,
+            "a session that publishes no media must not open platform audio"
+        );
+        let no_media_cleanup = complete_background_cleanup(&mut no_media_host);
+        assert_eq!(no_media_cleanup.session_id(), no_media_session);
+        assert_eq!(no_media_opens.load(Ordering::Acquire), 0);
+
+        let media_opens = Arc::new(AtomicUsize::new(0));
+        let mut media_host = test_host(
+            Arc::new(MediaFactory),
+            Arc::new(CountingAudioFactory(media_opens.clone())),
+        );
+        let media_session = launch_test_session(&mut media_host);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while media_opens.load(Ordering::Acquire) != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the first media frame must eventually open platform audio"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(media_opens.load(Ordering::Acquire), 1);
+        let media_cleanup = complete_background_cleanup(&mut media_host);
+        assert_eq!(media_cleanup.session_id(), media_session);
+        assert_eq!(media_opens.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn audio_worker_ignores_video_until_first_pcm_frame() {
+        let video_only_opens = Arc::new(AtomicUsize::new(0));
+        let (video_only_tx, video_only_rx) = mpsc::channel();
+        let video_only_factory: Arc<dyn AudioOutputFactory> =
+            Arc::new(CountingAudioFactory(video_only_opens.clone()));
+        let video_only_worker =
+            std::thread::spawn(move || super::run_audio_worker(video_only_factory, video_only_rx));
+        video_only_tx
+            .send(MediaFrame::EncodedVideo {
+                timestamp_us: 1,
+                bytes: vec![0xaa].into_boxed_slice(),
+            })
+            .unwrap();
+        drop(video_only_tx);
+        assert_eq!(
+            video_only_worker.join().unwrap(),
+            super::AudioWorkerExit::Closed
+        );
+        assert_eq!(
+            video_only_opens.load(Ordering::Acquire),
+            0,
+            "a video-only session must not open platform audio"
+        );
+
+        let video_then_pcm_opens = Arc::new(AtomicUsize::new(0));
+        let pcm_frames = Arc::new(Mutex::new(Vec::new()));
+        let (video_then_pcm_tx, video_then_pcm_rx) = mpsc::channel();
+        let video_then_pcm_factory: Arc<dyn AudioOutputFactory> = Arc::new(RecordingAudioFactory {
+            open_count: video_then_pcm_opens.clone(),
+            pcm_frames: pcm_frames.clone(),
+        });
+        let video_then_pcm_worker = std::thread::spawn(move || {
+            super::run_audio_worker(video_then_pcm_factory, video_then_pcm_rx)
+        });
+        video_then_pcm_tx
+            .send(MediaFrame::EncodedVideo {
+                timestamp_us: 2,
+                bytes: vec![0xbb].into_boxed_slice(),
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            video_then_pcm_opens.load(Ordering::Acquire),
+            0,
+            "video must not open platform audio before PCM arrives"
+        );
+        video_then_pcm_tx
+            .send(MediaFrame::Pcm {
+                sample_rate_hz: 48_000,
+                channels: 2,
+                samples: vec![7_i16, -8_i16].into_boxed_slice(),
+            })
+            .unwrap();
+        drop(video_then_pcm_tx);
+        assert_eq!(
+            video_then_pcm_worker.join().unwrap(),
+            super::AudioWorkerExit::Closed
+        );
+        assert_eq!(video_then_pcm_opens.load(Ordering::Acquire), 1);
+        assert_eq!(*pcm_frames.lock().unwrap(), vec![vec![7_i16, -8_i16]]);
     }
 
     fn assert_audio_degradation_and_cleanup(audio: Arc<dyn AudioOutputFactory>) {
