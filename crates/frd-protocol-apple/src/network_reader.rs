@@ -57,9 +57,18 @@ enum ServerGeometryDisposition {
     ServerInitiated,
 }
 
+/// 无副作用的 `ServerState` 几何提交计划。必须先完成所有可能失败的准备，
+/// 才能把它应用到 controller、MVS receiver 与 display surface。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ServerGeometryPlan {
+    disposition: ServerGeometryDisposition,
+    controller_generation: u64,
+}
+
 struct ServerGeometryCommit {
     commit: GeometryCommit,
     disposition: ServerGeometryDisposition,
+    previous: DisplaySize,
 }
 
 impl DynamicResolutionRuntime {
@@ -171,22 +180,59 @@ impl DynamicResolutionRuntime {
         Some(commit)
     }
 
-    fn classify_server_geometry(
-        &mut self,
+    fn plan_server_geometry(
+        &self,
         observed: DisplaySize,
         current_surface: DisplaySize,
         next_controller_generation: u64,
-    ) -> ServerGeometryDisposition {
+    ) -> ServerGeometryPlan {
         if observed == current_surface {
-            return ServerGeometryDisposition::Unchanged;
+            return ServerGeometryPlan {
+                disposition: ServerGeometryDisposition::Unchanged,
+                controller_generation: next_controller_generation,
+            };
         }
-        if self.observe_server_state(observed).is_some() {
-            return ServerGeometryDisposition::RequestedAck;
+        if self
+            .controller
+            .pending_server_state_matches(observed, next_controller_generation)
+        {
+            return ServerGeometryPlan {
+                disposition: ServerGeometryDisposition::RequestedAck,
+                controller_generation: next_controller_generation,
+            };
         }
-        self.pending_since = None;
-        self.controller
-            .adopt_server_initiated_geometry(next_controller_generation, observed);
-        ServerGeometryDisposition::ServerInitiated
+
+        ServerGeometryPlan {
+            disposition: ServerGeometryDisposition::ServerInitiated,
+            controller_generation: next_controller_generation,
+        }
+    }
+
+    /// `plan_server_geometry` 及所有可失败的准备完成后才能调用。
+    fn apply_server_geometry_plan(
+        &mut self,
+        plan: ServerGeometryPlan,
+        observed: DisplaySize,
+        previous: DisplaySize,
+    ) {
+        match plan.disposition {
+            ServerGeometryDisposition::Unchanged => {}
+            ServerGeometryDisposition::RequestedAck => {
+                let commit = self
+                    .observe_server_state(observed)
+                    .expect("已验证的 Pending ServerState 必须可提交");
+                debug_assert_eq!(commit.generation, plan.controller_generation);
+            }
+            ServerGeometryDisposition::ServerInitiated => {
+                self.pending_since = None;
+                self.controller.apply_server_initiated_geometry(
+                    plan.controller_generation,
+                    previous,
+                    observed,
+                    self.opt_in && self.armed,
+                );
+            }
+        }
     }
 
     fn timeout_pending(&mut self, now: Instant) -> bool {
@@ -275,25 +321,23 @@ fn commit_server_geometry(
     let Some(controller_generation) = generation.checked_sub(1) else {
         return Ok(None);
     };
-    let disposition = runtime.classify_server_geometry(observed, current, controller_generation);
-    if disposition == ServerGeometryDisposition::Unchanged {
+    let plan = runtime.plan_server_geometry(observed, current, controller_generation);
+    if plan.disposition == ServerGeometryDisposition::Unchanged {
         return Ok(None);
     }
+    let replacement = DisplaySurface::new(generation, replacement_size)?;
     before_generation_commit()?;
-    if media_state.reset_generation(generation).is_err() {
-        return Ok(None);
-    }
+    media_state.reset_generation(generation)?;
+    runtime.apply_server_geometry_plan(plan, observed, current);
     receiver.reset(generation);
-    let Ok(replacement) = DisplaySurface::new(generation, replacement_size) else {
-        return Ok(None);
-    };
     *surface = replacement;
     Ok(Some(ServerGeometryCommit {
         commit: GeometryCommit {
             generation,
             size: observed,
         },
-        disposition,
+        disposition: plan.disposition,
+        previous: current,
     }))
 }
 
@@ -1603,8 +1647,18 @@ impl NetworkReaderRuntime {
                         if let Some(ServerGeometryCommit {
                             commit,
                             disposition,
+                            previous,
                         }) = commit
                         {
+                            eprintln!(
+                                "[hpss-view] ServerState 几何 {:?}: {}x{} -> {}x{} (generation {})",
+                                disposition,
+                                previous.width,
+                                previous.height,
+                                commit.size.width,
+                                commit.size.height,
+                                commit.generation,
+                            );
                             if disposition == ServerGeometryDisposition::ServerInitiated {
                                 self.viewport_requests.lock().unwrap().drop_latest();
                             }
@@ -2060,17 +2114,100 @@ mod migrated_runtime_tests {
             .send_target_with(requested, |_| Ok(Instant::now()))
             .unwrap()
             .unwrap();
+        let mut receiver = MvsReceiveState::new(1);
+        let mut surface = DisplaySurface::new(1, PixelSize::new(1440, 2560).unwrap()).unwrap();
+        let mut media = ViewerMediaState::new(
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
-            runtime.classify_server_geometry(server_initiated, initial, 1),
+            commit_server_geometry(
+                &mut runtime,
+                &mut receiver,
+                &mut surface,
+                &mut media,
+                server_initiated,
+                || Ok(()),
+            )
+            .unwrap()
+            .unwrap()
+            .disposition,
             ServerGeometryDisposition::ServerInitiated
         );
         assert!(runtime.pending_since.is_none());
         assert!(matches!(
             runtime.controller.state(),
+            crate::dynamic_resolution::DynamicResolutionState::Switching {
+                generation: 1,
+                previous,
+                target,
+            } if *previous == initial && *target == server_initiated
+        ));
+        assert_eq!(
+            runtime.target_disposition(requested),
+            TargetDisposition::Wait
+        );
+        assert!(runtime.observe_full_applied(2, server_initiated));
+        assert!(matches!(
+            runtime.controller.state(),
             crate::dynamic_resolution::DynamicResolutionState::Stable { generation: 1, size }
                 if *size == server_initiated
         ));
+        assert_eq!(
+            runtime.target_disposition(requested),
+            TargetDisposition::Ready
+        );
+    }
+
+    #[test]
+    fn failed_before_generation_commit_preserves_pending_surface_and_receiver() {
+        let initial = DisplaySize::new(1440, 2560).unwrap();
+        let requested = DisplaySize::new(1280, 720).unwrap();
+        let server_initiated = DisplaySize::new(1456, 1080).unwrap();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        runtime
+            .send_target_with(requested, |_| Ok(Instant::now()))
+            .unwrap()
+            .unwrap();
+        let pending_since = runtime.pending_since;
+        let mut receiver = MvsReceiveState::new(1);
+        let mut surface = DisplaySurface::new(1, PixelSize::new(1440, 2560).unwrap()).unwrap();
+        let mut media = ViewerMediaState::new(
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let error = match commit_server_geometry(
+            &mut runtime,
+            &mut receiver,
+            &mut surface,
+            &mut media,
+            server_initiated,
+            || Err(anyhow::anyhow!("injected ReleaseAll failure")),
+        ) {
+            Ok(_) => panic!("injected ReleaseAll failure must propagate"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("injected ReleaseAll failure"));
+        assert_eq!(runtime.pending_since, pending_since);
+        assert!(matches!(
+            runtime.controller.state(),
+            crate::dynamic_resolution::DynamicResolutionState::Pending {
+                generation: 1,
+                previous,
+                target,
+            } if *previous == initial && *target == requested
+        ));
+        assert_eq!(surface.generation, 1);
+        assert_eq!((surface.width(), surface.height()), (1440, 2560));
+        assert_eq!(receiver.generation, 1);
     }
 
     #[test]
