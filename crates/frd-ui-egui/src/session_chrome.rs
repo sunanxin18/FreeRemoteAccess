@@ -6,7 +6,7 @@ use frd_ui_model::{
     CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel,
 };
 
-const SLOT_SIZE: f32 = 32.0;
+const SLOT_SIZE: f32 = 44.0;
 const SLOT_SPACING: f32 = 4.0;
 const SLOT_COUNT: usize = 4;
 
@@ -226,11 +226,14 @@ fn show_glyph(
         )
     });
 
-    let hovered = response.hovered() || response.has_focus();
-    let fill = if hovered {
-        ui.visuals().widgets.hovered.bg_fill
-    } else {
-        Color32::TRANSPARENT
+    let fill = match glyph_fill_state(
+        response.hovered(),
+        response.has_focus(),
+        actionable && response.is_pointer_button_down_on(),
+    ) {
+        GlyphFillState::None => Color32::TRANSPARENT,
+        GlyphFillState::Hover => ui.visuals().widgets.hovered.bg_fill,
+        GlyphFillState::Pressed => ui.visuals().widgets.active.bg_fill,
     };
     ui.painter().rect_filled(rect.shrink(2.0), 5.0, fill);
     if response.has_focus() {
@@ -260,6 +263,23 @@ fn show_glyph(
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlyphFillState {
+    None,
+    Hover,
+    Pressed,
+}
+
+fn glyph_fill_state(hovered: bool, focused: bool, pressed: bool) -> GlyphFillState {
+    if pressed {
+        GlyphFillState::Pressed
+    } else if hovered || focused {
+        GlyphFillState::Hover
+    } else {
+        GlyphFillState::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -271,8 +291,8 @@ mod tests {
 
     use super::{
         accessible_label, action_glyph, audio_glyph, clipboard_glyph, connection_glyph,
-        install_session_chrome_font, material_symbol_font_id, session_chrome_metrics,
-        MATERIAL_SYMBOLS_FONT_FAMILY,
+        glyph_fill_state, install_session_chrome_font, material_symbol_font_id,
+        session_chrome_metrics, GlyphFillState, MATERIAL_SYMBOLS_FONT_FAMILY,
     };
 
     #[test]
@@ -431,7 +451,7 @@ mod tests {
         let semantic = action_glyph(None);
         assert!(!semantic.available);
         assert_eq!(semantic.accessible_name, "会话正在清理");
-        assert_eq!(session_chrome_metrics().total_width, 140.0);
+        assert_eq!(session_chrome_metrics().slot_size, 44.0);
 
         let connected = SessionChromeModel {
             connection: ConnectionGlyph::Connected,
@@ -449,6 +469,18 @@ mod tests {
         };
         assert_eq!(session_chrome_metrics(), session_chrome_metrics());
         assert_ne!(connected.action, waiting.action);
+    }
+
+    #[test]
+    fn actionable_slot_uses_a_distinct_pressed_visual_state() {
+        assert_eq!(glyph_fill_state(false, false, false), GlyphFillState::None);
+        assert_eq!(glyph_fill_state(true, false, false), GlyphFillState::Hover);
+        assert_eq!(glyph_fill_state(false, true, false), GlyphFillState::Hover);
+        assert_eq!(glyph_fill_state(true, true, true), GlyphFillState::Pressed);
+        assert_ne!(
+            glyph_fill_state(true, false, false),
+            glyph_fill_state(true, false, true)
+        );
     }
 
     #[test]

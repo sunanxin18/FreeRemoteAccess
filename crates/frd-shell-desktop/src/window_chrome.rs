@@ -1,7 +1,7 @@
 use frd_core::PixelRect;
 
-pub const TITLE_BAR_HEIGHT_POINTS: f64 = 40.0;
-const SESSION_SLOT_POINTS: f64 = 32.0;
+pub const TITLE_BAR_HEIGHT_POINTS: f64 = 44.0;
+const SESSION_SLOT_POINTS: f64 = 44.0;
 const SESSION_SPACING_POINTS: f64 = 4.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -237,8 +237,8 @@ mod tests {
         let layout = ChromeLayout::for_window(1200, 800, 1.5, 72, 144).unwrap();
 
         assert_eq!(layout.session_center_x(), 600);
-        assert_eq!(layout.content_rect.y, 60);
-        assert_eq!(layout.content_rect.height, 740);
+        assert_eq!(layout.content_rect.y, 66);
+        assert_eq!(layout.content_rect.height, 734);
         assert_ne!(
             layout.hit_test(
                 layout.session_buttons[1].center().0,
@@ -278,8 +278,38 @@ mod tests {
         let at_100 = ChromeLayout::for_window(1100, 720, 1.0, 0, 138).unwrap();
         let at_200 = ChromeLayout::for_window(2200, 1440, 2.0, 0, 276).unwrap();
 
-        assert_eq!(at_100.content_rect.y, 40);
-        assert_eq!(at_200.content_rect.y, 80);
+        assert_eq!(at_100.content_rect.y, 44);
+        assert_eq!(at_200.content_rect.y, 88);
         assert_eq!(at_100.session_center_x() * 2, at_200.session_center_x());
+    }
+
+    #[test]
+    fn session_hit_targets_are_at_least_44_pixels_at_supported_scales() {
+        for (scale, expected) in [(1.0, 44), (1.5, 66), (2.0, 88)] {
+            let layout = ChromeLayout::for_window(1600, 1000, scale, 0, 180).unwrap();
+            assert!(layout
+                .session_buttons
+                .iter()
+                .all(|rect| { rect.width >= expected && rect.height >= expected }));
+            assert_eq!(layout.content_rect.y, (44.0 * scale).ceil() as u32);
+        }
+    }
+
+    #[test]
+    fn content_rect_and_hit_test_share_the_effective_titlebar_boundary() {
+        let layout = ChromeLayout::for_window(1200, 800, 1.5, 72, 144).unwrap();
+        assert_eq!(
+            layout.hit_test(100, layout.content_rect.y - 1),
+            ChromeHit::Drag
+        );
+        assert_eq!(
+            layout.hit_test(100, layout.content_rect.y),
+            ChromeHit::Client
+        );
+        let action = layout.session_buttons[3];
+        assert_eq!(
+            layout.hit_test(action.center().0, action.center().1),
+            ChromeHit::SessionAction
+        );
     }
 }
