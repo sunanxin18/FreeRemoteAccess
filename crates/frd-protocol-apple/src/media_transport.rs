@@ -92,8 +92,9 @@ pub struct OutboundAudioSentRange {
     pub packets_sent: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AudioReceptionEvidence {
+    #[default]
     NotObserved,
     MatchingReport {
         extended_highest_sequence: u32,
@@ -103,12 +104,6 @@ pub enum AudioReceptionEvidence {
         extended_highest_sequence: u32,
         cumulative_packets_lost: i32,
     },
-}
-
-impl Default for AudioReceptionEvidence {
-    fn default() -> Self {
-        Self::NotObserved
-    }
 }
 
 #[derive(Debug, Default)]

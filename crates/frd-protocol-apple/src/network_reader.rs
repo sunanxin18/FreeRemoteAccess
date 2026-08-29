@@ -1847,7 +1847,6 @@ mod migrated_runtime_tests {
                 &writer,
             )
             .unwrap();
-        let mut before_commit = || pointer.release_all(&writer);
         let mut server_state = vec![0u8; 94];
         server_state[0..4].copy_from_slice(&1u32.to_be_bytes());
         server_state[12..16].copy_from_slice(&encoding::SERVER_STATE.to_be_bytes());
@@ -1856,25 +1855,27 @@ mod migrated_runtime_tests {
         server_state[20..22].copy_from_slice(&target.width.to_be_bytes());
         server_state[22..24].copy_from_slice(&target.height.to_be_bytes());
 
-        reader
-            .handle_frame(
-                server_state.clone(),
-                &writer,
-                &mut media,
-                &mut protocol_runtime,
-                &mut before_commit,
-            )
-            .unwrap();
-        reader
-            .handle_frame(
-                server_state,
-                &writer,
-                &mut media,
-                &mut protocol_runtime,
-                &mut before_commit,
-            )
-            .unwrap();
-        drop(before_commit);
+        {
+            let mut before_commit = || pointer.release_all(&writer);
+            reader
+                .handle_frame(
+                    server_state.clone(),
+                    &writer,
+                    &mut media,
+                    &mut protocol_runtime,
+                    &mut before_commit,
+                )
+                .unwrap();
+            reader
+                .handle_frame(
+                    server_state,
+                    &writer,
+                    &mut media,
+                    &mut protocol_runtime,
+                    &mut before_commit,
+                )
+                .unwrap();
+        }
         pointer
             .handle(
                 InputEvent::PointerSample(PointerSample::new(

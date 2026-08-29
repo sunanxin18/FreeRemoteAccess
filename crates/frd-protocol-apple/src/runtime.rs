@@ -374,6 +374,9 @@ fn run_authenticated_session_with_media(
     }
 }
 
+// Keep the verified session wiring explicit; aggregating these arguments would
+// only move the boundary and risk coupling transport/media state construction.
+#[allow(clippy::too_many_arguments)]
 fn run_authenticated_session_inner(
     mut connection: crate::AppleConnection,
     display_name: String,

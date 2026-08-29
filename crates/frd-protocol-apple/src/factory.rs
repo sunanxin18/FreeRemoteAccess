@@ -191,6 +191,7 @@ fn literal_socket_address(host: &str, port: u16) -> Option<SocketAddr> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod product_profile_tests {
     use std::io::Write;
     use std::net::TcpListener;

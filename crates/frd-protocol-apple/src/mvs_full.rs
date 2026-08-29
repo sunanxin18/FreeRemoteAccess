@@ -2047,7 +2047,7 @@ mod tests {
         fn write_bits(&mut self, value: u32, count: u8) {
             assert!(count <= u32::BITS as u8);
             for shift in (0..count).rev() {
-                if self.bit_len % 8 == 0 {
+                if self.bit_len.is_multiple_of(8) {
                     self.bytes.push(0);
                 }
                 let bit = ((value >> shift) & 1) as u8;

@@ -3,21 +3,11 @@ use frd_core::{PixelRect, PixelSize, SessionId};
 use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
 use frd_protocol_api::{ProtocolError, ProtocolRuntime};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeMvsRenderObservability {
     pub(crate) type_zero_applied_count: u64,
     pub(crate) content_revision: u64,
     pub(crate) first_nonblack_render_revision: Option<u64>,
-}
-
-impl Default for NativeMvsRenderObservability {
-    fn default() -> Self {
-        Self {
-            type_zero_applied_count: 0,
-            content_revision: 0,
-            first_nonblack_render_revision: None,
-        }
-    }
 }
 
 /// Apple decoder 的 generation-bound canonical CPU surface。

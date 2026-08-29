@@ -336,7 +336,7 @@ impl AudioInputRuntime {
 
 pub fn p5_probe_pcm_frame() -> [i16; P5_PROBE_SAMPLES_PER_FRAME] {
     std::array::from_fn(|index| {
-        if (index / P5_PROBE_HALF_PERIOD_SAMPLES) % 2 == 0 {
+        if (index / P5_PROBE_HALF_PERIOD_SAMPLES).is_multiple_of(2) {
             P5_PROBE_AMPLITUDE
         } else {
             -P5_PROBE_AMPLITUDE

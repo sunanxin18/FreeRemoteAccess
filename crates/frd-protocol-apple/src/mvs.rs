@@ -86,6 +86,9 @@ impl PreparedOpaqueMvsState {
 }
 
 #[derive(Debug)]
+// Keep the verified MVS publication path allocation-free; boxing the prepared
+// generation would add a heap allocation to every decoded update.
+#[allow(clippy::large_enum_variant)]
 pub enum MvsDecodeDecision {
     Prepared(PreparedGenerationMvs),
     PreparedOpaque(PreparedOpaqueMvsState),
