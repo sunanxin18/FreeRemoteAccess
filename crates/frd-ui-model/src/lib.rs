@@ -79,7 +79,7 @@ pub struct ConnectionForm {
     pub remember_on_this_device: bool,
     pub password_visible: bool,
     password: SecretBuffer,
-    errors: ConnectionFormErrors,
+    errors: Box<ConnectionFormErrors>,
 }
 
 impl ConnectionForm {
@@ -91,7 +91,7 @@ impl ConnectionForm {
             remember_on_this_device: false,
             password_visible: false,
             password: SecretBuffer::new(Vec::new()),
-            errors: ConnectionFormErrors::default(),
+            errors: Box::default(),
         }
     }
 
@@ -203,7 +203,7 @@ impl ConnectionForm {
     }
 
     fn validate_and_resolve(&mut self, catalog: &ProtocolCatalog) -> Option<ProtocolId> {
-        self.errors = ConnectionFormErrors::default();
+        *self.errors = ConnectionFormErrors::default();
 
         let target_system = match self.draft.target_system {
             Some(target_system) => target_system,
@@ -489,6 +489,11 @@ mod tests {
             Page::connection_form(ConnectionDraft::default()),
             Page::ConnectionForm(_)
         ));
+    }
+
+    #[test]
+    fn page_keeps_connection_form_state_out_of_line() {
+        assert!(std::mem::size_of::<Page>() <= 256);
     }
 
     #[test]
