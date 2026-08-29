@@ -15,6 +15,7 @@ use frd_platform_windows::{
 };
 use frd_protocol_api::{ProtocolCatalog, ProtocolFactory};
 use frd_protocol_apple::AppleProtocolFactory;
+use frd_protocol_rdp::RdpProtocolFactory;
 use frd_shell_desktop::{
     AudioOutputFactory, DesktopApplication, DesktopPlatformStores, DesktopUserEvent,
     DesktopWindowConfiguration, FatalComponent, FatalOperation, FatalReason, FatalReport,
@@ -169,8 +170,10 @@ fn run(cli: Cli) -> RunnerOutcome {
         return finish_event_loop(run_result, application.runner_result());
     }
 
-    let factory = Arc::new(AppleProtocolFactory) as Arc<dyn ProtocolFactory>;
-    let catalog = ProtocolCatalog::new([factory.descriptor().id]);
+    let apple_factory = Arc::new(AppleProtocolFactory) as Arc<dyn ProtocolFactory>;
+    let rdp_factory = Arc::new(RdpProtocolFactory) as Arc<dyn ProtocolFactory>;
+    let factories = [apple_factory, rdp_factory];
+    let catalog = ProtocolCatalog::new(factories.iter().map(|factory| factory.descriptor().id));
     let provider = EnvironmentCredentialProvider;
     let launch_options = match cli.launch_options() {
         Ok(options) => options,
@@ -210,7 +213,7 @@ fn run(cli: Cli) -> RunnerOutcome {
     });
     let mut application = DesktopApplication::new_product(
         launch,
-        [factory],
+        factories,
         stores,
         Arc::new(WindowsAudioFactory),
         proxy,

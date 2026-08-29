@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_protocol_for_mac_is_resolved_before_submission() {
+    fn automatic_protocol_for_mac_remains_apple_with_rdp_registered() {
         let mut form = ConnectionForm::new(ConnectionDraft {
             target_system: Some(TargetSystem::MacOs),
             address: "host.invalid".to_owned(),
@@ -521,12 +521,31 @@ mod tests {
             username: "test-user".to_owned(),
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs(), ProtocolId::rdp()]);
 
         let submission = form
             .take_submission(&catalog)
             .expect("registered Mac automatic protocol is accepted");
 
         assert_eq!(submission.resolved_protocol, ProtocolId::apple_hpss_mvs());
+    }
+
+    #[test]
+    fn automatic_protocol_for_windows_is_resolved_before_submission() {
+        let mut form = ConnectionForm::new(ConnectionDraft {
+            target_system: Some(TargetSystem::Windows),
+            address: "host.invalid".to_owned(),
+            port: Some(3389),
+            protocol: super::ProtocolChoice::Automatic,
+            username: "test-user".to_owned(),
+        });
+        form.set_password(SecretBuffer::new(b"test-password".to_vec()));
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs(), ProtocolId::rdp()]);
+
+        let submission = form
+            .take_submission(&catalog)
+            .expect("registered Windows automatic protocol is accepted");
+
+        assert_eq!(submission.resolved_protocol, ProtocolId::rdp());
     }
 }

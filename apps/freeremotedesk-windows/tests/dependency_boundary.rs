@@ -114,7 +114,10 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
         })
         .map(String::as_str)
         .collect::<Vec<_>>();
-    assert_eq!(concrete_product_dependencies, vec!["frd-protocol-apple"]);
+    assert_eq!(
+        concrete_product_dependencies,
+        vec!["frd-protocol-apple", "frd-protocol-rdp"]
+    );
 
     let mut concrete_imports = Vec::new();
     collect_concrete_imports(&workspace.join("apps"), workspace, &mut concrete_imports);
@@ -123,21 +126,29 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
     assert_eq!(
         concrete_imports,
         vec!["apps/freeremotedesk-windows/src/main.rs".to_owned()],
-        "only the Windows composition root may import the concrete Apple adapter"
+        "only the Windows composition root may import concrete protocol adapters"
     );
 
     let main_source =
         std::fs::read_to_string(workspace.join("apps/freeremotedesk-windows/src/main.rs"))
             .expect("Windows composition root source is readable");
-    let concrete_crate = ["frd_protocol", "apple"].join("_");
-    assert_eq!(main_source.matches(&concrete_crate).count(), 1);
+    let apple_crate = ["frd_protocol", "apple"].join("_");
+    let rdp_crate = ["frd_protocol", "rdp"].join("_");
+    assert_eq!(main_source.matches(&apple_crate).count(), 1);
+    assert_eq!(main_source.matches(&rdp_crate).count(), 1);
     assert_eq!(main_source.matches("AppleProtocolFactory").count(), 2);
+    assert_eq!(main_source.matches("RdpProtocolFactory").count(), 2);
     assert_eq!(
         main_source
             .matches("Arc::new(AppleProtocolFactory)")
             .count(),
         1,
         "the product registers exactly the approved Apple factory"
+    );
+    assert_eq!(
+        main_source.matches("Arc::new(RdpProtocolFactory)").count(),
+        1,
+        "the product registers exactly the approved RDP factory"
     );
 }
 
@@ -223,14 +234,22 @@ fn collect_concrete_imports(
     for entry in std::fs::read_dir(directory).expect("workspace source directory is readable") {
         let path = entry.expect("source directory entry is readable").path();
         if path.is_dir() {
-            if path == workspace.join("crates/frd-protocol-apple") {
+            if path == workspace.join("crates/frd-protocol-apple")
+                || path == workspace.join("crates/frd-protocol-rdp")
+            {
                 continue;
             }
             collect_concrete_imports(&path, workspace, imports);
         } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
             let source = std::fs::read_to_string(&path).expect("Rust source is readable");
-            let concrete_crate = ["frd_protocol", "apple"].join("_");
-            if source.contains(&concrete_crate) {
+            let concrete_crates = [
+                ["frd_protocol", "apple"].join("_"),
+                ["frd_protocol", "rdp"].join("_"),
+            ];
+            if concrete_crates
+                .iter()
+                .any(|concrete_crate| source.contains(concrete_crate))
+            {
                 imports.push(
                     path.strip_prefix(workspace)
                         .expect("source stays inside workspace")

@@ -2093,6 +2093,7 @@ dependencies = [
  "frd-platform-windows",
  "frd-protocol-api",
  "frd-protocol-apple",
+ "frd-protocol-rdp",
  "frd-shell-desktop",
  "frd-ui-model",
  "ico",

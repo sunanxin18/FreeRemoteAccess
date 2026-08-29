@@ -13,6 +13,7 @@ frd-platform-api = { path = "../../crates/frd-platform-api" }
 frd-platform-windows = { path = "../../crates/frd-platform-windows" }
 frd-protocol-api = { path = "../../crates/frd-protocol-api" }
 frd-protocol-apple = { path = "../../crates/frd-protocol-apple" }
+frd-protocol-rdp = { path = "../../crates/frd-protocol-rdp" }
 frd-shell-desktop = { path = "../../crates/frd-shell-desktop" }
 frd-ui-model = { path = "../../crates/frd-ui-model" }
 winit.workspace = true
