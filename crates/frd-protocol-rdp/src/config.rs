@@ -16,6 +16,10 @@ pub struct ParsedUsername {
 }
 
 impl ParsedUsername {
+    // The public parser deliberately exposes no parsing detail: every rejected
+    // form maps to the stable adapter-facing `rdp_invalid_username` code.
+    // Replacing `()` would change this exported API only to satisfy Clippy.
+    #[allow(clippy::result_unit_err)]
     pub fn parse(value: &str) -> Result<Self, ()> {
         if value.is_empty() || value.trim() != value {
             return Err(());
