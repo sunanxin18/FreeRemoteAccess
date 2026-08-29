@@ -1045,10 +1045,12 @@ fn apply_native_mvs_frame(
             };
             let has_pixels = match applied {
                 Ok(true) => {
+                    #[cfg(debug_assertions)]
                     eprintln!("[hpss-view] MVS type-1 增量像素与 codec 状态已提交");
                     true
                 }
                 Ok(false) => {
+                    #[cfg(debug_assertions)]
                     eprintln!("[hpss-view] MVS type-1 no-op/cache 状态已提交");
                     false
                 }
@@ -1095,7 +1097,7 @@ fn apply_native_mvs_frame(
                 .map(|()| surface.record_native_type_zero_applied())
         }
     };
-    let observability = match applied {
+    let _observability = match applied {
         Ok(observability) => observability,
         Err(error) => {
             eprintln!("[hpss-view] MVS 原生 framebuffer 事务失败，重同步: {error:#}");
@@ -1104,6 +1106,7 @@ fn apply_native_mvs_frame(
         }
     };
 
+    #[cfg(debug_assertions)]
     eprintln!(
         "[hpss-view] native MVS: generation={}, rect=({},{} {}x{}), type0_total={}",
         receiver.generation,
@@ -1111,13 +1114,14 @@ fn apply_native_mvs_frame(
         record.rect.y,
         record.rect.width,
         record.rect.height,
-        observability.type_zero_applied_count,
+        _observability.type_zero_applied_count,
     );
     if complete_surface {
         dynamic_resolution
             .lock()
             .unwrap()
             .observe_full_applied(receiver.generation, display_size);
+        #[cfg(debug_assertions)]
         eprintln!("[hpss-view] 当前 generation 的完整 surface 证据已确认");
     }
     Ok(MvsRecordOutcome::FullApplied {
@@ -1360,12 +1364,14 @@ fn handle_complete_mvs_record(
                 request.target.width, request.target.height, request.generation
             );
         } else if boundary.incremental_sent {
+            #[cfg(debug_assertions)]
             eprintln!("[hpss-view] MVS full 已应用并请求下一增量响应");
         }
     } else if partial_applied {
         let size = current_surface_size(surface);
         let incremental = incremental_request_after_full_apply(size.width, size.height)?;
         if finish_partial_boundary_at(requests, || send_encrypted(writer, &incremental))? {
+            #[cfg(debug_assertions)]
             eprintln!("[hpss-view] MVS type-1 已提交并请求下一增量响应");
         }
     }
