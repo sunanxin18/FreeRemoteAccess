@@ -94,7 +94,9 @@ Expected: missing module/types or failed new assertions.
 
 Use private `Awaiting`, `Confirmed`, and `Failed` state. The five-second
 deadline starts at the timestamp captured immediately after the successful
-`0x1d` write.
+`0x1d` write. Store that origin and compare with
+`saturating_duration_since`; do not construct a future `Instant` by addition
+or leave a representational-overflow panic path.
 
 `observe_server_state_at(geometry, observed_at)` must check the deadline and
 geometry in one mutable operation. At/after the deadline it stores Failed and
@@ -102,6 +104,10 @@ returns `HighPerformanceUnavailable`. Before the deadline it converts the
 already strictly parsed geometry through `DisplaySize::new`. Matching confirmed
 geometry is Duplicate; conflicting direct reuse fails. `ensure_not_timed_out`
 also persists Failed.
+
+Tests assert the confirmed literal width/height independently of
+`DisplaySize::new` and cover zero width or height transitioning to persistent
+Failed.
 
 The concrete error type implements `Display`, `Error`, and `code()` without
 string parsing or a dependency. It must remain intact through `anyhow` so the
@@ -128,6 +134,8 @@ feat: add Apple High Performance startup gate
 **Files:**
 
 - Modify/Test: `crates/frd-protocol-apple/src/surface_publisher.rs`
+- Modify only the required exhaustive match in
+  `crates/frd-protocol-apple/src/network_reader.rs`
 
 **Produces:**
 
@@ -166,7 +174,11 @@ after it succeeds. `begin_next_generation` requires active state.
 Check inactive state before any `bgrx_patch`, complete-baseline validation, or
 revision work. Add `AwaitingHighPerformance` to every exhaustive private match;
 inside canonical snapshot recovery it is an invalid state and returns the
-existing frame-port error. Do not modify Task 1/2 canonical recovery semantics.
+existing frame-port error. In the current reader publication match, the new
+variant must return immediately without a boundary/full/incremental wire write;
+it is unreachable on the active production constructor until Task 3 moves the
+pending short-circuit before decoding. Do not otherwise modify reader behavior
+or Task 1/2 canonical recovery semantics.
 
 - [ ] **Step 4: Run GREEN and publisher regressions**
 
