@@ -113,18 +113,29 @@ fn republish_full_snapshot_with_patch_limit(
 
 The helper must:
 
-1. reject a session/generation mismatch before allocation;
-2. compute `row_bytes = width.checked_mul(4)` and require
+1. reject publisher/surface generation mismatches before allocation; the
+   publisher's session binding is established by `begin`, and
+   `ProtocolRuntime::publish_surface` remains the fail-closed authority for an
+   impossible cross-runtime session mismatch without adding a public runtime
+   accessor;
+2. retain the generation's exact `PixelSize` in `AppleSurfacePublisher` and
+   reject a same-generation surface whose width or height differs before any
+   BGRX allocation;
+3. compute `row_bytes = width.checked_mul(4)` and require
    `patch_byte_limit >= row_bytes`;
-3. use `rows_per_patch = patch_byte_limit / row_bytes`;
-4. extract exact full-width `PixelRect` bands through `bgrx_patch`;
-5. publish each band using the next revision and a matching boundary;
-6. use `Incremental` for every non-final boundary and `FullBaseline` only for
+4. use `rows_per_patch = patch_byte_limit / row_bytes`;
+5. extract exact full-width `PixelRect` bands through `bgrx_patch`;
+6. publish each band using the next revision and a matching boundary;
+7. use `Incremental` for every non-final boundary and `FullBaseline` only for
    the final boundary;
-7. set `baseline_established=false` before the first band and allow
+8. set `baseline_established=false` before the first band and allow
    `publish_patch` to restore it only on the accepted final boundary;
-8. propagate a second `NeedsFullSnapshot` as `ProtocolError::FramePortRejected`
+9. propagate a second `NeedsFullSnapshot` as `ProtocolError::FramePortRejected`
    without recursion or a network request.
+
+Add focused regressions proving that a same-generation geometry mismatch emits
+nothing and that recovery's own second overflow fails after one attempt while
+leaving incremental publication gated on a new full baseline.
 
 Do not increment `NativeMvsRenderObservability`; this is publication recovery,
 not another decoder commit.
