@@ -26,7 +26,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
 |---|---|---|---|---|---|
-| Windows | winit + egui + wgpu | 键盘、鼠标 | Windows Release/ICO 资源开发中 | macOS；Windows RDP 开发中 | **开发中**；Windows-first 重构见 `docs/superpowers/specs/2026-08-27-winit-wgpu-windows-first-architecture-design.md`，Windows RDP 尚未接入产品 |
+| Windows | winit + egui + wgpu | 键盘、鼠标 | Release 构建与多尺寸 ICO 已集成，安装包仍开发中 | macOS；Windows RDP 开发中 | **开发中**；保留已验证的 Mac/原生标题栏路径，并已通过同一登录界面注册独立 RDP adapter；当前仅有离线验证，等待独立授权的原生 Windows 目标完成真机登录、首帧与输入门禁（`BLOCKED_LIVE`），见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md) |
 | macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；必须保留 macOS 原生标题栏、字体和 Keychain 适配 |
 | Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；需实现窗口管理器适配与 Secret Service |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
