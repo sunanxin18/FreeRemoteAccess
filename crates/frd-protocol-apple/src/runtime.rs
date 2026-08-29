@@ -667,7 +667,10 @@ fn run_authenticated_session_inner(
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Mutex,
+    };
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -689,6 +692,35 @@ mod tests {
     impl RuntimeEventSink for TracingEvents {
         fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
             self.0
+                .send(RuntimeTrace::Event(event))
+                .map_err(|_| ProtocolError::EventPortClosed)
+        }
+    }
+
+    struct BlockingReadinessEvents {
+        trace: mpsc::Sender<RuntimeTrace>,
+        blocked: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        blocked_once: AtomicBool,
+    }
+
+    impl RuntimeEventSink for BlockingReadinessEvents {
+        fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
+            if matches!(
+                event,
+                SessionEvent::StageChanged(frd_protocol_api::ConnectionStage::TransportReady)
+            ) && !self.blocked_once.swap(true, Ordering::SeqCst)
+            {
+                self.blocked
+                    .send(())
+                    .map_err(|_| ProtocolError::EventPortClosed)?;
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .map_err(|_| ProtocolError::EventPortClosed)?;
+            }
+            self.trace
                 .send(RuntimeTrace::Event(event))
                 .map_err(|_| ProtocolError::EventPortClosed)
         }
@@ -786,7 +818,10 @@ mod tests {
         message
     }
 
-    fn start_production_harness(udp_media_enabled: bool) -> ProductionHarness {
+    fn start_production_harness_with_events(
+        udp_media_enabled: bool,
+        make_events: impl FnOnce(mpsc::Sender<RuntimeTrace>) -> Box<dyn RuntimeEventSink>,
+    ) -> ProductionHarness {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (peer, _) = listener.accept().unwrap();
@@ -800,10 +835,11 @@ mod tests {
         let session_id = frd_core::SessionId::allocate();
         let (commands, command_rx) = mpsc::channel();
         let (trace_tx, trace) = mpsc::channel();
+        let events = make_events(trace_tx.clone());
         let runtime = ProtocolRuntime::new(
             session_id,
             command_rx,
-            Box::new(TracingEvents(trace_tx.clone())),
+            events,
             Box::new(TracingFrames(trace_tx.clone())),
             None,
             Box::new(TracingWake(trace_tx)),
@@ -831,6 +867,12 @@ mod tests {
             worker,
             session_id,
         }
+    }
+
+    fn start_production_harness(udp_media_enabled: bool) -> ProductionHarness {
+        start_production_harness_with_events(udp_media_enabled, |trace| {
+            Box::new(TracingEvents(trace))
+        })
     }
 
     #[test]
@@ -989,7 +1031,16 @@ mod tests {
 
     #[test]
     fn production_session_buffers_media_until_readiness_then_handles_it_before_next_read() {
-        let mut harness = start_production_harness(true);
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut harness = start_production_harness_with_events(true, move |trace| {
+            Box::new(BlockingReadinessEvents {
+                trace,
+                blocked: blocked_tx,
+                release: Mutex::new(release_rx),
+                blocked_once: AtomicBool::new(false),
+            })
+        });
         harness.read_verified_startup();
 
         harness.send_message(&port_announcement_message(17_767));
@@ -1017,8 +1068,39 @@ mod tests {
             .unwrap();
         harness.send_message(&server_state_message(16, 8));
         assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 16, 0, 8]);
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        harness.send_message(&server_state_message(24, 8));
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            harness.peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        release_tx.send(()).unwrap();
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let media_configuration = harness.read_message();
         assert_eq!(media_configuration.first(), Some(&0x1c));
+        let mut saw_sentinel_full = false;
+        for _ in 0..3 {
+            if harness.read_message() == [3, 0, 0, 0, 0, 0, 0, 24, 0, 8] {
+                saw_sentinel_full = true;
+                break;
+            }
+        }
+        assert!(
+            saw_sentinel_full,
+            "缓存媒体必须在读取下一 ServerState 前排空"
+        );
 
         assert!(matches!(
             harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),

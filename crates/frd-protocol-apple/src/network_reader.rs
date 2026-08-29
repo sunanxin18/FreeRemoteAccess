@@ -585,11 +585,17 @@ impl ReaderRequestState {
         }
         match self.table_followup {
             TableFollowupState::None => {
-                let rate_due = self
-                    .last_full_request
-                    .map(|last| last + Duration::from_millis(200))
-                    .unwrap_or(arrived_at);
-                let due = (arrived_at + Duration::from_millis(200)).max(rate_due);
+                let delay = Duration::from_millis(200);
+                let rate_due = match self.last_full_request {
+                    Some(last) => last
+                        .checked_add(delay)
+                        .context("MVS table follow-up Instant 超出可表示范围")?,
+                    None => arrived_at,
+                };
+                let due = arrived_at
+                    .checked_add(delay)
+                    .context("MVS table follow-up Instant 超出可表示范围")?
+                    .max(rate_due);
                 self.table_followup = TableFollowupState::Scheduled { generation, due };
                 Ok(TableScheduleStatus::Scheduled)
             }
@@ -634,12 +640,19 @@ impl ReaderRequestState {
         Ok(())
     }
 
-    fn send_rate_limited_full_at<S, W>(&mut self, now: Instant, sleep: S, write: W) -> Result<()>
+    fn send_rate_limited_full_at<S, W, C>(
+        &mut self,
+        now: Instant,
+        sleep: S,
+        write: W,
+        completed_at: C,
+    ) -> Result<()>
     where
         S: FnMut(Duration),
         W: FnMut() -> Result<()>,
+        C: FnOnce() -> Instant,
     {
-        request_full_update_at(&mut self.last_full_request, now, sleep, write)?;
+        request_full_update_at(&mut self.last_full_request, now, sleep, write, completed_at)?;
         self.framebuffer_request_in_flight = true;
         Ok(())
     }
@@ -676,7 +689,7 @@ where
 
     if receiver.timeout_incomplete(now)? {
         requests.consume_mvs_response();
-        requests.send_rate_limited_full_at(now, &mut sleep, &mut write_full)?;
+        requests.send_rate_limited_full_at(now, &mut sleep, &mut write_full, Instant::now)?;
         outcome.incomplete_recovered = true;
     }
 
@@ -692,7 +705,7 @@ where
         && requests.table_followup_due().is_some_and(|due| now >= due)
     {
         write_full()?;
-        requests.mark_table_followup_sent(now)?;
+        requests.mark_table_followup_sent(Instant::now())?;
         outcome.table_followup_sent = true;
     }
 
@@ -835,28 +848,40 @@ fn request_full_update(
 ) -> Result<()> {
     let now = Instant::now();
     let req = protocol::msg_fb_update_request(false, 0, 0, width, height)?;
-    requests.send_rate_limited_full_at(now, thread::sleep, || send_encrypted(writer, &req))
+    requests.send_rate_limited_full_at(
+        now,
+        thread::sleep,
+        || send_encrypted(writer, &req),
+        Instant::now,
+    )
 }
 
-fn request_full_update_at<S, W>(
+fn request_full_update_at<S, W, C>(
     last_full_request: &mut Option<Instant>,
     now: Instant,
     sleep: S,
     write: W,
+    completed_at: C,
 ) -> Result<()>
 where
     S: FnOnce(Duration),
     W: FnOnce() -> Result<()>,
+    C: FnOnce() -> Instant,
 {
     let limit = Duration::from_millis(200);
-    let delay = last_full_request
-        .and_then(|last| (last + limit).checked_duration_since(now))
-        .unwrap_or_default();
+    let delay = match *last_full_request {
+        Some(last) => last
+            .checked_add(limit)
+            .context("full-request Instant 超出可表示范围")?
+            .checked_duration_since(now)
+            .unwrap_or_default(),
+        None => Duration::ZERO,
+    };
     if !delay.is_zero() {
         sleep(delay);
     }
     write()?;
-    *last_full_request = Some(now + delay);
+    *last_full_request = Some(completed_at());
     Ok(())
 }
 
@@ -1666,17 +1691,19 @@ impl NetworkReaderRuntime {
         Ok(())
     }
 
-    fn confirm_high_performance_at_with<S, W>(
+    fn confirm_high_performance_at_with<S, W, C>(
         &mut self,
         geometry: hpss::ServerStateGeometry,
         observed_at: Instant,
         protocol_runtime: &mut ProtocolRuntime,
         sleep: S,
         mut write: W,
+        completed_at: C,
     ) -> Result<NetworkFrameOutcome>
     where
         S: FnMut(Duration),
         W: FnMut(&[u8]) -> Result<()>,
+        C: FnOnce() -> Instant,
     {
         let confirmation = match self
             .startup_gate
@@ -1706,7 +1733,12 @@ impl NetworkReaderRuntime {
             ReaderRequestState::after_confirmation(self.initial_full_sent_at, 1);
         let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
 
-        prepared_requests.send_rate_limited_full_at(observed_at, sleep, || write(&full))?;
+        prepared_requests.send_rate_limited_full_at(
+            observed_at,
+            sleep,
+            || write(&full),
+            completed_at,
+        )?;
         prepared_dynamic.observe_initial_server_state(size, size);
         self.receiver = prepared_receiver;
         self.requests = prepared_requests;
@@ -1758,6 +1790,7 @@ impl NetworkReaderRuntime {
                 protocol_runtime,
                 thread::sleep,
                 |message| send_encrypted(writer, message),
+                Instant::now,
             );
         }
 
@@ -2167,6 +2200,30 @@ mod migrated_runtime_tests {
         }
     }
 
+    fn latest_addable_instant() -> Instant {
+        let base = Instant::now();
+        let mut maximum_seconds = 0u64;
+        for bit in (0..u64::BITS).rev() {
+            let candidate = maximum_seconds | (1u64 << bit);
+            if base.checked_add(Duration::from_secs(candidate)).is_some() {
+                maximum_seconds = candidate;
+            }
+        }
+        let mut maximum_nanos = 0u32;
+        for bit in (0..30).rev() {
+            let candidate = maximum_nanos | (1u32 << bit);
+            if candidate < 1_000_000_000
+                && base
+                    .checked_add(Duration::new(maximum_seconds, candidate))
+                    .is_some()
+            {
+                maximum_nanos = candidate;
+            }
+        }
+        base.checked_add(Duration::new(maximum_seconds, maximum_nanos))
+            .unwrap()
+    }
+
     #[test]
     fn preconfirmation_mvs_complete_fragmented_and_table_records_have_zero_side_effects() {
         use std::io::Read as _;
@@ -2184,6 +2241,13 @@ mod migrated_runtime_tests {
         let mut media = test_media_state();
         let mut before_generation_commit = || Ok(());
         let awaiting_full_before = reader.receiver.awaiting_full();
+        assert!(matches!(
+            reader
+                .receiver
+                .prepare(&native_mode_zero_payload(), 8, 8)
+                .unwrap(),
+            mvs::MvsDecodeDecision::RequestFull(mvs::MvsResyncReason::MissingTables)
+        ));
         let rect = MvsRect {
             x: 0,
             y: 0,
@@ -2248,6 +2312,13 @@ mod migrated_runtime_tests {
 
         assert!(!reader.receiver.is_pending());
         assert_eq!(reader.receiver.awaiting_full(), awaiting_full_before);
+        assert!(matches!(
+            reader
+                .receiver
+                .prepare(&native_mode_zero_payload(), 8, 8)
+                .unwrap(),
+            mvs::MvsDecodeDecision::RequestFull(mvs::MvsResyncReason::MissingTables)
+        ));
         assert!(!reader.publisher.is_active());
         assert!(trace.entries.lock().unwrap().is_empty());
         let surface = reader.surface.lock().unwrap();
@@ -2492,6 +2563,7 @@ mod migrated_runtime_tests {
                 &mut protocol_runtime,
                 |_| {},
                 |_| Ok(()),
+                Instant::now,
             )
             .unwrap();
         assert!(reader.is_high_performance_confirmed());
@@ -2571,6 +2643,7 @@ mod migrated_runtime_tests {
                     written_for_call.lock().unwrap().extend_from_slice(message);
                     Ok(())
                 },
+                Instant::now,
             )
             .unwrap();
 
@@ -2604,6 +2677,7 @@ mod migrated_runtime_tests {
                     &mut protocol_runtime,
                     |_| {},
                     |_| panic!("重复确认不得再次写 full request"),
+                    Instant::now,
                 )
                 .unwrap(),
             NetworkFrameOutcome::Consumed
@@ -2612,6 +2686,43 @@ mod migrated_runtime_tests {
             trace.entries.lock().unwrap().as_slice(),
             ["write", "generation", "reset", "wake"]
         );
+    }
+
+    #[test]
+    fn pending_viewport_is_never_queued_or_replayed_by_confirmation() {
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let geometry = hpss::parse_server_state_geometry(&server_state_message(initial)).unwrap();
+        let (mut protocol_runtime, _) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, true, requested_at, requested_at)
+                .unwrap();
+        let viewport = PhysicalViewport::new(
+            PixelSize::new(32, 16).unwrap(),
+            frd_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 16,
+            },
+            PixelSize::new(8, 8).unwrap(),
+        )
+        .unwrap();
+
+        reader.observe_viewport(viewport, requested_at);
+        assert!(reader.viewport_requests.lock().unwrap().latest.is_none());
+        reader
+            .confirm_high_performance_at_with(
+                geometry,
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| Ok(()),
+                Instant::now,
+            )
+            .unwrap();
+        assert!(reader.viewport_requests.lock().unwrap().latest.is_none());
     }
 
     #[test]
@@ -2632,6 +2743,7 @@ mod migrated_runtime_tests {
             &mut protocol_runtime,
             |_| {},
             |_| Err(anyhow::anyhow!("injected confirmed full write failure")),
+            Instant::now,
         ));
 
         assert!(error
@@ -2679,6 +2791,7 @@ mod migrated_runtime_tests {
                     ))
                     .context("confirmed-size full write"))
                 },
+                Instant::now,
             );
             let error = expect_network_frame_error(
                 crate::runtime::preserve_pending_confirmation_result(was_pending, result),
@@ -3023,6 +3136,7 @@ mod migrated_runtime_tests {
                 &mut protocol_runtime,
                 |_| {},
                 |_| Ok(()),
+                Instant::now,
             )
             .unwrap();
         {
@@ -3370,6 +3484,7 @@ mod migrated_runtime_tests {
                 &mut protocol_runtime,
                 |_| {},
                 |_| Ok(()),
+                Instant::now,
             )
             .unwrap();
         let mut media = ViewerMediaState::new(
@@ -3883,6 +3998,7 @@ mod migrated_runtime_tests {
     #[test]
     fn full_resync_rate_limit_waits_then_writes_exactly_once() {
         let now = Instant::now();
+        let completed_at = now.checked_add(Duration::from_millis(350)).unwrap();
         let mut last_request = Some(now);
         let mut delays = Vec::new();
         let mut writes = 0;
@@ -3895,12 +4011,54 @@ mod migrated_runtime_tests {
                 writes += 1;
                 Ok(())
             },
+            || completed_at,
         )
         .unwrap();
 
         assert_eq!(delays, vec![Duration::from_millis(200)]);
         assert_eq!(writes, 1);
-        assert_eq!(last_request, Some(now + Duration::from_millis(200)));
+        assert_eq!(last_request, Some(completed_at));
+    }
+
+    #[test]
+    fn latest_addable_confirmation_full_fails_closed_without_write_or_publication() {
+        let latest = latest_addable_instant();
+        let session_id = frd_core::SessionId::allocate();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let geometry = hpss::parse_server_state_geometry(&server_state_message(initial)).unwrap();
+        let (mut runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, latest, latest).unwrap();
+        let mut writes = 0;
+
+        let error = expect_network_frame_error(reader.confirm_high_performance_at_with(
+            geometry,
+            latest,
+            &mut runtime,
+            |_| {},
+            |_| {
+                writes += 1;
+                Ok(())
+            },
+            || latest,
+        ));
+
+        assert!(error.to_string().contains("Instant"));
+        assert_eq!(writes, 0);
+        assert!(trace.entries.lock().unwrap().is_empty());
+        assert!(!reader.publisher.is_active());
+    }
+
+    #[test]
+    fn latest_addable_table_followup_fails_closed_without_schedule() {
+        let latest = latest_addable_instant();
+        let mut requests = ReaderRequestState::after_startup(latest, 0);
+        requests.consume_mvs_response();
+
+        let error = requests.on_valid_table_record(0, latest).unwrap_err();
+
+        assert!(error.to_string().contains("Instant"));
+        assert!(matches!(requests.table_followup, TableFollowupState::None));
     }
     #[test]
     fn pending_record_treats_heartbeat_shaped_frame_as_opaque_continuation() {

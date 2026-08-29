@@ -183,6 +183,7 @@ impl AppleSurfacePublisher {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(
         runtime: &mut ProtocolRuntime,
         session_id: SessionId,
