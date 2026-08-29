@@ -200,6 +200,9 @@ fn finish_product_authenticated_session(
     authenticated: AppleAuthenticated,
     profile: SessionEncodingProfile,
 ) -> Result<EstablishedAppleSession, ProtocolError> {
+    if authenticated.security_type != security::APPLE_SRP || authenticated.srp_key.is_none() {
+        return Err(apple_error(APPLE_HIGH_PERFORMANCE_UNAVAILABLE));
+    }
     let established = finish_authenticated_session(authenticated, profile)
         .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
     if !established.connection.is_encrypted() {
@@ -276,20 +279,9 @@ mod product_profile_tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut client_init = [0u8; 1];
-            stream.read_exact(&mut client_init).unwrap();
-            assert_eq!(
-                client_init,
-                [crate::protocol::apple_session::SHARED_CLIENT_INIT]
-            );
-            let mut server_init = [0u8; frd_wire_rfb::SERVER_INIT_HEADER_BYTES];
-            server_init[..2].copy_from_slice(&8u16.to_be_bytes());
-            server_init[2..4].copy_from_slice(&8u16.to_be_bytes());
-            server_init[4..20].copy_from_slice(&frd_wire_rfb::PixelFormat::OURS.to_bytes());
-            stream.write_all(&server_init).unwrap();
-            let mut application_bytes = Vec::new();
-            stream.read_to_end(&mut application_bytes).unwrap();
-            application_bytes
+            let mut finalization_bytes = [0u8; 64];
+            let received = stream.read(&mut finalization_bytes).unwrap();
+            finalization_bytes[..received].to_vec()
         });
         let authenticated = super::AppleAuthenticated {
             connection: crate::AppleConnection::new(client),
@@ -309,7 +301,10 @@ mod product_profile_tests {
             error.code(),
             crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
         );
-        assert!(server.join().unwrap().is_empty());
+        assert!(
+            server.join().unwrap().is_empty(),
+            "不一致的 legacy 产品状态必须在 ClientInit 前拒绝"
+        );
     }
 
     #[test]
