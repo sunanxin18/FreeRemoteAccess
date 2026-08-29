@@ -475,22 +475,17 @@ impl MvsFullDecoder {
                                 tile_y,
                             )?;
                         } else {
-                            let source_tile_x = if tile_column != 0 {
-                                tile_x - TILE_EDGE
-                            } else {
-                                (tiles_x - 1) * TILE_EDGE
-                            };
-                            let source_tile_y = if tile_column != 0 {
-                                tile_y
-                            } else {
-                                tile_y - TILE_EDGE
-                            };
-                            copy_decoded_tile_within_rect(
+                            copy_overlay_or_committed_tile_to_rect(
+                                &surface_state.rgb,
+                                surface_width,
+                                surface_height,
                                 &mut rgb,
+                                rect_x,
+                                rect_y,
                                 width,
                                 height,
-                                source_tile_x,
-                                source_tile_y,
+                                source_x,
+                                source_y,
                                 tile_x,
                                 tile_y,
                             )?;
@@ -534,12 +529,17 @@ impl MvsFullDecoder {
                                 tile_y,
                             )?;
                         } else {
-                            copy_decoded_tile_within_rect(
+                            copy_overlay_or_committed_tile_to_rect(
+                                &surface_state.rgb,
+                                surface_width,
+                                surface_height,
                                 &mut rgb,
+                                rect_x,
+                                rect_y,
                                 width,
                                 height,
-                                tile_x,
-                                tile_y - TILE_EDGE,
+                                global_x,
+                                source_y,
                                 tile_x,
                                 tile_y,
                             )?;
@@ -1826,8 +1826,13 @@ fn copy_surface_tile_to_rect(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn copy_decoded_tile_within_rect(
+fn copy_overlay_or_committed_tile_to_rect(
+    committed_rgb: &[u8],
+    surface_width: usize,
+    surface_height: usize,
     rect_rgb: &mut [u8],
+    rect_x: usize,
+    rect_y: usize,
     rect_width: usize,
     rect_height: usize,
     source_x: usize,
@@ -1839,26 +1844,44 @@ fn copy_decoded_tile_within_rect(
     let copy_height = TILE_EDGE.min(rect_height - destination_y);
     if source_x
         .checked_add(copy_width)
-        .is_none_or(|right| right > rect_width)
+        .is_none_or(|right| right > surface_width)
         || source_y
             .checked_add(copy_height)
-            .is_none_or(|bottom| bottom > rect_height)
+            .is_none_or(|bottom| bottom > surface_height)
     {
-        bail!("MVS type-0 overlay copy source 超出 dirty rect");
-    }
-    let row_bytes = copy_width * RGB_CHANNELS;
-    let mut staging = [0u8; TILE_EDGE * TILE_EDGE * RGB_CHANNELS];
-    for dy in 0..copy_height {
-        let source = pixel_offset(rect_width, source_x, source_y + dy);
-        let destination = dy * row_bytes;
-        staging[destination..destination + row_bytes]
-            .copy_from_slice(&rect_rgb[source..source + row_bytes]);
+        bail!("MVS type-0 overlay copy source 超出 committed surface");
     }
     for dy in 0..copy_height {
-        let source = dy * row_bytes;
-        let destination = pixel_offset(rect_width, destination_x, destination_y + dy);
-        rect_rgb[destination..destination + row_bytes]
-            .copy_from_slice(&staging[source..source + row_bytes]);
+        for dx in 0..copy_width {
+            let source_global_x = source_x + dx;
+            let source_global_y = source_y + dy;
+            let color = if source_global_x >= rect_x
+                && source_global_x < rect_x + rect_width
+                && source_global_y >= rect_y
+                && source_global_y < rect_y + rect_height
+            {
+                let source = pixel_offset(
+                    rect_width,
+                    source_global_x - rect_x,
+                    source_global_y - rect_y,
+                );
+                [rect_rgb[source], rect_rgb[source + 1], rect_rgb[source + 2]]
+            } else {
+                let source = pixel_offset(surface_width, source_global_x, source_global_y);
+                [
+                    committed_rgb[source],
+                    committed_rgb[source + 1],
+                    committed_rgb[source + 2],
+                ]
+            };
+            write_pixel(
+                rect_rgb,
+                rect_width,
+                destination_x + dx,
+                destination_y + dy,
+                color,
+            );
+        }
     }
     Ok(())
 }
@@ -3850,6 +3873,44 @@ mod tests {
         let decoded = MvsFullDecoder::decoded(&prepared);
 
         assert_eq!(complete_tile(decoded, 0, 8), complete_tile(decoded, 8, 0));
+    }
+
+    #[test]
+    fn mode_one_cross_row_merges_clipped_overlay_with_committed_source_tail() {
+        let mut decoder = decoder();
+        let initial_modes = mode_stream(&[(3, 3)]);
+        let mut initial_data = TestBitWriter::new();
+        for _ in 0..4 {
+            initial_data.write_bits(0, 8);
+            for _ in 0..8 {
+                initial_data.write_bits(0, 8);
+            }
+        }
+        initial_data.write_bits(STREAM_TERMINAL as u32, 8);
+        let initial_data = initial_data.finish();
+        let initial = decoder
+            .prepare(&record(&initial_modes, &initial_data), 16, 16)
+            .unwrap();
+        decoder.commit(initial);
+
+        let modes = mode_stream(&[(3, 0), (0, 0), (1, 0), (0, 0)]);
+        let mut data = TestBitWriter::new();
+        data.write_bits(0, 8);
+        for _ in 0..8 {
+            data.write_bits(0, 8);
+        }
+        data.write_bits(STREAM_TERMINAL as u32, 8);
+        let data = data.finish();
+        let prepared = decoder
+            .prepare_rect(&record(&modes, &data), 0, 0, 10, 16, 16, 16)
+            .unwrap();
+        let decoded = MvsFullDecoder::decoded(&prepared);
+
+        assert_eq!(pixel(decoded, 0, 8), [255; 3]);
+        assert_eq!(pixel(decoded, 1, 8), [255; 3]);
+        for x in 2..8 {
+            assert_eq!(pixel(decoded, x, 8), [0; 3]);
+        }
     }
 
     #[test]
