@@ -481,17 +481,21 @@ mod tests {
     use crate::input::RdpInputState;
 
     use super::{
-        drain_active_commands, drain_reactivation_commands, run_protocol_session,
-        wait_for_blocking, wait_for_blocking_with_timeout, wait_for_network_future,
-        ActiveCommandBatch, ActiveCommandDrain, ActiveOptionalCommand, CancellationCheckedIo,
+        blocking_stage_worker, drain_active_commands, drain_reactivation_commands,
+        finish_tracked_worker, network_stage_worker, run_protocol_session, wait_for_blocking,
+        wait_for_blocking_with_timeout, wait_for_network_future, ActiveCommandBatch,
+        ActiveCommandDrain, ActiveOptionalCommand, CancellationCheckedIo,
     };
 
     static WORKER_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     fn worker_test_guard() -> MutexGuard<'static, ()> {
-        WORKER_TEST_SERIAL
+        let serial = WORKER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        finish_tracked_worker(network_stage_worker());
+        finish_tracked_worker(blocking_stage_worker());
+        serial
     }
 
     #[test]
