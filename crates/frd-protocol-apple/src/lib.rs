@@ -7,6 +7,7 @@ mod auth;
 mod connection;
 pub mod dynamic_resolution;
 mod factory;
+mod high_performance;
 pub mod hpss;
 pub mod media_negotiation;
 pub mod media_protocol;
