@@ -6,6 +6,25 @@
 Windows Remote Desktop Services 的真机登录、首帧、键鼠、证书、NLA、剪贴板、音频或
 Display Control 互操作证明。因此 README 中 Windows RDP 仍为 **开发中**。
 
+## Mac 基线集成刷新（2026-08-29）
+
+RDP adapter 已移植到经 Mac 真机验证的 Windows winit/wgpu 产品基线，并仅在
+Windows 应用 composition root 与 Apple adapter 并列注册。最终候选 `35e5962` 的
+fresh 离线门禁结果如下：
+
+- 两套完整 workspace 测试均为 868 passed、0 failed、11 个有理由的本地 fixture
+  ignored；
+- no-default workspace build、Windows Release build 和完整计划 `-D warnings`
+  Clippy 均通过；
+- `frd-protocol-rdp` 依赖/导入审计对 Apple、RFB、desktop shell、platform shell、
+  winit、wgpu 和 egui 均为零命中；
+- 最终重建的 Windows executable 为 42,106,880 bytes，SHA-256
+  `F0A80A17150BD9E457DFBBDABD8B4070C294A98DCA0A0A215B44F646EB5B1A4B`。
+
+同一候选完成了 macOS 自动选择、认证、首帧、MVS 增量、键鼠与正常断开回归；
+这只证明 RDP 注册没有取代 Apple composition path，不构成任何 Windows RDP 真机
+互操作。独立授权的 stock Windows 目标仍缺失，状态继续为 `BLOCKED_LIVE` / **开发中**。
+
 已实现并纳入离线门禁的适配器边界包括：系统信任链和仅不受信任签发者可用的显式
 证书确认/精确 pin、仅 CredSSP/NLA 的连接路径、licensing/activation 基线、BGRX
 脏矩形发布、fast-path 键鼠、单主显示器 Display Control、adapter 内 Unicode 文本

@@ -1,6 +1,6 @@
 # Windows WGPU Session Chrome and Apple Parity Validation
 
-Date: 2026-08-28
+Date: 2026-08-29
 
 ## Scope
 
@@ -70,7 +70,7 @@ Release visual acceptance confirmed:
 
 - `check_circle`, `volume_off`, `content_paste_off`, and `link_off` render with
   consistent rounded geometry and optical weight;
-- the four 32-point slots are centered as one cluster and occupy 64 physical
+- the four 44-point slots are centered as one cluster and occupy 88 physical
   pixels each at 200% scaling;
 - DWM remains responsible for minimize, maximize/restore, and close hit
   semantics, system tooltips, and Snap Layout on the Windows trailing side;
@@ -120,6 +120,52 @@ Observed result:
    form, exposing only 地址、端口、目标系统、协议、用户名、密码和连接 controls.
 6. A normal window-close request then terminated the process within the
    bounded wait.
+
+## Mac-baseline/RDP integration refresh (2026-08-29)
+
+The integration candidate was `35e5962`. Cargo used the normal default
+parallelism. A fresh final offline round passed `fmt`, both complete workspace
+test configurations (868 passed, 11 explicitly ignored local-fixture tests),
+the no-default-feature workspace build, the Windows Release build, the full
+planned `-D warnings` Clippy set, and the RDP forbidden-dependency/import
+checks. The final rebuilt executable used for the bounded live comparison was
+42,106,880 bytes with SHA-256
+`F0A80A17150BD9E457DFBBDABD8B4070C294A98DCA0A0A215B44F646EB5B1A4B`.
+
+Exactly one client was active at a time. The saved profile selected macOS and
+the product resolved automatic selection to `apple-hpss-mvs`; no RDP session,
+thread, or socket was created. The client authenticated, presented a correctly
+colored complete 1440-by-2560 portrait surface below the 44-point title bar,
+and continued to apply repeated type-0 and type-1 MVS updates without
+reconnecting. The user confirmed both pointer and keyboard input. A normal
+disconnect returned to the centered connection form, and normal close left no
+client process. The focus-loss/cursor-leave release behavior was not separately
+re-exercised in this refresh; its already verified shell path is unchanged by
+the RDP integration.
+
+One initial bounded session returned the generic `apple_runtime_failed` after
+successful first-frame and pointer activity. A temporary local diagnostic
+build did not reproduce an Apple runtime error: subsequent sessions sustained
+continuous MVS updates and closed normally. The temporary diagnostic source
+change was removed and was not committed. This remains a non-reproduced bounded
+observation, not evidence of a resolved root cause.
+
+The user also reported visibly higher input-to-refresh latency. A same-machine,
+same-target A/B sample did not attribute that latency to RDP integration:
+
+| Variant | CPU seconds in 5 seconds | Working set | Private bytes | stderr growth |
+| --- | ---: | ---: | ---: | ---: |
+| Frozen Mac-only baseline `cc71206` | 5.750 | 336.5 MiB | 458.3 MiB | 32,422 bytes |
+| Integrated candidate | 5.547 | 328.3 MiB | 449.5 MiB | 30,937 bytes |
+
+The current Apple path decodes the native 3.69-megapixel portrait surface even
+though the fitted client image is much smaller, and the active desktop was
+continuously changing. This keeps roughly one CPU core busy in both binaries.
+Release hot-path MVS diagnostics can add jitter, but their byte rate and the A/B
+result do not identify RDP registration as the regression. Dynamic resolution
+remains default-off because resized `0x09` interoperability is still an Apple
+wire experiment; performance work must not enable it without the required ARD
+evidence and live gate.
 
 ## Remaining Platform Evidence
 
