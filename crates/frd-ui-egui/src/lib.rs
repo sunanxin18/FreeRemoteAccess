@@ -103,14 +103,8 @@ fn login_icons_use_official_names_codepoints_and_chinese_help() {
         assert_eq!(semantic.codepoint, codepoint);
         assert!(!semantic.tooltip.is_empty());
         assert!(!semantic.accessible_name.is_empty());
-        assert!(semantic
-            .tooltip
-            .chars()
-            .any(|character| !character.is_ascii()));
-        assert!(semantic
-            .accessible_name
-            .chars()
-            .any(|character| !character.is_ascii()));
+        assert!(!semantic.tooltip.is_ascii());
+        assert!(!semantic.accessible_name.is_ascii());
     }
 }
 
