@@ -213,10 +213,22 @@ impl AppleSurfacePublisher {
         dirty: PixelRect,
         kind: MvsFrameKind,
     ) -> Result<PublicationOutcome, ProtocolError> {
+        if generation != self.generation || surface.generation != self.generation {
+            return Ok(PublicationOutcome::IgnoredStale);
+        }
+        let completeness = match self.publication_completeness(kind) {
+            Ok(completeness) => completeness,
+            Err(outcome) => return Ok(outcome),
+        };
         let patch = surface
             .bgrx_patch(dirty)
             .map_err(|_| ProtocolError::FramePortRejected)?;
-        self.publish_committed_patch(runtime, surface, generation, patch, kind)
+        if completeness == FrameCompleteness::FullBaseline
+            && validate_complete_baseline_patch(surface, &patch).is_err()
+        {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        self.publish_patch(runtime, patch, completeness)
     }
 
     /// 发布已在 decoder prepare 期间构造并校验的 BGRX patch。
@@ -233,32 +245,52 @@ impl AppleSurfacePublisher {
         if generation != self.generation || surface.generation != self.generation {
             return Ok(PublicationOutcome::IgnoredStale);
         }
-        let completeness = match kind {
+        let completeness = match self.publication_completeness(kind) {
+            Ok(completeness) => completeness,
+            Err(outcome) => return Ok(outcome),
+        };
+        if completeness == FrameCompleteness::FullBaseline
+            && validate_complete_baseline_patch(surface, &patch).is_err()
+        {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        self.publish_patch(runtime, patch, completeness)
+    }
+
+    fn publication_completeness(
+        &self,
+        kind: MvsFrameKind,
+    ) -> std::result::Result<FrameCompleteness, PublicationOutcome> {
+        match kind {
             MvsFrameKind::TypeZero {
                 complete_surface: true,
                 initial_nonblack: true,
-            } => FrameCompleteness::FullBaseline,
+            } => Ok(FrameCompleteness::FullBaseline),
             MvsFrameKind::TypeZero {
                 complete_surface: true,
                 initial_nonblack: false,
-            } => {
-                return Ok(PublicationOutcome::NeedsFullBaseline);
-            }
+            } => Err(PublicationOutcome::NeedsFullBaseline),
             MvsFrameKind::TypeZero {
                 complete_surface: false,
                 ..
-            } if !self.baseline_established => {
-                return Ok(PublicationOutcome::NeedsFullBaseline);
-            }
+            } if !self.baseline_established => Err(PublicationOutcome::NeedsFullBaseline),
             MvsFrameKind::TypeZero {
                 complete_surface: false,
                 ..
-            } => FrameCompleteness::Incremental,
+            } => Ok(FrameCompleteness::Incremental),
             MvsFrameKind::TypeOne if !self.baseline_established => {
-                return Ok(PublicationOutcome::NeedsFullBaseline);
+                Err(PublicationOutcome::NeedsFullBaseline)
             }
-            MvsFrameKind::TypeOne => FrameCompleteness::Incremental,
-        };
+            MvsFrameKind::TypeOne => Ok(FrameCompleteness::Incremental),
+        }
+    }
+
+    fn publish_patch(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        patch: PixelPatch,
+        completeness: FrameCompleteness,
+    ) -> Result<PublicationOutcome, ProtocolError> {
         let revision = self
             .revision
             .checked_add(1)
@@ -297,6 +329,35 @@ impl AppleSurfacePublisher {
         }
         Ok(PublicationOutcome::Published)
     }
+}
+
+fn validate_complete_baseline_patch(surface: &DisplaySurface, patch: &PixelPatch) -> Result<()> {
+    let width = u32::try_from(surface.width()).context("Apple complete baseline 宽度溢出")?;
+    let height = u32::try_from(surface.height()).context("Apple complete baseline 高度溢出")?;
+    if patch.rect
+        != (PixelRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })
+    {
+        bail!("Apple complete baseline patch 必须精确覆盖 surface");
+    }
+    let expected_stride = width
+        .checked_mul(4)
+        .context("Apple complete baseline stride 溢出")?;
+    if patch.stride_bytes != expected_stride {
+        bail!("Apple complete baseline patch stride 不匹配");
+    }
+    let expected_len = usize::try_from(expected_stride)
+        .ok()
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .context("Apple complete baseline payload 溢出")?;
+    if patch.pixels.len() != expected_len {
+        bail!("Apple complete baseline patch payload 长度不匹配");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -436,13 +497,170 @@ mod tests {
     }
 
     #[test]
-    fn direct_type_zero_patch_publishes_owned_bgrx_without_rereading_surface() {
+    fn stale_and_missing_baseline_short_circuit_before_invalid_dirty_patch_build() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let (mut runtime, _frames) = runtime_with_frames(session_id);
+        let surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        let invalid = PixelRect {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+
+        assert_eq!(
+            publisher
+                .publish_committed(&mut runtime, &surface, 2, invalid, MvsFrameKind::TypeOne)
+                .unwrap(),
+            PublicationOutcome::IgnoredStale
+        );
+        assert_eq!(
+            publisher
+                .publish_committed(&mut runtime, &surface, 1, invalid, MvsFrameKind::TypeOne)
+                .unwrap(),
+            PublicationOutcome::NeedsFullBaseline
+        );
+    }
+
+    #[test]
+    fn complete_type_zero_patch_rejects_invalid_full_baseline_layout_before_publication() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let invalid_patches = [
+            PixelPatch {
+                rect: PixelRect {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                stride_bytes: 4,
+                pixels: PixelBuffer::new(vec![0x33, 0x22, 0x11, 0]),
+            },
+            PixelPatch {
+                rect: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                },
+                stride_bytes: 4,
+                pixels: PixelBuffer::new(vec![0x33, 0x22, 0x11, 0, 0x66, 0x55, 0x44, 0]),
+            },
+            PixelPatch {
+                rect: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                },
+                stride_bytes: 8,
+                pixels: PixelBuffer::new(vec![0x33, 0x22, 0x11, 0]),
+            },
+        ];
+
+        for patch in invalid_patches {
+            let (mut runtime, frames) = runtime_with_frames(session_id);
+            let surface = DisplaySurface::new(1, size).unwrap();
+            let mut publisher =
+                AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+
+            assert!(matches!(
+                publisher.publish_committed_patch(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    patch,
+                    MvsFrameKind::TypeZero {
+                        complete_surface: true,
+                        initial_nonblack: true,
+                    },
+                ),
+                Err(ProtocolError::FramePortRejected)
+            ));
+            assert_eq!(
+                frames.lock().unwrap().len(),
+                1,
+                "invalid baseline must not publish damage"
+            );
+            assert_eq!(
+                publisher
+                    .publish_committed(
+                        &mut runtime,
+                        &surface,
+                        1,
+                        PixelRect {
+                            x: 0,
+                            y: 0,
+                            width: 1,
+                            height: 1,
+                        },
+                        MvsFrameKind::TypeOne,
+                    )
+                    .unwrap(),
+                PublicationOutcome::NeedsFullBaseline
+            );
+        }
+
+        let (mut runtime, frames) = runtime_with_frames(session_id);
+        let surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        assert!(matches!(
+            publisher.publish_committed(
+                &mut runtime,
+                &surface,
+                1,
+                PixelRect {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                MvsFrameKind::TypeZero {
+                    complete_surface: true,
+                    initial_nonblack: true,
+                },
+            ),
+            Err(ProtocolError::FramePortRejected)
+        ));
+        assert_eq!(frames.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn direct_local_type_zero_patch_publishes_owned_bgrx_without_rereading_surface() {
         let session_id = SessionId::allocate();
         let size = PixelSize::new(2, 1).unwrap();
         let (mut runtime, frames) = runtime_with_frames(session_id);
         let surface = DisplaySurface::new(1, size).unwrap();
         let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
-        let patch = PixelPatch {
+        let full_patch = PixelPatch {
+            rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            stride_bytes: 8,
+            pixels: PixelBuffer::new(vec![0x66, 0x55, 0x44, 0, 0x33, 0x22, 0x11, 0]),
+        };
+        assert_eq!(
+            publisher
+                .publish_committed_patch(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    full_patch,
+                    MvsFrameKind::TypeZero {
+                        complete_surface: true,
+                        initial_nonblack: true,
+                    },
+                )
+                .unwrap(),
+            PublicationOutcome::Published
+        );
+        let local_patch = PixelPatch {
             rect: PixelRect {
                 x: 1,
                 y: 0,
@@ -459,10 +677,10 @@ mod tests {
                     &mut runtime,
                     &surface,
                     1,
-                    patch,
+                    local_patch,
                     MvsFrameKind::TypeZero {
-                        complete_surface: true,
-                        initial_nonblack: true,
+                        complete_surface: false,
+                        initial_nonblack: false,
                     },
                 )
                 .unwrap(),
@@ -470,8 +688,8 @@ mod tests {
         );
 
         let frames = frames.lock().unwrap();
-        let SurfaceUpdate::Damage { ref patches, .. } = frames[1] else {
-            panic!("complete type-0 must publish its prepared patch");
+        let SurfaceUpdate::Damage { ref patches, .. } = frames[3] else {
+            panic!("local type-0 must publish its prepared patch");
         };
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].rect.x, 1);

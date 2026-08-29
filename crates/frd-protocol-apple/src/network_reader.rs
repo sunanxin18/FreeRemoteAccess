@@ -2589,6 +2589,56 @@ mod migrated_runtime_tests {
                 .contains_nonblack
         );
     }
+
+    #[test]
+    fn type_zero_patch_prepare_and_commit_failure_leave_visible_surface_unchanged() {
+        let size = PixelSize::new(8, 8).unwrap();
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        surface.framebuffer.pixels_mut().fill(0x0012_3456);
+        let before_prepare_failure = surface.framebuffer.pixels().to_vec();
+        let rect = MvsRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let malformed_decoded = crate::mvs_full::DecodedMvsRect {
+            width: 8,
+            height: 8,
+            rgb: vec![0; 3],
+        };
+
+        assert!(prepare_type_zero_patch(&malformed_decoded, rect).is_err());
+        assert_eq!(surface.framebuffer.pixels(), before_prepare_failure);
+
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let decision = receiver.prepare(&native_mode_zero_payload(), 8, 8).unwrap();
+        let mvs::MvsDecodeDecision::Prepared(prepared) = decision else {
+            panic!("expected native type-0 preparation");
+        };
+        let publication = prepare_type_zero_patch(prepared.decoded(), rect).unwrap();
+        receiver.reset(2);
+        let mut next_generation_surface = DisplaySurface::new(2, size).unwrap();
+        next_generation_surface
+            .framebuffer
+            .pixels_mut()
+            .fill(0x0065_4321);
+        let before_commit_failure = next_generation_surface.framebuffer.pixels().to_vec();
+
+        assert!(apply_prepared_mvs_to_surface(
+            &mut receiver,
+            &mut next_generation_surface,
+            prepared,
+            &publication,
+        )
+        .is_err());
+        assert_eq!(
+            next_generation_surface.framebuffer.pixels(),
+            before_commit_failure
+        );
+    }
+
     #[test]
     fn native_subrectangle_applies_without_complete_surface_evidence() {
         let surface = native_surface(16, 8);
