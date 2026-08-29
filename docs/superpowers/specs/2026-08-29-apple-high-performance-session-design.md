@@ -82,7 +82,10 @@ Add an Apple-private `HighPerformanceStartupGate`. It has three states:
 
 The deadline is five seconds from the successful `0x1d` write. It is a local
 fail-closed product deadline, not an inferred ARD wire timeout, and it sends no
-extra packet.
+extra packet. A ServerState observation carries its observation time into the
+gate; the gate checks the deadline and the geometry atomically, so a message
+observed at or after the deadline cannot confirm the session merely because the
+previous 100 ms reader tick happened before it.
 
 ### Deferred public generation
 
@@ -90,30 +93,48 @@ Authentication may construct private receive and decode state, but it must not
 call `ProtocolRuntime::begin_generation`, publish `TransportReady`, publish a
 frame, or enable input before the startup gate confirms the virtual display.
 An unencrypted authenticated compatibility path is not eligible for the
-product High Performance route and must fail before `0x1d` is written.
+product High Performance route and must fail before `0x1d` is written. The
+product security selector therefore requires the encrypted Apple security type;
+legacy unencrypted authentication remains research-only and cannot be selected
+by `AppleProtocolFactory`.
 
 `AppleSurfacePublisher` therefore starts pending. On the first accepted
 `ServerState`, the Apple adapter performs one transactional startup commit:
 
-1. validate the confirmed size against the existing Apple framebuffer budget;
-2. discard any MVS assembly, decoder, CPU pixels, and request bookkeeping that
-   predates confirmation;
-3. create generation 1 for the confirmed size;
-4. call `ProtocolRuntime::begin_generation` exactly once;
-5. request one non-incremental MVS update for the confirmed size;
-6. publish `TransportReady` and the existing capabilities before reading the
-   requested baseline response.
+1. strictly parse and validate the confirmed size against the existing Apple
+   framebuffer budget;
+2. allocate replacement generation-1 receiver, request, CPU surface, dynamic
+   state, and exact full-request bytes without changing public state;
+3. preserve only the timestamp of the earlier full write for wire-rate safety;
+   discard its in-flight/table/generation bookkeeping and all pre-confirmation
+   MVS assembly, decoder, pixels, and viewport targets;
+4. successfully write one existing non-incremental MVS request for the
+   confirmed size;
+5. install the prepared private state and call
+   `ProtocolRuntime::begin_generation` exactly once;
+6. return one private confirmation outcome; the runtime then publishes
+   `TransportReady`, the existing capabilities, and any audio-start state
+   before reading the requested baseline response.
 
-If preparation fails, none of steps 3-6 may be partially visible. A duplicate
-matching startup `ServerState` is idempotent. A later `ServerState` is handled
-only by the existing generation-bound geometry path.
+All fallible private preparation and the confirmed-size wire write occur before
+public generation activation. A public event/frame port failure during
+`begin_generation` keeps the existing terminal, no-rollback API contract and
+must not publish readiness. A duplicate matching startup `ServerState` is
+idempotent. After the startup commit, matching geometry is unchanged and later
+changed geometry is handled only by the existing generation-bound transaction;
+the startup gate is not reused to reject a valid later resize.
 
 ### Confirmation-before-frame rule
 
-MVS records that arrive before confirmation may be consumed to preserve the
-encrypted application-frame boundary, but they cannot establish a public
-baseline or produce `SurfaceUpdate`. The startup commit resets their decoder
-state and explicitly asks for a new full MVS record.
+MVS records that arrive before confirmation may be reassembled only to preserve
+the encrypted application-frame boundary, then are discarded. They must not be
+decoded, install tables, mutate the CPU surface or dynamic-resolution evidence,
+run recovery, publish a `SurfaceUpdate`, or send another full/incremental
+request. Structural pre-confirmation MVS failures reset private assembly and
+continue waiting for the confirmation deadline without a recovery write. The
+startup commit installs fresh decoder state and explicitly asks for a new full
+MVS record. While pending, the normal incomplete-MVS and dynamic-resolution
+tick is disabled; only the five-second startup deadline is serviced.
 
 After confirmation, the existing Apple invariant remains unchanged: only a
 complete, current-generation, non-black type-0 transaction can publish the
@@ -152,6 +173,8 @@ virtual-display size.
 - Missing or malformed initial `ServerState`:
   `apple_high_performance_unavailable`.
 - Invalid or over-budget geometry: `apple_high_performance_unavailable`.
+- Peer close before confirmation: `apple_high_performance_unavailable`; peer
+  close after confirmation retains the ordinary `Closed` result.
 - Failure after the startup commit: retain the existing typed Apple runtime
   failure behavior.
 - No failure path starts Standard, VNC, Curtain, or a second Apple session.
@@ -166,6 +189,16 @@ virtual-display size.
   `frd-compositor-wgpu` retain protocol-neutral session, frame, and input
   contracts.
 - `frd-protocol-rdp` and future RFB adapters are unchanged.
+
+## Evidence and Product-Policy Boundary
+
+ARD 3.10 evidence fixes the existing literal `0x1d`, `0x09`, framebuffer
+request bytes/order and the strict `0x451` geometry envelope. Treating the first
+strict post-`0x1d` ServerState as product-level virtual-display confirmation,
+the five-second deadline, discarding pre-confirmation MVS, the fresh confirmed
+baseline request, the stable failure code, and delayed public generation are
+local fail-closed product policies. They do not claim an undocumented Apple
+flag or redefine the wire protocol.
 
 ## Verification
 
