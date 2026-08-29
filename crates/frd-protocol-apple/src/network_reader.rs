@@ -186,12 +186,6 @@ impl DynamicResolutionRuntime {
         current_surface: DisplaySize,
         next_controller_generation: u64,
     ) -> Result<ServerGeometryPlan> {
-        if observed == current_surface {
-            return Ok(ServerGeometryPlan {
-                disposition: ServerGeometryDisposition::Unchanged,
-                controller_generation: next_controller_generation,
-            });
-        }
         if let crate::dynamic_resolution::DynamicResolutionState::Pending {
             generation,
             previous,
@@ -219,6 +213,12 @@ impl DynamicResolutionRuntime {
                     controller_generation: next_controller_generation,
                 });
             }
+        }
+        if observed == current_surface {
+            return Ok(ServerGeometryPlan {
+                disposition: ServerGeometryDisposition::Unchanged,
+                controller_generation: next_controller_generation,
+            });
         }
 
         Ok(ServerGeometryPlan {
@@ -2238,6 +2238,23 @@ mod migrated_runtime_tests {
             .plan_server_geometry(server_initiated, DisplaySize::new(1366, 768).unwrap(), 1)
             .unwrap_err();
         assert!(previous_error.to_string().contains("previous"));
+    }
+
+    #[test]
+    fn pending_geometry_drift_rejects_unchanged_server_state_before_classification() {
+        let initial = DisplaySize::new(1440, 2560).unwrap();
+        let requested = DisplaySize::new(1280, 720).unwrap();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        runtime
+            .send_target_with(requested, |_| Ok(Instant::now()))
+            .unwrap()
+            .unwrap();
+
+        let error = runtime
+            .plan_server_geometry(initial, initial, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("generation"));
     }
 
     #[test]
