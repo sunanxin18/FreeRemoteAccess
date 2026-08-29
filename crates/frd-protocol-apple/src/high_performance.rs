@@ -7,6 +7,7 @@ use crate::dynamic_resolution::DisplaySize;
 use crate::hpss::ServerStateGeometry;
 
 pub(crate) const APPLE_HIGH_PERFORMANCE_UNAVAILABLE: &str = "apple_high_performance_unavailable";
+const STARTUP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HighPerformanceUnavailable;
@@ -44,14 +45,14 @@ enum HighPerformanceStartupState {
 }
 
 pub(crate) struct HighPerformanceStartupGate {
-    deadline: Instant,
+    requested_at: Instant,
     state: HighPerformanceStartupState,
 }
 
 impl HighPerformanceStartupGate {
     pub(crate) fn new(requested_at: Instant) -> Self {
         Self {
-            deadline: requested_at + Duration::from_secs(5),
+            requested_at,
             state: HighPerformanceStartupState::Awaiting,
         }
     }
@@ -78,7 +79,7 @@ impl HighPerformanceStartupGate {
         match self.state {
             HighPerformanceStartupState::Failed => Err(HighPerformanceUnavailable),
             HighPerformanceStartupState::Confirmed(_) => Ok(()),
-            HighPerformanceStartupState::Awaiting if now < self.deadline => Ok(()),
+            HighPerformanceStartupState::Awaiting if self.is_before_deadline(now) => Ok(()),
             HighPerformanceStartupState::Awaiting => self.fail(),
         }
     }
@@ -103,7 +104,7 @@ impl HighPerformanceStartupGate {
                 Ok(HighPerformanceObservation::Duplicate)
             }
             HighPerformanceStartupState::Confirmed(_) => self.fail(),
-            HighPerformanceStartupState::Awaiting if observed_at < self.deadline => {
+            HighPerformanceStartupState::Awaiting if self.is_before_deadline(observed_at) => {
                 self.state = HighPerformanceStartupState::Confirmed(confirmation);
                 Ok(HighPerformanceObservation::Confirmed(confirmation))
             }
@@ -114,6 +115,10 @@ impl HighPerformanceStartupGate {
     fn fail<T>(&mut self) -> Result<T, HighPerformanceUnavailable> {
         self.state = HighPerformanceStartupState::Failed;
         Err(HighPerformanceUnavailable)
+    }
+
+    fn is_before_deadline(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.requested_at) < STARTUP_CONFIRMATION_TIMEOUT
     }
 }
 
@@ -127,7 +132,6 @@ mod tests {
         HighPerformanceObservation, HighPerformanceStartupGate, HighPerformanceUnavailable,
         APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
     };
-    use crate::dynamic_resolution::DisplaySize;
     use crate::hpss::ServerStateGeometry;
 
     const GEOMETRY: ServerStateGeometry = ServerStateGeometry {
@@ -135,6 +139,19 @@ mod tests {
         width: 1440,
         height: 2560,
     };
+
+    fn latest_addable_instant() -> Instant {
+        let base = Instant::now();
+        let mut maximum_seconds = 0_u64;
+        for bit in (0..u64::BITS).rev() {
+            let candidate = maximum_seconds | (1_u64 << bit);
+            if base.checked_add(Duration::from_secs(candidate)).is_some() {
+                maximum_seconds = candidate;
+            }
+        }
+        base.checked_add(Duration::from_secs(maximum_seconds))
+            .unwrap()
+    }
 
     #[test]
     fn strict_startup_pending_accepts_before_deadline() {
@@ -158,20 +175,27 @@ mod tests {
             .observe_server_state_at(GEOMETRY, requested_at + Duration::from_secs(1))
             .unwrap();
 
-        assert_eq!(
-            observation,
-            HighPerformanceObservation::Confirmed(super::HighPerformanceConfirmation {
-                size: DisplaySize::new(1440, 2560).unwrap(),
-            })
-        );
-        assert_eq!(
-            gate.confirmation(),
-            Some(super::HighPerformanceConfirmation {
-                size: DisplaySize::new(1440, 2560).unwrap(),
-            })
-        );
+        let HighPerformanceObservation::Confirmed(confirmation) = observation else {
+            panic!("首个严格 ServerState 必须确认高性能显示器");
+        };
+        assert_eq!(confirmation.size.width, 1440);
+        assert_eq!(confirmation.size.height, 2560);
+        let confirmed = gate.confirmation().unwrap();
+        assert_eq!(confirmed.size.width, 1440);
+        assert_eq!(confirmed.size.height, 2560);
         assert!(!gate.is_awaiting());
         assert!(gate.is_confirmed());
+    }
+
+    #[test]
+    fn strict_startup_near_instant_limit_does_not_overflow_the_deadline() {
+        let requested_at = latest_addable_instant();
+        assert!(requested_at.checked_add(Duration::from_secs(5)).is_none());
+
+        let mut gate = HighPerformanceStartupGate::new(requested_at);
+
+        gate.ensure_not_timed_out(requested_at).unwrap();
+        assert!(gate.is_awaiting());
     }
 
     #[test]
@@ -258,6 +282,36 @@ mod tests {
                 .unwrap_err(),
             HighPerformanceUnavailable
         );
+    }
+
+    #[test]
+    fn strict_startup_zero_dimension_observation_fails_persistently() {
+        let requested_at = Instant::now();
+        for geometry in [
+            ServerStateGeometry {
+                record_count: 5,
+                width: 0,
+                height: 2560,
+            },
+            ServerStateGeometry {
+                record_count: 5,
+                width: 1440,
+                height: 0,
+            },
+        ] {
+            let mut gate = HighPerformanceStartupGate::new(requested_at);
+
+            let error = gate
+                .observe_server_state_at(geometry, requested_at + Duration::from_secs(1))
+                .unwrap_err();
+
+            assert_eq!(error.code(), APPLE_HIGH_PERFORMANCE_UNAVAILABLE);
+            assert_eq!(
+                gate.ensure_not_timed_out(requested_at + Duration::from_secs(2))
+                    .unwrap_err(),
+                HighPerformanceUnavailable
+            );
+        }
     }
 
     #[test]
