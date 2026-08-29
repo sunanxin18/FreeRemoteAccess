@@ -194,18 +194,26 @@ impl DynamicResolutionRuntime {
         }
         if let crate::dynamic_resolution::DynamicResolutionState::Pending {
             generation,
+            previous,
             target,
             ..
         } = self.controller.state()
         {
+            if *generation != next_controller_generation {
+                bail!(
+                    "Pending 几何 generation 与当前 surface 不一致: pending {} != next {}",
+                    generation,
+                    next_controller_generation
+                );
+            }
+            if *previous != current_surface {
+                bail!(
+                    "Pending 几何 previous 与当前 surface 不一致: pending {:?} != current {:?}",
+                    previous,
+                    current_surface
+                );
+            }
             if *target == observed {
-                if *generation != next_controller_generation {
-                    bail!(
-                        "Pending 几何 generation 与当前 surface 不一致: pending {} != next {}",
-                        generation,
-                        next_controller_generation
-                    );
-                }
                 return Ok(ServerGeometryPlan {
                     disposition: ServerGeometryDisposition::RequestedAck,
                     controller_generation: next_controller_generation,
@@ -1545,6 +1553,28 @@ impl NetworkReaderRuntime {
         }
     }
 
+    fn ensure_server_state_generation_coherence(
+        &self,
+        media_state: &ViewerMediaState,
+    ) -> Result<()> {
+        let surface_generation = self.surface.lock().unwrap().generation;
+        if self.receiver.generation != surface_generation
+            || self.requests.generation != surface_generation
+            || self.publisher.generation() != surface_generation
+            || media_state.generation() != surface_generation
+        {
+            bail!(
+                "ServerState generation 不一致: surface {}, receiver {}, requests {}, publisher {}, media {}",
+                surface_generation,
+                self.receiver.generation,
+                self.requests.generation,
+                self.publisher.generation(),
+                media_state.generation(),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn service_tick(&mut self, writer: &AppleWriterHandle, now: Instant) -> Result<()> {
         let outcome = service_network_reader_tick(
             &mut self.receiver,
@@ -1650,6 +1680,7 @@ impl NetworkReaderRuntime {
             Ok(Media::State(encoding::SERVER_STATE)) => {
                 if let Some((width, height)) = hpss::parse_server_state_w_h(&message) {
                     if let Some(observed) = DisplaySize::new(width, height) {
+                        self.ensure_server_state_generation_coherence(media_state)?;
                         let commit = {
                             let mut dynamic = self.dynamic_resolution.lock().unwrap();
                             let mut surface = self.surface.lock().unwrap();
@@ -2187,6 +2218,29 @@ mod migrated_runtime_tests {
     }
 
     #[test]
+    fn pending_geometry_drift_rejects_mismatched_server_state_before_classification() {
+        let initial = DisplaySize::new(1440, 2560).unwrap();
+        let requested = DisplaySize::new(1280, 720).unwrap();
+        let server_initiated = DisplaySize::new(1456, 1080).unwrap();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        runtime
+            .send_target_with(requested, |_| Ok(Instant::now()))
+            .unwrap()
+            .unwrap();
+
+        let generation_error = runtime
+            .plan_server_geometry(server_initiated, initial, 2)
+            .unwrap_err();
+        assert!(generation_error.to_string().contains("generation"));
+
+        let previous_error = runtime
+            .plan_server_geometry(server_initiated, DisplaySize::new(1366, 768).unwrap(), 1)
+            .unwrap_err();
+        assert!(previous_error.to_string().contains("previous"));
+    }
+
+    #[test]
     fn failed_before_generation_commit_preserves_pending_surface_and_receiver() {
         let initial = DisplaySize::new(1440, 2560).unwrap();
         let requested = DisplaySize::new(1280, 720).unwrap();
@@ -2269,6 +2323,7 @@ mod migrated_runtime_tests {
 
     #[test]
     fn server_initiated_geometry_replaces_surface_and_requests_full_when_dynamic_off() {
+        use std::cell::Cell;
         use std::io::Read as _;
         use std::net::{TcpListener, TcpStream};
         use std::sync::mpsc;
@@ -2308,11 +2363,34 @@ mod migrated_runtime_tests {
             "127.0.0.1".parse().unwrap(),
         )
         .unwrap();
-        let mut releases = 0usize;
+        let releases = Cell::new(0usize);
         let mut before_generation_commit = || {
-            releases += 1;
+            releases.set(releases.get() + 1);
             Ok(())
         };
+
+        reader.receiver.generation = 2;
+        let error = match reader.handle_frame(
+            server_state_message(server_initiated),
+            &writer,
+            &mut media,
+            &mut protocol_runtime,
+            &mut before_generation_commit,
+        ) {
+            Ok(_) => panic!("generation drift must reject ServerState"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("generation 不一致"));
+        assert_eq!(releases.get(), 0);
+        assert_eq!(reader.generation(), 1);
+        assert_eq!(reader.receiver.generation, 2);
+        assert_eq!(reader.requests.generation, 1);
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!((surface.width(), surface.height()), (1440, 2560));
+        drop(surface);
+
+        reader.receiver.generation = 1;
 
         reader
             .handle_frame(
@@ -2324,7 +2402,7 @@ mod migrated_runtime_tests {
             )
             .unwrap();
 
-        assert_eq!(releases, 1);
+        assert_eq!(releases.get(), 1);
         assert_eq!(reader.generation(), 2);
         let surface = reader.surface.lock().unwrap();
         assert_eq!((surface.width(), surface.height()), (1456, 1080));

@@ -366,6 +366,10 @@ impl MediaTransport {
         self.phase
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Atomically retire the previous generation's sockets and negotiation
     /// state before accepting media for a newer display generation.
     pub fn reset_generation(&mut self, generation: u64) -> Result<()> {

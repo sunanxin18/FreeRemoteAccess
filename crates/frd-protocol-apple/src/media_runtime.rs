@@ -84,6 +84,10 @@ impl ViewerMediaState {
         Ok(())
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.transport.generation()
+    }
+
     pub(crate) fn handle_port_announcement(
         &mut self,
         generation: u64,
