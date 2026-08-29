@@ -4,14 +4,13 @@
 //! the sole outbound crypto owner; this module only serializes protocol-neutral
 //! commands into that writer.
 
-use std::error;
-use std::fmt;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use frd_core::{
-    ButtonState, InputEvent, PixelPoint, PointerButton, PointerButtons, PointerSample, SessionId,
-    WheelDelta,
+    ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelPoint, PointerButton,
+    PointerButtons, PointerSample, SessionId, WheelDelta,
 };
 use frd_protocol_api::{
     AudioState, ConnectionStage, ProtocolError, ProtocolExit, ProtocolRuntime, SessionCapabilities,
@@ -28,38 +27,18 @@ use crate::network_reader::{NetworkFrameOutcome, NetworkReaderRuntime};
 use crate::protocol;
 
 const APPLE_RUNTIME_FAILED: &str = "apple_runtime_failed";
-const APPLE_KEYBOARD_INPUT_UNSUPPORTED: &str = "apple_keyboard_input_unsupported_task_10";
 const APPLE_RUNTIME_READ_POLL: Duration = Duration::from_millis(100);
+fn startup_display_size(server_init: DisplaySize) -> DisplaySize {
+    server_init
+}
 
 fn adapter_error() -> ProtocolError {
     ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), APPLE_RUNTIME_FAILED)
 }
 
-#[derive(Debug)]
-struct UnsupportedKeyboardInput;
-
-impl fmt::Display for UnsupportedKeyboardInput {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Apple 迁移阶段仅支持鼠标；统一键盘输入由 Task 10 恢复")
-    }
-}
-
-impl error::Error for UnsupportedKeyboardInput {}
-
-fn is_unsupported_keyboard(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<UnsupportedKeyboardInput>())
-}
-
 fn protocol_exit_for_runtime_error(error: anyhow::Error) -> ProtocolExit {
     if is_peer_closed(&error) {
         ProtocolExit::Closed
-    } else if is_unsupported_keyboard(&error) {
-        ProtocolExit::Failed(ProtocolError::adapter(
-            frd_core::ProtocolId::apple_hpss_mvs(),
-            APPLE_KEYBOARD_INPUT_UNSUPPORTED,
-        ))
     } else {
         ProtocolExit::Failed(adapter_error())
     }
@@ -69,6 +48,7 @@ fn protocol_exit_for_runtime_error(error: anyhow::Error) -> ProtocolExit {
 pub(crate) struct PointerWireState {
     point: Option<PixelPoint>,
     buttons: u8,
+    pressed_keys: BTreeMap<PhysicalKeyCode, u32>,
 }
 
 impl PointerWireState {
@@ -112,12 +92,16 @@ impl PointerWireState {
             InputEvent::ReleaseAll => {
                 self.release_all(writer)?;
             }
-            // PhysicalKeyCode intentionally has no cross-platform keysym
-            // meaning yet. Do not guess one in the Apple adapter or silently
-            // claim the input was handled.
-            InputEvent::PhysicalKey { .. } | InputEvent::Text { .. } => {
-                return Err(UnsupportedKeyboardInput.into());
+            InputEvent::PhysicalKey {
+                code,
+                state,
+                modifiers,
+            } => {
+                self.handle_key(code, state, modifiers, writer)?;
             }
+            // The verified ARD 3.10 path uses RFB/X11 physical keysyms. No
+            // separate committed-text wire path has been established yet.
+            InputEvent::Text { .. } => {}
         }
         Ok(())
     }
@@ -129,6 +113,9 @@ impl PointerWireState {
     }
 
     pub(crate) fn release_all(&mut self, writer: &AppleWriterHandle) -> Result<()> {
+        for keysym in std::mem::take(&mut self.pressed_keys).into_values() {
+            writer.send_private_message(&protocol::msg_key_event(false, keysym))?;
+        }
         let point = self.point.unwrap_or(PixelPoint { x: 0, y: 0 });
         writer.send_private_message(&protocol::msg_pointer_event(
             0,
@@ -140,6 +127,35 @@ impl PointerWireState {
         Ok(())
     }
 
+    fn handle_key(
+        &mut self,
+        code: PhysicalKeyCode,
+        state: KeyState,
+        modifiers: Modifiers,
+        writer: &AppleWriterHandle,
+    ) -> Result<()> {
+        match state {
+            KeyState::Pressed => {
+                let Some(keysym) = self
+                    .pressed_keys
+                    .get(&code)
+                    .copied()
+                    .or_else(|| apple_keysym(code, modifiers))
+                else {
+                    return Ok(());
+                };
+                self.pressed_keys.insert(code, keysym);
+                writer.send_private_message(&protocol::msg_key_event(true, keysym))
+            }
+            KeyState::Released => {
+                let Some(keysym) = self.pressed_keys.remove(&code) else {
+                    return Ok(());
+                };
+                writer.send_private_message(&protocol::msg_key_event(false, keysym))
+            }
+        }
+    }
+
     fn send(&self, mask: u8, writer: &AppleWriterHandle) -> Result<()> {
         let Some(point) = self.point else {
             return Ok(());
@@ -147,6 +163,112 @@ impl PointerWireState {
         let x = u16::try_from(point.x).context("指针 x 超出 Apple RFB u16 范围")?;
         let y = u16::try_from(point.y).context("指针 y 超出 Apple RFB u16 范围")?;
         writer.send_private_message(&protocol::msg_pointer_event(mask, x, y))
+    }
+}
+
+fn apple_keysym(code: PhysicalKeyCode, modifiers: Modifiers) -> Option<u32> {
+    let usage = code.usb_hid_usage();
+    let shifted = modifiers.shift;
+    let keysym = match usage {
+        0x04..=0x1d => {
+            let lower = u32::from(b'a') + u32::from(usage - 0x04);
+            if shifted {
+                lower - 0x20
+            } else {
+                lower
+            }
+        }
+        0x1e..=0x27 => {
+            const PLAIN: [u32; 10] = [
+                b'1' as u32,
+                b'2' as u32,
+                b'3' as u32,
+                b'4' as u32,
+                b'5' as u32,
+                b'6' as u32,
+                b'7' as u32,
+                b'8' as u32,
+                b'9' as u32,
+                b'0' as u32,
+            ];
+            const SHIFTED: [u32; 10] = [
+                b'!' as u32,
+                b'@' as u32,
+                b'#' as u32,
+                b'$' as u32,
+                b'%' as u32,
+                b'^' as u32,
+                b'&' as u32,
+                b'*' as u32,
+                b'(' as u32,
+                b')' as u32,
+            ];
+            let index = usize::from(usage - 0x1e);
+            if shifted {
+                SHIFTED[index]
+            } else {
+                PLAIN[index]
+            }
+        }
+        0x28 => 0xff0d,
+        0x29 => 0xff1b,
+        0x2a => 0xff08,
+        0x2b => 0xff09,
+        0x2c => 0x20,
+        0x2d => shifted_ascii(shifted, b'-', b'_'),
+        0x2e => shifted_ascii(shifted, b'=', b'+'),
+        0x2f => shifted_ascii(shifted, b'[', b'{'),
+        0x30 => shifted_ascii(shifted, b']', b'}'),
+        0x31 | 0x64 => shifted_ascii(shifted, b'\\', b'|'),
+        0x33 => shifted_ascii(shifted, b';', b':'),
+        0x34 => shifted_ascii(shifted, b'\'', b'"'),
+        0x35 => shifted_ascii(shifted, b'`', b'~'),
+        0x36 => shifted_ascii(shifted, b',', b'<'),
+        0x37 => shifted_ascii(shifted, b'.', b'>'),
+        0x38 => shifted_ascii(shifted, b'/', b'?'),
+        0x39 => 0xffe5,
+        0x3a..=0x45 => 0xffbe + u32::from(usage - 0x3a),
+        0x46 => 0xff61,
+        0x47 => 0xff14,
+        0x48 => 0xff13,
+        0x49 => 0xff63,
+        0x4a => 0xff50,
+        0x4b => 0xff55,
+        0x4c => 0xffff,
+        0x4d => 0xff57,
+        0x4e => 0xff56,
+        0x4f => 0xff53,
+        0x50 => 0xff51,
+        0x51 => 0xff54,
+        0x52 => 0xff52,
+        0x53 => 0xff7f,
+        0x54 => 0xffaf,
+        0x55 => 0xffaa,
+        0x56 => 0xffad,
+        0x57 => 0xffab,
+        0x58 => 0xff8d,
+        0x59..=0x61 => 0xffb1 + u32::from(usage - 0x59),
+        0x62 => 0xffb0,
+        0x63 => 0xffae,
+        0x65 => 0xff67,
+        0xe0 => 0xffe3,
+        0xe1 => 0xffe1,
+        0xe2 => 0xffe9,
+        0xe3 => 0xffe7,
+        0xe4 => 0xffe4,
+        0xe5 => 0xffe2,
+        0xe6 => 0xffea,
+        0xe7 => 0xffe8,
+        _ => return None,
+    };
+    Some(keysym)
+}
+
+const fn shifted_ascii(shifted: bool, plain: u8, shifted_value: u8) -> u32 {
+    if shifted {
+        shifted_value as u32
+    } else {
+        plain as u32
     }
 }
 
@@ -191,7 +313,7 @@ pub(crate) fn run_authenticated_session(
         connection,
         metadata,
     } = established;
-    run_established_hpss_session(
+    run_authenticated_session_with_media(
         connection,
         metadata.name,
         metadata.size,
@@ -199,6 +321,7 @@ pub(crate) fn run_authenticated_session(
         session_id,
         false,
         AudioMediaFlow::MacToPc,
+        metadata.encoding_profile == crate::session::SessionEncodingProfile::AppleUdpMedia,
     )
 }
 
@@ -213,6 +336,29 @@ pub fn run_established_hpss_session(
     dynamic_resolution_enabled: bool,
     audio_flow: AudioMediaFlow,
 ) -> ProtocolExit {
+    run_authenticated_session_with_media(
+        connection,
+        display_name,
+        initial_pixel_size,
+        runtime,
+        session_id,
+        dynamic_resolution_enabled,
+        audio_flow,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_authenticated_session_with_media(
+    connection: crate::AppleConnection,
+    display_name: String,
+    initial_pixel_size: frd_core::PixelSize,
+    runtime: ProtocolRuntime,
+    session_id: SessionId,
+    dynamic_resolution_enabled: bool,
+    audio_flow: AudioMediaFlow,
+    udp_media_enabled: bool,
+) -> ProtocolExit {
     match run_authenticated_session_inner(
         connection,
         display_name,
@@ -221,6 +367,7 @@ pub fn run_established_hpss_session(
         session_id,
         dynamic_resolution_enabled,
         audio_flow,
+        udp_media_enabled,
     ) {
         Ok(()) => ProtocolExit::Closed,
         Err(error) => protocol_exit_for_runtime_error(error),
@@ -235,12 +382,14 @@ fn run_authenticated_session_inner(
     session_id: SessionId,
     dynamic_resolution_enabled: bool,
     audio_flow: AudioMediaFlow,
+    udp_media_enabled: bool,
 ) -> Result<()> {
-    let initial_size = DisplaySize::new(
+    let server_init_size = DisplaySize::new(
         u16::try_from(initial_pixel_size.width).context("Apple 初始宽度超出 u16")?,
         u16::try_from(initial_pixel_size.height).context("Apple 初始高度超出 u16")?,
     )
     .context("Apple 初始显示尺寸无效")?;
+    let initial_size = startup_display_size(server_init_size);
     let media_server_address = connection.peer_addr()?.ip();
     let media_bind_address = connection.local_addr()?.ip();
 
@@ -250,13 +399,16 @@ fn run_authenticated_session_inner(
     runtime
         .publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
             dynamic_resolution: dynamic_resolution_enabled,
-            remote_audio: true,
+            remote_audio: udp_media_enabled,
+            text_input: true,
             ..SessionCapabilities::default()
         }))
         .map_err(|error| anyhow::anyhow!(error.code()))?;
-    runtime
-        .publish_event(SessionEvent::AudioState(AudioState::Starting))
-        .map_err(|error| anyhow::anyhow!(error.code()))?;
+    if udp_media_enabled {
+        runtime
+            .publish_event(SessionEvent::AudioState(AudioState::Starting))
+            .map_err(|error| anyhow::anyhow!(error.code()))?;
+    }
 
     // Same verified startup ordering and timing as the legacy HPSS viewer.
     std::thread::sleep(Duration::from_millis(200));
@@ -359,7 +511,9 @@ fn run_authenticated_session_inner(
     })();
 
     let _ = runtime.publish_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
-    let _ = runtime.publish_event(SessionEvent::AudioState(AudioState::Stopped));
+    if udp_media_enabled {
+        let _ = runtime.publish_event(SessionEvent::AudioState(AudioState::Stopped));
+    }
     let _ = media.close(reader.generation());
     #[cfg(test)]
     connection
@@ -390,6 +544,41 @@ mod tests {
     };
 
     struct NoopWake;
+
+    #[test]
+    fn startup_geometry_preserves_the_authenticated_server_init() {
+        let landscape = crate::dynamic_resolution::DisplaySize::new(1920, 1080).unwrap();
+        let portrait = crate::dynamic_resolution::DisplaySize::new(1440, 2560).unwrap();
+
+        assert_eq!(super::startup_display_size(landscape), landscape);
+        assert_eq!(super::startup_display_size(portrait), portrait);
+    }
+
+    #[test]
+    fn normalized_usb_hid_keys_follow_the_verified_legacy_keysym_mapping() {
+        let plain = frd_core::Modifiers::default();
+        let shifted = frd_core::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::apple_keysym(frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04), plain),
+            Some(0x61)
+        );
+        assert_eq!(
+            super::apple_keysym(frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04), shifted),
+            Some(0x41)
+        );
+        assert_eq!(
+            super::apple_keysym(frd_core::PhysicalKeyCode::from_usb_hid_usage(0x1e), shifted),
+            Some(0x21)
+        );
+        assert_eq!(
+            super::apple_keysym(frd_core::PhysicalKeyCode::from_usb_hid_usage(0x28), plain),
+            Some(0xff0d)
+        );
+    }
 
     impl RuntimeWake for NoopWake {
         fn wake(&self) -> Result<(), ProtocolError> {
@@ -576,16 +765,5 @@ mod tests {
 
         release_peer_tx.send(()).unwrap();
         peer.join().unwrap();
-    }
-
-    #[test]
-    fn unsupported_keyboard_input_returns_stable_fail_closed_exit() {
-        let exit = super::protocol_exit_for_runtime_error(super::UnsupportedKeyboardInput.into());
-
-        assert!(matches!(
-            exit,
-            frd_protocol_api::ProtocolExit::Failed(error)
-                if error.code() == "apple_keyboard_input_unsupported_task_10"
-        ));
     }
 }

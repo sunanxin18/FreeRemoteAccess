@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,9 +21,12 @@ use crate::session::{self, SessionEncodingProfile};
 use crate::{ard, rsa_srp, srp};
 
 const APPLE_CONNECTION_FAILED: &str = "apple_connection_failed";
+const APPLE_NEGOTIATION_FAILED: &str = "apple_negotiation_failed";
 const APPLE_AUTHENTICATION_FAILED: &str = "apple_authentication_failed";
 const APPLE_PROTOCOL_MISMATCH: &str = "apple_protocol_mismatch";
 const SECURITY_FAILURE_REASON_MAX_BYTES: usize = 4096;
+const PRODUCT_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
+    SessionEncodingProfile::AppleTcpMvs;
 
 fn apple_error(code: &'static str) -> ProtocolError {
     ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), code)
@@ -79,6 +82,7 @@ pub struct AppleSessionMetadata {
     pub size: frd_core::PixelSize,
     pub pixel_format: frd_wire_rfb::PixelFormat,
     pub name: String,
+    pub encoding_profile: SessionEncodingProfile,
 }
 
 pub struct EstablishedAppleSession {
@@ -152,13 +156,16 @@ impl ProtocolSession for AppleProtocolSession {
 fn connect_authenticated(
     request: &ConnectRequest,
 ) -> Result<EstablishedAppleSession, ProtocolError> {
-    let stream = TcpStream::connect((request.endpoint.host(), request.endpoint.port()))
-        .map_err(|_| apple_error(APPLE_CONNECTION_FAILED))?;
+    let stream = match literal_socket_address(request.endpoint.host(), request.endpoint.port()) {
+        Some(address) => TcpStream::connect(address),
+        None => TcpStream::connect((request.endpoint.host(), request.endpoint.port())),
+    }
+    .map_err(|_| apple_error(APPLE_CONNECTION_FAILED))?;
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut connection = AppleConnection::new(stream);
     let (version, offered) =
-        negotiate(&mut connection).map_err(|_| apple_error(APPLE_CONNECTION_FAILED))?;
+        negotiate(&mut connection).map_err(|_| apple_error(APPLE_NEGOTIATION_FAILED))?;
     let credentials = request
         .credentials
         .as_ref()
@@ -173,8 +180,70 @@ fn connect_authenticated(
         password,
     )
     .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
-    finish_authenticated_session(authenticated, SessionEncodingProfile::AppleUdpMedia)
+    finish_authenticated_session(authenticated, PRODUCT_SESSION_ENCODING_PROFILE)
         .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))
+}
+
+fn literal_socket_address(host: &str, port: u16) -> Option<SocketAddr> {
+    host.parse::<IpAddr>()
+        .ok()
+        .map(|address| SocketAddr::new(address, port))
+}
+
+#[cfg(test)]
+mod product_profile_tests {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+
+    use crate::session::SessionEncodingProfile;
+
+    #[test]
+    fn product_desktop_uses_the_verified_tcp_mvs_profile() {
+        assert_eq!(
+            super::PRODUCT_SESSION_ENCODING_PROFILE,
+            SessionEncodingProfile::AppleTcpMvs
+        );
+    }
+
+    #[test]
+    fn literal_ip_endpoint_bypasses_windows_name_resolution() {
+        assert_eq!(
+            super::literal_socket_address("192.0.2.44", 5900),
+            Some("192.0.2.44:5900".parse().unwrap())
+        );
+        assert_eq!(super::literal_socket_address("mac.example", 5900), None);
+    }
+
+    #[test]
+    fn invalid_server_banner_reports_negotiation_failure_not_connect_failure() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&[0_u8; 12]).unwrap();
+        });
+        let session_id = frd_core::SessionId::allocate();
+        let mut password = frd_core::SecretBuffer::new(b"test-password".to_vec());
+        let request = frd_protocol_api::ConnectRequest {
+            session_id,
+            endpoint: frd_core::Endpoint::new(address.ip().to_string(), address.port()).unwrap(),
+            protocol_id: frd_core::ProtocolId::apple_hpss_mvs(),
+            credentials: Some(frd_protocol_api::Credentials {
+                username: "test-user".to_owned(),
+                password: password.take(),
+            }),
+            saved_server_pin: None,
+        };
+
+        let error = match super::connect_authenticated(&request) {
+            Ok(_) => panic!("invalid banner must fail negotiation"),
+            Err(error) => error,
+        };
+        server.join().unwrap();
+
+        assert_eq!(error.code(), "apple_negotiation_failed");
+    }
 }
 
 fn negotiate(connection: &mut AppleConnection) -> Result<((u8, u8), Vec<u8>)> {
@@ -325,6 +394,7 @@ pub fn finish_authenticated_session(
             size: server_init.size,
             pixel_format: server_init.pixel_format,
             name: server_init.name,
+            encoding_profile: profile,
         },
     })
 }

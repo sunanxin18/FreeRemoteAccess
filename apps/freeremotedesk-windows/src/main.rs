@@ -17,7 +17,7 @@ use frd_protocol_api::{ProtocolCatalog, ProtocolFactory};
 use frd_protocol_apple::AppleProtocolFactory;
 use frd_shell_desktop::{
     AudioOutputFactory, DesktopApplication, DesktopPlatformStores, DesktopUserEvent,
-    FatalComponent, FatalOperation, FatalReason, FatalReport,
+    DesktopWindowConfiguration, FatalComponent, FatalOperation, FatalReason, FatalReport,
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -71,6 +71,9 @@ impl RunnerOutcome {
                 FatalOperation::EventLoopRun,
                 FatalReason::EventLoopRunFailed,
             ),
+            RunnerFailure::WindowIcon => {
+                (FatalOperation::Initialize, FatalReason::WindowChromeFailed)
+            }
         };
         Self::Fatal(FatalReport::internal(
             FatalComponent::Application,
@@ -90,6 +93,18 @@ enum RunnerFailure {
     IdentityStore,
     CredentialStore,
     EventLoopRun,
+    WindowIcon,
+}
+
+const WINDOW_ICON_RGBA: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/app-icon/windows/window-icon-64.rgba"
+));
+
+fn product_window_configuration() -> Result<DesktopWindowConfiguration, RunnerFailure> {
+    let icon = winit::window::Icon::from_rgba(WINDOW_ICON_RGBA.to_vec(), 64, 64)
+        .map_err(|_| RunnerFailure::WindowIcon)?;
+    Ok(DesktopWindowConfiguration { icon: Some(icon) })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -145,6 +160,11 @@ fn run(cli: Cli) -> RunnerOutcome {
 
     if let Some(options) = cli.test_texture_options() {
         let mut application = DesktopApplication::new_test_texture(proxy, options);
+        let configuration = match product_window_configuration() {
+            Ok(configuration) => configuration,
+            Err(failure) => return RunnerOutcome::from_failure(failure),
+        };
+        application.set_window_configuration(configuration);
         let run_result = event_loop.run_app(&mut application);
         return finish_event_loop(run_result, application.runner_result());
     }
@@ -195,6 +215,11 @@ fn run(cli: Cli) -> RunnerOutcome {
         Arc::new(WindowsAudioFactory),
         proxy,
     );
+    let configuration = match product_window_configuration() {
+        Ok(configuration) => configuration,
+        Err(failure) => return RunnerOutcome::from_failure(failure),
+    };
+    application.set_window_configuration(configuration);
     let run_result = event_loop.run_app(&mut application);
     finish_event_loop(run_result, application.runner_result())
 }
@@ -246,7 +271,8 @@ mod tests {
     use frd_shell_desktop::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 
     use super::{
-        finish_event_loop, purge_pending_credentials, runner_decision, RunnerFailure, RunnerOutcome,
+        finish_event_loop, product_window_configuration, purge_pending_credentials,
+        runner_decision, RunnerFailure, RunnerOutcome, WINDOW_ICON_RGBA,
     };
 
     struct TestCredentialStore {
@@ -336,6 +362,12 @@ mod tests {
                 "FRD-WIN-FATAL-001 component=application operation=credential_store reason=credential_store_unavailable details=none\n"
             )
         );
+    }
+
+    #[test]
+    fn window_icon_uses_exact_64_pixel_rgba_asset() {
+        assert_eq!(WINDOW_ICON_RGBA.len(), 64 * 64 * 4);
+        assert!(product_window_configuration().unwrap().icon.is_some());
     }
 
     #[test]

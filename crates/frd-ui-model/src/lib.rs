@@ -1,5 +1,9 @@
 //! 单窗口 UI 可展示状态与低频连接提交 DTO。
 
+mod chrome;
+
+pub use chrome::{CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel};
+
 use frd_core::{CredentialProviderId, SecretBuffer, TargetSystem};
 use frd_platform_api::{ConnectionProfileKey, SavedConnectionProfile};
 use frd_protocol_api::{

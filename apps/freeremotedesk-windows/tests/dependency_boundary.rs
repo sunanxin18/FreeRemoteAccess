@@ -11,7 +11,6 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .current_dir(workspace)
         .env("RUSTUP_TOOLCHAIN", "stable")
-        .env("CARGO_BUILD_JOBS", "2")
         .output()
         .expect("cargo metadata starts");
     assert!(

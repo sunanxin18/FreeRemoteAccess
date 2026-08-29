@@ -1,7 +1,7 @@
 mod state;
 mod surface;
 
-use frd_core::PixelSize;
+use frd_core::{ContentViewport, PixelSize};
 use frd_protocol_api::PresentationEvent;
 use frd_render_wgpu::{
     GpuCleanToken, GpuContext, GpuContextError, GpuFaultClass, RecoveryRequirement, RemoteRenderer,
@@ -117,6 +117,27 @@ impl PresentationCompositor {
         overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
         hooks: &dyn PresentationHooks,
     ) -> Result<Option<PresentationEvent>, PresentError> {
+        self.render_with_viewport(remote, None, false, overlay, hooks)
+    }
+
+    pub fn render_in(
+        &mut self,
+        remote: &mut RemoteRenderer,
+        viewport: Option<ContentViewport>,
+        overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        hooks: &dyn PresentationHooks,
+    ) -> Result<Option<PresentationEvent>, PresentError> {
+        self.render_with_viewport(remote, viewport, true, overlay, hooks)
+    }
+
+    fn render_with_viewport(
+        &mut self,
+        remote: &mut RemoteRenderer,
+        viewport: Option<ContentViewport>,
+        explicit_viewport: bool,
+        overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        hooks: &dyn PresentationHooks,
+    ) -> Result<Option<PresentationEvent>, PresentError> {
         let context_pair = ContextPairState::new(self.context.context_id(), remote.context_id());
         require_context_match(context_pair.matches() && remote.uses_context(&self.context))?;
         if let Some(fault) = self.context.observed_fault() {
@@ -157,7 +178,11 @@ impl PresentationCompositor {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("FreeRemoteDesk presentation encoder"),
                         });
-                let receipt = remote.record(&mut encoder, &view, physical_size, target_format)?;
+                let receipt = if explicit_viewport {
+                    remote.record_in(&mut encoder, &view, viewport, target_format)?
+                } else {
+                    remote.record(&mut encoder, &view, physical_size, target_format)?
+                };
                 overlay(&mut encoder, &view);
                 hooks.before_submit();
                 self.context.queue().submit([encoder.finish()]);

@@ -1,4 +1,4 @@
-use frd_core::{ContentViewport, PixelSize};
+use frd_core::PixelRect;
 
 use crate::RendererError;
 
@@ -63,8 +63,7 @@ impl RemotePass {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         bind_group: Option<&wgpu::BindGroup>,
-        remote_size: Option<PixelSize>,
-        drawable: PixelSize,
+        content: Option<PixelRect>,
     ) {
         let color_attachment = Some(wgpu::RenderPassColorAttachment {
             view: target,
@@ -84,13 +83,12 @@ impl RemotePass {
             multiview_mask: None,
         });
 
-        if let (Some(bind_group), Some(remote_size)) = (bind_group, remote_size) {
-            let viewport = ContentViewport::fit(remote_size, drawable);
+        if let (Some(bind_group), Some(content)) = (bind_group, content) {
             pass.set_viewport(
-                viewport.content.x as f32,
-                viewport.content.y as f32,
-                viewport.content.width as f32,
-                viewport.content.height as f32,
+                content.x as f32,
+                content.y as f32,
+                content.width as f32,
+                content.height as f32,
                 0.0,
                 1.0,
             );

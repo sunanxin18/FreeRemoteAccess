@@ -15,61 +15,10 @@ pub fn show_session_page(
 
     match page {
         AppPage::ConnectionForm(_) => None,
-        AppPage::Connecting {
-            stage, diagnostics, ..
-        } => {
-            ui.heading("正在连接");
-            ui.label(format!("阶段：{}", stage_label(stage)));
-            if let Some(diagnostics) = diagnostics {
-                ui.label(format!("诊断：{diagnostics}"));
-            }
-            ui.button("取消")
-                .clicked()
-                .then_some(AppIntent::CancelConnect)
-        }
-        AppPage::AwaitingFirstFrame {
-            stage, diagnostics, ..
-        } => {
-            ui.heading("等待首个完整画面");
-            ui.label(format!("阶段：{}", stage_label(stage)));
-            if let Some(diagnostics) = diagnostics {
-                ui.label(format!("诊断：{diagnostics}"));
-            }
-            ui.button("取消")
-                .clicked()
-                .then_some(AppIntent::CancelConnect)
-        }
-        AppPage::Disconnecting { .. } => {
-            ui.heading("正在断开连接");
-            ui.label("正在清理会话资源，请稍候。");
-            None
-        }
-        AppPage::RemoteSession {
-            capabilities,
-            diagnostics,
-            ..
-        } => {
-            if let Some(diagnostics) = diagnostics {
-                ui.colored_label(ui.visuals().warn_fg_color, diagnostics);
-            }
-            ui.horizontal(|ui| {
-                ui.label(if capabilities.remote_audio {
-                    "远端音频可用"
-                } else {
-                    "远端音频不可用"
-                });
-                ui.label(
-                    if capabilities.clipboard_read || capabilities.clipboard_write {
-                        "剪贴板可用"
-                    } else {
-                        "剪贴板不可用"
-                    },
-                );
-            });
-            ui.button("断开连接")
-                .clicked()
-                .then_some(AppIntent::Disconnect)
-        }
+        AppPage::Connecting { .. }
+        | AppPage::AwaitingFirstFrame { .. }
+        | AppPage::Disconnecting { .. }
+        | AppPage::RemoteSession { .. } => None,
         AppPage::Failed { code, .. } => {
             ui.heading("连接失败");
             ui.label(format!("错误代码：{code}"));
@@ -77,15 +26,6 @@ pub fn show_session_page(
                 .clicked()
                 .then_some(AppIntent::ReturnToConnection)
         }
-    }
-}
-
-fn stage_label(stage: &frd_protocol_api::ConnectionStage) -> &'static str {
-    match stage {
-        frd_protocol_api::ConnectionStage::Connecting => "建立连接",
-        frd_protocol_api::ConnectionStage::TransportReady => "传输已就绪",
-        frd_protocol_api::ConnectionStage::AwaitingIdentityDecision => "等待身份确认",
-        frd_protocol_api::ConnectionStage::Disconnecting => "正在断开",
     }
 }
 

@@ -1,6 +1,7 @@
 mod connection;
 mod login_icons;
 mod session;
+mod session_chrome;
 
 pub use connection::{show_connection_form, show_connection_form_with_state, show_page};
 pub use login_icons::{
@@ -8,6 +9,10 @@ pub use login_icons::{
     LOGIN_MATERIAL_SYMBOLS_FONT_FAMILY,
 };
 pub use session::show_session_page;
+pub use session_chrome::{
+    install_session_chrome_font, session_chrome_metrics, show_session_chrome, SessionChromeMetrics,
+    MATERIAL_SYMBOLS_FONT_FAMILY,
+};
 
 #[cfg(test)]
 #[test]

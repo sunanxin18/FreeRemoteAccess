@@ -9,44 +9,64 @@ pub struct ContentViewport {
 
 impl ContentViewport {
     pub fn fit(remote: PixelSize, drawable: PixelSize) -> Self {
-        let remote = PixelSize {
-            width: remote.width.max(1),
-            height: remote.height.max(1),
-        };
         let drawable = PixelSize {
             width: drawable.width.max(1),
             height: drawable.height.max(1),
         };
+        Self::fit_in(
+            remote,
+            drawable,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: drawable.width,
+                height: drawable.height,
+            },
+        )
+        .expect("完整 drawable 必须形成有效视口")
+    }
 
-        let drawable_by_remote_height = u128::from(drawable.width) * u128::from(remote.height);
-        let drawable_height_by_remote_width =
-            u128::from(drawable.height) * u128::from(remote.width);
+    pub fn fit_in(remote: PixelSize, drawable: PixelSize, bounds: PixelRect) -> Option<Self> {
+        let remote = PixelSize {
+            width: remote.width.max(1),
+            height: remote.height.max(1),
+        };
+        if drawable.width == 0
+            || drawable.height == 0
+            || bounds.width == 0
+            || bounds.height == 0
+            || bounds.x.checked_add(bounds.width)? > drawable.width
+            || bounds.y.checked_add(bounds.height)? > drawable.height
+        {
+            return None;
+        }
+
+        let drawable_by_remote_height = u128::from(bounds.width) * u128::from(remote.height);
+        let drawable_height_by_remote_width = u128::from(bounds.height) * u128::from(remote.width);
         let (width, height) = if drawable_by_remote_height <= drawable_height_by_remote_width {
             (
-                drawable.width,
-                ((u128::from(remote.height) * u128::from(drawable.width))
-                    / u128::from(remote.width))
-                .clamp(1, u128::from(drawable.height)) as u32,
+                bounds.width,
+                ((u128::from(remote.height) * u128::from(bounds.width)) / u128::from(remote.width))
+                    .clamp(1, u128::from(bounds.height)) as u32,
             )
         } else {
             (
-                ((u128::from(remote.width) * u128::from(drawable.height))
-                    / u128::from(remote.height))
-                .clamp(1, u128::from(drawable.width)) as u32,
-                drawable.height,
+                ((u128::from(remote.width) * u128::from(bounds.height)) / u128::from(remote.height))
+                    .clamp(1, u128::from(bounds.width)) as u32,
+                bounds.height,
             )
         };
 
-        Self {
+        Some(Self {
             drawable,
             content: PixelRect {
-                x: (drawable.width - width) / 2,
-                y: (drawable.height - height) / 2,
+                x: bounds.x + (bounds.width - width) / 2,
+                y: bounds.y + (bounds.height - height) / 2,
                 width,
                 height,
             },
             remote,
-        }
+        })
     }
 
     pub fn map_pointer(self, drawable_x: f32, drawable_y: f32) -> Option<PixelPoint> {
@@ -198,5 +218,41 @@ mod tests {
             Some(PixelPoint { x: 0, y: 4 })
         );
         assert_eq!(viewport.map_pointer(1.0, 4.0), None);
+    }
+
+    #[test]
+    fn inset_drawable_keeps_remote_pixels_and_pointer_mapping_below_toolbar() {
+        let viewport = ContentViewport::fit_in(
+            PixelSize {
+                width: 100,
+                height: 100,
+            },
+            PixelSize {
+                width: 300,
+                height: 240,
+            },
+            crate::PixelRect {
+                x: 0,
+                y: 40,
+                width: 300,
+                height: 200,
+            },
+        )
+        .expect("工具栏下方区域有效");
+
+        assert_eq!(
+            viewport.content,
+            crate::PixelRect {
+                x: 50,
+                y: 40,
+                width: 200,
+                height: 200,
+            }
+        );
+        assert_eq!(
+            viewport.map_pointer(50.0, 40.0),
+            Some(PixelPoint { x: 0, y: 0 })
+        );
+        assert_eq!(viewport.map_pointer(50.0, 39.999), None);
     }
 }

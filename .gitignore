@@ -1,5 +1,10 @@
 /target
 *.png
+!/assets/
+!/assets/app-icon/
+!/assets/app-icon/**/*.png
+/assets/app-icon/source/app-icon-master-reference.png
+/assets/app-icon/source/portal-foreground-matte.png
 CREDENTIALS.local.md
 /ard_capture
 /ard_re

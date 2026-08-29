@@ -14,8 +14,9 @@ use frd_session::{
     SessionStartOwner, SessionStartPermit,
 };
 use frd_ui_model::{
-    ConnectionDraft, ConnectionForm, ConnectionSubmission, LaunchOptions, Page,
-    ProfilePersistenceWarning, ProtocolChoice,
+    CapabilityGlyphState, ConnectionDraft, ConnectionForm, ConnectionGlyph, ConnectionSubmission,
+    LaunchOptions, Page, ProfilePersistenceWarning, ProtocolChoice, SessionChromeAction,
+    SessionChromeModel,
 };
 
 use crate::AppIntent;
@@ -267,6 +268,61 @@ impl AppController {
 
     pub fn page(&self) -> &Page {
         &self.page
+    }
+
+    /// 返回连接开始后固定几何的标题栏状态；登录页和终态错误页不创建会话控件。
+    pub fn session_chrome(&self) -> Option<SessionChromeModel> {
+        let unavailable = CapabilityGlyphState::Unavailable;
+        match &self.page {
+            Page::ConnectionForm(_) => None,
+            Page::Connecting { diagnostics, .. } => Some(SessionChromeModel {
+                connection: ConnectionGlyph::Connecting,
+                diagnostics: diagnostics.clone(),
+                audio: unavailable,
+                clipboard: unavailable,
+                action: Some(SessionChromeAction::Cancel),
+            }),
+            Page::AwaitingFirstFrame { diagnostics, .. } => Some(SessionChromeModel {
+                connection: ConnectionGlyph::WaitingForFrame,
+                diagnostics: diagnostics.clone(),
+                audio: unavailable,
+                clipboard: unavailable,
+                action: Some(SessionChromeAction::Cancel),
+            }),
+            Page::Disconnecting { .. } => Some(SessionChromeModel {
+                connection: ConnectionGlyph::Disconnecting,
+                diagnostics: None,
+                audio: unavailable,
+                clipboard: unavailable,
+                action: None,
+            }),
+            Page::Failed { code, .. } => Some(SessionChromeModel {
+                connection: ConnectionGlyph::Failed,
+                diagnostics: Some(code.clone()),
+                audio: unavailable,
+                clipboard: unavailable,
+                action: None,
+            }),
+            Page::RemoteSession {
+                capabilities,
+                diagnostics,
+                ..
+            } => Some(SessionChromeModel {
+                connection: ConnectionGlyph::Connected,
+                diagnostics: diagnostics.clone(),
+                audio: if capabilities.remote_audio {
+                    CapabilityGlyphState::Available
+                } else {
+                    unavailable
+                },
+                clipboard: if capabilities.clipboard_read || capabilities.clipboard_write {
+                    CapabilityGlyphState::Available
+                } else {
+                    unavailable
+                },
+                action: Some(SessionChromeAction::Disconnect),
+            }),
+        }
     }
 
     pub fn connection_form_mut(&mut self) -> Option<&mut ConnectionForm> {

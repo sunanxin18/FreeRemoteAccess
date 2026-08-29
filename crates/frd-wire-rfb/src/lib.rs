@@ -7,9 +7,9 @@ mod server_init;
 pub use banner::{decode_banner, encode_banner, ParsedBanner, WireError, RFB_BANNER_BYTES};
 pub use messages::{
     decode_rectangle_header, decode_security_types, decode_security_types_header,
-    encode_framebuffer_update_request, encode_set_encodings, encode_set_pixel_format,
-    RectangleHeader, FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES, SET_ENCODINGS_HEADER_BYTES,
-    SET_PIXEL_FORMAT_MESSAGE_BYTES,
+    encode_framebuffer_update_request, encode_key_event, encode_set_encodings,
+    encode_set_pixel_format, RectangleHeader, FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES,
+    KEY_EVENT_MESSAGE_BYTES, SET_ENCODINGS_HEADER_BYTES, SET_PIXEL_FORMAT_MESSAGE_BYTES,
 };
 pub use server_init::{
     decode_server_init, decode_server_init_header, PixelFormat, ServerInit, RFB_PIXEL_FORMAT_BYTES,
@@ -126,6 +126,18 @@ mod tests {
         assert_eq!(
             encode_framebuffer_update_request(true, 2, 3, 4, 5).unwrap(),
             [3, 1, 0, 2, 0, 3, 0, 4, 0, 5]
+        );
+    }
+
+    #[test]
+    fn key_event_preserves_the_exact_rfb_wire_bytes() {
+        assert_eq!(
+            encode_key_event(true, 0x0000_0041),
+            [4, 1, 0, 0, 0, 0, 0, 0x41]
+        );
+        assert_eq!(
+            encode_key_event(false, 0x0000_ff0d),
+            [4, 0, 0, 0, 0, 0, 0xff, 0x0d]
         );
     }
 

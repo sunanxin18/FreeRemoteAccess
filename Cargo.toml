@@ -25,13 +25,14 @@ members = [
     "apps/freeremotedesk-windows",
     "tools/frd-legacy-minifb-lab",
     "tools/frd-wgpu-smoke",
+    "tools/frd-icon-assets",
 ]
 
 [workspace.dependencies]
 winit = "=0.30.13"
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "wgsl"] }
 egui = "=0.36.1"
-egui-winit = { version = "=0.36.1", default-features = false }
+egui-winit = { version = "=0.36.1", default-features = false, features = ["accesskit"] }
 egui-wgpu = { version = "=0.36.1", default-features = false }
 raw-window-handle = "=0.6.2"
 

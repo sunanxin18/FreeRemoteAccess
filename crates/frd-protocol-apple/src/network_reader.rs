@@ -402,9 +402,9 @@ struct ReaderRequestState {
 }
 
 impl ReaderRequestState {
-    fn after_startup(sent_at: Instant) -> Self {
+    fn after_startup(sent_at: Instant, generation: u64) -> Self {
         Self {
-            generation: 0,
+            generation,
             framebuffer_request_in_flight: true,
             last_full_request: Some(sent_at),
             table_followup: TableFollowupState::None,
@@ -1356,11 +1356,13 @@ impl NetworkReaderRuntime {
     ) -> Result<Self, ProtocolError> {
         let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
             .ok_or(ProtocolError::FramePortRejected)?;
+        let generation = 1;
         let publisher = AppleSurfacePublisher::begin(protocol_runtime, session_id, size)?;
-        let surface = DisplaySurface::new(1, size).map_err(|_| ProtocolError::FramePortRejected)?;
+        let surface =
+            DisplaySurface::new(generation, size).map_err(|_| ProtocolError::FramePortRejected)?;
         Ok(Self {
-            receiver: MvsReceiveState::new(1),
-            requests: ReaderRequestState::after_startup(startup_fb_sent_at),
+            receiver: MvsReceiveState::new(generation),
+            requests: ReaderRequestState::after_startup(startup_fb_sent_at, generation),
             surface: Arc::new(Mutex::new(surface)),
             viewport_requests: Arc::new(Mutex::new(ViewportRequestQueue::default())),
             dynamic_resolution: Arc::new(Mutex::new(DynamicResolutionRuntime::new(
@@ -2052,7 +2054,7 @@ mod migrated_runtime_tests {
         let mut runtime = DynamicResolutionRuntime::new(initial, true);
         arm_runtime(&mut runtime, initial, false);
         let mut receiver = MvsReceiveState::new(0);
-        let mut requests = ReaderRequestState::after_startup(started);
+        let mut requests = ReaderRequestState::after_startup(started, 0);
         let mut queue = ViewportRequestQueue::default();
         queue.observe(target, started);
         let mut dynamic_sends = Vec::new();
@@ -2153,7 +2155,7 @@ mod migrated_runtime_tests {
         let mut runtime = DynamicResolutionRuntime::new(initial, true);
         arm_runtime(&mut runtime, initial, false);
         let mut receiver = MvsReceiveState::new(0);
-        let mut requests = ReaderRequestState::after_startup(started);
+        let mut requests = ReaderRequestState::after_startup(started, 0);
         let mut queue = ViewportRequestQueue::default();
         requests.consume_mvs_response();
         let mut incrementals = 0;
@@ -2186,7 +2188,7 @@ mod migrated_runtime_tests {
         let mut runtime = DynamicResolutionRuntime::new(initial, true);
         arm_runtime(&mut runtime, initial, false);
         let mut receiver = MvsReceiveState::new(0);
-        let mut requests = ReaderRequestState::after_startup(started);
+        let mut requests = ReaderRequestState::after_startup(started, 0);
         let mut queue = ViewportRequestQueue::default();
         requests.consume_mvs_response();
         receiver.install_tables(&type_two_tables_fixture()).unwrap();
@@ -2268,7 +2270,7 @@ mod migrated_runtime_tests {
         let mut runtime = DynamicResolutionRuntime::new(initial, true);
         arm_runtime(&mut runtime, initial, false);
         let mut receiver = MvsReceiveState::new(0);
-        let mut requests = ReaderRequestState::after_startup(started);
+        let mut requests = ReaderRequestState::after_startup(started, 0);
         let mut queue = ViewportRequestQueue::default();
         requests.consume_mvs_response();
         receiver.install_tables(&type_two_tables_fixture()).unwrap();
@@ -2336,7 +2338,7 @@ mod migrated_runtime_tests {
             .begin_at(rect, 100, &[0], started)
             .unwrap()
             .is_none());
-        let mut requests = ReaderRequestState::after_startup(started);
+        let mut requests = ReaderRequestState::after_startup(started, 0);
         let mut queue = ViewportRequestQueue::default();
         queue.observe(latest, started + Duration::from_millis(10));
         let mut full_writes = 0;
@@ -2639,7 +2641,7 @@ mod migrated_runtime_tests {
     }
     #[test]
     fn slice_d_opaque_response_boundary_sends_one_normal_incremental_only() {
-        let mut requests = ReaderRequestState::after_startup(Instant::now());
+        let mut requests = ReaderRequestState::after_startup(Instant::now(), 0);
         requests.consume_mvs_response();
         let mut writes = 0usize;
 

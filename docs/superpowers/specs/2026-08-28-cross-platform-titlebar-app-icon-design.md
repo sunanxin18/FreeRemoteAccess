@@ -4,8 +4,10 @@ Date: 2026-08-28
 
 ## Status
 
-Approved direction; implementation requires a separate reviewed plan. The
-generated image is a visual candidate, not yet a packaged production asset.
+Implemented and validated for the Windows-first product shell on 2026-08-28.
+The shared model, official Material Symbols title-bar controls, common geometry,
+and canonical cross-platform icon assets are in place. macOS and Linux native
+shell runtime validation remains in their later packaging phases.
 
 ## Goals
 
@@ -76,7 +78,10 @@ responsibilities.
 
 ## Session Glyphs
 
-The shared glyph vocabulary is resolution-independent and visually consistent:
+The shared glyph vocabulary uses Google's official Material Symbols Rounded
+family at optical size 24, weight 400, fill 0, and grade 0. FreeRemoteDesk
+ships a deterministic offline subset under Apache License 2.0; the application
+never fetches fonts at runtime. The vocabulary is visually consistent:
 
 - connection: distinct connecting, connected, disconnecting, and failed shapes;
 - remote audio: speaker-active and speaker-unavailable shapes;
@@ -132,8 +137,8 @@ pipelines.
 - Keep shared state and glyph semantics out of platform code.
 - Keep window messages, AppKit title-bar configuration, and X11/Wayland
   decoration behavior behind platform adapters.
-- Use compact vector/path glyphs for session actions; do not reuse raster app
-  icon artwork as interface controls.
+- Use the vendored Material Symbols Rounded subset for session actions; do not
+  retain hand-drawn substitutes or reuse raster app-icon artwork as controls.
 - Do not add a fallback toolbar beneath the title bar.
 - Do not let title-bar failures terminate an otherwise valid network session;
   report a stable shell error before exposing a malformed remote viewport.

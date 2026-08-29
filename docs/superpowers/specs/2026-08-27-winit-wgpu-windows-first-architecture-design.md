@@ -466,6 +466,22 @@ ConnectionForm
 
 Windows、macOS、Linux 和 Android 可以复用 `frd-ui-egui` 的行为与控件，但窗口生命周期分别由 shell 适配。HarmonyOS NEXT 使用 ArkUI 控件呈现相同 `frd-ui-model` 状态，并通过稳定、粗粒度 C ABI 发送意图；ArkTS 不参与帧传输。
 
+### 平台字体与缺字回退
+
+普通 UI 文本由 shell 按平台和界面语言建立字体链，禁止用一套内嵌字体覆盖平台习惯：
+
+| 平台 | 拉丁/UI 主字体 | 简中/繁中 | 日文 | 韩文 |
+| --- | --- | --- | --- | --- |
+| Windows | Segoe UI | Microsoft YaHei UI / Microsoft JhengHei UI | Yu Gothic UI | Malgun Gothic |
+| macOS | San Francisco | PingFang SC/TC | Hiragino Sans | Apple SD Gothic Neo |
+| Linux | 桌面可用的默认 Sans | 系统 Noto Sans CJK 对应区域字形 | 同左 | 同左 |
+| Android | Roboto | 系统 Noto Sans CJK SC/TC | 系统 Noto Sans CJK JP | 系统 Noto Sans CJK KR |
+| HarmonyOS NEXT | ArkUI 平台默认字体；Rust shell 不替换 | 由 ArkUI 字体级联处理 | 同左 | 同左 |
+
+`frd-shell-desktop` 只读取当前界面语言对应的一套 CJK 系统字体，避免同时把多份大型 TTC 读入内存。当前产品文案是简体中文，因此使用 `zh-Hans` 字形顺序；未来本地化必须先切换界面语言，再切换统一汉字的区域字形，不能仅凭 Unicode 码点猜测中文或日文。若平台主字体不可用，内嵌的 Noto Sans SC 可成为比例字体主字体；存在平台字体时，它只处于普通文本和等宽文本链的最后一级。Material Symbols 使用独立命名字体族，不参与普通文字回退。
+
+内嵌 Noto Sans SC 字体、SHA-256 来源记录和 SIL OFL 1.1 必须一同分发。若后续恢复 iOS 客户端，其原生 UI 宿主直接使用系统 San Francisco 和系统区域 CJK 级联，不从 Rust 包复制 Apple 系统字体。
+
 Android shell 必须把重复的 `resumed`/`suspended` 当作幂等事件：仅在没有有效 lease 时 attach，仅在存在 lease 时 detach；绝不能复用上一轮 Activity 的 Surface。
 
 HarmonyOS NEXT C ABI 只暴露 opaque engine handle、版本化 `#[repr(C)]` POD 命令/状态和明确所有权的 buffer，不直接暴露 Rust enum、`String`、`Vec`、trait object 或 wgpu 类型。销毁顺序固定为：停止 present，销毁 `wgpu::Surface`，清除 Rust 中的窗口访问，再释放 `OHNativeWindow` 引用。正式支持前必须完成 HAP、XComponent、前后台、输入、IME、窗口缩放和真机 present POC；未通过 POC 前不得宣称已支持。

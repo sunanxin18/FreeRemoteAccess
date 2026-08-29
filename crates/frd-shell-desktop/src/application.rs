@@ -26,13 +26,15 @@ use frd_session::{
     CleanupComplete, CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
     SessionStartFailure, SessionStartOutcome, SessionStartPermit,
 };
-use frd_ui_model::{LaunchOptions, Page};
+use frd_ui_model::{
+    CapabilityGlyphState, ConnectionGlyph, LaunchOptions, Page, SessionChromeAction,
+    SessionChromeModel,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
-use winit::keyboard::ModifiersState;
-use winit::platform::scancode::PhysicalKeyExtScancode;
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::cleanup::{
@@ -40,18 +42,30 @@ use crate::cleanup::{
     PendingCleanup,
 };
 use crate::fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};
+use crate::input::hid_usage_from_key_code;
 use crate::lifecycle::{
     execute_presentation_recovery, OcclusionAction, PresentationLifecycle, PresentationOperation,
     PresentationRecoveryBackend, PresentationRecoveryContext, PresentationRecoveryFailure,
 };
+use crate::platform::PlatformWindowChrome;
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::ui_fonts::system_font_definitions;
-use crate::{InputGate, InputOwnership, InputRouter};
+use crate::{
+    ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter, WindowChromeAdapter,
+    TITLE_BAR_HEIGHT_POINTS,
+};
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
 const FRAME_MAILBOX_PIXEL_LIMIT: usize = 64 * 1024 * 1024;
 const MEDIA_MAILBOX_ENTRY_LIMIT: usize = 16;
 const PENDING_LAUNCH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
+    connection: ConnectionGlyph::Connected,
+    diagnostics: None,
+    audio: CapabilityGlyphState::Unavailable,
+    clipboard: CapabilityGlyphState::Unavailable,
+    action: Some(SessionChromeAction::Disconnect),
+};
 
 pub trait WakeSink: Send + Sync {
     fn wake(&self) -> Result<(), ProtocolError>;
@@ -738,6 +752,13 @@ pub enum DesktopUserEvent {
     ApplicationFatal(FatalReport),
     ResizeTestTexture,
     ExitTestTexture,
+    AccessKit(egui_winit::accesskit_winit::Event),
+}
+
+impl From<egui_winit::accesskit_winit::Event> for DesktopUserEvent {
+    fn from(event: egui_winit::accesskit_winit::Event) -> Self {
+        Self::AccessKit(event)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -796,7 +817,34 @@ struct RemoteBinding {
     size: PixelSize,
 }
 
+#[derive(Default)]
+struct DpiTransition {
+    pending: bool,
+}
+
+impl DpiTransition {
+    fn begin(&mut self) {
+        self.pending = true;
+    }
+
+    fn finish_resize(&mut self) {
+        self.pending = false;
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    fn settle(&mut self, actual: PixelSize) -> Option<PixelSize> {
+        self.pending.then(|| {
+            self.pending = false;
+            actual
+        })
+    }
+}
+
 struct DesktopWindowState {
+    chrome: PlatformWindowChrome,
     window: Arc<Window>,
     gpu: GpuContext,
     renderer: RemoteRenderer,
@@ -805,8 +853,26 @@ struct DesktopWindowState {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     physical_size: PixelSize,
+    remote_area: Option<PixelRect>,
     lifecycle: PresentationLifecycle,
     remote: Option<RemoteBinding>,
+    dpi_transition: DpiTransition,
+}
+
+impl DesktopWindowState {
+    fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayout> {
+        let insets = self.chrome.native_insets(&self.window);
+        let layout = ChromeLayout::for_window(
+            self.physical_size.width,
+            self.physical_size.height,
+            self.window.scale_factor(),
+            insets.leading_px,
+            insets.trailing_px,
+        )?;
+        self.remote_area = Some(layout.content_rect);
+        self.chrome.publish_hit_regions(ChromeHitRegions { layout });
+        Some(layout)
+    }
 }
 
 #[derive(Default)]
@@ -909,11 +975,129 @@ pub struct DesktopApplication {
     return_to_form_after_cancelled_launch: bool,
     repaint_scheduler: RepaintScheduler,
     armed_repaint: Option<RepaintPlan>,
+    window_configuration: DesktopWindowConfiguration,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DesktopWindowConfiguration {
+    pub icon: Option<winit::window::Icon>,
+}
+
+fn mark_texture_deltas_applied(deltas: &mut egui::TexturesDelta) {
+    deltas.clear();
+}
+
+#[cfg(test)]
+mod dpi_transition_tests {
+    use frd_core::PixelSize;
+
+    use super::DpiTransition;
+
+    #[test]
+    fn scale_change_waits_for_the_matching_physical_size() {
+        let mut transition = DpiTransition::default();
+        let committed = PixelSize::new(1200, 800).unwrap();
+        let resized = PixelSize::new(1800, 1200).unwrap();
+
+        transition.begin();
+        assert!(transition.is_pending());
+        assert_eq!(transition.settle(committed), Some(committed));
+
+        transition.begin();
+        transition.finish_resize();
+        assert!(!transition.is_pending());
+        assert_eq!(transition.settle(resized), None);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn paint_platform_window_controls(
+    ui: &egui::Ui,
+    layout: ChromeLayout,
+    scale_factor: f64,
+    maximized: bool,
+) {
+    // WM_NCCALCSIZE gives WGPU the full frame, so Windows no longer paints the
+    // caption glyph pixels. These are visual mirrors only: DwmDefWindowProc
+    // still owns native caption hit testing, hover tooltips and Snap Layout.
+    let color = ui.visuals().text_color();
+    let stroke = egui::Stroke::new(1.2, color);
+    let to_points = |rect: crate::ChromeRect| {
+        let scale = scale_factor as f32;
+        egui::Rect::from_min_size(
+            egui::pos2(rect.x as f32 / scale, rect.y as f32 / scale),
+            egui::vec2(rect.width as f32 / scale, rect.height as f32 / scale),
+        )
+    };
+    if let Some(rect) = layout.minimize_button.map(to_points) {
+        let center = rect.center();
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-5.0, 3.0),
+                center + egui::vec2(5.0, 3.0),
+            ],
+            stroke,
+        );
+    }
+    if let Some(rect) = layout.maximize_button.map(to_points) {
+        let center = rect.center();
+        if maximized {
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center + egui::vec2(-1.5, 1.5), egui::vec2(8.0, 8.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center + egui::vec2(1.5, -1.5), egui::vec2(8.0, 8.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        } else {
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)),
+                0.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    if let Some(rect) = layout.close_button.map(to_points) {
+        let center = rect.center();
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-5.0, -5.0),
+                center + egui::vec2(5.0, 5.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(5.0, -5.0),
+                center + egui::vec2(-5.0, 5.0),
+            ],
+            stroke,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn paint_platform_window_controls(
+    _ui: &egui::Ui,
+    _layout: ChromeLayout,
+    _scale_factor: f64,
+    _maximized: bool,
+) {
 }
 
 impl DesktopApplication {
     pub fn runner_result(&self) -> Result<(), FatalReport> {
         self.exit_state.runner_result()
+    }
+
+    pub fn set_window_configuration(&mut self, configuration: DesktopWindowConfiguration) {
+        self.window_configuration = configuration;
     }
 
     pub fn new_product(
@@ -939,6 +1123,7 @@ impl DesktopApplication {
             return_to_form_after_cancelled_launch: false,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
+            window_configuration: DesktopWindowConfiguration::default(),
         }
     }
 
@@ -977,16 +1162,23 @@ impl DesktopApplication {
             return_to_form_after_cancelled_launch: false,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
+            window_configuration: DesktopWindowConfiguration::default(),
         }
     }
 
-    fn initialize_window(event_loop: &ActiveEventLoop) -> Result<DesktopWindowState, FatalReport> {
+    fn initialize_window(
+        &self,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<DesktopWindowState, FatalReport> {
         let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
                         .with_title("FreeRemoteDesk")
+                        .with_window_icon(self.window_configuration.icon.clone())
+                        .with_visible(false)
                         .with_inner_size(LogicalSize::new(1100.0, 720.0))
+                        .with_min_inner_size(LogicalSize::new(520.0, 360.0))
                         .with_resizable(true),
                 )
                 .map_err(|_| {
@@ -997,6 +1189,14 @@ impl DesktopApplication {
                     )
                 })?,
         );
+        let mut chrome = PlatformWindowChrome::new();
+        chrome.configure(&window).map_err(|_| {
+            FatalReport::internal(
+                FatalComponent::Window,
+                FatalOperation::Initialize,
+                FatalReason::WindowChromeFailed,
+            )
+        })?;
         let physical = window.inner_size();
         let physical_size = PixelSize::new(physical.width, physical.height).ok_or_else(|| {
             FatalReport::internal(
@@ -1045,8 +1245,9 @@ impl DesktopApplication {
             )
         })?;
         let egui_context = egui::Context::default();
+        egui_context.enable_accesskit();
         egui_context.set_fonts(system_font_definitions());
-        let egui_state = egui_winit::State::new(
+        let mut egui_state = egui_winit::State::new(
             egui_context.clone(),
             egui::ViewportId::ROOT,
             window.as_ref(),
@@ -1054,12 +1255,14 @@ impl DesktopApplication {
             window.theme(),
             Some(gpu.device().limits().max_texture_dimension_2d as usize),
         );
+        egui_state.init_accesskit(event_loop, &window, self.proxy.clone());
         let egui_renderer = egui_wgpu::Renderer::new(
             gpu.device(),
             target_format,
             egui_wgpu::RendererOptions::default(),
         );
-        Ok(DesktopWindowState {
+        let mut state = DesktopWindowState {
+            chrome,
             window,
             gpu,
             renderer,
@@ -1068,9 +1271,25 @@ impl DesktopApplication {
             egui_state,
             egui_renderer,
             physical_size,
+            remote_area: Some(PixelRect {
+                x: 0,
+                y: 0,
+                width: physical_size.width,
+                height: physical_size.height,
+            }),
             lifecycle: PresentationLifecycle::new(physical_size),
             remote: None,
-        })
+            dpi_transition: DpiTransition::default(),
+        };
+        state.refresh_chrome_geometry().ok_or_else(|| {
+            FatalReport::internal(
+                FatalComponent::Window,
+                FatalOperation::Initialize,
+                FatalReason::WindowChromeFailed,
+            )
+        })?;
+        state.window.set_visible(true);
+        Ok(state)
     }
 
     fn install_repaint_callback(&self, context: &egui::Context) {
@@ -1266,10 +1485,36 @@ impl DesktopApplication {
         }
     }
 
+    fn commit_window_resize(&mut self, size: PixelSize) {
+        let mut committed = false;
+        let mut presentation_error = None;
+        if let Some(window) = self.window.as_mut() {
+            let result = window.compositor.resize(size);
+            match window.lifecycle.finish_resize(size, result) {
+                Ok(()) => {
+                    window.physical_size = size;
+                    window.dpi_transition.finish_resize();
+                    let _ = window.refresh_chrome_geometry();
+                    committed = true;
+                }
+                Err(error) => presentation_error = Some(error),
+            }
+        }
+        if committed {
+            self.send_viewport_changed();
+            self.request_redraw();
+        } else if let Some(error) = presentation_error {
+            self.transition_presentation_error(
+                PresentationRecoveryContext::Resize { requested: size },
+                error,
+            );
+        }
+    }
+
     fn content_viewport(&self) -> Option<ContentViewport> {
         let window = self.window.as_ref()?;
         let remote = window.remote?;
-        Some(ContentViewport::fit(remote.size, window.physical_size))
+        ContentViewport::fit_in(remote.size, window.physical_size, window.remote_area?)
     }
 
     fn send_viewport_changed(&self) {
@@ -1301,9 +1546,14 @@ impl DesktopApplication {
         let Some(window) = self.window.as_mut() else {
             return;
         };
-        if !window.lifecycle.accepts_redraw() {
+        if !window.lifecycle.accepts_redraw() || window.dpi_transition.is_pending() {
             return;
         }
+        let Some(chrome_layout) = window.refresh_chrome_geometry() else {
+            window.remote_area = None;
+            return;
+        };
+        let window_maximized = window.window.is_maximized();
         let raw_input = window.egui_state.take_egui_input(&window.window);
         let egui_context = window.egui_context.clone();
         let connection_busy = self.sessions.is_active();
@@ -1311,51 +1561,90 @@ impl DesktopApplication {
         let controller = self.launch.controller_mut();
         let catalog = &self.catalog;
         let mut intent = None;
-        let output = egui_context.run_ui(raw_input, |root_ui| match mode {
-            DesktopMode::Product => {
-                if let Some(form) = controller.connection_form_mut() {
-                    egui::CentralPanel::default_margins().show(root_ui, |ui| {
-                        intent = frd_ui_egui::show_connection_form_with_state(
-                            ui,
-                            form,
-                            catalog,
-                            connection_busy,
-                        );
-                    });
-                } else if matches!(controller.page(), AppPage::RemoteSession { .. }) {
-                    egui::Panel::top("remote-toolbar").show(root_ui, |ui| {
-                        intent = frd_ui_egui::show_session_page(
-                            ui,
-                            controller.page(),
-                            controller.current_server_identity_challenge(),
-                        );
-                    });
-                } else {
-                    egui::CentralPanel::default_margins().show(root_ui, |ui| {
-                        intent = frd_ui_egui::show_session_page(
-                            ui,
-                            controller.page(),
-                            controller.current_server_identity_challenge(),
-                        );
-                    });
+        let product_chrome = controller.session_chrome();
+        let mut output = egui_context.run_ui(raw_input, |root_ui| {
+            egui::Panel::top("window-session-chrome")
+                .exact_size(TITLE_BAR_HEIGHT_POINTS as f32)
+                .frame(
+                    egui::Frame::new()
+                        .fill(root_ui.style().visuals.panel_fill)
+                        .inner_margin(egui::Margin::symmetric(0, 4)),
+                )
+                .show(root_ui, |ui| {
+                    let chrome = match mode {
+                        DesktopMode::Product => product_chrome.as_ref(),
+                        DesktopMode::TestTexture {
+                            stage: TestTextureStage::RemoteSession,
+                            ..
+                        } => Some(&TEST_SESSION_CHROME),
+                        DesktopMode::TestTexture {
+                            stage: TestTextureStage::Connection,
+                            ..
+                        } => None,
+                    };
+                    if let Some(chrome) = chrome {
+                        let metrics = frd_ui_egui::session_chrome_metrics();
+                        ui.horizontal(|ui| {
+                            ui.add_space(
+                                ((ui.available_width() - metrics.total_width) / 2.0).max(0.0),
+                            );
+                            if let Some(action) = frd_ui_egui::show_session_chrome(ui, chrome) {
+                                intent = Some(match action {
+                                    frd_ui_model::SessionChromeAction::Cancel => {
+                                        AppIntent::CancelConnect
+                                    }
+                                    frd_ui_model::SessionChromeAction::Disconnect => {
+                                        AppIntent::Disconnect
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    paint_platform_window_controls(
+                        ui,
+                        chrome_layout,
+                        window.window.scale_factor(),
+                        window_maximized,
+                    );
+                });
+
+            match mode {
+                DesktopMode::Product => {
+                    if let Some(form) = controller.connection_form_mut() {
+                        egui::CentralPanel::default_margins().show(root_ui, |ui| {
+                            intent = frd_ui_egui::show_connection_form_with_state(
+                                ui,
+                                form,
+                                catalog,
+                                connection_busy,
+                            );
+                        });
+                    } else if controller.current_server_identity_challenge().is_some()
+                        || matches!(controller.page(), AppPage::Failed { .. })
+                    {
+                        egui::CentralPanel::default_margins().show(root_ui, |ui| {
+                            intent = frd_ui_egui::show_session_page(
+                                ui,
+                                controller.page(),
+                                controller.current_server_identity_challenge(),
+                            );
+                        });
+                    }
                 }
-            }
-            DesktopMode::TestTexture { stage, .. } => match stage {
-                TestTextureStage::Connection => {
+                DesktopMode::TestTexture {
+                    stage: TestTextureStage::Connection,
+                    ..
+                } => {
                     egui::CentralPanel::default_margins().show(root_ui, |ui| {
                         ui.heading("连接远程桌面");
                         ui.label("离线测试纹理正在初始化，不会读取凭据或连接网络。");
                     });
                 }
-                TestTextureStage::RemoteSession => {
-                    egui::Panel::top("test-remote-toolbar").show(root_ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading("测试远程会话");
-                            ui.label("离线 2×2 BGRX 纹理");
-                        });
-                    });
-                }
-            },
+                DesktopMode::TestTexture {
+                    stage: TestTextureStage::RemoteSession,
+                    ..
+                } => {}
+            }
         });
         window
             .egui_state
@@ -1365,6 +1654,9 @@ impl DesktopApplication {
             size_in_pixels: [window.physical_size.width, window.physical_size.height],
             pixels_per_point: output.pixels_per_point,
         };
+        let remote_viewport = window.remote.and_then(|remote| {
+            ContentViewport::fit_in(remote.size, window.physical_size, window.remote_area?)
+        });
         for (id, deltas) in &output.textures_delta.set {
             for delta in deltas {
                 window.egui_renderer.update_texture(
@@ -1378,8 +1670,9 @@ impl DesktopApplication {
         let hook = WindowPresentationHook(window.window.clone());
         let gpu = window.gpu.clone();
         let egui_renderer = &mut window.egui_renderer;
-        let render_result = window.compositor.render(
+        let render_result = window.compositor.render_in(
             &mut window.renderer,
+            remote_viewport,
             |encoder, target| {
                 let callbacks = egui_renderer.update_buffers(
                     gpu.device(),
@@ -1412,6 +1705,7 @@ impl DesktopApplication {
         for id in &output.textures_delta.free {
             window.egui_renderer.free_texture(id);
         }
+        mark_texture_deltas_applied(&mut output.textures_delta);
 
         let presentation_error = match render_result {
             Ok(Some(event)) => {
@@ -1618,9 +1912,15 @@ impl DesktopApplication {
                     .wheel(horizontal, vertical, viewport, pointer_ownership)
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                event.physical_key.to_scancode().and_then(|code| {
-                    self.input
-                        .key(code, map_key_state(event.state), keyboard_ownership)
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                hid_usage_from_key_code(code).and_then(|usage| {
+                    self.input.key(
+                        frd_core::PhysicalKeyCode::from_usb_hid_usage(usage),
+                        map_key_state(event.state),
+                        keyboard_ownership,
+                    )
                 })
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
@@ -1883,7 +2183,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         }
         event_loop.set_control_flow(ControlFlow::Wait);
         if self.window.is_none() {
-            match Self::initialize_window(event_loop) {
+            match self.initialize_window(event_loop) {
                 Ok(window) => {
                     self.install_repaint_callback(&window.egui_context);
                     self.window = Some(window);
@@ -1944,6 +2244,25 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 }
             }
             DesktopUserEvent::ExitTestTexture => event_loop.exit(),
+            DesktopUserEvent::AccessKit(event) => {
+                let Some(window) = self
+                    .window
+                    .as_mut()
+                    .filter(|window| window.window.id() == event.window_id)
+                else {
+                    return;
+                };
+                match event.window_event {
+                    egui_winit::accesskit_winit::WindowEvent::InitialTreeRequested => {
+                        window.window.request_redraw();
+                    }
+                    egui_winit::accesskit_winit::WindowEvent::ActionRequested(request) => {
+                        window.egui_state.on_accesskit_action_request(request);
+                        window.window.request_redraw();
+                    }
+                    egui_winit::accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+                }
+            }
         }
     }
 
@@ -1993,29 +2312,20 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             }
             WindowEvent::Resized(size) => {
                 if let Some(size) = PixelSize::new(size.width, size.height) {
-                    let mut committed = false;
-                    let mut presentation_error = None;
-                    if let Some(window) = self.window.as_mut() {
-                        let result = window.compositor.resize(size);
-                        match window.lifecycle.finish_resize(size, result) {
-                            Ok(()) => {
-                                window.physical_size = size;
-                                committed = true;
-                            }
-                            Err(error) => presentation_error = Some(error),
-                        }
-                    }
-                    if committed {
-                        self.send_viewport_changed();
-                        self.request_redraw();
-                    } else if let Some(error) = presentation_error {
-                        self.transition_presentation_error(
-                            PresentationRecoveryContext::Resize { requested: size },
-                            error,
-                        );
-                    }
+                    self.commit_window_resize(size);
                 } else if let Some(window) = self.window.as_mut() {
                     window.compositor.pause_presenting();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let refresh_result = self.window.as_mut().map(|window| {
+                    window.dpi_transition.begin();
+                    window.chrome.refresh_for_dpi(&window.window)
+                });
+                if refresh_result.is_some_and(|result| result.is_err()) {
+                    eprintln!(
+                        "标题栏缩放刷新失败（FRD-WIN-SHELL-001: window_chrome_dpi_refresh_failed）"
+                    );
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -2098,6 +2408,26 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 ),
             );
             return;
+        }
+        let pending_dpi_size = self.window.as_mut().and_then(|window| {
+            let actual = window.window.inner_size();
+            let actual = PixelSize::new(actual.width, actual.height)?;
+            window.dpi_transition.settle(actual)
+        });
+        if let Some(size) = pending_dpi_size {
+            let geometry_only = self
+                .window
+                .as_ref()
+                .is_some_and(|window| window.physical_size == size);
+            if geometry_only {
+                if let Some(window) = self.window.as_mut() {
+                    let _ = window.refresh_chrome_geometry();
+                }
+                self.send_viewport_changed();
+                self.request_redraw();
+            } else {
+                self.commit_window_resize(size);
+            }
         }
         if let Some(plan) = self.armed_repaint {
             if now >= plan.deadline {
@@ -2419,8 +2749,8 @@ mod tests {
         AppAction, AppController, AppIntent, AppPlatformStores, PresentationEvent, ProductPolicy,
     };
     use frd_core::{
-        Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, ProtocolId, SecretBuffer,
-        SessionId, TargetSystem,
+        Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelRect, ProtocolId,
+        SecretBuffer, SessionId, TargetSystem,
     };
     use frd_frame::{FrameCompleteness, PixelFormat};
     use frd_media_api::{AudioOutput, AudioOutputError, MediaFrame};
@@ -2434,10 +2764,35 @@ mod tests {
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
 
     use super::{
-        AcceptedLaunchOutcome, ApplicationExitState, AudioOutputFactory, SessionHost,
-        TestLaunchOutcome, UnavailableCredentialStore, UnavailableProfileStore, WakeSink,
-        WorkerKind, WorkerSpawner,
+        mark_texture_deltas_applied, AcceptedLaunchOutcome, ApplicationExitState,
+        AudioOutputFactory, SessionHost, TestLaunchOutcome, UnavailableCredentialStore,
+        UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
     };
+
+    #[test]
+    fn applied_egui_texture_deltas_are_empty_before_drop() {
+        let mut deltas = egui::TexturesDelta::default();
+        deltas.free.insert(egui::TextureId::Managed(7));
+
+        mark_texture_deltas_applied(&mut deltas);
+
+        assert!(deltas.set.is_empty());
+        assert!(deltas.free.is_empty());
+    }
+
+    #[test]
+    fn remote_area_starts_below_the_dpi_scaled_titlebar() {
+        let layout = crate::ChromeLayout::for_window(1100, 720, 1.5, 0, 144).unwrap();
+        assert_eq!(
+            layout.content_rect,
+            PixelRect {
+                x: 0,
+                y: 60,
+                width: 1100,
+                height: 660,
+            }
+        );
+    }
 
     struct CountingWake(AtomicUsize);
 
@@ -3271,7 +3626,7 @@ mod tests {
         });
 
         let unsupported_key = InputEvent::PhysicalKey {
-            code: PhysicalKeyCode(30),
+            code: PhysicalKeyCode::from_usb_hid_usage(30),
             state: KeyState::Pressed,
             modifiers: Modifiers::default(),
         };

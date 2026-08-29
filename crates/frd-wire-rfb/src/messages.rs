@@ -6,6 +6,7 @@ pub const RECTANGLE_HEADER_BYTES: usize = 12;
 pub const SET_PIXEL_FORMAT_MESSAGE_BYTES: usize = 20;
 pub const SET_ENCODINGS_HEADER_BYTES: usize = 4;
 pub const FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES: usize = 10;
+pub const KEY_EVENT_MESSAGE_BYTES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RectangleHeader {
@@ -145,6 +146,14 @@ pub fn encode_framebuffer_update_request(
     bytes[6..8].copy_from_slice(&width.to_be_bytes());
     bytes[8..].copy_from_slice(&height.to_be_bytes());
     Ok(bytes)
+}
+
+pub fn encode_key_event(down: bool, keysym: u32) -> [u8; KEY_EVENT_MESSAGE_BYTES] {
+    let mut bytes = [0_u8; KEY_EVENT_MESSAGE_BYTES];
+    bytes[0] = 4;
+    bytes[1] = u8::from(down);
+    bytes[4..].copy_from_slice(&keysym.to_be_bytes());
+    bytes
 }
 
 fn validate_security_type_count(count: usize) -> Result<(), WireError> {

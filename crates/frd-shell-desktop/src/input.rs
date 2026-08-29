@@ -4,6 +4,7 @@ use frd_core::{
     ButtonState, ContentViewport, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton,
     PointerButtons, PointerSample, SessionId, WheelDelta,
 };
+use winit::keyboard::KeyCode;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InputGate {
@@ -32,8 +33,8 @@ pub struct InputRouter {
     local_forward_pressed: bool,
     remote_back_pressed: bool,
     remote_forward_pressed: bool,
-    local_keys: BTreeSet<u32>,
-    remote_keys: BTreeSet<u32>,
+    local_keys: BTreeSet<PhysicalKeyCode>,
+    remote_keys: BTreeSet<PhysicalKeyCode>,
     pointer_armed: bool,
     keyboard_armed: bool,
     modifiers: Modifiers,
@@ -197,7 +198,7 @@ impl InputRouter {
 
     pub fn key(
         &mut self,
-        code: u32,
+        code: PhysicalKeyCode,
         state: KeyState,
         ownership: InputOwnership,
     ) -> Option<InputEvent> {
@@ -228,7 +229,7 @@ impl InputRouter {
             KeyState::Released => {}
         }
         Some(InputEvent::PhysicalKey {
-            code: PhysicalKeyCode(code),
+            code,
             state,
             modifiers: self.modifiers,
         })
@@ -278,6 +279,119 @@ impl InputRouter {
     }
 }
 
+pub(crate) fn hid_usage_from_key_code(code: KeyCode) -> Option<u16> {
+    use KeyCode::*;
+
+    Some(match code {
+        KeyA => 0x04,
+        KeyB => 0x05,
+        KeyC => 0x06,
+        KeyD => 0x07,
+        KeyE => 0x08,
+        KeyF => 0x09,
+        KeyG => 0x0a,
+        KeyH => 0x0b,
+        KeyI => 0x0c,
+        KeyJ => 0x0d,
+        KeyK => 0x0e,
+        KeyL => 0x0f,
+        KeyM => 0x10,
+        KeyN => 0x11,
+        KeyO => 0x12,
+        KeyP => 0x13,
+        KeyQ => 0x14,
+        KeyR => 0x15,
+        KeyS => 0x16,
+        KeyT => 0x17,
+        KeyU => 0x18,
+        KeyV => 0x19,
+        KeyW => 0x1a,
+        KeyX => 0x1b,
+        KeyY => 0x1c,
+        KeyZ => 0x1d,
+        Digit1 => 0x1e,
+        Digit2 => 0x1f,
+        Digit3 => 0x20,
+        Digit4 => 0x21,
+        Digit5 => 0x22,
+        Digit6 => 0x23,
+        Digit7 => 0x24,
+        Digit8 => 0x25,
+        Digit9 => 0x26,
+        Digit0 => 0x27,
+        Enter => 0x28,
+        Escape => 0x29,
+        Backspace => 0x2a,
+        Tab => 0x2b,
+        Space => 0x2c,
+        Minus => 0x2d,
+        Equal => 0x2e,
+        BracketLeft => 0x2f,
+        BracketRight => 0x30,
+        Backslash => 0x31,
+        Semicolon => 0x33,
+        Quote => 0x34,
+        Backquote => 0x35,
+        Comma => 0x36,
+        Period => 0x37,
+        Slash => 0x38,
+        CapsLock => 0x39,
+        F1 => 0x3a,
+        F2 => 0x3b,
+        F3 => 0x3c,
+        F4 => 0x3d,
+        F5 => 0x3e,
+        F6 => 0x3f,
+        F7 => 0x40,
+        F8 => 0x41,
+        F9 => 0x42,
+        F10 => 0x43,
+        F11 => 0x44,
+        F12 => 0x45,
+        PrintScreen => 0x46,
+        ScrollLock => 0x47,
+        Pause => 0x48,
+        Insert => 0x49,
+        Home => 0x4a,
+        PageUp => 0x4b,
+        Delete => 0x4c,
+        End => 0x4d,
+        PageDown => 0x4e,
+        ArrowRight => 0x4f,
+        ArrowLeft => 0x50,
+        ArrowDown => 0x51,
+        ArrowUp => 0x52,
+        NumLock => 0x53,
+        NumpadDivide => 0x54,
+        NumpadMultiply => 0x55,
+        NumpadSubtract => 0x56,
+        NumpadAdd => 0x57,
+        NumpadEnter => 0x58,
+        Numpad1 => 0x59,
+        Numpad2 => 0x5a,
+        Numpad3 => 0x5b,
+        Numpad4 => 0x5c,
+        Numpad5 => 0x5d,
+        Numpad6 => 0x5e,
+        Numpad7 => 0x5f,
+        Numpad8 => 0x60,
+        Numpad9 => 0x61,
+        Numpad0 => 0x62,
+        NumpadDecimal => 0x63,
+        IntlBackslash => 0x64,
+        ContextMenu => 0x65,
+        ControlLeft => 0xe0,
+        ShiftLeft => 0xe1,
+        AltLeft => 0xe2,
+        SuperLeft => 0xe3,
+        ControlRight => 0xe4,
+        ShiftRight => 0xe5,
+        AltRight => 0xe6,
+        SuperRight => 0xe7,
+        _ => return None,
+    })
+}
+
 fn set_auxiliary_button(
     back: &mut bool,
     forward: &mut bool,
@@ -308,13 +422,24 @@ mod tests {
         ButtonState, ContentViewport, InputEvent, KeyState, PixelSize, PointerButton, SessionId,
     };
 
-    use super::{InputGate, InputOwnership, InputRouter};
+    use super::{hid_usage_from_key_code, InputGate, InputOwnership, InputRouter};
+    use winit::keyboard::KeyCode;
 
     fn viewport() -> ContentViewport {
         ContentViewport::fit(
             PixelSize::new(100, 100).unwrap(),
             PixelSize::new(200, 100).unwrap(),
         )
+    }
+
+    #[test]
+    fn winit_physical_keys_normalize_to_usb_hid_keyboard_usages() {
+        assert_eq!(hid_usage_from_key_code(KeyCode::KeyA), Some(0x04));
+        assert_eq!(hid_usage_from_key_code(KeyCode::Digit1), Some(0x1e));
+        assert_eq!(hid_usage_from_key_code(KeyCode::Enter), Some(0x28));
+        assert_eq!(hid_usage_from_key_code(KeyCode::ArrowUp), Some(0x52));
+        assert_eq!(hid_usage_from_key_code(KeyCode::ControlRight), Some(0xe4));
+        assert_eq!(hid_usage_from_key_code(KeyCode::AudioVolumeUp), None);
     }
 
     #[test]
@@ -361,7 +486,11 @@ mod tests {
             generation: 2,
         });
         assert!(input
-            .key(7, KeyState::Pressed, InputOwnership::Remote)
+            .key(
+                frd_core::PhysicalKeyCode::from_usb_hid_usage(7),
+                KeyState::Pressed,
+                InputOwnership::Remote,
+            )
             .is_some());
         assert_eq!(input.focus_lost(), Some(InputEvent::ReleaseAll));
         assert_eq!(input.focus_lost(), None);
@@ -478,16 +607,35 @@ mod tests {
             generation: 1,
         });
         assert!(input
-            .key(7, KeyState::Pressed, InputOwnership::Remote)
+            .key(
+                frd_core::PhysicalKeyCode::from_usb_hid_usage(7),
+                KeyState::Pressed,
+                InputOwnership::Remote,
+            )
             .is_some());
 
         assert_eq!(
-            input.key(7, KeyState::Released, InputOwnership::Ui),
+            input.key(
+                frd_core::PhysicalKeyCode::from_usb_hid_usage(7),
+                KeyState::Released,
+                InputOwnership::Ui,
+            ),
             Some(InputEvent::ReleaseAll)
         );
-        assert_eq!(input.key(8, KeyState::Released, InputOwnership::Ui), None);
+        assert_eq!(
+            input.key(
+                frd_core::PhysicalKeyCode::from_usb_hid_usage(8),
+                KeyState::Released,
+                InputOwnership::Ui,
+            ),
+            None
+        );
         assert!(input
-            .key(8, KeyState::Pressed, InputOwnership::Remote)
+            .key(
+                frd_core::PhysicalKeyCode::from_usb_hid_usage(8),
+                KeyState::Pressed,
+                InputOwnership::Remote,
+            )
             .is_some());
         assert_eq!(
             input.keyboard_capability_lost(),

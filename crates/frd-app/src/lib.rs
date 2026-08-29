@@ -55,12 +55,136 @@ mod tests {
         SessionStartOutcome, SessionStartPermit,
     };
 
-    use frd_ui_model::{ConnectionDraft, ConnectionForm, LaunchOptions, ProtocolChoice};
+    use frd_ui_model::{
+        CapabilityGlyphState, ConnectionDraft, ConnectionForm, ConnectionGlyph, LaunchOptions,
+        ProtocolChoice, SessionChromeAction, SessionChromeModel,
+    };
 
     use super::{
         ActiveSessionSlot, AppAction, AppController, AppControllerError, AppIntent, AppLaunch,
         AppPage, AppPlatformStores, PresentationEvent, ProductPolicy,
     };
+
+    #[test]
+    fn session_chrome_maps_waiting_connected_and_disconnecting_states_literally() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+
+        assert_eq!(
+            controller.session_chrome(),
+            Some(SessionChromeModel {
+                connection: ConnectionGlyph::WaitingForFrame,
+                diagnostics: None,
+                audio: CapabilityGlyphState::Unavailable,
+                clipboard: CapabilityGlyphState::Unavailable,
+                action: Some(SessionChromeAction::Cancel),
+            })
+        );
+
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        assert_eq!(
+            controller.session_chrome(),
+            Some(SessionChromeModel {
+                connection: ConnectionGlyph::Connected,
+                diagnostics: None,
+                audio: CapabilityGlyphState::Unavailable,
+                clipboard: CapabilityGlyphState::Unavailable,
+                action: Some(SessionChromeAction::Disconnect),
+            })
+        );
+
+        controller
+            .handle_intent(
+                AppIntent::Disconnect,
+                &ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]),
+                &RecordingStore::default(),
+            )
+            .expect("disconnect starts cleanup");
+        assert_eq!(
+            controller.session_chrome(),
+            Some(SessionChromeModel {
+                connection: ConnectionGlyph::Disconnecting,
+                diagnostics: None,
+                audio: CapabilityGlyphState::Unavailable,
+                clipboard: CapabilityGlyphState::Unavailable,
+                action: None,
+            })
+        );
+    }
+
+    #[test]
+    fn session_chrome_maps_connecting_state_to_cancel_without_capability_actions() {
+        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let store = RecordingStore::default();
+        let mut controller = AppController::connection_form(complete_form());
+        let intent = controller
+            .connection_form_mut()
+            .unwrap()
+            .take_connect_intent(&catalog)
+            .unwrap();
+        let _ = controller.handle_intent(intent, &catalog, &store).unwrap();
+
+        assert_eq!(
+            controller.session_chrome(),
+            Some(SessionChromeModel {
+                connection: ConnectionGlyph::Connecting,
+                diagnostics: None,
+                audio: CapabilityGlyphState::Unavailable,
+                clipboard: CapabilityGlyphState::Unavailable,
+                action: Some(SessionChromeAction::Cancel),
+            })
+        );
+    }
+
+    #[test]
+    fn session_chrome_keeps_audio_and_clipboard_slots_stable_when_available() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        let all = frd_protocol_api::SessionCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        };
+        controller.set_platform_capabilities(PlatformCapabilities {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.set_product_policy(ProductPolicy {
+            dynamic_resolution: true,
+            clipboard_read: true,
+            clipboard_write: true,
+            remote_audio: true,
+            text_input: true,
+        });
+        controller.handle_session_event(SessionEvent::CapabilitiesChanged(all));
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+
+        assert_eq!(
+            controller.session_chrome(),
+            Some(SessionChromeModel {
+                connection: ConnectionGlyph::Connected,
+                diagnostics: None,
+                audio: CapabilityGlyphState::Available,
+                clipboard: CapabilityGlyphState::Available,
+                action: Some(SessionChromeAction::Disconnect),
+            })
+        );
+    }
 
     #[test]
     fn controller_transitions_connection_through_remote_session_and_failed() {
@@ -222,7 +346,7 @@ mod tests {
 
         assert!(controller
             .route_input(InputEvent::PhysicalKey {
-                code: PhysicalKeyCode(30),
+                code: PhysicalKeyCode::from_usb_hid_usage(30),
                 state: KeyState::Pressed,
                 modifiers: Modifiers::default(),
             })

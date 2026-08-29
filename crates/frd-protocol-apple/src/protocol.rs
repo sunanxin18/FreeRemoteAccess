@@ -56,6 +56,10 @@ pub fn msg_pointer_event(button_mask: u8, x: u16, y: u16) -> [u8; 6] {
     message
 }
 
+pub fn msg_key_event(down: bool, keysym: u32) -> [u8; frd_wire_rfb::KEY_EVENT_MESSAGE_BYTES] {
+    frd_wire_rfb::encode_key_event(down, keysym)
+}
+
 pub mod apple_session {
     pub const SHARED_CLIENT_INIT: u8 = 0x01;
     pub const ENCRYPTED_SESSION_CLIENT_INIT: u8 = 0xc1;

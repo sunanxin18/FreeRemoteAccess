@@ -1,4 +1,4 @@
-use frd_core::{PixelRect, PixelSize, SessionId};
+use frd_core::{ContentViewport, PixelRect, PixelSize, SessionId};
 use frd_frame::{FrameCompleteness, PixelFormat, PixelPatch, SurfaceUpdate};
 
 use crate::{pass::RemotePass, GpuCleanToken, GpuContext, GpuContextId, GpuFaultClass};
@@ -243,6 +243,27 @@ impl RemoteRenderer {
         drawable: PixelSize,
         target_format: wgpu::TextureFormat,
     ) -> Result<Option<PresentationReceipt>, RendererError> {
+        let viewport = self
+            .remote
+            .as_ref()
+            .map(|remote| ContentViewport::fit(remote.size, drawable));
+        self.record_in(encoder, target, viewport, target_format)
+    }
+
+    pub fn record_in(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        viewport: Option<ContentViewport>,
+        target_format: wgpu::TextureFormat,
+    ) -> Result<Option<PresentationReceipt>, RendererError> {
+        match (self.remote.as_ref(), viewport) {
+            (Some(remote), Some(viewport)) if remote.size != viewport.remote => {
+                return Err(RendererError::InvalidGeometry)
+            }
+            (None, Some(_)) => return Err(RendererError::InvalidGeometry),
+            _ => {}
+        }
         let scope = self.context.begin_fault_scope()?;
         let replacement_pass = if self
             .pass
@@ -266,15 +287,15 @@ impl RemoteRenderer {
                 encoder,
                 target,
                 remote.map(|texture| &texture.bind_group),
-                remote.map(|texture| texture.size),
-                drawable,
+                viewport.map(|viewport| viewport.content),
             );
         let token = scope.finish()?;
         let context = self.context.clone();
         let (old_pass, pending_receipt) = context
             .commit_if_unchanged(token, || {
                 let old_pass = replacement_pass.and_then(|pass| self.pass.replace(pass));
-                (old_pass, self.state.pending_receipt())
+                let receipt = viewport.and_then(|_| self.state.pending_receipt());
+                (old_pass, receipt)
             })
             .map_err(RendererError::from)?;
         drop(old_pass);

@@ -15,8 +15,22 @@ pub enum ButtonState {
     Released,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalKeyCode(pub u32);
+/// USB HID Keyboard/Keypad usage-page identifier.
+///
+/// Platform shells normalize native key codes into this shared space before a
+/// protocol adapter translates them to its wire representation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PhysicalKeyCode(u16);
+
+impl PhysicalKeyCode {
+    pub const fn from_usb_hid_usage(usage: u16) -> Self {
+        Self(usage)
+    }
+
+    pub const fn usb_hid_usage(self) -> u16 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyState {
