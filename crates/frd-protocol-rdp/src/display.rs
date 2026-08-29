@@ -9,6 +9,7 @@ use crate::surface::validate_surface_size;
 pub(crate) enum ResizeConfirmation {
     NoRequest,
     Confirmed,
+    StaleCapability,
     Mismatch,
 }
 
@@ -133,7 +134,7 @@ impl DisplayControlAdapter {
             }
             Some(expected) if !self.within_server_area(expected) => {
                 self.in_flight = None;
-                ResizeConfirmation::Mismatch
+                ResizeConfirmation::StaleCapability
             }
             Some(expected) if expected != observed => ResizeConfirmation::Mismatch,
             Some(_) => {
@@ -324,7 +325,7 @@ mod tests {
                 },
                 None,
             ),
-            ResizeConfirmation::Mismatch
+            ResizeConfirmation::StaleCapability
         );
         assert_eq!(adapter.confirmed_size(), initial);
 
@@ -375,7 +376,7 @@ mod tests {
                 },
                 Some(1280 * 720),
             ),
-            ResizeConfirmation::Mismatch
+            ResizeConfirmation::StaleCapability
         );
         assert_eq!(adapter.confirmed_size(), initial);
         assert_eq!(

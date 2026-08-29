@@ -174,6 +174,7 @@ fn run_active_loop(
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<(), ProtocolError> {
     let mut command_drain = ActiveCommandDrain::new();
+    let mut display_retry_pending = false;
     loop {
         refresh_optional_capabilities(
             active_stage,
@@ -182,70 +183,84 @@ fn run_active_loop(
             audio,
             runtime,
             published_capabilities,
+            !display_retry_pending,
         )?;
-        match drain_active_commands(runtime, input, &mut command_drain)
-            .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?
-        {
-            ActiveCommandBatch::Continue {
-                events,
-                optional_commands,
-                pending,
-            } => {
-                if route_input_events(
-                    active_stage,
-                    image,
-                    writer,
-                    runtime,
-                    baseline,
-                    *generation,
-                    &events,
-                )? != ActiveOutputControl::Continue
-                {
-                    return Err(rdp_error(RDP_ACTIVATION_FAILED));
+        if display_retry_pending {
+            match drain_reactivation_commands(runtime, session_id, *generation) {
+                ReactivationCommand::Continue { latest_viewport } => {
+                    if let Some(viewport) = latest_viewport {
+                        display.observe_viewport(viewport);
+                    }
                 }
-                service_optional_channels(
-                    active_stage,
-                    writer,
-                    runtime,
-                    display,
-                    audio,
+                ReactivationCommand::Disconnect => return Ok(()),
+                ReactivationCommand::Terminal => return Err(ProtocolError::Terminal),
+            }
+        } else {
+            match drain_active_commands(runtime, input, &mut command_drain)
+                .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?
+            {
+                ActiveCommandBatch::Continue {
+                    events,
                     optional_commands,
-                )?;
-                refresh_optional_capabilities(
-                    active_stage,
-                    display,
-                    display_capabilities,
-                    audio,
-                    runtime,
-                    published_capabilities,
-                )?;
-                if pending {
-                    continue;
+                    pending,
+                } => {
+                    if route_input_events(
+                        active_stage,
+                        image,
+                        writer,
+                        runtime,
+                        baseline,
+                        *generation,
+                        &events,
+                    )? != ActiveOutputControl::Continue
+                    {
+                        return Err(rdp_error(RDP_ACTIVATION_FAILED));
+                    }
+                    service_optional_channels(
+                        active_stage,
+                        writer,
+                        runtime,
+                        display,
+                        audio,
+                        optional_commands,
+                    )?;
+                    refresh_optional_capabilities(
+                        active_stage,
+                        display,
+                        display_capabilities,
+                        audio,
+                        runtime,
+                        published_capabilities,
+                        true,
+                    )?;
+                    if pending {
+                        continue;
+                    }
                 }
-            }
-            ActiveCommandBatch::Disconnect(events) => {
-                let _ = route_input_events(
-                    active_stage,
-                    image,
-                    writer,
-                    runtime,
-                    baseline,
-                    *generation,
-                    &events,
-                );
-                return Ok(());
-            }
-            ActiveCommandBatch::Terminal(events) => {
-                let _ = route_input_events(
-                    active_stage,
-                    image,
-                    writer,
-                    runtime,
-                    baseline,
-                    *generation,
-                    &events,
-                );
-                return Err(ProtocolError::Terminal);
+                ActiveCommandBatch::Disconnect(events) => {
+                    let _ = route_input_events(
+                        active_stage,
+                        image,
+                        writer,
+                        runtime,
+                        baseline,
+                        *generation,
+                        &events,
+                    );
+                    return Ok(());
+                }
+                ActiveCommandBatch::Terminal(events) => {
+                    let _ = route_input_events(
+                        active_stage,
+                        image,
+                        writer,
+                        runtime,
+                        baseline,
+                        *generation,
+                        &events,
+                    );
+                    return Err(ProtocolError::Terminal);
+                }
             }
         }
 
@@ -270,7 +285,15 @@ fn run_active_loop(
         let outputs = active_stage
             .process(image, action, payload.as_ref())
             .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
-        match route_active_outputs(outputs, writer, runtime, baseline, image, *generation)? {
+        match route_active_outputs(
+            outputs,
+            writer,
+            runtime,
+            baseline,
+            image,
+            *generation,
+            !display_retry_pending,
+        )? {
             ActiveOutputControl::Continue => {}
             ActiveOutputControl::Terminate => return Ok(()),
             ActiveOutputControl::Deactivate => {
@@ -303,11 +326,13 @@ fn run_active_loop(
                     activation_factory,
                 )? {
                     ReactivationOutcome::Continue => {
+                        display_retry_pending = false;
                         *published_capabilities = SessionCapabilities {
                             text_input: true,
                             ..SessionCapabilities::default()
                         };
                     }
+                    ReactivationOutcome::RetryDisplay => display_retry_pending = true,
                     ReactivationOutcome::Disconnect => return Ok(()),
                     ReactivationOutcome::Terminal => return Err(ProtocolError::Terminal),
                 }
@@ -324,6 +349,7 @@ fn refresh_optional_capabilities(
     audio_adapter: &RdpAudioAdapter,
     runtime: &mut ProtocolRuntime,
     published: &mut SessionCapabilities,
+    text_input: bool,
 ) -> Result<(), ProtocolError> {
     let display_max_monitor_area =
         current_display_max_monitor_area(active_stage, display_capabilities);
@@ -342,7 +368,7 @@ fn refresh_optional_capabilities(
         clipboard_read: clipboard_capabilities.clipboard_read,
         clipboard_write: clipboard_capabilities.clipboard_write,
         remote_audio: audio_capabilities.remote_audio,
-        text_input: true,
+        text_input,
     };
     if desired == *published {
         return Ok(());
@@ -451,6 +477,7 @@ fn route_active_outputs<S: std::io::Write>(
     baseline: &mut RdpBaseline,
     image: &DecodedImage,
     generation: u64,
+    publish_graphics: bool,
 ) -> Result<ActiveOutputControl, ProtocolError> {
     let mut control = ActiveOutputControl::Continue;
     for output in outputs {
@@ -458,9 +485,10 @@ fn route_active_outputs<S: std::io::Write>(
             ActiveStageOutput::ResponseFrame(frame) => writer
                 .write_frame(&frame)
                 .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?,
-            ActiveStageOutput::GraphicsUpdate(region) => {
+            ActiveStageOutput::GraphicsUpdate(region) if publish_graphics => {
                 publish_graphics_update(runtime, baseline, image, generation, region)?
             }
+            ActiveStageOutput::GraphicsUpdate(_) => {}
             ActiveStageOutput::Terminate(_) => control = ActiveOutputControl::Terminate,
             ActiveStageOutput::DeactivateAll if control != ActiveOutputControl::Terminate => {
                 control = ActiveOutputControl::Deactivate;
@@ -495,7 +523,7 @@ fn route_input_events(
         let outputs = active_stage
             .process_fastpath_input(image, batch)
             .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
-        match route_active_outputs(outputs, writer, runtime, baseline, image, generation)? {
+        match route_active_outputs(outputs, writer, runtime, baseline, image, generation, true)? {
             ActiveOutputControl::Continue => {}
             ActiveOutputControl::Deactivate if control != ActiveOutputControl::Terminate => {
                 control = ActiveOutputControl::Deactivate;
@@ -516,8 +544,15 @@ fn fast_path_input_batches(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReactivationOutcome {
     Continue,
+    RetryDisplay,
     Disconnect,
     Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReactivationSurfaceDisposition {
+    Committed,
+    StaleCapability,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -590,17 +625,17 @@ fn drive_reactivation(
             pointer_software_rendering,
         } = activation.connection_activation_state()
         {
-            let observed_size = validate_negotiated_size(desktop_size.width, desktop_size.height)
-                .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
             let current_max_monitor_area =
                 current_display_max_monitor_area(active_stage, display_capabilities);
-            if display.confirm_reactivation(observed_size, current_max_monitor_area)
-                == ResizeConfirmation::Mismatch
-            {
-                return Err(rdp_error(RDP_ACTIVATION_FAILED));
-            }
-            *generation =
-                commit_reactivated_surface(runtime, baseline, image, *generation, desktop_size)?;
+            let disposition = finalize_reactivated_surface(
+                runtime,
+                baseline,
+                image,
+                generation,
+                display,
+                desktop_size,
+                current_max_monitor_area,
+            )?;
             active_stage.set_fastpath_processor(
                 fast_path::ProcessorBuilder {
                     io_channel_id: activation.io_channel_id(),
@@ -614,8 +649,45 @@ fn drive_reactivation(
             );
             active_stage.set_share_id(share_id);
             active_stage.set_enable_server_pointer(enable_server_pointer);
-            resume_active_input_capabilities(runtime, input)?;
-            return Ok(ReactivationOutcome::Continue);
+            return match disposition {
+                ReactivationSurfaceDisposition::Committed => {
+                    resume_active_input_capabilities(runtime, input)?;
+                    Ok(ReactivationOutcome::Continue)
+                }
+                ReactivationSurfaceDisposition::StaleCapability => {
+                    Ok(ReactivationOutcome::RetryDisplay)
+                }
+            };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_reactivated_surface(
+    runtime: &mut ProtocolRuntime,
+    baseline: &mut RdpBaseline,
+    image: &mut DecodedImage,
+    generation: &mut u64,
+    display: &mut DisplayControlAdapter,
+    desktop_size: DesktopSize,
+    current_max_monitor_area: Option<u64>,
+) -> Result<ReactivationSurfaceDisposition, ProtocolError> {
+    let observed_size = validate_negotiated_size(desktop_size.width, desktop_size.height)
+        .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
+    match display.confirm_reactivation(observed_size, current_max_monitor_area) {
+        ResizeConfirmation::Mismatch => Err(rdp_error(RDP_ACTIVATION_FAILED)),
+        ResizeConfirmation::StaleCapability => {
+            *image = DecodedImage::new(
+                IronPixelFormat::RgbA32,
+                desktop_size.width,
+                desktop_size.height,
+            );
+            Ok(ReactivationSurfaceDisposition::StaleCapability)
+        }
+        ResizeConfirmation::NoRequest | ResizeConfirmation::Confirmed => {
+            *generation =
+                commit_reactivated_surface(runtime, baseline, image, *generation, desktop_size)?;
+            Ok(ReactivationSurfaceDisposition::Committed)
         }
     }
 }
@@ -715,7 +787,10 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::sync::{mpsc, Arc, Mutex};
 
-    use frd_core::{InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelSize, SessionId};
+    use frd_core::{
+        InputEvent, KeyState, Modifiers, PhysicalKeyCode, PhysicalViewport, PixelRect, PixelSize,
+        SessionId,
+    };
     use frd_frame::{FrameCompleteness, SurfaceUpdate};
     use frd_media_api::{MediaFrame, MediaPublishError, MediaPublisher};
     use frd_protocol_api::{
@@ -731,13 +806,15 @@ mod tests {
 
     use crate::audio::RdpAudioAdapter;
     use crate::baseline::RdpBaseline;
+    use crate::display::DisplayControlAdapter;
     use crate::input::RdpInputState;
     use crate::writer::OrderedRdpWriter;
 
     use super::{
-        commit_reactivated_surface, fast_path_input_batches, publish_active_input_capabilities,
-        publish_graphics_update, resume_active_input_capabilities, route_active_outputs,
-        stop_and_drain_audio, suspend_active_input_capabilities, ActiveOutputControl,
+        commit_reactivated_surface, fast_path_input_batches, finalize_reactivated_surface,
+        publish_active_input_capabilities, publish_graphics_update,
+        resume_active_input_capabilities, route_active_outputs, stop_and_drain_audio,
+        suspend_active_input_capabilities, ActiveOutputControl, ReactivationSurfaceDisposition,
     };
 
     #[test]
@@ -1014,6 +1091,145 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_stale_display_reactivation_keeps_latest_valid_viewport_in_same_session() {
+        let session_id = SessionId::allocate();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let (_commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(RecordingFrames(updates.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let initial = PixelSize {
+            width: 800,
+            height: 600,
+        };
+        let mut baseline =
+            RdpBaseline::begin(&mut runtime, session_id, initial).expect("generation begins");
+        let mut image = DecodedImage::new(IronPixelFormat::RgbA32, 800, 600);
+        let mut generation = 1;
+        let mut display = DisplayControlAdapter::new(initial);
+        display.set_negotiated(Some(1600 * 900));
+        display.observe_viewport(viewport(1600, 900));
+        assert_eq!(
+            display.take_resize_request(),
+            Some(PixelSize {
+                width: 1600,
+                height: 900,
+            })
+        );
+        display.observe_viewport(viewport(1280, 720));
+
+        let disposition = finalize_reactivated_surface(
+            &mut runtime,
+            &mut baseline,
+            &mut image,
+            &mut generation,
+            &mut display,
+            DesktopSize {
+                width: 1600,
+                height: 900,
+            },
+            Some(1280 * 720),
+        )
+        .expect("stale capability is recoverable");
+
+        assert_eq!(disposition, ReactivationSurfaceDisposition::StaleCapability);
+        assert_eq!(generation, 1, "stale generation is not committed");
+        assert_eq!((image.width(), image.height()), (1600, 900));
+        assert_eq!(updates.lock().expect("frame log").len(), 1);
+
+        let mut writer = OrderedRdpWriter::new(Framed::new(RecordingIo::default()));
+        let control = route_active_outputs(
+            vec![
+                ActiveStageOutput::ResponseFrame(b"progress".to_vec()),
+                ActiveStageOutput::GraphicsUpdate(InclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 1599,
+                    bottom: 899,
+                }),
+            ],
+            &mut writer,
+            &mut runtime,
+            &mut baseline,
+            &image,
+            generation,
+            false,
+        )
+        .expect("stale graphics remain quarantined while wire progress continues");
+        assert_eq!(control, ActiveOutputControl::Continue);
+        assert_eq!(
+            writer.into_framed().into_inner_no_leftover().written,
+            b"progress"
+        );
+        assert_eq!(updates.lock().expect("frame log").len(), 1);
+
+        assert_eq!(
+            display.take_resize_request(),
+            Some(PixelSize {
+                width: 1280,
+                height: 720,
+            }),
+            "latest viewport remains actionable in the same adapter/session"
+        );
+
+        let mut mismatch = DisplayControlAdapter::new(initial);
+        mismatch.set_negotiated(Some(1600 * 900));
+        mismatch.observe_viewport(viewport(1600, 900));
+        assert!(mismatch.take_resize_request().is_some());
+        assert!(finalize_reactivated_surface(
+            &mut runtime,
+            &mut baseline,
+            &mut image,
+            &mut generation,
+            &mut mismatch,
+            DesktopSize {
+                width: 1598,
+                height: 900,
+            },
+            Some(1600 * 900),
+        )
+        .is_err());
+        assert_eq!(generation, 1, "true mismatch remains fatal before commit");
+
+        let disposition = finalize_reactivated_surface(
+            &mut runtime,
+            &mut baseline,
+            &mut image,
+            &mut generation,
+            &mut display,
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            },
+            Some(1280 * 720),
+        )
+        .expect("retained viewport can complete");
+        assert_eq!(disposition, ReactivationSurfaceDisposition::Committed);
+        assert_eq!(generation, 2);
+        assert_eq!((image.width(), image.height()), (1280, 720));
+    }
+
+    fn viewport(width: u32, height: u32) -> PhysicalViewport {
+        let size = PixelSize { width, height };
+        PhysicalViewport::new(
+            size,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            size,
+        )
+        .expect("valid viewport")
+    }
+
+    #[test]
     fn lifecycle_output_router_writes_every_response_before_changing_state() {
         let session_id = SessionId::allocate();
         let (_commands, command_rx) = mpsc::channel();
@@ -1048,6 +1264,7 @@ mod tests {
             &mut baseline,
             &image,
             1,
+            true,
         )
         .expect("outputs route");
 
