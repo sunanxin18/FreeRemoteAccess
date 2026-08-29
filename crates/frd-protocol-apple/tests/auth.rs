@@ -10,7 +10,8 @@ use frd_protocol_api::{
     ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent, SurfacePublisher,
 };
 use frd_protocol_apple::{
-    authenticate_negotiated, AppleConnection, AppleProtocolFactory, APPLE_SECURITY_TYPE_UNAVAILABLE,
+    authenticate_negotiated, select_apple_security_type, AppleConnection, AppleProtocolFactory,
+    APPLE_SECURITY_TYPE_UNAVAILABLE,
 };
 
 struct AcceptEvents;
@@ -123,31 +124,45 @@ fn apple_factory_session_rejects_vnc_fallback_without_any_post_offer_bytes() {
         exit,
         ProtocolExit::Failed(ProtocolError::adapter(
             frd_core::ProtocolId::apple_hpss_mvs(),
-            APPLE_SECURITY_TYPE_UNAVAILABLE,
+            "apple_high_performance_unavailable",
         ))
     );
     assert!(post_offer.is_empty());
 }
 
 #[test]
-fn apple_factory_session_prefers_36_then_33_then_30_and_never_selects_35() {
+fn generic_apple_selector_preserves_36_then_33_then_30_and_never_selects_35() {
     for (offered, expected) in [
         (vec![30, 33, 36], 36),
         (vec![30, 33], 33),
         (vec![30], 30),
         (vec![35, 30], 30),
     ] {
-        let (_, post_offer) = run_factory_offer(offered, true);
-        assert_eq!(post_offer, [expected]);
+        assert_eq!(
+            select_apple_security_type(&offered, &credentials()).unwrap(),
+            expected
+        );
     }
 
-    let (exit, post_offer) = run_factory_offer(vec![35], false);
     assert_eq!(
-        exit,
-        ProtocolExit::Failed(ProtocolError::adapter(
-            frd_core::ProtocolId::apple_hpss_mvs(),
-            APPLE_SECURITY_TYPE_UNAVAILABLE,
-        ))
+        select_apple_security_type(&[35], &credentials())
+            .unwrap_err()
+            .code(),
+        APPLE_SECURITY_TYPE_UNAVAILABLE
     );
-    assert!(post_offer.is_empty());
+}
+
+#[test]
+fn apple_product_factory_rejects_legacy_offers_without_writing_selection() {
+    for offered in [vec![30, 33], vec![30], vec![35, 30], vec![35]] {
+        let (exit, post_offer) = run_factory_offer(offered, false);
+        assert_eq!(
+            exit,
+            ProtocolExit::Failed(ProtocolError::adapter(
+                frd_core::ProtocolId::apple_hpss_mvs(),
+                "apple_high_performance_unavailable",
+            ))
+        );
+        assert!(post_offer.is_empty());
+    }
 }

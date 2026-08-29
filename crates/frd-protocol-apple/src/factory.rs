@@ -12,10 +12,9 @@ use frd_wire_rfb::{
     decode_server_init_header, encode_banner, SERVER_INIT_HEADER_BYTES,
 };
 
-use crate::auth::{
-    select_apple_security_type, select_apple_security_type_parts, APPLE_CREDENTIALS_REQUIRED,
-};
+use crate::auth::{select_apple_security_type_parts, APPLE_CREDENTIALS_REQUIRED};
 use crate::connection::AppleConnection;
+use crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE;
 use crate::protocol::{self, security};
 use crate::session::{self, SessionEncodingProfile};
 use crate::{ard, rsa_srp, srp};
@@ -30,6 +29,19 @@ const PRODUCT_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
 
 fn apple_error(code: &'static str) -> ProtocolError {
     ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), code)
+}
+
+fn select_product_high_performance_security(
+    offered: &[u8],
+    credentials: &Credentials,
+) -> Result<u8, ProtocolError> {
+    if credentials.username.is_empty() || credentials.password.expose().is_empty() {
+        return Err(apple_error(APPLE_CREDENTIALS_REQUIRED));
+    }
+    offered
+        .contains(&security::APPLE_SRP)
+        .then_some(security::APPLE_SRP)
+        .ok_or_else(|| apple_error(APPLE_HIGH_PERFORMANCE_UNAVAILABLE))
 }
 
 pub struct AppleProtocolFactory;
@@ -96,7 +108,7 @@ impl AppleProtocolFactory {
         offered: &[u8],
         credentials: &Credentials,
     ) -> Result<u8, ProtocolError> {
-        select_apple_security_type(offered, credentials)
+        select_product_high_performance_security(offered, credentials)
     }
 }
 
@@ -170,6 +182,7 @@ fn connect_authenticated(
         .credentials
         .as_ref()
         .ok_or_else(|| apple_error(APPLE_CREDENTIALS_REQUIRED))?;
+    select_product_high_performance_security(&offered, credentials)?;
     let password = std::str::from_utf8(credentials.password.expose())
         .map_err(|_| apple_error(APPLE_AUTHENTICATION_FAILED))?;
     let authenticated = authenticate_negotiated(
@@ -180,8 +193,19 @@ fn connect_authenticated(
         password,
     )
     .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
-    finish_authenticated_session(authenticated, PRODUCT_SESSION_ENCODING_PROFILE)
-        .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))
+    finish_product_authenticated_session(authenticated, PRODUCT_SESSION_ENCODING_PROFILE)
+}
+
+fn finish_product_authenticated_session(
+    authenticated: AppleAuthenticated,
+    profile: SessionEncodingProfile,
+) -> Result<EstablishedAppleSession, ProtocolError> {
+    let established = finish_authenticated_session(authenticated, profile)
+        .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
+    if !established.connection.is_encrypted() {
+        return Err(apple_error(APPLE_HIGH_PERFORMANCE_UNAVAILABLE));
+    }
+    Ok(established)
 }
 
 fn literal_socket_address(host: &str, port: u16) -> Option<SocketAddr> {
@@ -193,11 +217,100 @@ fn literal_socket_address(host: &str, port: u16) -> Option<SocketAddr> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod product_profile_tests {
-    use std::io::Write;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     use crate::session::SessionEncodingProfile;
+
+    fn credentials() -> frd_protocol_api::Credentials {
+        let mut password = frd_core::SecretBuffer::new(b"test-password".to_vec());
+        frd_protocol_api::Credentials {
+            username: "test-user".to_owned(),
+            password: password.take(),
+        }
+    }
+
+    #[test]
+    fn product_high_performance_security_rejects_every_offer_without_named_srp() {
+        let factory = super::AppleProtocolFactory;
+        for offered in [
+            vec![crate::protocol::security::APPLE_ARD],
+            vec![crate::protocol::security::APPLE_RSA_SRP],
+            vec![crate::protocol::security::APPLE_ARD_39],
+            vec![
+                crate::protocol::security::APPLE_ARD,
+                crate::protocol::security::APPLE_RSA_SRP,
+                crate::protocol::security::APPLE_ARD_39,
+            ],
+        ] {
+            let error = factory
+                .select_security_type(&offered, &credentials())
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+            );
+        }
+    }
+
+    #[test]
+    fn product_high_performance_security_selects_only_named_srp() {
+        let selected = super::AppleProtocolFactory
+            .select_security_type(
+                &[
+                    crate::protocol::security::APPLE_ARD,
+                    crate::protocol::security::APPLE_SRP,
+                    crate::protocol::security::APPLE_RSA_SRP,
+                ],
+                &credentials(),
+            )
+            .unwrap();
+
+        assert_eq!(selected, crate::protocol::security::APPLE_SRP);
+    }
+
+    #[test]
+    fn unencrypted_product_session_is_rejected_after_finalization_without_hpss_bytes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut client_init = [0u8; 1];
+            stream.read_exact(&mut client_init).unwrap();
+            assert_eq!(
+                client_init,
+                [crate::protocol::apple_session::SHARED_CLIENT_INIT]
+            );
+            let mut server_init = [0u8; frd_wire_rfb::SERVER_INIT_HEADER_BYTES];
+            server_init[..2].copy_from_slice(&8u16.to_be_bytes());
+            server_init[2..4].copy_from_slice(&8u16.to_be_bytes());
+            server_init[4..20].copy_from_slice(&frd_wire_rfb::PixelFormat::OURS.to_bytes());
+            stream.write_all(&server_init).unwrap();
+            let mut application_bytes = Vec::new();
+            stream.read_to_end(&mut application_bytes).unwrap();
+            application_bytes
+        });
+        let authenticated = super::AppleAuthenticated {
+            connection: crate::AppleConnection::new(client),
+            security_type: crate::protocol::security::APPLE_ARD,
+            srp_key: None,
+        };
+
+        let error = match super::finish_product_authenticated_session(
+            authenticated,
+            SessionEncodingProfile::AppleTcpMvs,
+        ) {
+            Ok(_) => panic!("未加密产品会话不得进入 runtime"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.code(),
+            crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+        );
+        assert!(server.join().unwrap().is_empty());
+    }
 
     #[test]
     fn product_desktop_uses_the_verified_tcp_mvs_profile() {
