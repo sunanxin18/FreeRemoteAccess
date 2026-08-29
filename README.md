@@ -45,7 +45,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
-| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-29 在并列注册 RDP adapter 后重新完成自动选择、首帧、持续增量与键鼠真机回归；该真机证据早于 `3f8d8bd` 及其后续 type-0 copy-elision 修复。copy-elision 目前仅完成 Apple crate 离线验证，尚未证明真机 CPU 或输入延迟改善，也不得重用此前 A/B 性能结论；输入到显示延迟根因仍未确认，见 `docs/validation/windows-apple-wgpu-parity.md` |
+| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-29 在并列注册 RDP adapter 后重新完成自动选择、首帧、持续增量与键鼠真机回归；该真机证据早于 `3f8d8bd` 及其后续 type-0 copy-elision 修复。copy-elision 与服务端主动 `ServerState` 几何恢复目前仅完成 Apple crate 离线验证，尚未证明真机 CPU 或输入延迟改善，也不得重用此前 A/B 性能结论；输入到显示延迟根因仍未确认，见 `docs/validation/windows-apple-wgpu-parity.md` |
 | 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。现存成本为 dirty rect 的 BGRX 打包与 CPU→GPU 上传；见 `AGENTS.md` P2 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
 | 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |

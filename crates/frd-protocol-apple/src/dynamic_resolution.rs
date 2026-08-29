@@ -171,6 +171,19 @@ impl DynamicResolutionController {
         })
     }
 
+    /// 记录未与本地 Pending 目标匹配的服务端主动几何变化。
+    /// 这只同步已观察到的稳定几何，绝不构成用户 resize 请求的确认。
+    pub fn adopt_server_initiated_geometry(&mut self, generation: u64, size: DisplaySize) {
+        self.stable = StableDisplay { generation, size };
+        self.state = match self.state {
+            DynamicResolutionState::Unavailable => DynamicResolutionState::Unavailable,
+            DynamicResolutionState::Disabled { .. } => {
+                DynamicResolutionState::Disabled { stable: size }
+            }
+            _ => DynamicResolutionState::Stable { generation, size },
+        };
+    }
+
     pub fn mark_full_frame(&mut self, generation: u64) -> bool {
         let matches_generation = matches!(
             self.state,

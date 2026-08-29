@@ -49,6 +49,19 @@ enum TargetDisposition {
     Wait,
 }
 
+/// `ServerState` 几何观察的来源。只有精确 Pending 目标才是本地请求 ACK。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerGeometryDisposition {
+    Unchanged,
+    RequestedAck,
+    ServerInitiated,
+}
+
+struct ServerGeometryCommit {
+    commit: GeometryCommit,
+    disposition: ServerGeometryDisposition,
+}
+
 impl DynamicResolutionRuntime {
     fn new(initial_size: DisplaySize, enabled: bool) -> Self {
         // hpssview 是本地明确选择的交互控制角色；其余 Apple capability 谓词
@@ -114,6 +127,9 @@ impl DynamicResolutionRuntime {
     }
 
     fn target_disposition(&self, target: DisplaySize) -> TargetDisposition {
+        if !self.opt_in || !self.armed {
+            return TargetDisposition::Wait;
+        }
         match self.controller.state() {
             crate::dynamic_resolution::DynamicResolutionState::Stable { size, .. }
                 if *size == target =>
@@ -153,6 +169,24 @@ impl DynamicResolutionRuntime {
         let commit = self.controller.observe_server_state(size)?;
         self.pending_since = None;
         Some(commit)
+    }
+
+    fn classify_server_geometry(
+        &mut self,
+        observed: DisplaySize,
+        current_surface: DisplaySize,
+        next_controller_generation: u64,
+    ) -> ServerGeometryDisposition {
+        if observed == current_surface {
+            return ServerGeometryDisposition::Unchanged;
+        }
+        if self.observe_server_state(observed).is_some() {
+            return ServerGeometryDisposition::RequestedAck;
+        }
+        self.pending_since = None;
+        self.controller
+            .adopt_server_initiated_geometry(next_controller_generation, observed);
+        ServerGeometryDisposition::ServerInitiated
     }
 
     fn timeout_pending(&mut self, now: Instant) -> bool {
@@ -216,7 +250,8 @@ impl ViewportRequestQueue {
     }
 }
 
-/// 只有控制器返回精确确认时才提交新 surface，且每个 generation 只提交一次。
+/// 严格区分精确用户请求 ACK 与服务端主动几何变化；两者都以原子 generation
+/// 替换 surface，但后者绝不被记录为用户 resize 成功。
 fn commit_server_geometry(
     runtime: &mut DynamicResolutionRuntime,
     receiver: &mut MvsReceiveState,
@@ -224,18 +259,24 @@ fn commit_server_geometry(
     media_state: &mut ViewerMediaState,
     observed: DisplaySize,
     before_generation_commit: impl FnOnce() -> Result<()>,
-) -> Result<Option<GeometryCommit>> {
+) -> Result<Option<ServerGeometryCommit>> {
     let Some(replacement_size) = PixelSize::new(observed.width.into(), observed.height.into())
     else {
         return Ok(None);
     };
-    let Some(internal_commit) = runtime.observe_server_state(observed) else {
+    let current = DisplaySize::new(
+        surface.framebuffer.width as u16,
+        surface.framebuffer.height as u16,
+    )
+    .expect("DisplaySurface dimensions are non-zero u16 values");
+    let Some(generation) = surface.generation.checked_add(1) else {
         return Ok(None);
     };
-    let Some(generation) = internal_commit.generation.checked_add(1) else {
+    let Some(controller_generation) = generation.checked_sub(1) else {
         return Ok(None);
     };
-    if surface.generation.checked_add(1) != Some(generation) {
+    let disposition = runtime.classify_server_geometry(observed, current, controller_generation);
+    if disposition == ServerGeometryDisposition::Unchanged {
         return Ok(None);
     }
     before_generation_commit()?;
@@ -247,9 +288,12 @@ fn commit_server_geometry(
         return Ok(None);
     };
     *surface = replacement;
-    Ok(Some(GeometryCommit {
-        generation,
-        size: internal_commit.size,
+    Ok(Some(ServerGeometryCommit {
+        commit: GeometryCommit {
+            generation,
+            size: observed,
+        },
+        disposition,
     }))
 }
 
@@ -1556,7 +1600,14 @@ impl NetworkReaderRuntime {
                                 before_generation_commit,
                             )?
                         };
-                        if let Some(commit) = commit {
+                        if let Some(ServerGeometryCommit {
+                            commit,
+                            disposition,
+                        }) = commit
+                        {
+                            if disposition == ServerGeometryDisposition::ServerInitiated {
+                                self.viewport_requests.lock().unwrap().drop_latest();
+                            }
                             let size =
                                 PixelSize::new(commit.size.width.into(), commit.size.height.into())
                                     .context("动态分辨率确认尺寸非法")?;
@@ -1666,6 +1717,17 @@ mod migrated_runtime_tests {
         frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
         frame.extend_from_slice(&body);
         frame
+    }
+
+    fn server_state_message(size: DisplaySize) -> Vec<u8> {
+        let mut server_state = vec![0u8; 94];
+        server_state[0..4].copy_from_slice(&1u32.to_be_bytes());
+        server_state[12..16].copy_from_slice(&encoding::SERVER_STATE.to_be_bytes());
+        server_state[16..18].copy_from_slice(&76u16.to_be_bytes());
+        server_state[18..20].copy_from_slice(&5u16.to_be_bytes());
+        server_state[20..22].copy_from_slice(&size.width.to_be_bytes());
+        server_state[22..24].copy_from_slice(&size.height.to_be_bytes());
+        server_state
     }
 
     struct TestBitWriter {
@@ -1984,6 +2046,137 @@ mod migrated_runtime_tests {
             .send_target_with(target, |_| Ok(Instant::now()))
             .unwrap()
             .is_none());
+        assert_eq!(disabled.target_disposition(target), TargetDisposition::Wait);
+    }
+
+    #[test]
+    fn pending_mismatched_server_state_is_server_initiated_not_requested_ack() {
+        let initial = DisplaySize::new(1440, 2560).unwrap();
+        let requested = DisplaySize::new(1280, 720).unwrap();
+        let server_initiated = DisplaySize::new(1456, 1080).unwrap();
+        let mut runtime = DynamicResolutionRuntime::new(initial, true);
+        arm_runtime(&mut runtime, initial, false);
+        runtime
+            .send_target_with(requested, |_| Ok(Instant::now()))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            runtime.classify_server_geometry(server_initiated, initial, 1),
+            ServerGeometryDisposition::ServerInitiated
+        );
+        assert!(runtime.pending_since.is_none());
+        assert!(matches!(
+            runtime.controller.state(),
+            crate::dynamic_resolution::DynamicResolutionState::Stable { generation: 1, size }
+                if *size == server_initiated
+        ));
+    }
+
+    #[test]
+    fn repeated_server_geometry_is_unchanged_without_generation_side_effects() {
+        let size = DisplaySize::new(1440, 2560).unwrap();
+        let mut runtime = DynamicResolutionRuntime::new(size, false);
+        let mut receiver = MvsReceiveState::new(1);
+        let mut surface = DisplaySurface::new(1, PixelSize::new(1440, 2560).unwrap()).unwrap();
+        let mut media = ViewerMediaState::new(
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+        let mut releases = 0usize;
+
+        assert!(commit_server_geometry(
+            &mut runtime,
+            &mut receiver,
+            &mut surface,
+            &mut media,
+            size,
+            || {
+                releases += 1;
+                Ok(())
+            },
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(releases, 0);
+        assert_eq!(surface.generation, 1);
+        assert_eq!((surface.width(), surface.height()), (1440, 2560));
+        assert_eq!(receiver.generation, 1);
+    }
+
+    #[test]
+    fn server_initiated_geometry_replaces_surface_and_requests_full_when_dynamic_off() {
+        use std::io::Read as _;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        use frd_core::SessionId;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let mut protocol_runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopProtocolEvents),
+            Box::new(NoopProtocolFrames),
+            None,
+            Box::new(NoopProtocolWake),
+        );
+        let initial = DisplaySize::new(1440, 2560).unwrap();
+        let server_initiated = DisplaySize::new(1456, 1080).unwrap();
+        let mut reader = NetworkReaderRuntime::new(
+            &mut protocol_runtime,
+            session_id,
+            initial,
+            false,
+            Instant::now(),
+        )
+        .unwrap();
+        let mut media = ViewerMediaState::new(
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+        let mut releases = 0usize;
+        let mut before_generation_commit = || {
+            releases += 1;
+            Ok(())
+        };
+
+        reader
+            .handle_frame(
+                server_state_message(server_initiated),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+            )
+            .unwrap();
+
+        assert_eq!(releases, 1);
+        assert_eq!(reader.generation(), 2);
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!((surface.width(), surface.height()), (1456, 1080));
+        drop(surface);
+        assert_eq!(reader.receiver.generation, 2);
+        assert_eq!(reader.requests.generation, 2);
+        let mut full = [0u8; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
+        peer.read_exact(&mut full).unwrap();
+        assert_eq!(
+            full,
+            protocol::msg_fb_update_request(false, 0, 0, 1456, 1080).unwrap()
+        );
+        writer.shutdown().unwrap();
     }
     #[test]
     fn resize_pending_becomes_visible_only_after_successful_send() {
