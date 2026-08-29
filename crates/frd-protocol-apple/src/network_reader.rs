@@ -1460,6 +1460,7 @@ fn handle_complete_mvs_record(
         _ => PublicationOutcome::Published,
     };
     match publication {
+        PublicationOutcome::AwaitingHighPerformance => return Ok(()),
         PublicationOutcome::NeedsFullBaseline => {
             receiver.request_full()?;
             let size = current_surface_size(surface);

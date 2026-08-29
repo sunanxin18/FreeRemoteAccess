@@ -157,6 +157,7 @@ pub(crate) enum MvsFrameKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublicationOutcome {
+    AwaitingHighPerformance,
     Published,
     NeedsFullBaseline,
     NeedsFullSnapshot,
@@ -166,25 +167,52 @@ pub(crate) enum PublicationOutcome {
 pub(crate) struct AppleSurfacePublisher {
     session_id: SessionId,
     generation: u64,
-    size: PixelSize,
+    active_size: Option<PixelSize>,
     revision: u64,
     baseline_established: bool,
 }
 
 impl AppleSurfacePublisher {
+    pub(crate) fn pending(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            generation: 1,
+            active_size: None,
+            revision: 0,
+            baseline_established: false,
+        }
+    }
+
     pub(crate) fn begin(
         runtime: &mut ProtocolRuntime,
         session_id: SessionId,
         size: PixelSize,
     ) -> Result<Self, ProtocolError> {
-        runtime.begin_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)?;
-        Ok(Self {
-            session_id,
-            generation: 1,
+        let mut publisher = Self::pending(session_id);
+        publisher.activate_initial_generation(runtime, size)?;
+        Ok(publisher)
+    }
+
+    pub(crate) fn activate_initial_generation(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        size: PixelSize,
+    ) -> Result<(), ProtocolError> {
+        if self.generation != 1 || self.is_active() {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        runtime.begin_generation(
+            self.session_id,
+            self.generation,
             size,
-            revision: 0,
-            baseline_established: false,
-        })
+            PixelFormat::Bgrx8UnormSrgb,
+        )?;
+        self.active_size = Some(size);
+        Ok(())
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_size.is_some()
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -197,6 +225,9 @@ impl AppleSurfacePublisher {
         generation: u64,
         size: PixelSize,
     ) -> Result<(), ProtocolError> {
+        if !self.is_active() {
+            return Err(ProtocolError::FramePortRejected);
+        }
         runtime.begin_generation(
             self.session_id,
             generation,
@@ -204,7 +235,7 @@ impl AppleSurfacePublisher {
             PixelFormat::Bgrx8UnormSrgb,
         )?;
         self.generation = generation;
-        self.size = size;
+        self.active_size = Some(size);
         self.revision = 0;
         self.baseline_established = false;
         Ok(())
@@ -218,6 +249,9 @@ impl AppleSurfacePublisher {
         dirty: PixelRect,
         kind: MvsFrameKind,
     ) -> Result<PublicationOutcome, ProtocolError> {
+        if !self.is_active() {
+            return Ok(PublicationOutcome::AwaitingHighPerformance);
+        }
         if generation != self.generation || surface.generation != self.generation {
             return Ok(PublicationOutcome::IgnoredStale);
         }
@@ -247,6 +281,9 @@ impl AppleSurfacePublisher {
         patch: PixelPatch,
         kind: MvsFrameKind,
     ) -> Result<PublicationOutcome, ProtocolError> {
+        if !self.is_active() {
+            return Ok(PublicationOutcome::AwaitingHighPerformance);
+        }
         if generation != self.generation || surface.generation != self.generation {
             return Ok(PublicationOutcome::IgnoredStale);
         }
@@ -285,10 +322,13 @@ impl AppleSurfacePublisher {
         generation: u64,
         patch_byte_limit: usize,
     ) -> Result<(), ProtocolError> {
+        let Some(size) = self.active_size else {
+            return Err(ProtocolError::FramePortRejected);
+        };
         if generation != self.generation
             || surface.generation != self.generation
-            || surface.width() != self.size.width as usize
-            || surface.height() != self.size.height as usize
+            || surface.width() != size.width as usize
+            || surface.height() != size.height as usize
         {
             return Err(ProtocolError::FramePortRejected);
         }
@@ -325,7 +365,9 @@ impl AppleSurfacePublisher {
                 PublicationOutcome::NeedsFullSnapshot => {
                     return Err(ProtocolError::FramePortRejected);
                 }
-                PublicationOutcome::NeedsFullBaseline | PublicationOutcome::IgnoredStale => {
+                PublicationOutcome::AwaitingHighPerformance
+                | PublicationOutcome::NeedsFullBaseline
+                | PublicationOutcome::IgnoredStale => {
                     return Err(ProtocolError::FramePortRejected);
                 }
             }
@@ -516,12 +558,91 @@ mod tests {
         }
     }
 
+    struct NoopFrames;
+
+    impl SurfacePublisher for NoopFrames {
+        fn publish(&self, _update: SurfaceUpdate) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
     struct NoopWake;
 
     impl RuntimeWake for NoopWake {
         fn wake(&self) -> Result<(), ProtocolError> {
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct PublicationRecorders {
+        events: Mutex<Vec<SessionEvent>>,
+        frames: Mutex<Vec<SurfaceUpdate>>,
+        wakes: Mutex<usize>,
+    }
+
+    struct RecordingEvents(Arc<PublicationRecorders>);
+
+    impl RuntimeEventSink for RecordingEvents {
+        fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
+            self.0.events.lock().expect("event log lock").push(event);
+            Ok(())
+        }
+    }
+
+    struct FailingEvents;
+
+    impl RuntimeEventSink for FailingEvents {
+        fn publish(&self, _event: SessionEvent) -> Result<(), ProtocolError> {
+            Err(ProtocolError::EventPortClosed)
+        }
+    }
+
+    struct RecordingPublicationFrames(Arc<PublicationRecorders>);
+
+    impl SurfacePublisher for RecordingPublicationFrames {
+        fn publish(&self, update: SurfaceUpdate) -> Result<(), ProtocolError> {
+            self.0.frames.lock().expect("frame log lock").push(update);
+            Ok(())
+        }
+    }
+
+    struct RecordingPublicationWake(Arc<PublicationRecorders>);
+
+    impl RuntimeWake for RecordingPublicationWake {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            let mut wakes = self.0.wakes.lock().expect("wake log lock");
+            *wakes += 1;
+            Ok(())
+        }
+    }
+
+    fn runtime_with_publication_recorders(
+        session_id: SessionId,
+    ) -> (ProtocolRuntime, Arc<PublicationRecorders>) {
+        let (_commands, command_rx) = mpsc::channel();
+        let recorders = Arc::new(PublicationRecorders::default());
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(recorders.clone())),
+            Box::new(RecordingPublicationFrames(recorders.clone())),
+            None,
+            Box::new(RecordingPublicationWake(recorders.clone())),
+        );
+        (runtime, recorders)
+    }
+
+    fn runtime_with_failing_generation_event(session_id: SessionId) -> ProtocolRuntime {
+        let (_commands, command_rx) = mpsc::channel();
+        ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(FailingEvents),
+            Box::new(NoopFrames),
+            None,
+            Box::new(NoopWake),
+        )
     }
 
     fn runtime_with_frames(
@@ -538,6 +659,189 @@ mod tests {
             Box::new(NoopWake),
         );
         (runtime, frames)
+    }
+
+    #[test]
+    fn pending_publisher_does_not_publish_generation_or_wake() {
+        let session_id = SessionId::allocate();
+        let (_runtime, recorders) = runtime_with_publication_recorders(session_id);
+        let publisher = AppleSurfacePublisher::pending(session_id);
+
+        assert!(!publisher.is_active());
+        assert!(recorders.events.lock().unwrap().is_empty());
+        assert!(recorders.frames.lock().unwrap().is_empty());
+        assert_eq!(*recorders.wakes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_publisher_activates_generation_one_with_confirmed_size_once() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1234, 567).unwrap();
+        let (mut runtime, recorders) = runtime_with_publication_recorders(session_id);
+        let mut publisher = AppleSurfacePublisher::pending(session_id);
+
+        publisher
+            .activate_initial_generation(&mut runtime, size)
+            .unwrap();
+
+        assert!(publisher.is_active());
+        assert!(matches!(
+            recorders.events.lock().unwrap().as_slice(),
+            [SessionEvent::SurfaceGenerationChanged {
+                session_id: observed_session,
+                generation: 1,
+                size: observed_size,
+            }] if *observed_session == session_id && *observed_size == size
+        ));
+        assert!(matches!(
+            recorders.frames.lock().unwrap().as_slice(),
+            [SurfaceUpdate::Reset {
+                session_id: observed_session,
+                generation: 1,
+                size: observed_size,
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }] if *observed_session == session_id && *observed_size == size
+        ));
+        assert_eq!(*recorders.wakes.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_publisher_rejects_repeated_activation_without_republishing() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let (mut runtime, recorders) = runtime_with_publication_recorders(session_id);
+        let mut publisher = AppleSurfacePublisher::pending(session_id);
+        publisher
+            .activate_initial_generation(&mut runtime, size)
+            .unwrap();
+
+        assert!(publisher
+            .activate_initial_generation(&mut runtime, size)
+            .is_err());
+        assert!(publisher.is_active());
+        assert_eq!(recorders.events.lock().unwrap().len(), 1);
+        assert_eq!(recorders.frames.lock().unwrap().len(), 1);
+        assert_eq!(*recorders.wakes.lock().unwrap(), 1);
+        assert!(publisher
+            .begin_next_generation(&mut runtime, 2, size)
+            .is_ok());
+    }
+
+    #[test]
+    fn pending_publisher_stays_pending_when_initial_generation_publication_fails() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let mut runtime = runtime_with_failing_generation_event(session_id);
+        let mut publisher = AppleSurfacePublisher::pending(session_id);
+
+        assert_eq!(
+            publisher
+                .activate_initial_generation(&mut runtime, size)
+                .unwrap_err(),
+            ProtocolError::EventPortClosed
+        );
+        assert!(!publisher.is_active());
+    }
+
+    #[test]
+    fn awaiting_high_performance_short_circuits_committed_publication_before_stale_or_patch_work() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let (mut runtime, recorders) = runtime_with_publication_recorders(session_id);
+        let mut publisher = AppleSurfacePublisher::pending(session_id);
+        let stale_surface = DisplaySurface::new(2, size).unwrap();
+
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &stale_surface,
+                    2,
+                    PixelRect {
+                        x: 1,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeOne,
+                )
+                .unwrap(),
+            PublicationOutcome::AwaitingHighPerformance
+        );
+        assert!(recorders.events.lock().unwrap().is_empty());
+        assert!(recorders.frames.lock().unwrap().is_empty());
+        assert_eq!(*recorders.wakes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn awaiting_high_performance_short_circuits_committed_patch_before_baseline_work() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let (mut runtime, recorders) = runtime_with_publication_recorders(session_id);
+        let mut publisher = AppleSurfacePublisher::pending(session_id);
+        let surface = DisplaySurface::new(1, size).unwrap();
+        let invalid_patch = PixelPatch {
+            rect: PixelRect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            stride_bytes: 4,
+            pixels: PixelBuffer::new(vec![0x33, 0x22, 0x11, 0]),
+        };
+
+        assert_eq!(
+            publisher
+                .publish_committed_patch(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    invalid_patch,
+                    MvsFrameKind::TypeZero {
+                        complete_surface: true,
+                        initial_nonblack: true,
+                    },
+                )
+                .unwrap(),
+            PublicationOutcome::AwaitingHighPerformance
+        );
+        assert!(recorders.events.lock().unwrap().is_empty());
+        assert!(recorders.frames.lock().unwrap().is_empty());
+        assert_eq!(*recorders.wakes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn awaiting_high_performance_rejects_canonical_snapshot_recovery_without_publication() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let (mut runtime, recorders) = runtime_with_publication_recorders(session_id);
+        let mut publisher = AppleSurfacePublisher::pending(session_id);
+        let surface = DisplaySurface::new(1, size).unwrap();
+
+        assert_eq!(
+            publisher
+                .republish_full_snapshot(&mut runtime, &surface, 1)
+                .unwrap_err(),
+            ProtocolError::FramePortRejected
+        );
+        assert!(recorders.events.lock().unwrap().is_empty());
+        assert!(recorders.frames.lock().unwrap().is_empty());
+        assert_eq!(*recorders.wakes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_publisher_begin_convenience_activates_one_generation() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(9, 7).unwrap();
+        let (mut runtime, recorders) = runtime_with_publication_recorders(session_id);
+
+        let publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+
+        assert!(publisher.is_active());
+        assert_eq!(recorders.events.lock().unwrap().len(), 1);
+        assert_eq!(recorders.frames.lock().unwrap().len(), 1);
+        assert_eq!(*recorders.wakes.lock().unwrap(), 1);
     }
 
     #[test]
