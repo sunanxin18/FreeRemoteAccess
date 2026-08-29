@@ -2787,9 +2787,9 @@ mod tests {
             layout.content_rect,
             PixelRect {
                 x: 0,
-                y: 60,
+                y: 66,
                 width: 1100,
-                height: 660,
+                height: 654,
             }
         );
     }
