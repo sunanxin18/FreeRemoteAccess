@@ -1,6 +1,7 @@
 //! Apple HPSS/MVS reader、generation 与动态分辨率状态机。
 
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -800,6 +801,19 @@ fn reader_frame_class(receiver: &MvsReceiveState, msg: &[u8]) -> ReaderFrameClas
         Some(hpss::msg::QUERY_08) => ReaderFrameClass::Query,
         _ => ReaderFrameClass::ControlOrMedia,
     }
+}
+
+fn is_server_state_envelope_encoding_candidate(message: &[u8]) -> bool {
+    const ENCODING_OFFSET: usize = size_of::<u32>() + 4 * size_of::<u16>();
+    let Some(encoding_bytes) = message.get(ENCODING_OFFSET..ENCODING_OFFSET + size_of::<i32>())
+    else {
+        return false;
+    };
+    i32::from_be_bytes(
+        encoding_bytes
+            .try_into()
+            .expect("固定四字节 encoding slice"),
+    ) == encoding::SERVER_STATE
 }
 
 fn incremental_request_after_full_apply(
@@ -1733,9 +1747,7 @@ impl NetworkReaderRuntime {
         observed_at: Instant,
     ) -> Result<NetworkFrameOutcome> {
         let parsed_media = parse_media(&message);
-        if !self.publisher.is_active()
-            && matches!(&parsed_media, Ok(Media::State(encoding::SERVER_STATE)))
-        {
+        if !self.publisher.is_active() && is_server_state_envelope_encoding_candidate(&message) {
             self.receiver.abort_assembly();
             let geometry = hpss::parse_server_state_geometry(&message)
                 .map_err(|_| HighPerformanceUnavailable)?;
@@ -2636,6 +2648,56 @@ mod migrated_runtime_tests {
     }
 
     #[test]
+    fn high_performance_confirmation_startup_closes_map_typed_before_any_publication() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let session_id = frd_core::SessionId::allocate();
+            let requested_at = Instant::now();
+            let initial = DisplaySize::new(8, 8).unwrap();
+            let confirmed = DisplaySize::new(16, 24).unwrap();
+            let geometry =
+                hpss::parse_server_state_geometry(&server_state_message(confirmed)).unwrap();
+            let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+            let mut reader =
+                NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                    .unwrap();
+            let was_pending = !reader.is_high_performance_confirmed();
+            let result = reader.confirm_high_performance_at_with(
+                geometry,
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| {
+                    Err(anyhow::Error::new(std::io::Error::new(
+                        kind,
+                        "injected confirmed full write close",
+                    ))
+                    .context("confirmed-size full write"))
+                },
+            );
+            let error = expect_network_frame_error(
+                crate::runtime::preserve_pending_confirmation_result(was_pending, result),
+            );
+
+            assert_eq!(
+                error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
+                Some(&crate::high_performance::HighPerformanceUnavailable),
+                "kind={kind:?}"
+            );
+            assert!(trace.entries.lock().unwrap().is_empty());
+            assert!(!reader.publisher.is_active());
+            assert!(!reader.is_high_performance_confirmed());
+            let surface = reader.surface.lock().unwrap();
+            assert_eq!((surface.width(), surface.height()), (8, 8));
+        }
+    }
+
+    #[test]
     fn high_performance_confirmation_timeout_boundary_and_malformed_state_are_typed() {
         let session_id = frd_core::SessionId::allocate();
         let requested_at = Instant::now();
@@ -2680,6 +2742,89 @@ mod migrated_runtime_tests {
         );
         assert!(trace.entries.lock().unwrap().is_empty());
         writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preconfirmation_server_state_encoding_candidates_fail_typed_with_or_without_pending_mvs() {
+        use std::io::Read as _;
+
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        for pending_mvs in [false, true] {
+            for malformed_case in ["stream-id", "nonzero-rect", "declared-length"] {
+                let session_id = frd_core::SessionId::allocate();
+                let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+                let mut reader = NetworkReaderRuntime::new(
+                    session_id,
+                    initial,
+                    false,
+                    requested_at,
+                    requested_at,
+                )
+                .unwrap();
+                let (_connection, writer, mut peer) = socket_writer();
+                peer.set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                let mut media = test_media_state();
+                let mut before_generation_commit = || Ok(());
+                if pending_mvs {
+                    reader
+                        .handle_frame_at(
+                            mvs_message(
+                                MvsRect {
+                                    x: 0,
+                                    y: 0,
+                                    width: 8,
+                                    height: 8,
+                                },
+                                2,
+                                &[0xaa],
+                            ),
+                            &writer,
+                            &mut media,
+                            &mut protocol_runtime,
+                            &mut before_generation_commit,
+                            requested_at + Duration::from_secs(1),
+                        )
+                        .unwrap();
+                    assert!(reader.receiver.is_pending());
+                }
+
+                let mut malformed = server_state_message(initial);
+                match malformed_case {
+                    "stream-id" => malformed[0..4].copy_from_slice(&2u32.to_be_bytes()),
+                    "nonzero-rect" => malformed[4..6].copy_from_slice(&1u16.to_be_bytes()),
+                    "declared-length" => malformed[16..18].copy_from_slice(&75u16.to_be_bytes()),
+                    _ => unreachable!(),
+                }
+                let error = expect_network_frame_error(reader.handle_frame_at(
+                    malformed,
+                    &writer,
+                    &mut media,
+                    &mut protocol_runtime,
+                    &mut before_generation_commit,
+                    requested_at + Duration::from_secs(1),
+                ));
+                assert_eq!(
+                    error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
+                    Some(&crate::high_performance::HighPerformanceUnavailable),
+                    "case={malformed_case}, pending={pending_mvs}"
+                );
+                assert!(!reader.receiver.is_pending());
+                assert!(!reader.publisher.is_active());
+                assert!(trace.entries.lock().unwrap().is_empty());
+                let mut byte = [0u8; 1];
+                assert!(matches!(
+                    peer.read(&mut byte),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        )
+                ));
+                writer.shutdown().unwrap();
+            }
+        }
     }
 
     struct TestBitWriter {

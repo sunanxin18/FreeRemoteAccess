@@ -84,6 +84,17 @@ fn preserve_startup_transport_error<T>(result: Result<T>) -> Result<T> {
     })
 }
 
+pub(crate) fn preserve_pending_confirmation_result<T>(
+    was_pending: bool,
+    result: Result<T>,
+) -> Result<T> {
+    if was_pending {
+        preserve_startup_transport_error(result)
+    } else {
+        result
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PointerWireState {
     point: Option<PixelPoint>,
@@ -561,13 +572,18 @@ fn run_authenticated_session_inner(
                 Err(error) => return Err(error),
             };
             let mut before_generation_commit = || pointer.release_all(&writer);
-            match reader.handle_frame(
-                message,
-                &writer,
-                &mut media,
-                &mut runtime,
-                &mut before_generation_commit,
-            )? {
+            let was_pending = !reader.is_high_performance_confirmed();
+            let outcome = preserve_pending_confirmation_result(
+                was_pending,
+                reader.handle_frame(
+                    message,
+                    &writer,
+                    &mut media,
+                    &mut runtime,
+                    &mut before_generation_commit,
+                ),
+            )?;
+            match outcome {
                 NetworkFrameOutcome::Consumed => {}
                 NetworkFrameOutcome::HighPerformanceConfirmed { size } => {
                     eprintln!(
@@ -1145,6 +1161,36 @@ mod tests {
             let error = anyhow::Error::new(std::io::Error::new(kind, "synthetic startup close"))
                 .context("startup write wrapper");
             assert!(super::is_startup_transport_close(&error));
+
+            let pending_error = super::preserve_pending_confirmation_result::<()>(
+                true,
+                Err(anyhow::Error::new(std::io::Error::new(
+                    kind,
+                    "synthetic confirmed-size full write close",
+                ))
+                .context("handle_frame confirmation write")),
+            )
+            .unwrap_err();
+            assert_eq!(
+                pending_error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
+                Some(&crate::high_performance::HighPerformanceUnavailable)
+            );
+
+            let confirmed_error = super::preserve_pending_confirmation_result::<()>(
+                false,
+                Err(anyhow::Error::new(std::io::Error::new(
+                    kind,
+                    "synthetic active reader close",
+                ))),
+            )
+            .unwrap_err();
+            assert!(confirmed_error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .any(|error| error.kind() == kind));
+            assert!(confirmed_error
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .is_none());
         }
         let unrelated = anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
