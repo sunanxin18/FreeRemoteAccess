@@ -1459,14 +1459,20 @@ fn handle_complete_mvs_record(
         }
         _ => PublicationOutcome::Published,
     };
-    if matches!(
-        publication,
-        PublicationOutcome::NeedsFullBaseline | PublicationOutcome::NeedsFullSnapshot
-    ) {
-        receiver.request_full()?;
-        let size = current_surface_size(surface);
-        request_full_update(writer, requests, size.width, size.height)?;
-        return Ok(());
+    match publication {
+        PublicationOutcome::NeedsFullBaseline => {
+            receiver.request_full()?;
+            let size = current_surface_size(surface);
+            request_full_update(writer, requests, size.width, size.height)?;
+            return Ok(());
+        }
+        PublicationOutcome::NeedsFullSnapshot => {
+            let surface = surface.lock().unwrap();
+            publisher
+                .republish_full_snapshot(protocol_runtime, &surface, receiver.generation)
+                .map_err(|error| anyhow::anyhow!(error.code()))?;
+        }
+        PublicationOutcome::Published | PublicationOutcome::IgnoredStale => {}
     }
     if full_applied {
         let boundary = finish_network_full_boundary(
@@ -1776,6 +1782,26 @@ mod migrated_runtime_tests {
             &self,
             _update: frd_frame::SurfaceUpdate,
         ) -> Result<(), frd_protocol_api::ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct SnapshotRecoveryFrames {
+        updates: Arc<Mutex<Vec<frd_frame::SurfaceUpdate>>>,
+        reject_next_damage: Mutex<bool>,
+    }
+
+    impl frd_protocol_api::SurfacePublisher for SnapshotRecoveryFrames {
+        fn publish(
+            &self,
+            update: frd_frame::SurfaceUpdate,
+        ) -> Result<(), frd_protocol_api::ProtocolError> {
+            let mut reject_next_damage = self.reject_next_damage.lock().unwrap();
+            if *reject_next_damage && matches!(update, frd_frame::SurfaceUpdate::Damage { .. }) {
+                *reject_next_damage = false;
+                return Err(frd_protocol_api::ProtocolError::NeedsFullSnapshot);
+            }
+            self.updates.lock().unwrap().push(update);
             Ok(())
         }
     }
@@ -3341,5 +3367,156 @@ mod migrated_runtime_tests {
         let runtime = dynamic.lock().unwrap();
         assert!(runtime.evidence.current_full_media_applied);
         assert!(runtime.armed);
+    }
+
+    #[test]
+    fn mailbox_snapshot_recovery_preserves_decoder_and_sends_only_next_incremental() {
+        use std::io::Read as _;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        let session_id = frd_core::SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut protocol_runtime = frd_protocol_api::ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopProtocolEvents),
+            Box::new(SnapshotRecoveryFrames {
+                updates: frames.clone(),
+                reject_next_damage: Mutex::new(true),
+            }),
+            None,
+            Box::new(NoopProtocolWake),
+        );
+        let size = frd_core::PixelSize::new(8, 8).unwrap();
+        let mut publisher =
+            AppleSurfacePublisher::begin(&mut protocol_runtime, session_id, size).unwrap();
+        let surface = native_surface(8, 8);
+        let dynamic_resolution = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let last_full_request = Instant::now() - Duration::from_secs(1);
+        let mut requests = ReaderRequestState::after_startup(last_full_request, 1);
+        let viewport_requests = Arc::new(Mutex::new(ViewportRequestQueue::default()));
+        let record = native_record(MvsRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+
+        handle_complete_mvs_record(
+            &mut receiver,
+            &mut requests,
+            record,
+            &surface,
+            &viewport_requests,
+            &dynamic_resolution,
+            &writer,
+            &mut protocol_runtime,
+            &mut publisher,
+        )
+        .unwrap();
+
+        assert!(!receiver.awaiting_full());
+        let mut write = [0; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
+        peer.read_exact(&mut write).unwrap();
+        assert_eq!(
+            write,
+            protocol::msg_fb_update_request(true, 0, 0, 8, 8).unwrap()
+        );
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut extra = [0];
+        let error = peer.read(&mut extra).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(requests.last_full_request, Some(last_full_request));
+        let surface = surface.lock().unwrap();
+        assert_eq!(surface.native_mvs_observability.type_zero_applied_count, 1);
+        assert_eq!(surface.native_mvs_observability.content_revision, 1);
+        drop(surface);
+        assert!(matches!(
+            frames.lock().unwrap().last(),
+            Some(frd_frame::SurfaceUpdate::FrameBoundary {
+                completeness: frd_frame::FrameCompleteness::FullBaseline,
+                ..
+            })
+        ));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn needs_full_baseline_sets_awaiting_full_and_sends_non_incremental_request() {
+        use std::io::Read as _;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        let session_id = frd_core::SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let mut protocol_runtime = frd_protocol_api::ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopProtocolEvents),
+            Box::new(NoopProtocolFrames),
+            None,
+            Box::new(NoopProtocolWake),
+        );
+        let size = frd_core::PixelSize::new(16, 8).unwrap();
+        let mut publisher =
+            AppleSurfacePublisher::begin(&mut protocol_runtime, session_id, size).unwrap();
+        let surface = native_surface(16, 8);
+        let dynamic_resolution = native_runtime(16, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let last_full_request = Instant::now() - Duration::from_secs(1);
+        let mut requests = ReaderRequestState::after_startup(last_full_request, 1);
+        let viewport_requests = Arc::new(Mutex::new(ViewportRequestQueue::default()));
+        let record = native_record(MvsRect {
+            x: 8,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+
+        handle_complete_mvs_record(
+            &mut receiver,
+            &mut requests,
+            record,
+            &surface,
+            &viewport_requests,
+            &dynamic_resolution,
+            &writer,
+            &mut protocol_runtime,
+            &mut publisher,
+        )
+        .unwrap();
+
+        assert!(receiver.awaiting_full());
+        let mut write = [0; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
+        peer.read_exact(&mut write).unwrap();
+        assert_eq!(
+            write,
+            protocol::msg_fb_update_request(false, 0, 0, 16, 8).unwrap()
+        );
+        assert_ne!(requests.last_full_request, Some(last_full_request));
+        writer.shutdown().unwrap();
     }
 }
