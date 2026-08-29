@@ -185,27 +185,38 @@ impl DynamicResolutionRuntime {
         observed: DisplaySize,
         current_surface: DisplaySize,
         next_controller_generation: u64,
-    ) -> ServerGeometryPlan {
+    ) -> Result<ServerGeometryPlan> {
         if observed == current_surface {
-            return ServerGeometryPlan {
+            return Ok(ServerGeometryPlan {
                 disposition: ServerGeometryDisposition::Unchanged,
                 controller_generation: next_controller_generation,
-            };
+            });
         }
-        if self
-            .controller
-            .pending_server_state_matches(observed, next_controller_generation)
+        if let crate::dynamic_resolution::DynamicResolutionState::Pending {
+            generation,
+            target,
+            ..
+        } = self.controller.state()
         {
-            return ServerGeometryPlan {
-                disposition: ServerGeometryDisposition::RequestedAck,
-                controller_generation: next_controller_generation,
-            };
+            if *target == observed {
+                if *generation != next_controller_generation {
+                    bail!(
+                        "Pending 几何 generation 与当前 surface 不一致: pending {} != next {}",
+                        generation,
+                        next_controller_generation
+                    );
+                }
+                return Ok(ServerGeometryPlan {
+                    disposition: ServerGeometryDisposition::RequestedAck,
+                    controller_generation: next_controller_generation,
+                });
+            }
         }
 
-        ServerGeometryPlan {
+        Ok(ServerGeometryPlan {
             disposition: ServerGeometryDisposition::ServerInitiated,
             controller_generation: next_controller_generation,
-        }
+        })
     }
 
     /// `plan_server_geometry` 及所有可失败的准备完成后才能调用。
@@ -214,14 +225,26 @@ impl DynamicResolutionRuntime {
         plan: ServerGeometryPlan,
         observed: DisplaySize,
         previous: DisplaySize,
-    ) {
+    ) -> Result<()> {
         match plan.disposition {
             ServerGeometryDisposition::Unchanged => {}
             ServerGeometryDisposition::RequestedAck => {
+                if !self
+                    .controller
+                    .pending_server_state_matches(observed, plan.controller_generation)
+                {
+                    bail!("已计划的 Pending ServerState 在提交前失效");
+                }
                 let commit = self
                     .observe_server_state(observed)
-                    .expect("已验证的 Pending ServerState 必须可提交");
-                debug_assert_eq!(commit.generation, plan.controller_generation);
+                    .context("已计划的 Pending ServerState 在提交前失效")?;
+                if commit.generation != plan.controller_generation {
+                    bail!(
+                        "已计划的 Pending ServerState generation 在提交时改变: {} != {}",
+                        commit.generation,
+                        plan.controller_generation
+                    );
+                }
             }
             ServerGeometryDisposition::ServerInitiated => {
                 self.pending_since = None;
@@ -233,6 +256,7 @@ impl DynamicResolutionRuntime {
                 );
             }
         }
+        Ok(())
     }
 
     fn timeout_pending(&mut self, now: Instant) -> bool {
@@ -321,14 +345,14 @@ fn commit_server_geometry(
     let Some(controller_generation) = generation.checked_sub(1) else {
         return Ok(None);
     };
-    let plan = runtime.plan_server_geometry(observed, current, controller_generation);
+    let plan = runtime.plan_server_geometry(observed, current, controller_generation)?;
     if plan.disposition == ServerGeometryDisposition::Unchanged {
         return Ok(None);
     }
     let replacement = DisplaySurface::new(generation, replacement_size)?;
     before_generation_commit()?;
     media_state.reset_generation(generation)?;
-    runtime.apply_server_geometry_plan(plan, observed, current);
+    runtime.apply_server_geometry_plan(plan, observed, current)?;
     receiver.reset(generation);
     *surface = replacement;
     Ok(Some(ServerGeometryCommit {
