@@ -120,18 +120,27 @@ impl DisplayControlAdapter {
         })
     }
 
-    pub(crate) fn confirm_reactivation(&mut self, observed: PixelSize) -> ResizeConfirmation {
+    pub(crate) fn confirm_reactivation(
+        &mut self,
+        observed: PixelSize,
+        current_max_monitor_area: Option<u64>,
+    ) -> ResizeConfirmation {
+        self.set_negotiated(current_max_monitor_area);
         match self.in_flight {
             None => {
                 self.confirmed_size = observed;
                 ResizeConfirmation::NoRequest
             }
-            Some(expected) if expected == observed => {
+            Some(expected) if !self.within_server_area(expected) => {
+                self.in_flight = None;
+                ResizeConfirmation::Mismatch
+            }
+            Some(expected) if expected != observed => ResizeConfirmation::Mismatch,
+            Some(_) => {
                 self.confirmed_size = observed;
                 self.in_flight = None;
                 ResizeConfirmation::Confirmed
             }
-            Some(_) => ResizeConfirmation::Mismatch,
         }
     }
 }
@@ -194,10 +203,13 @@ mod tests {
         adapter.observe_viewport(viewport(1920, 1080));
         assert_eq!(adapter.take_resize_request(), None);
         assert_eq!(
-            adapter.confirm_reactivation(PixelSize {
-                width: 1598,
-                height: 900,
-            }),
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1598,
+                    height: 900,
+                },
+                Some(u64::MAX),
+            ),
             ResizeConfirmation::Mismatch
         );
         assert_eq!(
@@ -208,10 +220,13 @@ mod tests {
             }
         );
         assert_eq!(
-            adapter.confirm_reactivation(PixelSize {
-                width: 1600,
-                height: 900,
-            }),
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1600,
+                    height: 900,
+                },
+                Some(u64::MAX),
+            ),
             ResizeConfirmation::Confirmed
         );
         assert_eq!(
@@ -241,10 +256,13 @@ mod tests {
         adapter.observe_viewport(viewport(1920, 1080));
         adapter.observe_viewport(viewport(1601, 900));
         assert_eq!(
-            adapter.confirm_reactivation(PixelSize {
-                width: 1600,
-                height: 900,
-            }),
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1600,
+                    height: 900,
+                },
+                Some(u64::MAX),
+            ),
             ResizeConfirmation::Confirmed
         );
         assert_eq!(adapter.take_resize_request(), None);
@@ -269,17 +287,20 @@ mod tests {
 
         adapter.observe_viewport(viewport(1280, 720));
         assert_eq!(
-            adapter.confirm_reactivation(PixelSize {
-                width: 1600,
-                height: 900,
-            }),
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1600,
+                    height: 900,
+                },
+                Some(u64::MAX),
+            ),
             ResizeConfirmation::Confirmed
         );
         assert_eq!(adapter.take_resize_request(), Some(initial));
     }
 
     #[test]
-    fn display_dvc_loss_preserves_the_exact_in_flight_ack_guard() {
+    fn display_dvc_loss_rejects_and_retires_an_exact_in_flight_reactivation() {
         let initial = PixelSize {
             width: 1280,
             height: 720,
@@ -295,15 +316,92 @@ mod tests {
             })
         );
 
-        adapter.set_negotiated(None);
         assert_eq!(
-            adapter.confirm_reactivation(PixelSize {
-                width: 1280,
-                height: 720,
-            }),
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1600,
+                    height: 900,
+                },
+                None,
+            ),
             ResizeConfirmation::Mismatch
         );
         assert_eq!(adapter.confirmed_size(), initial);
+
+        adapter.set_negotiated(Some(1280 * 720));
+        adapter.observe_viewport(viewport(1024, 768));
+        assert_eq!(
+            adapter.take_resize_request(),
+            Some(PixelSize {
+                width: 1024,
+                height: 768,
+            })
+        );
+        assert_eq!(
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1024,
+                    height: 768,
+                },
+                Some(1280 * 720),
+            ),
+            ResizeConfirmation::Confirmed
+        );
+    }
+
+    #[test]
+    fn display_capability_shrink_rejects_stale_exact_ack_and_preserves_latest_valid_target() {
+        let initial = PixelSize {
+            width: 800,
+            height: 600,
+        };
+        let mut adapter = DisplayControlAdapter::new(initial);
+        adapter.set_negotiated(Some(1600 * 900));
+        adapter.observe_viewport(viewport(1600, 900));
+        assert_eq!(
+            adapter.take_resize_request(),
+            Some(PixelSize {
+                width: 1600,
+                height: 900,
+            })
+        );
+
+        adapter.observe_viewport(viewport(1280, 720));
+        assert_eq!(
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1600,
+                    height: 900,
+                },
+                Some(1280 * 720),
+            ),
+            ResizeConfirmation::Mismatch
+        );
+        assert_eq!(adapter.confirmed_size(), initial);
+        assert_eq!(
+            adapter.take_resize_request(),
+            Some(PixelSize {
+                width: 1280,
+                height: 720,
+            })
+        );
+        assert_eq!(
+            adapter.confirm_reactivation(
+                PixelSize {
+                    width: 1280,
+                    height: 720,
+                },
+                Some(1280 * 720),
+            ),
+            ResizeConfirmation::Confirmed
+        );
+        assert_eq!(
+            adapter.confirmed_size(),
+            PixelSize {
+                width: 1280,
+                height: 720,
+            }
+        );
     }
 
     #[test]

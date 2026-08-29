@@ -298,6 +298,7 @@ fn run_active_loop(
                     baseline,
                     generation,
                     display,
+                    display_capabilities,
                     input,
                     activation_factory,
                 )? {
@@ -324,11 +325,8 @@ fn refresh_optional_capabilities(
     runtime: &mut ProtocolRuntime,
     published: &mut SessionCapabilities,
 ) -> Result<(), ProtocolError> {
-    let display_max_monitor_area = active_stage
-        .get_dvc::<DisplayControlClient>()
-        .and_then(|channel| channel.channel_processor_downcast_ref::<DisplayControlClient>())
-        .filter(|display_control| display_control.ready())
-        .and_then(|_| display_capabilities.max_monitor_area());
+    let display_max_monitor_area =
+        current_display_max_monitor_area(active_stage, display_capabilities);
     display.set_negotiated(display_max_monitor_area);
 
     if let Some(rdpsnd) = active_stage.get_svc_processor::<Rdpsnd>() {
@@ -358,6 +356,17 @@ fn refresh_optional_capabilities(
         ))?;
     }
     Ok(())
+}
+
+fn current_display_max_monitor_area(
+    active_stage: &mut ActiveStage,
+    display_capabilities: &DisplayControlCapabilityState,
+) -> Option<u64> {
+    active_stage
+        .get_dvc::<DisplayControlClient>()
+        .and_then(|channel| channel.channel_processor_downcast_ref::<DisplayControlClient>())
+        .filter(|display_control| display_control.ready())
+        .and_then(|_| display_capabilities.max_monitor_area())
 }
 
 fn service_optional_channels(
@@ -521,6 +530,7 @@ fn drive_reactivation(
     baseline: &mut RdpBaseline,
     generation: &mut u64,
     display: &mut DisplayControlAdapter,
+    display_capabilities: &DisplayControlCapabilityState,
     input: &mut RdpInputState,
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<ReactivationOutcome, ProtocolError> {
@@ -582,7 +592,11 @@ fn drive_reactivation(
         {
             let observed_size = validate_negotiated_size(desktop_size.width, desktop_size.height)
                 .map_err(|_| rdp_error(RDP_ACTIVATION_FAILED))?;
-            if display.confirm_reactivation(observed_size) == ResizeConfirmation::Mismatch {
+            let current_max_monitor_area =
+                current_display_max_monitor_area(active_stage, display_capabilities);
+            if display.confirm_reactivation(observed_size, current_max_monitor_area)
+                == ResizeConfirmation::Mismatch
+            {
                 return Err(rdp_error(RDP_ACTIVATION_FAILED));
             }
             *generation =
