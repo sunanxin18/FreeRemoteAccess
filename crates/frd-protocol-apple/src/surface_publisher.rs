@@ -166,6 +166,7 @@ pub(crate) enum PublicationOutcome {
 pub(crate) struct AppleSurfacePublisher {
     session_id: SessionId,
     generation: u64,
+    size: PixelSize,
     revision: u64,
     baseline_established: bool,
 }
@@ -180,6 +181,7 @@ impl AppleSurfacePublisher {
         Ok(Self {
             session_id,
             generation: 1,
+            size,
             revision: 0,
             baseline_established: false,
         })
@@ -202,6 +204,7 @@ impl AppleSurfacePublisher {
             PixelFormat::Bgrx8UnormSrgb,
         )?;
         self.generation = generation;
+        self.size = size;
         self.revision = 0;
         self.baseline_established = false;
         Ok(())
@@ -282,7 +285,11 @@ impl AppleSurfacePublisher {
         generation: u64,
         patch_byte_limit: usize,
     ) -> Result<(), ProtocolError> {
-        if generation != self.generation || surface.generation != self.generation {
+        if generation != self.generation
+            || surface.generation != self.generation
+            || surface.width() != self.size.width as usize
+            || surface.height() != self.size.height as usize
+        {
             return Err(ProtocolError::FramePortRejected);
         }
 
@@ -1269,5 +1276,97 @@ mod tests {
             .republish_full_snapshot_with_patch_limit(&mut runtime, &surface, 1, 15)
             .unwrap_err();
         assert_eq!(error, ProtocolError::FramePortRejected);
+    }
+
+    #[test]
+    fn full_snapshot_recovery_rejects_same_generation_geometry_mismatch_before_publication() {
+        let session_id = SessionId::allocate();
+        let publisher_size = PixelSize::new(2, 1).unwrap();
+        let (mut runtime, frames) = runtime_with_frames(session_id);
+        let surface = DisplaySurface::new(1, PixelSize::new(1, 1).unwrap()).unwrap();
+        let mut publisher =
+            AppleSurfacePublisher::begin(&mut runtime, session_id, publisher_size).unwrap();
+
+        assert_eq!(
+            publisher
+                .republish_full_snapshot(&mut runtime, &surface, 1)
+                .unwrap_err(),
+            ProtocolError::FramePortRejected
+        );
+        let frames = frames.lock().unwrap();
+        assert!(matches!(frames.as_slice(), [SurfaceUpdate::Reset { .. }]));
+    }
+
+    #[test]
+    fn full_snapshot_recovery_second_overflow_fails_without_retry_or_baseline() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let (_commands, command_rx) = mpsc::channel();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(2, 4)));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        apply_rgb_rect_for_generation(&mut surface, 1, &[0x11, 0x22, 0x33], 0, 0, 1, 1).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        let full = MvsFrameKind::TypeZero {
+            complete_surface: true,
+            initial_nonblack: true,
+        };
+
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    full,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullSnapshot
+        );
+
+        assert_eq!(
+            publisher
+                .republish_full_snapshot(&mut runtime, &surface, 1)
+                .unwrap_err(),
+            ProtocolError::FramePortRejected
+        );
+        let mut mailbox = mailbox.lock().unwrap();
+        assert!(matches!(mailbox.pop(), Some(SurfaceUpdate::Reset { .. })));
+        assert!(
+            mailbox.pop().is_none(),
+            "recovery must not recursively retry"
+        );
+        drop(mailbox);
+
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeOne,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullBaseline
+        );
     }
 }
