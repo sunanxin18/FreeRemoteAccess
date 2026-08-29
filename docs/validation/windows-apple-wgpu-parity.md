@@ -151,21 +151,26 @@ change was removed and was not committed. This remains a non-reproduced bounded
 observation, not evidence of a resolved root cause.
 
 The user also reported visibly higher input-to-refresh latency. A same-machine,
-same-target A/B sample did not attribute that latency to RDP integration:
+same-target A/B resource sample produced these observations:
 
 | Variant | CPU seconds in 5 seconds | Working set | Private bytes | stderr growth |
 | --- | ---: | ---: | ---: | ---: |
 | Frozen Mac-only baseline `cc71206` | 5.750 | 336.5 MiB | 458.3 MiB | 32,422 bytes |
 | Integrated candidate | 5.547 | 328.3 MiB | 449.5 MiB | 30,937 bytes |
 
-The current Apple path decodes the native 3.69-megapixel portrait surface even
-though the fitted client image is much smaller, and the active desktop was
-continuously changing. This keeps roughly one CPU core busy in both binaries.
-Release hot-path MVS diagnostics can add jitter, but their byte rate and the A/B
-result do not identify RDP registration as the regression. Dynamic resolution
-remains default-off because resized `0x09` interoperability is still an Apple
-wire experiment; performance work must not enable it without the required ARD
-evidence and live gate.
+This sample only shows that it found no obvious CPU, working-set, private-byte,
+or stderr-volume increase in the integrated binary. It did not measure the
+input-send-to-MVS-commit-to-GPU-present path and did not prove identical remote
+desktop workloads, so it cannot exclude an RDP-integration scheduling or
+input-to-refresh regression. The latency root cause remains unconfirmed.
+
+The strongest current candidates are the native 3.69-megapixel portrait MVS
+decode while the fitted client image is much smaller, frequent large dirty
+rectangles, and synchronous Release hot-path diagnostics. These are candidates,
+not established causes. Dynamic resolution remains default-off because resized
+`0x09` interoperability is still an Apple wire experiment; performance work
+must not enable it without the required ARD evidence and live gate. That work is
+tracked explicitly in the top-level README pending list.
 
 ## Remaining Platform Evidence
 

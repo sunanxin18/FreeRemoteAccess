@@ -45,8 +45,8 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
-| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-29 在并列注册 RDP adapter 后重新完成自动选择、首帧、持续增量与键鼠真机回归；当前 1440×2560 原生 MVS 在缩小窗口中仍有明显 CPU/延迟成本，A/B 未显示 RDP 集成回归，见 `docs/validation/windows-apple-wgpu-parity.md` |
-| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；见 `AGENTS.md` P2 |
+| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-29 在并列注册 RDP adapter 后重新完成自动选择、首帧、持续增量与键鼠真机回归；当前 1440×2560 原生 MVS 在缩小窗口中仍有明显 CPU/延迟成本，资源采样未发现两版之间的明显 CPU/内存差异，但输入到显示延迟的根因尚未确认，见 `docs/validation/windows-apple-wgpu-parity.md` |
+| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。现存成本为 dirty rect 的 BGRX 打包与 CPU→GPU 上传；见 `AGENTS.md` P2 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
 | 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |
 | 动态分辨率 | 实验性 resized `0x09` + generation 切换 | **实验性** | 默认关闭；尚无足够 Apple 线协议互操作证据，见 `AGENTS.md` P1 |
@@ -90,6 +90,14 @@ HPSS/ARD/MVS 路径。
 矩阵只记录已完成的实际层级：编译通过、安装包生成、客户端本地运行、协议
 实现和真机互操作必须分别验证，不能相互替代。任何新增功能或平台改动都必须
 在同一提交中更新本节。
+
+### 近期待办
+
+- **Apple 动态 resize（P1）**：保持默认关闭和 **实验性**。以 ARD 3.10
+  运行证据为唯一协议基准，补齐 resized `0x09` 的真机互操作门禁；确认服务端
+  精确接受新尺寸后，再以一个原子 generation 切换同步替换 surface 尺寸、MVS
+  decoder 状态、wgpu texture 与输入坐标变换，并要求新 generation 的完整
+  type-0 baseline。没有该证据前不得用本地缩放或自定义协议冒充远端 resize。
 
 ---
 
