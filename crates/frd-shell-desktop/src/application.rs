@@ -1,7 +1,7 @@
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use frd_app::{AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
@@ -98,6 +98,7 @@ enum BackgroundLaunchResult {
     Started {
         cleanup_handle: SessionCleanupHandle,
         ports: LiveSessionPorts,
+        start_barrier: ProtocolStartBarrier,
     },
     LaunchRolledBack(SessionStartFailure),
 }
@@ -164,6 +165,75 @@ impl MediaPublisher for AudioMediaPublisher {
             mpsc::TrySendError::Full(_) => MediaPublishError::Full,
             mpsc::TrySendError::Disconnected(_) => MediaPublishError::Closed,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtocolStartState {
+    Pending,
+    Started,
+    Cancelled,
+}
+
+struct ProtocolStartBarrier {
+    state: Arc<(Mutex<ProtocolStartState>, Condvar)>,
+    resolved: bool,
+}
+
+struct ProtocolStartWaiter {
+    state: Arc<(Mutex<ProtocolStartState>, Condvar)>,
+}
+
+impl ProtocolStartBarrier {
+    fn new() -> (Self, ProtocolStartWaiter) {
+        let state = Arc::new((Mutex::new(ProtocolStartState::Pending), Condvar::new()));
+        (
+            Self {
+                state: state.clone(),
+                resolved: false,
+            },
+            ProtocolStartWaiter { state },
+        )
+    }
+
+    fn release(mut self) {
+        self.resolve(ProtocolStartState::Started);
+    }
+
+    fn resolve(&mut self, resolution: ProtocolStartState) {
+        if self.resolved {
+            return;
+        }
+        let (lock, ready) = &*self.state;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == ProtocolStartState::Pending {
+            *state = resolution;
+            ready.notify_all();
+        }
+        self.resolved = true;
+    }
+}
+
+impl Drop for ProtocolStartBarrier {
+    fn drop(&mut self) {
+        self.resolve(ProtocolStartState::Cancelled);
+    }
+}
+
+impl ProtocolStartWaiter {
+    fn wait(self) -> bool {
+        let (lock, ready) = &*self.state;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *state == ProtocolStartState::Pending {
+            state = ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *state == ProtocolStartState::Started
     }
 }
 
@@ -371,16 +441,20 @@ impl SessionHost {
             BackgroundLaunchResult::Started {
                 cleanup_handle,
                 ports,
+                start_barrier,
             } if !cancelled => {
                 self.coordinator = Some(outcome.coordinator);
                 self.active = Some(ports);
                 self.cleanup_handle = Some(cleanup_handle);
+                start_barrier.release();
                 Ok(AcceptedLaunchOutcome::Started)
             }
             BackgroundLaunchResult::Started {
                 cleanup_handle,
                 ports,
+                start_barrier,
             } => {
+                drop(start_barrier);
                 drop(ports);
                 self.cleanup_in_flight = true;
                 match spawn_cleanup(
@@ -556,13 +630,13 @@ fn run_background_launch(
         target,
         request,
     } = pending;
-    let mut launched_ports = None;
+    let mut launched_session = None;
     let outcome = coordinator.start(permit, target, request, |request| {
         if cancelled.load(Ordering::Acquire) {
             return Err(ProtocolError::Terminal);
         }
         let factory = selected_factory.ok_or(ProtocolError::UnregisteredProtocol)?;
-        let (cleanup, ports) = launch_live_session(
+        let (cleanup, ports, start_barrier) = launch_live_session(
             factory,
             wake,
             audio_factory,
@@ -570,17 +644,22 @@ fn run_background_launch(
             cancelled.clone(),
             request,
         )?;
-        launched_ports = Some(ports);
+        launched_session = Some((ports, start_barrier));
         Ok(Box::new(cleanup) as Box<dyn CleanupOperations>)
     });
     let cancelled_before_publish = cancelled.load(Ordering::Acquire);
     let result = match outcome {
-        SessionStartOutcome::Started(cleanup_handle) => BackgroundLaunchResult::Started {
-            cleanup_handle,
-            ports: launched_ports.expect("started transaction owns live ports"),
-        },
+        SessionStartOutcome::Started(cleanup_handle) => {
+            let (ports, start_barrier) =
+                launched_session.expect("started transaction owns live ports and barrier");
+            BackgroundLaunchResult::Started {
+                cleanup_handle,
+                ports,
+                start_barrier,
+            }
+        }
         SessionStartOutcome::LaunchRolledBack(failure) => {
-            debug_assert!(launched_ports.is_none());
+            debug_assert!(launched_session.is_none());
             BackgroundLaunchResult::LaunchRolledBack(failure)
         }
     };
@@ -620,7 +699,7 @@ fn launch_live_session(
     worker_spawner: Arc<dyn WorkerSpawner>,
     cancelled: Arc<AtomicBool>,
     request: ConnectRequest,
-) -> Result<(LiveSessionCleanup, LiveSessionPorts), ProtocolError> {
+) -> Result<(LiveSessionCleanup, LiveSessionPorts, ProtocolStartBarrier), ProtocolError> {
     let session_id = request.session_id;
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
@@ -673,12 +752,16 @@ fn launch_live_session(
         let _ = audio_worker.join();
         return Err(ProtocolError::Terminal);
     }
+    let (start_barrier, protocol_start_waiter) = ProtocolStartBarrier::new();
     let final_events = event_tx;
     let final_wake = wake;
     let protocol_worker = match worker_spawner.spawn(
         WorkerKind::Protocol,
         format!("frd-session-{}", session_id.get()),
         Box::new(move || {
+            if !protocol_start_waiter.wait() {
+                return;
+            }
             let exit = catch_unwind(AssertUnwindSafe(|| session.run()))
                 .unwrap_or(ProtocolExit::Failed(ProtocolError::Terminal));
             let _ = final_events.send(SessionEvent::Closed(exit));
@@ -709,6 +792,7 @@ fn launch_live_session(
             events: event_rx,
             mailbox,
         },
+        start_barrier,
     ))
 }
 
@@ -2992,6 +3076,83 @@ mod tests {
         worker_started: mpsc::Sender<()>,
     }
 
+    struct ProtocolStartProbeFactory {
+        protocol_id: ProtocolId,
+        run_entered: mpsc::Sender<()>,
+        publication_complete: mpsc::Sender<()>,
+        session_dropped: mpsc::Sender<()>,
+        run_count: Arc<AtomicUsize>,
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl ProtocolFactory for ProtocolStartProbeFactory {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                id: self.protocol_id.clone(),
+                display_name: "protocol-start-probe".to_owned(),
+                default_port: 5900,
+                credential_requirements: CredentialRequirements::username_password(),
+            }
+        }
+
+        fn create(
+            &self,
+            request: ConnectRequest,
+            runtime: ProtocolRuntime,
+        ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
+            Ok(Box::new(ProtocolStartProbeSession {
+                session_id: request.session_id,
+                runtime,
+                run_entered: self.run_entered.clone(),
+                publication_complete: self.publication_complete.clone(),
+                session_dropped: self.session_dropped.clone(),
+                run_count: self.run_count.clone(),
+                drop_count: self.drop_count.clone(),
+            }))
+        }
+    }
+
+    struct ProtocolStartProbeSession {
+        session_id: SessionId,
+        runtime: ProtocolRuntime,
+        run_entered: mpsc::Sender<()>,
+        publication_complete: mpsc::Sender<()>,
+        session_dropped: mpsc::Sender<()>,
+        run_count: Arc<AtomicUsize>,
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ProtocolStartProbeSession {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::AcqRel);
+            let _ = self.session_dropped.send(());
+        }
+    }
+
+    impl ProtocolSession for ProtocolStartProbeSession {
+        fn run(mut self: Box<Self>) -> ProtocolExit {
+            self.run_entered
+                .send(())
+                .expect("test observer remains available");
+            self.run_count.fetch_add(1, Ordering::AcqRel);
+            self.runtime
+                .publish_event(SessionEvent::StageChanged(ConnectionStage::TransportReady))
+                .expect("probe event port is installed");
+            self.runtime
+                .begin_generation(
+                    self.session_id,
+                    1,
+                    frd_core::PixelSize::new(2, 2).expect("test probe size is valid"),
+                    PixelFormat::Bgrx8UnormSrgb,
+                )
+                .expect("probe Reset port is installed");
+            self.publication_complete
+                .send(())
+                .expect("test publication observer remains available");
+            ProtocolExit::Closed
+        }
+    }
+
     struct ObservedBlockingFactory {
         create_count: Arc<AtomicUsize>,
         drop_count: Arc<AtomicUsize>,
@@ -3418,51 +3579,25 @@ mod tests {
     }
 
     #[test]
-    fn close_after_started_outcome_but_before_acceptance_never_installs_stale_active_ports() {
-        let (worker_started_tx, worker_started_rx) = mpsc::channel();
-        let mut host = test_host(
-            Arc::new(BlockingFactory {
-                worker_started: worker_started_tx,
-            }),
-            Arc::new(TestAudioFactory),
-        );
-        let session_id = SessionId::allocate();
-        let (_owner, permit) = reserve_session_start(session_id);
-        let (launch_tx, launch_rx) = mpsc::channel();
-        host.begin_launch(
-            permit,
+    fn protocol_worker_waits_until_live_ports_are_installed_for_apple_and_rdp() {
+        assert_protocol_worker_waits_until_live_ports_are_installed(
             TargetSystem::MacOs,
-            test_request(session_id),
-            move |outcome| launch_tx.send(outcome).unwrap(),
-        )
-        .expect("background launch starts");
-        let outcome = launch_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("launch outcome reaches the event loop");
-        worker_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("protocol worker is live before close");
-
-        assert!(host.cancel_pending_launch());
-        let (cleanup_tx, cleanup_rx) = mpsc::channel();
-        assert!(matches!(
-            host.accept_launch_outcome(outcome, move |outcome| {
-                cleanup_tx.send(outcome).unwrap();
-            }),
-            Ok(AcceptedLaunchOutcome::CancelledStarted)
-        ));
-        assert!(
-            host.active.is_none(),
-            "stale ports must never become active"
+            ProtocolId::apple_hpss_mvs(),
         );
-        let cleanup = cleanup_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("cancelled start is reclaimed by the bounded cleanup worker");
-        let completion = host
-            .accept_cleanup_outcome(cleanup)
-            .expect("cancelled launch cleanup completes");
-        assert_eq!(completion.session_id(), session_id);
-        assert!(!host.is_active());
+        assert_protocol_worker_waits_until_live_ports_are_installed(
+            TargetSystem::Windows,
+            ProtocolId::rdp(),
+        );
+    }
+
+    #[test]
+    fn cancelled_launch_drops_barrier_without_running_protocol() {
+        assert_cancelled_started_probe_launch(TargetSystem::MacOs, ProtocolId::apple_hpss_mvs());
+    }
+
+    #[test]
+    fn close_after_started_outcome_but_before_acceptance_never_installs_stale_active_ports() {
+        assert_cancelled_started_probe_launch(TargetSystem::MacOs, ProtocolId::apple_hpss_mvs());
     }
 
     #[test]
@@ -3527,18 +3662,19 @@ mod tests {
 
     #[test]
     fn fatal_after_started_is_queued_ignores_the_late_event_without_installing_ports() {
-        let create_count = Arc::new(AtomicUsize::new(0));
+        let run_count = Arc::new(AtomicUsize::new(0));
         let drop_count = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let (run_entered_tx, run_entered_rx) = mpsc::channel();
+        let (publication_complete_tx, _publication_complete_rx) = mpsc::channel();
+        let (session_dropped_tx, session_dropped_rx) = mpsc::channel();
         let mut host = test_host(
-            Arc::new(ObservedBlockingFactory {
-                create_count: create_count.clone(),
+            Arc::new(ProtocolStartProbeFactory {
+                protocol_id: ProtocolId::apple_hpss_mvs(),
+                run_entered: run_entered_tx,
+                publication_complete: publication_complete_tx,
+                session_dropped: session_dropped_tx,
+                run_count: run_count.clone(),
                 drop_count: drop_count.clone(),
-                stop: stop.clone(),
-                create_entered: None,
-                release_create: Mutex::new(None),
-                worker_started: worker_started_tx,
             }),
             Arc::new(TestAudioFactory),
         );
@@ -3555,9 +3691,10 @@ mod tests {
         let outcome = launch_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("Started is queued before the fatal transition");
-        worker_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("real protocol resource is live");
+        assert!(matches!(
+            run_entered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
 
         let mut exit = ApplicationExitState::default();
         let report = crate::fatal::FatalReport::internal(
@@ -3571,18 +3708,12 @@ mod tests {
         assert!(exit.should_ignore_events());
         drop(outcome);
         assert!(host.active.is_none());
-        assert_eq!(create_count.load(Ordering::Acquire), 1);
+        assert_eq!(run_count.load(Ordering::Acquire), 0);
         assert_eq!(exit.runner_result(), Err(report));
-
-        stop.store(true, Ordering::Release);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while drop_count.load(Ordering::Acquire) != 1 {
-            assert!(
-                Instant::now() < deadline,
-                "test protocol worker did not stop"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        session_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping the queued launch cancels the waiting session");
+        assert_eq!(drop_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -3943,6 +4074,137 @@ mod tests {
         )
     }
 
+    fn assert_protocol_worker_waits_until_live_ports_are_installed(
+        target: TargetSystem,
+        protocol_id: ProtocolId,
+    ) {
+        let (run_entered_tx, run_entered_rx) = mpsc::channel();
+        let (publication_complete_tx, publication_complete_rx) = mpsc::channel();
+        let (session_dropped_tx, session_dropped_rx) = mpsc::channel();
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut host = test_host(
+            Arc::new(ProtocolStartProbeFactory {
+                protocol_id: protocol_id.clone(),
+                run_entered: run_entered_tx,
+                publication_complete: publication_complete_tx,
+                session_dropped: session_dropped_tx,
+                run_count: run_count.clone(),
+                drop_count: drop_count.clone(),
+            }),
+            Arc::new(TestAudioFactory),
+        );
+        let session_id = SessionId::allocate();
+        let (_owner, permit) = reserve_session_start(session_id);
+        let (launch_tx, launch_rx) = mpsc::channel();
+        host.begin_launch(
+            permit,
+            target,
+            test_request_for_protocol(session_id, protocol_id),
+            move |outcome| launch_tx.send(outcome).unwrap(),
+        )
+        .expect("background launch starts");
+        let outcome = launch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("background launch completes");
+        assert!(matches!(
+            run_entered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(host.active.is_none());
+
+        assert!(matches!(
+            host.accept_launch_outcome(outcome, |_| panic!("normal launch cannot start cleanup")),
+            Ok(AcceptedLaunchOutcome::Started)
+        ));
+        run_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("protocol starts after live ports are installed");
+        publication_complete_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("protocol publishes its ordinary event and Reset");
+        assert_eq!(run_count.load(Ordering::Acquire), 1);
+        assert!(host.active.is_some());
+        assert!(host.drain_session_events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                SessionEvent::StageChanged(ConnectionStage::TransportReady)
+            )
+        }));
+        assert!(host
+            .drain_frame_updates()
+            .iter()
+            .any(|update| matches!(update, frd_frame::SurfaceUpdate::Reset { .. })));
+        session_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("one-shot probe session exits after publication");
+        let completion = complete_background_cleanup(&mut host);
+        assert_eq!(completion.session_id(), session_id);
+        assert_eq!(drop_count.load(Ordering::Acquire), 1);
+    }
+
+    fn assert_cancelled_started_probe_launch(target: TargetSystem, protocol_id: ProtocolId) {
+        let (run_entered_tx, run_entered_rx) = mpsc::channel();
+        let (publication_complete_tx, _publication_complete_rx) = mpsc::channel();
+        let (session_dropped_tx, session_dropped_rx) = mpsc::channel();
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut host = test_host(
+            Arc::new(ProtocolStartProbeFactory {
+                protocol_id: protocol_id.clone(),
+                run_entered: run_entered_tx,
+                publication_complete: publication_complete_tx,
+                session_dropped: session_dropped_tx,
+                run_count: run_count.clone(),
+                drop_count: drop_count.clone(),
+            }),
+            Arc::new(TestAudioFactory),
+        );
+        let session_id = SessionId::allocate();
+        let (_owner, permit) = reserve_session_start(session_id);
+        let (launch_tx, launch_rx) = mpsc::channel();
+        host.begin_launch(
+            permit,
+            target,
+            test_request_for_protocol(session_id, protocol_id),
+            move |outcome| launch_tx.send(outcome).unwrap(),
+        )
+        .expect("background launch starts");
+        let outcome = launch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Started reaches the application thread");
+        assert!(matches!(
+            run_entered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        assert!(host.cancel_pending_launch());
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        assert!(matches!(
+            host.accept_launch_outcome(outcome, move |outcome| {
+                cleanup_tx.send(outcome).unwrap();
+            }),
+            Ok(AcceptedLaunchOutcome::CancelledStarted)
+        ));
+        assert!(
+            host.active.is_none(),
+            "stale ports must never become active"
+        );
+        let cleanup = cleanup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled start is reclaimed by the bounded cleanup worker");
+        let completion = host
+            .accept_cleanup_outcome(cleanup)
+            .expect("cancelled launch cleanup completes");
+        assert_eq!(completion.session_id(), session_id);
+        session_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled waiter drops its protocol session");
+        assert_eq!(run_count.load(Ordering::Acquire), 0);
+        assert_eq!(drop_count.load(Ordering::Acquire), 1);
+        assert!(!host.is_active());
+    }
+
     fn launch_test_session(host: &mut SessionHost) -> SessionId {
         let session_id = SessionId::allocate();
         let (_owner, permit) = reserve_session_start(session_id);
@@ -3955,10 +4217,14 @@ mod tests {
     }
 
     fn test_request(session_id: SessionId) -> ConnectRequest {
+        test_request_for_protocol(session_id, ProtocolId::apple_hpss_mvs())
+    }
+
+    fn test_request_for_protocol(session_id: SessionId, protocol_id: ProtocolId) -> ConnectRequest {
         ConnectRequest {
             session_id,
             endpoint: Endpoint::new("test.invalid", 5900).expect("valid test endpoint"),
-            protocol_id: ProtocolId::apple_hpss_mvs(),
+            protocol_id,
             credentials: None,
             saved_server_pin: None,
         }
