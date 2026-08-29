@@ -1,5 +1,3 @@
-#![allow(dead_code)] // 由后续 Apple 读取器任务接入。
-
 use std::fmt;
 use std::time::{Duration, Instant};
 

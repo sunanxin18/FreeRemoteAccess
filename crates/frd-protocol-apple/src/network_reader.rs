@@ -1,5 +1,6 @@
 //! Apple HPSS/MVS reader、generation 与动态分辨率状态机。
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +15,9 @@ use crate::dynamic_resolution::{
     DisplaySize, DynamicResolutionCapability, DynamicResolutionController, GeometryCommit,
     ResolutionRequest,
 };
+use crate::high_performance::{
+    HighPerformanceObservation, HighPerformanceStartupGate, HighPerformanceUnavailable,
+};
 use crate::hpss::{self, encoding, parse_media, Media};
 use crate::media_runtime::ViewerMediaState;
 use crate::mvs;
@@ -25,6 +29,7 @@ use crate::surface_publisher::{
 };
 
 const MVS_INCOMPLETE_TIMEOUT: Duration = Duration::from_secs(2);
+const PENDING_MEDIA_CONTROL_BUDGET: usize = 8;
 struct DynamicResolutionRuntime {
     controller: DynamicResolutionController,
     pending_since: Option<Instant>,
@@ -391,6 +396,7 @@ impl MvsReceiveState {
         }
     }
 
+    #[cfg(test)]
     fn begin(&mut self, rect: MvsRect, total: u32, first: &[u8]) -> Result<Option<MvsRecord>> {
         self.begin_at(rect, total, first, Instant::now())
     }
@@ -424,10 +430,14 @@ impl MvsReceiveState {
     }
 
     fn reset(&mut self, generation: u64) {
-        self.assembler.abort();
-        self.incomplete_since = None;
+        self.abort_assembly();
         self.decoder.reset(generation);
         self.generation = generation;
+    }
+
+    fn abort_assembly(&mut self) {
+        self.assembler.abort();
+        self.incomplete_since = None;
     }
 
     fn install_tables(&mut self, payload: &[u8]) -> Result<()> {
@@ -528,6 +538,15 @@ impl ReaderRequestState {
             generation,
             framebuffer_request_in_flight: true,
             last_full_request: Some(sent_at),
+            table_followup: TableFollowupState::None,
+        }
+    }
+
+    fn after_confirmation(initial_full_sent_at: Instant, generation: u64) -> Self {
+        Self {
+            generation,
+            framebuffer_request_in_flight: false,
+            last_full_request: Some(initial_full_sent_at),
             table_followup: TableFollowupState::None,
         }
     }
@@ -1508,6 +1527,7 @@ fn handle_complete_mvs_record(
 pub(crate) enum NetworkFrameOutcome {
     Consumed,
     Media(Media),
+    HighPerformanceConfirmed { size: DisplaySize },
 }
 
 pub(crate) struct NetworkReaderRuntime {
@@ -1517,25 +1537,29 @@ pub(crate) struct NetworkReaderRuntime {
     viewport_requests: Arc<Mutex<ViewportRequestQueue>>,
     dynamic_resolution: Arc<Mutex<DynamicResolutionRuntime>>,
     publisher: AppleSurfacePublisher,
+    startup_gate: HighPerformanceStartupGate,
+    initial_full_sent_at: Instant,
+    dynamic_resolution_enabled: bool,
+    pending_media_controls: VecDeque<Media>,
 }
 
 impl NetworkReaderRuntime {
     pub(crate) fn new(
-        protocol_runtime: &mut ProtocolRuntime,
         session_id: frd_core::SessionId,
         initial_size: DisplaySize,
         dynamic_resolution_enabled: bool,
-        startup_fb_sent_at: Instant,
+        startup_gate_origin: Instant,
+        initial_full_sent_at: Instant,
     ) -> Result<Self, ProtocolError> {
         let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
             .ok_or(ProtocolError::FramePortRejected)?;
         let generation = 1;
-        let publisher = AppleSurfacePublisher::begin(protocol_runtime, session_id, size)?;
+        let publisher = AppleSurfacePublisher::pending(session_id);
         let surface =
             DisplaySurface::new(generation, size).map_err(|_| ProtocolError::FramePortRejected)?;
         Ok(Self {
             receiver: MvsReceiveState::new(generation),
-            requests: ReaderRequestState::after_startup(startup_fb_sent_at, generation),
+            requests: ReaderRequestState::after_startup(initial_full_sent_at, generation),
             surface: Arc::new(Mutex::new(surface)),
             viewport_requests: Arc::new(Mutex::new(ViewportRequestQueue::default())),
             dynamic_resolution: Arc::new(Mutex::new(DynamicResolutionRuntime::new(
@@ -1543,6 +1567,10 @@ impl NetworkReaderRuntime {
                 dynamic_resolution_enabled,
             ))),
             publisher,
+            startup_gate: HighPerformanceStartupGate::new(startup_gate_origin),
+            initial_full_sent_at,
+            dynamic_resolution_enabled,
+            pending_media_controls: VecDeque::new(),
         })
     }
 
@@ -1550,7 +1578,20 @@ impl NetworkReaderRuntime {
         self.publisher.generation()
     }
 
+    pub(crate) fn is_high_performance_confirmed(&self) -> bool {
+        self.startup_gate.is_confirmed() && self.publisher.is_active()
+    }
+
+    pub(crate) fn take_buffered_media_control(&mut self) -> Option<Media> {
+        self.is_high_performance_confirmed()
+            .then(|| self.pending_media_controls.pop_front())
+            .flatten()
+    }
+
     pub(crate) fn observe_viewport(&self, viewport: PhysicalViewport, now: Instant) {
+        if !self.is_high_performance_confirmed() {
+            return;
+        }
         let width = viewport.content.width as usize;
         let height = viewport.content.height as usize;
         if let Some(target) = DisplaySize::from_viewport(width, height) {
@@ -1583,6 +1624,13 @@ impl NetworkReaderRuntime {
     }
 
     pub(crate) fn service_tick(&mut self, writer: &AppleWriterHandle, now: Instant) -> Result<()> {
+        if !self.publisher.is_active() {
+            if !self.startup_gate.is_awaiting() {
+                return Err(HighPerformanceUnavailable.into());
+            }
+            self.startup_gate.ensure_not_timed_out(now)?;
+            return Ok(());
+        }
         let outcome = service_network_reader_tick(
             &mut self.receiver,
             &mut self.requests,
@@ -1596,6 +1644,67 @@ impl NetworkReaderRuntime {
         Ok(())
     }
 
+    fn buffer_pending_media_control(&mut self, media: Media) -> Result<()> {
+        if self.pending_media_controls.len() >= PENDING_MEDIA_CONTROL_BUDGET {
+            return Err(HighPerformanceUnavailable.into());
+        }
+        self.pending_media_controls.push_back(media);
+        Ok(())
+    }
+
+    fn confirm_high_performance_at_with<S, W>(
+        &mut self,
+        geometry: hpss::ServerStateGeometry,
+        observed_at: Instant,
+        protocol_runtime: &mut ProtocolRuntime,
+        sleep: S,
+        mut write: W,
+    ) -> Result<NetworkFrameOutcome>
+    where
+        S: FnMut(Duration),
+        W: FnMut(&[u8]) -> Result<()>,
+    {
+        let confirmation = match self
+            .startup_gate
+            .observe_server_state_at(geometry, observed_at)?
+        {
+            HighPerformanceObservation::Confirmed(_) => self
+                .startup_gate
+                .confirmation()
+                .ok_or(HighPerformanceUnavailable)?,
+            HighPerformanceObservation::Duplicate if self.publisher.is_active() => {
+                return Ok(NetworkFrameOutcome::Consumed);
+            }
+            HighPerformanceObservation::Duplicate => {
+                return Err(HighPerformanceUnavailable.into());
+            }
+        };
+        let size = confirmation.size;
+        let pixel_size = PixelSize::new(size.width.into(), size.height.into())
+            .ok_or(HighPerformanceUnavailable)?;
+        let prepared_receiver = MvsReceiveState::new(1);
+        let prepared_surface =
+            DisplaySurface::new(1, pixel_size).map_err(|_| HighPerformanceUnavailable)?;
+        let mut prepared_dynamic =
+            DynamicResolutionRuntime::new(size, self.dynamic_resolution_enabled);
+        let prepared_viewport = ViewportRequestQueue::default();
+        let mut prepared_requests =
+            ReaderRequestState::after_confirmation(self.initial_full_sent_at, 1);
+        let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
+
+        prepared_requests.send_rate_limited_full_at(observed_at, sleep, || write(&full))?;
+        prepared_dynamic.observe_initial_server_state(size, size);
+        self.receiver = prepared_receiver;
+        self.requests = prepared_requests;
+        self.surface = Arc::new(Mutex::new(prepared_surface));
+        self.viewport_requests = Arc::new(Mutex::new(prepared_viewport));
+        self.dynamic_resolution = Arc::new(Mutex::new(prepared_dynamic));
+        self.publisher
+            .activate_initial_generation(protocol_runtime, pixel_size)
+            .map_err(|error| anyhow::anyhow!(error.code()))?;
+        Ok(NetworkFrameOutcome::HighPerformanceConfirmed { size })
+    }
+
     pub(crate) fn handle_frame(
         &mut self,
         message: Vec<u8>,
@@ -1604,10 +1713,50 @@ impl NetworkReaderRuntime {
         protocol_runtime: &mut ProtocolRuntime,
         before_generation_commit: &mut impl FnMut() -> Result<()>,
     ) -> Result<NetworkFrameOutcome> {
+        self.handle_frame_at(
+            message,
+            writer,
+            media_state,
+            protocol_runtime,
+            before_generation_commit,
+            Instant::now(),
+        )
+    }
+
+    fn handle_frame_at(
+        &mut self,
+        message: Vec<u8>,
+        writer: &AppleWriterHandle,
+        media_state: &mut ViewerMediaState,
+        protocol_runtime: &mut ProtocolRuntime,
+        before_generation_commit: &mut impl FnMut() -> Result<()>,
+        observed_at: Instant,
+    ) -> Result<NetworkFrameOutcome> {
+        let parsed_media = parse_media(&message);
+        if !self.publisher.is_active()
+            && matches!(&parsed_media, Ok(Media::State(encoding::SERVER_STATE)))
+        {
+            self.receiver.abort_assembly();
+            let geometry = hpss::parse_server_state_geometry(&message)
+                .map_err(|_| HighPerformanceUnavailable)?;
+            self.ensure_server_state_generation_coherence(media_state)?;
+            return self.confirm_high_performance_at_with(
+                geometry,
+                observed_at,
+                protocol_runtime,
+                thread::sleep,
+                |message| send_encrypted(writer, message),
+            );
+        }
+
         if reader_frame_class(&self.receiver, &message) == ReaderFrameClass::Continuation {
             let record = match self.receiver.push_continuation(&message) {
                 Ok(record) => record,
                 Err(error) => {
+                    if !self.publisher.is_active() {
+                        self.receiver.abort_assembly();
+                        return Ok(NetworkFrameOutcome::Consumed);
+                    }
                     eprintln!("[hpss-view] MVS continuation 结构错误，重同步: {error:#}");
                     self.receiver.request_full()?;
                     self.requests.consume_mvs_response();
@@ -1617,6 +1766,9 @@ impl NetworkReaderRuntime {
                 }
             };
             if let Some(record) = record {
+                if !self.publisher.is_active() {
+                    return Ok(NetworkFrameOutcome::Consumed);
+                }
                 handle_complete_mvs_record(
                     &mut self.receiver,
                     &mut self.requests,
@@ -1640,7 +1792,7 @@ impl NetworkReaderRuntime {
             ReaderFrameClass::Continuation => unreachable!("continuation 已在上方处理"),
         }
 
-        match parse_media(&message) {
+        match parsed_media {
             Ok(Media::Mvs {
                 x,
                 y,
@@ -1649,7 +1801,7 @@ impl NetworkReaderRuntime {
                 total,
                 body,
             }) => {
-                let record = match self.receiver.begin(
+                let record = match self.receiver.begin_at(
                     MvsRect {
                         x,
                         y,
@@ -1658,9 +1810,14 @@ impl NetworkReaderRuntime {
                     },
                     total,
                     &body,
+                    observed_at,
                 ) {
                     Ok(record) => record,
                     Err(error) => {
+                        if !self.publisher.is_active() {
+                            self.receiver.abort_assembly();
+                            return Ok(NetworkFrameOutcome::Consumed);
+                        }
                         eprintln!("[hpss-view] MVS 首片结构错误，重同步: {error:#}");
                         self.receiver.request_full()?;
                         self.requests.consume_mvs_response();
@@ -1670,6 +1827,9 @@ impl NetworkReaderRuntime {
                     }
                 };
                 if let Some(record) = record {
+                    if !self.publisher.is_active() {
+                        return Ok(NetworkFrameOutcome::Consumed);
+                    }
                     handle_complete_mvs_record(
                         &mut self.receiver,
                         &mut self.requests,
@@ -1744,7 +1904,19 @@ impl NetworkReaderRuntime {
             }
             Ok(Media::State(_)) | Ok(Media::Cursor { .. }) => Ok(NetworkFrameOutcome::Consumed),
             Ok(media @ (Media::PortAnnouncement(_) | Media::StreamAnswer(_))) => {
-                Ok(NetworkFrameOutcome::Media(media))
+                if self.publisher.is_active() {
+                    Ok(NetworkFrameOutcome::Media(media))
+                } else {
+                    self.buffer_pending_media_control(media)?;
+                    Ok(NetworkFrameOutcome::Consumed)
+                }
+            }
+            Err(error) if !self.publisher.is_active() => {
+                if hpss::is_truncated_mvs_envelope(&message) {
+                    self.receiver.abort_assembly();
+                }
+                let _ = error;
+                Ok(NetworkFrameOutcome::Consumed)
             }
             Err(error) => match self.receiver.reject_truncated_mvs_envelope(&message) {
                 Ok(true) => {
@@ -1764,6 +1936,52 @@ impl NetworkReaderRuntime {
 #[cfg(test)]
 mod migrated_runtime_tests {
     use super::*;
+
+    #[derive(Default)]
+    struct ProtocolTrace {
+        entries: Mutex<Vec<&'static str>>,
+    }
+
+    struct TracingProtocolEvents(Arc<ProtocolTrace>);
+
+    impl frd_protocol_api::RuntimeEventSink for TracingProtocolEvents {
+        fn publish(
+            &self,
+            event: frd_protocol_api::SessionEvent,
+        ) -> Result<(), frd_protocol_api::ProtocolError> {
+            let label = match event {
+                frd_protocol_api::SessionEvent::SurfaceGenerationChanged { .. } => "generation",
+                _ => "event",
+            };
+            self.0.entries.lock().unwrap().push(label);
+            Ok(())
+        }
+    }
+
+    struct TracingProtocolFrames(Arc<ProtocolTrace>);
+
+    impl frd_protocol_api::SurfacePublisher for TracingProtocolFrames {
+        fn publish(
+            &self,
+            update: frd_frame::SurfaceUpdate,
+        ) -> Result<(), frd_protocol_api::ProtocolError> {
+            let label = match update {
+                frd_frame::SurfaceUpdate::Reset { .. } => "reset",
+                _ => "frame",
+            };
+            self.0.entries.lock().unwrap().push(label);
+            Ok(())
+        }
+    }
+
+    struct TracingProtocolWake(Arc<ProtocolTrace>);
+
+    impl frd_protocol_api::RuntimeWake for TracingProtocolWake {
+        fn wake(&self) -> Result<(), frd_protocol_api::ProtocolError> {
+            self.0.entries.lock().unwrap().push("wake");
+            Ok(())
+        }
+    }
 
     struct NoopProtocolEvents;
 
@@ -1864,6 +2082,604 @@ mod migrated_runtime_tests {
         server_state[20..22].copy_from_slice(&size.width.to_be_bytes());
         server_state[22..24].copy_from_slice(&size.height.to_be_bytes());
         server_state
+    }
+
+    fn mvs_message(rect: MvsRect, total: u32, body: &[u8]) -> Vec<u8> {
+        let mut message = Vec::with_capacity(20 + body.len());
+        message.extend_from_slice(&1u32.to_be_bytes());
+        message.extend_from_slice(&rect.x.to_be_bytes());
+        message.extend_from_slice(&rect.y.to_be_bytes());
+        message.extend_from_slice(&rect.width.to_be_bytes());
+        message.extend_from_slice(&rect.height.to_be_bytes());
+        message.extend_from_slice(&encoding::MVS.to_be_bytes());
+        message.extend_from_slice(&total.to_be_bytes());
+        message.extend_from_slice(body);
+        message
+    }
+
+    fn port_announcement_message(audio_port: u16) -> Vec<u8> {
+        let mut message = vec![
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0xf2, 0x00, 0x24, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x45, 0x67,
+            0x00, 0x00, 0x00, 0x01, 0x45, 0x68, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        message[26..28].copy_from_slice(&audio_port.to_be_bytes());
+        message
+    }
+
+    fn traced_protocol_runtime(
+        session_id: frd_core::SessionId,
+    ) -> (ProtocolRuntime, Arc<ProtocolTrace>) {
+        let trace = Arc::new(ProtocolTrace::default());
+        let (_commands, command_rx) = std::sync::mpsc::channel();
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(TracingProtocolEvents(trace.clone())),
+            Box::new(TracingProtocolFrames(trace.clone())),
+            None,
+            Box::new(TracingProtocolWake(trace.clone())),
+        );
+        (runtime, trace)
+    }
+
+    fn socket_writer() -> (
+        crate::AppleConnection,
+        AppleWriterHandle,
+        std::net::TcpStream,
+    ) {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        (connection, writer, peer)
+    }
+
+    fn test_media_state() -> ViewerMediaState {
+        ViewerMediaState::new(
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn expect_network_frame_error(result: Result<NetworkFrameOutcome>) -> anyhow::Error {
+        match result {
+            Ok(_) => panic!("预期 NetworkReader 返回错误"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn preconfirmation_mvs_complete_fragmented_and_table_records_have_zero_side_effects() {
+        use std::io::Read as _;
+
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, true, requested_at, requested_at)
+                .unwrap();
+        let (_connection, writer, mut peer) = socket_writer();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut media = test_media_state();
+        let mut before_generation_commit = || Ok(());
+        let awaiting_full_before = reader.receiver.awaiting_full();
+        let rect = MvsRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+
+        let tables = type_two_tables_fixture();
+        let full = native_mode_zero_payload();
+        let partial = native_opcode_zero_partial_payload();
+        for message in [
+            mvs_message(
+                MvsRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                tables.len() as u32,
+                &tables,
+            ),
+            mvs_message(rect, full.len() as u32, &full),
+            mvs_message(rect, partial.len() as u32, &partial),
+        ] {
+            assert!(matches!(
+                reader
+                    .handle_frame_at(
+                        message,
+                        &writer,
+                        &mut media,
+                        &mut protocol_runtime,
+                        &mut before_generation_commit,
+                        requested_at + Duration::from_secs(1),
+                    )
+                    .unwrap(),
+                NetworkFrameOutcome::Consumed
+            ));
+        }
+
+        let split = full.len() / 2;
+        reader
+            .handle_frame_at(
+                mvs_message(rect, full.len() as u32, &full[..split]),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(reader.receiver.is_pending());
+        reader
+            .handle_frame_at(
+                full[split..].to_vec(),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert!(!reader.receiver.is_pending());
+        assert_eq!(reader.receiver.awaiting_full(), awaiting_full_before);
+        assert!(!reader.publisher.is_active());
+        assert!(trace.entries.lock().unwrap().is_empty());
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!((surface.width(), surface.height()), (8, 8));
+        assert!(surface.framebuffer.pixels().iter().all(|pixel| *pixel == 0));
+        assert_eq!(surface.native_mvs_observability.content_revision, 0);
+        drop(surface);
+        let dynamic = reader.dynamic_resolution.lock().unwrap();
+        assert!(!dynamic.evidence.matching_initial_server_state);
+        assert!(!dynamic.evidence.current_full_media_applied);
+        assert!(!dynamic.evidence.non_paused_media_activity);
+        drop(dynamic);
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preconfirmation_mvs_malformed_truncated_and_incomplete_never_request_recovery() {
+        use std::io::Read as _;
+
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, true, requested_at, requested_at)
+                .unwrap();
+        let (_connection, writer, mut peer) = socket_writer();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut media = test_media_state();
+        let mut before_generation_commit = || Ok(());
+        let awaiting_full_before = reader.receiver.awaiting_full();
+        let rect = MvsRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+
+        reader
+            .handle_frame_at(
+                mvs_message(rect, 1, &[0xaa, 0xbb]),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!reader.receiver.is_pending());
+
+        let mut truncated = mvs_message(rect, 0, &[]);
+        truncated.truncate(18);
+        reader
+            .handle_frame_at(
+                truncated,
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(reader.receiver.awaiting_full(), awaiting_full_before);
+
+        reader
+            .handle_frame_at(
+                mvs_message(rect, 2, &[0xaa]),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(reader.receiver.is_pending());
+        reader
+            .handle_frame_at(
+                vec![0xbb, 0xcc],
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!reader.receiver.is_pending());
+
+        reader
+            .handle_frame_at(
+                mvs_message(rect, 2, &[0xaa]),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        reader
+            .service_tick(&writer, requested_at + Duration::from_secs(3))
+            .unwrap();
+        assert!(reader.receiver.is_pending());
+        assert_eq!(reader.receiver.awaiting_full(), awaiting_full_before);
+        assert!(trace.entries.lock().unwrap().is_empty());
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preconfirmation_mvs_then_server_state_preempts_assembly_and_confirms_without_decode() {
+        use std::io::Read as _;
+
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let confirmed = DisplaySize::new(16, 8).unwrap();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                .unwrap();
+        let (_connection, writer, mut peer) = socket_writer();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut media = test_media_state();
+        let mut before_generation_commit = || Ok(());
+        let payload = native_mode_zero_payload();
+
+        reader
+            .handle_frame_at(
+                mvs_message(
+                    MvsRect {
+                        x: 0,
+                        y: 0,
+                        width: 8,
+                        height: 8,
+                    },
+                    payload.len() as u32,
+                    &payload[..payload.len() / 2],
+                ),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(reader.receiver.is_pending());
+
+        let outcome = reader
+            .handle_frame_at(
+                server_state_message(confirmed),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            NetworkFrameOutcome::HighPerformanceConfirmed { size } if size == confirmed
+        ));
+        assert!(!reader.receiver.is_pending());
+        assert!(reader.publisher.is_active());
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!((surface.width(), surface.height()), (16, 8));
+        assert!(surface.framebuffer.pixels().iter().all(|pixel| *pixel == 0));
+        drop(surface);
+        assert_eq!(
+            trace.entries.lock().unwrap().as_slice(),
+            ["generation", "reset", "wake"]
+        );
+        let mut wire = [0u8; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
+        peer.read_exact(&mut wire).unwrap();
+        assert_eq!(
+            wire,
+            protocol::msg_fb_update_request(false, 0, 0, 16, 8).unwrap()
+        );
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preconfirmation_media_control_is_bounded_and_drains_in_wire_order_after_confirmation() {
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                .unwrap();
+        let (_connection, writer, _) = socket_writer();
+        let mut media = test_media_state();
+        let mut before_generation_commit = || Ok(());
+
+        for port in [17_767, 17_768] {
+            let message = port_announcement_message(port);
+            assert!(matches!(
+                parse_media(&message).unwrap(),
+                Media::PortAnnouncement(_)
+            ));
+            assert!(matches!(
+                reader
+                    .handle_frame_at(
+                        message,
+                        &writer,
+                        &mut media,
+                        &mut protocol_runtime,
+                        &mut before_generation_commit,
+                        requested_at + Duration::from_secs(1),
+                    )
+                    .unwrap(),
+                NetworkFrameOutcome::Consumed
+            ));
+        }
+        assert!(trace.entries.lock().unwrap().is_empty());
+        assert_eq!(reader.pending_media_controls.len(), 2);
+        assert!(reader.take_buffered_media_control().is_none());
+        assert_eq!(reader.pending_media_controls.len(), 2);
+
+        let geometry = hpss::parse_server_state_geometry(&server_state_message(initial)).unwrap();
+        reader
+            .confirm_high_performance_at_with(
+                geometry,
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(reader.is_high_performance_confirmed());
+        assert_eq!(reader.pending_media_controls.len(), 2);
+        for expected_port in [17_767, 17_768] {
+            let announcement = match reader.take_buffered_media_control() {
+                Some(Media::PortAnnouncement(announcement)) => announcement,
+                Some(Media::StreamAnswer(_)) => panic!("缓存媒体公告被错误解析为 answer"),
+                Some(Media::Mvs { .. }) => panic!("缓存媒体公告被错误解析为 MVS"),
+                Some(Media::Cursor { .. }) => panic!("缓存媒体公告被错误解析为 cursor"),
+                Some(Media::State(_)) => panic!("缓存媒体公告被错误解析为 state"),
+                None => panic!("确认后未返回缓存的媒体公告"),
+            };
+            assert_eq!(announcement.audio.port, expected_port);
+        }
+        assert!(reader.take_buffered_media_control().is_none());
+        writer.shutdown().unwrap();
+
+        let session_id = frd_core::SessionId::allocate();
+        let (mut protocol_runtime, _) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                .unwrap();
+        let (_connection, writer, _) = socket_writer();
+        let mut media = test_media_state();
+        let mut before_generation_commit = || Ok(());
+        for port in 20_000..20_008 {
+            reader
+                .handle_frame_at(
+                    port_announcement_message(port),
+                    &writer,
+                    &mut media,
+                    &mut protocol_runtime,
+                    &mut before_generation_commit,
+                    requested_at + Duration::from_secs(1),
+                )
+                .unwrap();
+        }
+        let error = expect_network_frame_error(reader.handle_frame_at(
+            port_announcement_message(20_008),
+            &writer,
+            &mut media,
+            &mut protocol_runtime,
+            &mut before_generation_commit,
+            requested_at + Duration::from_secs(1),
+        ));
+        assert_eq!(
+            error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
+            Some(&crate::high_performance::HighPerformanceUnavailable)
+        );
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn high_performance_confirmation_write_precedes_activation_and_installs_exact_geometry_once() {
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let confirmed = DisplaySize::new(16, 24).unwrap();
+        let geometry = hpss::parse_server_state_geometry(&server_state_message(confirmed)).unwrap();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, true, requested_at, requested_at)
+                .unwrap();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let written_for_call = written.clone();
+        let trace_for_write = trace.clone();
+
+        let outcome = reader
+            .confirm_high_performance_at_with(
+                geometry,
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| panic!("一秒后的确认不得触发 full-request 限速等待"),
+                move |message| {
+                    trace_for_write.entries.lock().unwrap().push("write");
+                    written_for_call.lock().unwrap().extend_from_slice(message);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            NetworkFrameOutcome::HighPerformanceConfirmed { size } if size == confirmed
+        ));
+        assert_eq!(
+            written.lock().unwrap().as_slice(),
+            protocol::msg_fb_update_request(false, 0, 0, 16, 24)
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(
+            trace.entries.lock().unwrap().as_slice(),
+            ["write", "generation", "reset", "wake"]
+        );
+        assert!(reader.is_high_performance_confirmed());
+        assert!(reader.requests.framebuffer_request_in_flight());
+        assert_eq!(reader.requests.generation, 1);
+        assert!(matches!(
+            reader.requests.table_followup,
+            TableFollowupState::None
+        ));
+        assert_eq!(reader.generation(), 1);
+        assert!(matches!(
+            reader
+                .confirm_high_performance_at_with(
+                    geometry,
+                    requested_at + Duration::from_secs(2),
+                    &mut protocol_runtime,
+                    |_| {},
+                    |_| panic!("重复确认不得再次写 full request"),
+                )
+                .unwrap(),
+            NetworkFrameOutcome::Consumed
+        ));
+        assert_eq!(
+            trace.entries.lock().unwrap().as_slice(),
+            ["write", "generation", "reset", "wake"]
+        );
+    }
+
+    #[test]
+    fn high_performance_confirmation_writer_failure_leaves_private_and_public_state_pending() {
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let confirmed = DisplaySize::new(16, 24).unwrap();
+        let geometry = hpss::parse_server_state_geometry(&server_state_message(confirmed)).unwrap();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                .unwrap();
+
+        let error = expect_network_frame_error(reader.confirm_high_performance_at_with(
+            geometry,
+            requested_at + Duration::from_secs(1),
+            &mut protocol_runtime,
+            |_| {},
+            |_| Err(anyhow::anyhow!("injected confirmed full write failure")),
+        ));
+
+        assert!(error
+            .to_string()
+            .contains("injected confirmed full write failure"));
+        assert!(trace.entries.lock().unwrap().is_empty());
+        assert!(!reader.publisher.is_active());
+        assert!(!reader.is_high_performance_confirmed());
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!((surface.width(), surface.height()), (8, 8));
+        drop(surface);
+        assert_eq!(reader.requests.generation, 1);
+        assert!(reader.requests.framebuffer_request_in_flight());
+    }
+
+    #[test]
+    fn high_performance_confirmation_timeout_boundary_and_malformed_state_are_typed() {
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let (_protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                .unwrap();
+        let (_connection, writer, _) = socket_writer();
+
+        let error = reader
+            .service_tick(&writer, requested_at + Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
+            Some(&crate::high_performance::HighPerformanceUnavailable)
+        );
+        assert!(trace.entries.lock().unwrap().is_empty());
+        writer.shutdown().unwrap();
+
+        let session_id = frd_core::SessionId::allocate();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                .unwrap();
+        let (_connection, writer, _) = socket_writer();
+        let mut media = test_media_state();
+        let mut before_generation_commit = || Ok(());
+        let mut malformed = server_state_message(initial);
+        malformed[18..20].copy_from_slice(&0u16.to_be_bytes());
+        let error = expect_network_frame_error(reader.handle_frame_at(
+            malformed,
+            &writer,
+            &mut media,
+            &mut protocol_runtime,
+            &mut before_generation_commit,
+            requested_at + Duration::from_secs(1),
+        ));
+        assert_eq!(
+            error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
+            Some(&crate::high_performance::HighPerformanceUnavailable)
+        );
+        assert!(trace.entries.lock().unwrap().is_empty());
+        writer.shutdown().unwrap();
     }
 
     struct TestBitWriter {
@@ -2051,14 +2867,19 @@ mod migrated_runtime_tests {
         );
         let initial = DisplaySize::new(1440, 900).unwrap();
         let target = DisplaySize::new(1280, 720).unwrap();
-        let mut reader = NetworkReaderRuntime::new(
-            &mut protocol_runtime,
-            session_id,
-            initial,
-            true,
-            Instant::now(),
-        )
-        .unwrap();
+        let requested_at = Instant::now();
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, true, requested_at, requested_at)
+                .unwrap();
+        reader
+            .confirm_high_performance_at_with(
+                hpss::parse_server_state_geometry(&server_state_message(initial)).unwrap(),
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| Ok(()),
+            )
+            .unwrap();
         {
             let mut dynamic = reader.dynamic_resolution.lock().unwrap();
             arm_runtime(&mut dynamic, initial, false);
@@ -2393,14 +3214,19 @@ mod migrated_runtime_tests {
         );
         let initial = DisplaySize::new(1440, 2560).unwrap();
         let server_initiated = DisplaySize::new(1456, 1080).unwrap();
-        let mut reader = NetworkReaderRuntime::new(
-            &mut protocol_runtime,
-            session_id,
-            initial,
-            false,
-            Instant::now(),
-        )
-        .unwrap();
+        let requested_at = Instant::now();
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
+                .unwrap();
+        reader
+            .confirm_high_performance_at_with(
+                hpss::parse_server_state_geometry(&server_state_message(initial)).unwrap(),
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| Ok(()),
+            )
+            .unwrap();
         let mut media = ViewerMediaState::new(
             crate::media_negotiation::AudioMediaFlow::MacToPc,
             1,

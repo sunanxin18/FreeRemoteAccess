@@ -20,6 +20,7 @@ use frd_protocol_api::{
 use crate::connection::{is_peer_closed, is_timeout, AppleWriterHandle};
 use crate::dynamic_resolution::DisplaySize;
 use crate::factory::EstablishedAppleSession;
+use crate::high_performance::{HighPerformanceUnavailable, APPLE_HIGH_PERFORMANCE_UNAVAILABLE};
 use crate::hpss::{self, Media};
 use crate::media_negotiation::AudioMediaFlow;
 use crate::media_runtime::ViewerMediaState;
@@ -36,12 +37,51 @@ fn adapter_error() -> ProtocolError {
     ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), APPLE_RUNTIME_FAILED)
 }
 
+fn high_performance_unavailable_error() -> ProtocolError {
+    ProtocolError::adapter(
+        frd_core::ProtocolId::apple_hpss_mvs(),
+        APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
+    )
+}
+
 fn protocol_exit_for_runtime_error(error: anyhow::Error) -> ProtocolExit {
-    if is_peer_closed(&error) {
+    if error
+        .chain()
+        .any(|cause| cause.is::<HighPerformanceUnavailable>())
+    {
+        ProtocolExit::Failed(high_performance_unavailable_error())
+    } else if is_peer_closed(&error) {
         ProtocolExit::Closed
     } else {
         ProtocolExit::Failed(adapter_error())
     }
+}
+
+fn is_startup_transport_close(error: &anyhow::Error) -> bool {
+    is_peer_closed(error)
+        || error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .any(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+}
+
+fn preserve_startup_transport_error<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if is_startup_transport_close(&error) {
+            HighPerformanceUnavailable.into()
+        } else {
+            error
+        }
+    })
 }
 
 #[derive(Default)]
@@ -374,6 +414,38 @@ fn run_authenticated_session_with_media(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "媒体控制必须显式携带 generation、地址、writer 与发布门禁"
+)]
+fn handle_media_control(
+    control: Media,
+    media: &mut ViewerMediaState,
+    runtime: &mut ProtocolRuntime,
+    generation: u64,
+    media_bind_address: std::net::IpAddr,
+    writer: &AppleWriterHandle,
+    audio_started: bool,
+) -> Result<()> {
+    match control {
+        Media::PortAnnouncement(announcement) => {
+            media.handle_port_announcement(generation, announcement, media_bind_address, writer)
+        }
+        Media::StreamAnswer(answer) => {
+            media.handle_answer(generation, answer)?;
+            if audio_started {
+                runtime
+                    .publish_event(SessionEvent::AudioState(AudioState::Playing))
+                    .map_err(|error| anyhow::anyhow!(error.code()))?;
+            }
+            Ok(())
+        }
+        Media::Mvs { .. } | Media::Cursor { .. } | Media::State(_) => {
+            unreachable!("reader 只返回媒体控制消息")
+        }
+    }
+}
+
 // Keep the verified session wiring explicit; aggregating these arguments would
 // only move the boundary and risk coupling transport/media state construction.
 #[allow(clippy::too_many_arguments)]
@@ -395,57 +467,47 @@ fn run_authenticated_session_inner(
     let initial_size = startup_display_size(server_init_size);
     let media_server_address = connection.peer_addr()?.ip();
     let media_bind_address = connection.local_addr()?.ip();
-
-    runtime
-        .publish_event(SessionEvent::StageChanged(ConnectionStage::TransportReady))
-        .map_err(|error| anyhow::anyhow!(error.code()))?;
-    runtime
-        .publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
-            dynamic_resolution: dynamic_resolution_enabled,
-            remote_audio: udp_media_enabled,
-            text_input: true,
-            ..SessionCapabilities::default()
-        }))
-        .map_err(|error| anyhow::anyhow!(error.code()))?;
-    if udp_media_enabled {
-        runtime
-            .publish_event(SessionEvent::AudioState(AudioState::Starting))
-            .map_err(|error| anyhow::anyhow!(error.code()))?;
+    if !connection.is_encrypted() {
+        return Err(HighPerformanceUnavailable.into());
     }
 
     // Same verified startup ordering and timing as the legacy HPSS viewer.
     std::thread::sleep(Duration::from_millis(200));
-    connection
-        .write_all(&hpss::build_set_display_config(&display_name))
-        .context("发送 Apple SetDisplayConfiguration 失败")?;
+    preserve_startup_transport_error(
+        connection
+            .write_all(&hpss::build_set_display_config(&display_name))
+            .context("发送 Apple SetDisplayConfiguration 失败"),
+    )?;
+    let startup_gate_origin = Instant::now();
     std::thread::sleep(Duration::from_millis(150));
-    connection.write_all(&hpss::build_display_query(initial_size))?;
+    preserve_startup_transport_error(
+        connection.write_all(&hpss::build_display_query(initial_size)),
+    )?;
     std::thread::sleep(Duration::from_millis(120));
-    connection.write_all(&protocol::msg_fb_update_request(
+    preserve_startup_transport_error(connection.write_all(&protocol::msg_fb_update_request(
         false,
         0,
         0,
         initial_size.width,
         initial_size.height,
-    )?)?;
-    let startup_fb_sent_at = Instant::now();
+    )?))?;
+    let initial_full_sent_at = Instant::now();
     connection.set_read_timeout(Some(APPLE_RUNTIME_READ_POLL))?;
-    if !connection.is_encrypted() {
-        anyhow::bail!("Apple HPSS runtime requires the authenticated encrypted session");
-    }
     let writer = connection.writer_handle()?;
 
     let mut media = ViewerMediaState::new(audio_flow, 1, media_server_address)?;
     let mut reader = NetworkReaderRuntime::new(
-        &mut runtime,
         session_id,
         initial_size,
         dynamic_resolution_enabled,
-        startup_fb_sent_at,
+        startup_gate_origin,
+        initial_full_sent_at,
     )
     .map_err(|error| anyhow::anyhow!(error.code()))?;
     let mut pointer = PointerWireState::default();
     let mut disconnect_requested = false;
+    let mut readiness_published = false;
+    let mut audio_started = false;
     #[cfg(test)]
     connection
         .notify_session_runtime_test_event(crate::connection::SessionRuntimeTestEvent::LoopEntered);
@@ -463,9 +525,15 @@ fn run_authenticated_session_inner(
                         break;
                     }
                     SessionCommand::ViewportChanged { viewport, .. } => {
-                        reader.observe_viewport(viewport, Instant::now());
+                        if reader.is_high_performance_confirmed() {
+                            reader.observe_viewport(viewport, Instant::now());
+                        }
                     }
-                    SessionCommand::Input(input) => pointer.handle(input.event, &writer)?,
+                    SessionCommand::Input(input) => {
+                        if reader.is_high_performance_confirmed() {
+                            pointer.handle(input.event, &writer)?;
+                        }
+                    }
                     SessionCommand::ResolveServerIdentity { .. }
                     | SessionCommand::ClipboardWrite(_) => {}
                 }
@@ -475,13 +543,21 @@ fn run_authenticated_session_inner(
             }
 
             let now = Instant::now();
-            media.service_active(&mut runtime, reader.generation(), now)?;
+            if reader.is_high_performance_confirmed() {
+                media.service_active(&mut runtime, reader.generation(), now)?;
+            }
             reader.service_tick(&writer, now)?;
 
             let message = match connection.read_app_frame_step() {
                 Ok(Some(message)) => message,
                 Ok(None) => continue,
                 Err(error) if is_timeout(&error) => continue,
+                Err(error)
+                    if !reader.is_high_performance_confirmed()
+                        && is_startup_transport_close(&error) =>
+                {
+                    return Err(HighPerformanceUnavailable.into());
+                }
                 Err(error) => return Err(error),
             };
             let mut before_generation_commit = || pointer.release_all(&writer);
@@ -493,28 +569,65 @@ fn run_authenticated_session_inner(
                 &mut before_generation_commit,
             )? {
                 NetworkFrameOutcome::Consumed => {}
-                NetworkFrameOutcome::Media(Media::PortAnnouncement(announcement)) => {
-                    media.handle_port_announcement(
+                NetworkFrameOutcome::HighPerformanceConfirmed { size } => {
+                    eprintln!(
+                        "[apple] High Performance 虚拟显示器已确认: {}x{}",
+                        size.width, size.height
+                    );
+                    if readiness_published {
+                        anyhow::bail!("Apple High Performance readiness 重复发布");
+                    }
+                    runtime
+                        .publish_event(SessionEvent::StageChanged(ConnectionStage::TransportReady))
+                        .map_err(|error| anyhow::anyhow!(error.code()))?;
+                    runtime
+                        .publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                            dynamic_resolution: dynamic_resolution_enabled,
+                            remote_audio: udp_media_enabled,
+                            text_input: true,
+                            ..SessionCapabilities::default()
+                        }))
+                        .map_err(|error| anyhow::anyhow!(error.code()))?;
+                    if udp_media_enabled {
+                        runtime
+                            .publish_event(SessionEvent::AudioState(AudioState::Starting))
+                            .map_err(|error| anyhow::anyhow!(error.code()))?;
+                        audio_started = true;
+                    }
+                    readiness_published = true;
+                    while let Some(control) = reader.take_buffered_media_control() {
+                        handle_media_control(
+                            control,
+                            &mut media,
+                            &mut runtime,
+                            reader.generation(),
+                            media_bind_address,
+                            &writer,
+                            audio_started,
+                        )?;
+                    }
+                }
+                NetworkFrameOutcome::Media(control) => {
+                    if !readiness_published {
+                        return Err(HighPerformanceUnavailable.into());
+                    }
+                    handle_media_control(
+                        control,
+                        &mut media,
+                        &mut runtime,
                         reader.generation(),
-                        announcement,
                         media_bind_address,
                         &writer,
+                        audio_started,
                     )?;
                 }
-                NetworkFrameOutcome::Media(Media::StreamAnswer(answer)) => {
-                    media.handle_answer(reader.generation(), answer)?;
-                    runtime
-                        .publish_event(SessionEvent::AudioState(AudioState::Playing))
-                        .map_err(|error| anyhow::anyhow!(error.code()))?;
-                }
-                NetworkFrameOutcome::Media(_) => unreachable!("reader only returns media control"),
             }
         }
         Ok(())
     })();
 
     let _ = runtime.publish_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
-    if udp_media_enabled {
+    if audio_started {
         let _ = runtime.publish_event(SessionEvent::AudioState(AudioState::Stopped));
     }
     let _ = media.close(reader.generation());
@@ -536,6 +649,7 @@ fn run_authenticated_session_inner(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
@@ -547,6 +661,161 @@ mod tests {
     };
 
     struct NoopWake;
+
+    enum RuntimeTrace {
+        Event(SessionEvent),
+        Surface(frd_frame::SurfaceUpdate),
+        Wake,
+    }
+
+    struct TracingEvents(mpsc::Sender<RuntimeTrace>);
+
+    impl RuntimeEventSink for TracingEvents {
+        fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
+            self.0
+                .send(RuntimeTrace::Event(event))
+                .map_err(|_| ProtocolError::EventPortClosed)
+        }
+    }
+
+    struct TracingFrames(mpsc::Sender<RuntimeTrace>);
+
+    impl SurfacePublisher for TracingFrames {
+        fn publish(&self, update: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
+            self.0
+                .send(RuntimeTrace::Surface(update))
+                .map_err(|_| ProtocolError::FramePortRejected)
+        }
+    }
+
+    struct TracingWake(mpsc::Sender<RuntimeTrace>);
+
+    impl RuntimeWake for TracingWake {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            self.0
+                .send(RuntimeTrace::Wake)
+                .map_err(|_| ProtocolError::WakeFailed)
+        }
+    }
+
+    struct ProductionHarness {
+        peer: TcpStream,
+        peer_crypto: crate::session::SessionCrypto,
+        commands: mpsc::Sender<SessionCommand>,
+        trace: mpsc::Receiver<RuntimeTrace>,
+        exit: mpsc::Receiver<frd_protocol_api::ProtocolExit>,
+        worker: thread::JoinHandle<()>,
+        session_id: frd_core::SessionId,
+    }
+
+    fn read_encrypted_test_message(
+        peer: &mut TcpStream,
+        crypto: &mut crate::session::SessionCrypto,
+    ) -> Vec<u8> {
+        let mut prefix = [0u8; 2];
+        peer.read_exact(&mut prefix).unwrap();
+        let length = usize::from(u16::from_be_bytes(prefix));
+        let mut ciphertext = vec![0u8; length];
+        peer.read_exact(&mut ciphertext).unwrap();
+        crypto.open(&ciphertext).unwrap()
+    }
+
+    fn write_encrypted_test_message(
+        peer: &mut TcpStream,
+        crypto: &mut crate::session::SessionCrypto,
+        message: &[u8],
+    ) {
+        let wire = crypto.seal(message).unwrap();
+        peer.write_all(&wire).unwrap();
+    }
+
+    impl ProductionHarness {
+        fn read_message(&mut self) -> Vec<u8> {
+            read_encrypted_test_message(&mut self.peer, &mut self.peer_crypto)
+        }
+
+        fn send_message(&mut self, message: &[u8]) {
+            write_encrypted_test_message(&mut self.peer, &mut self.peer_crypto, message);
+        }
+
+        fn read_verified_startup(&mut self) {
+            let set_display = self.read_message();
+            assert_eq!(set_display.first(), Some(&0x1d));
+            assert_eq!(set_display.len(), 308);
+            let display_query = self.read_message();
+            assert_eq!(display_query.first(), Some(&0x09));
+            assert_eq!(self.read_message(), [3, 0, 0, 0, 0, 0, 0, 8, 0, 8]);
+        }
+    }
+
+    fn server_state_message(width: u16, height: u16) -> Vec<u8> {
+        let mut server_state = vec![0u8; 94];
+        server_state[0..4].copy_from_slice(&1u32.to_be_bytes());
+        server_state[12..16].copy_from_slice(&crate::hpss::encoding::SERVER_STATE.to_be_bytes());
+        server_state[16..18].copy_from_slice(&76u16.to_be_bytes());
+        server_state[18..20].copy_from_slice(&5u16.to_be_bytes());
+        server_state[20..22].copy_from_slice(&width.to_be_bytes());
+        server_state[22..24].copy_from_slice(&height.to_be_bytes());
+        server_state
+    }
+
+    fn port_announcement_message(audio_port: u16) -> Vec<u8> {
+        let mut message = vec![
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0xf2, 0x00, 0x24, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x45, 0x67,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        message[26..28].copy_from_slice(&audio_port.to_be_bytes());
+        message
+    }
+
+    fn start_production_harness(udp_media_enabled: bool) -> ProductionHarness {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let key = [0x31; 16];
+        let iv = [0x42; 16];
+        let mut connection = crate::AppleConnection::new(client);
+        connection
+            .set_crypto(crate::session::SessionCrypto::from_key_iv(key, iv))
+            .unwrap();
+        let session_id = frd_core::SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (trace_tx, trace) = mpsc::channel();
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(TracingEvents(trace_tx.clone())),
+            Box::new(TracingFrames(trace_tx.clone())),
+            None,
+            Box::new(TracingWake(trace_tx)),
+        );
+        let (exit_tx, exit) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = super::run_authenticated_session_with_media(
+                connection,
+                "production-session-test".to_owned(),
+                frd_core::PixelSize::new(8, 8).unwrap(),
+                runtime,
+                session_id,
+                false,
+                crate::media_negotiation::AudioMediaFlow::MacToPc,
+                udp_media_enabled,
+            );
+            exit_tx.send(result).unwrap();
+        });
+        ProductionHarness {
+            peer,
+            peer_crypto: crate::session::SessionCrypto::from_key_iv(key, iv),
+            commands,
+            trace,
+            exit,
+            worker,
+            session_id,
+        }
+    }
 
     #[test]
     fn startup_geometry_preserves_the_authenticated_server_init() {
@@ -583,6 +852,316 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_session_defers_generation_and_readiness_until_strict_server_state() {
+        let mut harness = start_production_harness(false);
+        harness.read_verified_startup();
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        harness
+            .commands
+            .send(SessionCommand::Input(frd_core::SessionInput {
+                session_id: harness.session_id,
+                generation: 1,
+                event: frd_core::InputEvent::ReleaseAll,
+            }))
+            .unwrap();
+        let viewport = frd_core::PhysicalViewport::new(
+            frd_core::PixelSize::new(32, 16).unwrap(),
+            frd_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 16,
+            },
+            frd_core::PixelSize::new(8, 8).unwrap(),
+        )
+        .unwrap();
+        harness
+            .commands
+            .send(SessionCommand::ViewportChanged {
+                session_id: harness.session_id,
+                generation: 1,
+                viewport,
+            })
+            .unwrap();
+
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut pending_byte = [0u8; 1];
+        assert!(matches!(
+            harness.peer.read(&mut pending_byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        harness.send_message(&server_state_message(16, 8));
+        assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 16, 0, 8]);
+
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::SurfaceGenerationChanged {
+                generation: 1,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(16, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Surface(frd_frame::SurfaceUpdate::Reset {
+                generation: 1,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(16, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::StageChanged(
+                frd_protocol_api::ConnectionStage::TransportReady
+            ))
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::CapabilitiesChanged(capabilities))
+                if !capabilities.remote_audio && !capabilities.dynamic_resolution
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            harness.peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(
+            harness.exit.recv_timeout(Duration::from_secs(2)).unwrap(),
+            frd_protocol_api::ProtocolExit::Closed
+        );
+        harness.worker.join().unwrap();
+    }
+
+    #[test]
+    fn production_session_buffers_media_until_readiness_then_handles_it_before_next_read() {
+        let mut harness = start_production_harness(true);
+        harness.read_verified_startup();
+
+        harness.send_message(&port_announcement_message(17_767));
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut pending_byte = [0u8; 1];
+        assert!(matches!(
+            harness.peer.read(&mut pending_byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        harness.send_message(&server_state_message(16, 8));
+        assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 16, 0, 8]);
+        let media_configuration = harness.read_message();
+        assert_eq!(media_configuration.first(), Some(&0x1c));
+
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::SurfaceGenerationChanged { generation: 1, .. })
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Surface(frd_frame::SurfaceUpdate::Reset { generation: 1, .. })
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::StageChanged(
+                frd_protocol_api::ConnectionStage::TransportReady
+            ))
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::CapabilitiesChanged(capabilities))
+                if capabilities.remote_audio
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::AudioState(
+                frd_protocol_api::AudioState::Starting
+            ))
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(
+            harness.exit.recv_timeout(Duration::from_secs(2)).unwrap(),
+            frd_protocol_api::ProtocolExit::Closed
+        );
+        harness.worker.join().unwrap();
+    }
+
+    #[test]
+    fn production_session_pending_peer_close_is_high_performance_unavailable() {
+        let mut harness = start_production_harness(true);
+        harness.read_verified_startup();
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        let exit = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            exit,
+            frd_protocol_api::ProtocolExit::Failed(ref error)
+                if error.code()
+                    == crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+        ));
+        harness.worker.join().unwrap();
+        while let Ok(trace) = harness.trace.try_recv() {
+            assert!(!matches!(
+                trace,
+                RuntimeTrace::Event(SessionEvent::AudioState(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn production_session_unencrypted_startup_fails_before_any_hpss_write_or_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let connection = crate::AppleConnection::new(client);
+        let session_id = frd_core::SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let (trace_tx, trace_rx) = mpsc::channel();
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(TracingEvents(trace_tx.clone())),
+            Box::new(TracingFrames(trace_tx.clone())),
+            None,
+            Box::new(TracingWake(trace_tx)),
+        );
+
+        let exit = super::run_authenticated_session_with_media(
+            connection,
+            "unencrypted-test".to_owned(),
+            frd_core::PixelSize::new(8, 8).unwrap(),
+            runtime,
+            session_id,
+            false,
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+            false,
+        );
+
+        assert!(matches!(
+            exit,
+            frd_protocol_api::ProtocolExit::Failed(ref error)
+                if error.code()
+                    == crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+        ));
+        assert!(matches!(
+            trace_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
+        ));
+        let mut byte = [0u8; 1];
+        match peer.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            other => panic!("未加密启动不得发送 HPSS 字节: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn production_session_startup_transport_close_classifier_and_typed_exit_are_stable() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::new(kind, "synthetic startup close"))
+                .context("startup write wrapper");
+            assert!(super::is_startup_transport_close(&error));
+        }
+        let unrelated = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "synthetic unrelated error",
+        ));
+        assert!(!super::is_startup_transport_close(&unrelated));
+
+        assert!(matches!(
+            super::protocol_exit_for_runtime_error(
+                crate::high_performance::HighPerformanceUnavailable.into()
+            ),
+            frd_protocol_api::ProtocolExit::Failed(ref error)
+                if error.code()
+                    == crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+        ));
+    }
+
     impl RuntimeWake for NoopWake {
         fn wake(&self) -> Result<(), ProtocolError> {
             Ok(())
@@ -613,13 +1192,32 @@ mod tests {
             .unwrap();
         let address = listener.local_addr().unwrap();
         let (peer_ready_tx, peer_ready_rx) = mpsc::channel();
+        let (high_performance_ready_tx, high_performance_ready_rx) = mpsc::channel();
         let (release_peer_tx, release_peer_rx) = mpsc::channel();
         let peer = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
             socket2::SockRef::from(&stream)
                 .set_recv_buffer_size(1024)
                 .unwrap();
             peer_ready_tx.send(()).unwrap();
+            let mut crypto = crate::session::SessionCrypto::from_key_iv([0x31; 16], [0x42; 16]);
+            let set_display = read_encrypted_test_message(&mut stream, &mut crypto);
+            assert_eq!(set_display.first(), Some(&0x1d));
+            assert_eq!(set_display.len(), 308);
+            assert_eq!(
+                read_encrypted_test_message(&mut stream, &mut crypto).first(),
+                Some(&0x09)
+            );
+            assert_eq!(
+                read_encrypted_test_message(&mut stream, &mut crypto),
+                [3, 0, 0, 0, 0, 0, 0, 64, 0, 64]
+            );
+            write_encrypted_test_message(&mut stream, &mut crypto, &server_state_message(64, 64));
+            assert_eq!(
+                read_encrypted_test_message(&mut stream, &mut crypto),
+                [3, 0, 0, 0, 0, 0, 0, 64, 0, 64]
+            );
+            high_performance_ready_tx.send(()).unwrap();
             let _ = release_peer_rx.recv_timeout(Duration::from_secs(5));
             drop(stream);
         });
@@ -666,6 +1264,9 @@ mod tests {
             exit_tx.send(exit).unwrap();
         });
 
+        high_performance_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
         assert!(matches!(
             frames_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             frd_frame::SurfaceUpdate::Reset { generation: 1, .. }
