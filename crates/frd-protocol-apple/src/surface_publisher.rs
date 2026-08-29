@@ -100,13 +100,6 @@ impl DisplaySurface {
         self.native_mvs_observability
     }
 
-    pub(crate) fn contains_nonblack(&self) -> bool {
-        self.framebuffer
-            .pixels()
-            .iter()
-            .any(|pixel| *pixel & 0x00ff_ffff != 0)
-    }
-
     fn bgrx_patch(&self, rect: PixelRect) -> Result<PixelPatch> {
         if rect.width == 0 || rect.height == 0 {
             bail!("Apple surface dirty rect 不能为空");
@@ -220,6 +213,23 @@ impl AppleSurfacePublisher {
         dirty: PixelRect,
         kind: MvsFrameKind,
     ) -> Result<PublicationOutcome, ProtocolError> {
+        let patch = surface
+            .bgrx_patch(dirty)
+            .map_err(|_| ProtocolError::FramePortRejected)?;
+        self.publish_committed_patch(runtime, surface, generation, patch, kind)
+    }
+
+    /// 发布已在 decoder prepare 期间构造并校验的 BGRX patch。
+    /// type-0 调用方已保证 patch 与当前 surface 的 dirty rect 一致，
+    /// 因而这里不得重新读取 CPU surface 打包像素。
+    pub(crate) fn publish_committed_patch(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        surface: &DisplaySurface,
+        generation: u64,
+        patch: PixelPatch,
+        kind: MvsFrameKind,
+    ) -> Result<PublicationOutcome, ProtocolError> {
         if generation != self.generation || surface.generation != self.generation {
             return Ok(PublicationOutcome::IgnoredStale);
         }
@@ -249,9 +259,6 @@ impl AppleSurfacePublisher {
             }
             MvsFrameKind::TypeOne => FrameCompleteness::Incremental,
         };
-        let patch = surface
-            .bgrx_patch(dirty)
-            .map_err(|_| ProtocolError::FramePortRejected)?;
         let revision = self
             .revision
             .checked_add(1)
@@ -338,7 +345,9 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
 
     use frd_core::{PixelRect, PixelSize, SessionId};
-    use frd_frame::{FrameCompleteness, FrameMailbox, PixelFormat, SurfaceUpdate};
+    use frd_frame::{
+        FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
+    };
     use frd_protocol_api::{
         MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
         SessionEvent, SurfacePublisher,
@@ -424,6 +433,51 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn direct_type_zero_patch_publishes_owned_bgrx_without_rereading_surface() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let (mut runtime, frames) = runtime_with_frames(session_id);
+        let surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        let patch = PixelPatch {
+            rect: PixelRect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            stride_bytes: 4,
+            pixels: PixelBuffer::new(vec![0x33, 0x22, 0x11, 0]),
+        };
+
+        assert_eq!(
+            publisher
+                .publish_committed_patch(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    patch,
+                    MvsFrameKind::TypeZero {
+                        complete_surface: true,
+                        initial_nonblack: true,
+                    },
+                )
+                .unwrap(),
+            PublicationOutcome::Published
+        );
+
+        let frames = frames.lock().unwrap();
+        let SurfaceUpdate::Damage { ref patches, .. } = frames[1] else {
+            panic!("complete type-0 must publish its prepared patch");
+        };
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].rect.x, 1);
+        assert_eq!(patches[0].rect.width, 1);
+        assert_eq!(patches[0].stride_bytes, 4);
+        assert_eq!(patches[0].pixels.as_bytes(), &[0x33, 0x22, 0x11, 0]);
     }
 
     #[test]

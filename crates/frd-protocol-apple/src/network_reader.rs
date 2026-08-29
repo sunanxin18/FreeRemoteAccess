@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use frd_core::{PhysicalViewport, PixelRect, PixelSize};
+use frd_frame::{PixelBuffer, PixelPatch};
 use frd_protocol_api::{ProtocolError, ProtocolRuntime};
 
 use crate::connection::AppleWriterHandle;
@@ -715,13 +716,25 @@ fn current_surface_size(surface: &Arc<Mutex<DisplaySurface>>) -> DisplaySize {
     .expect("DisplaySurface dimensions are non-zero u16 values")
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MvsRecordOutcome {
     TableInstalled,
-    FullApplied { complete_surface: bool },
-    PartialApplied { has_pixels: bool },
+    FullApplied {
+        complete_surface: bool,
+        publication: PreparedTypeZeroPublication,
+    },
+    PartialApplied {
+        has_pixels: bool,
+    },
     RecoveryRequested,
     Ignored,
+}
+
+/// type-0 decoder prepare 后一次性构造的发布数据。其 patch 在 codec commit 前已完成
+/// generation/矩形/RGB layout 校验，commit 成功后仅按既定字节写入 CPU surface 并移交渲染器。
+#[derive(Debug)]
+struct PreparedTypeZeroPublication {
+    patch: PixelPatch,
+    contains_nonblack: bool,
 }
 
 fn is_complete_surface_frame(rect: MvsRect, display_size: DisplaySize) -> bool {
@@ -749,18 +762,14 @@ fn mark_recovery_for_invalid_mvs_geometry(
     Ok(true)
 }
 
-/// 在私有 staging framebuffer 上应用像素，decoder commit 成功后才发布 surface。
+/// 在 decoder commit 后将已预校验的 type-0 BGRX patch 原位写入持久 CPU surface。
 /// `receiver` 只属于 reader 线程；持有 surface 锁期间不进行任何 socket I/O。
-fn apply_prepared_mvs_to_surface_with<F>(
+fn apply_prepared_mvs_to_surface(
     receiver: &mut MvsReceiveState,
     surface: &mut DisplaySurface,
     prepared: mvs::PreparedGenerationMvs,
-    rect: MvsRect,
-    apply: F,
-) -> Result<()>
-where
-    F: FnOnce(&mut Framebuffer, &[u8], usize, usize, usize, usize) -> Result<()>,
-{
+    publication: &PreparedTypeZeroPublication,
+) -> Result<()> {
     if surface.generation != receiver.generation {
         bail!(
             "MVS prepared frame generation 与当前 surface 不一致: receiver={}, surface={}",
@@ -768,25 +777,85 @@ where
             surface.generation
         );
     }
-    let decoded = prepared.decoded();
+    receiver.commit(prepared)?;
+    apply_validated_bgrx_patch_to_framebuffer(&mut surface.framebuffer, &publication.patch);
+    Ok(())
+}
+
+/// 将 MVS 解码 RGB 转换为可由 wgpu 直接消费的 BGRX patch。
+/// 成功返回即代表 commit 后的 surface 写入不再需要分配、验证或返回错误。
+fn prepare_type_zero_patch(
+    decoded: &crate::mvs_full::DecodedMvsRect,
+    rect: MvsRect,
+) -> Result<PreparedTypeZeroPublication> {
     if decoded.width != usize::from(rect.width) || decoded.height != usize::from(rect.height) {
         bail!("MVS 原生解码矩形与 wire 矩形不一致");
     }
-    let mut staged = Framebuffer::new(surface.framebuffer.width, surface.framebuffer.height)?;
-    staged
-        .pixels_mut()
-        .copy_from_slice(surface.framebuffer.pixels());
-    apply(
-        &mut staged,
-        &decoded.rgb,
-        usize::from(rect.x),
-        usize::from(rect.y),
-        usize::from(rect.width),
-        usize::from(rect.height),
-    )?;
-    receiver.commit(prepared)?;
-    surface.framebuffer = staged;
-    Ok(())
+    mvs::validate_decoded_rgb_layout(rect.width, rect.height, decoded.rgb.len())?;
+    let stride_bytes = u32::from(rect.width)
+        .checked_mul(4)
+        .context("MVS type-0 BGRX stride 溢出")?;
+    let byte_count = usize::try_from(stride_bytes)
+        .ok()
+        .and_then(|stride| stride.checked_mul(usize::from(rect.height)))
+        .context("MVS type-0 BGRX payload 溢出")?;
+    let mut bgrx = Vec::new();
+    bgrx.try_reserve_exact(byte_count)
+        .context("MVS type-0 BGRX payload 分配失败")?;
+    let mut contains_nonblack = false;
+    for rgb in decoded.rgb.chunks_exact(mvs::MVS_RGB_CHANNEL_BYTES) {
+        contains_nonblack |= rgb.iter().any(|component| *component != 0);
+        bgrx.extend_from_slice(&[
+            rgb[mvs::MVS_RGB_BLUE_OFFSET],
+            rgb[mvs::MVS_RGB_GREEN_OFFSET],
+            rgb[mvs::MVS_RGB_RED_OFFSET],
+            0,
+        ]);
+    }
+    debug_assert_eq!(bgrx.len(), byte_count);
+    Ok(PreparedTypeZeroPublication {
+        patch: PixelPatch {
+            rect: PixelRect {
+                x: u32::from(rect.x),
+                y: u32::from(rect.y),
+                width: u32::from(rect.width),
+                height: u32::from(rect.height),
+            },
+            stride_bytes,
+            pixels: PixelBuffer::new(bgrx),
+        },
+        contains_nonblack,
+    })
+}
+
+/// 只接收 `prepare_type_zero_patch` 已完全校验的 patch，因此无分配且不返回错误。
+fn apply_validated_bgrx_patch_to_framebuffer(framebuffer: &mut Framebuffer, patch: &PixelPatch) {
+    debug_assert_eq!(patch.stride_bytes, patch.rect.width * 4);
+    debug_assert!(patch.rect.width > 0 && patch.rect.height > 0);
+    debug_assert!(
+        patch.rect.x.checked_add(patch.rect.width).unwrap() <= framebuffer.width as u32
+            && patch.rect.y.checked_add(patch.rect.height).unwrap() <= framebuffer.height as u32
+    );
+    debug_assert_eq!(
+        patch.pixels.len(),
+        usize::try_from(patch.stride_bytes).unwrap() * patch.rect.height as usize
+    );
+    let source = patch.pixels.as_bytes();
+    let width = patch.rect.width as usize;
+    for row in 0..patch.rect.height as usize {
+        let source_row = row * patch.stride_bytes as usize;
+        let destination_row =
+            (patch.rect.y as usize + row) * framebuffer.width + patch.rect.x as usize;
+        for column in 0..width {
+            let source_pixel = source_row + column * 4;
+            framebuffer.pixels_mut()[destination_row + column] = u32::from_le_bytes([
+                source[source_pixel],
+                source[source_pixel + 1],
+                source[source_pixel + 2],
+                source[source_pixel + 3],
+            ]);
+        }
+    }
 }
 
 fn validate_partial_pixels_for_framebuffer(
@@ -913,41 +982,6 @@ fn apply_validated_partial_pixels_to_framebuffer(
     }
 }
 
-fn apply_rgb_rect(
-    framebuffer: &mut Framebuffer,
-    rgb: &[u8],
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-) -> Result<()> {
-    let expected = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(mvs::MVS_RGB_CHANNEL_BYTES))
-        .context("RGB 矩形尺寸溢出")?;
-    if rgb.len() != expected {
-        bail!("RGB 数据长度不匹配: 期望 {expected}, 实际 {}", rgb.len());
-    }
-    if x.checked_add(width)
-        .is_none_or(|right| right > framebuffer.width)
-        || y.checked_add(height)
-            .is_none_or(|bottom| bottom > framebuffer.height)
-    {
-        bail!("RGB 矩形超出 framebuffer");
-    }
-    for row in 0..height {
-        for column in 0..width {
-            let source = (row * width + column) * mvs::MVS_RGB_CHANNEL_BYTES;
-            let destination = (y + row) * framebuffer.width + x + column;
-            let red = u32::from(rgb[source + mvs::MVS_RGB_RED_OFFSET]);
-            let green = u32::from(rgb[source + mvs::MVS_RGB_GREEN_OFFSET]);
-            let blue = u32::from(rgb[source + mvs::MVS_RGB_BLUE_OFFSET]);
-            framebuffer.pixels_mut()[destination] = (red << 16) | (green << 8) | blue;
-        }
-    }
-    Ok(())
-}
-
 fn apply_prepared_partial_to_surface(
     receiver: &mut MvsReceiveState,
     surface: &mut DisplaySurface,
@@ -971,16 +1005,12 @@ fn apply_prepared_partial_to_surface(
 }
 
 /// 已严格分类为像素记录后的原生 prepare/apply/commit 事务。
-fn apply_native_mvs_frame_with<F>(
+fn apply_native_mvs_frame(
     receiver: &mut MvsReceiveState,
     record: &MvsRecord,
     surface: &Arc<Mutex<DisplaySurface>>,
     dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
-    apply: F,
-) -> Result<MvsRecordOutcome>
-where
-    F: FnOnce(&mut Framebuffer, &[u8], usize, usize, usize, usize) -> Result<()>,
-{
+) -> Result<MvsRecordOutcome> {
     let (surface_generation, display_size) = {
         let surface = surface.lock().unwrap();
         (
@@ -1048,12 +1078,20 @@ where
         }
     };
 
+    let publication = match prepare_type_zero_patch(prepared.decoded(), record.rect) {
+        Ok(publication) => publication,
+        Err(error) => {
+            eprintln!("[hpss-view] MVS type-0 BGRX prepare 失败，重同步: {error:#}");
+            receiver.request_full()?;
+            return Ok(MvsRecordOutcome::RecoveryRequested);
+        }
+    };
     let applied = {
         let mut surface = surface.lock().unwrap();
         if surface.generation != surface_generation {
             Err(anyhow::anyhow!("MVS surface generation 在应用前发生变化"))
         } else {
-            apply_prepared_mvs_to_surface_with(receiver, &mut surface, prepared, record.rect, apply)
+            apply_prepared_mvs_to_surface(receiver, &mut surface, prepared, &publication)
                 .map(|()| surface.record_native_type_zero_applied())
         }
     };
@@ -1082,7 +1120,10 @@ where
             .observe_full_applied(receiver.generation, display_size);
         eprintln!("[hpss-view] 当前 generation 的完整 surface 证据已确认");
     }
-    Ok(MvsRecordOutcome::FullApplied { complete_surface })
+    Ok(MvsRecordOutcome::FullApplied {
+        complete_surface,
+        publication,
+    })
 }
 
 fn process_complete_mvs_record(
@@ -1134,14 +1175,8 @@ fn process_complete_mvs_record(
         }
     }
 
-    let outcome = apply_native_mvs_frame_with(
-        receiver,
-        &record,
-        surface,
-        dynamic_resolution,
-        apply_rgb_rect,
-    )?;
-    if outcome == MvsRecordOutcome::RecoveryRequested {
+    let outcome = apply_native_mvs_frame(receiver, &record, surface, dynamic_resolution)?;
+    if matches!(outcome, MvsRecordOutcome::RecoveryRequested) {
         return request_full_update(writer, requests, display_size.width, display_size.height)
             .map(|()| MvsRecordOutcome::RecoveryRequested);
     }
@@ -1265,18 +1300,23 @@ fn handle_complete_mvs_record(
         writer,
         requests,
     )?;
+    let full_applied = matches!(&outcome, MvsRecordOutcome::FullApplied { .. });
+    let partial_applied = matches!(&outcome, MvsRecordOutcome::PartialApplied { .. });
     let publication = match outcome {
-        MvsRecordOutcome::FullApplied { complete_surface } => {
+        MvsRecordOutcome::FullApplied {
+            complete_surface,
+            publication,
+        } => {
             let surface = surface.lock().unwrap();
             publisher
-                .publish_committed(
+                .publish_committed_patch(
                     protocol_runtime,
                     &surface,
                     receiver.generation,
-                    dirty,
+                    publication.patch,
                     MvsFrameKind::TypeZero {
                         complete_surface,
-                        initial_nonblack: surface.contains_nonblack(),
+                        initial_nonblack: publication.contains_nonblack,
                     },
                 )
                 .map_err(|error| anyhow::anyhow!(error.code()))?
@@ -1304,7 +1344,7 @@ fn handle_complete_mvs_record(
         request_full_update(writer, requests, size.width, size.height)?;
         return Ok(());
     }
-    if matches!(outcome, MvsRecordOutcome::FullApplied { .. }) {
+    if full_applied {
         let boundary = finish_network_full_boundary(
             receiver,
             requests,
@@ -1322,7 +1362,7 @@ fn handle_complete_mvs_record(
         } else if boundary.incremental_sent {
             eprintln!("[hpss-view] MVS full 已应用并请求下一增量响应");
         }
-    } else if matches!(outcome, MvsRecordOutcome::PartialApplied { .. }) {
+    } else if partial_applied {
         let size = current_surface_size(surface);
         let incremental = incremental_request_after_full_apply(size.width, size.height)?;
         if finish_partial_boundary_at(requests, || send_encrypted(writer, &incremental))? {
@@ -2512,6 +2552,43 @@ mod migrated_runtime_tests {
         assert!(!mark_recovery_for_invalid_mvs_geometry(&mut receiver, invalid, display).unwrap());
         assert!(receiver.awaiting_full());
     }
+
+    #[test]
+    fn prepared_type_zero_patch_converts_exact_bgrx_and_derives_complete_nonblack_gate() {
+        let rect = MvsRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+        let decoded = crate::mvs_full::DecodedMvsRect {
+            width: 2,
+            height: 1,
+            rgb: vec![0x11, 0x22, 0x33, 0, 0, 0],
+        };
+
+        let prepared = prepare_type_zero_patch(&decoded, rect).unwrap();
+
+        assert_eq!(prepared.patch.rect.x, 0);
+        assert_eq!(prepared.patch.rect.width, 2);
+        assert_eq!(prepared.patch.stride_bytes, 8);
+        assert_eq!(
+            prepared.patch.pixels.as_bytes(),
+            &[0x33, 0x22, 0x11, 0, 0, 0, 0, 0]
+        );
+        assert!(prepared.contains_nonblack);
+
+        let black = crate::mvs_full::DecodedMvsRect {
+            width: 2,
+            height: 1,
+            rgb: vec![0; 6],
+        };
+        assert!(
+            !prepare_type_zero_patch(&black, rect)
+                .unwrap()
+                .contains_nonblack
+        );
+    }
     #[test]
     fn native_subrectangle_applies_without_complete_surface_evidence() {
         let surface = native_surface(16, 8);
@@ -2525,19 +2602,13 @@ mod migrated_runtime_tests {
             height: 8,
         });
 
-        assert_eq!(
-            apply_native_mvs_frame_with(
-                &mut receiver,
-                &record,
-                &surface,
-                &dynamic,
-                apply_rgb_rect,
-            )
-            .unwrap(),
+        assert!(matches!(
+            apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
             MvsRecordOutcome::FullApplied {
-                complete_surface: false
+                complete_surface: false,
+                ..
             }
-        );
+        ));
         let surface = surface.lock().unwrap();
         assert!(surface.framebuffer.pixels()[..8]
             .iter()
@@ -2574,17 +2645,10 @@ mod migrated_runtime_tests {
             payload: native_opcode_zero_partial_payload(),
         };
 
-        assert_eq!(
-            apply_native_mvs_frame_with(
-                &mut receiver,
-                &record,
-                &surface,
-                &dynamic,
-                |_, _, _, _, _, _| panic!("opaque type-1 reached framebuffer apply"),
-            )
-            .unwrap(),
+        assert!(matches!(
+            apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
             MvsRecordOutcome::PartialApplied { has_pixels: false }
-        );
+        ));
         assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
         assert!(!receiver.awaiting_full());
         let runtime = dynamic.lock().unwrap();
@@ -2622,17 +2686,10 @@ mod migrated_runtime_tests {
             payload: native_opcode_one_partial_payload(),
         };
 
-        assert_eq!(
-            apply_native_mvs_frame_with(
-                &mut receiver,
-                &record,
-                &surface,
-                &dynamic,
-                apply_rgb_rect,
-            )
-            .unwrap(),
+        assert!(matches!(
+            apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
             MvsRecordOutcome::PartialApplied { has_pixels: true }
-        );
+        ));
         let surface = surface.lock().unwrap();
         assert_ne!(surface.framebuffer.pixels(), before);
         assert_eq!(surface.native_mvs_observability.type_zero_applied_count, 0);
@@ -2672,8 +2729,7 @@ mod migrated_runtime_tests {
             width: 8,
             height: 8,
         });
-        apply_native_mvs_frame_with(&mut receiver, &initial, &surface, &dynamic, apply_rgb_rect)
-            .unwrap();
+        apply_native_mvs_frame(&mut receiver, &initial, &surface, &dynamic).unwrap();
         assert!(!receiver.awaiting_full());
         let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
         let invalid = native_record(MvsRect {
@@ -2683,45 +2739,34 @@ mod migrated_runtime_tests {
             height: 8,
         });
 
-        assert_eq!(
-            apply_native_mvs_frame_with(
-                &mut receiver,
-                &invalid,
-                &surface,
-                &dynamic,
-                |_, _, _, _, _, _| panic!("invalid geometry reached framebuffer apply"),
-            )
-            .unwrap(),
+        assert!(matches!(
+            apply_native_mvs_frame(&mut receiver, &invalid, &surface, &dynamic).unwrap(),
             MvsRecordOutcome::RecoveryRequested
-        );
+        ));
         assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
         assert!(receiver.awaiting_full());
     }
     #[test]
-    fn failed_surface_apply_drops_preparation_and_retry_decodes_identically() {
+    fn type_zero_prepare_failure_preserves_visible_surface_and_requests_recovery() {
         let surface = native_surface(8, 8);
         let dynamic = native_runtime(8, 8);
         let mut receiver = MvsReceiveState::new(1);
         receiver.install_tables(&type_two_tables_fixture()).unwrap();
-        let record = native_record(MvsRect {
-            x: 0,
-            y: 0,
-            width: 8,
-            height: 8,
-        });
+        let record = MvsRecord {
+            rect: MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            payload: vec![0],
+        };
         let before = surface.lock().unwrap().framebuffer.pixels().to_vec();
 
-        assert_eq!(
-            apply_native_mvs_frame_with(
-                &mut receiver,
-                &record,
-                &surface,
-                &dynamic,
-                |_, _, _, _, _, _| anyhow::bail!("injected framebuffer failure"),
-            )
-            .unwrap(),
+        assert!(matches!(
+            apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
             MvsRecordOutcome::RecoveryRequested
-        );
+        ));
         assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
         assert!(receiver.awaiting_full());
         {
@@ -2729,27 +2774,6 @@ mod migrated_runtime_tests {
             assert!(!runtime.evidence.current_full_media_applied);
             assert!(!runtime.armed);
         }
-
-        assert_eq!(
-            apply_native_mvs_frame_with(
-                &mut receiver,
-                &record,
-                &surface,
-                &dynamic,
-                apply_rgb_rect,
-            )
-            .unwrap(),
-            MvsRecordOutcome::FullApplied {
-                complete_surface: true
-            }
-        );
-        assert!(surface
-            .lock()
-            .unwrap()
-            .framebuffer
-            .pixels()
-            .iter()
-            .all(|pixel| *pixel == 0x00ff_ffff));
     }
     #[test]
     fn type_one_and_decode_failure_preserve_visible_surface_and_request_resync() {
@@ -2775,17 +2799,10 @@ mod migrated_runtime_tests {
                 },
                 payload,
             };
-            assert_eq!(
-                apply_native_mvs_frame_with(
-                    &mut receiver,
-                    &record,
-                    &surface,
-                    &dynamic,
-                    apply_rgb_rect,
-                )
-                .unwrap(),
+            assert!(matches!(
+                apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
                 MvsRecordOutcome::RecoveryRequested
-            );
+            ));
             assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
             assert!(receiver.awaiting_full());
         }
@@ -2808,19 +2825,13 @@ mod migrated_runtime_tests {
             height: 8,
         });
 
-        assert_eq!(
-            apply_native_mvs_frame_with(
-                &mut receiver,
-                &record,
-                &surface,
-                &dynamic,
-                apply_rgb_rect,
-            )
-            .unwrap(),
+        assert!(matches!(
+            apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
             MvsRecordOutcome::FullApplied {
-                complete_surface: true
+                complete_surface: true,
+                ..
             }
-        );
+        ));
         assert!(!receiver.awaiting_full());
         let runtime = dynamic.lock().unwrap();
         assert!(runtime.evidence.current_full_media_applied);
