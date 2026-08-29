@@ -13,6 +13,7 @@ const PCM_SAMPLE_RATE_HZ: u32 = 48_000;
 const PCM_CHANNELS: u16 = 2;
 const PCM_BITS_PER_SAMPLE: u16 = 16;
 const PCM_BLOCK_ALIGN_BYTES: usize = 4;
+const PCM_CLIENT_FORMAT_NO: usize = 0;
 const MAX_QUEUED_PCM_FRAMES: usize = 8;
 const MAX_QUEUED_PCM_SAMPLES: usize = PCM_SAMPLE_RATE_HZ as usize * PCM_CHANNELS as usize;
 const MAX_QUEUED_PCM_BYTES: usize = MAX_QUEUED_PCM_SAMPLES * 2;
@@ -41,22 +42,22 @@ pub(crate) fn observe_negotiation(rdpsnd: &Rdpsnd, adapter: &RdpAudioAdapter) {
         return;
     };
     let mut exact_format = None;
-    for format_no in 0..256u16 {
-        let Ok(format) = rdpsnd.get_format(format_no) else {
+    for server_format_no in 0..256u16 {
+        let Ok(format) = rdpsnd.get_format(server_format_no) else {
             break;
         };
         if supported_formats()
             .iter()
             .any(|supported| supported == format)
         {
-            exact_format = Some((usize::from(format_no), format));
+            exact_format = Some(format);
             break;
         }
     }
     let (format_no, sample_rate_hz, channels, bits_per_sample) = exact_format
-        .map(|(format_no, format)| {
+        .map(|format| {
             (
-                Some(format_no),
+                Some(PCM_CLIENT_FORMAT_NO),
                 format.n_samples_per_sec,
                 format.n_channels,
                 format.bits_per_sample,
@@ -337,6 +338,15 @@ mod tests {
             .expect("server offer begins an epoch")
     }
 
+    fn server_offer_with_exact_pcm_at_position_one() -> ServerAudioOutputPdu<'static> {
+        let mut inexact = supported_formats()[0].clone();
+        inexact.n_samples_per_sec = 44_100;
+        ServerAudioOutputPdu::AudioFormat(ServerAudioFormatPdu {
+            version: Version::V8,
+            formats: vec![inexact, supported_formats()[0].clone()],
+        })
+    }
+
     #[test]
     fn audio_requires_negotiation_and_converts_little_endian_pcm() {
         let adapter = RdpAudioAdapter::new();
@@ -505,22 +515,10 @@ mod tests {
     }
 
     #[test]
-    fn audio_real_format_offer_preserves_exact_server_index_for_wave2() {
-        let server_formats = || {
-            let mut inexact = supported_formats()[0].clone();
-            inexact.n_samples_per_sec = 44_100;
-            vec![inexact, supported_formats()[0].clone()]
-        };
-        let formats_pdu = || {
-            ServerAudioOutputPdu::AudioFormat(ServerAudioFormatPdu {
-                version: Version::V8,
-                formats: server_formats(),
-            })
-        };
-
+    fn audio_real_format_offer_uses_client_format_index_for_wave2() {
         let adapter = RdpAudioAdapter::new();
         let mut rdpsnd = new_rdpsnd(&adapter);
-        process_server_audio_pdu(&mut rdpsnd, formats_pdu());
+        process_server_audio_pdu(&mut rdpsnd, server_offer_with_exact_pcm_at_position_one());
         observe_negotiation(&rdpsnd, &adapter);
         assert!(adapter.remote_audio());
         process_server_audio_pdu(
@@ -534,36 +532,41 @@ mod tests {
             &mut rdpsnd,
             ServerAudioOutputPdu::Wave2(Wave2Pdu {
                 timestamp: 2,
-                format_no: 1,
+                format_no: 0,
                 block_no: 1,
                 audio_timestamp: 2,
                 data: Cow::Borrowed(&[0x01, 0x00, 0x02, 0x00]),
             }),
         );
         assert!(adapter.take_frame().is_some());
+    }
 
-        let wrong_index_adapter = RdpAudioAdapter::new();
-        let mut wrong_index_rdpsnd = new_rdpsnd(&wrong_index_adapter);
-        process_server_audio_pdu(&mut wrong_index_rdpsnd, formats_pdu());
-        observe_negotiation(&wrong_index_rdpsnd, &wrong_index_adapter);
+    #[test]
+    fn audio_real_format_offer_rejects_server_offer_position_for_wave2() {
+        let adapter = RdpAudioAdapter::new();
+        let mut rdpsnd = new_rdpsnd(&adapter);
+        process_server_audio_pdu(&mut rdpsnd, server_offer_with_exact_pcm_at_position_one());
+        observe_negotiation(&rdpsnd, &adapter);
+        assert!(adapter.remote_audio());
         process_server_audio_pdu(
-            &mut wrong_index_rdpsnd,
+            &mut rdpsnd,
             ServerAudioOutputPdu::Training(TrainingPdu {
                 timestamp: 1,
                 data: Vec::new(),
             }),
         );
         process_server_audio_pdu(
-            &mut wrong_index_rdpsnd,
+            &mut rdpsnd,
             ServerAudioOutputPdu::Wave2(Wave2Pdu {
                 timestamp: 3,
-                format_no: 0,
+                format_no: 1,
                 block_no: 2,
                 audio_timestamp: 3,
                 data: Cow::Borrowed(&[0x03, 0x00, 0x04, 0x00]),
             }),
         );
-        assert!(wrong_index_adapter.take_frame().is_none());
+        assert!(adapter.take_frame().is_none());
+        assert!(!adapter.remote_audio());
     }
 
     #[test]

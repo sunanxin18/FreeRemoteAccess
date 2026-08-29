@@ -22,6 +22,11 @@ EGFX、ZGFX、AVC/AVC420 与 AVC444 均未实现或验证，不得因本次构�
 CLIPRDR 仍是 adapter-local、按协商能力作产品门控的离线实现；Windows 平台剪贴板
 gate 未启用，本记录不构成端到端剪贴板证明。
 
+RDPSND 的 `wFormatNo` 按客户端公布的共同格式列表解释，而不是按服务端原始 offer
+位置解释。真实 PDU 回归覆盖了服务端位置 0 为不精确格式、位置 1 为精确 PCM 的
+offer：客户端列表索引 0 的 Wave2 发布 PCM 帧，原服务端位置 1 的 Wave2 只在 adapter
+内降级音频且不发布帧。这仍是离线协议证据，不是 Windows 真机音频互操作证明。
+
 ## 工具链
 
 所有 Rust 命令均使用显式 `+stable`。已验证的实际工具链为：
@@ -40,6 +45,7 @@ gate 未启用，本记录不构成端到端剪贴板证明。
 
 ```powershell
 cargo +stable fmt -- --check
+cargo +stable test -p frd-protocol-rdp audio::tests -- --nocapture
 cargo +stable test -p frd-protocol-rdp
 cargo +stable test -p frd-shell-desktop
 cargo +stable test -p freeremotedesk-windows --test dependency_boundary
@@ -53,6 +59,7 @@ cargo +stable clippy --workspace --all-targets
 cargo +stable clippy --workspace --all-targets -- -D warnings
 cargo +stable clippy -p frd-protocol-rdp --all-targets --no-deps -- -D warnings -A clippy::result_unit_err
 cargo +stable build -p freeremotedesk-windows --release
+cargo +stable build --workspace
 cargo +stable build --no-default-features
 cargo +stable tree -p frd-protocol-rdp -e normal
 cargo +stable run -- --help
@@ -64,11 +71,12 @@ git diff --check
 | 门禁 | 结果 |
 |---|---|
 | 格式 | `cargo +stable fmt -- --check` 通过 |
-| RDP 协议单元/文档测试 | 102 通过，0 失败，0 忽略 |
+| RDP 音频聚焦测试 | 9 通过，0 失败，0 忽略；含 `wFormatNo` 正反真实 PDU 回归 |
+| RDP 协议单元/文档测试 | 103 通过，0 失败，0 忽略 |
 | 桌面 shell 单元/文档测试 | 40 通过，0 失败，0 忽略 |
 | Windows 依赖边界集成测试 | 2 通过，0 失败，0 忽略 |
-| 完整 workspace（默认特性） | 838 项列出；827 通过，0 失败，11 既有忽略 |
-| 完整 workspace（`--no-default-features`） | 838 项列出；827 通过，0 失败，11 既有忽略 |
+| 完整 workspace（默认特性） | 843 项列出；832 通过，0 失败，11 既有忽略 |
+| 完整 workspace（`--no-default-features`） | 843 项列出；832 通过，0 失败，11 既有忽略 |
 | 两个 workspace `cargo check` | 均通过；根 legacy binary 仅有下述 5 个既有 `dead_code` 警告 |
 | 普通 workspace Clippy | 通过；报告既有 lint 警告，不含本轮新增 lint |
 | 严格 workspace Clippy | 在未改动的 `frd-frame::PixelBuffer::len` 上因既有 `len_without_is_empty` 失败；`frd-protocol-rdp --no-deps` 继续暴露未改动 `config.rs` 的既有 `result_unit_err`。只豁免后者时，本轮 RDP 全目标以 `-D warnings` 通过 |
@@ -78,8 +86,8 @@ git diff --check
 | 差异空白检查 | `git diff --check` 通过 |
 
 通过 `cargo +stable test --workspace [--no-default-features] -- --list` 复核两个配置均列出
-838 项；源代码中的 11 个 `#[ignore]` 均为现有、需要未纳入公开仓库的授权媒体/捕获
-fixture 的测试。因此实际执行的 827 项全部通过。
+843 项；源代码中的 11 个 `#[ignore]` 均为现有、需要未纳入公开仓库的授权媒体/捕获
+fixture 的测试。因此实际执行的 832 项全部通过。
 
 `cargo +stable build --no-default-features` 发出 5 个既有 `dead_code` 警告，均位于旧
 `src/vnc/mvs_capture_v2*.rs` 的历史/诊断捕获 API；该命令仍成功完成。它们不在 RDP
@@ -105,8 +113,8 @@ adapter 或 Windows 产品包中，且本离线门禁没有证明需要修改它
 发布命令产生的 Windows 可执行文件：
 
 - 路径：`D:\FreeRemoteDesk\.worktrees\windows-rdp\target\release\freeremotedesk-windows.exe`
-- 大小：41,599,488 bytes
-- SHA-256：`ECAECFE885CC5B0DADD60A8E3CD1314BE6855558E300E5321BD469FBD5348669`
+- 大小：41,598,976 bytes
+- SHA-256：`DAA75F0A3520F50BEB82898AC84EB6AC6622376F29EE21E33C705D74D2C2CD50`
 
 哈希仅标识该工作树的本机构建产物；它不是签名、安装包验证，也不是任何在线
 互操作证明。本记录不包含主机、凭据、证书 DER、会话密钥或捕获密钥材料。

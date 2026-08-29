@@ -68,12 +68,14 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 动态分辨率与多显示器 | Display Control DVC | **开发中** | 已通过现有 viewport 接口实现单主显示器 latest-only 调整，仅在 DVC 打开且服务端能力就绪后宣告，并在精确 reactivation 尺寸确认后切换 generation；多显示器仍不支持。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 现代图形 | EGFX、ZGFX、AVC/AVC420、AVC444 | **计划中** | 均未实现或验证，不得宣告支持；未来只允许作为 RDP adapter 内部解码路径发布现有 `SurfaceUpdate`，不新增 UI |
 | 文本剪贴板 | CLIPRDR | **开发中** | CLIPRDR 仅在私有 RDP adapter 内适配 Unicode 文本，并由现有协商能力作产品门控；Windows 平台剪贴板 gate 本分支未启用，文件能力保持关闭，不能宣称端到端剪贴板。2026-08-29 证据仅限 adapter 单元/workspace 测试，无 Windows 真机互操作证明 |
-| Windows→客户端音频 | RDPSND | **开发中** | 已将共同协商的 48 kHz 双声道 16-bit PCM 通过协议中立 `MediaFrame` 端口发布，媒体背压只降级音频，RDP adapter 不打开平台音频设备。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
+| Windows→客户端音频 | RDPSND | **开发中** | 已将共同协商的 48 kHz 双声道 16-bit PCM 通过协议中立 `MediaFrame` 端口发布；`wFormatNo` 按客户端公布的共同格式列表索引验证，媒体背压只降级音频，RDP adapter 不打开平台音频设备。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 客户端麦克风、文件、磁盘与设备 | RDPEAI、CLIPRDR 文件、RDPDR | **计划中** | 不在当前 RDP 开发范围，也不新增入口或公共接口；未来必须单独设计并获得批准 |
 
 当前 RDP 开发只适配 FreeRemoteDesk 已有的统一登录、证书确认、画面、键鼠、
-动态分辨率、文本剪贴板、远程音频、状态与断开接口。不得为了暴露 IronRDP 的
-其他能力扩展当前 UI 或影响 Apple adapter；未纳入现有公共接口的能力保持隐藏。
+动态分辨率、文本剪贴板、远程音频、状态与断开接口，以及实现这些接口所必需的
+IronRDP 协议内部要求。IronRDP 的其他能力不属于当前 roadmap；不得为其扩展当前
+UI、公共接口或平台服务，RDP adapter 的本地改动也不得改变或门控 Apple
+HPSS/ARD/MVS 路径。
 
 ### 客户端与服务端组合
 
