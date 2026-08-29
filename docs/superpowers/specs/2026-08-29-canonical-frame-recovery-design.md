@@ -88,13 +88,19 @@ If overflow occurs before any complete canonical baseline exists, recovery is
 Add a protocol-neutral start barrier to the desktop session host:
 
 1. the background launch creates the command/event/frame ports and worker;
-2. the protocol worker waits on a one-shot start signal;
+2. the protocol worker waits on a private, single-owner RAII start gate;
 3. `accept_launch_outcome` installs `LiveSessionPorts` as active;
 4. only then does it release the protocol worker;
-5. cancellation or failed acceptance drops the signal and joins normally.
+5. ordinary cancellation drops the gate and uses the existing asynchronous
+   cleanup/join path;
+6. fatal exit or an ignored late outcome drops the gate through ownership only
+   and returns the already-latched fatal immediately, without waiting for
+   launch completion, cleanup, or join.
 
 This prevents every adapter from filling a mailbox before the application can
-drain it. The barrier contains no Apple, RDP, MVS, or wire-protocol branch.
+drain it. Gate release is non-blocking and cannot introduce a new public error
+or leave a half-installed active session. The barrier contains no Apple, RDP,
+MVS, or wire-protocol branch.
 
 ### Explicitly deferred amplifiers
 

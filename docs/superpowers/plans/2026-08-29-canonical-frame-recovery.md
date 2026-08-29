@@ -247,35 +247,59 @@ git commit -m "fix: separate Apple snapshot and baseline recovery"
 - Test: `crates/frd-shell-desktop/src/application.rs`
 
 **Interfaces:**
-- Consumes: existing `BackgroundLaunchResult`, `LiveSessionPorts`, protocol worker, and `accept_launch_outcome` transaction.
-- Produces: private `ProtocolStartBarrier`, returned by `launch_live_session` and released only after `SessionHost.active` is installed.
+- Consumes: existing `BackgroundLaunchResult`, `LiveSessionPorts`, protocol
+  worker, and `accept_launch_outcome` transaction.
+- Produces: a private, single-owner RAII `ProtocolStartBarrier` plus waiter,
+  returned by `launch_live_session` and released only after
+  `SessionHost.active` is installed. Release is infallible to the host and
+  introduces no public error variant.
 
 - [ ] **Step 1: Add RED lifecycle tests**
 
-Add a test protocol session whose `run` increments an `AtomicUsize` and
-immediately publishes one event and one Reset. Add:
+Add a private test probe factory/session whose `run` sends a `run_entered`
+signal, increments an `AtomicUsize`, and immediately publishes one event and
+one Reset. The factory accepts a `ProtocolId`, so the same helper can exercise
+Apple/Mac and RDP/Windows without modifying either adapter. Add deterministic
+channel-based tests:
 
 ```rust
 #[test]
 fn protocol_worker_waits_until_live_ports_are_installed() {
     host.begin_launch(permit, target, request, notify).unwrap();
     let outcome = receive_launch_outcome();
-    assert_eq!(run_count.load(Ordering::Acquire), 0);
-    assert!(!host.has_active_ports());
+    assert!(matches!(run_entered_rx.recv_timeout(short_bound), Err(RecvTimeoutError::Timeout)));
+    assert!(host.active.is_none());
     assert_eq!(host.accept_launch_outcome(outcome, |_| {}).unwrap(), AcceptedLaunchOutcome::Started);
-    wait_until(|| run_count.load(Ordering::Acquire) == 1);
-    assert!(host.has_active_ports());
+    run_entered_rx.recv_timeout(normal_bound).unwrap();
+    assert_eq!(run_count.load(Ordering::Acquire), 1);
+    assert!(host.active.is_some());
 }
 
 #[test]
 fn cancelled_launch_drops_barrier_without_running_protocol() {
-    let outcome = receive_launch_outcome_after_cancel();
-    assert_eq!(host.accept_launch_outcome(outcome, |_| {}).unwrap(), AcceptedLaunchOutcome::CancelledStarted);
+    let outcome = receive_launch_outcome();
+    host.cancel_pending_launch();
+    let cleanup = receive_cleanup_outcome_from_accept(outcome);
+    host.accept_cleanup_outcome(cleanup).unwrap();
     assert_eq!(run_count.load(Ordering::Acquire), 0);
+    assert_eq!(drop_count.load(Ordering::Acquire), 1);
+    assert!(!host.is_active());
 }
 ```
 
-Use existing test channels and bounded waits; do not sleep arbitrarily.
+Run the normal lifecycle helper for both
+`(TargetSystem::MacOs, ProtocolId::apple_hpss_mvs())` and
+`(TargetSystem::Windows, ProtocolId::rdp())`. Use existing test channels and
+bounded waits; do not sleep arbitrarily. Tests in the in-file module inspect
+private `host.active` directly; do not add a production test-only accessor.
+
+Rewrite the existing
+`close_after_started_outcome_but_before_acceptance_never_installs_stale_active_ports`
+and `fatal_after_started_is_queued_ignores_the_late_event_without_installing_ports`
+tests: neither may wait for `session.run()` before acceptance. The cancellation
+test must accept and join through existing asynchronous cleanup. The fatal test
+must latch/cancel, drop the unaccepted outcome, prove `run_count == 0` and
+session drop, and must not wait for cleanup or launch completion after fatal.
 
 - [ ] **Step 2: Run RED**
 
@@ -288,23 +312,22 @@ Expected: current protocol worker runs before `accept_launch_outcome` installs `
 
 - [ ] **Step 3: Add the one-shot start barrier**
 
-Use a private sender wrapper:
+Use a private single-owner RAII gate and waiter. A small
+`Arc<(Mutex<State>, Condvar)>` state machine (`Pending`, `Started`,
+`Cancelled`) is suitable: `release(self)` changes Pending to Started and
+notifies without returning an error; dropping an unresolved barrier changes
+Pending to Cancelled and notifies; the worker consumes the waiter and runs only
+for Started. Recover a poisoned private mutex with `into_inner` rather than
+expanding the public error surface.
 
 ```rust
-struct ProtocolStartBarrier(Option<mpsc::Sender<()>>);
-
 impl ProtocolStartBarrier {
-    fn release(mut self) -> Result<(), SessionHostError> {
-        self.0
-            .take()
-            .expect("protocol start barrier releases once")
-            .send(())
-            .map_err(|_| SessionHostError::ProtocolStartClosed)
+    fn release(mut self) {
+        self.resolve(ProtocolStartState::Started);
     }
 }
 ```
 
-Add `ProtocolStartClosed` to the private host error path. Add
 `start_barrier: ProtocolStartBarrier` to
 `BackgroundLaunchResult::Started`. Make `launch_live_session` return
 `(LiveSessionCleanup, LiveSessionPorts, ProtocolStartBarrier)`.
@@ -312,7 +335,7 @@ Add `ProtocolStartClosed` to the private host error path. Add
 The protocol worker must begin with:
 
 ```rust
-if protocol_start_rx.recv().is_err() {
+if !protocol_start_waiter.wait() {
     return;
 }
 let exit = catch_unwind(AssertUnwindSafe(|| session.run()))
@@ -320,20 +343,27 @@ let exit = catch_unwind(AssertUnwindSafe(|| session.run()))
 ```
 
 In the non-cancelled `accept_launch_outcome` branch, install coordinator,
-`active`, and cleanup handle first, then call `start_barrier.release()`. In every
-cancelled or rejected branch, drop the barrier before cleanup so the waiting
-worker exits and joins. Do not change the audio first-frame gate.
+`active`, and cleanup handle first, then call `start_barrier.release()`. In the
+ordinary cancelled branch, drop the barrier before ports and before starting
+the existing asynchronous cleanup so the waiting worker exits and is joined.
+Fatal handling remains immediate and unchanged: an unaccepted outcome is
+dropped, which cancels the gate, but fatal never waits for cleanup or join. Do
+not change the audio first-frame gate and do not add a public
+`SessionHostError` variant.
 
 - [ ] **Step 4: Run GREEN and existing launch/cleanup tests**
 
 ```powershell
 cargo +stable test -p frd-shell-desktop protocol_worker_waits_ -- --nocapture
 cargo +stable test -p frd-shell-desktop cancelled_launch_drops_barrier_ -- --nocapture
+cargo +stable test -p frd-shell-desktop fatal_after_started_is_queued_ -- --nocapture
 cargo +stable test -p frd-shell-desktop launch -- --nocapture
 cargo +stable test -p frd-shell-desktop cleanup -- --nocapture
 ```
 
-Expected: the worker cannot publish before ports are active, and cancel/fatal cleanup remains bounded.
+Expected: the worker cannot publish before ports are active; ordinary cancel
+reclaims through bounded asynchronous cleanup; fatal returns its report
+immediately and never starts the protocol worker.
 
 - [ ] **Step 5: Commit the protocol-neutral barrier**
 
