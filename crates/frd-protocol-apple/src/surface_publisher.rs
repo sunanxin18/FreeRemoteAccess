@@ -3,6 +3,8 @@ use frd_core::{PixelRect, PixelSize, SessionId};
 use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
 use frd_protocol_api::{ProtocolError, ProtocolRuntime};
 
+const FULL_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeMvsRenderObservability {
     pub(crate) type_zero_applied_count: u64,
@@ -255,6 +257,77 @@ impl AppleSurfacePublisher {
             return Err(ProtocolError::FramePortRejected);
         }
         self.publish_patch(runtime, patch, completeness)
+    }
+
+    #[allow(dead_code)] // Task 2 接入 network reader 前保留为 crate 内恢复入口。
+    pub(crate) fn republish_full_snapshot(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        surface: &DisplaySurface,
+        generation: u64,
+    ) -> Result<(), ProtocolError> {
+        self.republish_full_snapshot_with_patch_limit(
+            runtime,
+            surface,
+            generation,
+            FULL_SNAPSHOT_PATCH_BYTES,
+        )
+    }
+
+    #[allow(dead_code)] // 生产入口仅使用固定预算，测试以较小预算验证分段。
+    fn republish_full_snapshot_with_patch_limit(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        surface: &DisplaySurface,
+        generation: u64,
+        patch_byte_limit: usize,
+    ) -> Result<(), ProtocolError> {
+        if generation != self.generation || surface.generation != self.generation {
+            return Err(ProtocolError::FramePortRejected);
+        }
+
+        let width = surface.width();
+        let row_bytes = width
+            .checked_mul(4)
+            .ok_or(ProtocolError::FramePortRejected)?;
+        if patch_byte_limit < row_bytes {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        let rows_per_patch = patch_byte_limit / row_bytes;
+
+        self.baseline_established = false;
+        let mut y = 0usize;
+        while y < surface.height() {
+            let band_height = rows_per_patch.min(surface.height() - y);
+            let patch = surface
+                .bgrx_patch(PixelRect {
+                    x: 0,
+                    y: u32::try_from(y).map_err(|_| ProtocolError::FramePortRejected)?,
+                    width: u32::try_from(width).map_err(|_| ProtocolError::FramePortRejected)?,
+                    height: u32::try_from(band_height)
+                        .map_err(|_| ProtocolError::FramePortRejected)?,
+                })
+                .map_err(|_| ProtocolError::FramePortRejected)?;
+            let completeness = if y + band_height == surface.height() {
+                FrameCompleteness::FullBaseline
+            } else {
+                FrameCompleteness::Incremental
+            };
+            match self.publish_patch(runtime, patch, completeness)? {
+                PublicationOutcome::Published => {}
+                PublicationOutcome::NeedsFullSnapshot => {
+                    return Err(ProtocolError::FramePortRejected);
+                }
+                PublicationOutcome::NeedsFullBaseline | PublicationOutcome::IgnoredStale => {
+                    return Err(ProtocolError::FramePortRejected);
+                }
+            }
+            y = y
+                .checked_add(band_height)
+                .ok_or(ProtocolError::FramePortRejected)?;
+        }
+
+        Ok(())
     }
 
     fn publication_completeness(
@@ -922,5 +995,279 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn seed_distinct_rows(surface: &mut DisplaySurface) {
+        surface.pixels_mut().copy_from_slice(&[
+            0x0011_2233,
+            0x0044_5566,
+            0x0077_8899,
+            0x00aa_bbcc,
+            0x0012_3456,
+            0x0065_4321,
+            0x00de_adbe,
+            0x00fe_dcba,
+            0x0001_0203,
+            0x0004_0506,
+            0x0007_0809,
+            0x000a_0b0c,
+            0x00c0_ffee,
+            0x00fa_ce00,
+            0x000b_adf0,
+            0x0013_3713,
+        ]);
+    }
+
+    #[test]
+    fn damage_overflow_republishes_latest_canonical_bgrx() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let (_commands, command_rx) = mpsc::channel();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(3, 8)));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        let full = MvsFrameKind::TypeZero {
+            complete_surface: true,
+            initial_nonblack: true,
+        };
+
+        apply_rgb_rect_for_generation(
+            &mut surface,
+            1,
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+            0,
+            0,
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 1,
+                    },
+                    full,
+                )
+                .unwrap(),
+            PublicationOutcome::Published
+        );
+
+        apply_rgb_rect_for_generation(&mut surface, 1, &[0xaa, 0xbb, 0xcc], 1, 0, 1, 1).unwrap();
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 1,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    MvsFrameKind::TypeOne,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullSnapshot
+        );
+
+        publisher
+            .republish_full_snapshot(&mut runtime, &surface, 1)
+            .unwrap();
+
+        let mut mailbox = mailbox.lock().unwrap();
+        assert!(matches!(mailbox.pop(), Some(SurfaceUpdate::Reset { .. })));
+        let Some(SurfaceUpdate::Damage {
+            revision: 2,
+            patches,
+            ..
+        }) = mailbox.pop()
+        else {
+            panic!("recovery must publish revision-2 damage");
+        };
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0].pixels.as_bytes(),
+            &[0x33, 0x22, 0x11, 0, 0xcc, 0xbb, 0xaa, 0]
+        );
+        assert!(matches!(
+            mailbox.pop(),
+            Some(SurfaceUpdate::FrameBoundary {
+                revision: 2,
+                completeness: FrameCompleteness::FullBaseline,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn boundary_overflow_advances_recovery_revision() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let (_commands, command_rx) = mpsc::channel();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(2, 4)));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        apply_rgb_rect_for_generation(&mut surface, 1, &[0x11, 0x22, 0x33], 0, 0, 1, 1).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        let full = MvsFrameKind::TypeZero {
+            complete_surface: true,
+            initial_nonblack: true,
+        };
+
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    full,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullSnapshot
+        );
+        assert_eq!(
+            publisher
+                .publish_committed(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    full,
+                )
+                .unwrap(),
+            PublicationOutcome::NeedsFullSnapshot
+        );
+        assert!(matches!(
+            mailbox.lock().unwrap().pop(),
+            Some(SurfaceUpdate::Reset { .. })
+        ));
+
+        publisher
+            .republish_full_snapshot(&mut runtime, &surface, 1)
+            .unwrap();
+
+        let mut mailbox = mailbox.lock().unwrap();
+        assert!(matches!(
+            mailbox.pop(),
+            Some(SurfaceUpdate::Damage { revision: 3, .. })
+        ));
+        assert!(matches!(
+            mailbox.pop(),
+            Some(SurfaceUpdate::FrameBoundary {
+                revision: 3,
+                completeness: FrameCompleteness::FullBaseline,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn full_snapshot_recovery_bands_rows_and_marks_only_the_end_full() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(4, 4).unwrap();
+        let (mut runtime, frames) = runtime_with_frames(session_id);
+        let mut surface = DisplaySurface::new(1, size).unwrap();
+        seed_distinct_rows(&mut surface);
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+
+        publisher
+            .republish_full_snapshot_with_patch_limit(&mut runtime, &surface, 1, 16)
+            .unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 9);
+        let mut bgrx = Vec::new();
+        for row in 0..4 {
+            let SurfaceUpdate::Damage {
+                revision,
+                ref patches,
+                ..
+            } = frames[row * 2 + 1]
+            else {
+                panic!("recovery band must begin with damage");
+            };
+            assert_eq!(revision, row as u64 + 1);
+            assert_eq!(patches.len(), 1);
+            assert_eq!(patches[0].rect.x, 0);
+            assert_eq!(patches[0].rect.y, row as u32);
+            assert_eq!(patches[0].rect.width, 4);
+            assert_eq!(patches[0].rect.height, 1);
+            bgrx.extend_from_slice(patches[0].pixels.as_bytes());
+
+            let SurfaceUpdate::FrameBoundary {
+                revision,
+                completeness,
+                ..
+            } = frames[row * 2 + 2]
+            else {
+                panic!("recovery band must end with a boundary");
+            };
+            assert_eq!(revision, row as u64 + 1);
+            assert_eq!(
+                completeness,
+                if row == 3 {
+                    FrameCompleteness::FullBaseline
+                } else {
+                    FrameCompleteness::Incremental
+                }
+            );
+        }
+        assert_eq!(
+            bgrx,
+            vec![
+                0x33, 0x22, 0x11, 0, 0x66, 0x55, 0x44, 0, 0x99, 0x88, 0x77, 0, 0xcc, 0xbb, 0xaa, 0,
+                0x56, 0x34, 0x12, 0, 0x21, 0x43, 0x65, 0, 0xbe, 0xad, 0xde, 0, 0xba, 0xdc, 0xfe, 0,
+                0x03, 0x02, 0x01, 0, 0x06, 0x05, 0x04, 0, 0x09, 0x08, 0x07, 0, 0x0c, 0x0b, 0x0a, 0,
+                0xee, 0xff, 0xc0, 0, 0x00, 0xce, 0xfa, 0, 0xf0, 0xad, 0x0b, 0, 0x13, 0x37, 0x13, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn full_snapshot_recovery_rejects_a_limit_smaller_than_one_row() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(4, 4).unwrap();
+        let (mut runtime, _frames) = runtime_with_frames(session_id);
+        let surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+
+        let error = publisher
+            .republish_full_snapshot_with_patch_limit(&mut runtime, &surface, 1, 15)
+            .unwrap_err();
+        assert_eq!(error, ProtocolError::FramePortRejected);
     }
 }
