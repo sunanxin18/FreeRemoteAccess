@@ -42,7 +42,7 @@ use crate::cleanup::{
     PendingCleanup,
 };
 use crate::fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};
-use crate::input::hid_usage_from_key_code;
+use crate::input::{hid_usage_from_key_code, KeyboardDomain, KeyboardPreDispatch};
 use crate::lifecycle::{
     execute_presentation_recovery, OcclusionAction, PresentationLifecycle, PresentationOperation,
     PresentationRecoveryBackend, PresentationRecoveryContext, PresentationRecoveryFailure,
@@ -51,8 +51,8 @@ use crate::platform::PlatformWindowChrome;
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::ui_fonts::system_font_definitions;
 use crate::{
-    ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter, WindowChromeAdapter,
-    TITLE_BAR_HEIGHT_POINTS,
+    ChromeHit, ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter,
+    WindowChromeAdapter, TITLE_BAR_HEIGHT_POINTS,
 };
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -66,6 +66,29 @@ const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     clipboard: CapabilityGlyphState::Unavailable,
     action: Some(SessionChromeAction::Disconnect),
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImePreDispatch<'a> {
+    LocalChrome,
+    Consume,
+    Commit(&'a str),
+}
+
+fn classify_ime_before_egui<'a>(
+    domain: KeyboardDomain,
+    ime: &'a Ime,
+    text_input_available: bool,
+) -> ImePreDispatch<'a> {
+    if domain == KeyboardDomain::LocalChrome {
+        return ImePreDispatch::LocalChrome;
+    }
+    match ime {
+        Ime::Commit(text) if text_input_available => ImePreDispatch::Commit(text),
+        Ime::Commit(_) | Ime::Enabled | Ime::Preedit(_, _) | Ime::Disabled => {
+            ImePreDispatch::Consume
+        }
+    }
+}
 
 pub trait WakeSink: Send + Sync {
     fn wake(&self) -> Result<(), ProtocolError>;
@@ -955,13 +978,17 @@ struct DesktopWindowState {
     egui_renderer: egui_wgpu::Renderer,
     physical_size: PixelSize,
     remote_area: Option<PixelRect>,
+    chrome_layout: Option<ChromeLayout>,
+    cursor_position: Option<(u32, u32)>,
     lifecycle: PresentationLifecycle,
     remote: Option<RemoteBinding>,
     dpi_transition: DpiTransition,
+    focus_session_chrome: bool,
 }
 
 impl DesktopWindowState {
     fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayout> {
+        self.chrome_layout = None;
         let insets = self.chrome.native_insets(&self.window);
         let layout = ChromeLayout::for_window(
             self.physical_size.width,
@@ -971,6 +998,7 @@ impl DesktopWindowState {
             insets.trailing_px,
         )?;
         self.remote_area = Some(layout.content_rect);
+        self.chrome_layout = Some(layout);
         self.chrome.publish_hit_regions(ChromeHitRegions { layout });
         Some(layout)
     }
@@ -1378,9 +1406,12 @@ impl DesktopApplication {
                 width: physical_size.width,
                 height: physical_size.height,
             }),
+            chrome_layout: None,
+            cursor_position: None,
             lifecycle: PresentationLifecycle::new(physical_size),
             remote: None,
             dpi_transition: DpiTransition::default(),
+            focus_session_chrome: false,
         };
         state.refresh_chrome_geometry().ok_or_else(|| {
             FatalReport::internal(
@@ -1658,6 +1689,7 @@ impl DesktopApplication {
         let raw_input = window.egui_state.take_egui_input(&window.window);
         let egui_context = window.egui_context.clone();
         let connection_busy = self.sessions.is_active();
+        let focus_session_chrome = std::mem::take(&mut window.focus_session_chrome);
         let mode = &mut self.mode;
         let controller = self.launch.controller_mut();
         let catalog = &self.catalog;
@@ -1689,7 +1721,11 @@ impl DesktopApplication {
                             ui.add_space(
                                 ((ui.available_width() - metrics.total_width) / 2.0).max(0.0),
                             );
-                            if let Some(action) = frd_ui_egui::show_session_chrome(ui, chrome) {
+                            if let Some(action) = frd_ui_egui::show_session_chrome_with_focus(
+                                ui,
+                                chrome,
+                                focus_session_chrome,
+                            ) {
                                 intent = Some(match action {
                                     frd_ui_model::SessionChromeAction::Cancel => {
                                         AppIntent::CancelConnect
@@ -1824,12 +1860,14 @@ impl DesktopApplication {
                     AppPage::RemoteSession { .. }
                 ) && completeness == FrameCompleteness::FullBaseline
                 {
+                    let egui_context = window.egui_context.clone();
                     if let Some(release) = self.input.set_gate(InputGate::Interactive {
                         session_id,
                         generation,
                     }) {
                         self.send_input(release);
                     }
+                    egui_context.memory_mut(|memory| memory.stop_text_input());
                     self.send_viewport_changed();
                     self.request_redraw();
                 }
@@ -1984,12 +2022,14 @@ impl DesktopApplication {
         } else {
             InputOwnership::Remote
         };
-        let keyboard_ownership =
-            if consumed_by_egui || !self.launch.controller().effective_capabilities().text_input {
-                InputOwnership::Ui
-            } else {
-                InputOwnership::Remote
-            };
+        let keyboard_ownership = if consumed_by_egui
+            || self.input.keyboard_domain() == KeyboardDomain::LocalChrome
+            || !self.launch.controller().effective_capabilities().text_input
+        {
+            InputOwnership::Ui
+        } else {
+            InputOwnership::Remote
+        };
         let input = match event {
             WindowEvent::CursorMoved { position, .. } => self.input.pointer_moved(
                 position.x as f32,
@@ -2031,6 +2071,113 @@ impl DesktopApplication {
         };
         if let Some(input) = input {
             self.send_input(input);
+        }
+    }
+
+    fn handle_keyboard_before_egui(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event, .. } = event else {
+            if let WindowEvent::Ime(ime) = event {
+                match classify_ime_before_egui(
+                    self.input.keyboard_domain(),
+                    ime,
+                    self.launch.controller().effective_capabilities().text_input,
+                ) {
+                    ImePreDispatch::LocalChrome => return false,
+                    ImePreDispatch::Consume => return true,
+                    ImePreDispatch::Commit(text) => {
+                        if let Some(input) =
+                            self.input.text(text.to_owned(), InputOwnership::Remote)
+                        {
+                            self.send_input(input);
+                        }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return self.input.keyboard_domain() == KeyboardDomain::RemoteSurface;
+        };
+        let Some(usage) = hid_usage_from_key_code(code) else {
+            return self.input.keyboard_domain() == KeyboardDomain::RemoteSurface;
+        };
+        let physical = frd_core::PhysicalKeyCode::from_usb_hid_usage(usage);
+        let key_state = map_key_state(event.state);
+        let local_shortcut = local_chrome_shortcut(code, event.state, self.input.modifiers());
+        if self.input.keyboard_domain() == KeyboardDomain::RemoteSurface
+            && !local_shortcut
+            && !self.launch.controller().effective_capabilities().text_input
+        {
+            let _ = self.input.key(physical, key_state, InputOwnership::Ui);
+            return true;
+        }
+        match self
+            .input
+            .pre_dispatch_key(physical, key_state, local_shortcut)
+        {
+            KeyboardPreDispatch::Remote(input) => {
+                if let Some(input) = input {
+                    self.send_input(input);
+                }
+                true
+            }
+            KeyboardPreDispatch::EnterLocalChrome(release) => {
+                if let Some(release) = release {
+                    self.send_input(release);
+                }
+                if let Some(window) = self.window.as_mut() {
+                    window.egui_context.memory_mut(|memory| {
+                        memory.stop_text_input();
+                    });
+                    window.focus_session_chrome = true;
+                    window.window.request_redraw();
+                }
+                true
+            }
+            KeyboardPreDispatch::EnterRemoteSurface => {
+                self.clear_local_keyboard_focus();
+                true
+            }
+            KeyboardPreDispatch::LocalChrome => false,
+        }
+    }
+
+    fn clear_local_keyboard_focus(&mut self) {
+        if let Some(window) = self.window.as_mut() {
+            window
+                .egui_context
+                .memory_mut(|memory| memory.stop_text_input());
+            window.window.request_redraw();
+        }
+    }
+
+    fn update_keyboard_domain_from_pointer(
+        &mut self,
+        event: &WindowEvent,
+        _consumed_by_egui: bool,
+    ) {
+        if !matches!(
+            event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            }
+        ) {
+            return;
+        }
+        let ownership = self.window.as_ref().and_then(|window| {
+            pointer_keyboard_ownership(window.chrome_layout?, window.cursor_position?)
+        });
+        let Some(ownership) = ownership else {
+            return;
+        };
+        if let Some(release) = self.input.pointer_pressed_for_domain(ownership) {
+            self.send_input(release);
+        }
+        if ownership == InputOwnership::Remote {
+            self.clear_local_keyboard_focus();
         }
     }
 
@@ -2346,6 +2493,14 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             }
             DesktopUserEvent::ExitTestTexture => event_loop.exit(),
             DesktopUserEvent::AccessKit(event) => {
+                if matches!(
+                    &event.window_event,
+                    egui_winit::accesskit_winit::WindowEvent::ActionRequested(_)
+                ) {
+                    if let Some(release) = self.input.enter_local_chrome() {
+                        self.send_input(release);
+                    }
+                }
                 let Some(window) = self
                     .window
                     .as_mut()
@@ -2383,9 +2538,22 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         if window.window.id() != window_id {
             return;
         }
+        if self.handle_keyboard_before_egui(&event) {
+            return;
+        }
+        let Some(window) = self.window.as_mut() else {
+            return;
+        };
         let response = window.egui_state.on_window_event(&window.window, &event);
         if response.repaint {
             window.window.request_redraw();
+        }
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            let position = (position.x >= 0.0 && position.y >= 0.0)
+                .then_some((position.x as u32, position.y as u32));
+            if let Some(window) = self.window.as_mut() {
+                window.cursor_position = position;
+            }
         }
         match &event {
             WindowEvent::CloseRequested => {
@@ -2476,6 +2644,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             }
             _ => {}
         }
+        self.update_keyboard_domain_from_pointer(&event, response.consumed);
         self.handle_remote_window_event(&event, response.consumed);
     }
 
@@ -2646,6 +2815,48 @@ fn map_mouse_button(button: MouseButton) -> Option<PointerButton> {
         MouseButton::Forward => Some(PointerButton::Forward),
         MouseButton::Other(_) => None,
     }
+}
+
+fn pointer_keyboard_ownership(
+    layout: ChromeLayout,
+    position: (u32, u32),
+) -> Option<InputOwnership> {
+    match layout.hit_test(position.0, position.1) {
+        ChromeHit::Connection
+        | ChromeHit::Audio
+        | ChromeHit::Clipboard
+        | ChromeHit::SessionAction => Some(InputOwnership::Ui),
+        ChromeHit::Client => {
+            let rect = layout.content_rect;
+            let in_content = position.0 >= rect.x
+                && position.1 >= rect.y
+                && position.0 < rect.x.saturating_add(rect.width)
+                && position.1 < rect.y.saturating_add(rect.height);
+            in_content.then_some(InputOwnership::Remote)
+        }
+        ChromeHit::Drag | ChromeHit::Minimize | ChromeHit::Maximize | ChromeHit::Close => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn local_chrome_shortcut(
+    code: winit::keyboard::KeyCode,
+    state: ElementState,
+    modifiers: Modifiers,
+) -> bool {
+    code == winit::keyboard::KeyCode::Home
+        && state == ElementState::Pressed
+        && modifiers.control
+        && modifiers.alt
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_chrome_shortcut(
+    _code: winit::keyboard::KeyCode,
+    _state: ElementState,
+    _modifiers: Modifiers,
+) -> bool {
+    false
 }
 
 fn map_button_state(state: ElementState) -> ButtonState {
@@ -2863,12 +3074,102 @@ mod tests {
     };
     use frd_session::reserve_session_start;
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
+    use winit::event::Ime;
 
     use super::{
         mark_texture_deltas_applied, AcceptedLaunchOutcome, ApplicationExitState,
         AudioOutputFactory, SessionHost, TestLaunchOutcome, UnavailableCredentialStore,
         UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
     };
+
+    #[test]
+    fn application_routes_owned_keyboard_before_egui_window_event() {
+        let source = include_str!("application.rs");
+        let handler = source
+            .split_once("fn window_event(")
+            .expect("application handler exists")
+            .1
+            .split_once("fn exiting(")
+            .expect("window handler has a bounded body")
+            .0;
+        let pre_dispatch = handler
+            .find("handle_keyboard_before_egui")
+            .expect("keyboard ownership is decided in the window handler");
+        let egui_dispatch = handler
+            .find("egui_state.on_window_event")
+            .expect("local UI receives deferred window events");
+
+        assert!(pre_dispatch < egui_dispatch);
+    }
+
+    #[test]
+    fn pointer_domain_changes_only_for_session_glyphs_and_remote_content() {
+        let layout = crate::ChromeLayout::for_window(1100, 720, 1.0, 0, 144).unwrap();
+        let glyph = layout.session_buttons[0].center();
+        let content = (
+            layout.content_rect.x + layout.content_rect.width / 2,
+            layout.content_rect.y + layout.content_rect.height / 2,
+        );
+
+        assert_eq!(
+            super::pointer_keyboard_ownership(layout, glyph),
+            Some(crate::InputOwnership::Ui)
+        );
+        assert_eq!(
+            super::pointer_keyboard_ownership(layout, content),
+            Some(crate::InputOwnership::Remote)
+        );
+        assert_eq!(super::pointer_keyboard_ownership(layout, (100, 20)), None);
+        assert_eq!(
+            super::pointer_keyboard_ownership(
+                layout,
+                layout.minimize_button.expect("Windows layout").center(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_ime_commits_once_and_suppresses_non_commit_state_from_egui() {
+        assert_eq!(
+            super::classify_ime_before_egui(
+                crate::input::KeyboardDomain::RemoteSurface,
+                &Ime::Commit("中".to_owned()),
+                true,
+            ),
+            super::ImePreDispatch::Commit("中")
+        );
+        for ime in [
+            Ime::Enabled,
+            Ime::Preedit("中".to_owned(), Some((0, 3))),
+            Ime::Disabled,
+        ] {
+            assert_eq!(
+                super::classify_ime_before_egui(
+                    crate::input::KeyboardDomain::RemoteSurface,
+                    &ime,
+                    true,
+                ),
+                super::ImePreDispatch::Consume
+            );
+        }
+        assert_eq!(
+            super::classify_ime_before_egui(
+                crate::input::KeyboardDomain::RemoteSurface,
+                &Ime::Commit("blocked".to_owned()),
+                false,
+            ),
+            super::ImePreDispatch::Consume
+        );
+        assert_eq!(
+            super::classify_ime_before_egui(
+                crate::input::KeyboardDomain::LocalChrome,
+                &Ime::Commit("local".to_owned()),
+                true,
+            ),
+            super::ImePreDispatch::LocalChrome
+        );
+    }
 
     #[test]
     fn applied_egui_texture_deltas_are_empty_before_drop() {

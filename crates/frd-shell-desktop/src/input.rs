@@ -22,6 +22,21 @@ pub enum InputOwnership {
     Ui,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KeyboardDomain {
+    RemoteSurface,
+    #[default]
+    LocalChrome,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyboardPreDispatch {
+    Remote(Option<InputEvent>),
+    EnterLocalChrome(Option<InputEvent>),
+    EnterRemoteSurface,
+    LocalChrome,
+}
+
 #[derive(Default)]
 pub struct InputRouter {
     gate: InputGate,
@@ -38,6 +53,7 @@ pub struct InputRouter {
     pointer_armed: bool,
     keyboard_armed: bool,
     modifiers: Modifiers,
+    keyboard_domain: KeyboardDomain,
 }
 
 impl InputRouter {
@@ -47,6 +63,13 @@ impl InputRouter {
         }
         let release = self.release_remote_state();
         self.gate = gate;
+        self.keyboard_domain = match gate {
+            InputGate::Blocked => {
+                self.local_keys.clear();
+                KeyboardDomain::LocalChrome
+            }
+            InputGate::Interactive { .. } => KeyboardDomain::RemoteSurface,
+        };
         self.pointer_armed =
             self.is_interactive() && self.focused && !self.any_local_button_pressed();
         self.keyboard_armed = self.is_interactive() && self.focused && self.local_keys.is_empty();
@@ -71,6 +94,7 @@ impl InputRouter {
 
     pub fn focus_lost(&mut self) -> Option<InputEvent> {
         self.focused = false;
+        self.keyboard_domain = KeyboardDomain::LocalChrome;
         self.disarm_remote_ownership()
     }
 
@@ -89,6 +113,55 @@ impl InputRouter {
 
     pub fn set_modifiers(&mut self, modifiers: Modifiers) {
         self.modifiers = modifiers;
+    }
+
+    pub fn keyboard_domain(&self) -> KeyboardDomain {
+        self.keyboard_domain
+    }
+
+    pub fn modifiers(&self) -> Modifiers {
+        self.modifiers
+    }
+
+    pub fn enter_local_chrome(&mut self) -> Option<InputEvent> {
+        self.keyboard_domain = KeyboardDomain::LocalChrome;
+        self.disarm_remote_ownership()
+    }
+
+    pub fn enter_remote_surface(&mut self) {
+        self.keyboard_domain = KeyboardDomain::RemoteSurface;
+        self.keyboard_armed = self.is_interactive_and_focused() && self.local_keys.is_empty();
+    }
+
+    pub fn pointer_pressed_for_domain(&mut self, ownership: InputOwnership) -> Option<InputEvent> {
+        match ownership {
+            InputOwnership::Ui => self.enter_local_chrome(),
+            InputOwnership::Remote => {
+                self.enter_remote_surface();
+                None
+            }
+        }
+    }
+
+    pub fn pre_dispatch_key(
+        &mut self,
+        code: PhysicalKeyCode,
+        state: KeyState,
+        enter_local_shortcut: bool,
+    ) -> KeyboardPreDispatch {
+        if self.keyboard_domain == KeyboardDomain::LocalChrome {
+            if code.usb_hid_usage() == 0x29 && state == KeyState::Pressed {
+                self.enter_remote_surface();
+                return KeyboardPreDispatch::EnterRemoteSurface;
+            }
+            return KeyboardPreDispatch::LocalChrome;
+        }
+
+        if enter_local_shortcut {
+            return KeyboardPreDispatch::EnterLocalChrome(self.enter_local_chrome());
+        }
+
+        KeyboardPreDispatch::Remote(self.key(code, state, InputOwnership::Remote))
     }
 
     pub fn pointer_moved(
@@ -422,7 +495,10 @@ mod tests {
         ButtonState, ContentViewport, InputEvent, KeyState, PixelSize, PointerButton, SessionId,
     };
 
-    use super::{hid_usage_from_key_code, InputGate, InputOwnership, InputRouter};
+    use super::{
+        hid_usage_from_key_code, InputGate, InputOwnership, InputRouter, KeyboardDomain,
+        KeyboardPreDispatch,
+    };
     use winit::keyboard::KeyCode;
 
     fn viewport() -> ContentViewport {
@@ -642,5 +718,213 @@ mod tests {
             Some(InputEvent::ReleaseAll)
         );
         assert_eq!(input.keyboard_capability_lost(), None);
+    }
+
+    fn interactive_input() -> InputRouter {
+        let mut input = InputRouter::default();
+        input.focus_gained();
+        input.set_gate(InputGate::Interactive {
+            session_id: SessionId::allocate(),
+            generation: 1,
+        });
+        input
+    }
+
+    #[test]
+    fn remote_surface_tab_is_dispatched_before_egui_even_when_egui_would_consume_it() {
+        let mut input = interactive_input();
+        let mut egui_called = false;
+
+        let dispatch = input.pre_dispatch_key(
+            frd_core::PhysicalKeyCode::from_usb_hid_usage(0x2b),
+            KeyState::Pressed,
+            false,
+        );
+        if dispatch == KeyboardPreDispatch::LocalChrome {
+            egui_called = true;
+        }
+
+        assert!(!egui_called);
+        assert!(matches!(
+            dispatch,
+            KeyboardPreDispatch::Remote(Some(InputEvent::PhysicalKey { code, .. }))
+                if code.usb_hid_usage() == 0x2b
+        ));
+    }
+
+    #[test]
+    fn ctrl_alt_home_switches_local_without_sending_home_and_releases_remote_once() {
+        let mut input = interactive_input();
+        input.set_modifiers(frd_core::Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        });
+        let control = frd_core::PhysicalKeyCode::from_usb_hid_usage(0xe0);
+        assert!(matches!(
+            input.pre_dispatch_key(control, KeyState::Pressed, false),
+            KeyboardPreDispatch::Remote(Some(_))
+        ));
+
+        let home = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x4a);
+        assert_eq!(
+            input.pre_dispatch_key(home, KeyState::Pressed, true),
+            KeyboardPreDispatch::EnterLocalChrome(Some(InputEvent::ReleaseAll))
+        );
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+        assert_eq!(
+            input.pre_dispatch_key(home, KeyState::Pressed, false),
+            KeyboardPreDispatch::LocalChrome
+        );
+    }
+
+    #[test]
+    fn complete_local_shortcut_chord_does_not_poison_the_next_remote_key_pair() {
+        let mut input = interactive_input();
+        let control = frd_core::PhysicalKeyCode::from_usb_hid_usage(0xe0);
+        let alt = frd_core::PhysicalKeyCode::from_usb_hid_usage(0xe2);
+        let home = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x4a);
+        let a = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04);
+        let mut remote = Vec::new();
+
+        for key in [control, alt] {
+            if let KeyboardPreDispatch::Remote(Some(event)) =
+                input.pre_dispatch_key(key, KeyState::Pressed, false)
+            {
+                remote.push(event);
+            }
+        }
+        input.set_modifiers(frd_core::Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        });
+        if let KeyboardPreDispatch::EnterLocalChrome(Some(event)) =
+            input.pre_dispatch_key(home, KeyState::Pressed, true)
+        {
+            remote.push(event);
+        }
+        for state in [KeyState::Pressed, KeyState::Released] {
+            assert_eq!(
+                input.pre_dispatch_key(home, state, false),
+                KeyboardPreDispatch::LocalChrome
+            );
+            assert_eq!(input.key(home, state, InputOwnership::Ui), None);
+        }
+        for key in [alt, control] {
+            assert_eq!(
+                input.pre_dispatch_key(key, KeyState::Released, false),
+                KeyboardPreDispatch::LocalChrome
+            );
+            assert_eq!(input.key(key, KeyState::Released, InputOwnership::Ui), None);
+        }
+        assert_eq!(
+            input.pre_dispatch_key(
+                frd_core::PhysicalKeyCode::from_usb_hid_usage(0x29),
+                KeyState::Pressed,
+                false,
+            ),
+            KeyboardPreDispatch::EnterRemoteSurface
+        );
+        for state in [KeyState::Pressed, KeyState::Released] {
+            if let KeyboardPreDispatch::Remote(Some(event)) =
+                input.pre_dispatch_key(a, state, false)
+            {
+                remote.push(event);
+            }
+        }
+
+        assert_eq!(
+            remote
+                .iter()
+                .filter(|event| matches!(event, InputEvent::ReleaseAll))
+                .count(),
+            1
+        );
+        assert!(!remote.iter().any(|event| matches!(
+            event,
+            InputEvent::PhysicalKey { code, .. } if code.usb_hid_usage() == 0x4a
+        )));
+        assert!(matches!(
+            remote.as_slice(),
+            [
+                InputEvent::PhysicalKey { code: first, state: KeyState::Pressed, .. },
+                InputEvent::PhysicalKey { code: second, state: KeyState::Pressed, .. },
+                InputEvent::ReleaseAll,
+                InputEvent::PhysicalKey { code: pressed, state: KeyState::Pressed, .. },
+                InputEvent::PhysicalKey { code: released, state: KeyState::Released, .. },
+            ] if *first == control && *second == alt && *pressed == a && *released == a
+        ));
+    }
+
+    #[test]
+    fn local_chrome_navigation_is_left_to_egui_and_never_sent_remote() {
+        let mut input = interactive_input();
+        assert_eq!(input.enter_local_chrome(), None);
+        for usage in [0x2b, 0x28, 0x2c, 0x04] {
+            assert_eq!(
+                input.pre_dispatch_key(
+                    frd_core::PhysicalKeyCode::from_usb_hid_usage(usage),
+                    KeyState::Pressed,
+                    false,
+                ),
+                KeyboardPreDispatch::LocalChrome
+            );
+        }
+    }
+
+    #[test]
+    fn remote_click_and_escape_restore_remote_surface() {
+        let mut input = interactive_input();
+        input.enter_local_chrome();
+        assert_eq!(
+            input.pointer_pressed_for_domain(InputOwnership::Remote),
+            None
+        );
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::RemoteSurface);
+
+        input.enter_local_chrome();
+        assert_eq!(
+            input.pre_dispatch_key(
+                frd_core::PhysicalKeyCode::from_usb_hid_usage(0x29),
+                KeyState::Pressed,
+                false,
+            ),
+            KeyboardPreDispatch::EnterRemoteSurface
+        );
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::RemoteSurface);
+    }
+
+    #[test]
+    fn focus_loss_and_reconnect_reset_keyboard_domain_without_duplicate_releases() {
+        let mut input = interactive_input();
+        let key = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04);
+        assert!(matches!(
+            input.pre_dispatch_key(key, KeyState::Pressed, false),
+            KeyboardPreDispatch::Remote(Some(_))
+        ));
+        assert_eq!(input.focus_lost(), Some(InputEvent::ReleaseAll));
+        assert_eq!(input.focus_lost(), None);
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+
+        input.set_gate(InputGate::Blocked);
+        input.focus_gained();
+        input.set_gate(InputGate::Interactive {
+            session_id: SessionId::allocate(),
+            generation: 2,
+        });
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::RemoteSurface);
+        assert!(matches!(
+            input.pre_dispatch_key(key, KeyState::Pressed, false),
+            KeyboardPreDispatch::Remote(Some(_))
+        ));
+        assert!(matches!(
+            input.pre_dispatch_key(key, KeyState::Released, false),
+            KeyboardPreDispatch::Remote(Some(_))
+        ));
+        assert!(matches!(
+            input.pre_dispatch_key(key, KeyState::Released, false),
+            KeyboardPreDispatch::Remote(None)
+        ));
     }
 }

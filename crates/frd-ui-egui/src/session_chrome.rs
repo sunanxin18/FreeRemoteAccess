@@ -162,6 +162,14 @@ fn action_glyph(action: Option<SessionChromeAction>) -> GlyphSemantic {
 }
 
 pub fn show_session_chrome(ui: &mut Ui, model: &SessionChromeModel) -> Option<SessionChromeAction> {
+    show_session_chrome_with_focus(ui, model, false)
+}
+
+pub fn show_session_chrome_with_focus(
+    ui: &mut Ui,
+    model: &SessionChromeModel,
+    focus_first: bool,
+) -> Option<SessionChromeAction> {
     let mut selected = None;
     let prior_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.x = SLOT_SPACING;
@@ -175,13 +183,16 @@ pub fn show_session_chrome(ui: &mut Ui, model: &SessionChromeModel) -> Option<Se
             diagnostic_tooltip = connection.tooltip.to_owned();
         }
         let connection_accessible = accessible_label(connection, model.diagnostics.as_deref());
-        show_glyph(
+        let connection_response = show_glyph(
             ui,
             connection,
             Some(&diagnostic_tooltip),
             Some(&connection_accessible),
             false,
         );
+        if focus_first {
+            connection_response.request_focus();
+        }
         show_glyph(ui, audio_glyph(model.audio), None, None, false);
         show_glyph(ui, clipboard_glyph(model.clipboard), None, None, false);
 
@@ -294,6 +305,32 @@ mod tests {
         glyph_fill_state, install_session_chrome_font, material_symbol_font_id,
         session_chrome_metrics, GlyphFillState, MATERIAL_SYMBOLS_FONT_FAMILY,
     };
+
+    #[test]
+    fn programmatic_local_chrome_entry_focuses_the_first_accessible_glyph() {
+        let context = egui::Context::default();
+        let mut fonts = FontDefinitions::default();
+        install_session_chrome_font(&mut fonts);
+        context.set_fonts(fonts);
+        let mut output = context.run_ui(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                super::show_session_chrome_with_focus(
+                    ui,
+                    &SessionChromeModel {
+                        connection: ConnectionGlyph::Connected,
+                        diagnostics: None,
+                        audio: CapabilityGlyphState::Unavailable,
+                        clipboard: CapabilityGlyphState::Unavailable,
+                        action: Some(SessionChromeAction::Disconnect),
+                    },
+                    true,
+                );
+            });
+        });
+
+        assert!(context.memory(|memory| memory.focused().is_some()));
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn material_symbols_font_is_registered_as_an_isolated_named_family() {

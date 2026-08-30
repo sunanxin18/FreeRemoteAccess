@@ -10,8 +10,8 @@ pub use login_icons::{
 };
 pub use session::show_session_page;
 pub use session_chrome::{
-    install_session_chrome_font, session_chrome_metrics, show_session_chrome, SessionChromeMetrics,
-    MATERIAL_SYMBOLS_FONT_FAMILY,
+    install_session_chrome_font, session_chrome_metrics, show_session_chrome,
+    show_session_chrome_with_focus, SessionChromeMetrics, MATERIAL_SYMBOLS_FONT_FAMILY,
 };
 
 #[cfg(test)]
