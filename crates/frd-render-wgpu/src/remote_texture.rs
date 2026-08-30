@@ -496,6 +496,7 @@ fn create_remote_texture(
 struct RemoteUpdateState {
     current: Option<RemoteIdentity>,
     pending_receipt: Option<PresentationReceipt>,
+    unpresented_full_baseline: bool,
     baseline_presented: bool,
     recovery: Option<RecoveryRequirement>,
 }
@@ -542,6 +543,7 @@ impl RemoteUpdateState {
                     last_boundary_revision: 0,
                 });
                 self.pending_receipt = None;
+                self.unpresented_full_baseline = false;
                 self.baseline_presented = false;
                 self.recovery = None;
             }
@@ -560,6 +562,9 @@ impl RemoteUpdateState {
                     .as_mut()
                     .expect("boundary plan requires reset state");
                 current.last_boundary_revision = receipt.revision;
+                if receipt.completeness == FrameCompleteness::FullBaseline {
+                    self.unpresented_full_baseline = true;
+                }
                 self.pending_receipt = Some(receipt);
             }
         }
@@ -591,6 +596,7 @@ impl RemoteUpdateState {
         }
         self.pending_receipt = None;
         if receipt.completeness == FrameCompleteness::FullBaseline {
+            self.unpresented_full_baseline = false;
             self.baseline_presented = true;
         }
         Ok(())
@@ -603,6 +609,7 @@ impl RemoteUpdateState {
             generation: current.generation,
         };
         self.pending_receipt = None;
+        self.unpresented_full_baseline = false;
         self.baseline_presented = false;
         self.recovery = Some(recovery);
         recovery
@@ -702,6 +709,11 @@ impl RemoteUpdateState {
         {
             return Err(RendererError::BoundaryWithoutMatchingDamage);
         }
+        let completeness = if self.unpresented_full_baseline {
+            FrameCompleteness::FullBaseline
+        } else {
+            completeness
+        };
         Ok(PlannedUpdate {
             uploads: Vec::new(),
             data: PlannedUpdateData::Boundary(PresentationReceipt {
@@ -945,6 +957,83 @@ mod tests {
         assert!(!state.baseline_presented());
         state.confirm_presented(full).unwrap();
         assert!(state.baseline_presented());
+    }
+
+    #[test]
+    fn first_present_keeps_unpresented_full_baseline_through_incremental_coalescing() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let full_rect = pixel_rect(0, 0, 2, 2);
+        let incremental_rect = pixel_rect(1, 1, 1, 1);
+        let mut state = RemoteUpdateState::default();
+
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, full_rect, 8, vec![0; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+            damage(session_id, 1, 2, incremental_rect, 4, vec![1; 4]),
+            boundary(session_id, 1, 2, FrameCompleteness::Incremental),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+
+        let first_present = state.pending_receipt().unwrap();
+        assert_eq!(first_present.revision, 2);
+        assert_eq!(first_present.completeness, FrameCompleteness::FullBaseline);
+        state.confirm_presented(first_present).unwrap();
+        assert!(state.baseline_presented());
+    }
+
+    #[test]
+    fn confirmed_baseline_does_not_promote_later_incremental_receipts() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 2, 2);
+        let mut state = RemoteUpdateState::default();
+
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 8, vec![0; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+        let baseline = state.pending_receipt().unwrap();
+        state.confirm_presented(baseline).unwrap();
+
+        for update in [
+            damage(session_id, 1, 2, rect, 8, vec![1; 16]),
+            boundary(session_id, 1, 2, FrameCompleteness::Incremental),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+
+        let incremental = state.pending_receipt().unwrap();
+        assert_eq!(incremental.revision, 2);
+        assert_eq!(incremental.completeness, FrameCompleteness::Incremental);
+    }
+
+    #[test]
+    fn damage_without_boundary_does_not_reuse_unpresented_baseline_receipt() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 2, 2);
+        let mut state = RemoteUpdateState::default();
+
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 8, vec![0; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+            damage(session_id, 1, 2, rect, 8, vec![1; 16]),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+
+        assert_eq!(state.pending_receipt(), None);
     }
 
     #[test]
