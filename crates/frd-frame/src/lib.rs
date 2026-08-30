@@ -2,6 +2,10 @@
 
 mod mailbox;
 mod surface;
+mod transaction;
 
 pub use mailbox::{EnqueuedSurfaceUpdate, FrameMailbox, PushOutcome};
 pub use surface::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
+pub use transaction::{
+    FrameReset, FrameRevision, FrameTransaction, FrameTransactionCompiler, FrameTransactionError,
+};
