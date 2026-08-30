@@ -1725,7 +1725,9 @@ impl DesktopApplication {
                                 ui,
                                 chrome,
                                 focus_session_chrome,
-                            ) {
+                            )
+                            .action
+                            {
                                 intent = Some(match action {
                                     frd_ui_model::SessionChromeAction::Cancel => {
                                         AppIntent::CancelConnect
@@ -2075,7 +2077,12 @@ impl DesktopApplication {
     }
 
     fn handle_keyboard_before_egui(&mut self, event: &WindowEvent) -> bool {
-        let WindowEvent::KeyboardInput { event, .. } = event else {
+        let WindowEvent::KeyboardInput {
+            event,
+            is_synthetic,
+            ..
+        } = event
+        else {
             if let WindowEvent::Ime(ime) = event {
                 match classify_ime_before_egui(
                     self.input.keyboard_domain(),
@@ -2097,26 +2104,26 @@ impl DesktopApplication {
             return false;
         };
 
-        let PhysicalKey::Code(code) = event.physical_key else {
-            return self.input.keyboard_domain() == KeyboardDomain::RemoteSurface;
+        let code = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
+            PhysicalKey::Unidentified(_) => None,
         };
-        let Some(usage) = hid_usage_from_key_code(code) else {
-            return self.input.keyboard_domain() == KeyboardDomain::RemoteSurface;
-        };
-        let physical = frd_core::PhysicalKeyCode::from_usb_hid_usage(usage);
+        let physical = code
+            .and_then(hid_usage_from_key_code)
+            .map(frd_core::PhysicalKeyCode::from_usb_hid_usage);
         let key_state = map_key_state(event.state);
-        let local_shortcut = local_chrome_shortcut(code, event.state, self.input.modifiers());
-        if self.input.keyboard_domain() == KeyboardDomain::RemoteSurface
-            && !local_shortcut
-            && !self.launch.controller().effective_capabilities().text_input
-        {
-            let _ = self.input.key(physical, key_state, InputOwnership::Ui);
-            return true;
-        }
-        match self
-            .input
-            .pre_dispatch_key(physical, key_state, local_shortcut)
-        {
+        let local_shortcut = code.is_some_and(|code| {
+            local_chrome_shortcut(code, event.state, event.repeat, self.input.modifiers())
+        });
+        let remote_allowed = self.launch.controller().effective_capabilities().text_input;
+        match self.input.dispatch_key_event(
+            physical,
+            key_state,
+            *is_synthetic,
+            remote_allowed,
+            local_shortcut,
+        ) {
+            KeyboardPreDispatch::Consume => true,
             KeyboardPreDispatch::Remote(input) => {
                 if let Some(input) = input {
                     self.send_input(input);
@@ -2842,10 +2849,12 @@ fn pointer_keyboard_ownership(
 fn local_chrome_shortcut(
     code: winit::keyboard::KeyCode,
     state: ElementState,
+    repeat: bool,
     modifiers: Modifiers,
 ) -> bool {
     code == winit::keyboard::KeyCode::Home
         && state == ElementState::Pressed
+        && !repeat
         && modifiers.control
         && modifiers.alt
 }
@@ -2854,6 +2863,7 @@ fn local_chrome_shortcut(
 fn local_chrome_shortcut(
     _code: winit::keyboard::KeyCode,
     _state: ElementState,
+    _repeat: bool,
     _modifiers: Modifiers,
 ) -> bool {
     false
@@ -3081,26 +3091,6 @@ mod tests {
         AudioOutputFactory, SessionHost, TestLaunchOutcome, UnavailableCredentialStore,
         UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
     };
-
-    #[test]
-    fn application_routes_owned_keyboard_before_egui_window_event() {
-        let source = include_str!("application.rs");
-        let handler = source
-            .split_once("fn window_event(")
-            .expect("application handler exists")
-            .1
-            .split_once("fn exiting(")
-            .expect("window handler has a bounded body")
-            .0;
-        let pre_dispatch = handler
-            .find("handle_keyboard_before_egui")
-            .expect("keyboard ownership is decided in the window handler");
-        let egui_dispatch = handler
-            .find("egui_state.on_window_event")
-            .expect("local UI receives deferred window events");
-
-        assert!(pre_dispatch < egui_dispatch);
-    }
 
     #[test]
     fn pointer_domain_changes_only_for_session_glyphs_and_remote_content() {

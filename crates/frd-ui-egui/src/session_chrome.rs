@@ -162,15 +162,22 @@ fn action_glyph(action: Option<SessionChromeAction>) -> GlyphSemantic {
 }
 
 pub fn show_session_chrome(ui: &mut Ui, model: &SessionChromeModel) -> Option<SessionChromeAction> {
-    show_session_chrome_with_focus(ui, model, false)
+    show_session_chrome_with_focus(ui, model, false).action
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionChromeRenderResult {
+    pub action: Option<SessionChromeAction>,
+    pub connection_id: egui::Id,
 }
 
 pub fn show_session_chrome_with_focus(
     ui: &mut Ui,
     model: &SessionChromeModel,
     focus_first: bool,
-) -> Option<SessionChromeAction> {
+) -> SessionChromeRenderResult {
     let mut selected = None;
+    let mut connection_id = None;
     let prior_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.x = SLOT_SPACING;
     ui.horizontal(|ui| {
@@ -193,6 +200,7 @@ pub fn show_session_chrome_with_focus(
         if focus_first {
             connection_response.request_focus();
         }
+        connection_id = Some(connection_response.id);
         show_glyph(ui, audio_glyph(model.audio), None, None, false);
         show_glyph(ui, clipboard_glyph(model.clipboard), None, None, false);
 
@@ -202,7 +210,10 @@ pub fn show_session_chrome_with_focus(
         }
     });
     ui.spacing_mut().item_spacing = prior_spacing;
-    selected
+    SessionChromeRenderResult {
+        action: selected,
+        connection_id: connection_id.expect("session chrome always renders its connection glyph"),
+    }
 }
 
 fn accessible_label(semantic: GlyphSemantic, diagnostics: Option<&str>) -> String {
@@ -308,13 +319,17 @@ mod tests {
 
     #[test]
     fn programmatic_local_chrome_entry_focuses_the_first_accessible_glyph() {
+        use std::cell::Cell;
+
         let context = egui::Context::default();
+        context.enable_accesskit();
         let mut fonts = FontDefinitions::default();
         install_session_chrome_font(&mut fonts);
         context.set_fonts(fonts);
+        let connection_id = Cell::new(None);
         let mut output = context.run_ui(Default::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                super::show_session_chrome_with_focus(
+                let result = super::show_session_chrome_with_focus(
                     ui,
                     &SessionChromeModel {
                         connection: ConnectionGlyph::Connected,
@@ -325,11 +340,36 @@ mod tests {
                     },
                     true,
                 );
+                connection_id.set(Some(result.connection_id));
             });
         });
 
-        assert!(context.memory(|memory| memory.focused().is_some()));
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            connection_id.get()
+        );
+        assert_eq!(
+            connection_glyph(ConnectionGlyph::Connected).accessible_name,
+            "已连接"
+        );
+        let connection_node_id = connection_id
+            .get()
+            .expect("connection glyph id was captured")
+            .accesskit_id();
+        let connection_node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree is enabled")
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (*id == connection_node_id).then_some(node))
+            .expect("focused connection glyph remains in the accessibility tree");
         output.textures_delta.clear();
+        assert_eq!(
+            connection_node.label().or_else(|| connection_node.value()),
+            Some("已连接")
+        );
     }
 
     #[test]
