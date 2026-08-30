@@ -1575,7 +1575,6 @@ cargo test -p frd-frame oldest_enqueued_at_tracks_the_retained_front_entry -- --
 cargo test -p frd-frame --test transactions -- --nocapture
 cargo test -p frd-frame compiler_carries_earliest_constituent_enqueue_across_drains -- --nocapture
 cargo test -p frd-shell-desktop mailbox_age_returns_none_ -- --nocapture
-cargo test -p frd-shell-desktop serial_drain_age_ -- --nocapture
 cargo test -p frd-render-wgpu scope_lifecycle_seam_ -- --nocapture
 cargo test -p frd-render-wgpu atomic_startup_ -- --nocapture
 cargo test -p frd-render-wgpu recording_executor_ -- --nocapture
@@ -1606,7 +1605,7 @@ Run the real hardware smoke separately so its environment classification cannot 
 cargo test -p frd-render-wgpu dx12_scope_observation_smoke_reports_real_begin_finish_poll -- --nocapture
 ```
 
-Expected: every currently present deterministic command passes. Cite, rather than rerun, the recorded Task 2 `serial_nonempty_drain_emits_one_aggregate_row` passing result and verify the serial CSV has one `SerialDrain` row per non-empty drain; `ApplyOutcome` and its test fake no longer exist. The hardware smoke passes with actual `{1,1,1}` or reports only `SKIP adapter_unavailable`; any other outcome fails. Record the four injected execution/GPU/fatal test names and exit results as the separate fault-contract evidence consumed by Task 7; they are never merged into performance CSVs. Do not add duplicate decoder, visual snapshot, or synthetic wire tests.
+Expected: every currently present deterministic command passes. Cite, rather than rerun, the recorded Task 2 `serial_nonempty_drain_emits_one_aggregate_row` and `serial_drain_age_uses_earliest_envelope_after_unlock` passing results, then verify the retained serial CSV has one `SerialDrain` row per non-empty drain. The current protocol-neutral age contracts are `mailbox_age_returns_none_when_observation_precedes_enqueue_time`, `batch_metric_context_reaches_success_and_full_failure_observers`, and `compiler_carries_earliest_constituent_enqueue_across_drains`; do not recreate a deleted serial renderer seam. `ApplyOutcome` and its test fake no longer exist. The hardware smoke passes with actual `{1,1,1}` or reports only `SKIP adapter_unavailable`; any other outcome fails. Record the four injected execution/GPU/fatal test names and exit results as the separate fault-contract evidence consumed by Task 7; they are never merged into performance CSVs. Do not add duplicate decoder, visual snapshot, or synthetic wire tests.
 
 - [ ] **Step 2: Run the complete pinned-toolchain workspace test/build/help matrix**
 
@@ -1626,7 +1625,7 @@ Expected: all seven commands pass under repository-pinned Rust 1.96.0. Record ea
 
 ```powershell
 cargo build --release -p freeremotedesk-windows
-rg -n "ApplyOutcome|apply_update\(" crates apps src
+rg -n "\bApplyOutcome\b|\.apply_update\(" crates apps src
 rg -n "apply_update_batch" crates/frd-render-wgpu crates/frd-shell-desktop
 git diff --check
 git status --short
@@ -1683,10 +1682,10 @@ Expected: the script refuses an existing client and does not redirect general st
 
 ```powershell
 pwsh -NoProfile -File .\tools\compare-frame-metrics.ps1 `
-  -SerialEvents .\target\validation\serial_pre_batch.events.csv `
-  -SerialProcessSamples .\target\validation\serial_pre_batch.process.csv `
-  -CandidateEvents .\target\validation\candidate_frame_transaction.events.csv `
-  -CandidateProcessSamples .\target\validation\candidate_frame_transaction.process.csv `
+  -SerialEvents .\target\validation\serial_pre_batch-serial-events.csv `
+  -SerialProcessSamples .\target\validation\serial_pre_batch-serial-process.csv `
+  -CandidateEvents .\target\validation\candidate_frame_transaction-candidate-events.csv `
+  -CandidateProcessSamples .\target\validation\candidate_frame_transaction-candidate-process.csv `
   -OutputPath .\target\validation\frame-transaction-comparison.json
 ```
 
