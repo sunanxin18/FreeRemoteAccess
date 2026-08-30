@@ -1,10 +1,14 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use frd_compositor_wgpu::{
     PresentationCompositor, PresentationHooks, PresentationSurface, PresentationSurfaceLease,
 };
 use frd_core::{PixelRect, PixelSize, SessionId};
-use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
+use frd_frame::{
+    FrameCompleteness, FrameReset, FrameRevision, FrameTransaction, PixelBuffer, PixelFormat,
+    PixelPatch,
+};
 use frd_render_wgpu::RemoteRenderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -12,15 +16,16 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-fn smoke_updates(session_id: SessionId) -> Vec<SurfaceUpdate> {
-    vec![
-        SurfaceUpdate::Reset {
+fn smoke_transactions(session_id: SessionId) -> Vec<FrameTransaction> {
+    vec![FrameTransaction::Startup {
+        earliest_constituent_enqueue_at: Instant::now(),
+        reset: FrameReset {
             session_id,
             generation: 1,
             size: PixelSize::new(2, 2).expect("smoke texture geometry is non-zero"),
             format: PixelFormat::Bgrx8UnormSrgb,
         },
-        SurfaceUpdate::Damage {
+        revision: FrameRevision {
             session_id,
             generation: 1,
             revision: 1,
@@ -36,14 +41,9 @@ fn smoke_updates(session_id: SessionId) -> Vec<SurfaceUpdate> {
                     0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0,
                 ]),
             }],
-        },
-        SurfaceUpdate::FrameBoundary {
-            session_id,
-            generation: 1,
-            revision: 1,
             completeness: FrameCompleteness::FullBaseline,
         },
-    ]
+    }]
 }
 
 struct WindowPresentationHook(Arc<Window>);
@@ -93,11 +93,9 @@ impl SmokeApplication {
             .map_err(|error| format!("compositor:{error:?}"))?;
         let mut renderer =
             RemoteRenderer::new(context).map_err(|error| format!("renderer_create:{error:?}"))?;
-        for update in smoke_updates(SessionId::allocate()) {
-            renderer
-                .apply_update(update)
-                .map_err(|error| format!("fixture_upload:{error:?}"))?;
-        }
+        renderer
+            .apply_update_batch(smoke_transactions(SessionId::allocate()))
+            .map_err(|error| format!("fixture_upload:{error:?}"))?;
 
         Ok(SmokeState {
             window,
@@ -181,50 +179,35 @@ fn main() -> Result<(), winit::error::EventLoopError> {
 #[cfg(test)]
 mod tests {
     use frd_core::SessionId;
-    use frd_frame::{FrameCompleteness, PixelFormat, SurfaceUpdate};
+    use frd_frame::{FrameCompleteness, FrameTransaction, PixelFormat};
 
-    use super::smoke_updates;
+    use super::smoke_transactions;
 
     #[test]
-    fn fixture_is_exact_two_by_two_bgrx_red_green_blue_white_full_baseline() {
+    fn fixture_is_one_atomic_two_by_two_bgrx_red_green_blue_white_full_baseline_startup() {
         let session_id = SessionId::allocate();
-        let updates = smoke_updates(session_id);
-        assert_eq!(updates.len(), 3);
-        assert!(matches!(
-            updates[0],
-            SurfaceUpdate::Reset {
-                session_id: actual_session,
-                generation: 1,
-                size,
-                format: PixelFormat::Bgrx8UnormSrgb,
-            } if actual_session == session_id && size.width == 2 && size.height == 2
-        ));
-        let SurfaceUpdate::Damage {
-            session_id: actual_session,
-            generation,
-            revision,
-            ref patches,
-        } = updates[1]
+        let transactions = smoke_transactions(session_id);
+        assert_eq!(transactions.len(), 1);
+        let FrameTransaction::Startup {
+            reset, revision, ..
+        } = &transactions[0]
         else {
-            panic!("第二条 smoke 更新必须是 damage");
+            panic!("smoke fixture 必须是单个原子 startup transaction");
         };
-        assert_eq!(actual_session, session_id);
-        assert_eq!(generation, 1);
-        assert_eq!(revision, 1);
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].stride_bytes, 8);
+        assert_eq!(reset.session_id, session_id);
+        assert_eq!(reset.generation, 1);
+        assert_eq!(reset.size.width, 2);
+        assert_eq!(reset.size.height, 2);
+        assert_eq!(reset.format, PixelFormat::Bgrx8UnormSrgb);
+        assert_eq!(revision.session_id, session_id);
+        assert_eq!(revision.generation, 1);
+        assert_eq!(revision.revision, 1);
+        assert_eq!(revision.completeness, FrameCompleteness::FullBaseline);
+        assert_eq!(revision.patches.len(), 1);
+        assert_eq!(revision.patches[0].stride_bytes, 8);
         assert_eq!(
-            patches[0].pixels.as_bytes(),
+            revision.patches[0].pixels.as_bytes(),
             &[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0,]
         );
-        assert!(matches!(
-            updates[2],
-            SurfaceUpdate::FrameBoundary {
-                session_id: actual_session,
-                generation: 1,
-                revision: 1,
-                completeness: FrameCompleteness::FullBaseline,
-            } if actual_session == session_id
-        ));
     }
 }
