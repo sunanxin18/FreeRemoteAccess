@@ -3,6 +3,7 @@ use frd_frame::{
     FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch, PushOutcome,
     SurfaceUpdate,
 };
+use std::time::Instant;
 
 fn session() -> SessionId {
     SessionId::allocate()
@@ -556,6 +557,26 @@ fn overflow_does_not_advance_damage_revision() {
 #[should_panic(expected = "entry_limit 必须大于零")]
 fn mailbox_rejects_zero_entry_capacity() {
     let _ = FrameMailbox::new(0, 0);
+}
+
+#[test]
+fn oldest_enqueued_at_tracks_the_retained_front_entry() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(4, 64);
+    let before = Instant::now();
+    assert_eq!(mailbox.push(reset(session_id, 1)), PushOutcome::Queued);
+    let after = Instant::now();
+
+    let enqueued_at = mailbox
+        .oldest_enqueued_at()
+        .expect("accepted entry is timestamped");
+    assert!(enqueued_at >= before && enqueued_at <= after);
+    let envelope = mailbox
+        .pop_enqueued()
+        .expect("timestamped entry can be popped");
+    assert_eq!(envelope.enqueued_at, enqueued_at);
+    assert!(matches!(envelope.update, SurfaceUpdate::Reset { .. }));
+    assert!(mailbox.oldest_enqueued_at().is_none());
 }
 
 #[test]

@@ -2,13 +2,15 @@ mod gpu_fault;
 mod pass;
 mod remote_texture;
 
-pub use gpu_fault::{GpuCleanToken, GpuFaultClass, GpuFaultScope};
+pub use gpu_fault::{GpuCleanToken, GpuFaultClass, GpuFaultScope, GpuScopeObservation};
 pub use remote_texture::{
     ApplyOutcome, ConfirmedPresentation, PresentationReceipt, RecoveryRequirement, RemoteRenderer,
     RendererError,
 };
 
-pub(crate) use gpu_fault::GpuFaultObserver;
+pub(crate) use gpu_fault::{
+    AtomicScopeLifecycleObserver, GpuFaultObserver, ScopeLifecycleObserver,
+};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,6 +27,7 @@ pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     observer: Arc<GpuFaultObserver>,
+    scope_observer: Arc<AtomicScopeLifecycleObserver>,
     context_id: GpuContextId,
 }
 
@@ -65,6 +68,7 @@ impl GpuContext {
         queue: wgpu::Queue,
     ) -> Self {
         let observer = Arc::new(GpuFaultObserver::new());
+        let scope_observer = Arc::new(AtomicScopeLifecycleObserver::default());
         let uncaptured_observer = observer.clone();
         device.on_uncaptured_error(Arc::new(move |error| {
             uncaptured_observer.record(GpuFaultClass::from_wgpu_error(&error));
@@ -79,6 +83,7 @@ impl GpuContext {
             device,
             queue,
             observer,
+            scope_observer,
             context_id: GpuContextId(NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed)),
         }
     }
@@ -100,7 +105,16 @@ impl GpuContext {
     }
 
     pub fn begin_fault_scope(&self) -> Result<GpuFaultScope, GpuFaultClass> {
-        GpuFaultScope::new(self.device.clone(), self.observer.clone(), self.context_id)
+        GpuFaultScope::new(
+            self.device.clone(),
+            self.observer.clone(),
+            self.scope_observer.clone(),
+            self.context_id,
+        )
+    }
+
+    pub fn scope_observation(&self) -> GpuScopeObservation {
+        self.scope_observer.snapshot()
     }
 
     pub fn commit_if_unchanged<R>(
@@ -227,5 +241,56 @@ mod fault_observer_tests {
         observer.record(GpuFaultClass::Validation);
         assert_eq!(observer.current(), Some(GpuFaultClass::DeviceLost));
         assert_eq!(format!("{:?}", observer.current()), "Some(DeviceLost)");
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod dx12_scope_smoke_tests {
+    use super::{GpuContext, GpuScopeObservation};
+
+    #[test]
+    fn dx12_scope_observation_smoke_reports_real_begin_finish_poll() {
+        pollster::block_on(async {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = wgpu::Backends::DX12;
+            let instance = wgpu::Instance::new(descriptor);
+            let adapter = match instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(adapter) => adapter,
+                Err(_) => {
+                    println!("SKIP adapter_unavailable");
+                    return;
+                }
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("FreeRemoteDesk scope observation smoke"),
+                    ..Default::default()
+                })
+                .await
+                .expect("DX12 adapter must create the smoke-test device");
+            let context = GpuContext::from_parts(instance, adapter, device, queue);
+            let before = context.scope_observation();
+            context
+                .begin_fault_scope()
+                .expect("scope acquisition must succeed")
+                .finish()
+                .expect("scope validation must succeed");
+            assert_eq!(
+                context.scope_observation().checked_delta(before),
+                Some(GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                })
+            );
+        });
     }
 }

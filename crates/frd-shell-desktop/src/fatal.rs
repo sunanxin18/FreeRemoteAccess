@@ -5,6 +5,7 @@ use frd_render_wgpu::{GpuFaultClass, RendererError};
 use frd_session::CleanupError;
 
 use crate::cleanup::BackgroundCleanupFailure;
+use crate::frame_metrics_sink::MetricSinkError;
 use crate::lifecycle::PresentationOperation;
 
 const FATAL_CODE: &str = "FRD-WIN-FATAL-001";
@@ -131,6 +132,25 @@ impl FatalReport {
                     )),
                 }
             }
+        }
+    }
+
+    pub(crate) fn frame_metrics_startup(error: MetricSinkError) -> Self {
+        let reason = match error {
+            MetricSinkError::InvalidConfiguration => "frame_metrics_configuration_invalid",
+            MetricSinkError::CreateFailed | MetricSinkError::WriteFailed => {
+                "frame_metrics_create_failed"
+            }
+            MetricSinkError::CapacityExceeded | MetricSinkError::InvalidObservation => {
+                "frame_metrics_invalid_startup_state"
+            }
+        };
+        Self {
+            code: FATAL_CODE,
+            component: "application",
+            operation: "frame_metrics",
+            reason,
+            details: "none".to_owned(),
         }
     }
 
@@ -299,6 +319,7 @@ mod tests {
     use frd_session::CleanupError;
 
     use super::{sanitize_safe_detail, FatalReport};
+    use crate::frame_metrics_sink::MetricSinkError;
     use crate::BackgroundCleanupFailure;
     use crate::PresentationOperation;
 
@@ -367,5 +388,32 @@ mod tests {
             "step=join_workers_and_audio;attempts=999_plus"
         );
         assert!(bounded.to_string().len() <= 256);
+    }
+
+    #[test]
+    fn frame_metrics_startup_errors_use_only_closed_safe_fields() {
+        let expected = [
+            (
+                MetricSinkError::InvalidConfiguration,
+                "frame_metrics_configuration_invalid",
+            ),
+            (MetricSinkError::CreateFailed, "frame_metrics_create_failed"),
+            (MetricSinkError::WriteFailed, "frame_metrics_create_failed"),
+            (
+                MetricSinkError::CapacityExceeded,
+                "frame_metrics_invalid_startup_state",
+            ),
+            (
+                MetricSinkError::InvalidObservation,
+                "frame_metrics_invalid_startup_state",
+            ),
+        ];
+        for (error, reason) in expected {
+            let report = FatalReport::frame_metrics_startup(error);
+            assert_eq!(report.component(), "application");
+            assert_eq!(report.operation(), "frame_metrics");
+            assert_eq!(report.reason(), reason);
+            assert_eq!(report.details(), "none");
+        }
     }
 }

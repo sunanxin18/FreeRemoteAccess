@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
@@ -10,6 +11,113 @@ pub enum GpuFaultClass {
     Internal = 3,
     DeviceLost = 4,
     ObservationIncomplete = 5,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuScopeObservation {
+    pub begins: u64,
+    pub finishes: u64,
+    pub polls: u64,
+}
+
+impl GpuScopeObservation {
+    pub fn checked_delta(self, earlier: Self) -> Option<Self> {
+        Some(Self {
+            begins: self.begins.checked_sub(earlier.begins)?,
+            finishes: self.finishes.checked_sub(earlier.finishes)?,
+            polls: self.polls.checked_sub(earlier.polls)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeLifecycleEvent {
+    Begin,
+    Finish,
+    Poll,
+}
+
+pub(crate) trait ScopeLifecycleObserver: Send + Sync {
+    fn record(&self, event: ScopeLifecycleEvent);
+    fn snapshot(&self) -> GpuScopeObservation;
+}
+
+#[derive(Default)]
+pub(crate) struct AtomicScopeLifecycleObserver {
+    begins: AtomicU64,
+    finishes: AtomicU64,
+    polls: AtomicU64,
+}
+
+impl ScopeLifecycleObserver for AtomicScopeLifecycleObserver {
+    fn record(&self, event: ScopeLifecycleEvent) {
+        let counter = match event {
+            ScopeLifecycleEvent::Begin => &self.begins,
+            ScopeLifecycleEvent::Finish => &self.finishes,
+            ScopeLifecycleEvent::Poll => &self.polls,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> GpuScopeObservation {
+        GpuScopeObservation {
+            begins: self.begins.load(Ordering::Relaxed),
+            finishes: self.finishes.load(Ordering::Relaxed),
+            polls: self.polls.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) struct ObservedScopeLifecycle {
+    observer: Arc<dyn ScopeLifecycleObserver>,
+    finish_recorded: bool,
+    poll_recorded: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeLifecycleError {
+    DuplicateFinish,
+    PollBeforeFinish,
+    DuplicatePoll,
+}
+
+pub(crate) fn begin_observed_scope<T, E>(
+    observer: Arc<dyn ScopeLifecycleObserver>,
+    acquire: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, ObservedScopeLifecycle), E> {
+    let acquired = acquire()?;
+    observer.record(ScopeLifecycleEvent::Begin);
+    Ok((
+        acquired,
+        ObservedScopeLifecycle {
+            observer,
+            finish_recorded: false,
+            poll_recorded: false,
+        },
+    ))
+}
+
+impl ObservedScopeLifecycle {
+    pub(crate) fn record_finish(&mut self) -> Result<(), ScopeLifecycleError> {
+        if self.finish_recorded {
+            return Err(ScopeLifecycleError::DuplicateFinish);
+        }
+        self.observer.record(ScopeLifecycleEvent::Finish);
+        self.finish_recorded = true;
+        Ok(())
+    }
+
+    pub(crate) fn record_poll(&mut self) -> Result<(), ScopeLifecycleError> {
+        if !self.finish_recorded {
+            return Err(ScopeLifecycleError::PollBeforeFinish);
+        }
+        if self.poll_recorded {
+            return Err(ScopeLifecycleError::DuplicatePoll);
+        }
+        self.observer.record(ScopeLifecycleEvent::Poll);
+        self.poll_recorded = true;
+        Ok(())
+    }
 }
 
 impl GpuFaultClass {
@@ -162,18 +270,22 @@ pub struct GpuFaultScope {
     validation: Option<wgpu::ErrorScopeGuard>,
     internal: Option<wgpu::ErrorScopeGuard>,
     out_of_memory: Option<wgpu::ErrorScopeGuard>,
+    lifecycle: ObservedScopeLifecycle,
 }
 
 impl GpuFaultScope {
     pub(crate) fn new(
         device: wgpu::Device,
         observer: Arc<GpuFaultObserver>,
+        lifecycle_observer: Arc<dyn ScopeLifecycleObserver>,
         context_id: crate::GpuContextId,
     ) -> Result<Self, GpuFaultClass> {
         let start_epoch = observer.begin_operation()?;
         let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let (_, lifecycle) =
+            begin_observed_scope(lifecycle_observer, || Ok::<(), GpuFaultClass>(()))?;
         Ok(Self {
             device,
             observer,
@@ -182,10 +294,12 @@ impl GpuFaultScope {
             validation: Some(validation),
             internal: Some(internal),
             out_of_memory: Some(out_of_memory),
+            lifecycle,
         })
     }
 
     pub fn finish(mut self) -> Result<GpuCleanToken, GpuFaultClass> {
+        let finish_observation = self.lifecycle.record_finish();
         let validation = self
             .validation
             .take()
@@ -201,18 +315,21 @@ impl GpuFaultScope {
         // wgpu 30 的错误作用域是线程局部且按 LIFO 弹出；原生后端的 pop future
         // 在弹出时已就绪。Poll 只驱动回调/错误观测，不等待队列完成，因此每帧不会
         // 引入 Wait/Fence；若后端仍返回 Pending，则保守地拒绝确认本帧。
+        let poll_observation = self.lifecycle.record_poll();
         let poll_fault = self
             .device
             .poll(wgpu::PollType::Poll)
             .err()
             .map(|_| GpuFaultClass::Internal);
+        let lifecycle_fault = (finish_observation.is_err() || poll_observation.is_err())
+            .then_some(GpuFaultClass::ObservationIncomplete);
         let scope_fault = [
             poll_error_scope(validation),
             poll_error_scope(internal),
             poll_error_scope(out_of_memory),
         ]
         .into_iter()
-        .chain([poll_fault])
+        .chain([poll_fault, lifecycle_fault])
         .flatten()
         .max_by_key(|fault| fault.priority());
 
@@ -287,5 +404,76 @@ mod linearization_tests {
             Err(GpuFaultClass::Validation)
         );
         assert_eq!(*reset_state.lock().unwrap(), (1, "old-texture-owner"));
+    }
+}
+
+#[cfg(test)]
+mod scope_lifecycle_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        begin_observed_scope, GpuScopeObservation, ScopeLifecycleEvent, ScopeLifecycleObserver,
+    };
+
+    #[derive(Default)]
+    struct RecordingObserver(Mutex<Vec<ScopeLifecycleEvent>>);
+
+    impl ScopeLifecycleObserver for RecordingObserver {
+        fn record(&self, event: ScopeLifecycleEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+
+        fn snapshot(&self) -> GpuScopeObservation {
+            let events = self.0.lock().unwrap();
+            GpuScopeObservation {
+                begins: events
+                    .iter()
+                    .filter(|event| **event == ScopeLifecycleEvent::Begin)
+                    .count() as u64,
+                finishes: events
+                    .iter()
+                    .filter(|event| **event == ScopeLifecycleEvent::Finish)
+                    .count() as u64,
+                polls: events
+                    .iter()
+                    .filter(|event| **event == ScopeLifecycleEvent::Poll)
+                    .count() as u64,
+            }
+        }
+    }
+
+    #[test]
+    fn scope_lifecycle_seam_records_begin_finish_poll_in_order() {
+        let observer = Arc::new(RecordingObserver::default());
+        let before = observer.snapshot();
+        let (_, mut lifecycle) = begin_observed_scope(observer.clone(), || Ok::<_, ()>(()))
+            .expect("acquisition succeeds");
+        lifecycle.record_finish().unwrap();
+        lifecycle.record_poll().unwrap();
+
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [
+                ScopeLifecycleEvent::Begin,
+                ScopeLifecycleEvent::Finish,
+                ScopeLifecycleEvent::Poll
+            ]
+        );
+        assert_eq!(
+            observer.snapshot().checked_delta(before),
+            Some(GpuScopeObservation {
+                begins: 1,
+                finishes: 1,
+                polls: 1
+            })
+        );
+    }
+
+    #[test]
+    fn scope_lifecycle_failed_begin_records_nothing() {
+        let observer = Arc::new(RecordingObserver::default());
+        let result = begin_observed_scope(observer.clone(), || Err::<(), _>("acquire"));
+        assert!(result.is_err());
+        assert!(observer.0.lock().unwrap().is_empty());
     }
 }

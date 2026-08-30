@@ -1,6 +1,8 @@
 mod application;
 mod cleanup;
 mod fatal;
+mod frame_metrics;
+mod frame_metrics_sink;
 mod input;
 mod lifecycle;
 mod platform;

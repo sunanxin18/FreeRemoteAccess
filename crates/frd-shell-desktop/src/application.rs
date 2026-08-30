@@ -15,14 +15,17 @@ use frd_core::{
     PointerButton, SessionId, TargetSystem,
 };
 use frd_frame::{
-    FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
+    EnqueuedSurfaceUpdate, FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch,
+    SurfaceUpdate,
 };
 use frd_media_api::{AudioOutput, AudioOutputError, MediaFrame, MediaPublishError, MediaPublisher};
 use frd_protocol_api::{
     ConnectRequest, MailboxSurfacePublisher, ProtocolCatalog, ProtocolError, ProtocolExit,
     ProtocolFactory, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand, SessionEvent,
 };
-use frd_render_wgpu::{ApplyOutcome, GpuContext, RecoveryRequirement, RemoteRenderer};
+use frd_render_wgpu::{
+    ApplyOutcome, GpuContext, RecoveryRequirement, RemoteRenderer, RendererError,
+};
 use frd_session::{
     CleanupComplete, CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
     SessionStartFailure, SessionStartOutcome, SessionStartPermit,
@@ -43,6 +46,11 @@ use crate::cleanup::{
     PendingCleanup,
 };
 use crate::fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};
+use crate::frame_metrics::{
+    checked_mailbox_age, BatchMetricContext, DrainedFrameUpdates, FramePipelineMetrics,
+    MetricIdentity, SerialDrainAggregate,
+};
+use crate::frame_metrics_sink::MetricSinkError;
 use crate::input::{hid_usage_from_key_code, KeyboardDomain, KeyboardPreDispatch};
 use crate::lifecycle::{
     execute_presentation_recovery, OcclusionAction, PresentationLifecycle, PresentationOperation,
@@ -551,6 +559,13 @@ impl SessionHost {
     }
 
     pub fn drain_frame_updates(&mut self) -> Vec<SurfaceUpdate> {
+        self.drain_enqueued_frame_updates()
+            .into_iter()
+            .map(|entry| entry.update)
+            .collect()
+    }
+
+    fn drain_enqueued_frame_updates(&mut self) -> Vec<EnqueuedSurfaceUpdate> {
         let Some(active) = self.active.as_ref() else {
             return Vec::new();
         };
@@ -558,10 +573,14 @@ impl SessionHost {
             return Vec::new();
         };
         let mut updates = Vec::with_capacity(mailbox.len());
-        while let Some(update) = mailbox.pop() {
+        while let Some(update) = mailbox.pop_enqueued() {
             updates.push(update);
         }
         updates
+    }
+
+    fn active_session_id(&self) -> Option<SessionId> {
+        self.active.as_ref().map(|active| active.session_id)
     }
 
     pub fn is_active(&self) -> bool {
@@ -1193,6 +1212,7 @@ pub struct DesktopApplication {
     stores: DesktopPlatformStores,
     sessions: SessionHost,
     input: InputRouter,
+    metrics: FramePipelineMetrics,
     proxy: EventLoopProxy<DesktopUserEvent>,
     runtime_wake_gate: Arc<RuntimeWakeGate>,
     window: Option<DesktopWindowState>,
@@ -1202,6 +1222,16 @@ pub struct DesktopApplication {
     repaint_scheduler: RepaintScheduler,
     armed_repaint: Option<RepaintPlan>,
     window_configuration: DesktopWindowConfiguration,
+}
+
+#[cfg(test)]
+fn initialize_metrics_before_session_launch<T>(
+    metrics: Result<FramePipelineMetrics, MetricSinkError>,
+    launch: impl FnOnce(FramePipelineMetrics) -> T,
+) -> Result<T, FatalReport> {
+    metrics
+        .map(launch)
+        .map_err(FatalReport::frame_metrics_startup)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1348,17 +1378,29 @@ impl DesktopApplication {
             proxy: proxy.clone(),
             gate: runtime_wake_gate.clone(),
         });
+        let (metrics, exit_state) =
+            match FramePipelineMetrics::from_environment(std::time::Instant::now()) {
+                Ok(metrics) => (metrics, ApplicationExitState::default()),
+                Err(error) => (
+                    FramePipelineMetrics::disabled(),
+                    ApplicationExitState {
+                        fatal: Some(FatalReport::frame_metrics_startup(error)),
+                        ..ApplicationExitState::default()
+                    },
+                ),
+            };
         Self {
             launch,
             catalog,
             stores,
             sessions: SessionHost::new(factories, wake, audio_factory),
             input: InputRouter::default(),
+            metrics,
             proxy,
             runtime_wake_gate,
             window: None,
             mode: DesktopMode::Product,
-            exit_state: ApplicationExitState::default(),
+            exit_state,
             return_to_form_after_cancelled_launch: false,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
@@ -1392,6 +1434,7 @@ impl DesktopApplication {
                 Arc::new(UnavailableAudioFactory),
             ),
             input: InputRouter::default(),
+            metrics: FramePipelineMetrics::disabled(),
             proxy,
             runtime_wake_gate,
             window: None,
@@ -1625,6 +1668,20 @@ impl DesktopApplication {
         let mut cleanup_needed = false;
         let mut detach_remote = false;
         for (session_id, event) in events {
+            match &event {
+                SessionEvent::SurfaceGenerationChanged {
+                    session_id,
+                    generation,
+                    ..
+                } => self.metrics.observe_generation(*session_id, *generation),
+                SessionEvent::FrameResponseTiming(timing) => {
+                    self.metrics.observe_frame_response_timing(*timing)
+                }
+                SessionEvent::StageChanged(frd_protocol_api::ConnectionStage::Disconnecting)
+                | SessionEvent::Error(_)
+                | SessionEvent::Closed(_) => self.metrics.clear_input_probe(),
+                _ => {}
+            }
             if matches!(
                 event,
                 SessionEvent::CapabilitiesChanged(frd_protocol_api::SessionCapabilities {
@@ -1658,6 +1715,7 @@ impl DesktopApplication {
         }
 
         if detach_remote {
+            self.metrics.detach();
             if let Some(window) = self.window.as_mut() {
                 window.renderer.detach();
                 window.remote = None;
@@ -1668,10 +1726,47 @@ impl DesktopApplication {
         }
 
         // SessionEvent is deliberately reduced before frame mailbox data.
-        let updates = self.sessions.drain_frame_updates();
+        let updates = self.sessions.drain_enqueued_frame_updates();
         let had_events_or_frames = !updates.is_empty() || cleanup_needed || detach_remote;
-        for update in updates {
-            let binding = match &update {
+        let source_update_count = updates.len();
+        for entry in &updates {
+            if let SurfaceUpdate::Reset {
+                session_id,
+                generation,
+                ..
+            } = &entry.update
+            {
+                self.metrics.clear_input_probe();
+                self.metrics.observe_generation(*session_id, *generation);
+            }
+        }
+        let mut aggregate = SerialDrainAggregate::default();
+        let mut first_error: Option<RendererError> = None;
+        let drain_started_at = (!updates.is_empty()).then(std::time::Instant::now);
+        let oldest_age = drain_started_at.and_then(|started_at| {
+            updates
+                .iter()
+                .map(|entry| entry.enqueued_at)
+                .min()
+                .and_then(|earliest| checked_mailbox_age(started_at, earliest))
+        });
+        if drain_started_at.is_some() && oldest_age.is_none() {
+            self.metrics.invalidate(MetricSinkError::InvalidObservation);
+        }
+        let (updates, drain_started_at, oldest_age) =
+            if let (Some(drain_started_at), Some(_)) = (drain_started_at, oldest_age) {
+                let drained = DrainedFrameUpdates::new(updates, drain_started_at)
+                    .expect("the borrowed timestamp validation just succeeded");
+                (
+                    drained.updates,
+                    Some(drained.drain_started_at),
+                    Some(drained.oldest_age),
+                )
+            } else {
+                (updates, drain_started_at, oldest_age)
+            };
+        for entry in updates {
+            let binding = match &entry.update {
                 SurfaceUpdate::Reset {
                     session_id,
                     generation,
@@ -1687,8 +1782,19 @@ impl DesktopApplication {
             let Some(window) = self.window.as_mut() else {
                 continue;
             };
-            match window.renderer.apply_update(update) {
+            let before = window.gpu.scope_observation();
+            let apply_result = window.renderer.apply_update(entry.update);
+            let after = window.gpu.scope_observation();
+            let actual_delta = after.checked_delta(before);
+            match apply_result {
                 Ok(outcome) => {
+                    if let Some(actual_delta) = actual_delta {
+                        if let Err(error) = aggregate.observe(outcome, actual_delta) {
+                            self.metrics.invalidate(error);
+                        }
+                    } else {
+                        self.metrics.invalidate(MetricSinkError::InvalidObservation);
+                    }
                     if let ApplyOutcome::Damage {
                         uploaded_rectangles,
                     } = outcome
@@ -1701,8 +1807,31 @@ impl DesktopApplication {
                         window.remote = Some(binding);
                     }
                 }
-                Err(error) => eprintln!("远端帧更新被拒绝：{error:?}"),
+                Err(error) => {
+                    if let Some(actual_delta) = actual_delta {
+                        if let Err(metric_error) = aggregate.observe_failed_scope(actual_delta) {
+                            self.metrics.invalidate(metric_error);
+                        }
+                    } else {
+                        self.metrics.invalidate(MetricSinkError::InvalidObservation);
+                    }
+                    first_error.get_or_insert(error);
+                    eprintln!("远端帧更新被拒绝：{error:?}");
+                }
             }
+        }
+        if let (Some(batch_started_at), Some(oldest_age)) = (drain_started_at, oldest_age) {
+            self.metrics.observe_serial_drain(
+                BatchMetricContext {
+                    batch_started_at,
+                    source_update_count,
+                    oldest_age: Some(oldest_age),
+                    transaction_count: 0,
+                },
+                &aggregate,
+                first_error,
+                std::time::Instant::now(),
+            );
         }
         if let Some(window) = self.window.as_mut() {
             if window.pending_texture_writes.take_for_blocked_present(
@@ -1715,6 +1844,7 @@ impl DesktopApplication {
         if had_events_or_frames {
             self.request_redraw();
         }
+        self.publish_metrics_failure();
     }
 
     fn block_and_release_input(&mut self) {
@@ -1735,9 +1865,34 @@ impl DesktopApplication {
 
     fn send_input(&mut self, event: frd_core::InputEvent) {
         if let Some(command) = self.launch.controller().route_input(event) {
-            if let Err(error) = self.sessions.send_command(command) {
-                eprintln!("远端输入发送失败：{error:?}");
+            let probe = match &command {
+                SessionCommand::Input(input)
+                    if !matches!(input.event, frd_core::InputEvent::ReleaseAll) =>
+                {
+                    Some(MetricIdentity {
+                        session_id: input.session_id,
+                        generation: input.generation,
+                    })
+                }
+                _ => None,
+            };
+            let accepted_at = std::time::Instant::now();
+            match self.sessions.send_command(command) {
+                Ok(()) => {
+                    if let Some(identity) = probe {
+                        self.metrics.observe_input_sent(identity, accepted_at);
+                    }
+                }
+                Err(error) => eprintln!("远端输入发送失败：{error:?}"),
             }
+        }
+    }
+
+    fn publish_metrics_failure(&mut self) {
+        if let Some(error) = self.metrics.take_failure() {
+            let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal(
+                FatalReport::frame_metrics_startup(error),
+            ));
         }
     }
 
@@ -1995,14 +2150,27 @@ impl DesktopApplication {
 
         let presentation_error = match render_result {
             Ok(Some(event)) => {
-                let (session_id, generation, completeness) = match &event {
+                let (session_id, generation, revision, completeness) = match &event {
                     frd_protocol_api::PresentationEvent::FramePresented {
                         session_id,
                         generation,
+                        revision,
                         completeness,
                         ..
-                    } => (*session_id, *generation, *completeness),
+                    } => (*session_id, *generation, *revision, *completeness),
                 };
+                let identity = MetricIdentity {
+                    session_id,
+                    generation,
+                };
+                let presented_at = std::time::Instant::now();
+                if completeness == FrameCompleteness::FullBaseline {
+                    self.metrics
+                        .observe_full_baseline_presented(identity, revision, presented_at);
+                } else {
+                    self.metrics
+                        .observe_presented(identity, revision, presented_at);
+                }
                 self.launch.controller_mut().handle_presentation(event);
                 if matches!(
                     self.launch.controller().page(),
@@ -2025,6 +2193,7 @@ impl DesktopApplication {
             Ok(None) => None,
             Err(error) => Some(error),
         };
+        self.publish_metrics_failure();
 
         if let Some(error) = presentation_error {
             self.transition_presentation_error(PresentationRecoveryContext::Redraw, error);
@@ -2381,7 +2550,11 @@ impl DesktopApplication {
                 let _ = proxy.send_event(DesktopUserEvent::CleanupFinished(outcome));
             });
         match accepted {
-            Ok(AcceptedLaunchOutcome::Started) => {}
+            Ok(AcceptedLaunchOutcome::Started) => {
+                if let Some(session_id) = self.sessions.active_session_id() {
+                    self.metrics.begin_session(session_id);
+                }
+            }
             Ok(AcceptedLaunchOutcome::LaunchRolledBack(failure)) => {
                 let stores = self.stores.as_app_stores();
                 if self
@@ -2517,6 +2690,7 @@ impl DesktopApplication {
     }
 
     fn detach_window(&mut self) {
+        self.metrics.detach();
         self.repaint_scheduler.shutdown();
         self.armed_repaint = None;
         if let Some(mut window) = self.window.take() {
@@ -2549,6 +2723,7 @@ impl DesktopApplication {
         }
         // Fatal is monotonic. Latch first so no subsequent callback can install
         // a queued launch result while teardown remains on this call stack.
+        self.metrics.fatal();
         self.block_and_release_input_for_fatal();
         self.detach_window();
         let _ = self.sessions.cancel_pending_launch();
@@ -2755,6 +2930,9 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 }
             }
             WindowEvent::Occluded(occluded) => {
+                self.metrics
+                    .observe_occluded(*occluded, std::time::Instant::now());
+                self.publish_metrics_failure();
                 let action = self
                     .window
                     .as_mut()
@@ -2806,6 +2984,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.metrics.close();
         self.repaint_scheduler.shutdown();
         if let Some(release) = self.input.shutdown() {
             self.send_input(release);
@@ -2821,6 +3000,8 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             return;
         }
         let now = std::time::Instant::now();
+        self.metrics.advance_phase(now);
+        self.publish_metrics_failure();
         if self
             .exit_state
             .pending_launch_deadline()
@@ -2869,6 +3050,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             .map(|plan| plan.deadline)
             .into_iter()
             .chain(self.exit_state.pending_launch_deadline())
+            .chain(self.metrics.next_deadline(now))
             .min();
         event_loop.set_control_flow(
             next_deadline
@@ -3251,10 +3433,35 @@ mod tests {
     use winit::event::Ime;
 
     use super::{
-        mark_texture_deltas_applied, AcceptedLaunchOutcome, ApplicationExitState,
-        AudioOutputFactory, RuntimeWakeGate, SessionHost, TestLaunchOutcome,
-        UnavailableCredentialStore, UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
+        initialize_metrics_before_session_launch, mark_texture_deltas_applied,
+        AcceptedLaunchOutcome, ApplicationExitState, AudioOutputFactory, RuntimeWakeGate,
+        SessionHost, TestLaunchOutcome, UnavailableCredentialStore, UnavailableProfileStore,
+        WakeSink, WorkerKind, WorkerSpawner,
     };
+    use crate::frame_metrics_sink::MetricSinkError;
+
+    fn assert_metric_startup_fatal_before_launch(error: MetricSinkError) {
+        let launches = AtomicUsize::new(0);
+        let result = initialize_metrics_before_session_launch(Err(error), |_| {
+            launches.fetch_add(1, Ordering::Relaxed);
+        });
+        let report = result.unwrap_err();
+        assert_eq!(launches.load(Ordering::Relaxed), 0);
+        assert_eq!(report.component(), "application");
+        assert_eq!(report.operation(), "frame_metrics");
+        assert_eq!(report.reason(), "frame_metrics_configuration_invalid");
+        assert_eq!(report.details(), "none");
+    }
+
+    #[test]
+    fn partial_metric_configuration_is_fatal_before_session_launch() {
+        assert_metric_startup_fatal_before_launch(MetricSinkError::InvalidConfiguration);
+    }
+
+    #[test]
+    fn invalid_metric_configuration_is_fatal_before_session_launch() {
+        assert_metric_startup_fatal_before_launch(MetricSinkError::InvalidConfiguration);
+    }
 
     #[test]
     fn runtime_wake_gate_coalesces_until_consumed_and_rolls_back_failed_send() {

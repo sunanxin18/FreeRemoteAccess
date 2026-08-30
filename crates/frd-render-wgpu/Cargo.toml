@@ -7,3 +7,6 @@ edition = "2021"
 frd-core = { path = "../frd-core" }
 frd-frame = { path = "../frd-frame" }
 wgpu.workspace = true
+
+[dev-dependencies]
+pollster = "0.4"

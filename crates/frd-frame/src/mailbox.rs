@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use frd_core::{PixelSize, SessionId};
 
@@ -9,6 +10,11 @@ pub enum PushOutcome {
     Queued,
     Rejected,
     NeedsFullSnapshot,
+}
+
+pub struct EnqueuedSurfaceUpdate {
+    pub enqueued_at: Instant,
+    pub update: SurfaceUpdate,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -28,7 +34,7 @@ struct SurfaceState {
 pub struct FrameMailbox {
     entry_limit: usize,
     pixel_byte_limit: usize,
-    queue: VecDeque<SurfaceUpdate>,
+    queue: VecDeque<EnqueuedSurfaceUpdate>,
     queued_pixel_bytes: usize,
     current: Option<SurfaceState>,
 }
@@ -119,12 +125,20 @@ impl FrameMailbox {
     }
 
     pub fn pop(&mut self) -> Option<SurfaceUpdate> {
-        let update = self.queue.pop_front()?;
+        self.pop_enqueued().map(|entry| entry.update)
+    }
+
+    pub fn oldest_enqueued_at(&self) -> Option<Instant> {
+        self.queue.front().map(|entry| entry.enqueued_at)
+    }
+
+    pub fn pop_enqueued(&mut self) -> Option<EnqueuedSurfaceUpdate> {
+        let entry = self.queue.pop_front()?;
         self.queued_pixel_bytes = self
             .queued_pixel_bytes
-            .checked_sub(update_pixel_bytes(&update))
+            .checked_sub(update_pixel_bytes(&entry.update))
             .expect("帧邮箱像素字节记账不一致");
-        Some(update)
+        Some(entry)
     }
 
     pub fn len(&self) -> usize {
@@ -170,7 +184,10 @@ impl FrameMailbox {
         });
         self.queue.clear();
         self.queued_pixel_bytes = 0;
-        self.queue.push_back(update);
+        self.queue.push_back(EnqueuedSurfaceUpdate {
+            enqueued_at: Instant::now(),
+            update,
+        });
         PushOutcome::Queued
     }
 
@@ -195,7 +212,10 @@ impl FrameMailbox {
             .queued_pixel_bytes
             .checked_add(pixel_bytes)
             .expect("已检查帧邮箱像素字节溢出");
-        self.queue.push_back(update);
+        self.queue.push_back(EnqueuedSurfaceUpdate {
+            enqueued_at: Instant::now(),
+            update,
+        });
         PushOutcome::Queued
     }
 
@@ -203,7 +223,7 @@ impl FrameMailbox {
         let Some(current) = self.current else {
             return;
         };
-        self.queue.retain(|update| match update {
+        self.queue.retain(|entry| match &entry.update {
             SurfaceUpdate::Reset { .. } => true,
             SurfaceUpdate::Damage {
                 session_id,
@@ -219,8 +239,8 @@ impl FrameMailbox {
         self.queued_pixel_bytes = self
             .queue
             .iter()
-            .try_fold(0usize, |total, update| {
-                total.checked_add(update_pixel_bytes(update))
+            .try_fold(0usize, |total, entry| {
+                total.checked_add(update_pixel_bytes(&entry.update))
             })
             .expect("已入队帧像素字节溢出");
         self.current

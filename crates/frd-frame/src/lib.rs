@@ -3,5 +3,5 @@
 mod mailbox;
 mod surface;
 
-pub use mailbox::{FrameMailbox, PushOutcome};
+pub use mailbox::{EnqueuedSurfaceUpdate, FrameMailbox, PushOutcome};
 pub use surface::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};

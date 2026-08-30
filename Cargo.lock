@@ -1984,6 +1984,7 @@ version = "0.1.0"
 dependencies = [
  "frd-core",
  "frd-frame",
+ "pollster",
  "wgpu",
 ]
 
