@@ -1037,6 +1037,67 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_unpresented_baseline_before_new_incremental_boundary() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 2, 2);
+        let mut state = RemoteUpdateState::default();
+
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 8, vec![0; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+            reset(session_id, 2, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 2, 1, rect, 8, vec![1; 16]),
+            boundary(session_id, 2, 1, FrameCompleteness::Incremental),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+
+        let incremental = state.pending_receipt().unwrap();
+        assert_eq!(incremental.generation, 2);
+        assert_eq!(incremental.completeness, FrameCompleteness::Incremental);
+    }
+
+    #[test]
+    fn device_loss_recovery_clears_unpresented_baseline_before_incremental_boundary() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 2, 2);
+        let mut state = RemoteUpdateState::default();
+
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 8, vec![0; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+        assert_eq!(
+            state.invalidate_for_device_loss(),
+            RecoveryRequirement::ResetAndFullSnapshot {
+                session_id,
+                generation: 1,
+            }
+        );
+
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session_id, 1, 1, rect, 8, vec![1; 16]),
+            boundary(session_id, 1, 1, FrameCompleteness::Incremental),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+
+        let incremental = state.pending_receipt().unwrap();
+        assert_eq!(incremental.generation, 1);
+        assert_eq!(incremental.completeness, FrameCompleteness::Incremental);
+    }
+
+    #[test]
     fn damage_plan_keeps_the_dirty_rectangle_and_rejects_invalid_payloads() {
         let session_id = SessionId::allocate();
         let size = PixelSize::new(4, 4).unwrap();
