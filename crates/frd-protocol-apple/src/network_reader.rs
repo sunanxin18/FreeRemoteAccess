@@ -1793,6 +1793,10 @@ fn handle_complete_mvs_record(
     )?;
     let full_applied = matches!(&outcome, MvsRecordOutcome::FullApplied { .. });
     let partial_applied = matches!(&outcome, MvsRecordOutcome::PartialApplied { .. });
+    let nonempty_partial_applied = matches!(
+        &outcome,
+        MvsRecordOutcome::PartialApplied { patches } if !patches.is_empty()
+    );
     let recovery_requested = matches!(&outcome, MvsRecordOutcome::RecoveryRequested);
     let publication = match outcome {
         MvsRecordOutcome::FullApplied {
@@ -1846,15 +1850,16 @@ fn handle_complete_mvs_record(
         }
         PublicationOutcome::Published | PublicationOutcome::IgnoredStale => {}
     }
-    let frame_response_timing =
-        if (full_applied || partial_applied) && publication == PublicationOutcome::Published {
-            requests.complete_frame_response_at(receiver.generation, Instant::now())
-        } else if recovery_requested {
-            None
-        } else {
-            requests.discard_frame_response_timing();
-            None
-        };
+    let frame_response_timing = if (full_applied || nonempty_partial_applied)
+        && publication == PublicationOutcome::Published
+    {
+        requests.complete_frame_response_at(receiver.generation, Instant::now())
+    } else if recovery_requested {
+        None
+    } else {
+        requests.discard_frame_response_timing();
+        None
+    };
     if full_applied {
         let boundary = finish_network_full_boundary(
             receiver,
@@ -5100,6 +5105,101 @@ mod migrated_runtime_tests {
         let runtime = dynamic.lock().unwrap();
         assert!(runtime.evidence.current_full_media_applied);
         assert!(runtime.armed);
+    }
+
+    #[test]
+    fn empty_type_one_noop_discards_frame_response_timing_and_sends_next_incremental() {
+        use std::io::Read as _;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        let session_id = frd_core::SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let timings = Arc::new(Mutex::new(Vec::new()));
+        let mut protocol_runtime = frd_protocol_api::ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(TimingProtocolEvents(timings.clone())),
+            Box::new(NoopProtocolFrames),
+            None,
+            Box::new(NoopProtocolWake),
+        );
+        let size = frd_core::PixelSize::new(8, 8).unwrap();
+        let mut publisher =
+            AppleSurfacePublisher::begin(&mut protocol_runtime, session_id, size).unwrap();
+        let surface = native_surface(8, 8);
+        let dynamic_resolution = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let mut requests = ReaderRequestState::after_startup(Instant::now(), 1);
+        let viewport_requests = Arc::new(Mutex::new(ViewportRequestQueue::default()));
+
+        handle_complete_mvs_record(
+            &mut receiver,
+            &mut requests,
+            native_record(MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            }),
+            &surface,
+            &viewport_requests,
+            &dynamic_resolution,
+            &writer,
+            &mut protocol_runtime,
+            &mut publisher,
+        )
+        .unwrap();
+        let mut initial_incremental = [0; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
+        peer.read_exact(&mut initial_incremental).unwrap();
+        assert_eq!(
+            initial_incremental,
+            protocol::msg_fb_update_request(true, 0, 0, 8, 8).unwrap()
+        );
+        timings.lock().unwrap().clear();
+        requests.last_timing_published_at = Some(Instant::now() - Duration::from_millis(501));
+        let record = MvsRecord {
+            rect: MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            payload: native_opcode_zero_partial_payload(),
+        };
+
+        handle_complete_mvs_record(
+            &mut receiver,
+            &mut requests,
+            record,
+            &surface,
+            &viewport_requests,
+            &dynamic_resolution,
+            &writer,
+            &mut protocol_runtime,
+            &mut publisher,
+        )
+        .unwrap();
+
+        assert!(
+            timings.lock().unwrap().is_empty(),
+            "a type-1 no-op/cache response must not publish timing"
+        );
+        let mut incremental = [0; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
+        peer.read_exact(&mut incremental).unwrap();
+        assert_eq!(
+            incremental,
+            protocol::msg_fb_update_request(true, 0, 0, 8, 8).unwrap()
+        );
+        writer.shutdown().unwrap();
     }
 
     #[test]
