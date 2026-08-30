@@ -5,9 +5,9 @@ param(
   [Parameter(ParameterSetName='Capture')][string]$OutputDirectory = '.\target\validation',
   [Parameter(ParameterSetName='Capture')][switch]$AutoConnect,
   [Parameter(ParameterSetName='Capture')][ValidateSet('macos','windows','linux','custom')][string]$AutoConnectTarget,
-  [Parameter(ParameterSetName='Capture')][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$')][string]$AutoConnectAddress,
+  [Parameter(ParameterSetName='Capture')][ValidatePattern('\A[A-Za-z0-9][A-Za-z0-9._:-]{0,252}\z', Options=[Text.RegularExpressions.RegexOptions]::None)][string]$AutoConnectAddress,
   [Parameter(ParameterSetName='Capture')][UInt16]$AutoConnectPort,
-  [Parameter(ParameterSetName='Capture')][ValidatePattern('^[a-z0-9-]{1,64}$')][string]$AutoConnectProtocol,
+  [Parameter(ParameterSetName='Capture')][ValidatePattern('\A[a-z0-9][a-z0-9-]{0,63}\z', Options=[Text.RegularExpressions.RegexOptions]::None)][string]$AutoConnectProtocol,
   [Parameter(Mandatory=$true, ParameterSetName='SelfTest')][switch]$SelfTest
 )
 
@@ -31,13 +31,15 @@ function Get-CaptureClientArgumentVector(
   if (-not $AutoConnect) { return @() }
 
   $validTargets = @('macos', 'windows', 'linux', 'custom')
+  $addressPattern = [regex]::new('\A[A-Za-z0-9][A-Za-z0-9._:-]{0,252}\z', [Text.RegularExpressions.RegexOptions]::None)
+  $protocolPattern = [regex]::new('\A[a-z0-9][a-z0-9-]{0,63}\z', [Text.RegularExpressions.RegexOptions]::None)
   if ([string]::IsNullOrWhiteSpace($Target) -or
     $Target -notin $validTargets -or
     [string]::IsNullOrWhiteSpace($Address) -or
-    $Address -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$' -or
+    -not $addressPattern.IsMatch($Address) -or
     $Port -eq 0 -or
     [string]::IsNullOrWhiteSpace($Protocol) -or
-    $Protocol -notmatch '^[a-z0-9-]{1,64}$') {
+    -not $protocolPattern.IsMatch($Protocol)) {
     throw 'auto_connect_configuration_incomplete'
   }
 
@@ -294,7 +296,11 @@ function Invoke-SelfTest {
       @{ Target = ''; Address = 'capture.example.test'; Port = 5900; Protocol = 'hpss' },
       @{ Target = 'macos'; Address = ''; Port = 5900; Protocol = 'hpss' },
       @{ Target = 'macos'; Address = 'capture.example.test'; Port = 0; Protocol = 'hpss' },
-      @{ Target = 'macos'; Address = 'capture.example.test'; Port = 5900; Protocol = '' }
+      @{ Target = 'macos'; Address = 'capture.example.test'; Port = 5900; Protocol = '' },
+      @{ Target = 'macos'; Address = "capture.example.test`n"; Port = 5900; Protocol = 'hpss' },
+      @{ Target = 'macos'; Address = 'capture.example.test'; Port = 5900; Protocol = "hpss`n" },
+      @{ Target = 'macos'; Address = 'capture.example.test'; Port = 5900; Protocol = 'HPSS' },
+      @{ Target = 'macos'; Address = 'capture.example.test'; Port = 5900; Protocol = '--help' }
     )) {
       Assert-ThrowsCode { Get-CaptureClientArgumentVector -AutoConnect:$true -Target $missingConfiguration.Target -Address $missingConfiguration.Address -Port $missingConfiguration.Port -Protocol $missingConfiguration.Protocol } 'auto_connect_configuration_incomplete' 'selftest_autoconnect_incomplete_configuration'
     }
