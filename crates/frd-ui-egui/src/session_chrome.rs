@@ -9,6 +9,9 @@ use frd_ui_model::{
 const SLOT_SIZE: f32 = 44.0;
 const SLOT_SPACING: f32 = 4.0;
 const SLOT_COUNT: usize = 4;
+const FRAME_RESPONSE_WIDTH: f32 = 88.0;
+const FRAME_RESPONSE_TOOLTIP: &str =
+    "画面响应时间（从画面更新请求成功发送到完整更新处理完成，不含本地呈现）";
 
 pub const MATERIAL_SYMBOLS_FONT_FAMILY: &str = "frd-material-symbols-rounded";
 const MATERIAL_SYMBOLS_FONT_BYTES: &[u8] = include_bytes!(concat!(
@@ -34,6 +37,7 @@ fn material_symbol_font_id() -> FontId {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionChromeMetrics {
     pub slot_size: f32,
+    pub frame_response_width: f32,
     pub spacing: f32,
     pub total_width: f32,
     pub height: f32,
@@ -42,9 +46,32 @@ pub struct SessionChromeMetrics {
 pub const fn session_chrome_metrics() -> SessionChromeMetrics {
     SessionChromeMetrics {
         slot_size: SLOT_SIZE,
+        frame_response_width: FRAME_RESPONSE_WIDTH,
         spacing: SLOT_SPACING,
-        total_width: SLOT_SIZE * SLOT_COUNT as f32 + SLOT_SPACING * (SLOT_COUNT as f32 - 1.0),
+        total_width: SLOT_SIZE * SLOT_COUNT as f32
+            + FRAME_RESPONSE_WIDTH
+            + SLOT_SPACING * SLOT_COUNT as f32,
         height: SLOT_SIZE,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrameResponseSemantic {
+    text: String,
+    accessible_name: String,
+    tooltip: &'static str,
+}
+
+fn frame_response_semantic(frame_response_ms: Option<u32>) -> FrameResponseSemantic {
+    let text = match frame_response_ms {
+        None => "-- ms".to_owned(),
+        Some(ms) if ms < 10_000 => format!("{ms} ms"),
+        Some(_) => "9999+ ms".to_owned(),
+    };
+    FrameResponseSemantic {
+        accessible_name: format!("{FRAME_RESPONSE_TOOLTIP}；当前值：{text}"),
+        text,
+        tooltip: FRAME_RESPONSE_TOOLTIP,
     }
 }
 
@@ -169,6 +196,7 @@ pub fn show_session_chrome(ui: &mut Ui, model: &SessionChromeModel) -> Option<Se
 pub struct SessionChromeRenderResult {
     pub action: Option<SessionChromeAction>,
     pub connection_id: egui::Id,
+    pub frame_response_id: egui::Id,
 }
 
 pub fn show_session_chrome_with_focus(
@@ -178,6 +206,7 @@ pub fn show_session_chrome_with_focus(
 ) -> SessionChromeRenderResult {
     let mut selected = None;
     let mut connection_id = None;
+    let mut frame_response_id = None;
     let prior_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.x = SLOT_SPACING;
     ui.horizontal(|ui| {
@@ -201,6 +230,7 @@ pub fn show_session_chrome_with_focus(
             connection_response.request_focus();
         }
         connection_id = Some(connection_response.id);
+        frame_response_id = Some(show_frame_response(ui, model.frame_response_ms).id);
         show_glyph(ui, audio_glyph(model.audio), None, None, false);
         show_glyph(ui, clipboard_glyph(model.clipboard), None, None, false);
 
@@ -213,7 +243,44 @@ pub fn show_session_chrome_with_focus(
     SessionChromeRenderResult {
         action: selected,
         connection_id: connection_id.expect("session chrome always renders its connection glyph"),
+        frame_response_id: frame_response_id
+            .expect("session chrome always renders its frame response timing"),
     }
+}
+
+fn show_frame_response(ui: &mut Ui, frame_response_ms: Option<u32>) -> Response {
+    let semantic = frame_response_semantic(frame_response_ms);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(FRAME_RESPONSE_WIDTH, SLOT_SIZE),
+        Sense::focusable_noninteractive(),
+    );
+    response.widget_info(|| {
+        WidgetInfo::labeled(WidgetType::Label, true, semantic.accessible_name.clone())
+    });
+    let fill = match glyph_fill_state(response.hovered(), response.has_focus(), false) {
+        GlyphFillState::None => ui.visuals().widgets.inactive.bg_fill,
+        GlyphFillState::Hover => ui.visuals().widgets.hovered.bg_fill,
+        GlyphFillState::Pressed => unreachable!("frame response timing is not actionable"),
+    };
+    ui.painter().rect_filled(rect.shrink(2.0), 5.0, fill);
+    ui.painter().rect_stroke(
+        rect.shrink(2.0),
+        5.0,
+        if response.has_focus() {
+            ui.visuals().selection.stroke
+        } else {
+            ui.visuals().widgets.inactive.bg_stroke
+        },
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        semantic.text,
+        FontId::proportional(13.0),
+        ui.visuals().text_color(),
+    );
+    response.on_hover_text(semantic.tooltip)
 }
 
 fn accessible_label(semantic: GlyphSemantic, diagnostics: Option<&str>) -> String {
@@ -313,9 +380,32 @@ mod tests {
 
     use super::{
         accessible_label, action_glyph, audio_glyph, clipboard_glyph, connection_glyph,
-        glyph_fill_state, install_session_chrome_font, material_symbol_font_id,
-        session_chrome_metrics, GlyphFillState, MATERIAL_SYMBOLS_FONT_FAMILY,
+        frame_response_semantic, glyph_fill_state, install_session_chrome_font,
+        material_symbol_font_id, session_chrome_metrics, GlyphFillState,
+        MATERIAL_SYMBOLS_FONT_FAMILY,
     };
+
+    #[test]
+    fn frame_response_box_formats_text_accessibility_tooltip_and_metrics() {
+        let unknown = frame_response_semantic(None);
+        assert_eq!(unknown.text, "-- ms");
+        assert_eq!(
+            unknown.accessible_name,
+            "画面响应时间（从画面更新请求成功发送到完整更新处理完成，不含本地呈现）；当前值：-- ms"
+        );
+        assert_eq!(
+            unknown.tooltip,
+            "画面响应时间（从画面更新请求成功发送到完整更新处理完成，不含本地呈现）"
+        );
+
+        assert_eq!(frame_response_semantic(Some(37)).text, "37 ms");
+        assert_eq!(frame_response_semantic(Some(u32::MAX)).text, "9999+ ms");
+
+        let metrics = session_chrome_metrics();
+        assert_eq!(metrics.frame_response_width, 88.0);
+        assert_eq!(metrics.height, 44.0);
+        assert_eq!(metrics.total_width, 280.0);
+    }
 
     #[test]
     fn programmatic_local_chrome_entry_focuses_the_first_accessible_glyph() {
@@ -334,6 +424,7 @@ mod tests {
                     &SessionChromeModel {
                         connection: ConnectionGlyph::Connected,
                         diagnostics: None,
+                        frame_response_ms: None,
                         audio: CapabilityGlyphState::Unavailable,
                         clipboard: CapabilityGlyphState::Unavailable,
                         action: Some(SessionChromeAction::Disconnect),
@@ -533,6 +624,7 @@ mod tests {
         let connected = SessionChromeModel {
             connection: ConnectionGlyph::Connected,
             diagnostics: None,
+            frame_response_ms: None,
             audio: CapabilityGlyphState::Available,
             clipboard: CapabilityGlyphState::Available,
             action: Some(SessionChromeAction::Disconnect),
@@ -540,6 +632,7 @@ mod tests {
         let waiting = SessionChromeModel {
             connection: ConnectionGlyph::WaitingForFrame,
             diagnostics: None,
+            frame_response_ms: None,
             audio: CapabilityGlyphState::Unavailable,
             clipboard: CapabilityGlyphState::Unavailable,
             action: Some(SessionChromeAction::Cancel),

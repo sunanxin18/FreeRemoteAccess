@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +22,7 @@ use frd_protocol_api::{
     ConnectRequest, MailboxSurfacePublisher, ProtocolCatalog, ProtocolError, ProtocolExit,
     ProtocolFactory, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand, SessionEvent,
 };
-use frd_render_wgpu::{GpuContext, RecoveryRequirement, RemoteRenderer};
+use frd_render_wgpu::{ApplyOutcome, GpuContext, RecoveryRequirement, RemoteRenderer};
 use frd_session::{
     CleanupComplete, CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
     SessionStartFailure, SessionStartOutcome, SessionStartPermit,
@@ -62,6 +63,7 @@ const PENDING_LAUNCH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration
 const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     connection: ConnectionGlyph::Connected,
     diagnostics: None,
+    frame_response_ms: None,
     audio: CapabilityGlyphState::Unavailable,
     clipboard: CapabilityGlyphState::Unavailable,
     action: Some(SessionChromeAction::Disconnect),
@@ -893,21 +895,70 @@ pub struct PresentationFailure {
     pub recovery: Option<PresentError>,
 }
 
-struct EventLoopWake(EventLoopProxy<DesktopUserEvent>);
+#[derive(Default)]
+struct RuntimeWakeGate {
+    armed: AtomicBool,
+}
 
-impl WakeSink for EventLoopWake {
-    fn wake(&self) -> Result<(), ProtocolError> {
-        self.0
-            .send_event(DesktopUserEvent::Wake)
-            .map_err(|_| ProtocolError::WakeFailed)
+impl RuntimeWakeGate {
+    fn arm(&self) -> bool {
+        // AcqRel elects one sender while observing the preceding Release from
+        // either UI consumption or a failed-send rollback.
+        self.armed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn consume(&self) {
+        // Release before draining lets a concurrent publisher acquire the gate
+        // and queue the next level-triggered wake without being lost.
+        self.armed.store(false, Ordering::Release);
+    }
+
+    fn rollback_failed_send(&self) {
+        self.armed.store(false, Ordering::Release);
     }
 }
 
-struct WindowPresentationHook(Arc<Window>);
+struct EventLoopWake {
+    proxy: EventLoopProxy<DesktopUserEvent>,
+    gate: Arc<RuntimeWakeGate>,
+}
+
+impl WakeSink for EventLoopWake {
+    fn wake(&self) -> Result<(), ProtocolError> {
+        if !self.gate.arm() {
+            return Ok(());
+        }
+        self.proxy.send_event(DesktopUserEvent::Wake).map_err(|_| {
+            self.gate.rollback_failed_send();
+            ProtocolError::WakeFailed
+        })
+    }
+}
+
+struct WindowPresentationHook {
+    window: Arc<Window>,
+    actual_submit: Cell<bool>,
+}
+
+impl WindowPresentationHook {
+    fn new(window: Arc<Window>) -> Self {
+        Self {
+            window,
+            actual_submit: Cell::new(false),
+        }
+    }
+
+    fn actual_submit(&self) -> bool {
+        self.actual_submit.get()
+    }
+}
 
 impl PresentationHooks for WindowPresentationHook {
     fn before_submit(&self) {
-        self.0.pre_present_notify();
+        self.actual_submit.set(true);
+        self.window.pre_present_notify();
     }
 }
 
@@ -967,6 +1018,50 @@ impl DpiTransition {
     }
 }
 
+#[derive(Default)]
+struct PendingTextureWrites {
+    pending: bool,
+}
+
+impl PendingTextureWrites {
+    fn record_damage_upload(&mut self, uploaded_rectangles: usize) {
+        self.pending |= uploaded_rectangles > 0;
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    fn take_for_blocked_present(
+        &mut self,
+        accepts_redraw: bool,
+        dpi_transition_pending: bool,
+    ) -> bool {
+        if !should_submit_pending_texture_writes(
+            self.pending,
+            accepts_redraw,
+            dpi_transition_pending,
+        ) {
+            return false;
+        }
+        self.pending = false;
+        true
+    }
+
+    fn finish_render(&mut self, actual_submit: bool, render_succeeded: bool) -> bool {
+        if actual_submit {
+            self.pending = false;
+            return false;
+        }
+        if render_succeeded && self.pending {
+            self.pending = false;
+            return true;
+        }
+        false
+    }
+}
+
 struct DesktopWindowState {
     chrome: PlatformWindowChrome,
     window: Arc<Window>,
@@ -983,6 +1078,7 @@ struct DesktopWindowState {
     lifecycle: PresentationLifecycle,
     remote: Option<RemoteBinding>,
     dpi_transition: DpiTransition,
+    pending_texture_writes: PendingTextureWrites,
     focus_session_chrome: bool,
 }
 
@@ -1098,6 +1194,7 @@ pub struct DesktopApplication {
     sessions: SessionHost,
     input: InputRouter,
     proxy: EventLoopProxy<DesktopUserEvent>,
+    runtime_wake_gate: Arc<RuntimeWakeGate>,
     window: Option<DesktopWindowState>,
     mode: DesktopMode,
     exit_state: ApplicationExitState,
@@ -1114,6 +1211,14 @@ pub struct DesktopWindowConfiguration {
 
 fn mark_texture_deltas_applied(deltas: &mut egui::TexturesDelta) {
     deltas.clear();
+}
+
+fn should_submit_pending_texture_writes(
+    applied_nonempty_damage: bool,
+    accepts_redraw: bool,
+    dpi_transition_pending: bool,
+) -> bool {
+    applied_nonempty_damage && (!accepts_redraw || dpi_transition_pending)
 }
 
 #[cfg(test)]
@@ -1238,7 +1343,11 @@ impl DesktopApplication {
     ) -> Self {
         let factories = factories.into_iter().collect::<Vec<_>>();
         let catalog = ProtocolCatalog::new(factories.iter().map(|factory| factory.descriptor().id));
-        let wake = Arc::new(EventLoopWake(proxy.clone()));
+        let runtime_wake_gate = Arc::new(RuntimeWakeGate::default());
+        let wake = Arc::new(EventLoopWake {
+            proxy: proxy.clone(),
+            gate: runtime_wake_gate.clone(),
+        });
         Self {
             launch,
             catalog,
@@ -1246,6 +1355,7 @@ impl DesktopApplication {
             sessions: SessionHost::new(factories, wake, audio_factory),
             input: InputRouter::default(),
             proxy,
+            runtime_wake_gate,
             window: None,
             mode: DesktopMode::Product,
             exit_state: ApplicationExitState::default(),
@@ -1262,7 +1372,11 @@ impl DesktopApplication {
     ) -> Self {
         let catalog = ProtocolCatalog::new([]);
         let launch = AppLaunch::new(LaunchOptions::default(), &UnavailableCredentials, &catalog);
-        let wake = Arc::new(EventLoopWake(proxy.clone()));
+        let runtime_wake_gate = Arc::new(RuntimeWakeGate::default());
+        let wake = Arc::new(EventLoopWake {
+            proxy: proxy.clone(),
+            gate: runtime_wake_gate.clone(),
+        });
         let session_id = SessionId::allocate();
         Self {
             launch,
@@ -1279,6 +1393,7 @@ impl DesktopApplication {
             ),
             input: InputRouter::default(),
             proxy,
+            runtime_wake_gate,
             window: None,
             mode: DesktopMode::TestTexture {
                 stage: TestTextureStage::Connection,
@@ -1411,6 +1526,7 @@ impl DesktopApplication {
             lifecycle: PresentationLifecycle::new(physical_size),
             remote: None,
             dpi_transition: DpiTransition::default(),
+            pending_texture_writes: PendingTextureWrites::default(),
             focus_session_chrome: false,
         };
         state.refresh_chrome_geometry().ok_or_else(|| {
@@ -1572,12 +1688,28 @@ impl DesktopApplication {
                 continue;
             };
             match window.renderer.apply_update(update) {
-                Ok(_) => {
+                Ok(outcome) => {
+                    if let ApplyOutcome::Damage {
+                        uploaded_rectangles,
+                    } = outcome
+                    {
+                        window
+                            .pending_texture_writes
+                            .record_damage_upload(uploaded_rectangles);
+                    }
                     if let Some(binding) = binding {
                         window.remote = Some(binding);
                     }
                 }
                 Err(error) => eprintln!("远端帧更新被拒绝：{error:?}"),
+            }
+        }
+        if let Some(window) = self.window.as_mut() {
+            if window.pending_texture_writes.take_for_blocked_present(
+                window.lifecycle.accepts_redraw(),
+                window.dpi_transition.is_pending(),
+            ) {
+                let _ = window.gpu.queue().submit(std::iter::empty());
             }
         }
         if had_events_or_frames {
@@ -1679,6 +1811,12 @@ impl DesktopApplication {
             return;
         };
         if !window.lifecycle.accepts_redraw() || window.dpi_transition.is_pending() {
+            if window.pending_texture_writes.take_for_blocked_present(
+                window.lifecycle.accepts_redraw(),
+                window.dpi_transition.is_pending(),
+            ) {
+                let _ = window.gpu.queue().submit(std::iter::empty());
+            }
             return;
         }
         let Some(chrome_layout) = window.refresh_chrome_geometry() else {
@@ -1806,7 +1944,7 @@ impl DesktopApplication {
                 );
             }
         }
-        let hook = WindowPresentationHook(window.window.clone());
+        let hook = WindowPresentationHook::new(window.window.clone());
         let gpu = window.gpu.clone();
         let egui_renderer = &mut window.egui_renderer;
         let render_result = window.compositor.render_in(
@@ -1841,10 +1979,19 @@ impl DesktopApplication {
             },
             &hook,
         );
+        let render_succeeded = render_result.is_ok();
+        let actual_submit = hook.actual_submit();
         for id in &output.textures_delta.free {
             window.egui_renderer.free_texture(id);
         }
         mark_texture_deltas_applied(&mut output.textures_delta);
+
+        if window
+            .pending_texture_writes
+            .finish_render(actual_submit, render_succeeded)
+        {
+            let _ = window.gpu.queue().submit(std::iter::empty());
+        }
 
         let presentation_error = match render_result {
             Ok(Some(event)) => {
@@ -2160,11 +2307,7 @@ impl DesktopApplication {
         }
     }
 
-    fn update_keyboard_domain_from_pointer(
-        &mut self,
-        event: &WindowEvent,
-        _consumed_by_egui: bool,
-    ) {
+    fn update_keyboard_domain_from_pointer(&mut self, event: &WindowEvent, consumed_by_egui: bool) {
         if !matches!(
             event,
             WindowEvent::MouseInput {
@@ -2174,8 +2317,14 @@ impl DesktopApplication {
         ) {
             return;
         }
+        let interactive = self.input.interactive_epoch().is_some();
         let ownership = self.window.as_ref().and_then(|window| {
-            pointer_keyboard_ownership(window.chrome_layout?, window.cursor_position?)
+            effective_pointer_keyboard_ownership(
+                window.chrome_layout?,
+                window.cursor_position?,
+                consumed_by_egui,
+                interactive,
+            )
         });
         let Some(ownership) = ownership else {
             return;
@@ -2472,6 +2621,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         }
         match event {
             DesktopUserEvent::Wake => {
+                self.runtime_wake_gate.consume();
                 self.drain_runtime();
                 self.request_redraw();
                 self.maybe_finish_exit(event_loop);
@@ -2845,6 +2995,20 @@ fn pointer_keyboard_ownership(
     }
 }
 
+fn effective_pointer_keyboard_ownership(
+    layout: ChromeLayout,
+    position: (u32, u32),
+    consumed_by_egui: bool,
+    interactive: bool,
+) -> Option<InputOwnership> {
+    match pointer_keyboard_ownership(layout, position) {
+        Some(InputOwnership::Remote) if consumed_by_egui || !interactive => {
+            Some(InputOwnership::Ui)
+        }
+        ownership => ownership,
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn local_chrome_shortcut(
     code: winit::keyboard::KeyCode,
@@ -3088,9 +3252,64 @@ mod tests {
 
     use super::{
         mark_texture_deltas_applied, AcceptedLaunchOutcome, ApplicationExitState,
-        AudioOutputFactory, SessionHost, TestLaunchOutcome, UnavailableCredentialStore,
-        UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
+        AudioOutputFactory, RuntimeWakeGate, SessionHost, TestLaunchOutcome,
+        UnavailableCredentialStore, UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
     };
+
+    #[test]
+    fn runtime_wake_gate_coalesces_until_consumed_and_rolls_back_failed_send() {
+        let gate = RuntimeWakeGate::default();
+
+        assert!(gate.arm(), "the first publisher must send a wake event");
+        assert!(!gate.arm(), "an armed gate must coalesce later wakes");
+
+        gate.consume();
+        assert!(gate.arm(), "consuming a wake must re-arm event delivery");
+
+        gate.rollback_failed_send();
+        assert!(gate.arm(), "a failed send must permit a retry");
+        assert!(!gate.arm(), "the successful retry must arm the gate");
+    }
+
+    #[test]
+    fn pending_texture_writes_submit_only_when_present_is_blocked() {
+        assert!(super::should_submit_pending_texture_writes(
+            true, false, false
+        ));
+        assert!(!super::should_submit_pending_texture_writes(
+            false, false, false
+        ));
+        assert!(!super::should_submit_pending_texture_writes(
+            true, true, false
+        ));
+        assert!(super::should_submit_pending_texture_writes(
+            true, true, true
+        ));
+    }
+
+    #[test]
+    fn pending_texture_write_state_tracks_actual_and_fallback_submits() {
+        let mut pending = super::PendingTextureWrites::default();
+
+        pending.record_damage_upload(1);
+        assert!(pending.is_pending());
+        assert!(!pending.finish_render(true, true));
+        assert!(
+            !pending.is_pending(),
+            "an actual submit clears pending writes"
+        );
+
+        pending.record_damage_upload(1);
+        assert!(!pending.finish_render(false, false));
+        assert!(
+            pending.is_pending(),
+            "a render error must not fake a submit"
+        );
+        assert!(pending.finish_render(false, true));
+        assert!(!pending.is_pending(), "fallback takes the pending writes");
+
+        assert!(!pending.finish_render(false, true));
+    }
 
     #[test]
     fn pointer_domain_changes_only_for_session_glyphs_and_remote_content() {
@@ -3107,6 +3326,18 @@ mod tests {
         );
         assert_eq!(
             super::pointer_keyboard_ownership(layout, content),
+            Some(crate::InputOwnership::Remote)
+        );
+        assert_eq!(
+            super::effective_pointer_keyboard_ownership(layout, content, true, true),
+            Some(crate::InputOwnership::Ui)
+        );
+        assert_eq!(
+            super::effective_pointer_keyboard_ownership(layout, content, false, false),
+            Some(crate::InputOwnership::Ui)
+        );
+        assert_eq!(
+            super::effective_pointer_keyboard_ownership(layout, content, false, true),
             Some(crate::InputOwnership::Remote)
         );
         assert_eq!(super::pointer_keyboard_ownership(layout, (100, 20)), None);

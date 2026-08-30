@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use frd_core::{PhysicalViewport, PixelRect, PixelSize};
 use frd_frame::{PixelBuffer, PixelPatch};
-use frd_protocol_api::{ProtocolError, ProtocolRuntime};
+use frd_protocol_api::{FrameResponseTiming, ProtocolError, ProtocolRuntime};
 
 use crate::connection::AppleWriterHandle;
 use crate::dynamic_resolution::{
@@ -26,7 +26,7 @@ use crate::mvs_stream::{MvsRecord, MvsRecordAssembler, MvsRect};
 use crate::protocol;
 use crate::surface_publisher::{
     AppleSurfacePublisher, CpuFramebuffer as Framebuffer, DisplaySurface, MvsFrameKind,
-    PublicationOutcome,
+    PublicationOutcome, MAX_TYPE_ONE_PATCHES,
 };
 
 const MVS_INCOMPLETE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -529,8 +529,17 @@ enum TableFollowupState {
 struct ReaderRequestState {
     generation: u64,
     framebuffer_request_in_flight: bool,
+    timing_request: Option<TimedFramebufferRequest>,
+    smoothed_response_ms: Option<u32>,
+    last_timing_published_at: Option<Instant>,
     last_full_request: Option<Instant>,
     table_followup: TableFollowupState,
+}
+
+#[derive(Clone, Copy)]
+struct TimedFramebufferRequest {
+    generation: u64,
+    sent_at: Instant,
 }
 
 impl ReaderRequestState {
@@ -538,6 +547,12 @@ impl ReaderRequestState {
         Self {
             generation,
             framebuffer_request_in_flight: true,
+            timing_request: Some(TimedFramebufferRequest {
+                generation,
+                sent_at,
+            }),
+            smoothed_response_ms: None,
+            last_timing_published_at: None,
             last_full_request: Some(sent_at),
             table_followup: TableFollowupState::None,
         }
@@ -547,6 +562,9 @@ impl ReaderRequestState {
         Self {
             generation,
             framebuffer_request_in_flight: false,
+            timing_request: None,
+            smoothed_response_ms: None,
+            last_timing_published_at: None,
             last_full_request: Some(initial_full_sent_at),
             table_followup: TableFollowupState::None,
         }
@@ -558,20 +576,69 @@ impl ReaderRequestState {
 
     fn consume_mvs_response(&mut self) {
         self.framebuffer_request_in_flight = false;
+        self.timing_request = None;
     }
 
-    fn mark_incremental_request_sent(&mut self) {
+    fn begin_complete_mvs_response(&mut self) {
+        self.framebuffer_request_in_flight = false;
+    }
+
+    fn mark_incremental_request_sent(&mut self, sent_at: Instant) {
         self.framebuffer_request_in_flight = true;
+        self.timing_request = Some(TimedFramebufferRequest {
+            generation: self.generation,
+            sent_at,
+        });
     }
 
     fn mark_full_request_sent(&mut self, sent_at: Instant) {
-        self.framebuffer_request_in_flight = true;
+        self.mark_incremental_request_sent(sent_at);
         self.last_full_request = Some(sent_at);
+    }
+
+    fn complete_frame_response_at(
+        &mut self,
+        generation: u64,
+        completed_at: Instant,
+    ) -> Option<FrameResponseTiming> {
+        self.framebuffer_request_in_flight = false;
+        let request = self.timing_request.take()?;
+        if request.generation != generation {
+            return None;
+        }
+        let elapsed = completed_at.checked_duration_since(request.sent_at)?;
+        let sample_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
+        let smoothed_ms = self.smoothed_response_ms.map_or(sample_ms, |previous| {
+            (((previous as u64) * 7 + sample_ms as u64) / 8).min(u32::MAX as u64) as u32
+        });
+        self.smoothed_response_ms = Some(smoothed_ms);
+
+        let publish_due = self.last_timing_published_at.map_or(true, |last| {
+            completed_at
+                .checked_duration_since(last)
+                .is_some_and(|elapsed| elapsed >= Duration::from_millis(500))
+        });
+        if !publish_due {
+            return None;
+        }
+        self.last_timing_published_at = Some(completed_at);
+        Some(FrameResponseTiming {
+            generation,
+            sample_ms,
+            smoothed_ms,
+        })
+    }
+
+    fn discard_frame_response_timing(&mut self) {
+        self.timing_request = None;
     }
 
     fn reset_generation(&mut self, generation: u64) {
         self.generation = generation;
         self.framebuffer_request_in_flight = false;
+        self.timing_request = None;
+        self.smoothed_response_ms = None;
+        self.last_timing_published_at = None;
         self.table_followup = TableFollowupState::None;
     }
 
@@ -653,7 +720,10 @@ impl ReaderRequestState {
         C: FnOnce() -> Instant,
     {
         request_full_update_at(&mut self.last_full_request, now, sleep, write, completed_at)?;
-        self.framebuffer_request_in_flight = true;
+        self.mark_full_request_sent(
+            self.last_full_request
+                .expect("successful full request records its completion time"),
+        );
         Ok(())
     }
 }
@@ -737,7 +807,7 @@ where
         return Ok(false);
     }
     send_incremental()?;
-    requests.mark_incremental_request_sent();
+    requests.mark_incremental_request_sent(Instant::now());
     Ok(true)
 }
 
@@ -776,7 +846,7 @@ where
     let incremental_sent =
         if tick.dynamic_request.is_none() && !requests.framebuffer_request_in_flight() {
             send_incremental()?;
-            requests.mark_incremental_request_sent();
+            requests.mark_incremental_request_sent(Instant::now());
             true
         } else {
             false
@@ -901,7 +971,7 @@ enum MvsRecordOutcome {
         publication: PreparedTypeZeroPublication,
     },
     PartialApplied {
-        has_pixels: bool,
+        patches: Vec<PixelPatch>,
     },
     RecoveryRequested,
     Ignored,
@@ -1097,6 +1167,246 @@ fn validate_partial_pixels_for_framebuffer(
     Ok(())
 }
 
+struct PlannedTypeOnePatch {
+    rect: PixelRect,
+    stride_bytes: u32,
+    pixels: Box<[u8]>,
+}
+
+struct PlannedTypeOnePublication {
+    patches: Vec<PlannedTypeOnePatch>,
+    completed: Vec<PixelPatch>,
+}
+
+fn operation_destination_rect(
+    operation: &crate::mvs_full::PartialPixelOperation,
+) -> Result<PixelRect> {
+    use crate::mvs_full::PartialPixelOperation;
+
+    let (x, y, width, height) = match operation {
+        PartialPixelOperation::Replace {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => (*x, *y, *width, *height),
+        PartialPixelOperation::Copy {
+            destination_x,
+            destination_y,
+            width,
+            height,
+            ..
+        } => (*destination_x, *destination_y, *width, *height),
+    };
+    let rect = PixelRect {
+        x: u32::try_from(x).context("MVS type-1 destination x 溢出")?,
+        y: u32::try_from(y).context("MVS type-1 destination y 溢出")?,
+        width: u32::try_from(width).context("MVS type-1 destination width 溢出")?,
+        height: u32::try_from(height).context("MVS type-1 destination height 溢出")?,
+    };
+    rect.x
+        .checked_add(rect.width)
+        .context("MVS type-1 destination right 溢出")?;
+    rect.y
+        .checked_add(rect.height)
+        .context("MVS type-1 destination bottom 溢出")?;
+    Ok(rect)
+}
+
+fn merge_type_one_destination_rects(mut rects: Vec<PixelRect>) -> Result<Vec<PixelRect>> {
+    loop {
+        let before = rects.len();
+        rects.sort_by_key(|rect| (rect.y, rect.height, rect.x, rect.width));
+        let mut horizontal: Vec<PixelRect> = Vec::new();
+        horizontal
+            .try_reserve_exact(rects.len())
+            .context("MVS type-1 horizontal patch plan 分配失败")?;
+        for rect in rects {
+            let rect_right = rect
+                .x
+                .checked_add(rect.width)
+                .context("MVS type-1 horizontal rect right 溢出")?;
+            if let Some(previous) = horizontal.last_mut() {
+                let previous_right = previous
+                    .x
+                    .checked_add(previous.width)
+                    .context("MVS type-1 horizontal previous right 溢出")?;
+                if previous.y == rect.y
+                    && previous.height == rect.height
+                    && previous_right >= rect.x
+                {
+                    previous.width = previous_right
+                        .max(rect_right)
+                        .checked_sub(previous.x)
+                        .context("MVS type-1 horizontal merged width 下溢")?;
+                    continue;
+                }
+            }
+            horizontal.push(rect);
+        }
+
+        horizontal.sort_by_key(|rect| (rect.x, rect.width, rect.y, rect.height));
+        let mut vertical: Vec<PixelRect> = Vec::new();
+        vertical
+            .try_reserve_exact(horizontal.len())
+            .context("MVS type-1 vertical patch plan 分配失败")?;
+        for rect in horizontal {
+            if let Some(previous) = vertical.last_mut() {
+                let previous_bottom = previous
+                    .y
+                    .checked_add(previous.height)
+                    .context("MVS type-1 vertical previous bottom 溢出")?;
+                if previous.x == rect.x && previous.width == rect.width && previous_bottom == rect.y
+                {
+                    previous.height = previous
+                        .height
+                        .checked_add(rect.height)
+                        .context("MVS type-1 vertical merged height 溢出")?;
+                    continue;
+                }
+            }
+            vertical.push(rect);
+        }
+        if vertical.len() == before {
+            vertical.sort_by_key(|rect| (rect.y, rect.x, rect.height, rect.width));
+            return Ok(vertical);
+        }
+        rects = vertical;
+    }
+}
+
+fn bounding_type_one_destination_rect(rects: &[PixelRect]) -> Result<PixelRect> {
+    let first = rects.first().context("MVS type-1 bounding rect 不能为空")?;
+    let mut left = first.x;
+    let mut top = first.y;
+    let mut right = first
+        .x
+        .checked_add(first.width)
+        .context("MVS type-1 bounding rect right 溢出")?;
+    let mut bottom = first
+        .y
+        .checked_add(first.height)
+        .context("MVS type-1 bounding rect bottom 溢出")?;
+    for rect in &rects[1..] {
+        left = left.min(rect.x);
+        top = top.min(rect.y);
+        right = right.max(
+            rect.x
+                .checked_add(rect.width)
+                .context("MVS type-1 bounding rect right 溢出")?,
+        );
+        bottom = bottom.max(
+            rect.y
+                .checked_add(rect.height)
+                .context("MVS type-1 bounding rect bottom 溢出")?,
+        );
+    }
+    Ok(PixelRect {
+        x: left,
+        y: top,
+        width: right
+            .checked_sub(left)
+            .context("MVS type-1 bounding rect width 下溢")?,
+        height: bottom
+            .checked_sub(top)
+            .context("MVS type-1 bounding rect height 下溢")?,
+    })
+}
+
+fn plan_type_one_patches(
+    framebuffer: &Framebuffer,
+    partial: &crate::mvs_full::PreparedPartialPixels,
+) -> Result<PlannedTypeOnePublication> {
+    validate_partial_pixels_for_framebuffer(framebuffer, partial)?;
+    if partial.operations.is_empty() {
+        return Ok(PlannedTypeOnePublication {
+            patches: Vec::new(),
+            completed: Vec::new(),
+        });
+    }
+
+    let mut destinations = Vec::new();
+    destinations
+        .try_reserve_exact(partial.operations.len())
+        .context("MVS type-1 destination plan 分配失败")?;
+    for operation in &partial.operations {
+        destinations.push(operation_destination_rect(operation)?);
+    }
+    let bounding = bounding_type_one_destination_rect(&destinations)?;
+    let mut merged = merge_type_one_destination_rects(destinations)?;
+    if merged.len() > MAX_TYPE_ONE_PATCHES {
+        merged.clear();
+        merged.push(bounding);
+    }
+    debug_assert!(merged.len() <= MAX_TYPE_ONE_PATCHES);
+
+    let mut patches = Vec::new();
+    patches
+        .try_reserve_exact(merged.len())
+        .context("MVS type-1 patch plan 分配失败")?;
+    for rect in merged {
+        let stride_bytes = rect
+            .width
+            .checked_mul(4)
+            .context("MVS type-1 BGRX stride 溢出")?;
+        let byte_count = usize::try_from(stride_bytes)
+            .ok()
+            .and_then(|stride| {
+                usize::try_from(rect.height)
+                    .ok()
+                    .and_then(|height| stride.checked_mul(height))
+            })
+            .context("MVS type-1 BGRX payload 溢出")?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(byte_count)
+            .context("MVS type-1 BGRX payload 分配失败")?;
+        pixels.resize(byte_count, 0);
+        patches.push(PlannedTypeOnePatch {
+            rect,
+            stride_bytes,
+            pixels: pixels.into_boxed_slice(),
+        });
+    }
+    let mut completed = Vec::new();
+    completed
+        .try_reserve_exact(patches.len())
+        .context("MVS type-1 completed patch plan 分配失败")?;
+    Ok(PlannedTypeOnePublication { patches, completed })
+}
+
+fn fill_type_one_patches_from_committed_surface(
+    framebuffer: &Framebuffer,
+    mut plan: PlannedTypeOnePublication,
+) -> Vec<PixelPatch> {
+    for mut patch in plan.patches {
+        let right = patch.rect.x + patch.rect.width;
+        let bottom = patch.rect.y + patch.rect.height;
+        debug_assert!(right as usize <= framebuffer.width);
+        debug_assert!(bottom as usize <= framebuffer.height);
+        let expected_len = patch.stride_bytes as usize * patch.rect.height as usize;
+        debug_assert_eq!(patch.pixels.len(), expected_len);
+        for row in patch.rect.y as usize..bottom as usize {
+            let start = row * framebuffer.width + patch.rect.x as usize;
+            let destination_row = (row - patch.rect.y as usize) * patch.stride_bytes as usize;
+            for (column, pixel) in framebuffer.pixels()[start..start + patch.rect.width as usize]
+                .iter()
+                .enumerate()
+            {
+                let destination = destination_row + column * 4;
+                patch.pixels[destination..destination + 4].copy_from_slice(&pixel.to_le_bytes());
+            }
+        }
+        plan.completed.push(PixelPatch {
+            rect: patch.rect,
+            stride_bytes: patch.stride_bytes,
+            pixels: PixelBuffer::from_boxed_slice(patch.pixels),
+        });
+    }
+    plan.completed
+}
+
 /// 只接收已经通过 `validate_partial_pixels_for_framebuffer` 的 decoder 输出。
 /// replace 与 copy 都是固定 8x8 上限，因此提交后不再分配内存或返回错误。
 fn apply_validated_partial_pixels_to_framebuffer(
@@ -1164,7 +1474,7 @@ fn apply_prepared_partial_to_surface(
     receiver: &mut MvsReceiveState,
     surface: &mut DisplaySurface,
     prepared: mvs::PreparedOpaqueMvsState,
-) -> Result<bool> {
+) -> Result<Vec<PixelPatch>> {
     if surface.generation != receiver.generation {
         bail!(
             "MVS prepared partial generation 与当前 surface 不一致: receiver={}, surface={}",
@@ -1172,14 +1482,17 @@ fn apply_prepared_partial_to_surface(
             surface.generation
         );
     }
-    validate_partial_pixels_for_framebuffer(&surface.framebuffer, prepared.partial_pixels())?;
-    let has_pixels = !prepared.partial_pixels().operations.is_empty();
+    let plan = plan_type_one_patches(&surface.framebuffer, prepared.partial_pixels())?;
+    let has_pixels = !plan.patches.is_empty();
     let partial_pixels = receiver.commit_opaque(prepared)?;
     if has_pixels {
         apply_validated_partial_pixels_to_framebuffer(&mut surface.framebuffer, &partial_pixels);
         surface.record_native_partial_applied();
     }
-    Ok(has_pixels)
+    Ok(fill_type_one_patches_from_committed_surface(
+        &surface.framebuffer,
+        plan,
+    ))
 }
 
 /// 已严格分类为像素记录后的原生 prepare/apply/commit 事务。
@@ -1221,16 +1534,16 @@ fn apply_native_mvs_frame(
                     apply_prepared_partial_to_surface(receiver, &mut surface, prepared)
                 }
             };
-            let has_pixels = match applied {
-                Ok(true) => {
+            let patches = match applied {
+                Ok(patches) if !patches.is_empty() => {
                     #[cfg(debug_assertions)]
                     eprintln!("[hpss-view] MVS type-1 增量像素与 codec 状态已提交");
-                    true
+                    patches
                 }
-                Ok(false) => {
+                Ok(patches) => {
                     #[cfg(debug_assertions)]
                     eprintln!("[hpss-view] MVS type-1 no-op/cache 状态已提交");
-                    false
+                    patches
                 }
                 Err(error) => {
                     eprintln!("[hpss-view] MVS type-1 framebuffer 事务失败，重同步: {error:#}");
@@ -1240,7 +1553,7 @@ fn apply_native_mvs_frame(
             };
             // Partial pixels are visible, but a type-1 update is never the
             // complete type-0 codec baseline used by the P1 evidence latch.
-            return Ok(MvsRecordOutcome::PartialApplied { has_pixels });
+            return Ok(MvsRecordOutcome::PartialApplied { patches });
         }
         Ok(mvs::MvsDecodeDecision::RequestFull(reason)) => {
             eprintln!("[hpss-view] MVS 原生记录要求全量重同步: {reason:?}");
@@ -1308,6 +1621,16 @@ fn apply_native_mvs_frame(
     })
 }
 
+fn replace_failed_response_with_full_request(
+    writer: &AppleWriterHandle,
+    requests: &mut ReaderRequestState,
+    display_size: DisplaySize,
+) -> Result<MvsRecordOutcome> {
+    requests.discard_frame_response_timing();
+    request_full_update(writer, requests, display_size.width, display_size.height)?;
+    Ok(MvsRecordOutcome::RecoveryRequested)
+}
+
 fn process_complete_mvs_record(
     receiver: &mut MvsReceiveState,
     record: MvsRecord,
@@ -1336,13 +1659,7 @@ fn process_complete_mvs_record(
             if let Err(e) = receiver.install_tables(payload) {
                 eprintln!("[hpss-view] MVS 表初始化无效，重同步: {e:#}");
                 receiver.request_full()?;
-                return request_full_update(
-                    writer,
-                    requests,
-                    display_size.width,
-                    display_size.height,
-                )
-                .map(|()| MvsRecordOutcome::RecoveryRequested);
+                return replace_failed_response_with_full_request(writer, requests, display_size);
             }
             let status = requests.on_valid_table_record(receiver.generation, Instant::now())?;
             eprintln!("[hpss-view] MVS 量化表就绪，full follow-up 已调度: {status:?}");
@@ -1352,15 +1669,13 @@ fn process_complete_mvs_record(
         Err(error) => {
             eprintln!("[hpss-view] MVS 表初始化候选无效，重同步: {error:#}");
             receiver.request_full()?;
-            return request_full_update(writer, requests, display_size.width, display_size.height)
-                .map(|()| MvsRecordOutcome::RecoveryRequested);
+            return replace_failed_response_with_full_request(writer, requests, display_size);
         }
     }
 
     let outcome = apply_native_mvs_frame(receiver, &record, surface, dynamic_resolution)?;
     if matches!(outcome, MvsRecordOutcome::RecoveryRequested) {
-        return request_full_update(writer, requests, display_size.width, display_size.height)
-            .map(|()| MvsRecordOutcome::RecoveryRequested);
+        return replace_failed_response_with_full_request(writer, requests, display_size);
     }
     Ok(outcome)
 }
@@ -1467,13 +1782,7 @@ fn handle_complete_mvs_record(
     protocol_runtime: &mut ProtocolRuntime,
     publisher: &mut AppleSurfacePublisher,
 ) -> Result<()> {
-    requests.consume_mvs_response();
-    let dirty = PixelRect {
-        x: u32::from(record.rect.x),
-        y: u32::from(record.rect.y),
-        width: u32::from(record.rect.width),
-        height: u32::from(record.rect.height),
-    };
+    requests.begin_complete_mvs_response();
     let outcome = process_complete_mvs_record(
         receiver,
         record,
@@ -1484,6 +1793,7 @@ fn handle_complete_mvs_record(
     )?;
     let full_applied = matches!(&outcome, MvsRecordOutcome::FullApplied { .. });
     let partial_applied = matches!(&outcome, MvsRecordOutcome::PartialApplied { .. });
+    let recovery_requested = matches!(&outcome, MvsRecordOutcome::RecoveryRequested);
     let publication = match outcome {
         MvsRecordOutcome::FullApplied {
             complete_surface,
@@ -1503,23 +1813,26 @@ fn handle_complete_mvs_record(
                 )
                 .map_err(|error| anyhow::anyhow!(error.code()))?
         }
-        MvsRecordOutcome::PartialApplied { has_pixels: true } => {
+        MvsRecordOutcome::PartialApplied { patches } if !patches.is_empty() => {
             let surface = surface.lock().unwrap();
             publisher
-                .publish_committed(
+                .publish_committed_type_one_patches(
                     protocol_runtime,
                     &surface,
                     receiver.generation,
-                    dirty,
-                    MvsFrameKind::TypeOne,
+                    patches,
                 )
                 .map_err(|error| anyhow::anyhow!(error.code()))?
         }
         _ => PublicationOutcome::Published,
     };
     match publication {
-        PublicationOutcome::AwaitingHighPerformance => return Ok(()),
+        PublicationOutcome::AwaitingHighPerformance => {
+            requests.discard_frame_response_timing();
+            return Ok(());
+        }
         PublicationOutcome::NeedsFullBaseline => {
+            requests.discard_frame_response_timing();
             receiver.request_full()?;
             let size = current_surface_size(surface);
             request_full_update(writer, requests, size.width, size.height)?;
@@ -1533,6 +1846,15 @@ fn handle_complete_mvs_record(
         }
         PublicationOutcome::Published | PublicationOutcome::IgnoredStale => {}
     }
+    let frame_response_timing =
+        if (full_applied || partial_applied) && publication == PublicationOutcome::Published {
+            requests.complete_frame_response_at(receiver.generation, Instant::now())
+        } else if recovery_requested {
+            None
+        } else {
+            requests.discard_frame_response_timing();
+            None
+        };
     if full_applied {
         let boundary = finish_network_full_boundary(
             receiver,
@@ -1559,6 +1881,11 @@ fn handle_complete_mvs_record(
             #[cfg(debug_assertions)]
             eprintln!("[hpss-view] MVS type-1 已提交并请求下一增量响应");
         }
+    }
+    if let Some(timing) = frame_response_timing {
+        protocol_runtime
+            .publish_event(frd_protocol_api::SessionEvent::FrameResponseTiming(timing))
+            .map_err(|error| anyhow::anyhow!(error.code()))?;
     }
     Ok(())
 }
@@ -1890,7 +2217,9 @@ impl NetworkReaderRuntime {
                 Ok(NetworkFrameOutcome::Consumed)
             }
             Ok(Media::State(encoding::SERVER_STATE)) => {
-                if let Some((width, height)) = hpss::parse_server_state_w_h(&message) {
+                let geometry = hpss::parse_server_state_geometry(&message)
+                    .context("活动会话 ServerState 结构非法")?;
+                if let Some((width, height)) = Some((geometry.width, geometry.height)) {
                     if let Some(observed) = DisplaySize::new(width, height) {
                         self.ensure_server_state_generation_coherence(media_state)?;
                         let commit = {
@@ -1999,6 +2328,20 @@ mod migrated_runtime_tests {
                 _ => "event",
             };
             self.0.entries.lock().unwrap().push(label);
+            Ok(())
+        }
+    }
+
+    struct TimingProtocolEvents(Arc<Mutex<Vec<FrameResponseTiming>>>);
+
+    impl frd_protocol_api::RuntimeEventSink for TimingProtocolEvents {
+        fn publish(
+            &self,
+            event: frd_protocol_api::SessionEvent,
+        ) -> Result<(), frd_protocol_api::ProtocolError> {
+            if let frd_protocol_api::SessionEvent::FrameResponseTiming(timing) = event {
+                self.0.lock().unwrap().push(timing);
+            }
             Ok(())
         }
     }
@@ -2126,6 +2469,9 @@ mod migrated_runtime_tests {
         server_state[18..20].copy_from_slice(&5u16.to_be_bytes());
         server_state[20..22].copy_from_slice(&size.width.to_be_bytes());
         server_state[22..24].copy_from_slice(&size.height.to_be_bytes());
+        server_state[24..26].copy_from_slice(&size.width.to_be_bytes());
+        server_state[26..28].copy_from_slice(&size.height.to_be_bytes());
+        server_state[36..38].copy_from_slice(&1u16.to_be_bytes());
         server_state
     }
 
@@ -2840,7 +3186,7 @@ mod migrated_runtime_tests {
         let mut media = test_media_state();
         let mut before_generation_commit = || Ok(());
         let mut malformed = server_state_message(initial);
-        malformed[18..20].copy_from_slice(&0u16.to_be_bytes());
+        malformed[36..38].copy_from_slice(&0u16.to_be_bytes());
         let error = expect_network_frame_error(reader.handle_frame_at(
             malformed,
             &writer,
@@ -3178,6 +3524,9 @@ mod migrated_runtime_tests {
         server_state[18..20].copy_from_slice(&5u16.to_be_bytes());
         server_state[20..22].copy_from_slice(&target.width.to_be_bytes());
         server_state[22..24].copy_from_slice(&target.height.to_be_bytes());
+        server_state[24..26].copy_from_slice(&target.width.to_be_bytes());
+        server_state[26..28].copy_from_slice(&target.height.to_be_bytes());
+        server_state[36..38].copy_from_slice(&1u16.to_be_bytes());
 
         {
             let mut before_commit = || pointer.release_all(&writer);
@@ -3499,6 +3848,23 @@ mod migrated_runtime_tests {
             Ok(())
         };
 
+        let mut malformed = server_state_message(server_initiated);
+        malformed.truncate(28);
+        malformed[16..18].copy_from_slice(&10u16.to_be_bytes());
+        let error = expect_network_frame_error(reader.handle_frame(
+            malformed,
+            &writer,
+            &mut media,
+            &mut protocol_runtime,
+            &mut before_generation_commit,
+        ));
+        assert!(error.to_string().contains("ServerState"));
+        assert_eq!(releases.get(), 0);
+        assert_eq!(reader.generation(), 1);
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!((surface.width(), surface.height()), (1440, 2560));
+        drop(surface);
+
         reader.receiver.generation = 2;
         let error = match reader.handle_frame(
             server_state_message(server_initiated),
@@ -3655,6 +4021,91 @@ mod migrated_runtime_tests {
         assert_eq!(sent, vec![first, latest]);
         assert!(queue.latest.is_none());
     }
+    #[test]
+    fn frame_response_timing_starts_only_after_success_and_correlates_once() {
+        let started = Instant::now();
+        let mut requests = ReaderRequestState::after_confirmation(started, 7);
+
+        let failed = requests.send_rate_limited_full_at(
+            started + Duration::from_millis(200),
+            |_| {},
+            || anyhow::bail!("write failed"),
+            || started + Duration::from_millis(210),
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            requests.complete_frame_response_at(7, started + Duration::from_millis(310)),
+            None,
+            "a failed write must not start a timing sample"
+        );
+
+        requests
+            .send_rate_limited_full_at(
+                started + Duration::from_millis(200),
+                |_| {},
+                || Ok(()),
+                || started + Duration::from_millis(210),
+            )
+            .unwrap();
+        assert_eq!(
+            requests.complete_frame_response_at(7, started + Duration::from_millis(310)),
+            Some(frd_protocol_api::FrameResponseTiming {
+                generation: 7,
+                sample_ms: 100,
+                smoothed_ms: 100,
+            })
+        );
+        assert_eq!(
+            requests.complete_frame_response_at(7, started + Duration::from_millis(410)),
+            None,
+            "one request must correlate with at most one complete response"
+        );
+    }
+
+    #[test]
+    fn frame_response_timing_ewma_throttles_publication_and_resets_per_generation() {
+        let started = Instant::now();
+        let mut requests = ReaderRequestState::after_startup(started, 1);
+
+        assert_eq!(
+            requests.complete_frame_response_at(1, started + Duration::from_millis(80)),
+            Some(frd_protocol_api::FrameResponseTiming {
+                generation: 1,
+                sample_ms: 80,
+                smoothed_ms: 80,
+            })
+        );
+
+        requests.mark_incremental_request_sent(started + Duration::from_millis(100));
+        assert_eq!(
+            requests.complete_frame_response_at(1, started + Duration::from_millis(260)),
+            None,
+            "EWMA updates internally while publication is rate limited"
+        );
+
+        requests.mark_incremental_request_sent(started + Duration::from_millis(500));
+        assert_eq!(
+            requests.complete_frame_response_at(1, started + Duration::from_millis(670)),
+            Some(frd_protocol_api::FrameResponseTiming {
+                generation: 1,
+                sample_ms: 170,
+                smoothed_ms: 100,
+            })
+        );
+
+        requests.reset_generation(2);
+        requests.mark_incremental_request_sent(started + Duration::from_millis(700));
+        assert_eq!(
+            requests.complete_frame_response_at(2, started + Duration::from_millis(750)),
+            Some(frd_protocol_api::FrameResponseTiming {
+                generation: 2,
+                sample_ms: 50,
+                smoothed_ms: 50,
+            }),
+            "a generation change resets EWMA and publication throttling"
+        );
+    }
+
     #[test]
     fn old_incremental_inflight_defers_dynamic_until_fragmented_response_boundary() {
         let initial = DisplaySize::new(1440, 900).unwrap();
@@ -4251,6 +4702,158 @@ mod migrated_runtime_tests {
     }
 
     #[test]
+    fn type_one_compact_plan_merges_two_by_two_adjacent_destinations() {
+        use crate::mvs_full::{PartialPixelOperation, PreparedPartialPixels};
+
+        let framebuffer = crate::surface_publisher::CpuFramebuffer::new(24, 16).unwrap();
+        let operations = [(0, 0), (8, 0), (0, 8), (8, 8)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (x, y))| {
+                if index == 3 {
+                    PartialPixelOperation::Copy {
+                        source_x: 16,
+                        source_y: 0,
+                        destination_x: x,
+                        destination_y: y,
+                        width: 8,
+                        height: 8,
+                    }
+                } else {
+                    PartialPixelOperation::Replace {
+                        x,
+                        y,
+                        width: 8,
+                        height: 8,
+                        rgb: vec![0; 8 * 8 * mvs::MVS_RGB_CHANNEL_BYTES],
+                    }
+                }
+            })
+            .collect();
+
+        let plan =
+            plan_type_one_patches(&framebuffer, &PreparedPartialPixels { operations }).unwrap();
+
+        assert_eq!(plan.patches.len(), 1);
+        assert_eq!(
+            plan.patches[0].rect,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn type_one_compact_plan_bounds_more_than_thirty_two_sparse_destinations() {
+        use crate::mvs_full::{PartialPixelOperation, PreparedPartialPixels};
+
+        let framebuffer = crate::surface_publisher::CpuFramebuffer::new(65, 1).unwrap();
+        let operations = (0..33)
+            .map(|index| PartialPixelOperation::Replace {
+                x: index * 2,
+                y: 0,
+                width: 1,
+                height: 1,
+                rgb: vec![0; mvs::MVS_RGB_CHANNEL_BYTES],
+            })
+            .collect();
+
+        let plan =
+            plan_type_one_patches(&framebuffer, &PreparedPartialPixels { operations }).unwrap();
+
+        assert_eq!(plan.patches.len(), 1);
+        assert_eq!(
+            plan.patches[0].rect,
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 65,
+                height: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn type_one_fix_round_merging_reaches_horizontal_vertical_closure() {
+        let merged = merge_type_one_destination_rects(vec![
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            PixelRect {
+                x: 0,
+                y: 8,
+                width: 8,
+                height: 8,
+            },
+            PixelRect {
+                x: 8,
+                y: 0,
+                width: 8,
+                height: 16,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            merged,
+            vec![PixelRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            }]
+        );
+    }
+
+    #[test]
+    fn type_one_fix_round_copy_publishes_only_final_destination_pixels() {
+        use crate::mvs_full::{PartialPixelOperation, PreparedPartialPixels};
+
+        let mut framebuffer = crate::surface_publisher::CpuFramebuffer::new(3, 1).unwrap();
+        framebuffer
+            .pixels_mut()
+            .copy_from_slice(&[0x0011_2233, 0x0044_5566, 0x00aa_bbcc]);
+        let partial = PreparedPartialPixels {
+            operations: vec![PartialPixelOperation::Copy {
+                source_x: 0,
+                source_y: 0,
+                destination_x: 2,
+                destination_y: 0,
+                width: 1,
+                height: 1,
+            }],
+        };
+        let plan = plan_type_one_patches(&framebuffer, &partial).unwrap();
+
+        assert_eq!(
+            plan.patches[0].rect,
+            PixelRect {
+                x: 2,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            "source must not be included in dirty damage"
+        );
+        assert_eq!(plan.patches[0].pixels.len(), 4);
+        let allocation = plan.patches[0].pixels.as_ptr();
+
+        apply_validated_partial_pixels_to_framebuffer(&mut framebuffer, &partial);
+        let patches = fill_type_one_patches_from_committed_surface(&framebuffer, plan);
+
+        assert_eq!(framebuffer.pixels()[2], 0x0011_2233);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].pixels.as_bytes(), &[0x33, 0x22, 0x11, 0]);
+        assert_eq!(patches[0].pixels.as_bytes().as_ptr(), allocation);
+    }
+
+    #[test]
     fn native_subrectangle_applies_without_complete_surface_evidence() {
         let surface = native_surface(16, 8);
         let dynamic = native_runtime(16, 8);
@@ -4308,7 +4911,7 @@ mod migrated_runtime_tests {
 
         assert!(matches!(
             apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
-            MvsRecordOutcome::PartialApplied { has_pixels: false }
+            MvsRecordOutcome::PartialApplied { patches } if patches.is_empty()
         ));
         assert_eq!(surface.lock().unwrap().framebuffer.pixels(), before);
         assert!(!receiver.awaiting_full());
@@ -4349,7 +4952,7 @@ mod migrated_runtime_tests {
 
         assert!(matches!(
             apply_native_mvs_frame(&mut receiver, &record, &surface, &dynamic).unwrap(),
-            MvsRecordOutcome::PartialApplied { has_pixels: true }
+            MvsRecordOutcome::PartialApplied { patches } if !patches.is_empty()
         ));
         let surface = surface.lock().unwrap();
         assert_ne!(surface.framebuffer.pixels(), before);
@@ -4497,6 +5100,98 @@ mod migrated_runtime_tests {
         let runtime = dynamic.lock().unwrap();
         assert!(runtime.evidence.current_full_media_applied);
         assert!(runtime.armed);
+    }
+
+    #[test]
+    fn recovery_full_request_replaces_failed_response_timing_and_completes_on_next_valid_type_zero()
+    {
+        use std::io::Read as _;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        let writer = connection.writer_handle().unwrap();
+        let session_id = frd_core::SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let timings = Arc::new(Mutex::new(Vec::new()));
+        let mut protocol_runtime = frd_protocol_api::ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(TimingProtocolEvents(timings.clone())),
+            Box::new(NoopProtocolFrames),
+            None,
+            Box::new(NoopProtocolWake),
+        );
+        let size = frd_core::PixelSize::new(8, 8).unwrap();
+        let mut publisher =
+            AppleSurfacePublisher::begin(&mut protocol_runtime, session_id, size).unwrap();
+        let surface = native_surface(8, 8);
+        let dynamic_resolution = native_runtime(8, 8);
+        let mut receiver = MvsReceiveState::new(1);
+        receiver.install_tables(&type_two_tables_fixture()).unwrap();
+        let mut requests =
+            ReaderRequestState::after_startup(Instant::now() - Duration::from_secs(1), 1);
+        let viewport_requests = Arc::new(Mutex::new(ViewportRequestQueue::default()));
+        let malformed = MvsRecord {
+            rect: MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            payload: vec![0],
+        };
+
+        handle_complete_mvs_record(
+            &mut receiver,
+            &mut requests,
+            malformed,
+            &surface,
+            &viewport_requests,
+            &dynamic_resolution,
+            &writer,
+            &mut protocol_runtime,
+            &mut publisher,
+        )
+        .unwrap();
+
+        let mut recovery = [0; protocol::FRAMEBUFFER_UPDATE_REQUEST_MESSAGE_BYTES];
+        peer.read_exact(&mut recovery).unwrap();
+        assert_eq!(
+            recovery,
+            protocol::msg_fb_update_request(false, 0, 0, 8, 8).unwrap()
+        );
+        assert!(
+            timings.lock().unwrap().is_empty(),
+            "the malformed record must not produce a timing sample"
+        );
+
+        handle_complete_mvs_record(
+            &mut receiver,
+            &mut requests,
+            native_record(MvsRect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            }),
+            &surface,
+            &viewport_requests,
+            &dynamic_resolution,
+            &writer,
+            &mut protocol_runtime,
+            &mut publisher,
+        )
+        .unwrap();
+
+        assert_eq!(timings.lock().unwrap().as_slice().len(), 1);
+        assert_eq!(timings.lock().unwrap()[0].generation, 1);
+        writer.shutdown().unwrap();
     }
 
     #[test]

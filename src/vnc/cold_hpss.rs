@@ -796,9 +796,12 @@ mod tests {
         frame[0..4].copy_from_slice(&1u32.to_be_bytes());
         frame[12..16].copy_from_slice(&crate::vnc::hpss::encoding::SERVER_STATE.to_be_bytes());
         frame[16..18].copy_from_slice(&76u16.to_be_bytes());
-        frame[18..20].copy_from_slice(&1u16.to_be_bytes());
+        frame[18..20].copy_from_slice(&5u16.to_be_bytes());
         frame[20..22].copy_from_slice(&width.to_be_bytes());
         frame[22..24].copy_from_slice(&height.to_be_bytes());
+        frame[24..26].copy_from_slice(&width.to_be_bytes());
+        frame[26..28].copy_from_slice(&height.to_be_bytes());
+        frame[36..38].copy_from_slice(&1u16.to_be_bytes());
         frame
     }
 

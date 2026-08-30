@@ -29,6 +29,7 @@ pub enum SessionChromeAction {
 pub struct SessionChromeModel {
     pub connection: ConnectionGlyph,
     pub diagnostics: Option<String>,
+    pub frame_response_ms: Option<u32>,
     pub audio: CapabilityGlyphState,
     pub clipboard: CapabilityGlyphState,
     pub action: Option<SessionChromeAction>,

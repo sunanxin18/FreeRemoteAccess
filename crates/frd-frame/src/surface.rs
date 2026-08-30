@@ -29,7 +29,11 @@ pub struct PixelBuffer(Box<[u8]>);
 
 impl PixelBuffer {
     pub fn new(pixels: Vec<u8>) -> Self {
-        Self(pixels.into_boxed_slice())
+        Self::from_boxed_slice(pixels.into_boxed_slice())
+    }
+
+    pub fn from_boxed_slice(pixels: Box<[u8]>) -> Self {
+        Self(pixels)
     }
 
     pub fn len(&self) -> usize {
@@ -76,4 +80,20 @@ pub enum SurfaceUpdate {
         revision: u64,
         completeness: FrameCompleteness,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PixelBuffer;
+
+    #[test]
+    fn boxed_pixel_buffer_constructor_adopts_the_exact_allocation() {
+        let pixels = vec![1, 2, 3, 4].into_boxed_slice();
+        let allocation = pixels.as_ptr();
+
+        let buffer = PixelBuffer::from_boxed_slice(pixels);
+
+        assert_eq!(buffer.as_bytes(), &[1, 2, 3, 4]);
+        assert_eq!(buffer.as_bytes().as_ptr(), allocation);
+    }
 }

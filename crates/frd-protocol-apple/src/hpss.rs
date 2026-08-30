@@ -416,7 +416,8 @@ const MEDIA_RECTANGLE_HEADER_LEN: usize = MEDIA_RECTANGLE_STREAM_ID_BYTES
     + MEDIA_RECTANGLE_ENCODING_BYTES;
 const MVS_DECLARED_TOTAL_BYTES: usize = size_of::<u32>();
 const SERVER_STATE_SIZE_FIELD_LEN: usize = size_of::<u16>();
-const SERVER_STATE_FIXED_FIELDS_LEN: usize = 3 * size_of::<u16>();
+const SERVER_STATE_BODY_PREFIX_LEN: usize = 20;
+const SERVER_STATE_DISPLAY_RECORD_LEN: usize = 56;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MediaRectangle<'a> {
@@ -459,15 +460,25 @@ pub fn mvs_envelope_candidate_rect(message: &[u8]) -> Option<MvsRect> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerStateGeometry {
-    pub record_count: u16,
+    pub message_version: u16,
+    pub display_count: u16,
     pub width: u16,
     pub height: u16,
 }
 
-/// 严格解析固定媒体矩形中的 ServerState 主屏尺寸。
+fn checked_server_state_body_len(display_count: usize) -> Result<usize> {
+    // Apple 的固定前缀 20B 和每条 display record 56B 均已是 4B 倍数，
+    // 因而 align4(20 + count * 56) 与下式严格等价，不需要隐式补齐。
+    display_count
+        .checked_mul(SERVER_STATE_DISPLAY_RECORD_LEN)
+        .and_then(|records_len| SERVER_STATE_BODY_PREFIX_LEN.checked_add(records_len))
+        .context("ServerState display records 长度溢出")
+}
+
+/// 严格解析固定媒体矩形中的 ServerState 活动 framebuffer 尺寸。
 pub fn parse_server_state_geometry(message: &[u8]) -> Result<ServerStateGeometry> {
     let minimum_len =
-        MEDIA_RECTANGLE_HEADER_LEN + SERVER_STATE_SIZE_FIELD_LEN + SERVER_STATE_FIXED_FIELDS_LEN;
+        MEDIA_RECTANGLE_HEADER_LEN + SERVER_STATE_SIZE_FIELD_LEN + SERVER_STATE_BODY_PREFIX_LEN;
     if message.len() < minimum_len {
         bail!("ServerState 截断: {} 字节", message.len());
     }
@@ -490,12 +501,23 @@ pub fn parse_server_state_geometry(message: &[u8]) -> Result<ServerStateGeometry
     if declared_len != actual_len {
         bail!("ServerState 声明长度 {declared_len} 与实际 {actual_len} 不一致");
     }
-    let record_count = payload.read_u16("ServerState 记录数量")?;
-    if record_count == 0 {
-        bail!("ServerState 记录数量为零");
+    let message_version = payload.read_u16("ServerState messageVersion")?;
+    let _unclassified_width = payload.read_u16("ServerState 未分类几何组 width")?;
+    let _unclassified_height = payload.read_u16("ServerState 未分类几何组 height")?;
+    let width = payload.read_u16("ServerState 活动 framebuffer width")?;
+    let height = payload.read_u16("ServerState 活动 framebuffer height")?;
+    let _unclassified_flags = payload.read_u32("ServerState 未分类 flags")?;
+    let _unclassified_sequence = payload.read_u32("ServerState 未分类 sequence")?;
+    let display_count = payload.read_u16("ServerState display count")?;
+    if display_count == 0 {
+        bail!("ServerState display count 为零");
     }
-    let width = payload.read_u16("ServerState width")?;
-    let height = payload.read_u16("ServerState height")?;
+    let expected_len = checked_server_state_body_len(usize::from(display_count))?;
+    if declared_len < expected_len {
+        bail!(
+            "ServerState body 长度 {declared_len} 小于 display count {display_count} 要求的 {expected_len}"
+        );
+    }
     let pixel_count = usize::from(width)
         .checked_mul(usize::from(height))
         .context("ServerState framebuffer 像素数量溢出")?;
@@ -503,7 +525,8 @@ pub fn parse_server_state_geometry(message: &[u8]) -> Result<ServerStateGeometry
         bail!("ServerState framebuffer 尺寸超过资源预算: {width}x{height}");
     }
     Ok(ServerStateGeometry {
-        record_count,
+        message_version,
+        display_count,
         width,
         height,
     })
@@ -874,6 +897,16 @@ fn record_authenticated_datagram(
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) const CAPTURED_SERVER_STATE_WITH_ACTIVE_FRAMEBUFFER: [u8; 94] = [
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x51,
+    0x00, 0x4c, 0x00, 0x05, 0x05, 0xa0, 0x0a, 0x00, 0x05, 0x33, 0x09, 0x3d, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x06, 0x00, 0x01, 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xed,
+    0x91, 0x11, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00,
+    0x05, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x09, 0x3d, 0x05, 0x33, 0x00, 0x00, 0x00, 0x01, 0x20, 0x20,
+    0x00, 0x01, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00,
+];
 
 #[cfg(test)]
 mod tests {
@@ -1283,28 +1316,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_server_state_sizes() {
-        // 真机 ServerState 固定头；声明 payload 76B，尾部在此测试中置零。
-        let mut m = vec![0u8; 94];
-        m[0..4].copy_from_slice(&1u32.to_be_bytes());
-        m[12..16].copy_from_slice(&encoding::SERVER_STATE.to_be_bytes());
-        m[16..18].copy_from_slice(&76u16.to_be_bytes());
-        m[18..20].copy_from_slice(&5u16.to_be_bytes());
-        m[20..22].copy_from_slice(&1440u16.to_be_bytes());
-        m[22..24].copy_from_slice(&2560u16.to_be_bytes());
-        assert_eq!(parse_server_state_w_h(&m), Some((0x05a0, 0x0a00)));
+    fn parse_server_state_uses_the_captured_active_framebuffer_group() {
+        let mut m = CAPTURED_SERVER_STATE_WITH_ACTIVE_FRAMEBUFFER.to_vec();
+        assert_eq!(parse_server_state_w_h(&m), Some((1331, 2365)));
         assert_eq!(
             parse_server_state_geometry(&m).unwrap(),
             ServerStateGeometry {
-                record_count: 5,
-                width: 1440,
-                height: 2560,
+                message_version: 5,
+                display_count: 1,
+                width: 1331,
+                height: 2365,
             }
         );
 
         assert!(parse_server_state_geometry(&m[..m.len() - 1]).is_err());
         m[12..16].copy_from_slice(&encoding::MVS.to_be_bytes());
         assert!(parse_server_state_geometry(&m).is_err());
+    }
+
+    #[test]
+    fn parse_server_state_rejects_dimensions_without_display_records() {
+        let mut message = vec![0u8; 28];
+        message[0..4].copy_from_slice(&media_protocol::PRIMARY_MEDIA_STREAM_ID.to_be_bytes());
+        message[12..16].copy_from_slice(&encoding::SERVER_STATE.to_be_bytes());
+        message[16..18].copy_from_slice(&10u16.to_be_bytes());
+        message[18..20].copy_from_slice(&5u16.to_be_bytes());
+        message[20..22].copy_from_slice(&1440u16.to_be_bytes());
+        message[22..24].copy_from_slice(&2560u16.to_be_bytes());
+        message[24..26].copy_from_slice(&1331u16.to_be_bytes());
+        message[26..28].copy_from_slice(&2365u16.to_be_bytes());
+
+        assert!(parse_server_state_geometry(&message).is_err());
+    }
+
+    #[test]
+    fn parse_server_state_accepts_stock_style_trailing_extension() {
+        let mut message = CAPTURED_SERVER_STATE_WITH_ACTIVE_FRAMEBUFFER.to_vec();
+        message.extend_from_slice(&[0; 4]);
+        message[16..18].copy_from_slice(&80u16.to_be_bytes());
+
+        assert_eq!(parse_server_state_w_h(&message), Some((1331, 2365)));
     }
 
     #[test]

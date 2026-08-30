@@ -4,6 +4,7 @@ use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, Surface
 use frd_protocol_api::{ProtocolError, ProtocolRuntime};
 
 const FULL_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_TYPE_ONE_PATCHES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeMvsRenderObservability {
@@ -242,6 +243,10 @@ impl AppleSurfacePublisher {
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "保留单 dirty rect 兼容入口；生产 type-1 使用批量已完成 patch"
+    )]
     pub(crate) fn publish_committed(
         &mut self,
         runtime: &mut ProtocolRuntime,
@@ -298,6 +303,29 @@ impl AppleSurfacePublisher {
             return Err(ProtocolError::FramePortRejected);
         }
         self.publish_patch(runtime, patch, completeness)
+    }
+
+    pub(crate) fn publish_committed_type_one_patches(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        surface: &DisplaySurface,
+        generation: u64,
+        patches: Vec<PixelPatch>,
+    ) -> Result<PublicationOutcome, ProtocolError> {
+        if !self.is_active() {
+            return Ok(PublicationOutcome::AwaitingHighPerformance);
+        }
+        if generation != self.generation || surface.generation != self.generation {
+            return Ok(PublicationOutcome::IgnoredStale);
+        }
+        let completeness = match self.publication_completeness(MvsFrameKind::TypeOne) {
+            Ok(completeness) => completeness,
+            Err(outcome) => return Ok(outcome),
+        };
+        if patches.is_empty() || patches.len() > MAX_TYPE_ONE_PATCHES {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        self.publish_patches(runtime, patches, completeness)
     }
 
     #[allow(dead_code)] // Task 2 接入 network reader 前保留为 crate 内恢复入口。
@@ -414,6 +442,15 @@ impl AppleSurfacePublisher {
         patch: PixelPatch,
         completeness: FrameCompleteness,
     ) -> Result<PublicationOutcome, ProtocolError> {
+        self.publish_patches(runtime, vec![patch], completeness)
+    }
+
+    fn publish_patches(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        patches: Vec<PixelPatch>,
+        completeness: FrameCompleteness,
+    ) -> Result<PublicationOutcome, ProtocolError> {
         let revision = self
             .revision
             .checked_add(1)
@@ -422,7 +459,7 @@ impl AppleSurfacePublisher {
             session_id: self.session_id,
             generation: self.generation,
             revision,
-            patches: vec![patch],
+            patches,
         }) {
             Ok(()) => {}
             Err(ProtocolError::NeedsFullSnapshot) => {
@@ -879,6 +916,90 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn type_one_compact_batch_publishes_one_damage_and_one_boundary() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let (mut runtime, frames) = runtime_with_frames(session_id);
+        let surface = DisplaySurface::new(1, size).unwrap();
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        publisher
+            .publish_committed_patch(
+                &mut runtime,
+                &surface,
+                1,
+                PixelPatch {
+                    rect: PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 1,
+                    },
+                    stride_bytes: 8,
+                    pixels: PixelBuffer::new(vec![1, 0, 0, 0, 2, 0, 0, 0]),
+                },
+                MvsFrameKind::TypeZero {
+                    complete_surface: true,
+                    initial_nonblack: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            publisher
+                .publish_committed_type_one_patches(
+                    &mut runtime,
+                    &surface,
+                    1,
+                    vec![
+                        PixelPatch {
+                            rect: PixelRect {
+                                x: 0,
+                                y: 0,
+                                width: 1,
+                                height: 1,
+                            },
+                            stride_bytes: 4,
+                            pixels: PixelBuffer::new(vec![3, 0, 0, 0]),
+                        },
+                        PixelPatch {
+                            rect: PixelRect {
+                                x: 1,
+                                y: 0,
+                                width: 1,
+                                height: 1,
+                            },
+                            stride_bytes: 4,
+                            pixels: PixelBuffer::new(vec![4, 0, 0, 0]),
+                        },
+                    ],
+                )
+                .unwrap(),
+            PublicationOutcome::Published
+        );
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 5);
+        let SurfaceUpdate::Damage {
+            revision,
+            ref patches,
+            ..
+        } = frames[3]
+        else {
+            panic!("type-1 batch must publish one damage");
+        };
+        assert_eq!(revision, 2);
+        assert_eq!(patches.len(), 2);
+        assert!(matches!(
+            frames[4],
+            SurfaceUpdate::FrameBoundary {
+                revision: 2,
+                completeness: FrameCompleteness::Incremental,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -131,16 +131,20 @@ impl InputRouter {
         self.disarm_remote_ownership()
     }
 
-    pub fn enter_remote_surface(&mut self) {
+    pub fn enter_remote_surface(&mut self) -> bool {
+        if !self.is_interactive() {
+            return false;
+        }
         self.keyboard_domain = KeyboardDomain::RemoteSurface;
         self.keyboard_armed = self.is_interactive_and_focused() && self.local_keys.is_empty();
+        true
     }
 
     pub fn pointer_pressed_for_domain(&mut self, ownership: InputOwnership) -> Option<InputEvent> {
         match ownership {
             InputOwnership::Ui => self.enter_local_chrome(),
             InputOwnership::Remote => {
-                self.enter_remote_surface();
+                let _ = self.enter_remote_surface();
                 None
             }
         }
@@ -153,8 +157,10 @@ impl InputRouter {
         enter_local_shortcut: bool,
     ) -> KeyboardPreDispatch {
         if self.keyboard_domain == KeyboardDomain::LocalChrome {
-            if code.usb_hid_usage() == 0x29 && state == KeyState::Pressed {
-                self.enter_remote_surface();
+            if code.usb_hid_usage() == 0x29
+                && state == KeyState::Pressed
+                && self.enter_remote_surface()
+            {
                 return KeyboardPreDispatch::EnterRemoteSurface;
             }
             return KeyboardPreDispatch::LocalChrome;
@@ -998,6 +1004,19 @@ mod tests {
     fn blocked_login_and_disabled_remote_keyboard_stay_local_without_remote_held_state() {
         let mut input = InputRouter::default();
         let a = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04);
+        let escape = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x29);
+
+        assert_eq!(
+            input.pointer_pressed_for_domain(InputOwnership::Remote),
+            None
+        );
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+        assert_eq!(
+            input.dispatch_key_event(Some(escape), KeyState::Pressed, false, true, false),
+            KeyboardPreDispatch::LocalChrome
+        );
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+
         assert_eq!(
             input.dispatch_key_event(Some(a), KeyState::Pressed, false, true, false),
             KeyboardPreDispatch::LocalChrome

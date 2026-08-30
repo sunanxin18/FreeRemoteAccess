@@ -130,10 +130,14 @@ mod tests {
         HighPerformanceObservation, HighPerformanceStartupGate, HighPerformanceUnavailable,
         APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
     };
-    use crate::hpss::ServerStateGeometry;
+    use crate::hpss::{
+        parse_server_state_geometry, ServerStateGeometry,
+        CAPTURED_SERVER_STATE_WITH_ACTIVE_FRAMEBUFFER,
+    };
 
     const GEOMETRY: ServerStateGeometry = ServerStateGeometry {
-        record_count: 5,
+        message_version: 5,
+        display_count: 1,
         width: 1440,
         height: 2560,
     };
@@ -183,6 +187,24 @@ mod tests {
         assert_eq!(confirmed.size.height, 2560);
         assert!(!gate.is_awaiting());
         assert!(gate.is_confirmed());
+    }
+
+    #[test]
+    fn strict_startup_confirms_the_captured_active_framebuffer_group() {
+        let requested_at = Instant::now();
+        let mut gate = HighPerformanceStartupGate::new(requested_at);
+        let geometry =
+            parse_server_state_geometry(&CAPTURED_SERVER_STATE_WITH_ACTIVE_FRAMEBUFFER).unwrap();
+
+        let observation = gate
+            .observe_server_state_at(geometry, requested_at + Duration::from_secs(1))
+            .unwrap();
+
+        let HighPerformanceObservation::Confirmed(confirmation) = observation else {
+            panic!("捕获的活动 framebuffer 几何必须确认高性能显示器");
+        };
+        assert_eq!(confirmation.size.width, 1331);
+        assert_eq!(confirmation.size.height, 2365);
     }
 
     #[test]
@@ -266,7 +288,8 @@ mod tests {
         let error = gate
             .observe_server_state_at(
                 ServerStateGeometry {
-                    record_count: 5,
+                    message_version: 5,
+                    display_count: 1,
                     width: 1920,
                     height: 1080,
                 },
@@ -287,12 +310,14 @@ mod tests {
         let requested_at = Instant::now();
         for geometry in [
             ServerStateGeometry {
-                record_count: 5,
+                message_version: 5,
+                display_count: 1,
                 width: 0,
                 height: 2560,
             },
             ServerStateGeometry {
-                record_count: 5,
+                message_version: 5,
+                display_count: 1,
                 width: 1440,
                 height: 0,
             },

@@ -442,6 +442,15 @@ pub enum AudioState {
     Failed,
 }
 
+/// framebuffer 画面请求成功写出，到对应完整响应完成 decode、commit 与 surface
+/// publication 的协议侧耗时。它不表示 ping、输入到显示或本地 present 延迟。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameResponseTiming {
+    pub generation: u64,
+    pub sample_ms: u32,
+    pub smoothed_ms: u32,
+}
+
 pub enum SessionCommand {
     Input(SessionInput),
     ViewportChanged {
@@ -468,6 +477,7 @@ pub enum SessionEvent {
         size: frd_core::PixelSize,
     },
     CapabilitiesChanged(SessionCapabilities),
+    FrameResponseTiming(FrameResponseTiming),
     Clipboard(ClipboardPayload),
     AudioState(AudioState),
     Closed(ProtocolExit),

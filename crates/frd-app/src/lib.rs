@@ -47,9 +47,11 @@ mod tests {
 
     use frd_protocol_api::{
         evaluate_server_identity, AudioState, ClipboardPayload, ConnectRequest, ConnectionStage,
-        Endpoint, ProtocolCatalog, ProtocolError, ProtocolId, ServerIdentityChallenge,
-        ServerIdentityDecision, ServerIdentityValidation, SessionCommand, SessionEvent,
+        Endpoint, FrameResponseTiming, ProtocolCatalog, ProtocolError, ProtocolId,
+        ServerIdentityChallenge, ServerIdentityDecision, ServerIdentityValidation, SessionCommand,
+        SessionEvent,
     };
+
     use frd_session::{
         CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
         SessionStartOutcome, SessionStartPermit,
@@ -66,6 +68,66 @@ mod tests {
     };
 
     #[test]
+    fn frame_response_timing_updates_remote_chrome_and_clears_on_generation_and_failure() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+
+        controller.handle_session_event(SessionEvent::FrameResponseTiming(FrameResponseTiming {
+            generation: 1,
+            sample_ms: 36,
+            smoothed_ms: 40,
+        }));
+        assert_eq!(
+            controller.session_chrome().unwrap().frame_response_ms,
+            None,
+            "waiting chrome does not present timing"
+        );
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        assert_eq!(
+            controller.session_chrome().unwrap().frame_response_ms,
+            Some(40)
+        );
+        controller.handle_session_event(SessionEvent::FrameResponseTiming(FrameResponseTiming {
+            generation: 0,
+            sample_ms: 90,
+            smoothed_ms: 99,
+        }));
+        assert_eq!(
+            controller.session_chrome().unwrap().frame_response_ms,
+            Some(40),
+            "a stale-generation timing event must be ignored"
+        );
+
+        controller.handle_session_event(SessionEvent::SurfaceGenerationChanged {
+            session_id,
+            generation: 2,
+            size: PixelSize::new(1024, 768).unwrap(),
+        });
+        assert_eq!(controller.session_chrome().unwrap().frame_response_ms, None);
+        controller.handle_session_event(SessionEvent::FrameResponseTiming(FrameResponseTiming {
+            generation: 1,
+            sample_ms: 90,
+            smoothed_ms: 99,
+        }));
+        assert_eq!(
+            controller.session_chrome().unwrap().frame_response_ms,
+            None,
+            "the prior generation cannot restore cleared timing"
+        );
+
+        controller.handle_session_event(SessionEvent::Error(ProtocolError::adapter(
+            ProtocolId::apple_hpss_mvs(),
+            "timing_test_failure",
+        )));
+        assert_eq!(controller.session_chrome().unwrap().frame_response_ms, None);
+    }
+
+    #[test]
     fn session_chrome_maps_waiting_connected_and_disconnecting_states_literally() {
         let session_id = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
@@ -75,6 +137,7 @@ mod tests {
             Some(SessionChromeModel {
                 connection: ConnectionGlyph::WaitingForFrame,
                 diagnostics: None,
+                frame_response_ms: None,
                 audio: CapabilityGlyphState::Unavailable,
                 clipboard: CapabilityGlyphState::Unavailable,
                 action: Some(SessionChromeAction::Cancel),
@@ -92,6 +155,7 @@ mod tests {
             Some(SessionChromeModel {
                 connection: ConnectionGlyph::Connected,
                 diagnostics: None,
+                frame_response_ms: None,
                 audio: CapabilityGlyphState::Unavailable,
                 clipboard: CapabilityGlyphState::Unavailable,
                 action: Some(SessionChromeAction::Disconnect),
@@ -110,6 +174,7 @@ mod tests {
             Some(SessionChromeModel {
                 connection: ConnectionGlyph::Disconnecting,
                 diagnostics: None,
+                frame_response_ms: None,
                 audio: CapabilityGlyphState::Unavailable,
                 clipboard: CapabilityGlyphState::Unavailable,
                 action: None,
@@ -134,6 +199,7 @@ mod tests {
             Some(SessionChromeModel {
                 connection: ConnectionGlyph::Connecting,
                 diagnostics: None,
+                frame_response_ms: None,
                 audio: CapabilityGlyphState::Unavailable,
                 clipboard: CapabilityGlyphState::Unavailable,
                 action: Some(SessionChromeAction::Cancel),
@@ -179,6 +245,7 @@ mod tests {
             Some(SessionChromeModel {
                 connection: ConnectionGlyph::Connected,
                 diagnostics: None,
+                frame_response_ms: None,
                 audio: CapabilityGlyphState::Available,
                 clipboard: CapabilityGlyphState::Available,
                 action: Some(SessionChromeAction::Disconnect),

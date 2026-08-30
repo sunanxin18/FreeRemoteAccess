@@ -804,6 +804,9 @@ mod tests {
         server_state[18..20].copy_from_slice(&5u16.to_be_bytes());
         server_state[20..22].copy_from_slice(&width.to_be_bytes());
         server_state[22..24].copy_from_slice(&height.to_be_bytes());
+        server_state[24..26].copy_from_slice(&width.to_be_bytes());
+        server_state[26..28].copy_from_slice(&height.to_be_bytes());
+        server_state[36..38].copy_from_slice(&1u16.to_be_bytes());
         server_state
     }
 
