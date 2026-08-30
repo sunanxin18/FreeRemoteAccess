@@ -2912,10 +2912,21 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 self.input.set_modifiers(map_modifiers(modifiers.state()));
             }
             WindowEvent::Resized(size) => {
+                #[cfg(target_os = "windows")]
+                let minimized = self
+                    .window
+                    .as_ref()
+                    .and_then(|window| window.window.is_minimized());
                 if let Some(size) = PixelSize::new(size.width, size.height) {
                     self.commit_window_resize(size);
                 } else if let Some(window) = self.window.as_mut() {
                     window.compositor.pause_presenting();
+                }
+                #[cfg(target_os = "windows")]
+                if let Some(minimized) = minimized {
+                    self.metrics
+                        .observe_window_minimized(minimized, std::time::Instant::now());
+                    self.publish_metrics_failure();
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {

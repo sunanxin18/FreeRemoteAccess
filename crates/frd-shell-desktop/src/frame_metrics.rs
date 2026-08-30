@@ -333,15 +333,19 @@ impl FramePipelineMetrics {
     }
 
     pub(crate) fn observe_occluded(&mut self, occluded: bool, at: Instant) {
+        self.observe_window_minimized(occluded, at);
+    }
+
+    pub(crate) fn observe_window_minimized(&mut self, minimized: bool, at: Instant) {
         let Some(state) = self.run_phase.as_ref() else {
             return;
         };
-        let next = if occluded
+        let next = if minimized
             && state.phase == MetricPhase::VisibleMeasurement
             && at.saturating_duration_since(state.phase_started_at) >= Duration::from_secs(30)
         {
             Some(MetricPhase::MinimizedWarmup)
-        } else if !occluded
+        } else if !minimized
             && state.phase == MetricPhase::MinimizedMeasurement
             && at.saturating_duration_since(state.phase_started_at) >= Duration::from_secs(30)
         {
@@ -470,10 +474,122 @@ mod tests {
     use frd_protocol_api::FrameResponseTiming;
     use frd_render_wgpu::{ApplyOutcome, GpuScopeObservation};
 
+    use crate::frame_metrics_sink::MetricPhase;
+
     use super::{
         checked_mailbox_age, BatchMetricContext, FramePipelineMetrics, MetricIdentity,
-        SerialDrainAggregate,
+        MetricPhaseState, SerialDrainAggregate,
     };
+
+    fn metrics_in_phase(
+        label: &str,
+        phase: MetricPhase,
+        phase_started_at: Instant,
+    ) -> (FramePipelineMetrics, std::path::PathBuf, std::path::PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("frd-window-phase-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("events.csv");
+        let mut metrics = FramePipelineMetrics::test_sink(path.clone(), phase_started_at).unwrap();
+        metrics.run_phase = Some(MetricPhaseState {
+            phase,
+            run_started_at: phase_started_at,
+            phase_started_at,
+        });
+        (metrics, directory, path)
+    }
+
+    fn finish_phase_test(
+        mut metrics: FramePipelineMetrics,
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+    ) -> String {
+        metrics.close();
+        let output = fs::read_to_string(path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        output
+    }
+
+    #[test]
+    fn windows_minimized_resize_evidence_transitions_completed_visible_measurement() {
+        let started_at = Instant::now();
+        let observed_at = started_at + Duration::from_secs(30);
+        let (mut metrics, directory, path) =
+            metrics_in_phase("minimized", MetricPhase::VisibleMeasurement, started_at);
+
+        metrics.observe_window_minimized(true, observed_at);
+        metrics.observe_window_minimized(true, observed_at + Duration::from_secs(1));
+
+        assert_eq!(metrics.current_phase(), Some(MetricPhase::MinimizedWarmup));
+        assert_eq!(
+            metrics.run_phase.as_ref().unwrap().phase_started_at,
+            observed_at
+        );
+        let output = finish_phase_test(metrics, directory, path);
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains(",MinimizedWarmup,PhaseBoundary,"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn windows_restored_resize_evidence_transitions_completed_minimized_measurement() {
+        let started_at = Instant::now();
+        let observed_at = started_at + Duration::from_secs(30);
+        let (mut metrics, directory, path) =
+            metrics_in_phase("restored", MetricPhase::MinimizedMeasurement, started_at);
+
+        metrics.observe_window_minimized(false, observed_at);
+        metrics.observe_window_minimized(false, observed_at + Duration::from_secs(1));
+
+        assert_eq!(metrics.current_phase(), Some(MetricPhase::Restore));
+        assert_eq!(
+            metrics.run_phase.as_ref().unwrap().phase_started_at,
+            observed_at
+        );
+        let output = finish_phase_test(metrics, directory, path);
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains(",Restore,PhaseBoundary,"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn windows_visible_nonzero_resize_evidence_cannot_skip_phases() {
+        let started_at = Instant::now();
+        let observed_at = started_at + Duration::from_secs(30);
+        let (mut metrics, directory, path) = metrics_in_phase(
+            "visible-resize",
+            MetricPhase::VisibleMeasurement,
+            started_at,
+        );
+
+        metrics.observe_window_minimized(false, observed_at);
+
+        assert_eq!(
+            metrics.current_phase(),
+            Some(MetricPhase::VisibleMeasurement)
+        );
+        assert_eq!(
+            metrics.run_phase.as_ref().unwrap().phase_started_at,
+            started_at
+        );
+        let output = finish_phase_test(metrics, directory, path);
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.contains(",PhaseBoundary,"))
+                .count(),
+            0
+        );
+    }
 
     #[test]
     fn mailbox_age_returns_none_when_observation_precedes_enqueue_time() {
