@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use frd_core::SessionId;
-use frd_frame::EnqueuedSurfaceUpdate;
+use frd_frame::FrameTransactionError;
 use frd_protocol_api::FrameResponseTiming;
-use frd_render_wgpu::{ApplyOutcome, GpuScopeObservation, RendererError};
+use frd_render_wgpu::{BatchApplyFailure, BatchApplyOutcome, BatchScopeDiagnostics, RendererError};
 
 use crate::frame_metrics_sink::{
     duration_us, FrameMetricsSink, MetricBatchFailureClass, MetricBatchResult, MetricEventKind,
@@ -49,89 +49,6 @@ pub(crate) struct BatchMetricContext {
     pub(crate) source_update_count: usize,
     pub(crate) oldest_age: Option<Duration>,
     pub(crate) transaction_count: usize,
-}
-
-pub(crate) struct DrainedFrameUpdates {
-    pub(crate) updates: Vec<EnqueuedSurfaceUpdate>,
-    pub(crate) drain_started_at: Instant,
-    pub(crate) oldest_age: Duration,
-}
-
-impl DrainedFrameUpdates {
-    pub(crate) fn new(
-        updates: Vec<EnqueuedSurfaceUpdate>,
-        drain_started_at: Instant,
-    ) -> Result<Self, MetricSinkError> {
-        let earliest = updates
-            .iter()
-            .map(|entry| entry.enqueued_at)
-            .min()
-            .ok_or(MetricSinkError::InvalidObservation)?;
-        let oldest_age = checked_mailbox_age(drain_started_at, earliest)
-            .ok_or(MetricSinkError::InvalidObservation)?;
-        Ok(Self {
-            updates,
-            drain_started_at,
-            oldest_age,
-        })
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct SerialDrainAggregate {
-    pub(crate) successful_updates: usize,
-    pub(crate) uploaded_rectangles: usize,
-    pub(crate) scope: GpuScopeObservation,
-}
-
-impl SerialDrainAggregate {
-    pub(crate) fn observe(
-        &mut self,
-        outcome: ApplyOutcome,
-        actual_delta: GpuScopeObservation,
-    ) -> Result<(), MetricSinkError> {
-        self.observe_scope(actual_delta)?;
-        self.successful_updates = self
-            .successful_updates
-            .checked_add(1)
-            .ok_or(MetricSinkError::InvalidObservation)?;
-        if let ApplyOutcome::Damage {
-            uploaded_rectangles,
-        } = outcome
-        {
-            self.uploaded_rectangles = self
-                .uploaded_rectangles
-                .checked_add(uploaded_rectangles)
-                .ok_or(MetricSinkError::InvalidObservation)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn observe_failed_scope(
-        &mut self,
-        actual_delta: GpuScopeObservation,
-    ) -> Result<(), MetricSinkError> {
-        self.observe_scope(actual_delta)
-    }
-
-    fn observe_scope(&mut self, actual_delta: GpuScopeObservation) -> Result<(), MetricSinkError> {
-        self.scope.begins = self
-            .scope
-            .begins
-            .checked_add(actual_delta.begins)
-            .ok_or(MetricSinkError::InvalidObservation)?;
-        self.scope.finishes = self
-            .scope
-            .finishes
-            .checked_add(actual_delta.finishes)
-            .ok_or(MetricSinkError::InvalidObservation)?;
-        self.scope.polls = self
-            .scope
-            .polls
-            .checked_add(actual_delta.polls)
-            .ok_or(MetricSinkError::InvalidObservation)?;
-        Ok(())
-    }
 }
 
 impl FramePipelineMetrics {
@@ -255,12 +172,11 @@ impl FramePipelineMetrics {
         self.write(row);
     }
 
-    pub(crate) fn observe_serial_drain(
+    pub(crate) fn observe_batch_success(
         &mut self,
         context: BatchMetricContext,
-        aggregate: &SerialDrainAggregate,
-        error: Option<RendererError>,
-        completed_at: Instant,
+        outcome: &BatchApplyOutcome,
+        scope: &BatchScopeDiagnostics,
     ) {
         let Some(phase) = self.current_phase() else {
             return;
@@ -268,43 +184,122 @@ impl FramePipelineMetrics {
         let Some(sink) = self.sink.as_ref() else {
             return;
         };
-        let mut row = sink.new_row(phase, MetricEventKind::SerialDrain);
-        if let Some(identity) = self.active_identity {
-            row.session_id = Some(identity.session_id.get());
-            row.generation = Some(identity.generation);
+        let Some(oldest_age) = context.oldest_age else {
+            self.record_failure(MetricSinkError::InvalidObservation);
+            return;
+        };
+        let Some(batch_cpu) = Instant::now().checked_duration_since(context.batch_started_at)
+        else {
+            self.record_failure(MetricSinkError::InvalidObservation);
+            return;
+        };
+        let mut row = sink.new_row(phase, MetricEventKind::CandidateBatch);
+        if let Some(receipt) = outcome.final_boundary {
+            row.session_id = Some(receipt.session_id.get());
+            row.generation = Some(receipt.generation);
+            row.revision = Some(receipt.revision);
+        } else if let Some(installed) = outcome.installed_surface {
+            row.session_id = Some(installed.session_id.get());
+            row.generation = Some(installed.generation);
         }
         row.source_updates = u64::try_from(context.source_update_count).ok();
         row.transactions = u64::try_from(context.transaction_count).ok();
-        row.rectangles = u64::try_from(aggregate.uploaded_rectangles).ok();
-        row.batch_cpu_us = completed_at
-            .checked_duration_since(context.batch_started_at)
-            .map(duration_us);
-        row.mailbox_age_us = context.oldest_age.map(duration_us);
-        row.scope_begins = Some(aggregate.scope.begins);
-        row.scope_finishes = Some(aggregate.scope.finishes);
-        row.scope_polls = Some(aggregate.scope.polls);
-        match error {
-            None => row.batch_result = Some(MetricBatchResult::Success),
-            Some(error) => {
-                row.batch_result = Some(MetricBatchResult::SerialFailure);
-                if let RendererError::GpuFault(fault) = error {
-                    row.batch_failure_class = Some(MetricBatchFailureClass::Gpu);
-                    row.gpu_fault_code = Some(fault);
-                } else {
-                    row.batch_failure_class = Some(MetricBatchFailureClass::RendererExecution);
-                }
-            }
-        }
-        if row.source_updates.is_none()
-            || row.transactions.is_none()
-            || row.rectangles.is_none()
-            || row.batch_cpu_us.is_none()
-            || row.mailbox_age_us.is_none()
-        {
+        row.rectangles = u64::try_from(outcome.uploaded_rectangles).ok();
+        row.batch_cpu_us = Some(duration_us(batch_cpu));
+        row.mailbox_age_us = Some(duration_us(oldest_age));
+        row.scope_begins = Some(scope.observation.begins);
+        row.scope_finishes = Some(scope.observation.finishes);
+        row.scope_polls = Some(scope.observation.polls);
+        row.gpu_fault_code = scope.observed_fault;
+        row.batch_result = Some(MetricBatchResult::Success);
+        if row.source_updates.is_none() || row.transactions.is_none() || row.rectangles.is_none() {
             self.record_failure(MetricSinkError::InvalidObservation);
             return;
         }
         self.write(row);
+    }
+
+    pub(crate) fn observe_batch_failure(
+        &mut self,
+        context: BatchMetricContext,
+        failure: &BatchApplyFailure,
+    ) {
+        let Some(phase) = self.current_phase() else {
+            return;
+        };
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
+        let completed_at = Instant::now();
+        let mut row = sink.new_row(phase, MetricEventKind::StableFault);
+        if let Some(identity) = failure.identity {
+            row.session_id = Some(identity.session_id.get());
+            row.generation = Some(identity.generation);
+            row.revision = Some(identity.revision);
+        }
+        row.source_updates = u64::try_from(context.source_update_count).ok();
+        row.transactions = u64::try_from(context.transaction_count).ok();
+        row.batch_cpu_us = completed_at
+            .checked_duration_since(context.batch_started_at)
+            .map(duration_us);
+        row.mailbox_age_us = context.oldest_age.map(duration_us);
+        if let Some(scope) = failure.scope {
+            row.scope_begins = Some(scope.observation.begins);
+            row.scope_finishes = Some(scope.observation.finishes);
+            row.scope_polls = Some(scope.observation.polls);
+            row.gpu_fault_code = scope.observed_fault;
+        }
+        if row.gpu_fault_code.is_none() {
+            if let RendererError::GpuFault(fault) = failure.primary {
+                row.gpu_fault_code = Some(fault);
+            }
+        }
+        row.batch_result = Some(MetricBatchResult::RendererFailure);
+        row.batch_failure_class = Some(match failure.primary {
+            RendererError::GpuFault(_) | RendererError::ScopeObservationInvalid => {
+                MetricBatchFailureClass::Gpu
+            }
+            _ if failure.scope.is_none() => MetricBatchFailureClass::RendererPlanning,
+            _ => MetricBatchFailureClass::RendererExecution,
+        });
+        let valid = row.source_updates.is_some()
+            && row.transactions.is_some()
+            && row.batch_cpu_us.is_some()
+            && row.mailbox_age_us.is_some();
+        self.write(row);
+        if !valid {
+            self.record_failure(MetricSinkError::InvalidObservation);
+        }
+    }
+
+    pub(crate) fn observe_compile_failure(
+        &mut self,
+        context: BatchMetricContext,
+        _error: FrameTransactionError,
+    ) {
+        let Some(phase) = self.current_phase() else {
+            return;
+        };
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
+        let mut row = sink.new_row(phase, MetricEventKind::StableFault);
+        row.source_updates = u64::try_from(context.source_update_count).ok();
+        row.transactions = u64::try_from(context.transaction_count).ok();
+        row.batch_cpu_us = Instant::now()
+            .checked_duration_since(context.batch_started_at)
+            .map(duration_us);
+        row.mailbox_age_us = context.oldest_age.map(duration_us);
+        row.batch_result = Some(MetricBatchResult::CompileFailure);
+        row.batch_failure_class = Some(MetricBatchFailureClass::Compiler);
+        let valid = row.source_updates.is_some()
+            && row.transactions.is_some()
+            && row.batch_cpu_us.is_some()
+            && row.mailbox_age_us.is_some();
+        self.write(row);
+        if !valid {
+            self.record_failure(MetricSinkError::InvalidObservation);
+        }
     }
 
     pub(crate) fn clear_input_probe(&mut self) {
@@ -401,10 +396,6 @@ impl FramePipelineMetrics {
         self.failure.take()
     }
 
-    pub(crate) fn invalidate(&mut self, error: MetricSinkError) {
-        self.record_failure(error);
-    }
-
     fn current_phase(&self) -> Option<MetricPhase> {
         self.run_phase.as_ref().map(|state| state.phase)
     }
@@ -470,15 +461,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use frd_core::{PixelSize, SessionId};
-    use frd_frame::{EnqueuedSurfaceUpdate, PixelFormat, SurfaceUpdate};
+    use frd_frame::{FrameTransactionError, PixelFormat};
     use frd_protocol_api::FrameResponseTiming;
-    use frd_render_wgpu::{ApplyOutcome, GpuScopeObservation};
+    use frd_render_wgpu::{
+        BatchApplyFailure, BatchApplyOutcome, BatchScopeDiagnostics, FrameBatchIdentity,
+        GpuFaultClass, GpuScopeObservation, InstalledSurface, PresentationReceipt, RendererError,
+    };
 
     use crate::frame_metrics_sink::MetricPhase;
 
     use super::{
         checked_mailbox_age, BatchMetricContext, FramePipelineMetrics, MetricIdentity,
-        MetricPhaseState, SerialDrainAggregate,
+        MetricPhaseState,
     };
 
     fn metrics_in_phase(
@@ -603,110 +597,192 @@ mod tests {
     }
 
     #[test]
-    fn serial_drain_age_uses_earliest_envelope_after_unlock() {
+    fn batch_metric_context_reaches_success_and_full_failure_observers() {
+        let started_at = Instant::now();
         let session_id = SessionId::allocate();
-        let now = Instant::now();
-        let earlier = now - Duration::from_millis(40);
-        let later = now - Duration::from_millis(10);
-        let envelopes = vec![
-            EnqueuedSurfaceUpdate {
-                enqueued_at: later,
-                update: SurfaceUpdate::Reset {
+        let context = BatchMetricContext {
+            batch_started_at: started_at,
+            source_update_count: 7,
+            oldest_age: Some(Duration::from_micros(11)),
+            transaction_count: 3,
+        };
+        let (mut success_metrics, success_directory, success_path) =
+            metrics_in_phase("candidate-success", MetricPhase::VisibleWarmup, started_at);
+        success_metrics.begin_session(session_id);
+        success_metrics.observe_generation(session_id, 9);
+        success_metrics.observe_batch_success(
+            context,
+            &BatchApplyOutcome {
+                installed_surface: Some(InstalledSurface {
                     session_id,
-                    generation: 2,
+                    generation: 9,
                     size: PixelSize::new(4, 3).unwrap(),
-                    format: PixelFormat::Bgra8UnormSrgb,
-                },
-            },
-            EnqueuedSurfaceUpdate {
-                enqueued_at: earlier,
-                update: SurfaceUpdate::FrameBoundary {
+                    format: PixelFormat::Bgrx8UnormSrgb,
+                }),
+                uploaded_rectangles: 5,
+                had_texture_writes: true,
+                final_boundary: Some(PresentationReceipt {
                     session_id,
-                    generation: 2,
-                    revision: 1,
+                    generation: 9,
+                    revision: 13,
                     completeness: frd_frame::FrameCompleteness::FullBaseline,
-                },
+                }),
             },
-        ];
-        let drain_started_at = Instant::now();
-        let drained = super::DrainedFrameUpdates::new(envelopes, drain_started_at).unwrap();
-        assert_eq!(drained.oldest_age, drain_started_at.duration_since(earlier));
+            &BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: None,
+            },
+        );
+        let success = finish_phase_test(success_metrics, success_directory, success_path);
+        let success_row = success
+            .lines()
+            .find(|line| line.contains(",CandidateBatch,"))
+            .unwrap();
+        let fields = success_row.split(',').collect::<Vec<_>>();
+        assert_eq!(&fields[5..=6], &["Success", ""]);
+        assert_eq!(
+            &fields[8..=13],
+            &[
+                session_id.get().to_string().as_str(),
+                "9",
+                "13",
+                "7",
+                "3",
+                "5"
+            ]
+        );
+        assert_eq!(fields[15], "11");
+        assert_eq!(&fields[16..=18], &["1", "1", "1"]);
+
+        let (mut failure_metrics, failure_directory, failure_path) =
+            metrics_in_phase("candidate-failure", MetricPhase::VisibleWarmup, started_at);
+        failure_metrics.begin_session(session_id);
+        failure_metrics.observe_generation(session_id, 9);
+        let failure = BatchApplyFailure {
+            identity: Some(FrameBatchIdentity {
+                session_id,
+                generation: 9,
+                revision: 13,
+            }),
+            primary: RendererError::GpuFault(GpuFaultClass::DeviceLost),
+            secondary_execution: Some(RendererError::BoundaryWithoutMatchingDamage),
+            scope: Some(BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 2,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: Some(GpuFaultClass::DeviceLost),
+            }),
+        };
+        failure_metrics.observe_batch_failure(context, &failure);
+        let failure_output = finish_phase_test(failure_metrics, failure_directory, failure_path);
+        assert!(!failure_output.contains(",CandidateBatch,"));
+        let failure_row = failure_output
+            .lines()
+            .find(|line| line.contains(",StableFault,"))
+            .unwrap();
+        let fields = failure_row.split(',').collect::<Vec<_>>();
+        assert_eq!(&fields[5..=6], &["RendererFailure", "Gpu"]);
+        assert_eq!(
+            &fields[8..=12],
+            &[session_id.get().to_string().as_str(), "9", "13", "7", "3"]
+        );
+        assert_eq!(fields[15], "11");
+        assert_eq!(&fields[16..=19], &["2", "1", "1", "DeviceLost"]);
+
+        let (mut compile_metrics, compile_directory, compile_path) =
+            metrics_in_phase("compile-failure", MetricPhase::VisibleWarmup, started_at);
+        compile_metrics.observe_compile_failure(context, FrameTransactionError::ForeignSession);
+        let compile_output = finish_phase_test(compile_metrics, compile_directory, compile_path);
+        assert!(!compile_output.contains(",CandidateBatch,"));
+        let compile_row = compile_output
+            .lines()
+            .find(|line| line.contains(",StableFault,"))
+            .unwrap();
+        let fields = compile_row.split(',').collect::<Vec<_>>();
+        assert_eq!(&fields[5..=6], &["CompileFailure", "Compiler"]);
+        assert_eq!(fields[11], "7");
+        assert_eq!(fields[12], "3");
+        assert_eq!(fields[15], "11");
     }
 
     #[test]
-    fn serial_nonempty_drain_emits_one_aggregate_row() {
-        let directory =
-            std::env::temp_dir().join(format!("frd-serial-drain-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
-        let path = directory.join("events.csv");
+    fn candidate_metric_row_uses_observed_scope_and_success_is_one_one_one() {
         let started_at = Instant::now();
-        let mut metrics = FramePipelineMetrics::test_sink(path.clone(), started_at).unwrap();
         let session_id = SessionId::allocate();
-        let identity = MetricIdentity {
-            session_id,
-            generation: 1,
+        let context = BatchMetricContext {
+            batch_started_at: started_at,
+            source_update_count: 2,
+            oldest_age: Some(Duration::from_micros(4)),
+            transaction_count: 1,
         };
-        metrics.begin_session(session_id);
-        metrics.observe_generation(session_id, 1);
-        metrics.observe_full_baseline_presented(identity, 1, started_at);
-        let mut aggregate = SerialDrainAggregate::default();
-        for outcome in [
-            ApplyOutcome::Reset,
-            ApplyOutcome::Damage {
-                uploaded_rectangles: 2,
-            },
-            ApplyOutcome::BoundaryPending(frd_render_wgpu::PresentationReceipt {
+        let outcome = BatchApplyOutcome {
+            installed_surface: None,
+            uploaded_rectangles: 1,
+            had_texture_writes: true,
+            final_boundary: Some(PresentationReceipt {
                 session_id,
                 generation: 1,
-                revision: 1,
-                completeness: frd_frame::FrameCompleteness::FullBaseline,
+                revision: 2,
+                completeness: frd_frame::FrameCompleteness::Incremental,
             }),
-        ] {
-            aggregate
-                .observe(
-                    outcome,
-                    GpuScopeObservation {
-                        begins: 1,
-                        finishes: 1,
-                        polls: 1,
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(aggregate.successful_updates, 3);
-        assert_eq!(aggregate.uploaded_rectangles, 2);
-        assert_eq!(
-            aggregate.scope,
+        };
+        let write_candidate = |label: &str, observation: GpuScopeObservation| {
+            let (mut metrics, directory, path) =
+                metrics_in_phase(label, MetricPhase::VisibleWarmup, started_at);
+            metrics.begin_session(session_id);
+            metrics.observe_generation(session_id, 1);
+            metrics.observe_batch_success(
+                context,
+                &outcome,
+                &BatchScopeDiagnostics {
+                    observation,
+                    observed_fault: None,
+                },
+            );
+            finish_phase_test(metrics, directory, path)
+        };
+
+        let conforming = write_candidate(
+            "scope-one-one-one",
             GpuScopeObservation {
-                begins: 3,
-                finishes: 3,
-                polls: 3
-            }
-        );
-        metrics.observe_serial_drain(
-            BatchMetricContext {
-                batch_started_at: started_at,
-                source_update_count: 3,
-                oldest_age: Some(Duration::from_millis(4)),
-                transaction_count: 0,
+                begins: 1,
+                finishes: 1,
+                polls: 1,
             },
-            &aggregate,
-            None,
-            started_at + Duration::from_millis(7),
         );
-        metrics.close();
-        let output = fs::read_to_string(path).unwrap();
-        let rows = output
+        let row = conforming
             .lines()
-            .filter(|line| line.contains(",SerialDrain,"))
+            .find(|line| line.contains(",CandidateBatch,"))
+            .unwrap();
+        assert_eq!(
+            &row.split(',').collect::<Vec<_>>()[16..=18],
+            &["1", "1", "1"]
+        );
+
+        let nonconforming = write_candidate(
+            "scope-two-one-one",
+            GpuScopeObservation {
+                begins: 2,
+                finishes: 1,
+                polls: 1,
+            },
+        );
+        let fields = nonconforming
+            .lines()
+            .find(|line| line.contains(",CandidateBatch,"))
+            .unwrap()
+            .split(',')
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 1);
-        let fields = rows[0].split(',').collect::<Vec<_>>();
-        assert_eq!(fields[5], "Success");
-        assert_eq!(fields[13], "2");
-        assert_eq!(&fields[16..=18], &["3", "3", "3"]);
-        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(&fields[16..=18], &["2", "1", "1"]);
+        let comparison_gate_accepts =
+            fields[5] == "Success" && fields[16] == "1" && fields[17] == "1" && fields[18] == "1";
+        assert!(!comparison_gate_accepts);
     }
 
     #[test]

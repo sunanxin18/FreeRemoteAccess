@@ -1,7 +1,8 @@
 use std::fmt;
 
 use frd_compositor_wgpu::PresentError;
-use frd_render_wgpu::{GpuFaultClass, RendererError};
+use frd_frame::FrameTransactionError;
+use frd_render_wgpu::{BatchApplyFailure, GpuFaultClass, GpuScopeObservation, RendererError};
 use frd_session::CleanupError;
 
 use crate::cleanup::BackgroundCleanupFailure;
@@ -154,6 +155,46 @@ impl FatalReport {
         }
     }
 
+    pub(crate) fn frame_transaction(error: FrameTransactionError) -> Self {
+        Self {
+            code: FATAL_CODE,
+            component: "presentation",
+            operation: "frame_transaction",
+            reason: "frame_transaction_invalid",
+            details: frame_transaction_error_code(error).to_owned(),
+        }
+    }
+
+    pub(crate) fn frame_batch(failure: &BatchApplyFailure) -> Self {
+        let gpu = failure
+            .scope
+            .and_then(|scope| scope.observed_fault)
+            .or_else(|| match failure.primary {
+                RendererError::GpuFault(fault) => Some(fault),
+                _ => None,
+            });
+        let details = encode_compact_frame_batch_detail(CompactFrameBatchDetail {
+            primary: failure.primary,
+            secondary: failure.secondary_execution,
+            identity: failure.identity.map(|identity| {
+                (
+                    identity.session_id.get(),
+                    identity.generation,
+                    identity.revision,
+                )
+            }),
+            scope: failure.scope.map(|scope| scope.observation),
+            gpu,
+        });
+        Self {
+            code: FATAL_CODE,
+            component: "presentation",
+            operation: "frame_batch",
+            reason: "frame_batch_failed",
+            details,
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -172,6 +213,93 @@ impl FatalReport {
 
     pub fn details(&self) -> &str {
         &self.details
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactFrameBatchDetail {
+    primary: RendererError,
+    secondary: Option<RendererError>,
+    identity: Option<(u64, u64, u64)>,
+    scope: Option<GpuScopeObservation>,
+    gpu: Option<GpuFaultClass>,
+}
+
+fn encode_compact_frame_batch_detail(detail: CompactFrameBatchDetail) -> String {
+    let primary = compact_renderer_error_code(detail.primary);
+    let secondary = detail
+        .secondary
+        .map(compact_renderer_error_code)
+        .unwrap_or("n");
+    let (session, generation, revision) = detail
+        .identity
+        .map(|(session, generation, revision)| {
+            (
+                session.to_string(),
+                generation.to_string(),
+                revision.to_string(),
+            )
+        })
+        .unwrap_or_else(|| ("n".to_owned(), "n".to_owned(), "n".to_owned()));
+    let secondary_and_identity = format!("{secondary}:{session}:{generation}:{revision}");
+    let (begins, finishes, polls) = detail
+        .scope
+        .map(|scope| {
+            (
+                scope.begins.to_string(),
+                scope.finishes.to_string(),
+                scope.polls.to_string(),
+            )
+        })
+        .unwrap_or_else(|| ("n".to_owned(), "n".to_owned(), "n".to_owned()));
+    let gpu = detail.gpu.map(compact_gpu_fault_code).unwrap_or("n");
+    format!("p={primary};s={secondary_and_identity};b={begins};f={finishes};o={polls};g={gpu}")
+}
+
+fn compact_renderer_error_code(error: RendererError) -> &'static str {
+    match error {
+        RendererError::StaleUpdate => "stale",
+        RendererError::InvalidGeometry => "geom",
+        RendererError::TextureBudgetExceeded => "budget",
+        RendererError::UnsupportedPixelFormat => "pixfmt",
+        RendererError::NonMonotonicRevision => "rev",
+        RendererError::BoundaryWithoutMatchingDamage => "boundary",
+        RendererError::InvalidPatch => "patch",
+        RendererError::ResetRequired => "reset",
+        RendererError::StalePresentationReceipt => "receipt",
+        RendererError::TextureDimensionUnsupported => "dim",
+        RendererError::UnsupportedTargetFormat => "target",
+        RendererError::GpuFault(_) => "gpu",
+        RendererError::EmptyBatch => "empty",
+        RendererError::BatchExecutionPanicked => "panic",
+        RendererError::ScopeObservationInvalid => "scope",
+    }
+}
+
+fn compact_gpu_fault_code(fault: GpuFaultClass) -> &'static str {
+    match fault {
+        GpuFaultClass::Validation => "v",
+        GpuFaultClass::OutOfMemory => "oom",
+        GpuFaultClass::Internal => "int",
+        GpuFaultClass::DeviceLost => "lost",
+        GpuFaultClass::ObservationIncomplete => "obs",
+    }
+}
+
+fn frame_transaction_error_code(error: FrameTransactionError) -> &'static str {
+    match error {
+        FrameTransactionError::InvalidReset => "frame_transaction_invalid_reset",
+        FrameTransactionError::ForeignSession => "frame_transaction_foreign_session",
+        FrameTransactionError::StaleReset => "frame_transaction_stale_reset",
+        FrameTransactionError::UpdateBeforeReset => "frame_transaction_update_before_reset",
+        FrameTransactionError::StaleUpdate => "frame_transaction_stale_update",
+        FrameTransactionError::DuplicateDamage => "frame_transaction_duplicate_damage",
+        FrameTransactionError::RevisionWhilePending => "frame_transaction_revision_while_pending",
+        FrameTransactionError::BoundaryWithoutDamage => "frame_transaction_boundary_without_damage",
+        FrameTransactionError::BoundaryMismatch => "frame_transaction_boundary_mismatch",
+        FrameTransactionError::StartupBoundaryNotFullBaseline => {
+            "frame_transaction_startup_boundary_not_full_baseline"
+        }
     }
 }
 
@@ -318,10 +446,17 @@ fn renderer_error_code(error: RendererError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use frd_compositor_wgpu::PresentError;
-    use frd_render_wgpu::{GpuFaultClass, RendererError};
+    use frd_frame::FrameTransactionError;
+    use frd_render_wgpu::{
+        BatchApplyFailure, BatchScopeDiagnostics, FrameBatchIdentity, GpuFaultClass,
+        GpuScopeObservation, RendererError,
+    };
     use frd_session::CleanupError;
 
-    use super::{present_error_code, sanitize_safe_detail, FatalReport};
+    use super::{
+        encode_compact_frame_batch_detail, present_error_code, sanitize_safe_detail,
+        CompactFrameBatchDetail, FatalReport, MAX_SAFE_DETAIL_BYTES,
+    };
     use crate::frame_metrics_sink::MetricSinkError;
     use crate::BackgroundCleanupFailure;
     use crate::PresentationOperation;
@@ -437,6 +572,68 @@ mod tests {
                 RendererError::ScopeObservationInvalid,
             )),
             "renderer_scope_observation_invalid"
+        );
+    }
+
+    #[test]
+    fn frame_batch_longest_fixed_schema_fits_safe_detail_without_truncation() {
+        let details = encode_compact_frame_batch_detail(CompactFrameBatchDetail {
+            primary: RendererError::GpuFault(GpuFaultClass::DeviceLost),
+            secondary: Some(RendererError::BoundaryWithoutMatchingDamage),
+            identity: Some((u64::MAX, u64::MAX, u64::MAX)),
+            scope: Some(GpuScopeObservation {
+                begins: u64::MAX,
+                finishes: u64::MAX,
+                polls: u64::MAX,
+            }),
+            gpu: Some(GpuFaultClass::DeviceLost),
+        });
+        let expected = format!(
+            "p=gpu;s=boundary:{0}:{0}:{0};b={0};f={0};o={0};g=lost",
+            u64::MAX
+        );
+
+        assert_eq!(details, expected);
+        assert!(details.is_ascii());
+        assert_eq!(details.len(), 155);
+        assert!(details.len() <= MAX_SAFE_DETAIL_BYTES);
+    }
+
+    #[test]
+    fn frame_transaction_and_batch_reports_use_only_closed_stable_fields() {
+        let compiler = FatalReport::frame_transaction(FrameTransactionError::ForeignSession);
+        assert_eq!(compiler.component(), "presentation");
+        assert_eq!(compiler.operation(), "frame_transaction");
+        assert_eq!(compiler.reason(), "frame_transaction_invalid");
+        assert_eq!(compiler.details(), "frame_transaction_foreign_session");
+
+        let session_id = frd_core::SessionId::allocate();
+        let renderer = FatalReport::frame_batch(&BatchApplyFailure {
+            identity: Some(FrameBatchIdentity {
+                session_id,
+                generation: 7,
+                revision: 11,
+            }),
+            primary: RendererError::GpuFault(GpuFaultClass::DeviceLost),
+            secondary_execution: Some(RendererError::BoundaryWithoutMatchingDamage),
+            scope: Some(BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: Some(GpuFaultClass::DeviceLost),
+            }),
+        });
+        assert_eq!(renderer.component(), "presentation");
+        assert_eq!(renderer.operation(), "frame_batch");
+        assert_eq!(renderer.reason(), "frame_batch_failed");
+        assert_eq!(
+            renderer.details(),
+            format!(
+                "p=gpu;s=boundary:{}:7:11;b=1;f=1;o=1;g=lost",
+                session_id.get()
+            )
         );
     }
 }

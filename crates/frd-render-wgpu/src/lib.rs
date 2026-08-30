@@ -4,7 +4,7 @@ mod remote_texture;
 
 pub use gpu_fault::{GpuCleanToken, GpuFaultClass, GpuFaultScope, GpuScopeObservation};
 pub use remote_texture::{
-    ApplyOutcome, BatchApplyFailure, BatchApplyOutcome, BatchApplySuccess, BatchScopeDiagnostics,
+    BatchApplyFailure, BatchApplyOutcome, BatchApplySuccess, BatchScopeDiagnostics,
     ConfirmedPresentation, FrameBatchIdentity, InstalledSurface, PresentationReceipt,
     RecoveryRequirement, RemoteRenderer, RendererError,
 };
@@ -149,15 +149,18 @@ impl GpuContext {
 #[cfg(test)]
 mod api_tests {
     use frd_core::PixelSize;
-    use frd_frame::SurfaceUpdate;
+    use frd_frame::FrameTransaction;
 
-    use super::{ApplyOutcome, GpuContext, RecoveryRequirement, RemoteRenderer, RendererError};
+    use super::{
+        BatchApplyFailure, BatchApplySuccess, GpuContext, RecoveryRequirement, RemoteRenderer,
+        RendererError,
+    };
 
-    fn apply_update_contract(
+    fn apply_update_batch_contract(
         renderer: &mut RemoteRenderer,
-        update: SurfaceUpdate,
-    ) -> Result<ApplyOutcome, RendererError> {
-        renderer.apply_update(update)
+        transactions: Vec<FrameTransaction>,
+    ) -> Result<BatchApplySuccess, BatchApplyFailure> {
+        renderer.apply_update_batch(transactions)
     }
 
     fn create_renderer_contract(context: GpuContext) -> Result<RemoteRenderer, RendererError> {
@@ -182,8 +185,8 @@ mod api_tests {
     }
 
     #[test]
-    fn public_renderer_boundary_accepts_only_frame_updates_and_caller_owned_targets() {
-        let _ = apply_update_contract;
+    fn public_renderer_boundary_accepts_only_transaction_batches_and_caller_owned_targets() {
+        let _ = apply_update_batch_contract;
         let _ = create_renderer_contract;
         let _ = record_contract;
         let _ = recovery_contract;

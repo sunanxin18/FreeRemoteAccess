@@ -15,8 +15,9 @@ use frd_core::{
     PointerButton, SessionId, TargetSystem,
 };
 use frd_frame::{
-    EnqueuedSurfaceUpdate, FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch,
-    SurfaceUpdate,
+    EnqueuedSurfaceUpdate, FrameCompleteness, FrameMailbox, FrameReset, FrameRevision,
+    FrameTransaction, FrameTransactionCompiler, FrameTransactionError, PixelBuffer, PixelFormat,
+    PixelPatch, SurfaceUpdate,
 };
 use frd_media_api::{AudioOutput, AudioOutputError, MediaFrame, MediaPublishError, MediaPublisher};
 use frd_protocol_api::{
@@ -24,7 +25,8 @@ use frd_protocol_api::{
     ProtocolFactory, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand, SessionEvent,
 };
 use frd_render_wgpu::{
-    ApplyOutcome, GpuContext, RecoveryRequirement, RemoteRenderer, RendererError,
+    BatchApplyFailure, BatchApplyOutcome, BatchApplySuccess, GpuContext, RecoveryRequirement,
+    RemoteRenderer,
 };
 use frd_session::{
     CleanupComplete, CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
@@ -47,9 +49,9 @@ use crate::cleanup::{
 };
 use crate::fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 use crate::frame_metrics::{
-    checked_mailbox_age, BatchMetricContext, DrainedFrameUpdates, FramePipelineMetrics,
-    MetricIdentity, SerialDrainAggregate,
+    checked_mailbox_age, BatchMetricContext, FramePipelineMetrics, MetricIdentity,
 };
+#[cfg(test)]
 use crate::frame_metrics_sink::MetricSinkError;
 use crate::input::{hid_usage_from_key_code, KeyboardDomain, KeyboardPreDispatch};
 use crate::lifecycle::{
@@ -130,7 +132,7 @@ pub struct BackgroundLaunchOutcome {
 enum BackgroundLaunchResult {
     Started {
         cleanup_handle: SessionCleanupHandle,
-        ports: LiveSessionPorts,
+        ports: PendingLiveSessionPorts,
         start_barrier: ProtocolStartBarrier,
     },
     LaunchRolledBack(SessionStartFailure),
@@ -270,11 +272,42 @@ impl ProtocolStartWaiter {
     }
 }
 
+struct PendingLiveSessionPorts {
+    session_id: SessionId,
+    commands: mpsc::Sender<SessionCommand>,
+    events: mpsc::Receiver<SessionEvent>,
+    mailbox: Arc<Mutex<FrameMailbox>>,
+}
+
 struct LiveSessionPorts {
     session_id: SessionId,
     commands: mpsc::Sender<SessionCommand>,
     events: mpsc::Receiver<SessionEvent>,
     mailbox: Arc<Mutex<FrameMailbox>>,
+    frame_compiler: FrameTransactionCompiler,
+}
+
+impl PendingLiveSessionPorts {
+    fn accept(self) -> LiveSessionPorts {
+        LiveSessionPorts {
+            session_id: self.session_id,
+            commands: self.commands,
+            events: self.events,
+            mailbox: self.mailbox,
+            frame_compiler: FrameTransactionCompiler::new(self.session_id),
+        }
+    }
+}
+
+struct CompiledFrameDrain {
+    transactions: Vec<FrameTransaction>,
+    metrics: BatchMetricContext,
+}
+
+#[derive(Debug)]
+struct FrameCompileFailure {
+    error: FrameTransactionError,
+    metrics: BatchMetricContext,
 }
 
 struct LiveSessionCleanup {
@@ -477,7 +510,7 @@ impl SessionHost {
                 start_barrier,
             } if !cancelled => {
                 self.coordinator = Some(outcome.coordinator);
-                self.active = Some(ports);
+                self.active = Some(ports.accept());
                 self.cleanup_handle = Some(cleanup_handle);
                 start_barrier.release();
                 Ok(AcceptedLaunchOutcome::Started)
@@ -577,6 +610,98 @@ impl SessionHost {
             updates.push(update);
         }
         updates
+    }
+
+    fn drain_frame_transactions(&mut self) -> Result<CompiledFrameDrain, FrameCompileFailure> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(CompiledFrameDrain {
+                transactions: Vec::new(),
+                metrics: BatchMetricContext {
+                    batch_started_at: std::time::Instant::now(),
+                    source_update_count: 0,
+                    oldest_age: None,
+                    transaction_count: 0,
+                },
+            });
+        };
+        let pre_call_buffered_count = active.frame_compiler.buffered_source_update_count();
+        let pre_call_earliest = active.frame_compiler.earliest_buffered_enqueue_at();
+        let updates = {
+            let Ok(mut mailbox) = active.mailbox.lock() else {
+                return Ok(CompiledFrameDrain {
+                    transactions: Vec::new(),
+                    metrics: BatchMetricContext {
+                        batch_started_at: std::time::Instant::now(),
+                        source_update_count: 0,
+                        oldest_age: None,
+                        transaction_count: 0,
+                    },
+                });
+            };
+            let mut updates = Vec::with_capacity(mailbox.len());
+            while let Some(update) = mailbox.pop_enqueued() {
+                updates.push(update);
+            }
+            updates
+        };
+        if updates.is_empty() {
+            return Ok(CompiledFrameDrain {
+                transactions: Vec::new(),
+                metrics: BatchMetricContext {
+                    batch_started_at: std::time::Instant::now(),
+                    source_update_count: pre_call_buffered_count,
+                    oldest_age: None,
+                    transaction_count: 0,
+                },
+            });
+        }
+        let drained_count = updates.len();
+        let current_earliest = updates.iter().map(|entry| entry.enqueued_at).min();
+        let batch_started_at = std::time::Instant::now();
+        match active.frame_compiler.compile(updates) {
+            Ok(transactions) => {
+                let source_update_count = if transactions.is_empty() {
+                    pre_call_buffered_count.saturating_add(drained_count)
+                } else {
+                    transactions
+                        .iter()
+                        .map(FrameTransaction::source_update_count)
+                        .sum()
+                };
+                let earliest = transactions
+                    .iter()
+                    .map(FrameTransaction::earliest_constituent_enqueue_at)
+                    .min();
+                let oldest_age =
+                    earliest.and_then(|earliest| checked_mailbox_age(batch_started_at, earliest));
+                Ok(CompiledFrameDrain {
+                    metrics: BatchMetricContext {
+                        batch_started_at,
+                        source_update_count,
+                        oldest_age,
+                        transaction_count: transactions.len(),
+                    },
+                    transactions,
+                })
+            }
+            Err(error) => {
+                let earliest = match (pre_call_earliest, current_earliest) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(value), None) | (None, Some(value)) => Some(value),
+                    (None, None) => None,
+                };
+                Err(FrameCompileFailure {
+                    error,
+                    metrics: BatchMetricContext {
+                        batch_started_at,
+                        source_update_count: pre_call_buffered_count.saturating_add(drained_count),
+                        oldest_age: earliest
+                            .and_then(|earliest| checked_mailbox_age(batch_started_at, earliest)),
+                        transaction_count: 0,
+                    },
+                })
+            }
+        }
     }
 
     fn active_session_id(&self) -> Option<SessionId> {
@@ -743,7 +868,14 @@ fn launch_live_session(
     worker_spawner: Arc<dyn WorkerSpawner>,
     cancelled: Arc<AtomicBool>,
     request: ConnectRequest,
-) -> Result<(LiveSessionCleanup, LiveSessionPorts, ProtocolStartBarrier), ProtocolError> {
+) -> Result<
+    (
+        LiveSessionCleanup,
+        PendingLiveSessionPorts,
+        ProtocolStartBarrier,
+    ),
+    ProtocolError,
+> {
     let session_id = request.session_id;
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
@@ -830,7 +962,7 @@ fn launch_live_session(
             audio_worker: Some(audio_worker),
             mailbox: Some(mailbox.clone()),
         },
-        LiveSessionPorts {
+        PendingLiveSessionPorts {
             session_id,
             commands: command_tx,
             events: event_rx,
@@ -1004,11 +1136,102 @@ enum DesktopMode {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RemoteBinding {
     session_id: SessionId,
     generation: u64,
     size: PixelSize,
+}
+
+fn apply_compiled_drain(
+    transactions: Vec<FrameTransaction>,
+    apply: impl FnOnce(Vec<FrameTransaction>) -> Result<BatchApplySuccess, BatchApplyFailure>,
+) -> Result<BatchApplySuccess, BatchApplyFailure> {
+    debug_assert!(!transactions.is_empty());
+    apply(transactions)
+}
+
+fn accept_batch_outcome(
+    remote: &mut Option<RemoteBinding>,
+    pending_texture_writes: &mut PendingTextureWrites,
+    outcome: &BatchApplyOutcome,
+) -> bool {
+    if let Some(installed) = outcome.installed_surface {
+        *remote = Some(RemoteBinding {
+            session_id: installed.session_id,
+            generation: installed.generation,
+            size: installed.size,
+        });
+    }
+    pending_texture_writes.record_batch(outcome.had_texture_writes);
+    outcome.final_boundary.is_some_and(|boundary| {
+        remote.is_some_and(|binding| {
+            binding.session_id == boundary.session_id && binding.generation == boundary.generation
+        })
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeDrainOutcome {
+    ui_redraw_needed: bool,
+    frame_redraw_needed: bool,
+}
+
+impl RuntimeDrainOutcome {
+    fn any_redraw(self) -> bool {
+        self.ui_redraw_needed || self.frame_redraw_needed
+    }
+}
+
+enum FrameDrainFailure {
+    Compile(FrameTransactionError),
+    Render(BatchApplyFailure),
+}
+
+trait FrameBatchFailureTarget {
+    fn block_remote_input(&mut self);
+    fn detach_remote_surface(&mut self);
+    fn clear_pending_texture_writes(&mut self);
+}
+
+fn terminate_failed_frame_batch(
+    target: &mut impl FrameBatchFailureTarget,
+    failure: FrameDrainFailure,
+) -> FatalReport {
+    target.block_remote_input();
+    target.detach_remote_surface();
+    target.clear_pending_texture_writes();
+    match failure {
+        FrameDrainFailure::Compile(error) => FatalReport::frame_transaction(error),
+        FrameDrainFailure::Render(failure) => FatalReport::frame_batch(&failure),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeDrainCallback {
+    Wake,
+    RedrawRequested,
+}
+
+trait RuntimeDrainCallbackTarget {
+    fn request_redraw(&mut self);
+    fn render_now(&mut self);
+    fn terminate(&mut self, report: FatalReport);
+}
+
+fn dispatch_runtime_drain(
+    callback: RuntimeDrainCallback,
+    result: Result<RuntimeDrainOutcome, FatalReport>,
+    target: &mut impl RuntimeDrainCallbackTarget,
+) {
+    match (callback, result) {
+        (_, Err(report)) => target.terminate(report),
+        (RuntimeDrainCallback::Wake, Ok(outcome)) if outcome.any_redraw() => {
+            target.request_redraw();
+        }
+        (RuntimeDrainCallback::Wake, Ok(_)) => {}
+        (RuntimeDrainCallback::RedrawRequested, Ok(_)) => target.render_now(),
+    }
 }
 
 #[derive(Default)]
@@ -1043,8 +1266,12 @@ struct PendingTextureWrites {
 }
 
 impl PendingTextureWrites {
-    fn record_damage_upload(&mut self, uploaded_rectangles: usize) {
-        self.pending |= uploaded_rectangles > 0;
+    fn record_batch(&mut self, had_texture_writes: bool) {
+        self.pending |= had_texture_writes;
+    }
+
+    fn clear(&mut self) {
+        self.pending = false;
     }
 
     #[cfg(test)]
@@ -1224,6 +1451,35 @@ pub struct DesktopApplication {
     window_configuration: DesktopWindowConfiguration,
 }
 
+struct ApplicationDrainCallbacks<'a> {
+    application: &'a mut DesktopApplication,
+    event_loop: &'a ActiveEventLoop,
+}
+
+impl<'a> ApplicationDrainCallbacks<'a> {
+    fn new(application: &'a mut DesktopApplication, event_loop: &'a ActiveEventLoop) -> Self {
+        Self {
+            application,
+            event_loop,
+        }
+    }
+}
+
+impl RuntimeDrainCallbackTarget for ApplicationDrainCallbacks<'_> {
+    fn request_redraw(&mut self) {
+        self.application.request_redraw();
+    }
+
+    fn render_now(&mut self) {
+        self.application.render();
+    }
+
+    fn terminate(&mut self, report: FatalReport) {
+        self.application
+            .handle_application_fatal(self.event_loop, report);
+    }
+}
+
 #[cfg(test)]
 fn initialize_metrics_before_session_launch<T>(
     metrics: Result<FramePipelineMetrics, MetricSinkError>,
@@ -1353,6 +1609,25 @@ fn paint_platform_window_controls(
     _scale_factor: f64,
     _maximized: bool,
 ) {
+}
+
+impl FrameBatchFailureTarget for DesktopApplication {
+    fn block_remote_input(&mut self) {
+        self.block_and_release_input_for_fatal();
+    }
+
+    fn detach_remote_surface(&mut self) {
+        if let Some(window) = self.window.as_mut() {
+            window.renderer.detach();
+            window.remote = None;
+        }
+    }
+
+    fn clear_pending_texture_writes(&mut self) {
+        if let Some(window) = self.window.as_mut() {
+            window.pending_texture_writes.clear();
+        }
+    }
 }
 
 impl DesktopApplication {
@@ -1663,8 +1938,12 @@ impl DesktopApplication {
         self.request_redraw();
     }
 
-    fn drain_runtime(&mut self) {
+    fn drain_runtime(&mut self) -> Result<RuntimeDrainOutcome, FatalReport> {
         let events = self.sessions.drain_session_events();
+        let mut outcome = RuntimeDrainOutcome {
+            ui_redraw_needed: !events.is_empty(),
+            frame_redraw_needed: false,
+        };
         let mut cleanup_needed = false;
         let mut detach_remote = false;
         for (session_id, event) in events {
@@ -1719,6 +1998,7 @@ impl DesktopApplication {
             if let Some(window) = self.window.as_mut() {
                 window.renderer.detach();
                 window.remote = None;
+                window.pending_texture_writes.clear();
             }
         }
         if cleanup_needed {
@@ -1726,125 +2006,58 @@ impl DesktopApplication {
         }
 
         // SessionEvent is deliberately reduced before frame mailbox data.
-        let updates = self.sessions.drain_enqueued_frame_updates();
-        let had_events_or_frames = !updates.is_empty() || cleanup_needed || detach_remote;
-        let source_update_count = updates.len();
-        for entry in &updates {
-            if let SurfaceUpdate::Reset {
-                session_id,
-                generation,
-                ..
-            } = &entry.update
-            {
-                self.metrics.clear_input_probe();
-                self.metrics.observe_generation(*session_id, *generation);
+        let drain = match self.sessions.drain_frame_transactions() {
+            Ok(drain) => drain,
+            Err(failure) => {
+                self.metrics
+                    .observe_compile_failure(failure.metrics, failure.error);
+                return Err(terminate_failed_frame_batch(
+                    self,
+                    FrameDrainFailure::Compile(failure.error),
+                ));
             }
+        };
+        if drain.transactions.is_empty() {
+            self.publish_metrics_failure();
+            return Ok(outcome);
         }
-        let mut aggregate = SerialDrainAggregate::default();
-        let mut first_error: Option<RendererError> = None;
-        let drain_started_at = (!updates.is_empty()).then(std::time::Instant::now);
-        let oldest_age = drain_started_at.and_then(|started_at| {
-            updates
-                .iter()
-                .map(|entry| entry.enqueued_at)
-                .min()
-                .and_then(|earliest| checked_mailbox_age(started_at, earliest))
+        let metrics = drain.metrics;
+        let Some(window) = self.window.as_mut() else {
+            self.publish_metrics_failure();
+            return Ok(outcome);
+        };
+        let applied = apply_compiled_drain(drain.transactions, |transactions| {
+            window.renderer.apply_update_batch(transactions)
         });
-        if drain_started_at.is_some() && oldest_age.is_none() {
-            self.metrics.invalidate(MetricSinkError::InvalidObservation);
-        }
-        let (updates, drain_started_at, oldest_age) =
-            if let (Some(drain_started_at), Some(_)) = (drain_started_at, oldest_age) {
-                let drained = DrainedFrameUpdates::new(updates, drain_started_at)
-                    .expect("the borrowed timestamp validation just succeeded");
-                (
-                    drained.updates,
-                    Some(drained.drain_started_at),
-                    Some(drained.oldest_age),
-                )
-            } else {
-                (updates, drain_started_at, oldest_age)
-            };
-        for entry in updates {
-            let binding = match &entry.update {
-                SurfaceUpdate::Reset {
-                    session_id,
-                    generation,
-                    size,
-                    ..
-                } => Some(RemoteBinding {
-                    session_id: *session_id,
-                    generation: *generation,
-                    size: *size,
-                }),
-                _ => None,
-            };
-            let Some(window) = self.window.as_mut() else {
-                continue;
-            };
-            let before = window.gpu.scope_observation();
-            let apply_result = window.renderer.apply_update(entry.update);
-            let after = window.gpu.scope_observation();
-            let actual_delta = after.checked_delta(before);
-            match apply_result {
-                Ok(outcome) => {
-                    if let Some(actual_delta) = actual_delta {
-                        if let Err(error) = aggregate.observe(outcome, actual_delta) {
-                            self.metrics.invalidate(error);
-                        }
-                    } else {
-                        self.metrics.invalidate(MetricSinkError::InvalidObservation);
-                    }
-                    if let ApplyOutcome::Damage {
-                        uploaded_rectangles,
-                    } = outcome
-                    {
-                        window
-                            .pending_texture_writes
-                            .record_damage_upload(uploaded_rectangles);
-                    }
-                    if let Some(binding) = binding {
-                        window.remote = Some(binding);
-                    }
-                }
-                Err(error) => {
-                    if let Some(actual_delta) = actual_delta {
-                        if let Err(metric_error) = aggregate.observe_failed_scope(actual_delta) {
-                            self.metrics.invalidate(metric_error);
-                        }
-                    } else {
-                        self.metrics.invalidate(MetricSinkError::InvalidObservation);
-                    }
-                    first_error.get_or_insert(error);
-                    eprintln!("远端帧更新被拒绝：{error:?}");
-                }
+        let success = match applied {
+            Ok(success) => success,
+            Err(failure) => {
+                self.metrics.observe_batch_failure(metrics, &failure);
+                return Err(terminate_failed_frame_batch(
+                    self,
+                    FrameDrainFailure::Render(failure),
+                ));
             }
-        }
-        if let (Some(batch_started_at), Some(oldest_age)) = (drain_started_at, oldest_age) {
-            self.metrics.observe_serial_drain(
-                BatchMetricContext {
-                    batch_started_at,
-                    source_update_count,
-                    oldest_age: Some(oldest_age),
-                    transaction_count: 0,
-                },
-                &aggregate,
-                first_error,
-                std::time::Instant::now(),
-            );
-        }
-        if let Some(window) = self.window.as_mut() {
-            if window.pending_texture_writes.take_for_blocked_present(
-                window.lifecycle.accepts_redraw(),
-                window.dpi_transition.is_pending(),
-            ) {
-                let _ = window.gpu.queue().submit(std::iter::empty());
-            }
-        }
-        if had_events_or_frames {
-            self.request_redraw();
+        };
+        self.metrics
+            .observe_batch_success(metrics, &success.outcome, &success.scope);
+        let window = self
+            .window
+            .as_mut()
+            .expect("a successful renderer batch retains the window");
+        outcome.frame_redraw_needed = accept_batch_outcome(
+            &mut window.remote,
+            &mut window.pending_texture_writes,
+            &success.outcome,
+        );
+        if window.pending_texture_writes.take_for_blocked_present(
+            window.lifecycle.accepts_redraw(),
+            window.dpi_transition.is_pending(),
+        ) {
+            let _ = window.gpu.queue().submit(std::iter::empty());
         }
         self.publish_metrics_failure();
+        Ok(outcome)
     }
 
     fn block_and_release_input(&mut self) {
@@ -2208,16 +2421,25 @@ impl DesktopApplication {
         } = &mut self.mode
         {
             if *stage == TestTextureStage::Connection {
-                let updates = test_texture_updates(*session_id);
                 if let Some(window) = self.window.as_mut() {
-                    for update in updates {
-                        let _ = window.renderer.apply_update(update);
+                    match window
+                        .renderer
+                        .apply_update_batch(test_texture_transactions(*session_id))
+                    {
+                        Ok(success) => {
+                            let _ = accept_batch_outcome(
+                                &mut window.remote,
+                                &mut window.pending_texture_writes,
+                                &success.outcome,
+                            );
+                        }
+                        Err(failure) => {
+                            let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal(
+                                FatalReport::frame_batch(&failure),
+                            ));
+                            return;
+                        }
                     }
-                    window.remote = Some(RemoteBinding {
-                        session_id: *session_id,
-                        generation: 1,
-                        size: PixelSize::new(2, 2).expect("test texture is non-zero"),
-                    });
                     window.window.set_title("FreeRemoteDesk — 离线测试远程会话");
                 }
                 *stage = TestTextureStage::RemoteSession;
@@ -2287,20 +2509,38 @@ impl DesktopApplication {
                     .window
                     .as_mut()
                     .ok_or(PresentError::SurfaceDetached)
-                    .and_then(|window| {
-                        for update in test_texture_updates(session_id) {
-                            window.renderer.apply_update(update)?;
-                        }
-                        Ok(())
+                    .map(|window| {
+                        window
+                            .renderer
+                            .apply_update_batch(test_texture_transactions(session_id))
                     });
-                if let Err(recovery) = restore {
-                    self.publish_presentation_fatal(PresentationRecoveryFailure {
-                        operation: context.operation(),
-                        source,
-                        retry: None,
-                        recovery: Some(recovery),
-                    });
-                    return;
+                match restore {
+                    Ok(Ok(batch)) => {
+                        let window = self
+                            .window
+                            .as_mut()
+                            .expect("offline recovery retains its window");
+                        let _ = accept_batch_outcome(
+                            &mut window.remote,
+                            &mut window.pending_texture_writes,
+                            &batch.outcome,
+                        );
+                    }
+                    Ok(Err(failure)) => {
+                        let _ = self.proxy.send_event(DesktopUserEvent::ApplicationFatal(
+                            FatalReport::frame_batch(&failure),
+                        ));
+                        return;
+                    }
+                    Err(recovery) => {
+                        self.publish_presentation_fatal(PresentationRecoveryFailure {
+                            operation: context.operation(),
+                            source,
+                            retry: None,
+                            recovery: Some(recovery),
+                        });
+                        return;
+                    }
                 }
             } else {
                 self.publish_presentation_fatal(PresentationRecoveryFailure {
@@ -2797,8 +3037,10 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         match event {
             DesktopUserEvent::Wake => {
                 self.runtime_wake_gate.consume();
-                self.drain_runtime();
-                self.request_redraw();
+                let result = self.drain_runtime();
+                let mut callbacks = ApplicationDrainCallbacks::new(self, event_loop);
+                dispatch_runtime_drain(RuntimeDrainCallback::Wake, result, &mut callbacks);
+                drop(callbacks);
                 self.maybe_finish_exit(event_loop);
             }
             DesktopUserEvent::Repaint => self.synchronize_repaint_deadline(event_loop),
@@ -2983,8 +3225,14 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.drain_runtime();
-                self.render();
+                let result = self.drain_runtime();
+                let mut callbacks = ApplicationDrainCallbacks::new(self, event_loop);
+                dispatch_runtime_drain(
+                    RuntimeDrainCallback::RedrawRequested,
+                    result,
+                    &mut callbacks,
+                );
+                drop(callbacks);
                 self.maybe_finish_exit(event_loop);
                 return;
             }
@@ -3267,15 +3515,16 @@ fn axis_sign(value: f32) -> i8 {
     }
 }
 
-fn test_texture_updates(session_id: SessionId) -> [SurfaceUpdate; 3] {
-    [
-        SurfaceUpdate::Reset {
+fn test_texture_transactions(session_id: SessionId) -> Vec<FrameTransaction> {
+    vec![FrameTransaction::Startup {
+        earliest_constituent_enqueue_at: std::time::Instant::now(),
+        reset: FrameReset {
             session_id,
             generation: 1,
             size: PixelSize::new(2, 2).expect("test texture size is non-zero"),
             format: PixelFormat::Bgrx8UnormSrgb,
         },
-        SurfaceUpdate::Damage {
+        revision: FrameRevision {
             session_id,
             generation: 1,
             revision: 1,
@@ -3291,14 +3540,9 @@ fn test_texture_updates(session_id: SessionId) -> [SurfaceUpdate; 3] {
                     0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0,
                 ]),
             }],
-        },
-        SurfaceUpdate::FrameBoundary {
-            session_id,
-            generation: 1,
-            revision: 1,
             completeness: FrameCompleteness::FullBaseline,
         },
-    ]
+    }]
 }
 
 struct UnavailableCredentials;
@@ -3431,7 +3675,10 @@ mod tests {
         Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelRect, ProtocolId,
         SecretBuffer, SessionId, TargetSystem,
     };
-    use frd_frame::{FrameCompleteness, PixelFormat};
+    use frd_frame::{
+        EnqueuedSurfaceUpdate, FrameCompleteness, FrameReset, FrameRevision, FrameTransaction,
+        FrameTransactionError, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
+    };
     use frd_media_api::{AudioOutput, AudioOutputError, MediaFrame};
     use frd_platform_api::{PlatformCapabilities, PlatformError, ServerIdentityStore};
     use frd_protocol_api::{
@@ -3439,15 +3686,22 @@ mod tests {
         ProtocolDescriptor, ProtocolError, ProtocolExit, ProtocolFactory, ProtocolRuntime,
         ProtocolSession, SessionCapabilities, SessionCommand, SessionEvent,
     };
+    use frd_render_wgpu::{
+        BatchApplyOutcome, BatchApplySuccess, BatchScopeDiagnostics, GpuScopeObservation,
+        InstalledSurface, PresentationReceipt,
+    };
     use frd_session::reserve_session_start;
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
     use winit::event::Ime;
 
     use super::{
+        accept_batch_outcome, apply_compiled_drain, dispatch_runtime_drain,
         initialize_metrics_before_session_launch, mark_texture_deltas_applied,
-        AcceptedLaunchOutcome, ApplicationExitState, AudioOutputFactory, RuntimeWakeGate,
-        SessionHost, TestLaunchOutcome, UnavailableCredentialStore, UnavailableProfileStore,
-        WakeSink, WorkerKind, WorkerSpawner,
+        terminate_failed_frame_batch, AcceptedLaunchOutcome, ApplicationExitState,
+        AudioOutputFactory, FrameBatchFailureTarget, FrameDrainFailure, PendingLiveSessionPorts,
+        RemoteBinding, RuntimeDrainCallback, RuntimeDrainCallbackTarget, RuntimeDrainOutcome,
+        RuntimeWakeGate, SessionHost, TestLaunchOutcome, UnavailableCredentialStore,
+        UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
 
@@ -3509,7 +3763,7 @@ mod tests {
     fn pending_texture_write_state_tracks_actual_and_fallback_submits() {
         let mut pending = super::PendingTextureWrites::default();
 
-        pending.record_damage_upload(1);
+        pending.record_batch(true);
         assert!(pending.is_pending());
         assert!(!pending.finish_render(true, true));
         assert!(
@@ -3517,7 +3771,7 @@ mod tests {
             "an actual submit clears pending writes"
         );
 
-        pending.record_damage_upload(1);
+        pending.record_batch(true);
         assert!(!pending.finish_render(false, false));
         assert!(
             pending.is_pending(),
@@ -3527,6 +3781,362 @@ mod tests {
         assert!(!pending.is_pending(), "fallback takes the pending writes");
 
         assert!(!pending.finish_render(false, true));
+    }
+
+    fn test_reset(session_id: SessionId, at: Instant) -> EnqueuedSurfaceUpdate {
+        EnqueuedSurfaceUpdate {
+            enqueued_at: at,
+            update: SurfaceUpdate::Reset {
+                session_id,
+                generation: 1,
+                size: frd_core::PixelSize::new(2, 2).unwrap(),
+                format: PixelFormat::Bgrx8UnormSrgb,
+            },
+        }
+    }
+
+    fn test_damage(session_id: SessionId, at: Instant) -> EnqueuedSurfaceUpdate {
+        EnqueuedSurfaceUpdate {
+            enqueued_at: at,
+            update: SurfaceUpdate::Damage {
+                session_id,
+                generation: 1,
+                revision: 1,
+                patches: vec![PixelPatch {
+                    rect: PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    },
+                    stride_bytes: 8,
+                    pixels: PixelBuffer::new(vec![0; 16]),
+                }],
+            },
+        }
+    }
+
+    fn test_boundary(session_id: SessionId, at: Instant) -> EnqueuedSurfaceUpdate {
+        EnqueuedSurfaceUpdate {
+            enqueued_at: at,
+            update: SurfaceUpdate::FrameBoundary {
+                session_id,
+                generation: 1,
+                revision: 1,
+                completeness: FrameCompleteness::FullBaseline,
+            },
+        }
+    }
+
+    fn frame_drain_host(session_id: SessionId) -> SessionHost {
+        let mut host = SessionHost::new(
+            std::iter::empty::<Arc<dyn ProtocolFactory>>(),
+            Arc::new(CountingWake(AtomicUsize::new(0))),
+            Arc::new(TestAudioFactory),
+        );
+        let (commands, _command_rx) = mpsc::channel();
+        let (_event_tx, events) = mpsc::channel();
+        let mailbox = Arc::new(Mutex::new(frd_frame::FrameMailbox::new(8, 1024)));
+        host.active = Some(
+            PendingLiveSessionPorts {
+                session_id,
+                commands,
+                events,
+                mailbox,
+            }
+            .accept(),
+        );
+        host
+    }
+
+    fn enqueue_frame(host: &mut SessionHost, envelope: EnqueuedSurfaceUpdate) {
+        let mailbox = host.active.as_ref().unwrap().mailbox.clone();
+        assert_eq!(
+            mailbox.lock().unwrap().push(envelope.update),
+            frd_frame::PushOutcome::Queued
+        );
+    }
+
+    fn successful_startup(session_id: SessionId) -> BatchApplySuccess {
+        BatchApplySuccess {
+            outcome: BatchApplyOutcome {
+                installed_surface: Some(InstalledSurface {
+                    session_id,
+                    generation: 1,
+                    size: frd_core::PixelSize::new(2, 2).unwrap(),
+                    format: PixelFormat::Bgrx8UnormSrgb,
+                }),
+                uploaded_rectangles: 1,
+                had_texture_writes: true,
+                final_boundary: Some(PresentationReceipt {
+                    session_id,
+                    generation: 1,
+                    revision: 1,
+                    completeness: FrameCompleteness::FullBaseline,
+                }),
+            },
+            scope: BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: None,
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDrainCallbacks {
+        redraws: usize,
+        renders: usize,
+        terminations: usize,
+        records: usize,
+        submits: usize,
+        presents: usize,
+        receipts: usize,
+        renderer_batch_calls: usize,
+    }
+
+    impl RuntimeDrainCallbackTarget for RecordingDrainCallbacks {
+        fn request_redraw(&mut self) {
+            self.redraws += 1;
+        }
+
+        fn render_now(&mut self) {
+            self.renders += 1;
+            self.records += 1;
+            self.submits += 1;
+            self.presents += 1;
+            self.receipts += 1;
+        }
+
+        fn terminate(&mut self, _report: crate::fatal::FatalReport) {
+            self.terminations += 1;
+        }
+    }
+
+    #[test]
+    fn event_only_wake_requests_one_ui_redraw_and_zero_frame_redraw() {
+        let outcome = RuntimeDrainOutcome {
+            ui_redraw_needed: true,
+            frame_redraw_needed: false,
+        };
+        let mut callbacks = RecordingDrainCallbacks::default();
+
+        dispatch_runtime_drain(RuntimeDrainCallback::Wake, Ok(outcome), &mut callbacks);
+
+        assert_eq!(callbacks.redraws, 1);
+        assert_eq!(callbacks.renderer_batch_calls, 0);
+        assert!(outcome.ui_redraw_needed);
+        assert!(!outcome.frame_redraw_needed);
+    }
+
+    #[test]
+    fn reset_only_and_reset_damage_without_boundary_request_no_frame_redraw() {
+        let session_id = SessionId::allocate();
+        let at = Instant::now();
+        let mut host = frame_drain_host(session_id);
+        let mut renderer_batch_calls = 0;
+        let mut binding: Option<RemoteBinding> = None;
+
+        enqueue_frame(&mut host, test_reset(session_id, at));
+        let reset_only = host.drain_frame_transactions().unwrap();
+        if !reset_only.transactions.is_empty() {
+            let _ = apply_compiled_drain(reset_only.transactions, |_| {
+                renderer_batch_calls += 1;
+                Ok(successful_startup(session_id))
+            });
+        }
+        assert_eq!(reset_only.metrics.transaction_count, 0);
+        assert_eq!(renderer_batch_calls, 0);
+        assert!(binding.is_none());
+        assert!(!RuntimeDrainOutcome::default().frame_redraw_needed);
+
+        enqueue_frame(
+            &mut host,
+            test_damage(session_id, at + Duration::from_millis(1)),
+        );
+        let reset_damage = host.drain_frame_transactions().unwrap();
+        if !reset_damage.transactions.is_empty() {
+            let success = apply_compiled_drain(reset_damage.transactions, |_| {
+                renderer_batch_calls += 1;
+                Ok(successful_startup(session_id))
+            })
+            .unwrap();
+            let _ = accept_batch_outcome(
+                &mut binding,
+                &mut super::PendingTextureWrites::default(),
+                &success.outcome,
+            );
+        }
+        assert_eq!(reset_damage.metrics.transaction_count, 0);
+        assert_eq!(renderer_batch_calls, 0);
+        assert!(binding.is_none());
+        assert!(!RuntimeDrainOutcome::default().frame_redraw_needed);
+    }
+
+    #[test]
+    fn atomic_startup_full_baseline_installs_binding_and_requests_one_frame_redraw() {
+        let session_id = SessionId::allocate();
+        let at = Instant::now();
+        let mut host = frame_drain_host(session_id);
+        enqueue_frame(&mut host, test_reset(session_id, at));
+        assert!(host
+            .drain_frame_transactions()
+            .unwrap()
+            .transactions
+            .is_empty());
+        enqueue_frame(
+            &mut host,
+            test_damage(session_id, at + Duration::from_millis(1)),
+        );
+        assert!(host
+            .drain_frame_transactions()
+            .unwrap()
+            .transactions
+            .is_empty());
+        enqueue_frame(
+            &mut host,
+            test_boundary(session_id, at + Duration::from_millis(2)),
+        );
+        let drain = host.drain_frame_transactions().unwrap();
+        assert_eq!(drain.metrics.source_update_count, 3);
+        assert_eq!(drain.metrics.transaction_count, 1);
+        let mut renderer_batch_calls = 0;
+        let success = apply_compiled_drain(drain.transactions, |transactions| {
+            renderer_batch_calls += 1;
+            assert_eq!(transactions.len(), 1);
+            Ok(successful_startup(session_id))
+        })
+        .unwrap();
+        let mut binding = None;
+        let mut pending = super::PendingTextureWrites::default();
+
+        let frame_redraw_needed =
+            accept_batch_outcome(&mut binding, &mut pending, &success.outcome);
+
+        assert_eq!(renderer_batch_calls, 1);
+        let binding = binding.expect("atomic Startup installs its returned surface");
+        assert_eq!(binding.session_id, session_id);
+        assert_eq!(binding.generation, 1);
+        assert_eq!(binding.size, frd_core::PixelSize::new(2, 2).unwrap());
+        assert!(frame_redraw_needed);
+        assert!(pending.is_pending());
+    }
+
+    #[test]
+    fn one_nonempty_compiled_drain_calls_renderer_once() {
+        let session_id = SessionId::allocate();
+        let transaction = FrameTransaction::Startup {
+            earliest_constituent_enqueue_at: Instant::now(),
+            reset: FrameReset {
+                session_id,
+                generation: 1,
+                size: frd_core::PixelSize::new(2, 2).unwrap(),
+                format: PixelFormat::Bgrx8UnormSrgb,
+            },
+            revision: FrameRevision {
+                session_id,
+                generation: 1,
+                revision: 1,
+                patches: Vec::new(),
+                completeness: FrameCompleteness::FullBaseline,
+            },
+        };
+        let expected = successful_startup(session_id);
+        let mut calls = 0;
+
+        let actual = apply_compiled_drain(vec![transaction], |transactions| {
+            calls += 1;
+            assert_eq!(transactions.len(), 1);
+            Ok(expected)
+        })
+        .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(actual, expected);
+    }
+
+    #[derive(Default)]
+    struct RecordingFrameFailureTarget {
+        order: Vec<&'static str>,
+    }
+
+    impl FrameBatchFailureTarget for RecordingFrameFailureTarget {
+        fn block_remote_input(&mut self) {
+            self.order.push("block_remote_input");
+        }
+
+        fn detach_remote_surface(&mut self) {
+            self.order.push("detach_remote_surface");
+        }
+
+        fn clear_pending_texture_writes(&mut self) {
+            self.order.push("clear_pending_texture_writes");
+        }
+    }
+
+    #[test]
+    fn frame_batch_failure_blocks_detaches_and_clears_in_exact_order() {
+        let mut target = RecordingFrameFailureTarget::default();
+
+        let report = terminate_failed_frame_batch(
+            &mut target,
+            FrameDrainFailure::Compile(FrameTransactionError::ForeignSession),
+        );
+
+        assert_eq!(
+            target.order,
+            [
+                "block_remote_input",
+                "detach_remote_surface",
+                "clear_pending_texture_writes"
+            ]
+        );
+        assert_eq!(report.operation(), "frame_transaction");
+        assert_eq!(report.details(), "frame_transaction_foreign_session");
+    }
+
+    fn callback_fatal_report() -> crate::fatal::FatalReport {
+        crate::fatal::FatalReport::frame_transaction(FrameTransactionError::ForeignSession)
+    }
+
+    #[test]
+    fn fatal_wake_has_zero_redraw_record_submit_present_and_receipt() {
+        let mut callbacks = RecordingDrainCallbacks::default();
+
+        dispatch_runtime_drain(
+            RuntimeDrainCallback::Wake,
+            Err(callback_fatal_report()),
+            &mut callbacks,
+        );
+
+        assert_eq!(callbacks.terminations, 1);
+        assert_eq!(callbacks.redraws, 0);
+        assert_eq!(callbacks.renders, 0);
+        assert_eq!(callbacks.records, 0);
+        assert_eq!(callbacks.submits, 0);
+        assert_eq!(callbacks.presents, 0);
+        assert_eq!(callbacks.receipts, 0);
+    }
+
+    #[test]
+    fn fatal_redraw_requested_has_zero_record_submit_present_and_receipt() {
+        let mut callbacks = RecordingDrainCallbacks::default();
+
+        dispatch_runtime_drain(
+            RuntimeDrainCallback::RedrawRequested,
+            Err(callback_fatal_report()),
+            &mut callbacks,
+        );
+
+        assert_eq!(callbacks.terminations, 1);
+        assert_eq!(callbacks.renders, 0);
+        assert_eq!(callbacks.records, 0);
+        assert_eq!(callbacks.submits, 0);
+        assert_eq!(callbacks.presents, 0);
+        assert_eq!(callbacks.receipts, 0);
     }
 
     #[test]

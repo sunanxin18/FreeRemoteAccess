@@ -1,7 +1,7 @@
 use frd_core::{ContentViewport, PixelRect, PixelSize, SessionId};
-use frd_frame::{
-    FrameCompleteness, FrameReset, FrameTransaction, PixelFormat, PixelPatch, SurfaceUpdate,
-};
+#[cfg(test)]
+use frd_frame::SurfaceUpdate;
+use frd_frame::{FrameCompleteness, FrameReset, FrameTransaction, PixelFormat, PixelPatch};
 
 use crate::{
     pass::RemotePass, GpuCleanToken, GpuContext, GpuContextId, GpuFaultClass, GpuFaultScope,
@@ -167,13 +167,6 @@ pub enum RecoveryRequirement {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ApplyOutcome {
-    Reset,
-    Damage { uploaded_rectangles: usize },
-    BoundaryPending(PresentationReceipt),
-}
-
 struct RemoteTexture {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
@@ -219,93 +212,6 @@ impl RemoteRenderer {
                 state: RemoteUpdateState::default(),
             })
             .map_err(RendererError::from)
-    }
-
-    pub fn apply_update(&mut self, update: SurfaceUpdate) -> Result<ApplyOutcome, RendererError> {
-        let plan = self.state.plan(update)?;
-        match &plan.data {
-            PlannedUpdateData::StartupReset { size, .. } => {
-                let limits = self.context.device().limits();
-                if size.width > limits.max_texture_dimension_2d
-                    || size.height > limits.max_texture_dimension_2d
-                {
-                    return Err(RendererError::TextureDimensionUnsupported);
-                }
-                let scope = self.context.begin_fault_scope()?;
-                let candidate = create_remote_texture(
-                    self.context.device(),
-                    &self.bind_group_layout,
-                    &self.sampler,
-                    *size,
-                );
-                let token = scope.finish()?;
-                let context = self.context.clone();
-                let committed = context
-                    .commit_if_unchanged(token, || {
-                        commit_reset_resource_after_gpu(
-                            &mut self.state,
-                            &mut self.remote,
-                            plan,
-                            Ok(candidate),
-                        )
-                    })
-                    .map_err(RendererError::from)??;
-                let (outcome, old_remote) = committed;
-                drop(old_remote);
-                Ok(outcome)
-            }
-            PlannedUpdateData::Damage { patches, .. } => {
-                let remote = self.remote.as_ref().ok_or(RendererError::ResetRequired)?;
-                let scope = self.context.begin_fault_scope()?;
-                for (patch, upload) in patches.iter().zip(plan.uploads()) {
-                    debug_assert_eq!(patch.pixels.len(), upload.byte_len);
-                    self.context.queue().write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &remote.texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: upload.rect.x,
-                                y: upload.rect.y,
-                                z: 0,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        patch.pixels.as_bytes(),
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(upload.stride_bytes),
-                            rows_per_image: Some(upload.rect.height),
-                        },
-                        wgpu::Extent3d {
-                            width: upload.rect.width,
-                            height: upload.rect.height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                }
-                let uploaded_rectangles = patches.len();
-                let token = scope.finish()?;
-                let context = self.context.clone();
-                context
-                    .commit_if_unchanged(token, || {
-                        commit_planned_update_after_gpu(&mut self.state, plan, Ok(()))
-                    })
-                    .map_err(RendererError::from)??;
-                Ok(ApplyOutcome::Damage {
-                    uploaded_rectangles,
-                })
-            }
-            PlannedUpdateData::Boundary(receipt) => {
-                let receipt = *receipt;
-                let scope = self.context.begin_fault_scope()?;
-                let token = scope.finish()?;
-                let context = self.context.clone();
-                context
-                    .commit_if_unchanged(token, || self.state.commit(plan))
-                    .map_err(RendererError::from)?;
-                Ok(ApplyOutcome::BoundaryPending(receipt))
-            }
-        }
     }
 
     pub fn apply_update_batch(
@@ -845,18 +751,19 @@ fn commit_planned_batch_after_gpu<R>(
     (outcome, prepared.superseded)
 }
 
+#[cfg(test)]
 fn commit_reset_resource_after_gpu<R>(
     state: &mut RemoteUpdateState,
     resource: &mut Option<R>,
     plan: PlannedUpdate,
     candidate: Result<R, RendererError>,
-) -> Result<(ApplyOutcome, Option<R>), RendererError> {
+) -> Result<Option<R>, RendererError> {
     let candidate = candidate?;
     state.commit(plan);
-    let old_resource = resource.replace(candidate);
-    Ok((ApplyOutcome::Reset, old_resource))
+    Ok(resource.replace(candidate))
 }
 
+#[cfg(test)]
 fn commit_planned_update_after_gpu(
     state: &mut RemoteUpdateState,
     plan: PlannedUpdate,
@@ -982,6 +889,7 @@ impl RemoteUpdateState {
     fn clear(&mut self) {
         *self = Self::default();
     }
+    #[cfg(test)]
     fn plan(&self, update: SurfaceUpdate) -> Result<PlannedUpdate, RendererError> {
         match update {
             SurfaceUpdate::Reset {
@@ -1105,6 +1013,7 @@ impl RemoteUpdateState {
         })
     }
 
+    #[cfg(test)]
     fn commit(&mut self, plan: PlannedUpdate) {
         self.commit_metadata(&plan);
     }
