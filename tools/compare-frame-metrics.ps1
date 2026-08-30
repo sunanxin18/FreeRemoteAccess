@@ -125,6 +125,59 @@ function Assert-HeadersAndRows([string]$Path, [string]$ExpectedHeader, [string]$
   return $rows
 }
 
+function Assert-FileRowIdentity(
+  $Rows,
+  [string]$ExpectedImplementation,
+  [string]$Kind,
+  [string[]]$AllowedPhases
+) {
+  foreach ($row in $Rows) {
+    Assert-True ([string]$row.schema_version -eq '1') "invalid_${Kind}_schema_version"
+    Assert-True ([string]$row.run_id -match '^[A-Za-z0-9_-]{1,64}$') "invalid_${Kind}_run_id"
+    Assert-True ([string]$row.implementation -ceq $ExpectedImplementation) "invalid_${Kind}_implementation"
+    Assert-True ($AllowedPhases -ccontains [string]$row.phase) "invalid_${Kind}_phase"
+  }
+  $runIds = @($Rows | Select-Object -ExpandProperty run_id -Unique)
+  Assert-True ($runIds.Count -eq 1) "invalid_${Kind}_run_id"
+  return [string]$runIds[0]
+}
+
+function Assert-RunRows(
+  $Events,
+  $ProcessRows,
+  [ValidateSet('serial','candidate')][string]$ExpectedImplementation,
+  [string]$Kind
+) {
+  $allPhases = @('VisibleWarmup', 'VisibleMeasurement', 'MinimizedWarmup', 'MinimizedMeasurement', 'Restore')
+  $eventRunId = Assert-FileRowIdentity $Events $ExpectedImplementation "${Kind}_events" $allPhases
+  $processRunId = Assert-FileRowIdentity $ProcessRows $ExpectedImplementation "${Kind}_process" $MeasuredPhases
+  Assert-True ($eventRunId -ceq $processRunId) "${Kind}_run_identity_mismatch"
+
+  $eventPhases = @($Events | Select-Object -ExpandProperty phase -Unique)
+  Assert-True ($eventPhases.Count -eq $allPhases.Count) "invalid_${Kind}_events_phase_set"
+  foreach ($phase in $allPhases) {
+    Assert-True ($eventPhases -ccontains $phase) "invalid_${Kind}_events_phase_set"
+  }
+  $processPhases = @($ProcessRows | Select-Object -ExpandProperty phase -Unique)
+  Assert-True ($processPhases.Count -eq $MeasuredPhases.Count) "invalid_${Kind}_process_phase_set"
+  foreach ($phase in $MeasuredPhases) {
+    Assert-True ($processPhases -ccontains $phase) "invalid_${Kind}_process_phase_set"
+  }
+
+  $boundaries = @($Events | Where-Object { $_.event -ceq 'PhaseBoundary' })
+  Assert-True ($boundaries.Count -eq $allPhases.Count) "invalid_${Kind}_events_phase_boundaries"
+  for ($index = 0; $index -lt $allPhases.Count; $index++) {
+    $phase = $allPhases[$index]
+    Assert-True ([string]$boundaries[$index].phase -ceq $phase) "invalid_${Kind}_events_phase_boundaries"
+    Assert-True (@($boundaries | Where-Object { $_.phase -ceq $phase }).Count -eq 1) "invalid_${Kind}_events_phase_boundaries"
+    $boundaryTimestamp = Convert-U64 $boundaries[$index].monotonic_us 'invalid_event_timestamp'
+    Assert-True (@($Events | Where-Object {
+      $_.phase -ceq $phase -and (Convert-U64 $_.monotonic_us 'invalid_event_timestamp') -lt $boundaryTimestamp
+    }).Count -eq 0) "invalid_${Kind}_events_phase_boundaries"
+  }
+  return $eventRunId
+}
+
 function Assert-MonotonicEvents($Rows) {
   [UInt64]$previous = 0
   $first = $true
@@ -210,6 +263,41 @@ function Get-RunStatistics($Events, $ProcessRows, [string]$Implementation) {
   return $result
 }
 
+function Assert-FailsWith([scriptblock]$Action, [string]$ExpectedCode) {
+  try {
+    & $Action
+    throw 'selftest_expected_failure_missing'
+  } catch {
+    Assert-True ($_.Exception.Message -eq $ExpectedCode) "selftest_wrong_failure_$ExpectedCode"
+  }
+}
+
+function New-SelfTestEventRows([string]$RunId, [string]$Implementation) {
+  $rows = @()
+  [UInt64]$timestamp = 0
+  foreach ($phase in @('VisibleWarmup', 'VisibleMeasurement', 'MinimizedWarmup', 'MinimizedMeasurement', 'Restore')) {
+    $rows += [pscustomobject]@{
+      schema_version = '1'; run_id = $RunId; implementation = $Implementation
+      phase = $phase; event = 'PhaseBoundary'; monotonic_us = [string]$timestamp
+    }
+    $timestamp += 1000000
+  }
+  return $rows
+}
+
+function New-SelfTestProcessRows([string]$RunId, [string]$Implementation) {
+  $rows = @()
+  foreach ($phase in $MeasuredPhases) {
+    foreach ($second in 0..30) {
+      $rows += [pscustomobject]@{
+        schema_version = '1'; run_id = $RunId; implementation = $Implementation
+        phase = $phase; second = [string]$second; monotonic_us = [string]($second * 1000000)
+      }
+    }
+  }
+  return $rows
+}
+
 function Invoke-SelfTest {
   Assert-True ((Get-NearestRankP95 ([UInt64[]](1..20))) -eq 19) 'selftest_nearest_rank_p95'
   Assert-True ((Get-Median ([UInt64[]]@(9, 1, 5, 3, 7))) -eq 5) 'selftest_odd_median'
@@ -240,6 +328,49 @@ function Invoke-SelfTest {
   Assert-True ($statistics.working_set_max_bytes -eq 1030) 'selftest_working_set_maximum'
   Assert-True ($statistics.working_set_first_median_bytes -eq 1003) 'selftest_first_median'
   Assert-True ($statistics.working_set_last_median_bytes -eq 1028) 'selftest_last_median'
+
+  Assert-FailsWith {
+    Assert-RunRows (New-SelfTestEventRows 'serial-a' 'serial') (New-SelfTestProcessRows 'serial-b' 'serial') 'serial' 'serial'
+  } 'serial_run_identity_mismatch'
+  Assert-FailsWith {
+    $events = New-SelfTestEventRows 'serial-a' 'serial'
+    $events[3].run_id = 'serial-b'
+    Assert-RunRows $events (New-SelfTestProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_run_id'
+  Assert-FailsWith {
+    $events = New-SelfTestEventRows 'serial-a' 'serial'
+    $events[2].implementation = 'candidate'
+    Assert-RunRows $events (New-SelfTestProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_implementation'
+  Assert-FailsWith {
+    $processRows = New-SelfTestProcessRows 'serial-a' 'serial'
+    $processRows[17].schema_version = '2'
+    Assert-RunRows (New-SelfTestEventRows 'serial-a' 'serial') $processRows 'serial' 'serial'
+  } 'invalid_serial_process_schema_version'
+  Assert-FailsWith {
+    $processRows = New-SelfTestProcessRows 'serial-a' 'serial'
+    $processRows[0].phase = 'Restore'
+    Assert-RunRows (New-SelfTestEventRows 'serial-a' 'serial') $processRows 'serial' 'serial'
+  } 'invalid_serial_process_phase'
+  Assert-FailsWith {
+    $events = @(New-SelfTestEventRows 'serial-a' 'serial')
+    $events += [pscustomobject]@{
+      schema_version = '1'; run_id = 'serial-a'; implementation = 'serial'
+      phase = 'Restore'; event = 'PhaseBoundary'; monotonic_us = '5000000'
+    }
+    Assert-RunRows $events (New-SelfTestProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_phase_boundaries'
+  Assert-FailsWith {
+    $events = @(New-SelfTestEventRows 'serial-a' 'serial')
+    $swapped = $events[1]
+    $events[1] = $events[2]
+    $events[2] = $swapped
+    Assert-RunRows $events (New-SelfTestProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_phase_boundaries'
+  Assert-FailsWith {
+    $events = @(New-SelfTestEventRows 'serial-a' 'serial' | Where-Object { $_.phase -ne 'Restore' })
+    Assert-RunRows $events (New-SelfTestProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_phase_set'
   Write-Output 'SELFTEST PASS'
 }
 
@@ -256,6 +387,8 @@ $serialEventRows = Assert-HeadersAndRows $SerialEvents $EventHeader 'serial_even
 $serialProcessRows = Assert-HeadersAndRows $SerialProcessSamples $ProcessHeader 'serial_process'
 $candidateEventRows = Assert-HeadersAndRows $CandidateEvents $EventHeader 'candidate_events'
 $candidateProcessRows = Assert-HeadersAndRows $CandidateProcessSamples $ProcessHeader 'candidate_process'
+[void](Assert-RunRows $serialEventRows $serialProcessRows 'serial' 'serial')
+[void](Assert-RunRows $candidateEventRows $candidateProcessRows 'candidate' 'candidate')
 $serial = Get-RunStatistics $serialEventRows $serialProcessRows 'serial'
 $candidate = Get-RunStatistics $candidateEventRows $candidateProcessRows 'candidate'
 

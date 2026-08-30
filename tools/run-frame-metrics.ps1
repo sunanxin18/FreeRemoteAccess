@@ -1,7 +1,9 @@
+[CmdletBinding(DefaultParameterSetName='Capture')]
 param(
-  [Parameter(Mandatory=$true)][ValidateSet('serial','candidate')][string]$Implementation,
-  [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]{1,64}$')][string]$RunId,
-  [string]$OutputDirectory = '.\target\validation'
+  [Parameter(Mandatory=$true, ParameterSetName='Capture')][ValidateSet('serial','candidate')][string]$Implementation,
+  [Parameter(Mandatory=$true, ParameterSetName='Capture')][ValidatePattern('^[A-Za-z0-9_-]{1,64}$')][string]$RunId,
+  [Parameter(ParameterSetName='Capture')][string]$OutputDirectory = '.\target\validation',
+  [Parameter(Mandatory=$true, ParameterSetName='SelfTest')][switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -52,9 +54,21 @@ function New-SafeDirectory([string]$Path, [string]$AllowedRoot, [string]$Reposit
     $ancestor = Split-Path -Parent $ancestor
   }
   for ($index = $missing.Count - 1; $index -ge 0; $index--) {
-    [void](New-Item -ItemType Directory -LiteralPath $missing[$index])
+    [void][IO.Directory]::CreateDirectory($missing[$index])
     Assert-NormalDirectory $missing[$index]
   }
+}
+
+function Resolve-SafeOutputDirectory([string]$RepositoryRoot, [string]$RequestedDirectory) {
+  Assert-NoDeviceNamespace $RequestedDirectory
+  $outputFullPath = if ([IO.Path]::IsPathRooted($RequestedDirectory)) {
+    [IO.Path]::GetFullPath($RequestedDirectory)
+  } else {
+    [IO.Path]::GetFullPath((Join-Path $RepositoryRoot $RequestedDirectory))
+  }
+  $validationRoot = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot 'target\validation'))
+  New-SafeDirectory $outputFullPath $validationRoot $RepositoryRoot
+  return $outputFullPath
 }
 
 function Read-EventRows([string]$Path) {
@@ -125,15 +139,132 @@ function Get-MainWindowHandle([Diagnostics.Process]$Process, [int]$TimeoutSecond
   throw 'client_main_window_unavailable'
 }
 
-$repositoryRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-Assert-NoDeviceNamespace $OutputDirectory
-$outputFullPath = if ([IO.Path]::IsPathRooted($OutputDirectory)) {
-  [IO.Path]::GetFullPath($OutputDirectory)
-} else {
-  [IO.Path]::GetFullPath((Join-Path $repositoryRoot $OutputDirectory))
+function Assert-Sequence($Actual, [string[]]$Expected, [string]$Code) {
+  Assert-True ($Actual.Count -eq $Expected.Count) $Code
+  for ($index = 0; $index -lt $Expected.Count; $index++) {
+    Assert-True ([string]$Actual[$index] -ceq $Expected[$index]) $Code
+  }
 }
-$validationRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'target\validation'))
-New-SafeDirectory $outputFullPath $validationRoot $repositoryRoot
+
+function Invoke-CleanupWorkflow(
+  [scriptblock]$HasExited,
+  [scriptblock]$RequestNormalClose,
+  [scriptblock]$WaitAfterClose,
+  [scriptblock]$TerminateExactProcess,
+  [scriptblock]$WaitAfterTerminate
+) {
+  $actions = [Collections.Generic.List[string]]::new()
+  if ([bool](& $HasExited)) {
+    $actions.Add('ConfirmExit')
+    return $actions.ToArray()
+  }
+
+  $actions.Add('RequestNormalClose')
+  [void](& $RequestNormalClose)
+  $actions.Add('BoundedWaitAfterClose')
+  if ([bool](& $WaitAfterClose)) {
+    $actions.Add('ConfirmExit')
+    return $actions.ToArray()
+  }
+
+  $actions.Add('TerminateExactProcess')
+  [void](& $TerminateExactProcess)
+  $actions.Add('BoundedWaitAfterTerminate')
+  Assert-True ([bool](& $WaitAfterTerminate)) 'client_cleanup_termination_timeout'
+  $actions.Add('ConfirmExit')
+  return $actions.ToArray()
+}
+
+function Stop-StartedClientOnFailure([Diagnostics.Process]$Process) {
+  $startedProcessId = $Process.Id
+  [void](Invoke-CleanupWorkflow `
+    {
+      $Process.Refresh()
+      $Process.HasExited
+    } `
+    {
+      $Process.Refresh()
+      Assert-True ($Process.Id -eq $startedProcessId) 'client_cleanup_process_identity_changed'
+      [void]$Process.CloseMainWindow()
+    } `
+    { $Process.WaitForExit(5000) } `
+    {
+      $Process.Refresh()
+      if (-not $Process.HasExited) {
+        Assert-True ($Process.Id -eq $startedProcessId) 'client_cleanup_process_identity_changed'
+        $Process.Kill()
+      }
+    } `
+    { $Process.WaitForExit(5000) })
+  $Process.Refresh()
+  Assert-True ($Process.HasExited) 'client_cleanup_exit_unconfirmed'
+}
+
+function Finalize-CaptureArtifacts([string[]]$Paths, [bool]$CaptureComplete) {
+  if ($CaptureComplete) { return }
+  foreach ($path in $Paths) {
+    Assert-True (-not [string]::IsNullOrWhiteSpace($path)) 'capture_artifact_path_missing'
+    Assert-True (-not [IO.Directory]::Exists($path)) 'capture_artifact_cleanup_failed'
+    if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+    Assert-True (-not [IO.File]::Exists($path)) 'capture_artifact_cleanup_failed'
+  }
+}
+
+function Invoke-SelfTest {
+  $testRepositoryRoot = Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target'))) ".run-frame-metrics-selftest-$([Guid]::NewGuid().ToString('N'))"
+  $defaultOutput = [IO.Path]::GetFullPath((Join-Path $testRepositoryRoot 'target\validation'))
+  try {
+    [void][IO.Directory]::CreateDirectory($testRepositoryRoot)
+    $resolvedDefault = Resolve-SafeOutputDirectory $testRepositoryRoot '.\target\validation'
+    Assert-True ($resolvedDefault -ceq $defaultOutput) 'selftest_default_directory_resolution'
+    Assert-True (Test-Path -LiteralPath $defaultOutput -PathType Container) 'selftest_default_directory_not_created'
+
+    $normalCalls = [Collections.Generic.List[string]]::new()
+    $normalActions = @(Invoke-CleanupWorkflow `
+      { $false } `
+      { [void]$normalCalls.Add('request_normal_close') } `
+      { [void]$normalCalls.Add('wait_after_close'); $true } `
+      { throw 'selftest_normal_path_terminated' } `
+      { throw 'selftest_normal_path_waited_after_terminate' })
+    Assert-Sequence $normalCalls @('request_normal_close', 'wait_after_close') 'selftest_normal_cleanup_calls'
+    Assert-Sequence $normalActions @('RequestNormalClose', 'BoundedWaitAfterClose', 'ConfirmExit') 'selftest_normal_cleanup_actions'
+
+    $forcedCalls = [Collections.Generic.List[string]]::new()
+    $forcedActions = @(Invoke-CleanupWorkflow `
+      { $false } `
+      { [void]$forcedCalls.Add('request_normal_close') } `
+      { [void]$forcedCalls.Add('wait_after_close'); $false } `
+      { [void]$forcedCalls.Add('terminate_exact_process') } `
+      { [void]$forcedCalls.Add('wait_after_terminate'); $true })
+    Assert-Sequence $forcedCalls @('request_normal_close', 'wait_after_close', 'terminate_exact_process', 'wait_after_terminate') 'selftest_forced_cleanup_calls'
+    Assert-Sequence $forcedActions @('RequestNormalClose', 'BoundedWaitAfterClose', 'TerminateExactProcess', 'BoundedWaitAfterTerminate', 'ConfirmExit') 'selftest_forced_cleanup_actions'
+
+    $incompleteEvent = Join-Path $defaultOutput 'incomplete-events.csv'
+    $incompleteProcess = Join-Path $defaultOutput 'incomplete-process.csv'
+    [IO.File]::WriteAllText($incompleteEvent, 'incomplete')
+    [IO.File]::WriteAllText($incompleteProcess, 'incomplete')
+    Finalize-CaptureArtifacts @($incompleteEvent, $incompleteProcess) $false
+    Assert-True (-not [IO.File]::Exists($incompleteEvent) -and -not [IO.File]::Exists($incompleteProcess)) 'selftest_incomplete_artifacts_retained'
+
+    [IO.File]::WriteAllText($incompleteEvent, 'complete')
+    [IO.File]::WriteAllText($incompleteProcess, 'complete')
+    Finalize-CaptureArtifacts @($incompleteEvent, $incompleteProcess) $true
+    Assert-True ([IO.File]::Exists($incompleteEvent) -and [IO.File]::Exists($incompleteProcess)) 'selftest_complete_artifacts_removed'
+  } finally {
+    if (Test-Path -LiteralPath $testRepositoryRoot) {
+      [IO.Directory]::Delete($testRepositoryRoot, $true)
+    }
+  }
+  Write-Output 'SELFTEST PASS'
+}
+
+if ($SelfTest) {
+  Invoke-SelfTest
+  exit 0
+}
+
+$repositoryRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$outputFullPath = Resolve-SafeOutputDirectory $repositoryRoot $OutputDirectory
 
 $existingClients = @(Get-Process -Name 'freeremotedesk-windows' -ErrorAction SilentlyContinue)
 Assert-True ($existingClients.Count -eq 0) 'existing_client_detected'
@@ -163,6 +294,7 @@ foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariabl
 $processStream = $null
 $processWriter = $null
 $client = $null
+$captureComplete = $false
 try {
   [Environment]::SetEnvironmentVariable('FRD_FRAME_METRICS_PATH', $eventPath, 'Process')
   [Environment]::SetEnvironmentVariable('FRD_FRAME_METRICS_RUN_ID', $RunId, 'Process')
@@ -193,12 +325,27 @@ try {
   Assert-True ($client.ExitCode -eq 0) 'client_exit_nonzero'
   $faults = @(Read-EventRows $eventPath | Where-Object { $_.event -eq 'StableFault' })
   Assert-True ($faults.Count -eq 0) 'stable_fault_present'
+  $captureComplete = $true
 } finally {
-  if ($null -ne $processWriter) { $processWriter.Dispose() }
-  elseif ($null -ne $processStream) { $processStream.Dispose() }
+  $finalizationError = $null
+  if (-not $captureComplete -and $null -ne $client) {
+    try { Stop-StartedClientOnFailure $client } catch { $finalizationError = $_ }
+  }
+  try {
+    if ($null -ne $processWriter) { $processWriter.Dispose() }
+    elseif ($null -ne $processStream) { $processStream.Dispose() }
+  } catch {
+    if ($null -eq $finalizationError) { $finalizationError = $_ }
+  }
   foreach ($name in $names) {
     [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
   }
+  try {
+    Finalize-CaptureArtifacts @($eventPath, $processPath) $captureComplete
+  } catch {
+    if ($null -eq $finalizationError) { $finalizationError = $_ }
+  }
+  if ($null -ne $finalizationError) { throw $finalizationError }
 }
 
 Write-Output $eventPath
