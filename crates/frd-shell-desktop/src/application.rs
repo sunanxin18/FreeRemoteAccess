@@ -1088,6 +1088,10 @@ fn mark_texture_deltas_applied(deltas: &mut egui::TexturesDelta) {
     deltas.clear();
 }
 
+fn stop_local_text_input_for_remote_entry(context: &egui::Context) {
+    context.memory_mut(|memory| memory.stop_text_input());
+}
+
 #[cfg(test)]
 mod dpi_transition_tests {
     use frd_core::PixelSize;
@@ -1818,12 +1822,18 @@ impl DesktopApplication {
                         ..
                     } => (*session_id, *generation, *completeness),
                 };
-                self.launch.controller_mut().handle_presentation(event);
-                if matches!(
+                let was_remote = matches!(
                     self.launch.controller().page(),
                     AppPage::RemoteSession { .. }
-                ) && completeness == FrameCompleteness::FullBaseline
-                {
+                );
+                self.launch.controller_mut().handle_presentation(event);
+                let entered_remote = !was_remote
+                    && matches!(
+                        self.launch.controller().page(),
+                        AppPage::RemoteSession { .. }
+                    );
+                if entered_remote && completeness == FrameCompleteness::FullBaseline {
+                    stop_local_text_input_for_remote_entry(&egui_context);
                     if let Some(release) = self.input.set_gate(InputGate::Interactive {
                         session_id,
                         generation,
@@ -2865,9 +2875,9 @@ mod tests {
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
 
     use super::{
-        mark_texture_deltas_applied, AcceptedLaunchOutcome, ApplicationExitState,
-        AudioOutputFactory, SessionHost, TestLaunchOutcome, UnavailableCredentialStore,
-        UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
+        mark_texture_deltas_applied, stop_local_text_input_for_remote_entry, AcceptedLaunchOutcome,
+        ApplicationExitState, AudioOutputFactory, SessionHost, TestLaunchOutcome,
+        UnavailableCredentialStore, UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
     };
 
     #[test]
@@ -2879,6 +2889,38 @@ mod tests {
 
         assert!(deltas.set.is_empty());
         assert!(deltas.free.is_empty());
+    }
+
+    #[test]
+    fn remote_entry_releases_hidden_text_edit_focus_without_disabling_later_ui_focus() {
+        let context = egui::Context::default();
+        let mut password = String::from("placeholder");
+        let mut password_id = None;
+        let mut output = context.run_ui(Default::default(), |ui| {
+            let response = ui.add(egui::TextEdit::singleline(&mut password).password(true));
+            response.request_focus();
+            password_id = Some(response.id);
+        });
+        mark_texture_deltas_applied(&mut output.textures_delta);
+        let password_id = password_id.unwrap();
+        assert!(context.memory(|memory| memory.has_focus(password_id)));
+        assert!(context.text_edit_focused());
+
+        stop_local_text_input_for_remote_entry(&context);
+
+        assert!(!context.memory(|memory| memory.has_focus(password_id)));
+        assert!(!context.text_edit_focused());
+
+        let mut titlebar_id = None;
+        let mut output = context.run_ui(Default::default(), |ui| {
+            let response = ui.button("断开连接");
+            response.request_focus();
+            titlebar_id = Some(response.id);
+        });
+        mark_texture_deltas_applied(&mut output.textures_delta);
+        let titlebar_id = titlebar_id.unwrap();
+        assert!(context.memory(|memory| memory.has_focus(titlebar_id)));
+        assert!(context.egui_wants_keyboard_input());
     }
 
     #[test]
