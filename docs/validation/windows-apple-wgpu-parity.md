@@ -172,6 +172,50 @@ not established causes. Dynamic resolution remains default-off because resized
 must not enable it without the required ARD evidence and live gate. That work is
 tracked explicitly in the top-level README pending list.
 
+## Strict Apple High Performance pre-live evidence (2026-08-30)
+
+The reviewed commit was
+`b2d89d16f598a355268d781a4a9505a6e7340c10`. Cargo used its normal default
+parallelism. The following implementation and build gates all exited with code
+0:
+
+- `cargo +stable fmt --all -- --check`;
+- `cargo +stable test -p frd-protocol-apple` (345 passed, 9 ignored), including
+  the separate authentication (4 passed) and session (1 passed) integration
+  targets;
+- `cargo +stable test -p frd-app` (72 passed);
+- `cargo +stable test -p frd-shell-desktop` (53 passed);
+- both `cargo +stable test --workspace --no-default-features` and
+  `cargo +stable test --workspace`;
+- both `cargo +stable build --workspace --no-default-features` and
+  `cargo +stable build --workspace`;
+- `cargo +stable run -- --help` and
+  `cargo +stable run -- hpssview --help`;
+- `cargo +stable build --release -p frd-shell-desktop` and
+  `cargo +stable build --release -p freeremotedesk-windows`.
+
+The resulting standalone executable was
+`D:\FreeRemoteDesk\.worktrees\mac-baseline-rdp-integration\target\release\freeremotedesk-windows.exe`,
+42,138,112 bytes, with SHA-256
+`5CD74FE5396EE7E1C2D3B74917697D2022579F4E3EE703FAAE4A6B56CA3C328B`.
+It is not Authenticode-signed. This repository state provides no installer or
+packaging pipeline, so the artifact is an unsigned standalone EXE, not an MSI,
+ZIP package, or installable release.
+
+The strict live gate was not started. The Windows host was attached to a
+different local /24 from the previously authorized target; ICMP, ARP, and TCP
+5900 checks could not reach that target. A bounded scan found seven responsive
+hosts on the current /24 and no listening TCP 5900 service. Target addresses
+are intentionally omitted from this tracked record.
+
+Consequently, none of the strict product observations were made: stock macOS
+acceptance of the High Performance virtual display, physical-display blanking
+and restoration, complete continuously updating virtual desktop, strict
+geometry agreement, focused input, or normal disconnect. Historical
+shared-console authentication, MVS, input, and media evidence cannot substitute
+for this gate. Windows-client to macOS-server strict High Performance therefore
+remains **开发中** and must not be promoted to **受限验证**.
+
 ## Remaining Platform Evidence
 
 - macOS and Linux expose the same platform-adapter contract but are compile

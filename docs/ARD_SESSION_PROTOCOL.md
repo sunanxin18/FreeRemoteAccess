@@ -827,12 +827,38 @@ pub mod viewer_off {
 
 ## 九、HPSS 高性能屏幕共享（2026-08-21，证据边界）
 
+### 9.0 Apple wire 证据与 FreeRemoteDesk 本地策略
+
+本章的 `0x1d`、严格媒体包络中的 `0x451 ServerState`、`0x09` 以及非增量
+FramebufferUpdateRequest 字节，来自既有反汇编、捕获或有界实验，是 Apple wire
+互操作证据。它们只证明消息形状、顺序或已观察到的服务端响应，不把任何本地超时、
+发布时机或产品裁剪重新解释为 Apple 协议语义。
+
+当前 `frd-protocol-apple` 的严格 High Performance 产品路径另有一组本地
+fail-closed 策略：
+
+- 产品工厂只接受现有命名的加密 `APPLE_SRP` 类型；legacy shared 认证仍仅供
+  通用研究接口使用，不能进入产品 runtime；
+- 成功写出既有 `0x1d` 后，必须在本地五秒期限内收到并严格解析首个
+  `0x451 ServerState`，否则返回 typed
+  `apple_high_performance_unavailable`；
+- 确认前 generation、Reset、TransportReady、能力与音频状态均不公开；严格几何
+  的新全量请求成功写出后，才激活首个公共 generation；
+- 加密会话、HPSS 认证成功、`0x1d` 写入或收到任意 ServerState，任一项单独成立
+  都不能证明 stock macOS 已接受 High Performance 虚拟显示，更不能替代实体显示器
+  置黑/恢复和完整远程桌面的有界真机观察。
+
+以上五秒期限、延迟 generation、typed failure 和 encrypted-only 选择均是
+FreeRemoteDesk 产品安全策略，不是从 ARD 3.10 推导出的新 wire 字段或服务器保证。
+现行设计见
+[`Apple High Performance Session`](superpowers/specs/2026-08-29-apple-high-performance-session-design.md)。
+
 ### 9.1 协商链路（客户端 → 服务器）
 
 | 消息 | 方向 | 格式 | 语义 |
 |---|---|---|---|
-| 0x1d | C→S | `[0x1d][u16 1][u8 0x30][u16 1][u16 1][u32 0][u8 1][u8 40][UTF-8 名 40B][零填]` 308B | SetDisplayConfiguration：请求虚拟显示器 |
-| 0x451 | S→C | ServerState（1440×2560）| 0x1d 确认：虚拟屏就绪 |
+| 0x1d | C→S | `[0x1d][u16 1][u8 0x30][u16 1][u16 1][u32 0][u8 1][u8 40][UTF-8 名 40B][零填]` 308B | 已捕获的 SetDisplayConfiguration 虚拟显示请求 |
+| 0x451 | S→C | ServerState（1440×2560）| 已观察到的 post-`0x1d` 显示状态；严格解析可取得几何，但本身不证明产品模式或实体显示器置黑 |
 | 0x08 | C→S | `[08 00][f64 BE scale][u16 zero reserved]` | SetServerScaling；`3fe6/3fed/3fee` 是浮点数高位，不是 subtype |
 | 0x451 | S→C | 严格媒体矩形包络 + 声明长度 + ServerState 记录 | 显示状态族；不能据此推断 UDP 查询/应答关系 |
 | 0x09 | C→S | `[09][00][u16 1][u32 0][u32 0][u16 w][u16 h]` | 已验证携带显示尺寸并启动 MVS 捕获路径；以新尺寸发送仍是 opt-in 实验 |
@@ -860,15 +886,15 @@ P1 仅由 `hpssview --dynamic-resolution` 启用，默认关闭。运行时先�
 窗口与当前 surface 尺寸。
 
 P2 先按声明总长度组装 MVS 记录，不把后续加密应用帧重新解释成媒体头。已捕获的
-32748 + 26572 = 59320 片段是该规则的回归用例。全量、部分和畸形负载严格分类；部分或
-畸形负载绝不送入 JPEG 路径，而是请求全量重同步（200 ms 限制写入速率，不丢弃唯一所需
-请求）。量化表、参考帧和等待全量状态均绑定显示 generation。离线捕获格式为带矩形的
-`FRDMVS01`；旧的无矩形格式显式拒绝，避免用整屏尺寸伪解局部熵流。
+32748 + 26572 = 59320 片段是该规则的回归用例。全量、部分和畸形负载严格分类；畸形
+负载不进入错误 decoder 路径，而是按当前 generation 请求全量重同步（200 ms 限制写入
+速率，不丢弃唯一所需请求）。量化表、参考帧和等待全量状态均绑定显示 generation。
 
-**BLOCKED：** type-1 部分更新的确切字段、`mvs` 标记偏移及参考系数规则仍无可信夹具或
-完整解码器恢复，不实现也不宣称可解码。没有本轮真机联调；调整尺寸的 `0x09`、确认时序、
-切换后的表下发和交互窗口行为均仍待验证。本文也不以现有证据推断 UDP、HDR、帧率语义或
-额外线格式字段。
+ARD 3.10 type-1 已按捕获证据实现 opcode 0/1/2/3、固定 Cb/Cr extent、`mvs` 终止、
+cache/scan-order 引用和 generation 状态；严格 `FRDMVS02` 回放覆盖 18 条捕获记录，旧的
+无版本/无几何捕获格式保持拒绝。该证据不覆盖所有非八对齐边缘、质量语义或长期网络条件。
+调整尺寸的 `0x09`、本节新增的严格 High Performance 门禁、切换后的表下发和交互窗口仍
+须分别完成真机验证；本文也不以现有证据推断 UDP、HDR、帧率语义或额外线格式字段。
 
 ### 9.4 客户端判定链（伪造服务器实测）
 1. ServerInit 60B 必须逐字节克隆真实（时间戳区格式=Apple-ness 钥匙）

@@ -36,15 +36,21 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
 |---|---|---|---|---|
-| macOS | Screen Sharing / Remote Management | Apple HPSS、RFB 线协议、MVS、Apple UDP 媒体 | Windows | **受限验证**；账号密码登录、画面、输入和 Mac→PC 音频已有有界真机证据 |
+| macOS | Screen Sharing / Remote Management | `frd-protocol-apple`：严格 Apple High Performance HPSS/MVS | Windows | **开发中**；当前产品仅允许加密 High Performance 路径，设计见 [`Apple High Performance Session`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md)。既有账号密码、共享会话画面/输入及媒体证据早于严格虚拟显示确认门禁，不能证明当前产品模式已被 stock macOS 接受 |
 | Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；私有 adapter 已实现服务器身份验证、TLS、CredSSP/NLA、licensing 与 activation，2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录、首帧或输入互操作；完整离线门禁、构建哈希和未验证边界见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md)；不得要求安装 FreeRemoteDesk 服务端 |
 | Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
 
 ### Windows 客户端连接 macOS 功能明细
 
+本表中既有“已验证/受限验证”记录描述对应认证、MVS、输入或媒体子系统的历史
+证据，不自动继承为当前严格 High Performance 产品组合的互操作结论。当前组合
+必须另外证明 stock macOS 接受虚拟显示、实体显示器按预期置黑并可在断开后恢复；
+完成该有界门禁前，组合状态保持 **开发中**。
+
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
+| High Performance 虚拟显示与实体显示器置黑 | `frd-protocol-apple` 严格确认门禁 | **开发中** | 产品只选择加密 `APPLE_SRP`，发送现有 `0x1d` 后等待严格 `0x451 ServerState`，确认前不公开 generation/readiness；自动化门禁不能替代实体显示器置黑/恢复与完整远程桌面的真机观察，见 [`设计`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md) |
 | 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-29 在并列注册 RDP adapter 后重新完成自动选择、首帧、持续增量与键鼠真机回归；该真机证据早于 `3f8d8bd` 及其后续 type-0 copy-elision 修复。copy-elision 与服务端主动 `ServerState` 几何恢复目前仅完成 Apple crate 离线验证，尚未证明真机 CPU 或输入延迟改善，也不得重用此前 A/B 性能结论；输入到显示延迟根因仍未确认，见 `docs/validation/windows-apple-wgpu-parity.md` |
 | 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。现存成本为 dirty rect 的 BGRX 打包与 CPU→GPU 上传；见 `AGENTS.md` P2 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
@@ -81,7 +87,7 @@ HPSS/ARD/MVS 路径。
 
 | 客户端 \ 服务端 | macOS 原生服务 | Windows 原生服务 | Linux 原生服务 |
 |---|---|---|---|
-| Windows | **受限验证** | **开发中** | **计划中** |
+| Windows | **开发中** | **开发中** | **计划中** |
 | macOS | **计划中** | **计划中** | **计划中** |
 | Linux | **计划中** | **计划中** | **计划中** |
 | Android | **计划中** | **计划中** | **计划中** |
