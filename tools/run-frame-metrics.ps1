@@ -3,6 +3,11 @@ param(
   [Parameter(Mandatory=$true, ParameterSetName='Capture')][ValidateSet('serial','candidate')][string]$Implementation,
   [Parameter(Mandatory=$true, ParameterSetName='Capture')][ValidatePattern('^[A-Za-z0-9_-]{1,64}$')][string]$RunId,
   [Parameter(ParameterSetName='Capture')][string]$OutputDirectory = '.\target\validation',
+  [Parameter(ParameterSetName='Capture')][switch]$AutoConnect,
+  [Parameter(ParameterSetName='Capture')][ValidateSet('macos','windows','linux','custom')][string]$AutoConnectTarget,
+  [Parameter(ParameterSetName='Capture')][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$')][string]$AutoConnectAddress,
+  [Parameter(ParameterSetName='Capture')][UInt16]$AutoConnectPort,
+  [Parameter(ParameterSetName='Capture')][ValidatePattern('^[a-z0-9-]{1,64}$')][string]$AutoConnectProtocol,
   [Parameter(Mandatory=$true, ParameterSetName='SelfTest')][switch]$SelfTest
 )
 
@@ -14,6 +19,44 @@ $DevicePrefixes = @('\\.\', '\\?\', '\??\')
 
 function Assert-True([bool]$Condition, [string]$Code) {
   if (-not $Condition) { throw $Code }
+}
+
+function Get-CaptureClientArgumentVector(
+  [bool]$AutoConnect,
+  [string]$Target,
+  [string]$Address,
+  [UInt16]$Port,
+  [string]$Protocol
+) {
+  if (-not $AutoConnect) { return @() }
+
+  $validTargets = @('macos', 'windows', 'linux', 'custom')
+  if ([string]::IsNullOrWhiteSpace($Target) -or
+    $Target -notin $validTargets -or
+    [string]::IsNullOrWhiteSpace($Address) -or
+    $Address -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$' -or
+    $Port -eq 0 -or
+    [string]::IsNullOrWhiteSpace($Protocol) -or
+    $Protocol -notmatch '^[a-z0-9-]{1,64}$') {
+    throw 'auto_connect_configuration_incomplete'
+  }
+
+  if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('FRD_USERNAME', 'Process'))) {
+    throw 'auto_connect_username_environment_missing'
+  }
+  if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable('FRD_PASSWORD', 'Process'))) {
+    throw 'auto_connect_password_environment_missing'
+  }
+
+  return @(
+    '--target', $Target,
+    '--address', $Address,
+    '--port', $Port.ToString([Globalization.CultureInfo]::InvariantCulture),
+    '--protocol', $Protocol,
+    '--username-provider', 'environment',
+    '--password-provider', 'environment',
+    '--connect'
+  )
 }
 
 function Test-Within([string]$Path, [string]$Root) {
@@ -213,11 +256,57 @@ function Finalize-CaptureArtifacts([string[]]$Paths, [bool]$CaptureComplete) {
 function Invoke-SelfTest {
   $testRepositoryRoot = Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target'))) ".run-frame-metrics-selftest-$([Guid]::NewGuid().ToString('N'))"
   $defaultOutput = [IO.Path]::GetFullPath((Join-Path $testRepositoryRoot 'target\validation'))
+  $credentialNames = @('FRD_USERNAME', 'FRD_PASSWORD')
+  $savedCredentials = @{}
+  foreach ($name in $credentialNames) {
+    $savedCredentials[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+  }
+
+  function Assert-ThrowsCode([scriptblock]$Action, [string]$ExpectedCode, [string]$FailureCode) {
+    $threw = $false
+    try {
+      [void](& $Action)
+    } catch {
+      $threw = $true
+      Assert-True ($_.Exception.Message -ceq $ExpectedCode) $FailureCode
+    }
+    Assert-True $threw $FailureCode
+  }
+
   try {
     [void][IO.Directory]::CreateDirectory($testRepositoryRoot)
     $resolvedDefault = Resolve-SafeOutputDirectory $testRepositoryRoot '.\target\validation'
     Assert-True ($resolvedDefault -ceq $defaultOutput) 'selftest_default_directory_resolution'
     Assert-True (Test-Path -LiteralPath $defaultOutput -PathType Container) 'selftest_default_directory_not_created'
+
+    [Environment]::SetEnvironmentVariable('FRD_USERNAME', 'selftest-username-material', 'Process')
+    [Environment]::SetEnvironmentVariable('FRD_PASSWORD', 'selftest-password-material', 'Process')
+
+    $disabledClientArguments = @(Get-CaptureClientArgumentVector -AutoConnect:$false -Target 'macos' -Address 'capture.example.test' -Port 5900 -Protocol 'hpss')
+    Assert-True ($disabledClientArguments.Count -eq 0) 'selftest_autoconnect_disabled_arguments'
+
+    $enabledClientArguments = @(Get-CaptureClientArgumentVector -AutoConnect:$true -Target 'macos' -Address 'capture.example.test' -Port 5900 -Protocol 'hpss')
+    Assert-Sequence $enabledClientArguments @('--target', 'macos', '--address', 'capture.example.test', '--port', '5900', '--protocol', 'hpss', '--username-provider', 'environment', '--password-provider', 'environment', '--connect') 'selftest_autoconnect_enabled_arguments'
+    Assert-True (-not ($enabledClientArguments -contains 'selftest-username-material')) 'selftest_autoconnect_username_material_exposed'
+    Assert-True (-not ($enabledClientArguments -contains 'selftest-password-material')) 'selftest_autoconnect_password_material_exposed'
+
+    foreach ($missingConfiguration in @(
+      @{ Target = ''; Address = 'capture.example.test'; Port = 5900; Protocol = 'hpss' },
+      @{ Target = 'macos'; Address = ''; Port = 5900; Protocol = 'hpss' },
+      @{ Target = 'macos'; Address = 'capture.example.test'; Port = 0; Protocol = 'hpss' },
+      @{ Target = 'macos'; Address = 'capture.example.test'; Port = 5900; Protocol = '' }
+    )) {
+      Assert-ThrowsCode { Get-CaptureClientArgumentVector -AutoConnect:$true -Target $missingConfiguration.Target -Address $missingConfiguration.Address -Port $missingConfiguration.Port -Protocol $missingConfiguration.Protocol } 'auto_connect_configuration_incomplete' 'selftest_autoconnect_incomplete_configuration'
+    }
+
+    [Environment]::SetEnvironmentVariable('FRD_USERNAME', $null, 'Process')
+    Assert-ThrowsCode { Get-CaptureClientArgumentVector -AutoConnect:$true -Target 'macos' -Address 'capture.example.test' -Port 5900 -Protocol 'hpss' } 'auto_connect_username_environment_missing' 'selftest_autoconnect_username_environment'
+
+    [Environment]::SetEnvironmentVariable('FRD_USERNAME', 'selftest-username-material', 'Process')
+    [Environment]::SetEnvironmentVariable('FRD_PASSWORD', $null, 'Process')
+    Assert-ThrowsCode { Get-CaptureClientArgumentVector -AutoConnect:$true -Target 'macos' -Address 'capture.example.test' -Port 5900 -Protocol 'hpss' } 'auto_connect_password_environment_missing' 'selftest_autoconnect_password_environment'
+
+    [Environment]::SetEnvironmentVariable('FRD_PASSWORD', 'selftest-password-material', 'Process')
 
     $normalCalls = [Collections.Generic.List[string]]::new()
     $normalActions = @(Invoke-CleanupWorkflow `
@@ -251,6 +340,9 @@ function Invoke-SelfTest {
     Finalize-CaptureArtifacts @($incompleteEvent, $incompleteProcess) $true
     Assert-True ([IO.File]::Exists($incompleteEvent) -and [IO.File]::Exists($incompleteProcess)) 'selftest_complete_artifacts_removed'
   } finally {
+    foreach ($name in $credentialNames) {
+      [Environment]::SetEnvironmentVariable($name, $savedCredentials[$name], 'Process')
+    }
     if (Test-Path -LiteralPath $testRepositoryRoot) {
       [IO.Directory]::Delete($testRepositoryRoot, $true)
     }
@@ -271,6 +363,7 @@ Assert-True ($existingClients.Count -eq 0) 'existing_client_detected'
 
 $clientPath = Join-Path $repositoryRoot 'target\release\freeremotedesk-windows.exe'
 Assert-True (Test-Path -LiteralPath $clientPath -PathType Leaf) 'release_client_missing'
+$clientArguments = @(Get-CaptureClientArgumentVector -AutoConnect:$AutoConnect -Target $AutoConnectTarget -Address $AutoConnectAddress -Port $AutoConnectPort -Protocol $AutoConnectProtocol)
 $eventPath = Join-Path $outputFullPath "$RunId-$Implementation-events.csv"
 $processPath = Join-Path $outputFullPath "$RunId-$Implementation-process.csv"
 Assert-True (-not (Test-Path -LiteralPath $eventPath)) 'event_output_exists'
@@ -305,7 +398,11 @@ try {
   $processWriter.WriteLine($ProcessHeader)
   $processWriter.Flush()
 
-  $client = Start-Process -FilePath $clientPath -PassThru
+  $client = if ($clientArguments.Count -eq 0) {
+    Start-Process -FilePath $clientPath -PassThru
+  } else {
+    Start-Process -FilePath $clientPath -ArgumentList $clientArguments -PassThru
+  }
   [void](Wait-EventRow $eventPath 'VisibleWarmup' 'PhaseBoundary' 180)
   $visible = Wait-EventRow $eventPath 'VisibleMeasurement' 'PhaseBoundary' 15
   Write-PhaseSamples $client $processWriter 'VisibleMeasurement' ([UInt64]$visible.monotonic_us)
