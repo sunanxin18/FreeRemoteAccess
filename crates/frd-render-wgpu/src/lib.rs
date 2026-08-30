@@ -4,8 +4,9 @@ mod remote_texture;
 
 pub use gpu_fault::{GpuCleanToken, GpuFaultClass, GpuFaultScope, GpuScopeObservation};
 pub use remote_texture::{
-    ApplyOutcome, ConfirmedPresentation, PresentationReceipt, RecoveryRequirement, RemoteRenderer,
-    RendererError,
+    ApplyOutcome, BatchApplyFailure, BatchApplyOutcome, BatchApplySuccess, BatchScopeDiagnostics,
+    ConfirmedPresentation, FrameBatchIdentity, InstalledSurface, PresentationReceipt,
+    RecoveryRequirement, RemoteRenderer, RendererError,
 };
 
 pub(crate) use gpu_fault::{

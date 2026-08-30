@@ -1,7 +1,12 @@
 use frd_core::{ContentViewport, PixelRect, PixelSize, SessionId};
-use frd_frame::{FrameCompleteness, PixelFormat, PixelPatch, SurfaceUpdate};
+use frd_frame::{
+    FrameCompleteness, FrameReset, FrameTransaction, PixelFormat, PixelPatch, SurfaceUpdate,
+};
 
-use crate::{pass::RemotePass, GpuCleanToken, GpuContext, GpuContextId, GpuFaultClass};
+use crate::{
+    pass::RemotePass, GpuCleanToken, GpuContext, GpuContextId, GpuFaultClass, GpuFaultScope,
+    GpuScopeObservation,
+};
 
 const MAX_REMOTE_TEXTURE_BYTES: u64 = 256 * 1024 * 1024;
 const BYTES_PER_PIXEL: u32 = 4;
@@ -12,6 +17,68 @@ pub struct PresentationReceipt {
     pub generation: u64,
     pub revision: u64,
     pub completeness: FrameCompleteness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameBatchIdentity {
+    pub session_id: SessionId,
+    pub generation: u64,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstalledSurface {
+    pub session_id: SessionId,
+    pub generation: u64,
+    pub size: PixelSize,
+    pub format: PixelFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchApplyOutcome {
+    pub installed_surface: Option<InstalledSurface>,
+    pub uploaded_rectangles: usize,
+    pub had_texture_writes: bool,
+    pub final_boundary: Option<PresentationReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchScopeDiagnostics {
+    pub observation: GpuScopeObservation,
+    pub observed_fault: Option<GpuFaultClass>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchApplySuccess {
+    pub outcome: BatchApplyOutcome,
+    pub scope: BatchScopeDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchApplyFailure {
+    pub identity: Option<FrameBatchIdentity>,
+    pub primary: RendererError,
+    pub secondary_execution: Option<RendererError>,
+    pub scope: Option<BatchScopeDiagnostics>,
+}
+
+impl BatchApplyFailure {
+    fn planning(identity: Option<FrameBatchIdentity>, error: RendererError) -> Self {
+        Self {
+            identity,
+            primary: error,
+            secondary_execution: None,
+            scope: None,
+        }
+    }
+
+    fn begin(identity: Option<FrameBatchIdentity>, fault: GpuFaultClass) -> Self {
+        Self::planning(identity, RendererError::GpuFault(fault))
+    }
+
+    fn counter_regressed(identity: Option<FrameBatchIdentity>) -> Self {
+        Self::planning(identity, RendererError::ScopeObservationInvalid)
+    }
 }
 
 #[derive(Debug)]
@@ -32,10 +99,11 @@ struct UploadDescriptor {
 
 #[derive(Debug)]
 enum PlannedUpdateData {
-    Reset {
+    StartupReset {
         session_id: SessionId,
         generation: u64,
         size: PixelSize,
+        format: PixelFormat,
     },
     Damage {
         revision: u64,
@@ -61,12 +129,16 @@ struct RemoteIdentity {
     session_id: SessionId,
     generation: u64,
     size: PixelSize,
+    format: PixelFormat,
     last_damage_revision: u64,
     last_boundary_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RendererError {
+    EmptyBatch,
+    BatchExecutionPanicked,
+    ScopeObservationInvalid,
     StaleUpdate,
     InvalidGeometry,
     TextureBudgetExceeded,
@@ -152,7 +224,7 @@ impl RemoteRenderer {
     pub fn apply_update(&mut self, update: SurfaceUpdate) -> Result<ApplyOutcome, RendererError> {
         let plan = self.state.plan(update)?;
         match &plan.data {
-            PlannedUpdateData::Reset { size, .. } => {
+            PlannedUpdateData::StartupReset { size, .. } => {
                 let limits = self.context.device().limits();
                 if size.width > limits.max_texture_dimension_2d
                     || size.height > limits.max_texture_dimension_2d
@@ -233,6 +305,92 @@ impl RemoteRenderer {
                     .map_err(RendererError::from)?;
                 Ok(ApplyOutcome::BoundaryPending(receipt))
             }
+        }
+    }
+
+    pub fn apply_update_batch(
+        &mut self,
+        transactions: Vec<FrameTransaction>,
+    ) -> Result<BatchApplySuccess, BatchApplyFailure> {
+        if transactions.is_empty() {
+            return Err(BatchApplyFailure::planning(None, RendererError::EmptyBatch));
+        }
+        let max_dimension = self.context.device().limits().max_texture_dimension_2d;
+        for transaction in &transactions {
+            if let FrameTransaction::Startup { reset, .. } = transaction {
+                if reset.size.width > max_dimension || reset.size.height > max_dimension {
+                    return Err(BatchApplyFailure::planning(
+                        Some(transaction_identity(transaction)),
+                        RendererError::TextureDimensionUnsupported,
+                    ));
+                }
+            }
+        }
+        let planned = self
+            .state
+            .plan_batch(transactions)
+            .map_err(|failure| BatchApplyFailure::planning(failure.identity, failure.error))?;
+        self.run_planned_batch(planned)
+    }
+
+    fn run_planned_batch(
+        &mut self,
+        planned: PlannedBatch,
+    ) -> Result<BatchApplySuccess, BatchApplyFailure> {
+        let mut executor = WgpuPlannedExecutor::new(
+            &self.context,
+            &self.bind_group_layout,
+            &self.sampler,
+            self.remote.as_ref(),
+        );
+        let scoped = execute_with_observed_scope(
+            &GpuContextBatchScopeBackend::new(&self.context),
+            planned.identity,
+            || {
+                execute_planned_operations(&mut executor, &planned.operations)
+                    .map(own_wgpu_prepared_resources)
+            },
+        )?;
+        drop(executor);
+        self.commit_clean_batch(
+            scoped.clean_token,
+            planned,
+            scoped.prepared,
+            scoped.scope.observation,
+        )
+    }
+
+    fn commit_clean_batch(
+        &mut self,
+        clean_token: GpuCleanToken,
+        planned: PlannedBatch,
+        prepared: PreparedBatchResources<RemoteTexture>,
+        observation: GpuScopeObservation,
+    ) -> Result<BatchApplySuccess, BatchApplyFailure> {
+        let identity = planned.identity;
+        let context = self.context.clone();
+        match context.commit_if_unchanged(clean_token, || {
+            commit_planned_batch_after_gpu(&mut self.state, &mut self.remote, planned, prepared)
+        }) {
+            Ok((outcome, dropped)) => {
+                drop(dropped);
+                Ok(BatchApplySuccess {
+                    outcome,
+                    scope: BatchScopeDiagnostics {
+                        observation,
+                        observed_fault: None,
+                    },
+                })
+            }
+            Err(fault) => Err(BatchApplyFailure {
+                identity: Some(identity),
+                primary: RendererError::GpuFault(fault),
+                secondary_execution: None,
+                scope: Some(BatchScopeDiagnostics {
+                    observation,
+                    observed_fault: Some(fault),
+                }),
+            }),
         }
     }
 
@@ -384,6 +542,309 @@ impl RemoteRenderer {
     }
 }
 
+trait PlannedOperationExecutor {
+    type Resource;
+
+    fn allocate(&mut self, reset: &FrameReset) -> Result<Self::Resource, RendererError>;
+
+    fn write_patch(
+        &mut self,
+        resource: &Self::Resource,
+        revision: u64,
+        patch_index: usize,
+        patch: &PixelPatch,
+        upload: UploadDescriptor,
+    ) -> Result<(), RendererError>;
+}
+
+trait PlannedExecutionContext: PlannedOperationExecutor {
+    fn take_existing_resource(&mut self) -> Option<Self::Resource>;
+}
+
+struct PreparedBatchResources<R> {
+    final_startup: Option<R>,
+    superseded: Vec<R>,
+}
+
+fn execute_planned_operations<E>(
+    executor: &mut E,
+    operations: &[PlannedUpdate],
+) -> Result<PreparedBatchResources<E::Resource>, RendererError>
+where
+    E: PlannedExecutionContext,
+{
+    let mut active = executor.take_existing_resource();
+    let mut active_is_startup = false;
+    let mut superseded = Vec::new();
+
+    for operation in operations {
+        match &operation.data {
+            PlannedUpdateData::StartupReset {
+                session_id,
+                generation,
+                size,
+                format,
+            } => {
+                let candidate = executor.allocate(&FrameReset {
+                    session_id: *session_id,
+                    generation: *generation,
+                    size: *size,
+                    format: *format,
+                })?;
+                if let Some(previous) = active.replace(candidate) {
+                    if active_is_startup {
+                        superseded.push(previous);
+                    } else {
+                        drop(previous);
+                    }
+                }
+                active_is_startup = true;
+            }
+            PlannedUpdateData::Damage { revision, patches } => {
+                let resource = active.as_ref().ok_or(RendererError::ResetRequired)?;
+                for (patch_index, (patch, upload)) in
+                    patches.iter().zip(operation.uploads()).enumerate()
+                {
+                    executor.write_patch(resource, *revision, patch_index, patch, *upload)?;
+                }
+            }
+            PlannedUpdateData::Boundary(_) => {}
+        }
+    }
+
+    let final_startup = if active_is_startup {
+        active
+    } else {
+        drop(active);
+        None
+    };
+    Ok(PreparedBatchResources {
+        final_startup,
+        superseded,
+    })
+}
+
+struct WgpuPlannedExecutor<'a> {
+    context: &'a GpuContext,
+    bind_group_layout: &'a wgpu::BindGroupLayout,
+    sampler: &'a wgpu::Sampler,
+    existing: Option<&'a RemoteTexture>,
+}
+
+impl<'a> WgpuPlannedExecutor<'a> {
+    fn new(
+        context: &'a GpuContext,
+        bind_group_layout: &'a wgpu::BindGroupLayout,
+        sampler: &'a wgpu::Sampler,
+        existing: Option<&'a RemoteTexture>,
+    ) -> Self {
+        Self {
+            context,
+            bind_group_layout,
+            sampler,
+            existing,
+        }
+    }
+}
+
+enum WgpuExecutionResource<'a> {
+    Existing(&'a RemoteTexture),
+    Startup(RemoteTexture),
+}
+
+impl WgpuExecutionResource<'_> {
+    fn texture(&self) -> &wgpu::Texture {
+        match self {
+            Self::Existing(remote) => &remote.texture,
+            Self::Startup(remote) => &remote.texture,
+        }
+    }
+}
+
+impl<'a> PlannedOperationExecutor for WgpuPlannedExecutor<'a> {
+    type Resource = WgpuExecutionResource<'a>;
+
+    fn allocate(&mut self, reset: &FrameReset) -> Result<Self::Resource, RendererError> {
+        Ok(WgpuExecutionResource::Startup(create_remote_texture(
+            self.context.device(),
+            self.bind_group_layout,
+            self.sampler,
+            reset.size,
+        )))
+    }
+
+    fn write_patch(
+        &mut self,
+        resource: &Self::Resource,
+        _revision: u64,
+        _patch_index: usize,
+        patch: &PixelPatch,
+        upload: UploadDescriptor,
+    ) -> Result<(), RendererError> {
+        debug_assert_eq!(patch.pixels.len(), upload.byte_len);
+        self.context.queue().write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: resource.texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: upload.rect.x,
+                    y: upload.rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            patch.pixels.as_bytes(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(upload.stride_bytes),
+                rows_per_image: Some(upload.rect.height),
+            },
+            wgpu::Extent3d {
+                width: upload.rect.width,
+                height: upload.rect.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+}
+
+impl<'a> PlannedExecutionContext for WgpuPlannedExecutor<'a> {
+    fn take_existing_resource(&mut self) -> Option<Self::Resource> {
+        self.existing.take().map(WgpuExecutionResource::Existing)
+    }
+}
+
+fn own_wgpu_prepared_resources(
+    prepared: PreparedBatchResources<WgpuExecutionResource<'_>>,
+) -> PreparedBatchResources<RemoteTexture> {
+    let own = |resource| match resource {
+        WgpuExecutionResource::Startup(remote) => remote,
+        WgpuExecutionResource::Existing(_) => {
+            unreachable!("existing resource cannot become a startup candidate")
+        }
+    };
+    PreparedBatchResources {
+        final_startup: prepared.final_startup.map(own),
+        superseded: prepared.superseded.into_iter().map(own).collect(),
+    }
+}
+
+trait BatchScopeBackend {
+    type Scope;
+    type CleanToken;
+
+    fn observation(&self) -> GpuScopeObservation;
+    fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
+    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+}
+
+struct GpuContextBatchScopeBackend<'a> {
+    context: &'a GpuContext,
+}
+
+impl<'a> GpuContextBatchScopeBackend<'a> {
+    fn new(context: &'a GpuContext) -> Self {
+        Self { context }
+    }
+}
+
+impl BatchScopeBackend for GpuContextBatchScopeBackend<'_> {
+    type Scope = GpuFaultScope;
+    type CleanToken = GpuCleanToken;
+
+    fn observation(&self) -> GpuScopeObservation {
+        self.context.scope_observation()
+    }
+
+    fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+        self.context.begin_fault_scope()
+    }
+
+    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+        scope.finish()
+    }
+}
+
+#[derive(Debug)]
+struct ScopedExecution<T, R> {
+    clean_token: T,
+    prepared: R,
+    scope: BatchScopeDiagnostics,
+}
+
+fn execute_with_observed_scope<B, R>(
+    backend: &B,
+    identity: FrameBatchIdentity,
+    execute: impl FnOnce() -> Result<R, RendererError>,
+) -> Result<ScopedExecution<B::CleanToken, R>, BatchApplyFailure>
+where
+    B: BatchScopeBackend,
+{
+    let before = backend.observation();
+    let scope = match backend.begin() {
+        Ok(scope) => scope,
+        Err(fault) => return Err(BatchApplyFailure::begin(Some(identity), fault)),
+    };
+    let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(execute))
+        .unwrap_or(Err(RendererError::BatchExecutionPanicked));
+    let finish = backend.finish(scope);
+    let observation = backend.observation().checked_delta(before);
+
+    match (finish, execution) {
+        (Err(gpu), execution) => Err(BatchApplyFailure {
+            identity: Some(identity),
+            primary: RendererError::GpuFault(gpu),
+            secondary_execution: execution.err(),
+            scope: observation.map(|observation| BatchScopeDiagnostics {
+                observation,
+                observed_fault: Some(gpu),
+            }),
+        }),
+        (Ok(_), _) if observation.is_none() => {
+            Err(BatchApplyFailure::counter_regressed(Some(identity)))
+        }
+        (Ok(_), Err(execution)) => Err(BatchApplyFailure {
+            identity: Some(identity),
+            primary: execution,
+            secondary_execution: None,
+            scope: Some(BatchScopeDiagnostics {
+                observation: observation.expect("checked above"),
+                observed_fault: None,
+            }),
+        }),
+        (Ok(clean_token), Ok(prepared)) => Ok(ScopedExecution {
+            clean_token,
+            prepared,
+            scope: BatchScopeDiagnostics {
+                observation: observation.expect("checked above"),
+                observed_fault: None,
+            },
+        }),
+    }
+}
+
+fn commit_planned_batch_after_gpu<R>(
+    state: &mut RemoteUpdateState,
+    resource: &mut Option<R>,
+    planned: PlannedBatch,
+    mut prepared: PreparedBatchResources<R>,
+) -> (BatchApplyOutcome, Vec<R>) {
+    let outcome = BatchApplyOutcome {
+        installed_surface: planned.installed_surface,
+        uploaded_rectangles: planned.uploaded_rectangles,
+        had_texture_writes: planned.had_texture_writes,
+        final_boundary: planned.final_boundary,
+    };
+    *state = planned.staged_state;
+    if let Some(final_startup) = prepared.final_startup {
+        if let Some(old_resource) = resource.replace(final_startup) {
+            prepared.superseded.push(old_resource);
+        }
+    }
+    (outcome, prepared.superseded)
+}
+
 fn commit_reset_resource_after_gpu<R>(
     state: &mut RemoteUpdateState,
     resource: &mut Option<R>,
@@ -492,13 +953,29 @@ fn create_remote_texture(
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RemoteUpdateState {
     current: Option<RemoteIdentity>,
     pending_receipt: Option<PresentationReceipt>,
     unpresented_full_baseline: bool,
     baseline_presented: bool,
     recovery: Option<RecoveryRequirement>,
+}
+
+struct PlannedBatch {
+    identity: FrameBatchIdentity,
+    staged_state: RemoteUpdateState,
+    operations: Vec<PlannedUpdate>,
+    installed_surface: Option<InstalledSurface>,
+    uploaded_rectangles: usize,
+    had_texture_writes: bool,
+    final_boundary: Option<PresentationReceipt>,
+}
+
+#[derive(Debug)]
+struct BatchPlanningFailure {
+    identity: Option<FrameBatchIdentity>,
+    error: RendererError,
 }
 
 impl RemoteUpdateState {
@@ -528,17 +1005,123 @@ impl RemoteUpdateState {
         }
     }
 
+    fn plan_batch(
+        &self,
+        transactions: Vec<FrameTransaction>,
+    ) -> Result<PlannedBatch, BatchPlanningFailure> {
+        let mut staged_state = self.clone();
+        let mut operations = Vec::new();
+        let mut installed_surface = None;
+        let mut uploaded_rectangles = 0_usize;
+        let mut final_identity = None;
+
+        for transaction in transactions {
+            let identity = transaction_identity(&transaction);
+            final_identity = Some(identity);
+            let planned = (|| -> Result<Vec<PlannedUpdate>, RendererError> {
+                match transaction {
+                    FrameTransaction::Startup {
+                        reset, revision, ..
+                    } => {
+                        if revision.completeness != FrameCompleteness::FullBaseline {
+                            return Err(RendererError::BoundaryWithoutMatchingDamage);
+                        }
+                        let reset_plan = staged_state.plan_reset(
+                            reset.session_id,
+                            reset.generation,
+                            reset.size,
+                            reset.format,
+                        )?;
+                        staged_state.commit_metadata(&reset_plan);
+                        installed_surface = Some(InstalledSurface {
+                            session_id: reset.session_id,
+                            generation: reset.generation,
+                            size: reset.size,
+                            format: reset.format,
+                        });
+                        let damage_plan = staged_state.plan_damage(
+                            revision.session_id,
+                            revision.generation,
+                            revision.revision,
+                            revision.patches,
+                        )?;
+                        let rectangles = damage_plan.uploads().len();
+                        uploaded_rectangles = uploaded_rectangles
+                            .checked_add(rectangles)
+                            .ok_or(RendererError::InvalidPatch)?;
+                        staged_state.commit_metadata(&damage_plan);
+                        let boundary_plan = staged_state.plan_boundary(
+                            revision.session_id,
+                            revision.generation,
+                            revision.revision,
+                            revision.completeness,
+                        )?;
+                        staged_state.commit_metadata(&boundary_plan);
+                        Ok(vec![reset_plan, damage_plan, boundary_plan])
+                    }
+                    FrameTransaction::Revision { revision, .. } => {
+                        let damage_plan = staged_state.plan_damage(
+                            revision.session_id,
+                            revision.generation,
+                            revision.revision,
+                            revision.patches,
+                        )?;
+                        let rectangles = damage_plan.uploads().len();
+                        uploaded_rectangles = uploaded_rectangles
+                            .checked_add(rectangles)
+                            .ok_or(RendererError::InvalidPatch)?;
+                        staged_state.commit_metadata(&damage_plan);
+                        let boundary_plan = staged_state.plan_boundary(
+                            revision.session_id,
+                            revision.generation,
+                            revision.revision,
+                            revision.completeness,
+                        )?;
+                        staged_state.commit_metadata(&boundary_plan);
+                        Ok(vec![damage_plan, boundary_plan])
+                    }
+                }
+            })()
+            .map_err(|error| BatchPlanningFailure {
+                identity: Some(identity),
+                error,
+            })?;
+            operations.extend(planned);
+        }
+
+        let identity = final_identity.ok_or(BatchPlanningFailure {
+            identity: None,
+            error: RendererError::EmptyBatch,
+        })?;
+        let final_boundary = staged_state.pending_receipt();
+        Ok(PlannedBatch {
+            identity,
+            staged_state,
+            operations,
+            installed_surface,
+            uploaded_rectangles,
+            had_texture_writes: uploaded_rectangles != 0,
+            final_boundary,
+        })
+    }
+
     fn commit(&mut self, plan: PlannedUpdate) {
-        match plan.data {
-            PlannedUpdateData::Reset {
+        self.commit_metadata(&plan);
+    }
+
+    fn commit_metadata(&mut self, plan: &PlannedUpdate) {
+        match &plan.data {
+            PlannedUpdateData::StartupReset {
                 session_id,
                 generation,
                 size,
+                format,
             } => {
                 self.current = Some(RemoteIdentity {
-                    session_id,
-                    generation,
-                    size,
+                    session_id: *session_id,
+                    generation: *generation,
+                    size: *size,
+                    format: *format,
                     last_damage_revision: 0,
                     last_boundary_revision: 0,
                 });
@@ -547,13 +1130,12 @@ impl RemoteUpdateState {
                 self.baseline_presented = false;
                 self.recovery = None;
             }
-            PlannedUpdateData::Damage { revision, patches } => {
-                let _pixels_are_consumed_after_upload = patches;
+            PlannedUpdateData::Damage { revision, .. } => {
                 let current = self
                     .current
                     .as_mut()
                     .expect("damage plan requires reset state");
-                current.last_damage_revision = revision;
+                current.last_damage_revision = *revision;
                 self.pending_receipt = None;
             }
             PlannedUpdateData::Boundary(receipt) => {
@@ -565,7 +1147,7 @@ impl RemoteUpdateState {
                 if receipt.completeness == FrameCompleteness::FullBaseline {
                     self.unpresented_full_baseline = true;
                 }
-                self.pending_receipt = Some(receipt);
+                self.pending_receipt = Some(*receipt);
             }
         }
     }
@@ -656,10 +1238,11 @@ impl RemoteUpdateState {
 
         Ok(PlannedUpdate {
             uploads: Vec::new(),
-            data: PlannedUpdateData::Reset {
+            data: PlannedUpdateData::StartupReset {
                 session_id,
                 generation,
                 size,
+                format,
             },
         })
     }
@@ -672,6 +1255,9 @@ impl RemoteUpdateState {
         patches: Vec<PixelPatch>,
     ) -> Result<PlannedUpdate, RendererError> {
         let current = self.current.ok_or(RendererError::ResetRequired)?;
+        if current.format != PixelFormat::Bgrx8UnormSrgb {
+            return Err(RendererError::UnsupportedPixelFormat);
+        }
         if session_id != current.session_id || generation != current.generation {
             return Err(RendererError::StaleUpdate);
         }
@@ -723,6 +1309,23 @@ impl RemoteUpdateState {
                 completeness,
             }),
         })
+    }
+}
+
+fn transaction_identity(transaction: &FrameTransaction) -> FrameBatchIdentity {
+    match transaction {
+        FrameTransaction::Startup {
+            reset, revision, ..
+        } => FrameBatchIdentity {
+            session_id: reset.session_id,
+            generation: reset.generation,
+            revision: revision.revision,
+        },
+        FrameTransaction::Revision { revision, .. } => FrameBatchIdentity {
+            session_id: revision.session_id,
+            generation: revision.generation,
+            revision: revision.revision,
+        },
     }
 }
 
@@ -778,18 +1381,29 @@ impl RemoteColorPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Instant;
 
     use frd_core::{PixelRect, PixelSize, SessionId};
-    use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
+    use frd_frame::{
+        FrameCompleteness, FrameReset, FrameRevision, FrameTransaction, PixelBuffer, PixelFormat,
+        PixelPatch, SurfaceUpdate,
+    };
 
     use super::{
-        commit_planned_update_after_gpu, commit_reset_resource_after_gpu,
-        confirm_presented_with_commit, RecoveryRequirement, RemoteColorPolicy, RemoteUpdateState,
-        RendererError,
+        commit_planned_batch_after_gpu, commit_planned_update_after_gpu,
+        commit_reset_resource_after_gpu, confirm_presented_with_commit, execute_planned_operations,
+        execute_with_observed_scope, BatchApplySuccess, BatchScopeDiagnostics,
+        PlannedOperationExecutor, PreparedBatchResources, RecoveryRequirement, RemoteColorPolicy,
+        RemoteUpdateState, RendererError,
     };
-    use crate::{GpuContextId, GpuFaultClass, GpuFaultObserver};
+    use crate::gpu_fault::{begin_observed_scope, ObservedScopeLifecycle, ScopeLifecycleEvent};
+    use crate::{
+        GpuContextId, GpuFaultClass, GpuFaultObserver, GpuScopeObservation, ScopeLifecycleObserver,
+    };
 
     fn reset(
         session_id: SessionId,
@@ -846,6 +1460,457 @@ mod tests {
             width,
             height,
         }
+    }
+
+    fn patch(rect: PixelRect, stride_bytes: u32, bytes: Vec<u8>) -> PixelPatch {
+        PixelPatch {
+            rect,
+            stride_bytes,
+            pixels: PixelBuffer::new(bytes),
+        }
+    }
+
+    fn startup_transaction(
+        session_id: SessionId,
+        generation: u64,
+        size: PixelSize,
+        revision: u64,
+        patches: Vec<PixelPatch>,
+    ) -> FrameTransaction {
+        FrameTransaction::Startup {
+            earliest_constituent_enqueue_at: Instant::now(),
+            reset: FrameReset {
+                session_id,
+                generation,
+                size,
+                format: PixelFormat::Bgrx8UnormSrgb,
+            },
+            revision: FrameRevision {
+                session_id,
+                generation,
+                revision,
+                patches,
+                completeness: FrameCompleteness::FullBaseline,
+            },
+        }
+    }
+
+    fn revision_transaction(
+        session_id: SessionId,
+        generation: u64,
+        revision: u64,
+        patches: Vec<PixelPatch>,
+    ) -> FrameTransaction {
+        FrameTransaction::Revision {
+            earliest_constituent_enqueue_at: Instant::now(),
+            revision: FrameRevision {
+                session_id,
+                generation,
+                revision,
+                patches,
+                completeness: FrameCompleteness::Incremental,
+            },
+        }
+    }
+
+    fn symbolic_row(ids: &[u8], padding: u8) -> Vec<u8> {
+        let mut row = Vec::new();
+        for id in ids {
+            row.extend_from_slice(&[*id, *id, *id, 0]);
+        }
+        row.extend(std::iter::repeat_n(padding, 4));
+        row
+    }
+
+    #[test]
+    fn atomic_startup_plan_returns_all_four_product_facts() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(3, 2).unwrap();
+        let full = patch(pixel_rect(0, 0, 3, 2), 12, vec![0x11; 24]);
+        let steady = patch(pixel_rect(1, 0, 2, 2), 8, vec![0x22; 16]);
+        let mut state = RemoteUpdateState::default();
+        let planned = state
+            .plan_batch(vec![
+                startup_transaction(session_id, 7, size, 1, vec![full]),
+                revision_transaction(session_id, 7, 2, vec![steady]),
+            ])
+            .unwrap();
+        let mut resource = None;
+
+        let (outcome, dropped) = commit_planned_batch_after_gpu(
+            &mut state,
+            &mut resource,
+            planned,
+            PreparedBatchResources {
+                final_startup: Some("startup-texture"),
+                superseded: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            outcome.installed_surface,
+            Some(super::InstalledSurface {
+                session_id,
+                generation: 7,
+                size,
+                format: PixelFormat::Bgrx8UnormSrgb,
+            })
+        );
+        assert_eq!(outcome.uploaded_rectangles, 2);
+        assert!(outcome.had_texture_writes);
+        assert_eq!(
+            outcome.final_boundary,
+            Some(super::PresentationReceipt {
+                session_id,
+                generation: 7,
+                revision: 2,
+                completeness: FrameCompleteness::FullBaseline,
+            })
+        );
+        assert_eq!(resource, Some("startup-texture"));
+        assert!(dropped.is_empty());
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum RecordedOperation {
+        Reset,
+        Patch { revision: u64, patch_index: usize },
+    }
+
+    struct RecordingResource {
+        size: PixelSize,
+        pixels: Rc<RefCell<Vec<u8>>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        operations: Vec<RecordedOperation>,
+        existing: Option<RecordingResource>,
+    }
+
+    impl PlannedOperationExecutor for RecordingExecutor {
+        type Resource = RecordingResource;
+
+        fn allocate(&mut self, reset: &FrameReset) -> Result<Self::Resource, RendererError> {
+            self.operations.push(RecordedOperation::Reset);
+            Ok(RecordingResource {
+                size: reset.size,
+                pixels: Rc::new(RefCell::new(vec![
+                    0;
+                    usize::try_from(
+                        reset.size.width * reset.size.height * 4
+                    )
+                    .unwrap()
+                ])),
+            })
+        }
+
+        fn write_patch(
+            &mut self,
+            resource: &Self::Resource,
+            revision: u64,
+            patch_index: usize,
+            patch: &PixelPatch,
+            upload: super::UploadDescriptor,
+        ) -> Result<(), RendererError> {
+            self.operations.push(RecordedOperation::Patch {
+                revision,
+                patch_index,
+            });
+            let mut destination = resource.pixels.borrow_mut();
+            let source = patch.pixels.as_bytes();
+            let row_bytes = usize::try_from(upload.rect.width * 4).unwrap();
+            let source_stride = usize::try_from(upload.stride_bytes).unwrap();
+            let destination_stride = usize::try_from(resource.size.width * 4).unwrap();
+            for row in 0..usize::try_from(upload.rect.height).unwrap() {
+                let source_start = row * source_stride;
+                let destination_start = (usize::try_from(upload.rect.y).unwrap() + row)
+                    * destination_stride
+                    + usize::try_from(upload.rect.x * 4).unwrap();
+                destination[destination_start..destination_start + row_bytes]
+                    .copy_from_slice(&source[source_start..source_start + row_bytes]);
+            }
+            Ok(())
+        }
+    }
+
+    impl super::PlannedExecutionContext for RecordingExecutor {
+        fn take_existing_resource(&mut self) -> Option<Self::Resource> {
+            self.existing.take()
+        }
+    }
+
+    #[test]
+    fn recording_executor_preserves_fifo_patch_row_byte_and_overlap_order() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(3, 2).unwrap();
+        let mut base = symbolic_row(b"ABC", 0xE0);
+        base.extend(symbolic_row(b"DEF", 0xE0));
+        let mut overlay = symbolic_row(b"GH", 0xE1);
+        overlay.extend(symbolic_row(b"IJ", 0xE1));
+        let mut final_patch = symbolic_row(b"KL", 0xE2);
+        final_patch.extend(symbolic_row(b"MN", 0xE2));
+        let planned = RemoteUpdateState::default()
+            .plan_batch(vec![
+                startup_transaction(
+                    session_id,
+                    1,
+                    size,
+                    1,
+                    vec![
+                        patch(pixel_rect(0, 0, 3, 2), 16, base),
+                        patch(pixel_rect(1, 0, 2, 2), 12, overlay),
+                    ],
+                ),
+                revision_transaction(
+                    session_id,
+                    1,
+                    2,
+                    vec![patch(pixel_rect(0, 0, 2, 2), 12, final_patch)],
+                ),
+            ])
+            .unwrap();
+        let mut executor = RecordingExecutor::default();
+
+        let prepared = execute_planned_operations(&mut executor, &planned.operations).unwrap();
+
+        assert_eq!(
+            executor.operations,
+            [
+                RecordedOperation::Reset,
+                RecordedOperation::Patch {
+                    revision: 1,
+                    patch_index: 0,
+                },
+                RecordedOperation::Patch {
+                    revision: 1,
+                    patch_index: 1,
+                },
+                RecordedOperation::Patch {
+                    revision: 2,
+                    patch_index: 0,
+                },
+            ]
+        );
+        let pixels = prepared.final_startup.unwrap().pixels.borrow().clone();
+        let mut expected = Vec::new();
+        for id in b"KLHMNJ" {
+            expected.extend_from_slice(&[*id, *id, *id, 0]);
+        }
+        assert_eq!(pixels, expected);
+        assert!(!pixels.iter().any(|byte| matches!(byte, 0xE0 | 0xE1 | 0xE2)));
+    }
+
+    #[test]
+    fn recording_executor_steady_only_batch_uses_captured_existing_resource() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 1).unwrap();
+        let mut state = RemoteUpdateState::default();
+        for update in [
+            reset(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(
+                session_id,
+                1,
+                1,
+                pixel_rect(0, 0, 2, 1),
+                8,
+                vec![b'A', b'A', b'A', 0, b'B', b'B', b'B', 0],
+            ),
+            boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+        let planned = state
+            .plan_batch(vec![revision_transaction(
+                session_id,
+                1,
+                2,
+                vec![patch(pixel_rect(1, 0, 1, 1), 4, vec![b'Z', b'Z', b'Z', 0])],
+            )])
+            .unwrap();
+        let pixels = Rc::new(RefCell::new(vec![b'A', b'A', b'A', 0, b'B', b'B', b'B', 0]));
+        let mut executor = RecordingExecutor {
+            operations: Vec::new(),
+            existing: Some(RecordingResource {
+                size,
+                pixels: pixels.clone(),
+            }),
+        };
+
+        let prepared = execute_planned_operations(&mut executor, &planned.operations).unwrap();
+
+        assert!(prepared.final_startup.is_none());
+        assert!(prepared.superseded.is_empty());
+        assert_eq!(*pixels.borrow(), [b'A', b'A', b'A', 0, b'Z', b'Z', b'Z', 0]);
+    }
+
+    struct RecordingBatchScopeBackend {
+        observer: Arc<dyn ScopeLifecycleObserver>,
+        finish_result: Result<(), GpuFaultClass>,
+    }
+
+    impl super::BatchScopeBackend for RecordingBatchScopeBackend {
+        type Scope = ObservedScopeLifecycle;
+        type CleanToken = ();
+
+        fn observation(&self) -> GpuScopeObservation {
+            self.observer.snapshot()
+        }
+
+        fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+            begin_observed_scope(self.observer.clone(), || Ok::<_, GpuFaultClass>(()))
+                .map(|(_, lifecycle)| lifecycle)
+        }
+
+        fn finish(&self, mut scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+            scope.record_finish().unwrap();
+            scope.record_poll().unwrap();
+            self.finish_result
+        }
+    }
+
+    #[derive(Default)]
+    struct TestScopeObserver {
+        observation: std::sync::Mutex<GpuScopeObservation>,
+    }
+
+    impl ScopeLifecycleObserver for TestScopeObserver {
+        fn record(&self, event: ScopeLifecycleEvent) {
+            let mut observation = self.observation.lock().unwrap();
+            match event {
+                ScopeLifecycleEvent::Begin => observation.begins += 1,
+                ScopeLifecycleEvent::Finish => observation.finishes += 1,
+                ScopeLifecycleEvent::Poll => observation.polls += 1,
+            }
+        }
+
+        fn snapshot(&self) -> GpuScopeObservation {
+            *self.observation.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn execution_error_still_finishes_and_returns_execution_primary() {
+        let observer = Arc::new(TestScopeObserver::default());
+        let backend = RecordingBatchScopeBackend {
+            observer,
+            finish_result: Ok(()),
+        };
+        let identity = super::FrameBatchIdentity {
+            session_id: SessionId::allocate(),
+            generation: 2,
+            revision: 9,
+        };
+        let state = RemoteUpdateState::default();
+        let resource: Option<&str> = None;
+
+        let failure = execute_with_observed_scope(&backend, identity, || {
+            Err::<(), _>(RendererError::InvalidPatch)
+        })
+        .unwrap_err();
+
+        assert_eq!(failure.identity, Some(identity));
+        assert_eq!(failure.primary, RendererError::InvalidPatch);
+        assert_eq!(failure.secondary_execution, None);
+        assert_eq!(
+            failure.scope,
+            Some(BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: None,
+            })
+        );
+        assert_eq!(state.current_generation(), None);
+        assert_eq!(resource, None);
+    }
+
+    #[test]
+    fn gpu_fault_wins_when_execution_and_finish_both_fail() {
+        let observer = Arc::new(TestScopeObserver::default());
+        let backend = RecordingBatchScopeBackend {
+            observer,
+            finish_result: Err(GpuFaultClass::Validation),
+        };
+        let identity = super::FrameBatchIdentity {
+            session_id: SessionId::allocate(),
+            generation: 3,
+            revision: 10,
+        };
+        let state = RemoteUpdateState::default();
+        let resource: Option<&str> = None;
+
+        let failure = execute_with_observed_scope(&backend, identity, || {
+            Err::<(), _>(RendererError::InvalidPatch)
+        })
+        .unwrap_err();
+
+        assert_eq!(failure.identity, Some(identity));
+        assert_eq!(
+            failure.primary,
+            RendererError::GpuFault(GpuFaultClass::Validation)
+        );
+        assert_eq!(
+            failure.secondary_execution,
+            Some(RendererError::InvalidPatch)
+        );
+        assert_eq!(
+            failure.scope,
+            Some(BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: Some(GpuFaultClass::Validation),
+            })
+        );
+        assert_eq!(state.current_generation(), None);
+        assert_eq!(resource, None);
+    }
+
+    #[test]
+    fn batch_receipt_is_not_presented_before_real_submit() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let full = patch(pixel_rect(0, 0, 2, 2), 8, vec![0x44; 16]);
+        let mut state = RemoteUpdateState::default();
+        let planned = state
+            .plan_batch(vec![startup_transaction(
+                session_id,
+                1,
+                size,
+                1,
+                vec![full],
+            )])
+            .unwrap();
+        let mut resource = None;
+        let (outcome, _) = commit_planned_batch_after_gpu(
+            &mut state,
+            &mut resource,
+            planned,
+            PreparedBatchResources {
+                final_startup: Some("startup-texture"),
+                superseded: Vec::new(),
+            },
+        );
+        let success = BatchApplySuccess {
+            outcome,
+            scope: BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: None,
+            },
+        };
+
+        assert_eq!(state.pending_receipt(), success.outcome.final_boundary);
+        assert!(!state.baseline_presented());
     }
 
     #[test]

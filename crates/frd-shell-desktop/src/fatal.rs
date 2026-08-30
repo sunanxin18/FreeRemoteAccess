@@ -297,6 +297,9 @@ fn gpu_fault_code(fault: GpuFaultClass) -> &'static str {
 
 fn renderer_error_code(error: RendererError) -> &'static str {
     match error {
+        RendererError::EmptyBatch => "renderer_empty_batch",
+        RendererError::BatchExecutionPanicked => "renderer_batch_execution_panicked",
+        RendererError::ScopeObservationInvalid => "renderer_scope_observation_invalid",
         RendererError::StaleUpdate => "renderer_stale_update",
         RendererError::InvalidGeometry => "renderer_invalid_geometry",
         RendererError::TextureBudgetExceeded => "renderer_texture_budget_exceeded",
@@ -315,10 +318,10 @@ fn renderer_error_code(error: RendererError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use frd_compositor_wgpu::PresentError;
-    use frd_render_wgpu::GpuFaultClass;
+    use frd_render_wgpu::{GpuFaultClass, RendererError};
     use frd_session::CleanupError;
 
-    use super::{sanitize_safe_detail, FatalReport};
+    use super::{present_error_code, sanitize_safe_detail, FatalReport};
     use crate::frame_metrics_sink::MetricSinkError;
     use crate::BackgroundCleanupFailure;
     use crate::PresentationOperation;
@@ -415,5 +418,25 @@ mod tests {
             assert_eq!(report.reason(), reason);
             assert_eq!(report.details(), "none");
         }
+    }
+
+    #[test]
+    fn fatal_renderer_error_tokens_cover_new_batch_variants() {
+        assert_eq!(
+            present_error_code(PresentError::Renderer(RendererError::EmptyBatch)),
+            "renderer_empty_batch"
+        );
+        assert_eq!(
+            present_error_code(PresentError::Renderer(
+                RendererError::BatchExecutionPanicked,
+            )),
+            "renderer_batch_execution_panicked"
+        );
+        assert_eq!(
+            present_error_code(PresentError::Renderer(
+                RendererError::ScopeObservationInvalid,
+            )),
+            "renderer_scope_observation_invalid"
+        );
     }
 }
