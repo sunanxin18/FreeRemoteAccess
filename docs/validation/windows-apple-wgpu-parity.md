@@ -216,6 +216,111 @@ shared-console authentication, MVS, input, and media evidence cannot substitute
 for this gate. Windows-client to macOS-server strict High Performance therefore
 remains **开发中** and must not be promoted to **受限验证**.
 
+## Frame-transaction latency gate (2026-08-31)
+
+This gate passes for two retained fixed captures of the bounded Windows-client
+Apple HPSS/MVS render and input pipeline comparison. It is not evidence for
+Apple dynamic resize, arbitrary workloads or packet loss, hardware decoding,
+or the separate strict High Performance physical-display blanking/restoration
+product gate. The floating control-island dependency is unblocked by this
+latency gate only.
+
+Both runs used the same Windows machine, the same stock Mac, the same geometry
+and Release profile, a fixed visible-click cadence, a static minimized interval,
+and a Restore workflow, with one client active at a time. The reconstructed
+serial source identity was branch HEAD
+`44a62ad690fbef2067df022f6b0f9bf678e5d6ef`, based on the last serial runtime
+`017bcf71aae6db9cfcd14e196dea6baf26a1cbbf` plus the symmetric reviewed
+capture-capacity change; its Release SHA-256 was
+`8CED2D0DB0788D34152AE498461A18F0255B103B3C20F87FCD2026932DD4C421`.
+The candidate runtime capture identity was
+`c57dc7774a377622c7b0ed1486cec71180985788`, with Release SHA-256
+`4D1AECB691463E813F3C36122C9BC83464BB697028113C7AFE5814A0F102207F`.
+Comparator corrections `e0a29e647804f478198252e5b90e9575ce150762` and
+`d57eee9574e8703e7b0beebf40dc3abfdc3ebdbf` changed neither measured runtime
+binary.
+
+The serial run was `serial_capacity_click_20260831_23`: 3,660 event rows, 62
+process rows, all five phases, 25 `InputToNextPresent` rows, and zero
+`StableFault`. The candidate run was `candidate_capacity_click_20260831_23`:
+3,775 event rows, 62 process rows, all five phases, 19
+`InputToNextPresent` rows, and zero `StableFault`.
+
+### VisibleMeasurement
+
+The independently selected worst five-second windows below are not a paired
+microbenchmark. Units are preserved; p95 values, worst-window totals,
+whole-phase activity totals, and process samples are distinct measures.
+
+| Metric | Serial | Candidate |
+| --- | ---: | ---: |
+| worst-window batch CPU p95 | 2,937 us | 2,946 us |
+| worst-window mailbox age p95 | 16,618 us | 16,113 us |
+| worst-window scope begins/finishes/polls | 554/554/554 | 169/169/169 |
+| worst-window Presentation count | 168 | 167 |
+| worst-window InputToNextPresent p95 | 181,279 us | 48,664 us |
+| worst-window FrameResponse p95 | 5,214 ms | 66 ms |
+| Batch activity/source updates/batch CPU total | 972 / 3,054 / 1,413,495 us | 992 / 3,314 / 1,454,173 us |
+| Batch scope begins/finishes/polls totals | 3,054/3,054/3,054 | 992/992/992 |
+| Presentation activity count | 960 | 974 |
+| FrameResponse activity/total | 57 / 6,919 ms | 59 / 1,812 ms |
+| process worst five-second CPU | 5,546,875 us | 5,453,125 us |
+| maximum working set | 331,833,344 B | 331,206,656 B |
+| first/last five-sample WS median | 321,826,816 / 323,649,536 B | 324,796,416 / 323,039,232 B |
+
+The batch-CPU gate is candidate `<= 8,000 us` and candidate
+`<= max(ceil(serial*110/100), serial+500 us)`. Its latter limit is 3,437 us,
+so the 2,946 us candidate p95 passes. This is not a 50% batch-CPU reduction
+claim. The source-normalized exact scope-amplification gate also passes:
+`992/3314 <= 0.5 * (3054/3054)`. Raw scope reduction is only supporting
+context, not the batch-CPU result. Candidate whole-run
+batch/begins/finishes/polls are exactly `2,496/2,496/2,496/2,496`, proving one
+observed begin, finish, and poll for every successful candidate batch. The
+visible `InputToNextPresent` requirement is at least 50% lower and passes;
+`FrameResponse` is no worse and passes.
+
+### MinimizedMeasurement
+
+The static minimized workload has JSON `null`/N/A for batch CPU p95, mailbox
+age p95, per-window scope sums, Presentation windows, `InputToNextPresent`, and
+`FrameResponse` p95. No synthetic zeros or favorable-window selection are used.
+Both observed Presentation activity counts are exactly zero, the mandatory
+paused-compositor result. The following activity is reported without treating
+it as a latency distribution:
+
+| Metric | Serial | Candidate |
+| --- | ---: | ---: |
+| Batch activity/source updates/batch CPU total | 1,254 / 2,532 / 906,575 us | 1,072 / 2,192 / 931,672 us |
+| Batch scope begins/finishes/polls totals | 2,532/2,532/2,532 | 1,072/1,072/1,072 |
+| FrameResponse activity/total | 39 / 1,190 ms | 39 / 1,233 ms |
+| process worst five-second CPU | 9,265,625 us | 9,406,250 us |
+| maximum working set | 329,711,616 B | 331,325,440 B |
+| first/last five-sample WS median | 317,870,080 / 313,180,160 B | 319,590,400 / 315,015,168 B |
+
+The minimized process-CPU, maximum-working-set, and trend gates all pass.
+Both Restore phases contain an identity-bearing Presentation: serial
+`(session=1,generation=1,revision=3106)` and candidate
+`(session=1,generation=1,revision=3305)`.
+
+### Fault and result boundary
+
+Both performance runs had zero `StableFault`, completed through Restore, and
+exited normally. Injected-fault evidence is separate from these performance
+CSVs. Previously recorded passing contract tests
+`execution_error_still_finishes_and_returns_execution_primary`,
+`gpu_fault_wins_when_execution_and_finish_both_fail`, the `fatal_wake_`
+focused suite, and the `fatal_redraw_requested_` focused suite prove only that,
+once fatal, input/binding/presentation are detached and no failed texture is
+recorded, submitted, or presented. They do not claim that a live GPU fault
+occurred.
+
+Every mandatory comparator predicate passed: visible CPU, working set,
+input, and `FrameResponse`; minimized CPU, working set, and trend; exact
+candidate scopes; zero minimized Presentation; and both Restore receipts. The
+honest overall result is that the frame-transaction latency gate passes for
+these two retained fixed captures, not other workloads or the strict
+virtual-display/physical-blanking gate.
+
 ## Remaining Platform Evidence
 
 - macOS and Linux expose the same platform-adapter contract but are compile

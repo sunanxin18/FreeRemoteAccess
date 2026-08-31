@@ -51,8 +51,8 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 |---|---|---|---|
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
 | High Performance 虚拟显示与实体显示器置黑 | `frd-protocol-apple` 严格确认门禁 | **开发中** | 产品只选择加密 `APPLE_SRP`，发送现有 `0x1d` 后等待严格 `0x451 ServerState`，确认前不公开 generation/readiness；自动化门禁不能替代实体显示器置黑/恢复与完整远程桌面的真机观察，见 [`设计`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md) |
-| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-29 在并列注册 RDP adapter 后重新完成自动选择、首帧、持续增量与键鼠真机回归；该真机证据早于 `3f8d8bd` 及其后续 type-0 copy-elision 修复。copy-elision 与服务端主动 `ServerState` 几何恢复目前仅完成 Apple crate 离线验证，尚未证明真机 CPU 或输入延迟改善，也不得重用此前 A/B 性能结论；输入到显示延迟根因仍未确认，见 `docs/validation/windows-apple-wgpu-parity.md` |
-| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。现存成本为 dirty rect 的 BGRX 打包与 CPU→GPU 上传；见 `AGENTS.md` P2 |
+| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-31 保留固定捕获证明 Windows wgpu frame-transaction 路径在有界 Apple HPSS/MVS 真机比较中通过；范围、run id 与二进制身份见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。这不包含严格 High Performance 虚拟显示/实体显示器置黑与恢复门禁。 |
+| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。2026-08-31 候选实现通过固定真机比较：每个成功 batch 恰有一个 scope begin/finish/poll，源更新归一化的 scope-amplification 门禁、输入/FrameResponse 及 CPU/内存门禁均通过；证据范围与非结论见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
 | 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |
 | 动态分辨率 | 实验性 resized `0x09` + generation 切换 | **实验性** | 默认关闭；尚无足够 Apple 线协议互操作证据，见 `AGENTS.md` P1 |
