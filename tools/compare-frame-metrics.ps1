@@ -14,6 +14,7 @@ $EventHeader = 'schema_version,run_id,implementation,phase,event,batch_result,ba
 $ProcessHeader = 'schema_version,run_id,implementation,phase,second,monotonic_us,process_cpu_total_us,process_cpu_delta_us,working_set_bytes'
 $MeasuredPhases = @('VisibleMeasurement', 'MinimizedMeasurement')
 $EventRowCapacity = 32768
+$ProcessSampleRowLimit = 62
 
 function Assert-True([bool]$Condition, [string]$Code) {
   if (-not $Condition) { throw $Code }
@@ -144,15 +145,22 @@ function Get-ProcessStatistics($Rows, [string]$Phase) {
   }
 }
 
-function Assert-HeadersAndRows([string]$Path, [string]$ExpectedHeader, [string]$Kind, [UInt32]$MaximumRows = 0) {
+function Assert-HeadersAndRows(
+  [string]$Path,
+  [string]$ExpectedHeader,
+  [string]$Kind,
+  [Nullable[UInt32]]$MaximumRows
+) {
   Assert-True (-not [string]::IsNullOrWhiteSpace($Path)) "missing_${Kind}_path"
   Assert-True (Test-Path -LiteralPath $Path -PathType Leaf) "missing_${Kind}_file"
   $first = Get-Content -LiteralPath $Path -TotalCount 1
   Assert-True ($first -eq $ExpectedHeader) "invalid_${Kind}_schema"
   $rows = @(Import-Csv -LiteralPath $Path)
-  if ($MaximumRows -gt 0) {
-    Assert-True ($rows.Count -le $MaximumRows) "${Kind}_capacity_exceeded"
+  if ($null -eq $MaximumRows) {
+    Assert-True ($Kind -like '*_process') "missing_${Kind}_row_limit"
+    $MaximumRows = $ProcessSampleRowLimit
   }
+  Assert-True ($rows.Count -le $MaximumRows) "${Kind}_capacity_exceeded"
   Assert-True ($rows.Count -gt 0) "empty_${Kind}_file"
   return $rows
 }
@@ -470,7 +478,12 @@ function New-SelfTestCsv([string]$Path, [string]$Header, [int]$RowCount) {
   }
 }
 
-function New-SelfTestProcessCsv([string]$Path, [int]$VisibleCount, [int]$MinimizedCount) {
+function New-SelfTestProcessCsv(
+  [string]$Path,
+  [int]$VisibleCount,
+  [int]$MinimizedCount,
+  [int]$VisibleDuplicateSecond = -1
+) {
   $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
   try {
     $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
@@ -481,7 +494,8 @@ function New-SelfTestProcessCsv([string]$Path, [int]$VisibleCount, [int]$Minimiz
         [pscustomobject]@{ phase = 'MinimizedMeasurement'; count = $MinimizedCount; origin = 40000000 }
       )) {
         foreach ($index in 0..($phaseAndCount.count - 1)) {
-          $second = [Math]::Min($index, 30)
+          $second = if ($phaseAndCount.phase -eq 'VisibleMeasurement' -and
+              $index -eq $VisibleDuplicateSecond) { 30 } else { [Math]::Min($index, 30) }
           $timestamp = $phaseAndCount.origin + ($second * 1000000)
           $writer.WriteLine("1,serial-a,serial,$($phaseAndCount.phase),$second,$timestamp,0,0,1000")
         }
@@ -614,20 +628,30 @@ function Invoke-SelfTest {
     $event16385 = Join-Path $capacityFixtureDirectory 'events-16385.csv'
     $event32768 = Join-Path $capacityFixtureDirectory 'events-32768.csv'
     $event32769 = Join-Path $capacityFixtureDirectory 'events-32769.csv'
-    $invalidProcess = Join-Path $capacityFixtureDirectory 'process-duplicate-s30.csv'
+    $serialOverCapacityProcess = Join-Path $capacityFixtureDirectory 'serial-process-63.csv'
+    $candidateOverCapacityProcess = Join-Path $capacityFixtureDirectory 'candidate-process-63.csv'
+    $malformedProcess = Join-Path $capacityFixtureDirectory 'process-duplicate-s30.csv'
     New-SelfTestCsv $event16385 $EventHeader 16385
     New-SelfTestCsv $event32768 $EventHeader 32768
     New-SelfTestCsv $event32769 $EventHeader 32769
-    New-SelfTestProcessCsv $invalidProcess 32 31
+    New-SelfTestProcessCsv $serialOverCapacityProcess 32 31
+    New-SelfTestProcessCsv $candidateOverCapacityProcess 32 31
+    New-SelfTestProcessCsv $malformedProcess 31 31 29
     Assert-True (@(Assert-HeadersAndRows $event16385 $EventHeader 'serial_events' $EventRowCapacity).Count -eq 16385) 'selftest_event_16385_rejected'
     Assert-True (@(Assert-HeadersAndRows $event32768 $EventHeader 'serial_events' $EventRowCapacity).Count -eq 32768) 'selftest_event_32768_rejected'
     Assert-FailsWith {
       Assert-HeadersAndRows $event32769 $EventHeader 'serial_events' $EventRowCapacity
     } 'serial_events_capacity_exceeded'
-    $invalidProcessRows = @(Assert-HeadersAndRows $invalidProcess $ProcessHeader 'serial_process')
     Assert-FailsWith {
-      Get-RunStatistics (New-SelfTestMetricEventRows 'serial' 40 $true) $invalidProcessRows 'serial'
-    } 'missing_VisibleMeasurement_samples'
+      Assert-HeadersAndRows $serialOverCapacityProcess $ProcessHeader 'serial_process'
+    } 'serial_process_capacity_exceeded'
+    Assert-FailsWith {
+      Assert-HeadersAndRows $candidateOverCapacityProcess $ProcessHeader 'candidate_process'
+    } 'candidate_process_capacity_exceeded'
+    $malformedProcessRows = @(Assert-HeadersAndRows $malformedProcess $ProcessHeader 'serial_process')
+    Assert-FailsWith {
+      Get-RunStatistics (New-SelfTestMetricEventRows 'serial' 40 $true) $malformedProcessRows 'serial'
+    } 'missing_VisibleMeasurement_S29'
   } finally {
     Remove-Item -LiteralPath $capacityFixtureDirectory -Recurse -Force -ErrorAction SilentlyContinue
   }
@@ -799,9 +823,9 @@ foreach ($required in @($SerialEvents, $SerialProcessSamples, $CandidateEvents, 
 }
 
 $serialEventRows = Assert-HeadersAndRows $SerialEvents $EventHeader 'serial_events' $EventRowCapacity
-$serialProcessRows = Assert-HeadersAndRows $SerialProcessSamples $ProcessHeader 'serial_process'
+$serialProcessRows = Assert-HeadersAndRows $SerialProcessSamples $ProcessHeader 'serial_process' $ProcessSampleRowLimit
 $candidateEventRows = Assert-HeadersAndRows $CandidateEvents $EventHeader 'candidate_events' $EventRowCapacity
-$candidateProcessRows = Assert-HeadersAndRows $CandidateProcessSamples $ProcessHeader 'candidate_process'
+$candidateProcessRows = Assert-HeadersAndRows $CandidateProcessSamples $ProcessHeader 'candidate_process' $ProcessSampleRowLimit
 [void](Assert-RunRows $serialEventRows $serialProcessRows 'serial' 'serial')
 [void](Assert-RunRows $candidateEventRows $candidateProcessRows 'candidate' 'candidate')
 $serial = Get-RunStatistics $serialEventRows $serialProcessRows 'serial'
