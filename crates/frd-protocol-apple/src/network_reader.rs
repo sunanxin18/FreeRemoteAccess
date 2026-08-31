@@ -1409,6 +1409,90 @@ fn bounding_type_one_destination_rect(rects: &[PixelRect]) -> Result<PixelRect> 
     })
 }
 
+fn type_one_partition_sort_key(
+    rect: &PixelRect,
+    horizontal: bool,
+) -> (u64, u64, u32, u32, u32, u32) {
+    let center_x_twice = u64::from(rect.x) * 2 + u64::from(rect.width);
+    let center_y_twice = u64::from(rect.y) * 2 + u64::from(rect.height);
+    if horizontal {
+        (
+            center_x_twice,
+            center_y_twice,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+        )
+    } else {
+        (
+            center_y_twice,
+            center_x_twice,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+        )
+    }
+}
+
+fn partition_type_one_destination_group(
+    rects: &mut [PixelRect],
+    group_count: usize,
+    groups: &mut Vec<PixelRect>,
+) -> Result<()> {
+    debug_assert!(!rects.is_empty());
+    debug_assert!(group_count > 0 && group_count <= rects.len());
+    if group_count == 1 {
+        groups.push(bounding_type_one_destination_rect(rects)?);
+        return Ok(());
+    }
+    if group_count == rects.len() {
+        groups.extend_from_slice(rects);
+        return Ok(());
+    }
+
+    let bounds = bounding_type_one_destination_rect(rects)?;
+    let horizontal = bounds.width >= bounds.height;
+    rects.sort_by_key(|rect| type_one_partition_sort_key(rect, horizontal));
+
+    let left_group_count = group_count / 2;
+    let right_group_count = group_count - left_group_count;
+    let base_group_size = rects.len() / group_count;
+    let remainder = rects.len() % group_count;
+    let left_len = base_group_size
+        .checked_mul(left_group_count)
+        .and_then(|base| {
+            remainder
+                .checked_mul(left_group_count)
+                .and_then(|extra| base.checked_add(extra / group_count))
+        })
+        .context("MVS type-1 spatial partition 尺寸溢出")?;
+    let (left, right) = rects.split_at_mut(left_len);
+    partition_type_one_destination_group(left, left_group_count, groups)?;
+    partition_type_one_destination_group(right, right_group_count, groups)
+}
+
+fn bound_type_one_destination_rects(
+    mut rects: Vec<PixelRect>,
+    max_groups: usize,
+) -> Result<Vec<PixelRect>> {
+    if rects.len() <= max_groups {
+        return Ok(rects);
+    }
+    if max_groups == 0 {
+        bail!("MVS type-1 spatial partition patch 上限不能为零");
+    }
+
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(max_groups)
+        .context("MVS type-1 spatial partition plan 分配失败")?;
+    partition_type_one_destination_group(&mut rects, max_groups, &mut groups)?;
+    groups.sort_by_key(|rect| (rect.y, rect.x, rect.height, rect.width));
+    Ok(groups)
+}
+
 fn plan_type_one_patches(
     framebuffer: &Framebuffer,
     partial: &crate::mvs_full::PreparedPartialPixels,
@@ -1428,11 +1512,9 @@ fn plan_type_one_patches(
     for operation in &partial.operations {
         destinations.push(operation_destination_rect(operation)?);
     }
-    let bounding = bounding_type_one_destination_rect(&destinations)?;
     let mut merged = merge_type_one_destination_rects(destinations)?;
     if merged.len() > MAX_TYPE_ONE_PATCHES {
-        merged.clear();
-        merged.push(bounding);
+        merged = bound_type_one_destination_rects(merged, MAX_TYPE_ONE_PATCHES)?;
     }
     debug_assert!(merged.len() <= MAX_TYPE_ONE_PATCHES);
 
@@ -5468,30 +5550,66 @@ mod migrated_runtime_tests {
     fn type_one_compact_plan_bounds_more_than_thirty_two_sparse_destinations() {
         use crate::mvs_full::{PartialPixelOperation, PreparedPartialPixels};
 
-        let framebuffer = crate::surface_publisher::CpuFramebuffer::new(65, 1).unwrap();
-        let operations = (0..33)
+        let framebuffer = crate::surface_publisher::CpuFramebuffer::new(2048, 1024).unwrap();
+        let operations: Vec<_> = (0usize..33)
             .map(|index| PartialPixelOperation::Replace {
-                x: index * 2,
-                y: 0,
+                x: index * 60,
+                y: index * 30,
                 width: 1,
                 height: 1,
                 rgb: vec![0; mvs::MVS_RGB_CHANNEL_BYTES],
             })
             .collect();
 
-        let plan =
-            plan_type_one_patches(&framebuffer, &PreparedPartialPixels { operations }).unwrap();
+        let forward = plan_type_one_patches(
+            &framebuffer,
+            &PreparedPartialPixels {
+                operations: operations.clone(),
+            },
+        )
+        .unwrap();
+        let mut reversed_operations = operations.clone();
+        reversed_operations.reverse();
+        let reversed = plan_type_one_patches(
+            &framebuffer,
+            &PreparedPartialPixels {
+                operations: reversed_operations,
+            },
+        )
+        .unwrap();
 
-        assert_eq!(plan.patches.len(), 1);
+        let forward_rects: Vec<_> = forward.patches.iter().map(|patch| patch.rect).collect();
+        let reversed_rects: Vec<_> = reversed.patches.iter().map(|patch| patch.rect).collect();
         assert_eq!(
-            plan.patches[0].rect,
-            PixelRect {
-                x: 0,
-                y: 0,
-                width: 65,
-                height: 1,
-            }
+            forward_rects, reversed_rects,
+            "patch plan 必须与输入顺序无关"
         );
+        assert_eq!(forward_rects.len(), MAX_TYPE_ONE_PATCHES);
+
+        let upload_area: u64 = forward_rects
+            .iter()
+            .map(|rect| u64::from(rect.width) * u64::from(rect.height))
+            .sum();
+        assert!(
+            upload_area < 4_000,
+            "33 个稀疏像素不得放大为接近 1,846,081 像素的全局包围矩形: {upload_area}"
+        );
+        assert_eq!(
+            forward_rects
+                .iter()
+                .filter(|rect| rect.width != 1 || rect.height != 1)
+                .count(),
+            1,
+            "32 个 patch 只应有一个局部配对"
+        );
+
+        for index in 0u32..33 {
+            let x = index * 60;
+            let y = index * 30;
+            assert!(forward_rects.iter().any(|rect| {
+                x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+            }));
+        }
     }
 
     #[test]
