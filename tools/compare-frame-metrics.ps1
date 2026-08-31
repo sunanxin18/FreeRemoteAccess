@@ -42,6 +42,16 @@ function Get-Median([UInt64[]]$Values) {
   return [UInt64][Math]::Floor(([decimal]$sorted[$middle - 1] + [decimal]$sorted[$middle]) / 2)
 }
 
+function Get-CheckedU64Total([UInt64[]]$Values, [string]$Code) {
+  $total = [System.Numerics.BigInteger]::Zero
+  $maximum = [System.Numerics.BigInteger][UInt64]::MaxValue
+  foreach ($value in $Values) {
+    $total += [System.Numerics.BigInteger]$value
+    Assert-True ($total -le $maximum) "${Code}_overflow"
+  }
+  return [UInt64]$total
+}
+
 function Get-WorstEventWindow($Rows, [string]$Field, [UInt64]$OriginUs, [ValidateSet('p95','sum','count')][string]$Mode) {
   $bestValue = $null
   $bestStart = $null
@@ -63,7 +73,7 @@ function Get-WorstEventWindow($Rows, [string]$Field, [UInt64]$OriginUs, [Validat
     $value = if ($Mode -eq 'p95') {
       Get-NearestRankP95 ([UInt64[]]$values)
     } else {
-      [UInt64](($values | Measure-Object -Sum).Sum)
+      Get-CheckedU64Total ([UInt64[]]$values) "invalid_${Field}_sum"
     }
     if ($null -eq $bestValue -or $value -gt $bestValue) {
       $bestValue = $value
@@ -85,7 +95,8 @@ function Get-PhaseSamples($Rows, [string]$Phase) {
 
 function Get-FieldTotal($Rows, [string]$Field, [string]$Code) {
   if ($Rows.Count -eq 0) { return [UInt64]0 }
-  return [UInt64](($Rows | ForEach-Object { Convert-U64 $_.$Field $Code } | Measure-Object -Sum).Sum)
+  $values = @($Rows | ForEach-Object { Convert-U64 $_.$Field $Code })
+  return Get-CheckedU64Total ([UInt64[]]$values) $Code
 }
 
 function Get-BatchAndFrameActivity($BatchRows, $FrameResponseRows) {
@@ -314,8 +325,11 @@ function Get-VisibleScopeAmplificationReduced50Percent($SerialVisible, $Candidat
   [UInt64]$candidateSourceUpdates = $CandidateVisible.batch_source_updates_total
   Assert-True ($serialSourceUpdates -gt 0) 'missing_visible_serial_source_updates'
   Assert-True ($candidateSourceUpdates -gt 0) 'missing_visible_candidate_source_updates'
-  return [bool]((([decimal]$CandidateVisible.batch_scope_polls_total * 2 * [decimal]$serialSourceUpdates) -le
-    ([decimal]$SerialVisible.batch_scope_polls_total * [decimal]$candidateSourceUpdates)))
+  $left = [System.Numerics.BigInteger]$CandidateVisible.batch_scope_polls_total *
+    [System.Numerics.BigInteger]2 * [System.Numerics.BigInteger]$serialSourceUpdates
+  $right = [System.Numerics.BigInteger]$SerialVisible.batch_scope_polls_total *
+    [System.Numerics.BigInteger]$candidateSourceUpdates
+  return [bool]($left -le $right)
 }
 
 function Get-MinimizedPresentationPaused($Serial, $Candidate) {
@@ -379,6 +393,30 @@ function Get-MandatoryPhasePredicates($PhaseGates) {
     }
   }
   return $mandatory
+}
+
+function Assert-MandatoryPredicates($Predicates) {
+  $failed = @()
+  foreach ($entry in $Predicates.GetEnumerator()) {
+    if (-not $entry.Value) { $failed += [string]$entry.Key }
+  }
+  Assert-True ($failed.Count -eq 0) ("mandatory_performance_predicate_failed_{0}" -f ($failed -join ','))
+}
+
+function Write-ComparisonOutput([string]$OutputPath, $Report, $MandatoryPredicates) {
+  Assert-MandatoryPredicates $MandatoryPredicates
+  $outputFullPath = [IO.Path]::GetFullPath($OutputPath)
+  Assert-True (-not (Test-Path -LiteralPath $outputFullPath)) 'comparison_output_exists'
+  $parent = Split-Path -Parent $outputFullPath
+  Assert-True (Test-Path -LiteralPath $parent -PathType Container) 'comparison_output_parent_missing'
+  $stream = [IO.File]::Open($outputFullPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try {
+    $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
+    try { $writer.WriteLine(($Report | ConvertTo-Json -Depth 12)) } finally { $writer.Dispose() }
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+  Write-Output $outputFullPath
 }
 
 function Assert-FailsWith([scriptblock]$Action, [string]$ExpectedCode) {
@@ -473,6 +511,26 @@ function New-SelfTestMetricProcessRows {
 function Invoke-SelfTest {
   Assert-True ((Get-NearestRankP95 ([UInt64[]](1..20))) -eq 19) 'selftest_nearest_rank_p95'
   Assert-True ((Get-Median ([UInt64[]]@(9, 1, 5, 3, 7))) -eq 5) 'selftest_odd_median'
+  $largeExactRows = @(
+    [pscustomobject]@{ value = '9007199254740992' },
+    [pscustomobject]@{ value = '1' }
+  )
+  Assert-True ((Get-FieldTotal $largeExactRows 'value' 'selftest_checked_total') -eq [UInt64]9007199254740993) 'selftest_checked_u64_total'
+  $overflowRows = @(
+    [pscustomobject]@{ value = '18446744073709551615' },
+    [pscustomobject]@{ value = '1' }
+  )
+  Assert-FailsWith {
+    Get-FieldTotal $overflowRows 'value' 'selftest_checked_total'
+  } 'selftest_checked_total_overflow'
+  $largeWindowRows = @()
+  foreach ($second in 0..29) {
+    $value = if ($second -eq 0) { '9007199254740993' } else { '1' }
+    $largeWindowRows += [pscustomobject]@{ monotonic_us = [string]($second * 1000000); sample = $value }
+  }
+  $largeWindowSum = Get-WorstEventWindow $largeWindowRows 'sample' 0 'sum'
+  Assert-True ($largeWindowSum.value -eq [UInt64]9007199254740997 -and
+    $largeWindowSum.start_second -eq 0) 'selftest_checked_u64_window_sum'
   $rows = @()
   foreach ($second in 0..29) {
     $value = if ($second -in 7, 17) { 100 } else { 1 }
@@ -540,14 +598,28 @@ function Invoke-SelfTest {
     $idleSerialStatistics = Get-RunStatistics $idleSerialEvents $metricProcessRows 'serial'
     $idleCandidateStatistics = Get-RunStatistics $idleCandidateEvents $metricProcessRows 'candidate'
     $idleMinimized = $idleCandidateStatistics.MinimizedMeasurement
-    if ($null -ne $idleMinimized.batch_cpu_p95 -or
-        $null -ne $idleMinimized.mailbox_age_p95 -or
-        $null -ne $idleMinimized.scope_begins_sum -or
-        $null -ne $idleMinimized.scope_finishes_sum -or
-        $null -ne $idleMinimized.scope_polls_sum -or
-        $null -ne $idleMinimized.frame_response_p95 -or
-        $idleMinimized.batch_activity_count -ne 0 -or
-        $idleMinimized.frame_response_activity_count -ne 0) {
+    $idleSerialMinimized = $idleSerialStatistics.MinimizedMeasurement
+    $idleMinimizedStatistics = @($idleSerialMinimized, $idleMinimized)
+    $idleMinimizedInvalid = @($idleMinimizedStatistics | Where-Object {
+      $null -ne $_.batch_cpu_p95 -or
+      $null -ne $_.mailbox_age_p95 -or
+      $null -ne $_.scope_begins_sum -or
+      $null -ne $_.scope_finishes_sum -or
+      $null -ne $_.scope_polls_sum -or
+      $null -ne $_.presentation_sum -or
+      $null -ne $_.frame_response_p95 -or
+      $_.presentation_activity_count -ne 0 -or
+      $_.batch_activity_count -ne 0 -or
+      $_.frame_response_activity_count -ne 0 -or
+      $_.batch_source_updates_total -ne 0 -or
+      $_.batch_cpu_total_us -ne 0 -or
+      $_.batch_scope_begins_total -ne 0 -or
+      $_.batch_scope_finishes_total -ne 0 -or
+      $_.batch_scope_polls_total -ne 0 -or
+      $_.frame_response_total_ms -ne 0
+    }).Count -ne 0
+    if ($idleMinimizedInvalid -or
+        -not (Get-MinimizedPresentationPaused $idleSerialStatistics $idleCandidateStatistics)) {
       $task7Failures += 'idle_minimized_statistics'
     }
   } catch {
@@ -572,16 +644,43 @@ function Invoke-SelfTest {
     $scopeCandidateUnreduced = [pscustomobject]@{ batch_scope_polls_total = [UInt64]51; batch_source_updates_total = [UInt64]100 }
     $scopeReduced = Get-VisibleScopeAmplificationReduced50Percent $scopeSerial $scopeCandidateReduced
     $scopeUnreduced = Get-VisibleScopeAmplificationReduced50Percent $scopeSerial $scopeCandidateUnreduced
+    $largeScope = [UInt64]9007199254740993
+    $largeScopeSerial = [pscustomobject]@{ batch_scope_polls_total = $largeScope; batch_source_updates_total = $largeScope }
+    $largeScopeCandidate = [pscustomobject]@{ batch_scope_polls_total = $largeScope; batch_source_updates_total = [UInt64]18014398509481986 }
+    $largeScopeReduced = Get-VisibleScopeAmplificationReduced50Percent $largeScopeSerial $largeScopeCandidate
     if ((Get-VisibleBatchCpu8msAndNoRegression 1000 1500) -ne $true -or
         (Get-VisibleBatchCpu8msAndNoRegression 1000 1501) -ne $false -or
+        (Get-VisibleBatchCpu8msAndNoRegression 10000 8000) -ne $true -or
+        (Get-VisibleBatchCpu8msAndNoRegression 7001 7702) -ne $true -or
+        (Get-VisibleBatchCpu8msAndNoRegression 7001 7703) -ne $false -or
         (Get-VisibleBatchCpu8msAndNoRegression 10000 8001) -ne $false -or
-        $scopeReduced -ne $true -or $scopeUnreduced -ne $false) {
+        $scopeReduced -ne $true -or $scopeUnreduced -ne $false -or $largeScopeReduced -ne $true) {
       $task7Failures += 'visible_bounded_predicates'
     }
   } catch {
     $task7Failures += 'visible_bounded_predicates'
   }
   Assert-True ($task7Failures.Count -eq 0) ("selftest_task7_approved_behavior_absent_{0}" -f ($task7Failures -join '_'))
+  $zeroSerialSource = [pscustomobject]@{ batch_scope_polls_total = [UInt64]1; batch_source_updates_total = [UInt64]0 }
+  $nonzeroCandidateSource = [pscustomobject]@{ batch_scope_polls_total = [UInt64]0; batch_source_updates_total = [UInt64]1 }
+  Assert-FailsWith {
+    Get-VisibleScopeAmplificationReduced50Percent $zeroSerialSource $nonzeroCandidateSource
+  } 'missing_visible_serial_source_updates'
+  $nonzeroSerialSource = [pscustomobject]@{ batch_scope_polls_total = [UInt64]1; batch_source_updates_total = [UInt64]1 }
+  $zeroCandidateSource = [pscustomobject]@{ batch_scope_polls_total = [UInt64]0; batch_source_updates_total = [UInt64]0 }
+  Assert-FailsWith {
+    Get-VisibleScopeAmplificationReduced50Percent $nonzeroSerialSource $zeroCandidateSource
+  } 'missing_visible_candidate_source_updates'
+  $failedPredicateOutput = Join-Path ([IO.Path]::GetTempPath()) ("frd-task7-selftest-{0}.json" -f [Guid]::NewGuid())
+  $diagnosticPredicates = [ordered]@{
+    candidate_batches_success_scope_exact = $true
+    visible_scope_amplification_reduced_50_percent = $false
+    minimized_presentation_paused = $false
+  }
+  Assert-FailsWith {
+    Write-ComparisonOutput $failedPredicateOutput ([ordered]@{ schema_version = 1 }) $diagnosticPredicates
+  } 'mandatory_performance_predicate_failed_visible_scope_amplification_reduced_50_percent,minimized_presentation_paused'
+  Assert-True (-not (Test-Path -LiteralPath $failedPredicateOutput)) 'selftest_mandatory_failure_created_output'
 
   Assert-FailsWith {
     Assert-RunRows (New-SelfTestEventRows 'serial-a' 'serial') (New-SelfTestProcessRows 'serial-b' 'serial') 'serial' 'serial'
@@ -682,20 +781,24 @@ $report = [ordered]@{
   }
 }
 
-$mandatory = @($scopeRowsExact, $scopeTotalsExact, $visibleBatchCpuGate,
-  $visibleScopeAmplificationGate, $minimizedPresentationPaused, $restoreReceiptPresent) +
-  @(Get-MandatoryPhasePredicates $phaseGates)
-Assert-True (@($mandatory | Where-Object { -not $_ }).Count -eq 0) 'mandatory_performance_predicate_failed'
-
-$outputFullPath = [IO.Path]::GetFullPath($OutputPath)
-Assert-True (-not (Test-Path -LiteralPath $outputFullPath)) 'comparison_output_exists'
-$parent = Split-Path -Parent $outputFullPath
-Assert-True (Test-Path -LiteralPath $parent -PathType Container) 'comparison_output_parent_missing'
-$stream = [IO.File]::Open($outputFullPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-try {
-  $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
-  try { $writer.WriteLine(($report | ConvertTo-Json -Depth 12)) } finally { $writer.Dispose() }
-} finally {
-  if ($null -ne $stream) { $stream.Dispose() }
+$mandatoryPredicates = [ordered]@{
+  candidate_batches_success_scope_exact = $scopeRowsExact
+  candidate_scope_totals_equal_batch_count = $scopeTotalsExact
+  visible_batch_cpu_8ms_and_no_regression = $visibleBatchCpuGate
+  visible_scope_amplification_reduced_50_percent = $visibleScopeAmplificationGate
+  minimized_presentation_paused = $minimizedPresentationPaused
+  restore_identity_bearing_presentation_present = $restoreReceiptPresent
 }
-Write-Output $outputFullPath
+foreach ($phase in $MeasuredPhases) {
+  $gate = $phaseGates[$phase]
+  $mandatoryPredicates["${phase}.cpu"] = $gate.cpu
+  $mandatoryPredicates["${phase}.working_set_max"] = $gate.working_set_max
+  $mandatoryPredicates["${phase}.working_set_trend"] = $gate.working_set_trend
+  if ($gate.input_to_next_present_applicable) {
+    $mandatoryPredicates["${phase}.input_to_next_present"] = $gate.input_to_next_present
+  }
+  if ($gate.frame_response_applicable) {
+    $mandatoryPredicates["${phase}.frame_response"] = $gate.frame_response
+  }
+}
+Write-ComparisonOutput $OutputPath $report $mandatoryPredicates
