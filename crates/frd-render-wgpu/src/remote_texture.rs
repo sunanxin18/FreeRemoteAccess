@@ -362,31 +362,24 @@ impl RemoteRenderer {
         prepared: PreparedBatchResources<RemoteTexture>,
         observation: GpuScopeObservation,
     ) -> Result<BatchApplySuccess, BatchApplyFailure> {
-        let identity = planned.identity;
-        let context = self.context.clone();
-        match context.commit_if_unchanged(clean_token, || {
-            commit_planned_batch_after_gpu(&mut self.state, &mut self.remote, planned, prepared)
-        }) {
-            Ok((outcome, dropped)) => {
-                drop(dropped);
-                Ok(BatchApplySuccess {
-                    outcome,
-                    scope: BatchScopeDiagnostics {
-                        observation,
-                        observed_fault: None,
-                    },
-                })
-            }
-            Err(fault) => Err(BatchApplyFailure {
-                identity: Some(identity),
-                primary: RendererError::GpuFault(fault),
-                secondary_execution: None,
-                scope: Some(BatchScopeDiagnostics {
-                    observation,
-                    observed_fault: Some(fault),
-                }),
-            }),
-        }
+        let Self {
+            context,
+            state,
+            remote,
+            ..
+        } = self;
+        commit_scoped_batch(
+            &GpuContextBatchScopeBackend::new(context),
+            clean_token,
+            state,
+            remote,
+            planned,
+            prepared,
+            BatchScopeDiagnostics {
+                observation,
+                observed_fault: None,
+            },
+        )
     }
 
     pub fn record(
@@ -737,6 +730,11 @@ trait BatchScopeBackend {
     fn observation(&self) -> GpuScopeObservation;
     fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
     fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+    fn commit_if_unchanged<R>(
+        &self,
+        token: Self::CleanToken,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GpuFaultClass>;
 }
 
 struct GpuContextBatchScopeBackend<'a> {
@@ -763,6 +761,14 @@ impl BatchScopeBackend for GpuContextBatchScopeBackend<'_> {
 
     fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
         scope.finish()
+    }
+
+    fn commit_if_unchanged<R>(
+        &self,
+        token: Self::CleanToken,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GpuFaultClass> {
+        self.context.commit_if_unchanged(token, commit)
     }
 }
 
@@ -843,6 +849,38 @@ fn commit_planned_batch_after_gpu<R>(
         }
     }
     (outcome, prepared.superseded)
+}
+
+fn commit_scoped_batch<B, R>(
+    backend: &B,
+    clean_token: B::CleanToken,
+    state: &mut RemoteUpdateState,
+    resource: &mut Option<R>,
+    planned: PlannedBatch,
+    prepared: PreparedBatchResources<R>,
+    scope: BatchScopeDiagnostics,
+) -> Result<BatchApplySuccess, BatchApplyFailure>
+where
+    B: BatchScopeBackend,
+{
+    let identity = planned.identity;
+    match backend.commit_if_unchanged(clean_token, || {
+        commit_planned_batch_after_gpu(state, resource, planned, prepared)
+    }) {
+        Ok((outcome, dropped)) => {
+            drop(dropped);
+            Ok(BatchApplySuccess { outcome, scope })
+        }
+        Err(fault) => Err(BatchApplyFailure {
+            identity: Some(identity),
+            primary: RendererError::GpuFault(fault),
+            secondary_execution: None,
+            scope: Some(BatchScopeDiagnostics {
+                observation: scope.observation,
+                observed_fault: Some(fault),
+            }),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1398,9 +1436,9 @@ mod tests {
 
     use super::{
         commit_planned_batch_after_gpu, commit_planned_update_after_gpu,
-        commit_reset_resource_after_gpu, confirm_presented_with_commit, execute_planned_operations,
-        execute_record_with_fault_scope, execute_with_observed_scope, BatchApplySuccess,
-        BatchScopeDiagnostics, PlannedOperationExecutor, PreparedBatchResources,
+        commit_reset_resource_after_gpu, commit_scoped_batch, confirm_presented_with_commit,
+        execute_planned_operations, execute_record_with_fault_scope, execute_with_observed_scope,
+        BatchApplySuccess, BatchScopeDiagnostics, PlannedOperationExecutor, PreparedBatchResources,
         PreparedRecordCommit, RecordScopeBackend, RecoveryRequirement, RemoteColorPolicy,
         RemoteUpdateState, RendererError,
     };
@@ -1772,6 +1810,61 @@ mod tests {
             scope.record_poll().unwrap();
             self.finish_result
         }
+
+        fn commit_if_unchanged<R>(
+            &self,
+            _token: Self::CleanToken,
+            commit: impl FnOnce() -> R,
+        ) -> Result<R, GpuFaultClass> {
+            Ok(commit())
+        }
+    }
+
+    #[test]
+    fn successful_nonempty_batch_commits_through_borrowed_non_clone_backend() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1, 1).unwrap();
+        let mut state = RemoteUpdateState::default();
+        let planned = state
+            .plan_batch(vec![startup_transaction(
+                session_id,
+                4,
+                size,
+                1,
+                vec![patch(pixel_rect(0, 0, 1, 1), 4, vec![0x31; 4])],
+            )])
+            .unwrap();
+        let mut resource = None;
+        let backend = RecordingBatchScopeBackend {
+            observer: Arc::new(TestScopeObserver::default()),
+            finish_result: Ok(()),
+        };
+
+        let success = commit_scoped_batch(
+            &backend,
+            (),
+            &mut state,
+            &mut resource,
+            planned,
+            PreparedBatchResources {
+                final_startup: Some("startup-texture"),
+                superseded: Vec::new(),
+            },
+            BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(backend.finish_result, Ok(()));
+        assert_eq!(state.current_generation(), Some(4));
+        assert_eq!(resource, Some("startup-texture"));
+        assert_eq!(success.scope.observed_fault, None);
     }
 
     struct RecordingRecordScopeBackend {

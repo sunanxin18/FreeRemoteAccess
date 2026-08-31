@@ -2313,7 +2313,9 @@ impl DesktopApplication {
             }
         }
         let hook = WindowPresentationHook::new(window.window.clone());
-        let gpu = window.gpu.clone();
+        // 重绘热路径只借用 GPU 上下文；compositor、renderer 与 egui renderer
+        // 是互不重叠的字段，不需要为闭包延长所有权而复制整组 wgpu handle。
+        let gpu = &window.gpu;
         let egui_renderer = &mut window.egui_renderer;
         let render_result = window.compositor.render_in(
             &mut window.renderer,
