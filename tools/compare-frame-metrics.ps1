@@ -193,6 +193,9 @@ function Get-OptionalRowField($Row, [string]$Name) {
 function Assert-EventIdentityRows($Rows, [string]$Kind) {
   $activeSession = $null
   $activeGeneration = $null
+  $restoreSession = $null
+  $restoreGeneration = $null
+  $restoreBoundarySeen = $false
   $restorePresentationCount = 0
   foreach ($row in $Rows) {
     $event = [string]$row.event
@@ -206,17 +209,23 @@ function Assert-EventIdentityRows($Rows, [string]$Kind) {
 
     if ($event -ceq 'PhaseBoundary') {
       Assert-True (-not $hasAnyIdentity) "invalid_${Kind}_control_identity"
+      if ([string]$row.phase -ceq 'Restore') {
+        $restoreBoundarySeen = $true
+        $restoreSession = $activeSession
+        $restoreGeneration = $activeGeneration
+      }
       continue
+    }
+
+    if ([string]$row.phase -ceq 'Restore') {
+      Assert-True $restoreBoundarySeen "invalid_${Kind}_restore_event_before_boundary"
     }
 
     $knownIdentityEvent = @(
       'SerialDrain', 'CandidateBatch', 'Presentation',
       'FrameResponse', 'InputToNextPresent', 'StableFault'
     ) -ccontains $event
-    if (-not $knownIdentityEvent) {
-      Assert-True (-not $hasAnyIdentity) "invalid_${Kind}_identity_event"
-      continue
-    }
+    Assert-True $knownIdentityEvent "invalid_${Kind}_event"
 
     if ($event -ceq 'StableFault') {
       Assert-True ((-not $hasAnyIdentity) -or
@@ -249,10 +258,14 @@ function Assert-EventIdentityRows($Rows, [string]$Kind) {
     $isRestorePresentation = [string]$row.phase -ceq 'Restore' -and
       $event -ceq 'Presentation'
     if ($isRestorePresentation) {
-      Assert-True ($null -ne $activeSession -and $null -ne $activeGeneration -and
-        $session -eq [UInt64]$activeSession -and
-        $generation -eq [UInt64]$activeGeneration) "invalid_${Kind}_restore_presentation_current_identity"
+      Assert-True ($null -ne $restoreSession -and $null -ne $restoreGeneration -and
+        $session -eq [UInt64]$restoreSession -and
+        $generation -eq [UInt64]$restoreGeneration) "invalid_${Kind}_restore_presentation_current_identity"
       $restorePresentationCount += 1
+    } elseif ([string]$row.phase -ceq 'Restore') {
+      Assert-True ($null -ne $restoreSession -and $null -ne $restoreGeneration -and
+        $session -eq [UInt64]$restoreSession -and
+        $generation -eq [UInt64]$restoreGeneration) "invalid_${Kind}_restore_identity_changed"
     }
 
     if ($advancesCurrentGeneration) {
@@ -428,19 +441,19 @@ function Assert-MonotonicProcess($Rows) {
 function Get-RunStatistics($Events, $ProcessRows, [string]$Implementation) {
   Assert-MonotonicEvents $Events
   Assert-MonotonicProcess $ProcessRows
-  Assert-True (@($Events | Where-Object { $_.event -eq 'StableFault' }).Count -eq 0) 'stable_fault_present'
+  Assert-True (@($Events | Where-Object { $_.event -ceq 'StableFault' }).Count -eq 0) 'stable_fault_present'
   $batchEvent = if ($Implementation -eq 'serial') { 'SerialDrain' } else { 'CandidateBatch' }
-  $batchRows = @($Events | Where-Object { $_.event -eq $batchEvent })
+  $batchRows = @($Events | Where-Object { $_.event -ceq $batchEvent })
   Assert-True ($batchRows.Count -gt 0) "missing_${Implementation}_batches"
   Assert-True (@($batchRows | Where-Object { $_.batch_result -ne 'Success' }).Count -eq 0) 'non_success_performance_batch'
 
   $result = [ordered]@{}
   foreach ($phase in $MeasuredPhases) {
     $process = Get-ProcessStatistics $ProcessRows $phase
-    $phaseEvents = @($Events | Where-Object { $_.phase -eq $phase })
-    $phaseBatches = @($phaseEvents | Where-Object { $_.event -eq $batchEvent })
-    $presentations = @($phaseEvents | Where-Object { $_.event -eq 'Presentation' })
-    $frameResponses = @($phaseEvents | Where-Object { $_.event -eq 'FrameResponse' })
+    $phaseEvents = @($Events | Where-Object { $_.phase -ceq $phase })
+    $phaseBatches = @($phaseEvents | Where-Object { $_.event -ceq $batchEvent })
+    $presentations = @($phaseEvents | Where-Object { $_.event -ceq 'Presentation' })
+    $frameResponses = @($phaseEvents | Where-Object { $_.event -ceq 'FrameResponse' })
     $visible = $phase -eq 'VisibleMeasurement'
     if ($visible) {
       Assert-True ($phaseBatches.Count -gt 0) "missing_${phase}_batches"
@@ -455,7 +468,7 @@ function Get-RunStatistics($Events, $ProcessRows, [string]$Implementation) {
       presentation_sum = if ($visible) { Get-WorstEventWindow $presentations '' $process.origin_us 'count' } else { $null }
       presentation_activity_count = [UInt64]$presentations.Count
       input_to_next_present_p95 = if ($visible) {
-        Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'InputToNextPresent' }) 'input_to_next_present_us' $process.origin_us 'p95'
+        Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -ceq 'InputToNextPresent' }) 'input_to_next_present_us' $process.origin_us 'p95'
       } else {
         $null
       }
@@ -912,6 +925,42 @@ function Assert-SelfTestTopLevelRejected(
 }
 
 function Invoke-SelfTest {
+  $caseFoldedCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
+  $caseFoldedCandidateBatch = @($caseFoldedCandidateEvents | Where-Object {
+    $_.event -ceq 'CandidateBatch'
+  })[0]
+  $caseFoldedCandidateBatch.event = 'candidatebatch'
+  $caseFoldedCandidateBatch.session_id = ''
+  $caseFoldedCandidateBatch.generation = ''
+  $caseFoldedCandidateBatch.revision = ''
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $caseFoldedCandidateEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_candidate_events_event' 'case_folded_candidate_batch'
+
+  $restoreRebasedCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 2 8
+  $restoreRebasedPrefix = @(
+    $restoreRebasedCandidateEvents[0..($restoreRebasedCandidateEvents.Count - 2)]
+  )
+  $restoreRebasedPresentation = $restoreRebasedCandidateEvents[-1]
+  $restoreRebasedCandidateEvents = @($restoreRebasedPrefix)
+  $restoreRebasedCandidateEvents += New-SelfTestComparisonRow $EventHeader ([ordered]@{
+    schema_version = '1'; run_id = 'candidate-a'; implementation = 'candidate'
+    phase = 'Restore'; event = 'CandidateBatch'; batch_result = 'Success'
+    monotonic_us = '64000000'; session_id = '1'; generation = '2'; revision = '7'
+    source_updates = '1'; transactions = '1'; rectangles = '1'; batch_cpu_us = '1000'
+    mailbox_age_us = '1000'; scope_begins = '1'; scope_finishes = '1'; scope_polls = '1'
+  })
+  $restoreRebasedCandidateEvents += $restoreRebasedPresentation
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $restoreRebasedCandidateEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_candidate_events_restore_identity_changed' 'restore_candidate_batch_rebase'
+
   $poisonedBoundaryEvents = New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 2 7
   $poisonedRestoreBoundary = @($poisonedBoundaryEvents | Where-Object {
     $_.phase -ceq 'Restore' -and $_.event -ceq 'PhaseBoundary'
@@ -940,7 +989,7 @@ function Invoke-SelfTest {
     (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
     (New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7) `
     (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
-    'invalid_serial_events_identity_event' 'unknown_event_identity_poison'
+    'invalid_serial_events_event' 'unknown_event_identity_poison'
 
   $fakeTimelineProcess = New-SelfTestComparisonProcessRows 'serial-a' 'serial'
   foreach ($row in $fakeTimelineProcess) {
@@ -1276,7 +1325,7 @@ $candidateRun = Assert-RunRows $candidateEventRows $candidateProcessRows 'candid
 $serial = Get-RunStatistics $serialEventRows $serialProcessRows 'serial'
 $candidate = Get-RunStatistics $candidateEventRows $candidateProcessRows 'candidate'
 
-$candidateBatches = @($candidateEventRows | Where-Object { $_.event -eq 'CandidateBatch' })
+$candidateBatches = @($candidateEventRows | Where-Object { $_.event -ceq 'CandidateBatch' })
 $scopeRowsExact = @($candidateBatches | Where-Object {
   $_.batch_result -ne 'Success' -or $_.scope_begins -ne '1' -or
   $_.scope_finishes -ne '1' -or $_.scope_polls -ne '1'
