@@ -206,14 +206,27 @@ function Assert-RunRows(
 
   $boundaries = @($Events | Where-Object { $_.event -ceq 'PhaseBoundary' })
   Assert-True ($boundaries.Count -eq $allPhases.Count) "invalid_${Kind}_events_phase_boundaries"
+  $boundaryTimestamps = @()
   for ($index = 0; $index -lt $allPhases.Count; $index++) {
     $phase = $allPhases[$index]
     Assert-True ([string]$boundaries[$index].phase -ceq $phase) "invalid_${Kind}_events_phase_boundaries"
     Assert-True (@($boundaries | Where-Object { $_.phase -ceq $phase }).Count -eq 1) "invalid_${Kind}_events_phase_boundaries"
     $boundaryTimestamp = Convert-U64 $boundaries[$index].monotonic_us 'invalid_event_timestamp'
+    $boundaryTimestamps += $boundaryTimestamp
     Assert-True (@($Events | Where-Object {
       $_.phase -ceq $phase -and (Convert-U64 $_.monotonic_us 'invalid_event_timestamp') -lt $boundaryTimestamp
     }).Count -eq 0) "invalid_${Kind}_events_phase_boundaries"
+  }
+  for ($index = 0; $index -lt $allPhases.Count; $index++) {
+    $phase = $allPhases[$index]
+    $lower = [UInt64]$boundaryTimestamps[$index]
+    $hasUpper = $index + 1 -lt $allPhases.Count
+    $upper = if ($hasUpper) { [UInt64]$boundaryTimestamps[$index + 1] } else { [UInt64]::MaxValue }
+    Assert-True (@($Events | Where-Object {
+      if ([string]$_.phase -cne $phase) { return $false }
+      $timestamp = Convert-U64 $_.monotonic_us 'invalid_event_timestamp'
+      $timestamp -lt $lower -or ($hasUpper -and $timestamp -ge $upper)
+    }).Count -eq 0) "invalid_${Kind}_events_phase_interval"
   }
   return $eventRunId
 }
@@ -806,6 +819,16 @@ function Invoke-SelfTest {
     $events[2] = $swapped
     Assert-RunRows $events (New-SelfTestProcessRows 'serial-a' 'serial') 'serial' 'serial'
   } 'invalid_serial_events_phase_boundaries'
+  Assert-FailsWith {
+    $events = @(New-SelfTestEventRows 'candidate-a' 'candidate')
+    $events += [pscustomobject]@{
+      schema_version = '1'; run_id = 'candidate-a'; implementation = 'candidate'
+      phase = 'VisibleMeasurement'; event = 'CandidateBatch'; batch_result = 'Success'
+      monotonic_us = '5000000'; source_updates = '18446744073709551615'
+      scope_begins = '1'; scope_finishes = '1'; scope_polls = '1'
+    }
+    Assert-RunRows $events (New-SelfTestProcessRows 'candidate-a' 'candidate') 'candidate' 'candidate'
+  } 'invalid_candidate_events_phase_interval'
   Assert-FailsWith {
     $events = @(New-SelfTestEventRows 'serial-a' 'serial' | Where-Object { $_.phase -ne 'Restore' })
     Assert-RunRows $events (New-SelfTestProcessRows 'serial-a' 'serial') 'serial' 'serial'
