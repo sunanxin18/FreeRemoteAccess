@@ -7,7 +7,7 @@ use std::time::Instant;
 use frd_render_wgpu::GpuFaultClass;
 
 const METRIC_SCHEMA_VERSION: u16 = 1;
-const MAX_METRIC_ROWS: usize = 16_384;
+const MAX_METRIC_ROWS: usize = 32_768;
 const METRIC_HEADER: &str = "schema_version,run_id,implementation,phase,event,batch_result,batch_failure_class,monotonic_us,session_id,generation,revision,source_updates,transactions,rectangles,batch_cpu_us,mailbox_age_us,scope_begins,scope_finishes,scope_polls,gpu_fault_code,process_cpu_total_us,process_cpu_delta_us,working_set_bytes,frame_response_ms,input_to_next_present_us";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -589,6 +589,35 @@ mod tests {
         assert!(!METRIC_HEADER.contains("pixel"));
         assert!(!METRIC_HEADER.contains("error"));
         assert!(lines.next().is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn metric_sink_accepts_row_32768_then_fails_closed_on_the_next_write() {
+        let directory = test_directory("capacity-boundary");
+        let path = directory.join("events.csv");
+        let mut sink = FrameMetricsSink::open_enabled(
+            path,
+            SafeRunId("capacity_run".to_owned()),
+            MetricImplementation::Serial,
+            Instant::now(),
+        )
+        .unwrap();
+
+        for _ in 0..32_768 {
+            let row = sink.new_row(MetricPhase::VisibleWarmup, MetricEventKind::FrameResponse);
+            sink.write_row(row).unwrap();
+        }
+
+        let row = sink.new_row(MetricPhase::VisibleWarmup, MetricEventKind::FrameResponse);
+        assert_eq!(sink.write_row(row), Err(MetricSinkError::CapacityExceeded));
+
+        let row = sink.new_row(MetricPhase::VisibleWarmup, MetricEventKind::FrameResponse);
+        assert_eq!(
+            sink.write_row(row),
+            Err(MetricSinkError::InvalidObservation)
+        );
+
         fs::remove_dir_all(directory).unwrap();
     }
 
