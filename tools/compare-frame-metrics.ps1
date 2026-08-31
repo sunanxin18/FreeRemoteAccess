@@ -251,7 +251,11 @@ function Get-RunStatistics($Events, $ProcessRows, [string]$Implementation) {
       scope_finishes_sum = Get-WorstEventWindow $phaseBatches 'scope_finishes' $process.origin_us 'sum'
       scope_polls_sum = Get-WorstEventWindow $phaseBatches 'scope_polls' $process.origin_us 'sum'
       presentation_sum = Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'Presentation' }) '' $process.origin_us 'count'
-      input_to_next_present_p95 = Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'InputToNextPresent' }) 'input_to_next_present_us' $process.origin_us 'p95'
+      input_to_next_present_p95 = if ($phase -eq 'VisibleMeasurement') {
+        Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'InputToNextPresent' }) 'input_to_next_present_us' $process.origin_us 'p95'
+      } else {
+        $null
+      }
       frame_response_p95 = Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'FrameResponse' }) 'frame_response_ms' $process.origin_us 'p95'
       process = $process
     }
@@ -261,6 +265,47 @@ function Get-RunStatistics($Events, $ProcessRows, [string]$Implementation) {
   $result['scope_finishes_total'] = [UInt64](($batchRows | ForEach-Object { Convert-U64 $_.scope_finishes 'invalid_scope_finishes' } | Measure-Object -Sum).Sum)
   $result['scope_polls_total'] = [UInt64](($batchRows | ForEach-Object { Convert-U64 $_.scope_polls 'invalid_scope_polls' } | Measure-Object -Sum).Sum)
   return $result
+}
+
+function Get-PhaseGates($Serial, $Candidate) {
+  $phaseGates = [ordered]@{}
+  foreach ($phase in $MeasuredPhases) {
+    $serialPhase = $Serial[$phase]
+    $candidatePhase = $Candidate[$phase]
+    $cpuLimit = [Math]::Max([decimal]$serialPhase.process.cpu_worst_window_delta_us * 1.10,
+      [decimal]$serialPhase.process.cpu_worst_window_delta_us + 500000)
+    $inputApplicable = $phase -eq 'VisibleMeasurement'
+    $phaseGates[$phase] = [ordered]@{
+      cpu = ([decimal]$candidatePhase.process.cpu_worst_window_delta_us -le $cpuLimit)
+      working_set_max = ([decimal]$candidatePhase.process.working_set_max_bytes -le
+        [decimal]$serialPhase.process.working_set_max_bytes + 67108864)
+      working_set_trend = ([decimal]$candidatePhase.process.working_set_last_median_bytes -le
+        [decimal]$candidatePhase.process.working_set_first_median_bytes + 16777216)
+      input_to_next_present_applicable = $inputApplicable
+      input_to_next_present = if ($inputApplicable) {
+        (([decimal]$candidatePhase.input_to_next_present_p95.value * 2) -le
+          [decimal]$serialPhase.input_to_next_present_p95.value)
+      } else {
+        $null
+      }
+      frame_response = ([decimal]$candidatePhase.frame_response_p95.value -le
+        [decimal]$serialPhase.frame_response_p95.value)
+    }
+  }
+  return $phaseGates
+}
+
+function Get-MandatoryPhasePredicates($PhaseGates) {
+  $mandatory = @()
+  foreach ($phase in $MeasuredPhases) {
+    $gate = $PhaseGates[$phase]
+    $mandatory += @($gate.cpu, $gate.working_set_max, $gate.working_set_trend)
+    if ($gate.input_to_next_present_applicable) {
+      $mandatory += @($gate.input_to_next_present)
+    }
+    $mandatory += @($gate.frame_response)
+  }
+  return $mandatory
 }
 
 function Assert-FailsWith([scriptblock]$Action, [string]$ExpectedCode) {
@@ -292,6 +337,56 @@ function New-SelfTestProcessRows([string]$RunId, [string]$Implementation) {
       $rows += [pscustomobject]@{
         schema_version = '1'; run_id = $RunId; implementation = $Implementation
         phase = $phase; second = [string]$second; monotonic_us = [string]($second * 1000000)
+      }
+    }
+  }
+  return $rows
+}
+
+function New-SelfTestMetricEventRows(
+  [string]$Implementation,
+  [UInt64]$VisibleInputValue,
+  [bool]$IncludeVisibleInput
+) {
+  $rows = @()
+  foreach ($phase in $MeasuredPhases) {
+    [UInt64]$phaseOrigin = if ($phase -eq 'VisibleMeasurement') { 0 } else { 40000000 }
+    foreach ($second in 0, 5, 10, 15, 20, 25) {
+      $timestamp = [string]($phaseOrigin + [UInt64]($second * 1000000))
+      $rows += [pscustomobject]@{
+        phase = $phase; event = if ($Implementation -eq 'serial') { 'SerialDrain' } else { 'CandidateBatch' }
+        monotonic_us = $timestamp; batch_result = 'Success'; batch_cpu_us = '1'; mailbox_age_us = '1'
+        scope_begins = '1'; scope_finishes = '1'; scope_polls = '1'
+        session_id = ''; generation = ''; revision = ''
+      }
+      $rows += [pscustomobject]@{
+        phase = $phase; event = 'Presentation'; monotonic_us = $timestamp
+        session_id = ''; generation = ''; revision = ''
+      }
+      $rows += [pscustomobject]@{
+        phase = $phase; event = 'FrameResponse'; monotonic_us = $timestamp; frame_response_ms = '1'
+        session_id = ''; generation = ''; revision = ''
+      }
+      if ($phase -eq 'VisibleMeasurement' -and $IncludeVisibleInput) {
+        $rows += [pscustomobject]@{
+          phase = $phase; event = 'InputToNextPresent'; monotonic_us = $timestamp
+          input_to_next_present_us = [string]$VisibleInputValue
+          session_id = ''; generation = ''; revision = ''
+        }
+      }
+    }
+  }
+  return $rows
+}
+
+function New-SelfTestMetricProcessRows {
+  $rows = @()
+  foreach ($phase in $MeasuredPhases) {
+    [UInt64]$phaseOrigin = if ($phase -eq 'VisibleMeasurement') { 0 } else { 40000000 }
+    foreach ($second in 0..30) {
+      $rows += [pscustomobject]@{
+        phase = $phase; second = [string]$second; monotonic_us = [string]($phaseOrigin + [UInt64]($second * 1000000))
+        process_cpu_total_us = [string]($second * 100); working_set_bytes = [string](1000 + $second)
       }
     }
   }
@@ -339,6 +434,25 @@ function Invoke-SelfTest {
   Assert-True ($statistics.working_set_max_bytes -eq 1030) 'selftest_working_set_maximum'
   Assert-True ($statistics.working_set_first_median_bytes -eq 1003) 'selftest_first_median'
   Assert-True ($statistics.working_set_last_median_bytes -eq 1028) 'selftest_last_median'
+
+  $metricProcessRows = New-SelfTestMetricProcessRows
+  $serialMetricStatistics = Get-RunStatistics (New-SelfTestMetricEventRows 'serial' 40 $true) $metricProcessRows 'serial'
+  $candidateMetricStatistics = Get-RunStatistics (New-SelfTestMetricEventRows 'candidate' 20 $true) $metricProcessRows 'candidate'
+  Assert-True ($null -eq $candidateMetricStatistics.MinimizedMeasurement.input_to_next_present_p95) 'selftest_minimized_input_not_applicable'
+  Assert-FailsWith {
+    Get-RunStatistics (New-SelfTestMetricEventRows 'serial' 40 $false) $metricProcessRows 'serial'
+  } 'incomplete_input_to_next_present_us_window_0'
+  $phaseGates = Get-PhaseGates $serialMetricStatistics $candidateMetricStatistics
+  Assert-True ($candidateMetricStatistics.VisibleMeasurement.input_to_next_present_p95.value -eq 20 -and
+    $phaseGates.VisibleMeasurement.input_to_next_present_applicable -and
+    $phaseGates.VisibleMeasurement.input_to_next_present) 'selftest_visible_input_real_and_applicable'
+  Assert-True (-not $phaseGates.MinimizedMeasurement.input_to_next_present_applicable -and
+    $null -eq $phaseGates.MinimizedMeasurement.input_to_next_present) 'selftest_minimized_input_predicate_not_applicable'
+  $phaseMandatory = Get-MandatoryPhasePredicates $phaseGates
+  Assert-True ($phaseMandatory.Count -eq 9 -and @($phaseMandatory | Where-Object { -not $_ }).Count -eq 0) 'selftest_mandatory_excludes_minimized_input'
+  $phaseGates.VisibleMeasurement.input_to_next_present = $false
+  $phaseMandatory = Get-MandatoryPhasePredicates $phaseGates
+  Assert-True ($phaseMandatory.Count -eq 9 -and @($phaseMandatory | Where-Object { -not $_ }).Count -eq 1) 'selftest_mandatory_includes_visible_input'
 
   Assert-FailsWith {
     Assert-RunRows (New-SelfTestEventRows 'serial-a' 'serial') (New-SelfTestProcessRows 'serial-b' 'serial') 'serial' 'serial'
@@ -416,24 +530,7 @@ $visibleSerial = $serial.VisibleMeasurement
 $visibleCandidate = $candidate.VisibleMeasurement
 $latencyGate = $visibleCandidate.batch_cpu_p95.value -le 8000 -and
   ([decimal]$visibleCandidate.batch_cpu_p95.value * 2) -le [decimal]$visibleSerial.batch_cpu_p95.value
-$phaseGates = [ordered]@{}
-foreach ($phase in $MeasuredPhases) {
-  $serialPhase = $serial[$phase]
-  $candidatePhase = $candidate[$phase]
-  $cpuLimit = [Math]::Max([decimal]$serialPhase.process.cpu_worst_window_delta_us * 1.10,
-    [decimal]$serialPhase.process.cpu_worst_window_delta_us + 500000)
-  $phaseGates[$phase] = [ordered]@{
-    cpu = ([decimal]$candidatePhase.process.cpu_worst_window_delta_us -le $cpuLimit)
-    working_set_max = ([decimal]$candidatePhase.process.working_set_max_bytes -le
-      [decimal]$serialPhase.process.working_set_max_bytes + 67108864)
-    working_set_trend = ([decimal]$candidatePhase.process.working_set_last_median_bytes -le
-      [decimal]$candidatePhase.process.working_set_first_median_bytes + 16777216)
-    input_to_next_present = (([decimal]$candidatePhase.input_to_next_present_p95.value * 2) -le
-      [decimal]$serialPhase.input_to_next_present_p95.value)
-    frame_response = ([decimal]$candidatePhase.frame_response_p95.value -le
-      [decimal]$serialPhase.frame_response_p95.value)
-  }
-}
+$phaseGates = Get-PhaseGates $serial $candidate
 $restoreReceipt = @($candidateEventRows | Where-Object {
   $_.phase -eq 'Restore' -and $_.event -eq 'Presentation' -and
   -not [string]::IsNullOrEmpty($_.session_id) -and
@@ -456,12 +553,8 @@ $report = [ordered]@{
   }
 }
 
-$mandatory = @($scopeRowsExact, $scopeTotalsExact, $latencyGate, $restoreReceipt)
-foreach ($phase in $MeasuredPhases) {
-  $mandatory += @($phaseGates[$phase].cpu, $phaseGates[$phase].working_set_max,
-    $phaseGates[$phase].working_set_trend, $phaseGates[$phase].input_to_next_present,
-    $phaseGates[$phase].frame_response)
-}
+$mandatory = @($scopeRowsExact, $scopeTotalsExact, $latencyGate, $restoreReceipt) +
+  @(Get-MandatoryPhasePredicates $phaseGates)
 Assert-True (@($mandatory | Where-Object { -not $_ }).Count -eq 0) 'mandatory_performance_predicate_failed'
 
 $outputFullPath = [IO.Path]::GetFullPath($OutputPath)

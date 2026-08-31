@@ -1689,7 +1689,7 @@ pwsh -NoProfile -File .\tools\compare-frame-metrics.ps1 `
   -OutputPath .\target\validation\frame-transaction-comparison.json
 ```
 
-The script rejects a phase missing S0..S30, any incomplete five-second window, schema mismatch, row-capacity overflow, identity mismatch, or non-monotonic timestamp. For each metric it reports the worst value and earliest tied `[t,t+5)` window; it never averages windows or chooses a favorable interval.
+The script rejects a phase missing S0..S30, any incomplete five-second window for an applicable metric, schema mismatch, row-capacity overflow, identity mismatch, or non-monotonic timestamp. `input-to-next-present` is applicable only in `VisibleMeasurement`: every complete visible five-second window remains mandatory. `MinimizedMeasurement` reports that input statistic and predicate as explicit `null`/N/A because focus-gated remote input is forbidden there. For every applicable metric it reports the worst value and earliest tied `[t,t+5)` window; it never averages windows or chooses a favorable interval.
 
 - [ ] **Step 3: Apply deterministic scope, latency, CPU, and memory equations exactly**
 
@@ -1731,16 +1731,21 @@ Apply the three per-row predicates and aggregate equalities to the whole candida
 
 - [ ] **Step 4: Classify input timing without claiming visual causality**
 
-For exact same-identity controlled probes verify:
+For exact same-identity controlled probes during `VisibleMeasurement`, verify:
 
 ```text
 candidate_input_to_next_present_worst_p95_us * 2
     <= serial_input_to_next_present_worst_p95_us
+```
+
+`MinimizedMeasurement` input-to-next-present is explicitly N/A: minimized capture drives `Focused(false)`, and the product rule forbids remote input without application/remote-surface focus. Its input statistic and predicate are JSON `null` and are excluded from mandatory predicate collection; CPU, working-set, frame-response, presentation, batch, scope, restore, and fault-free gates remain mandatory. For each phase verify:
+
+```text
 candidate_frame_response_worst_p95_ms
     <= serial_frame_response_worst_p95_ms
 ```
 
-Both frame-response operands are computed only from `frame_response_ms = FrameResponseTiming::sample_ms`; never substitute the UI-only `smoothed_ms`. The normal input metric is named only `input-to-next-present`. Run one isolated action with an externally visible effect for an optional causality trial. Label `input-to-visible` only if a human/capture verifies the correlated changed pixels in the next receipt; that visible-causality trial has exactly `passed` or `inconclusive`, never an inferred success or numeric proxy. If required input-to-next-present comparison is inconclusive, the overall gate remains inconclusive and does not unlock floating-island work.
+Both frame-response operands are computed only from `frame_response_ms = FrameResponseTiming::sample_ms`; never substitute the UI-only `smoothed_ms`. The normal input metric is named only `input-to-next-present`. Run one isolated action with an externally visible effect for an optional causality trial. Label `input-to-visible` only if a human/capture verifies the correlated changed pixels in the next receipt; that visible-causality trial has exactly `passed` or `inconclusive`, never an inferred success or numeric proxy. If the required visible input-to-next-present comparison is inconclusive, the overall gate remains inconclusive and does not unlock floating-island work.
 
 - [ ] **Step 5: Verify fault-free restore/FIFO behavior and the separate injected fault contract**
 
@@ -1760,7 +1765,7 @@ Expected: no regression. Any semantic failure blocks acceptance even if timing i
 
 - [ ] **Step 6: Record the exact evidence in the validation document**
 
-Append a dated “Frame transaction latency gate” section to `docs/validation/windows-apple-wgpu-parity.md`. Record serial/candidate commits and binary SHA-256, schema/run ids, the fact that both measured processes were fault-free through restore/normal close, phase boundaries, every earliest worst window, per-row and aggregate actual scope counts, batch/input/frame-response p95, both CPU equations, both maximum-working-set equations, both memory-trend equations, restore parity, and every Task 6 command/result. Record the four named injected fault tests and their exit results in a separate “fault contract (excluded from performance runs)” subsection. Record required input-to-next-present and optional visible-causality classifications separately.
+Append a dated “Frame transaction latency gate” section to `docs/validation/windows-apple-wgpu-parity.md`. Record serial/candidate commits and binary SHA-256, schema/run ids, the fact that both measured processes were fault-free through restore/normal close, phase boundaries, every earliest worst window, per-row and aggregate actual scope counts, batch/input/frame-response p95, both CPU equations, both maximum-working-set equations, both memory-trend equations, restore parity, and every Task 6 command/result. Record the required visible-only input-to-next-present classification and the minimized explicit N/A/focus-gated exclusion, plus optional visible-causality, separately. Record the four named injected fault tests and their exit results in a separate “fault contract (excluded from performance runs)” subsection.
 
 If any mandatory item fails, record `failed`; if required comparable evidence is unavailable, record overall `inconclusive`. Both stop this plan and block floating-control work. Neither authorizes frame dropping.
 
