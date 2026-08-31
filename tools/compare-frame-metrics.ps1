@@ -17,6 +17,7 @@ $EventRowCapacity = 32768
 $ProcessSampleRowLimit = 62
 $ProcessSamplePeriodUs = [UInt64]1000000
 $ProcessSampleJitterToleranceUs = [UInt64]100000
+$EventFields = $EventHeader.Split(',')
 
 function Assert-True([bool]$Condition, [string]$Code) {
   if (-not $Condition) { throw $Code }
@@ -156,7 +157,7 @@ function Assert-HeadersAndRows(
   Assert-True (-not [string]::IsNullOrWhiteSpace($Path)) "missing_${Kind}_path"
   Assert-True (Test-Path -LiteralPath $Path -PathType Leaf) "missing_${Kind}_file"
   $first = Get-Content -LiteralPath $Path -TotalCount 1
-  Assert-True ($first -eq $ExpectedHeader) "invalid_${Kind}_schema"
+  Assert-True ($first -ceq $ExpectedHeader) "invalid_${Kind}_schema"
   $rows = @(Import-Csv -LiteralPath $Path)
   if ($null -eq $MaximumRows) {
     Assert-True ($Kind -like '*_process') "missing_${Kind}_row_limit"
@@ -173,15 +174,20 @@ function Assert-FileRowIdentity(
   [string]$Kind,
   [string[]]$AllowedPhases
 ) {
+  $runId = $null
   foreach ($row in $Rows) {
     Assert-True ([string]$row.schema_version -eq '1') "invalid_${Kind}_schema_version"
     Assert-True ([string]$row.run_id -match '^[A-Za-z0-9_-]{1,64}$') "invalid_${Kind}_run_id"
     Assert-True ([string]$row.implementation -ceq $ExpectedImplementation) "invalid_${Kind}_implementation"
     Assert-True ($AllowedPhases -ccontains [string]$row.phase) "invalid_${Kind}_phase"
+    if ($null -eq $runId) {
+      $runId = [string]$row.run_id
+    } else {
+      Assert-True ([string]::Equals($runId, [string]$row.run_id, [StringComparison]::Ordinal)) `
+        "invalid_${Kind}_run_id"
+    }
   }
-  $runIds = @($Rows | Select-Object -ExpandProperty run_id -Unique)
-  Assert-True ($runIds.Count -eq 1) "invalid_${Kind}_run_id"
-  return [string]$runIds[0]
+  return $runId
 }
 
 function Get-OptionalRowField($Row, [string]$Name) {
@@ -235,7 +241,7 @@ function Assert-EventIdentityRows($Rows, [string]$Kind) {
       Assert-True ($hasSession -and $hasGeneration -and $hasRevision) `
         "invalid_${Kind}_presentation_identity_shape"
     } elseif ($event -ceq 'CandidateBatch') {
-      Assert-True ($hasSession -and $hasGeneration -and $hasRevision) `
+      Assert-True ($hasSession -and $hasGeneration) `
         "invalid_${Kind}_event_identity_shape"
     } else {
       Assert-True ($hasSession -and $hasGeneration -and -not $hasRevision) `
@@ -321,6 +327,23 @@ function Assert-ProcessTimelineRows($Rows, $PhaseIntervals, [string]$Kind) {
   }
 }
 
+function Get-CanonicalEventRowKey($Row) {
+  $builder = [Text.StringBuilder]::new()
+  foreach ($field in $EventFields) {
+    $value = Get-OptionalRowField $Row $field
+    [void]$builder.Append($value.Length).Append(':').Append($value).Append(';')
+  }
+  return $builder.ToString()
+}
+
+function Assert-NoDuplicateEventRows($Rows, [string]$Kind) {
+  $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  foreach ($row in $Rows) {
+    $key = Get-CanonicalEventRowKey $row
+    Assert-True ($seen.Add($key)) "duplicate_${Kind}_event_row"
+  }
+}
+
 function Assert-RunRows(
   $Events,
   $ProcessRows,
@@ -331,6 +354,7 @@ function Assert-RunRows(
   $eventRunId = Assert-FileRowIdentity $Events $ExpectedImplementation "${Kind}_events" $allPhases
   $processRunId = Assert-FileRowIdentity $ProcessRows $ExpectedImplementation "${Kind}_process" $MeasuredPhases
   Assert-True ($eventRunId -ceq $processRunId) "${Kind}_run_identity_mismatch"
+  Assert-NoDuplicateEventRows $Events "${Kind}_events"
 
   $eventPhases = @($Events | Select-Object -ExpandProperty phase -Unique)
   Assert-True ($eventPhases.Count -eq $allPhases.Count) "invalid_${Kind}_events_phase_set"
@@ -445,7 +469,7 @@ function Get-RunStatistics($Events, $ProcessRows, [string]$Implementation) {
   $batchEvent = if ($Implementation -eq 'serial') { 'SerialDrain' } else { 'CandidateBatch' }
   $batchRows = @($Events | Where-Object { $_.event -ceq $batchEvent })
   Assert-True ($batchRows.Count -gt 0) "missing_${Implementation}_batches"
-  Assert-True (@($batchRows | Where-Object { $_.batch_result -ne 'Success' }).Count -eq 0) 'non_success_performance_batch'
+  Assert-True (@($batchRows | Where-Object { $_.batch_result -cne 'Success' }).Count -eq 0) 'non_success_performance_batch'
 
   $result = [ordered]@{}
   foreach ($phase in $MeasuredPhases) {
@@ -924,7 +948,102 @@ function Assert-SelfTestTopLevelRejected(
   }
 }
 
+function Assert-SelfTestTopLevelAccepted(
+  $SerialEventRows,
+  $SerialProcessRows,
+  $CandidateEventRows,
+  $CandidateProcessRows,
+  [string]$FixtureName
+) {
+  $fixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ("frd-comparator-acceptance-{0}" -f [Guid]::NewGuid())
+  [void](New-Item -ItemType Directory -Path $fixtureDirectory)
+  try {
+    $serialEvents = Join-Path $fixtureDirectory 'serial-events.csv'
+    $serialProcess = Join-Path $fixtureDirectory 'serial-process.csv'
+    $candidateEvents = Join-Path $fixtureDirectory 'candidate-events.csv'
+    $candidateProcess = Join-Path $fixtureDirectory 'candidate-process.csv'
+    $output = Join-Path $fixtureDirectory 'comparison.json'
+    Write-SelfTestComparisonCsv $serialEvents $EventHeader $SerialEventRows
+    Write-SelfTestComparisonCsv $serialProcess $ProcessHeader $SerialProcessRows
+    Write-SelfTestComparisonCsv $candidateEvents $EventHeader $CandidateEventRows
+    Write-SelfTestComparisonCsv $candidateProcess $ProcessHeader $CandidateProcessRows
+    $hostExecutable = if (Test-Path -LiteralPath (Join-Path $PSHOME 'pwsh.exe')) {
+      Join-Path $PSHOME 'pwsh.exe'
+    } else {
+      Join-Path $PSHOME 'powershell.exe'
+    }
+    $childStdout = Join-Path $fixtureDirectory 'child.stdout.txt'
+    $childStderr = Join-Path $fixtureDirectory 'child.stderr.txt'
+    $child = Start-Process -FilePath $hostExecutable -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
+      '-SerialEvents', $serialEvents, '-SerialProcessSamples', $serialProcess,
+      '-CandidateEvents', $candidateEvents, '-CandidateProcessSamples', $candidateProcess,
+      '-OutputPath', $output
+    ) -Wait -PassThru -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
+    $stderr = @(Get-Content -LiteralPath $childStderr -ErrorAction SilentlyContinue)
+    Assert-True ($child.ExitCode -eq 0) "selftest_${FixtureName}_rejected"
+    Assert-True (Test-Path -LiteralPath $output -PathType Leaf) "selftest_${FixtureName}_missing_output"
+    Assert-True ([string]::IsNullOrWhiteSpace(($stderr -join "`n"))) "selftest_${FixtureName}_stderr_not_empty"
+  } finally {
+    Remove-Item -LiteralPath $fixtureDirectory -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Invoke-SelfTest {
+  $duplicatedCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
+  $duplicateCandidateBatch = @($duplicatedCandidateEvents | Where-Object {
+    $_.event -ceq 'CandidateBatch'
+  })[0]
+  $duplicateCandidateIndex = [Array]::IndexOf($duplicatedCandidateEvents, $duplicateCandidateBatch)
+  $duplicatedCandidateEvents = @(
+    $duplicatedCandidateEvents[0..$duplicateCandidateIndex]
+    $duplicateCandidateBatch
+    $duplicatedCandidateEvents[($duplicateCandidateIndex + 1)..($duplicatedCandidateEvents.Count - 1)]
+  )
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $duplicatedCandidateEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'duplicate_candidate_events_event_row' 'duplicate_candidate_batch'
+
+  $lowercaseSuccessEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
+  $lowercaseSuccessBatch = @($lowercaseSuccessEvents | Where-Object {
+    $_.event -ceq 'CandidateBatch'
+  })[0]
+  $lowercaseSuccessBatch.batch_result = 'success'
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $lowercaseSuccessEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'non_success_performance_batch' 'lowercase_candidate_batch_success'
+
+  $installedSurfaceCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
+  $installedSurfaceCandidateBatch = @($installedSurfaceCandidateEvents | Where-Object {
+    $_.event -ceq 'CandidateBatch'
+  })[0]
+  $installedSurfaceCandidateBatch.revision = ''
+  Assert-SelfTestTopLevelAccepted `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $installedSurfaceCandidateEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'candidate_installed_surface_identity'
+
+  $partialCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
+  $partialCandidateBatch = @($partialCandidateEvents | Where-Object {
+    $_.event -ceq 'CandidateBatch'
+  })[0]
+  $partialCandidateBatch.generation = ''
+  $partialCandidateBatch.revision = ''
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $partialCandidateEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_candidate_events_event_identity_shape' 'partial_candidate_batch_identity'
+
   $caseFoldedCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
   $caseFoldedCandidateBatch = @($caseFoldedCandidateEvents | Where-Object {
     $_.event -ceq 'CandidateBatch'
@@ -949,7 +1068,7 @@ function Invoke-SelfTest {
   $restoreRebasedCandidateEvents += New-SelfTestComparisonRow $EventHeader ([ordered]@{
     schema_version = '1'; run_id = 'candidate-a'; implementation = 'candidate'
     phase = 'Restore'; event = 'CandidateBatch'; batch_result = 'Success'
-    monotonic_us = '64000000'; session_id = '1'; generation = '2'; revision = '7'
+    monotonic_us = '64000000'; session_id = '1'; generation = '2'; revision = ''
     source_updates = '1'; transactions = '1'; rectangles = '1'; batch_cpu_us = '1000'
     mailbox_age_us = '1000'; scope_begins = '1'; scope_finishes = '1'; scope_polls = '1'
   })
@@ -1327,8 +1446,8 @@ $candidate = Get-RunStatistics $candidateEventRows $candidateProcessRows 'candid
 
 $candidateBatches = @($candidateEventRows | Where-Object { $_.event -ceq 'CandidateBatch' })
 $scopeRowsExact = @($candidateBatches | Where-Object {
-  $_.batch_result -ne 'Success' -or $_.scope_begins -ne '1' -or
-  $_.scope_finishes -ne '1' -or $_.scope_polls -ne '1'
+  $_.batch_result -cne 'Success' -or $_.scope_begins -cne '1' -or
+  $_.scope_finishes -cne '1' -or $_.scope_polls -cne '1'
 }).Count -eq 0
 $scopeTotalsExact = $candidate.scope_begins_total -eq $candidate.batch_count -and
   $candidate.scope_finishes_total -eq $candidate.batch_count -and
