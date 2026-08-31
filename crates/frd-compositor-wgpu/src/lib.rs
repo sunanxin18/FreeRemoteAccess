@@ -59,17 +59,29 @@ trait FrameScopeBackend {
     fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
 }
 
-struct GpuContextFrameScopeBackend {
-    context: GpuContext,
+trait RecordedFrameFlow<T> {
+    type Output;
+
+    fn overlay(&mut self);
+    fn before_submit(&mut self);
+    fn submit(&mut self);
+    fn present(&mut self);
+    fn reconfigure_after_finish(&mut self) -> Result<(), PresentError>;
+    fn confirm_presented(&mut self, token: T) -> Result<(), PresentError>;
+    fn emit_event(self) -> Self::Output;
 }
 
-impl GpuContextFrameScopeBackend {
-    fn new(context: GpuContext) -> Self {
+struct GpuContextFrameScopeBackend<'a> {
+    context: &'a GpuContext,
+}
+
+impl<'a> GpuContextFrameScopeBackend<'a> {
+    fn new(context: &'a GpuContext) -> Self {
         Self { context }
     }
 }
 
-impl FrameScopeBackend for GpuContextFrameScopeBackend {
+impl FrameScopeBackend for GpuContextFrameScopeBackend<'_> {
     type Scope = frd_render_wgpu::GpuFaultScope;
     type CleanToken = GpuCleanToken;
 
@@ -82,29 +94,163 @@ impl FrameScopeBackend for GpuContextFrameScopeBackend {
     }
 }
 
-#[derive(Debug)]
-struct ScopedFrame<T, R> {
-    clean_token: T,
-    recorded: R,
-}
-
 fn execute_frame_with_fault_scope<B, R>(
     backend: &B,
     record_and_present: impl FnOnce() -> Result<R, PresentError>,
-) -> Result<ScopedFrame<B::CleanToken, R>, PresentError>
+) -> Result<R::Output, PresentError>
 where
     B: FrameScopeBackend,
+    R: RecordedFrameFlow<B::CleanToken>,
 {
     let scope = backend.begin()?;
-    let recorded = record_and_present();
+    let recorded = record_and_present().map(|mut recorded| {
+        recorded.overlay();
+        recorded.before_submit();
+        recorded.submit();
+        recorded.present();
+        recorded
+    });
     let finish = backend.finish(scope);
     match (finish, recorded) {
         (Err(fault), _) => Err(PresentError::GpuFault(fault)),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(clean_token), Ok(recorded)) => Ok(ScopedFrame {
-            clean_token,
-            recorded,
-        }),
+        (Ok(clean_token), Ok(mut recorded)) => {
+            recorded.reconfigure_after_finish()?;
+            recorded.confirm_presented(clean_token)?;
+            Ok(recorded.emit_event())
+        }
+    }
+}
+
+struct WgpuRecordedFrame<'a, O> {
+    context: &'a GpuContext,
+    presentation: &'a PresentationSurface,
+    configuration: &'a Option<wgpu::SurfaceConfiguration>,
+    action: AcquisitionAction,
+    remote: &'a mut RemoteRenderer,
+    texture: Option<wgpu::SurfaceTexture>,
+    view: wgpu::TextureView,
+    encoder: Option<wgpu::CommandEncoder>,
+    receipt: Option<frd_render_wgpu::PresentationReceipt>,
+    overlay: Option<O>,
+    hooks: &'a dyn PresentationHooks,
+    event: Option<PresentationEvent>,
+}
+
+impl<'a, O> WgpuRecordedFrame<'a, O>
+where
+    O: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+{
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        context: &'a GpuContext,
+        presentation: &'a PresentationSurface,
+        configuration: &'a Option<wgpu::SurfaceConfiguration>,
+        action: AcquisitionAction,
+        remote: &'a mut RemoteRenderer,
+        texture: wgpu::SurfaceTexture,
+        viewport: Option<ContentViewport>,
+        explicit_viewport: bool,
+        physical_size: PixelSize,
+        target_format: wgpu::TextureFormat,
+        overlay: O,
+        hooks: &'a dyn PresentationHooks,
+    ) -> Result<Self, PresentError> {
+        let view = texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder =
+            context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("FreeRemoteDesk presentation encoder"),
+                });
+        let receipt = if explicit_viewport {
+            remote.record_in(&mut encoder, &view, viewport, target_format)?
+        } else {
+            remote.record(&mut encoder, &view, physical_size, target_format)?
+        };
+        Ok(Self {
+            context,
+            presentation,
+            configuration,
+            action,
+            remote,
+            texture: Some(texture),
+            view,
+            encoder: Some(encoder),
+            receipt,
+            overlay: Some(overlay),
+            hooks,
+            event: None,
+        })
+    }
+}
+
+impl<O> RecordedFrameFlow<GpuCleanToken> for WgpuRecordedFrame<'_, O>
+where
+    O: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+{
+    type Output = Option<PresentationEvent>;
+
+    fn overlay(&mut self) {
+        self.overlay.take().expect("叠加层回调只调用一次")(
+            self.encoder.as_mut().expect("呈现编码器尚未提交"),
+            &self.view,
+        );
+    }
+
+    fn before_submit(&mut self) {
+        self.hooks.before_submit();
+    }
+
+    fn submit(&mut self) {
+        let encoder = self.encoder.take().expect("呈现编码器只提交一次");
+        self.context.queue().submit([encoder.finish()]);
+    }
+
+    fn present(&mut self) {
+        let texture = self.texture.take().expect("呈现纹理只提交一次");
+        self.context.queue().present(texture);
+    }
+
+    fn reconfigure_after_finish(&mut self) -> Result<(), PresentError> {
+        if self.action != AcquisitionAction::RenderThenReconfigure {
+            return Ok(());
+        }
+        let configuration = self
+            .configuration
+            .as_ref()
+            .ok_or(PresentError::SurfaceDetached)?;
+        let surface = self
+            .presentation
+            .surface()
+            .ok_or(PresentError::SurfaceDetached)?;
+        let token = configure_surface_with(surface, self.context, configuration)?;
+        self.context.commit_if_unchanged(token, || ())?;
+        Ok(())
+    }
+
+    fn confirm_presented(&mut self, token: GpuCleanToken) -> Result<(), PresentError> {
+        if let Some(receipt) = self.receipt {
+            let receipt = self
+                .remote
+                .confirm_presented(token, receipt)?
+                .into_receipt();
+            self.event = Some(PresentationEvent::FramePresented {
+                session_id: receipt.session_id,
+                generation: receipt.generation,
+                revision: receipt.revision,
+                completeness: receipt.completeness,
+            });
+        } else {
+            self.context.commit_if_unchanged(token, || ())?;
+        }
+        Ok(())
+    }
+
+    fn emit_event(self) -> Self::Output {
+        self.event
     }
 }
 
@@ -225,50 +371,26 @@ impl PresentationCompositor {
                     AcquiredFrame::Success(texture) | AcquiredFrame::Suboptimal(texture) => texture,
                     _ => unreachable!("渲染动作必须包含 SurfaceTexture"),
                 };
-                let scope_backend = GpuContextFrameScopeBackend::new(self.context.clone());
-                let scoped = execute_frame_with_fault_scope(&scope_backend, || {
-                    let view = texture
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
-                    let mut encoder = self.context.device().create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("FreeRemoteDesk presentation encoder"),
-                        },
-                    );
-                    let receipt = if explicit_viewport {
-                        remote.record_in(&mut encoder, &view, viewport, target_format)?
-                    } else {
-                        remote.record(&mut encoder, &view, physical_size, target_format)?
-                    };
-                    overlay(&mut encoder, &view);
-                    hooks.before_submit();
-                    self.context.queue().submit([encoder.finish()]);
-                    self.context.queue().present(texture);
-                    Ok(receipt)
-                })?;
+                let scope_backend = GpuContextFrameScopeBackend::new(&self.context);
                 // submit/present 在 wgpu 30 中不返回逐帧 Result；同一错误作用域和共享
                 // observer 负责在确认回执前收集同步验证错误与设备丢失。finish 使用
                 // 非阻塞 Poll，不把呈现路径变成等待 GPU 完成的 fence。
-                let frame_token = scoped.clean_token;
-                let receipt = scoped.recorded;
-                if action == AcquisitionAction::RenderThenReconfigure {
-                    self.reconfigure_existing()?;
-                }
-                let event = if let Some(receipt) = receipt {
-                    let receipt = remote
-                        .confirm_presented(frame_token, receipt)?
-                        .into_receipt();
-                    Some(PresentationEvent::FramePresented {
-                        session_id: receipt.session_id,
-                        generation: receipt.generation,
-                        revision: receipt.revision,
-                        completeness: receipt.completeness,
-                    })
-                } else {
-                    self.context.commit_if_unchanged(frame_token, || ())?;
-                    None
-                };
-                Ok(event)
+                execute_frame_with_fault_scope(&scope_backend, || {
+                    WgpuRecordedFrame::record(
+                        &self.context,
+                        &self.presentation,
+                        &self.configuration,
+                        action,
+                        remote,
+                        texture,
+                        viewport,
+                        explicit_viewport,
+                        physical_size,
+                        target_format,
+                        overlay,
+                        hooks,
+                    )
+                })
             }
             AcquisitionAction::Reconfigure => {
                 self.reconfigure_existing()?;
@@ -521,7 +643,9 @@ mod scope_tests {
 
     use frd_render_wgpu::{GpuFaultClass, RendererError};
 
-    use super::{execute_frame_with_fault_scope, FrameScopeBackend, PresentError};
+    use super::{
+        execute_frame_with_fault_scope, FrameScopeBackend, PresentError, RecordedFrameFlow,
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ScopeName {
@@ -532,8 +656,6 @@ mod scope_tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum LifecycleEvent {
         Begin(ScopeName),
-        CreateView,
-        CreateEncoder,
         Record,
         Finish(ScopeName),
         Poll(ScopeName),
@@ -541,6 +663,7 @@ mod scope_tests {
         BeforeSubmit,
         Submit,
         Present,
+        Reconfigure,
         ConfirmReceipt,
         FramePresented,
     }
@@ -570,6 +693,72 @@ mod scope_tests {
         }
     }
 
+    struct RecordingPresentedFrame {
+        events: Rc<RefCell<Vec<LifecycleEvent>>>,
+    }
+
+    impl RecordedFrameFlow<()> for RecordingPresentedFrame {
+        type Output = ();
+
+        fn overlay(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::Overlay);
+        }
+
+        fn before_submit(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
+        }
+
+        fn submit(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::Submit);
+        }
+
+        fn present(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::Present);
+        }
+
+        fn reconfigure_after_finish(&mut self) -> Result<(), PresentError> {
+            self.events.borrow_mut().push(LifecycleEvent::Reconfigure);
+            Ok(())
+        }
+
+        fn confirm_presented(&mut self, _token: ()) -> Result<(), PresentError> {
+            self.events
+                .borrow_mut()
+                .push(LifecycleEvent::ConfirmReceipt);
+            Ok(())
+        }
+
+        fn emit_event(self) -> Self::Output {
+            self.events
+                .borrow_mut()
+                .push(LifecycleEvent::FramePresented);
+        }
+    }
+
+    struct SilentRecordedFrame;
+
+    impl RecordedFrameFlow<()> for SilentRecordedFrame {
+        type Output = ();
+
+        fn overlay(&mut self) {}
+
+        fn before_submit(&mut self) {}
+
+        fn submit(&mut self) {}
+
+        fn present(&mut self) {}
+
+        fn reconfigure_after_finish(&mut self) -> Result<(), PresentError> {
+            Ok(())
+        }
+
+        fn confirm_presented(&mut self, _token: ()) -> Result<(), PresentError> {
+            Ok(())
+        }
+
+        fn emit_event(self) -> Self::Output {}
+    }
+
     #[test]
     fn outer_frame_scope_closes_when_record_fails_without_presentation_callbacks() {
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -580,18 +769,12 @@ mod scope_tests {
         };
 
         let error = execute_frame_with_fault_scope(&outer, || {
-            events.borrow_mut().push(LifecycleEvent::CreateView);
-            events.borrow_mut().push(LifecycleEvent::CreateEncoder);
             events.borrow_mut().push(LifecycleEvent::Record);
-            let receipt = Err::<Option<u64>, _>(PresentError::Renderer(
+            Err::<RecordingPresentedFrame, _>(PresentError::Renderer(
                 RendererError::UnsupportedTargetFormat,
-            ))?;
-            events.borrow_mut().push(LifecycleEvent::Overlay);
-            events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
-            events.borrow_mut().push(LifecycleEvent::Submit);
-            events.borrow_mut().push(LifecycleEvent::Present);
-            Ok(receipt)
+            ))
         })
+        .map(|_| ())
         .unwrap_err();
 
         assert_eq!(
@@ -602,8 +785,6 @@ mod scope_tests {
             *events.borrow(),
             [
                 LifecycleEvent::Begin(ScopeName::Outer),
-                LifecycleEvent::CreateView,
-                LifecycleEvent::CreateEncoder,
                 LifecycleEvent::Record,
                 LifecycleEvent::Finish(ScopeName::Outer),
                 LifecycleEvent::Poll(ScopeName::Outer),
@@ -626,18 +807,14 @@ mod scope_tests {
         };
 
         let result = execute_frame_with_fault_scope(&outer, || {
-            events.borrow_mut().push(LifecycleEvent::CreateView);
-            events.borrow_mut().push(LifecycleEvent::CreateEncoder);
             let inner_result = execute_frame_with_fault_scope(&inner, || {
                 events.borrow_mut().push(LifecycleEvent::Record);
-                Ok(())
+                Ok(SilentRecordedFrame)
             });
             inner_result?;
-            events.borrow_mut().push(LifecycleEvent::Overlay);
-            events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
-            events.borrow_mut().push(LifecycleEvent::Submit);
-            events.borrow_mut().push(LifecycleEvent::Present);
-            Ok(())
+            Ok(RecordingPresentedFrame {
+                events: events.clone(),
+            })
         });
 
         assert_eq!(
@@ -648,8 +825,6 @@ mod scope_tests {
             *events.borrow(),
             [
                 LifecycleEvent::Begin(ScopeName::Outer),
-                LifecycleEvent::CreateView,
-                LifecycleEvent::CreateEncoder,
                 LifecycleEvent::Begin(ScopeName::Inner),
                 LifecycleEvent::Record,
                 LifecycleEvent::Finish(ScopeName::Inner),
@@ -674,30 +849,22 @@ mod scope_tests {
             finish_result: Ok(()),
         };
 
-        let scoped = execute_frame_with_fault_scope(&outer, || {
-            events.borrow_mut().push(LifecycleEvent::CreateView);
-            events.borrow_mut().push(LifecycleEvent::CreateEncoder);
-            let inner = execute_frame_with_fault_scope(&inner, || {
+        let result = execute_frame_with_fault_scope(&outer, || {
+            let inner_result = execute_frame_with_fault_scope(&inner, || {
                 events.borrow_mut().push(LifecycleEvent::Record);
-                Ok(41_u64)
-            })?;
-            events.borrow_mut().push(LifecycleEvent::Overlay);
-            events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
-            events.borrow_mut().push(LifecycleEvent::Submit);
-            events.borrow_mut().push(LifecycleEvent::Present);
-            Ok(inner.recorded)
-        })
-        .unwrap();
-        assert_eq!(scoped.recorded, 41);
-        events.borrow_mut().push(LifecycleEvent::ConfirmReceipt);
-        events.borrow_mut().push(LifecycleEvent::FramePresented);
+                Ok(SilentRecordedFrame)
+            });
+            assert!(inner_result.is_ok());
+            Ok(RecordingPresentedFrame {
+                events: events.clone(),
+            })
+        });
+        assert!(result.is_ok());
 
         assert_eq!(
             *events.borrow(),
             [
                 LifecycleEvent::Begin(ScopeName::Outer),
-                LifecycleEvent::CreateView,
-                LifecycleEvent::CreateEncoder,
                 LifecycleEvent::Begin(ScopeName::Inner),
                 LifecycleEvent::Record,
                 LifecycleEvent::Finish(ScopeName::Inner),
@@ -708,6 +875,7 @@ mod scope_tests {
                 LifecycleEvent::Present,
                 LifecycleEvent::Finish(ScopeName::Outer),
                 LifecycleEvent::Poll(ScopeName::Outer),
+                LifecycleEvent::Reconfigure,
                 LifecycleEvent::ConfirmReceipt,
                 LifecycleEvent::FramePresented,
             ]

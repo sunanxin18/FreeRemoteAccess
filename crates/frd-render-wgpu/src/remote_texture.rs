@@ -193,19 +193,30 @@ trait RecordScopeBackend {
 
     fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
     fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+    fn commit_if_unchanged<R>(
+        &self,
+        token: Self::CleanToken,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GpuFaultClass>;
 }
 
-struct GpuContextRecordScopeBackend {
-    context: GpuContext,
+trait PreparedRecordCommit {
+    type Output;
+
+    fn commit(self) -> Self::Output;
 }
 
-impl GpuContextRecordScopeBackend {
-    fn new(context: GpuContext) -> Self {
+struct GpuContextRecordScopeBackend<'a> {
+    context: &'a GpuContext,
+}
+
+impl<'a> GpuContextRecordScopeBackend<'a> {
+    fn new(context: &'a GpuContext) -> Self {
         Self { context }
     }
 }
 
-impl RecordScopeBackend for GpuContextRecordScopeBackend {
+impl RecordScopeBackend for GpuContextRecordScopeBackend<'_> {
     type Scope = GpuFaultScope;
     type CleanToken = GpuCleanToken;
 
@@ -216,20 +227,23 @@ impl RecordScopeBackend for GpuContextRecordScopeBackend {
     fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
         scope.finish()
     }
-}
 
-#[derive(Debug)]
-struct ScopedRecord<T, R> {
-    clean_token: T,
-    recorded: R,
+    fn commit_if_unchanged<R>(
+        &self,
+        token: Self::CleanToken,
+        commit: impl FnOnce() -> R,
+    ) -> Result<R, GpuFaultClass> {
+        self.context.commit_if_unchanged(token, commit)
+    }
 }
 
 fn execute_record_with_fault_scope<B, R>(
     backend: &B,
     record: impl FnOnce() -> Result<R, RendererError>,
-) -> Result<ScopedRecord<B::CleanToken, R>, RendererError>
+) -> Result<R::Output, RendererError>
 where
     B: RecordScopeBackend,
+    R: PreparedRecordCommit,
 {
     let scope = backend.begin()?;
     let recorded = record();
@@ -237,10 +251,28 @@ where
     match (finish, recorded) {
         (Err(fault), _) => Err(RendererError::GpuFault(fault)),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(clean_token), Ok(recorded)) => Ok(ScopedRecord {
-            clean_token,
-            recorded,
-        }),
+        (Ok(clean_token), Ok(recorded)) => backend
+            .commit_if_unchanged(clean_token, || recorded.commit())
+            .map_err(RendererError::from),
+    }
+}
+
+struct WgpuPreparedRecord<'a> {
+    replacement_pass: Option<RemotePass>,
+    pass: &'a mut Option<RemotePass>,
+    state: &'a RemoteUpdateState,
+    viewport: Option<ContentViewport>,
+}
+
+impl PreparedRecordCommit for WgpuPreparedRecord<'_> {
+    type Output = (Option<RemotePass>, Option<PresentationReceipt>);
+
+    fn commit(self) -> Self::Output {
+        let old_pass = self
+            .replacement_pass
+            .and_then(|pass| self.pass.replace(pass));
+        let receipt = self.viewport.and_then(|_| self.state.pending_receipt());
+        (old_pass, receipt)
     }
 }
 
@@ -385,44 +417,45 @@ impl RemoteRenderer {
             (None, Some(_)) => return Err(RendererError::InvalidGeometry),
             _ => {}
         }
-        let scope_backend = GpuContextRecordScopeBackend::new(self.context.clone());
-        let scoped = execute_record_with_fault_scope(&scope_backend, || {
-            let replacement_pass = if self
-                .pass
+        let Self {
+            context,
+            bind_group_layout,
+            remote,
+            pass,
+            state,
+            ..
+        } = self;
+        let scope_backend = GpuContextRecordScopeBackend::new(context);
+        let (old_pass, pending_receipt) = execute_record_with_fault_scope(&scope_backend, || {
+            let replacement_pass = if pass
                 .as_ref()
                 .is_none_or(|pass| !pass.matches(target_format))
             {
                 Some(RemotePass::new(
-                    self.context.device(),
-                    &self.bind_group_layout,
+                    context.device(),
+                    bind_group_layout,
                     target_format,
                 )?)
             } else {
                 None
             };
-            let remote = self.remote.as_ref();
             replacement_pass
                 .as_ref()
-                .or(self.pass.as_ref())
+                .or(pass.as_ref())
                 .expect("远端 pass 已创建")
                 .record(
                     encoder,
                     target,
-                    remote.map(|texture| &texture.bind_group),
+                    remote.as_ref().map(|texture| &texture.bind_group),
                     viewport.map(|viewport| viewport.content),
                 );
-            Ok(replacement_pass)
-        })?;
-        let token = scoped.clean_token;
-        let replacement_pass = scoped.recorded;
-        let context = self.context.clone();
-        let (old_pass, pending_receipt) = context
-            .commit_if_unchanged(token, || {
-                let old_pass = replacement_pass.and_then(|pass| self.pass.replace(pass));
-                let receipt = viewport.and_then(|_| self.state.pending_receipt());
-                (old_pass, receipt)
+            Ok(WgpuPreparedRecord {
+                replacement_pass,
+                pass,
+                state,
+                viewport,
             })
-            .map_err(RendererError::from)?;
+        })?;
         drop(old_pass);
         Ok(pending_receipt)
     }
@@ -432,8 +465,8 @@ impl RemoteRenderer {
         token: GpuCleanToken,
         receipt: PresentationReceipt,
     ) -> Result<ConfirmedPresentation, RendererError> {
-        let context = self.context.clone();
-        confirm_presented_with_commit(&mut self.state, receipt, |state, receipt| {
+        let Self { context, state, .. } = self;
+        confirm_presented_with_commit(state, receipt, |state, receipt| {
             context
                 .commit_if_unchanged(token, || state.confirm_presented(receipt))
                 .map_err(RendererError::from)?
@@ -1368,8 +1401,8 @@ mod tests {
         commit_reset_resource_after_gpu, confirm_presented_with_commit, execute_planned_operations,
         execute_record_with_fault_scope, execute_with_observed_scope, BatchApplySuccess,
         BatchScopeDiagnostics, PlannedOperationExecutor, PreparedBatchResources,
-        RecordScopeBackend, RecoveryRequirement, RemoteColorPolicy, RemoteUpdateState,
-        RendererError,
+        PreparedRecordCommit, RecordScopeBackend, RecoveryRequirement, RemoteColorPolicy,
+        RemoteUpdateState, RendererError,
     };
     use crate::gpu_fault::{begin_observed_scope, ObservedScopeLifecycle, ScopeLifecycleEvent};
     use crate::{
@@ -1744,6 +1777,7 @@ mod tests {
     struct RecordingRecordScopeBackend {
         observer: Arc<dyn ScopeLifecycleObserver>,
         finish_result: Result<(), GpuFaultClass>,
+        commit_calls: Rc<std::cell::Cell<u64>>,
     }
 
     impl RecordScopeBackend for RecordingRecordScopeBackend {
@@ -1759,6 +1793,49 @@ mod tests {
             scope.record_finish().unwrap();
             scope.record_poll().unwrap();
             self.finish_result
+        }
+
+        fn commit_if_unchanged<R>(
+            &self,
+            _token: Self::CleanToken,
+            commit: impl FnOnce() -> R,
+        ) -> Result<R, GpuFaultClass> {
+            self.commit_calls.set(self.commit_calls.get() + 1);
+            Ok(commit())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRecordState {
+        pass: Option<PreparedResource>,
+        receipt: Option<u64>,
+    }
+
+    #[derive(Debug)]
+    struct PreparedResource {
+        id: u64,
+        drops: Rc<std::cell::Cell<u64>>,
+    }
+
+    impl Drop for PreparedResource {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    struct FakePreparedRecord {
+        resource: PreparedResource,
+        state: Rc<RefCell<FakeRecordState>>,
+    }
+
+    impl PreparedRecordCommit for FakePreparedRecord {
+        type Output = Option<u64>;
+
+        fn commit(self) -> Self::Output {
+            let mut state = self.state.borrow_mut();
+            state.pass = Some(self.resource);
+            state.receipt = Some(17);
+            state.receipt
         }
     }
 
@@ -1785,17 +1862,30 @@ mod tests {
     #[test]
     fn record_operation_error_still_finishes_and_polls_exactly_once() {
         let observer = Arc::new(TestScopeObserver::default());
+        let commit_calls = Rc::new(std::cell::Cell::new(0));
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let state = Rc::new(RefCell::new(FakeRecordState::default()));
         let backend = RecordingRecordScopeBackend {
             observer: observer.clone(),
             finish_result: Ok(()),
+            commit_calls: commit_calls.clone(),
         };
 
         let error = execute_record_with_fault_scope(&backend, || {
-            Err::<(), _>(RendererError::UnsupportedTargetFormat)
+            let _prepared = PreparedResource {
+                id: 1,
+                drops: drops.clone(),
+            };
+            Err::<FakePreparedRecord, _>(RendererError::UnsupportedTargetFormat)
         })
+        .map(|_| ())
         .unwrap_err();
 
         assert_eq!(error, RendererError::UnsupportedTargetFormat);
+        assert_eq!(commit_calls.get(), 0);
+        assert!(state.borrow().pass.is_none());
+        assert_eq!(state.borrow().receipt, None);
+        assert_eq!(drops.get(), 1);
         assert_eq!(
             observer.snapshot(),
             GpuScopeObservation {
@@ -1807,29 +1897,72 @@ mod tests {
     }
 
     #[test]
-    fn record_finish_gpu_fault_wins_and_prepared_state_is_not_committed() {
+    fn successful_record_with_finish_gpu_fault_drops_prepared_without_commit() {
         let observer = Arc::new(TestScopeObserver::default());
+        let commit_calls = Rc::new(std::cell::Cell::new(0));
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let state = Rc::new(RefCell::new(FakeRecordState::default()));
         let backend = RecordingRecordScopeBackend {
             observer: observer.clone(),
             finish_result: Err(GpuFaultClass::DeviceLost),
+            commit_calls: commit_calls.clone(),
         };
-        let mut committed_pass = None;
-        let mut returned_receipt = None;
 
         let result = execute_record_with_fault_scope(&backend, || {
-            Err::<(&str, Option<u64>), _>(RendererError::UnsupportedTargetFormat)
+            Ok(FakePreparedRecord {
+                resource: PreparedResource {
+                    id: 2,
+                    drops: drops.clone(),
+                },
+                state: state.clone(),
+            })
         });
-        if let Ok(scoped) = &result {
-            committed_pass = Some(scoped.recorded.0);
-            returned_receipt = scoped.recorded.1;
-        }
 
         assert_eq!(
             result.map(|_| ()),
             Err(RendererError::GpuFault(GpuFaultClass::DeviceLost))
         );
-        assert_eq!(committed_pass, None);
-        assert_eq!(returned_receipt, None);
+        assert_eq!(commit_calls.get(), 0);
+        assert!(state.borrow().pass.is_none());
+        assert_eq!(state.borrow().receipt, None);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(
+            observer.snapshot(),
+            GpuScopeObservation {
+                begins: 1,
+                finishes: 1,
+                polls: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn successful_record_commits_prepared_pass_and_receipt_through_epoch_gate() {
+        let observer = Arc::new(TestScopeObserver::default());
+        let commit_calls = Rc::new(std::cell::Cell::new(0));
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let state = Rc::new(RefCell::new(FakeRecordState::default()));
+        let backend = RecordingRecordScopeBackend {
+            observer: observer.clone(),
+            finish_result: Ok(()),
+            commit_calls: commit_calls.clone(),
+        };
+
+        let result = execute_record_with_fault_scope(&backend, || {
+            Ok(FakePreparedRecord {
+                resource: PreparedResource {
+                    id: 3,
+                    drops: drops.clone(),
+                },
+                state: state.clone(),
+            })
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(commit_calls.get(), 1);
+        assert_eq!(state.borrow().pass.as_ref().map(|pass| pass.id), Some(3));
+        assert_eq!(state.borrow().receipt, Some(17));
+        assert_eq!(drops.get(), 0);
         assert_eq!(
             observer.snapshot(),
             GpuScopeObservation {
