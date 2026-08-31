@@ -404,7 +404,9 @@ function Assert-EventFieldShapeRows($Rows, [string]$Kind) {
       }
       if (($numericFields -ccontains $field) -and
           -not [string]::IsNullOrEmpty($value)) {
-        [void](Convert-U64 $value "invalid_${Kind}_event_fields")
+        $parsed = Convert-U64 $value "invalid_${Kind}_event_fields"
+        $canonical = $parsed.ToString([Globalization.CultureInfo]::InvariantCulture)
+        Assert-True ($canonical -ceq $value) "invalid_${Kind}_event_fields"
       }
     }
 
@@ -1111,6 +1113,28 @@ function Invoke-SelfTest {
     $ignoredFieldCandidateEvents `
     (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
     'invalid_candidate_events_event_fields' 'ignored_gpu_fault_duplicate_candidate_batch'
+
+  $nonCanonicalCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
+  $nonCanonicalSourceBatch = @($nonCanonicalCandidateEvents | Where-Object {
+    $_.event -ceq 'CandidateBatch'
+  })[0]
+  $nonCanonicalBatch = New-SelfTestComparisonRow $EventHeader ([ordered]@{})
+  foreach ($field in $EventFields) {
+    $nonCanonicalBatch.$field = [string]$nonCanonicalSourceBatch.$field
+  }
+  $nonCanonicalBatch.source_updates = '01'
+  $nonCanonicalIndex = [Array]::IndexOf($nonCanonicalCandidateEvents, $nonCanonicalSourceBatch)
+  $nonCanonicalCandidateEvents = @(
+    $nonCanonicalCandidateEvents[0..$nonCanonicalIndex]
+    $nonCanonicalBatch
+    $nonCanonicalCandidateEvents[($nonCanonicalIndex + 1)..($nonCanonicalCandidateEvents.Count - 1)]
+  )
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $nonCanonicalCandidateEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_candidate_events_event_fields' 'noncanonical_numeric_duplicate_candidate_batch'
 
   $lowercaseSuccessEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
   $lowercaseSuccessBatch = @($lowercaseSuccessEvents | Where-Object {
