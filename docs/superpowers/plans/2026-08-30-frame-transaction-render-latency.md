@@ -582,7 +582,7 @@ schema_version,run_id,implementation,phase,second,monotonic_us,process_cpu_total
 
 For S0, `process_cpu_delta_us` is empty. For S1..S30 it is the current total minus the preceding one-second sample; the analyzer still uses endpoint totals for every five-second CPU equation.
 
-`tools/compare-frame-metrics.ps1` accepts serial/candidate app-event and process-sample CSV paths. For each 30-second phase, enumerate every half-open window `[t,t+5)` for integer `t=0..25`. Use nearest-rank p95 `sorted[(count * 95 + 99) / 100 - 1]`; ties retain the earliest window. Scope/cadence use the greatest window sum. CPU uses `process_cpu_total_us[S(t+5)] - process_cpu_total_us[S(t)]`; working-set maximum uses S0..S30; first median uses S1..S5 and last median uses S26..S30. `-SelfTest` runs deterministic fixtures and exits nonzero on any mismatch.
+`tools/compare-frame-metrics.ps1` accepts serial/candidate app-event and process-sample CSV paths. `VisibleMeasurement` enumerates every half-open window `[t,t+5)` for integer `t=0..25` for batch CPU, mailbox age, scope counts, Presentation, InputToNextPresent, and FrameResponse. Use nearest-rank p95 `sorted[(count * 95 + 99) / 100 - 1]`; ties retain the earliest window. Scope/cadence use the greatest window sum. `MinimizedMeasurement` still requires complete S0..S30 process samples, but static-workload event latency/window fields are N/A; it reports observed Batch/FrameResponse activity counts and totals, and requires zero observed Presentation rows. CPU uses `process_cpu_total_us[S(t+5)] - process_cpu_total_us[S(t)]`; working-set maximum uses S0..S30; first median uses S1..S5 and last median uses S26..S30. `-SelfTest` runs deterministic fixtures and exits nonzero on any mismatch.
 
 Use this exact comparison-script boundary:
 
@@ -597,7 +597,7 @@ param(
 )
 ```
 
-Its output includes the exact Task 7 predicates: every `CandidateBatch` row in a performance run has `batch_result=Success` and scope `{1,1,1}`, aggregate candidate begins=finishes=polls=successful non-empty batches, 8 ms/50-percent batch latency, per-phase CPU, +64 MiB maximum-working-set, +16 MiB median-trend, input-to-next-present, and frame-response from raw `sample_ms` rows. It exits nonzero for a non-success performance batch, false mandatory predicate, incomplete window, missing S0..S30 sample, schema/capacity error, or non-monotonic identity/timestamp.
+Its output includes the exact Task 7 predicates: every `CandidateBatch` row in a performance run has `batch_result=Success` and scope `{1,1,1}`, aggregate candidate begins=finishes=polls=successful non-empty batches, `visible_batch_cpu_8ms_and_no_regression`, `visible_scope_amplification_reduced_50_percent`, the unchanged visible CPU/working-set/input/frame-response gates, minimized CPU/working-set gates, `minimized_presentation_paused`, and identity-bearing Restore Presentations from serial and candidate. It exits nonzero for a non-success performance batch, false mandatory predicate, incomplete applicable visible window, missing S0..S30 sample, schema/capacity error, or non-monotonic identity/timestamp.
 
 - [ ] **Step 9: Run focused GREEN and build the serial release**
 
@@ -1656,140 +1656,58 @@ Expected: all fourteen are demonstrable from exact call paths and recorded tests
 
 ---
 
-### Task 7: Run the fixed live Mac comparison and update tracked status truthfully
+### Task 7: Correct the fixed-capture comparator gates
 
 **Files:**
 
-- Modify: `docs/validation/windows-apple-wgpu-parity.md`
-- Modify: `README.md`
+- Modify: `tools/compare-frame-metrics.ps1`
+- Modify: this plan
 
-**Interfaces:**
+**Inputs and result:**
 
-- Consumes: Task 2 serial event/process CSV files, final release binary, fault-free candidate fixed-schema files, `compare-frame-metrics.ps1` worst-window report, Task 4/5 injected fault-contract test results recorded by Task 6, and observed stock-Mac pixels/input/restore/normal-close behavior.
-- Produces: one dated fixed-phase report with every exact equation, binary/source identities, pass/fail/inconclusive classifications, and accurate README matrix status. Only an overall pass unlocks floating-island implementation.
+- Consume only the retained valid fixed-schema captures `serial_capacity_click_20260831_23` and `candidate_capacity_click_20260831_23`. Each has five phases, complete measured-phase S0..S30 process samples, and zero `StableFault` rows.
+- Produce a JSON comparison only when every mandatory predicate passes. A false predicate, incomplete applicable visible window, invalid schema/identity/order, or missing required process sample fails closed and leaves no output file.
 
-- [ ] **Step 1: Capture exactly one candidate with the same fixed phases**
+- [ ] **Step 1: Keep visible measurements complete and make static minimized measurements explicit N/A**
 
-```powershell
-pwsh -NoProfile -File .\tools\run-frame-metrics.ps1 `
-  -Implementation candidate `
-  -RunId candidate_frame_transaction
-```
+For `VisibleMeasurement`, retain every complete `[t,t+5)` window requirement for Batch CPU, mailbox age, scope begins/finishes/polls, Presentation, InputToNextPresent, and FrameResponse. Preserve earliest-tie worst-window reporting, the visible InputToNextPresent and FrameResponse predicates, and the existing process CPU, maximum working-set, and working-set trend gates.
 
-Expected: the script refuses an existing client and does not redirect general stderr. Use the same saved secure profile, stock Mac mode, release profile, machine, window geometry, and visible workload as serial. The measured candidate process remains fault-free through visible warm-up/measurement, minimized warm-up/measurement, restore verification, and normal disconnect/close; do not inject renderer, GPU, compiler, or fatal faults into it. Artifacts contain exactly 5-second visible warm-up, 30-second visible measurement, 5-second minimized warm-up, 30-second minimized measurement, Restore verification, and S0..S30 process samples in each measured phase.
+For `MinimizedMeasurement`, require the complete S0..S30 process samples and retain its CPU, maximum-working-set, and trend gates. `InputToNextPresent`, Batch CPU, mailbox age, per-window scope sums, Presentation windows, and FrameResponse p95 are JSON `null`/N/A for the static workload: no synthetic zero-latency samples and no favorable-window selection. Report observed Batch and FrameResponse activity counts/totals. Require the observed minimized Presentation count to be exactly zero for serial and candidate; any minimized Presentation is a mandatory paused-compositor failure. Restore is separate and requires an identity-bearing Presentation from both serial and candidate.
 
-- [ ] **Step 2: Generate all 26-window worst-case values and gate booleans**
+- [ ] **Step 2: Apply the approved visible batch-CPU and scope-amplification predicates**
 
-```powershell
-pwsh -NoProfile -File .\tools\compare-frame-metrics.ps1 `
-  -SerialEvents .\target\validation\serial_pre_batch-serial-events.csv `
-  -SerialProcessSamples .\target\validation\serial_pre_batch-serial-process.csv `
-  -CandidateEvents .\target\validation\candidate_frame_transaction-candidate-events.csv `
-  -CandidateProcessSamples .\target\validation\candidate_frame_transaction-candidate-process.csv `
-  -OutputPath .\target\validation\frame-transaction-comparison.json
-```
-
-The script rejects a phase missing S0..S30, any incomplete five-second window for an applicable metric, schema mismatch, row-capacity overflow, identity mismatch, or non-monotonic timestamp. `input-to-next-present` is applicable only in `VisibleMeasurement`: every complete visible five-second window remains mandatory. `MinimizedMeasurement` reports that input statistic and predicate as explicit `null`/N/A because focus-gated remote input is forbidden there. For every applicable metric it reports the worst value and earliest tied `[t,t+5)` window; it never averages windows or chooses a favorable interval.
-
-- [ ] **Step 3: Apply deterministic scope, latency, CPU, and memory equations exactly**
-
-The comparison script emits and the reviewer verifies these exact predicates:
+Every observed `CandidateBatch` remains `Success` with exact `{scope_begins, scope_finishes, scope_polls}={1,1,1}`; whole-run candidate begins=finishes=polls=batch count remains mandatory. Replace the former 50-percent batch-CPU claim with the truthfully named predicate `visible_batch_cpu_8ms_and_no_regression`:
 
 ```text
-every CandidateBatch row has batch_result == Success
-every successful CandidateBatch row has scope_begins == 1
-every successful CandidateBatch row has scope_finishes == 1
-every successful CandidateBatch row has scope_polls == 1
+candidate_visible_batch_cpu_worst_p95_us <= 8000
 
-candidate_scope_begins == candidate_scope_finishes
-candidate_scope_begins == candidate_scope_polls
-candidate_scope_begins == candidate_successful_nonempty_batches
-
-candidate_visible_batch_commit_worst_p95_us <= 8000
-candidate_visible_batch_commit_worst_p95_us * 2
-    <= serial_visible_batch_commit_worst_p95_us
-
-candidate_visible_cpu_worst_window_us
-    <= max(ceil(serial_visible_cpu_worst_window_us * 110 / 100),
-           serial_visible_cpu_worst_window_us + 500000)
-candidate_minimized_cpu_worst_window_us
-    <= max(ceil(serial_minimized_cpu_worst_window_us * 110 / 100),
-           serial_minimized_cpu_worst_window_us + 500000)
-
-candidate_visible_max_working_set_bytes
-    <= serial_visible_max_working_set_bytes + 67108864
-candidate_minimized_max_working_set_bytes
-    <= serial_minimized_max_working_set_bytes + 67108864
-
-candidate_visible_last5_median_working_set_bytes
-    <= candidate_visible_first5_median_working_set_bytes + 16777216
-candidate_minimized_last5_median_working_set_bytes
-    <= candidate_minimized_first5_median_working_set_bytes + 16777216
+candidate_visible_batch_cpu_worst_p95_us
+    <= max(ceil(serial_visible_batch_cpu_worst_p95_us * 110 / 100),
+           serial_visible_batch_cpu_worst_p95_us + 500)
 ```
 
-Apply the three per-row predicates and aggregate equalities to the whole candidate run and independently to every complete five-second window. Because the fixed candidate run is fault-free, every non-empty candidate batch must be successful; a missing scope value, failed batch, or aggregate mismatch invalidates the performance run. Task 4/5 injected error tests separately prove every begun failure scope finishes/polls and are not mixed into these CSVs. Any false predicate is `failed`; missing or environmentally incomparable evidence is `inconclusive`, never passed.
-
-- [ ] **Step 4: Classify input timing without claiming visual causality**
-
-For exact same-identity controlled probes during `VisibleMeasurement`, verify:
+Add the mandatory, truthfully named `visible_scope_amplification_reduced_50_percent` predicate. Both visible source-update totals must be nonzero and the comparison must use exact decimal/cross-multiplied arithmetic:
 
 ```text
-candidate_input_to_next_present_worst_p95_us * 2
-    <= serial_input_to_next_present_worst_p95_us
+candidate_visible_scope_polls_total / candidate_visible_source_updates_total
+    <= 0.5 *
+       (serial_visible_scope_polls_total / serial_visible_source_updates_total)
 ```
 
-`MinimizedMeasurement` input-to-next-present is explicitly N/A: minimized capture drives `Focused(false)`, and the product rule forbids remote input without application/remote-surface focus. Its input statistic and predicate are JSON `null` and are excluded from mandatory predicate collection; CPU, working-set, frame-response, presentation, batch, scope, restore, and fault-free gates remain mandatory. For each phase verify:
+- [ ] **Step 3: Test and compare the retained captures**
 
-```text
-candidate_frame_response_worst_p95_ms
-    <= serial_frame_response_worst_p95_ms
-```
+Before behavior changes, extend `Invoke-SelfTest` with real fixtures proving that idle minimized events remain statistically valid and N/A, a minimized Presentation is rejected, and the two approved visible predicates have their boundary behavior. Run `./tools/compare-frame-metrics.ps1 -SelfTest` RED, then make the minimal change and rerun it GREEN.
 
-Both frame-response operands are computed only from `frame_response_ms = FrameResponseTiming::sample_ms`; never substitute the UI-only `smoothed_ms`. The normal input metric is named only `input-to-next-present`. Run one isolated action with an externally visible effect for an optional causality trial. Label `input-to-visible` only if a human/capture verifies the correlated changed pixels in the next receipt; that visible-causality trial has exactly `passed` or `inconclusive`, never an inferred success or numeric proxy. If the required visible input-to-next-present comparison is inconclusive, the overall gate remains inconclusive and does not unlock floating-island work.
+Run the comparator against the two retained CSV pairs with a new `target/validation` output path. Inspect that JSON to confirm all named mandatory predicates are true, visible metrics retain their worst complete windows, minimized latency/window fields are `null`, minimized Presentation counts are zero, and both Restore receipts carry identity. Do not alter retained CSV files, connect to the Mac, or infer live interoperability beyond those bounded captures.
 
-- [ ] **Step 5: Verify fault-free restore/FIFO behavior and the separate injected fault contract**
-
-During the fault-free measured run confirm, without relying on metrics alone:
-
-- correct colors and complete pixels with no black/stale rectangles;
-- continuous type-0/type-1 updates and FIFO visible changes;
-- pointer, keyboard, wheel, focus loss, and re-entry remain correct;
-- no input before a presented full baseline;
-- generation/geometry transitions remain atomic;
-- restore after minimized measurement shows the latest correct presentable frame;
-- only one client process exists and normal disconnect/close leaves none.
-
-Do not inject a fault before the measured process closes normally. Separately cite the successful Task 4/5 test results `execution_error_still_finishes_and_returns_execution_primary`, `gpu_fault_wins_when_execution_and_finish_both_fail`, `fatal_wake_has_zero_redraw_record_submit_present_and_receipt`, and `fatal_redraw_requested_has_zero_record_submit_present_and_receipt`. Those deterministic injected tests are the fault no-present artifact: they prove actual seam finish/poll and zero remote record, queue submit, surface present, and `FramePresented`, but contribute no row or timing sample to the serial/candidate performance comparison.
-
-Expected: no regression. Any semantic failure blocks acceptance even if timing improves.
-
-- [ ] **Step 6: Record the exact evidence in the validation document**
-
-Append a dated “Frame transaction latency gate” section to `docs/validation/windows-apple-wgpu-parity.md`. Record serial/candidate commits and binary SHA-256, schema/run ids, the fact that both measured processes were fault-free through restore/normal close, phase boundaries, every earliest worst window, per-row and aggregate actual scope counts, batch/input/frame-response p95, both CPU equations, both maximum-working-set equations, both memory-trend equations, restore parity, and every Task 6 command/result. Record the required visible-only input-to-next-present classification and the minimized explicit N/A/focus-gated exclusion, plus optional visible-causality, separately. Record the four named injected fault tests and their exit results in a separate “fault contract (excluded from performance runs)” subsection.
-
-If any mandatory item fails, record `failed`; if required comparable evidence is unavailable, record overall `inconclusive`. Both stop this plan and block floating-control work. Neither authorizes frame dropping.
-
-- [ ] **Step 7: Update README without overstating the mode or platform**
-
-In the Windows-client/macOS-server “完整桌面画面” and “增量桌面更新” rows, replace the stale latency wording with the actual dated result and link the validation section. Keep protocol implementation, build, and live interoperability as separate claims. Do not change RDP, Linux, macOS-client, Android, HarmonyOS NEXT, dynamic-resolution, audio, or Apple dual-mode status in this commit.
-
-- [ ] **Step 8: Run documentation and diff checks**
+- [ ] **Step 4: Check and commit only the correction**
 
 ```powershell
 git diff --check
-git diff -- README.md docs/validation/windows-apple-wgpu-parity.md
 git status --short
-```
-
-Expected: only the two tracked evidence files are modified; no log, credential, address, capture, or `target` artifact is present.
-
-- [ ] **Step 9: Commit the measured validation result**
-
-```powershell
-git add -- README.md docs/validation/windows-apple-wgpu-parity.md
+git add -- tools/compare-frame-metrics.ps1 docs/superpowers/plans/2026-08-30-frame-transaction-render-latency.md
 git diff --cached --check
-git diff --cached
-git commit -m "docs: record frame transaction latency gate"
+git commit -m "fix: correct frame metrics gate"
 ```
 
-Expected: the commit states the measured pass/inconclusive/fail result. Floating-control work may start only if all mandatory gates are recorded as passed.
+Expected: only the comparator and this plan are tracked changes. The generated comparison JSON and the Task 7 implementation report remain untracked/ignored. Do not merge or push.

@@ -83,6 +83,24 @@ function Get-PhaseSamples($Rows, [string]$Phase) {
   return $phaseRows
 }
 
+function Get-FieldTotal($Rows, [string]$Field, [string]$Code) {
+  if ($Rows.Count -eq 0) { return [UInt64]0 }
+  return [UInt64](($Rows | ForEach-Object { Convert-U64 $_.$Field $Code } | Measure-Object -Sum).Sum)
+}
+
+function Get-BatchAndFrameActivity($BatchRows, $FrameResponseRows) {
+  return [ordered]@{
+    batch_activity_count = [UInt64]$BatchRows.Count
+    batch_source_updates_total = Get-FieldTotal $BatchRows 'source_updates' 'invalid_source_updates'
+    batch_cpu_total_us = Get-FieldTotal $BatchRows 'batch_cpu_us' 'invalid_batch_cpu_us'
+    batch_scope_begins_total = Get-FieldTotal $BatchRows 'scope_begins' 'invalid_scope_begins'
+    batch_scope_finishes_total = Get-FieldTotal $BatchRows 'scope_finishes' 'invalid_scope_finishes'
+    batch_scope_polls_total = Get-FieldTotal $BatchRows 'scope_polls' 'invalid_scope_polls'
+    frame_response_activity_count = [UInt64]$FrameResponseRows.Count
+    frame_response_total_ms = Get-FieldTotal $FrameResponseRows 'frame_response_ms' 'invalid_frame_response_ms'
+  }
+}
+
 function Get-ProcessStatistics($Rows, [string]$Phase) {
   $samples = Get-PhaseSamples $Rows $Phase
   $worstCpu = $null
@@ -243,28 +261,75 @@ function Get-RunStatistics($Events, $ProcessRows, [string]$Implementation) {
     $process = Get-ProcessStatistics $ProcessRows $phase
     $phaseEvents = @($Events | Where-Object { $_.phase -eq $phase })
     $phaseBatches = @($phaseEvents | Where-Object { $_.event -eq $batchEvent })
-    Assert-True ($phaseBatches.Count -gt 0) "missing_${phase}_batches"
+    $presentations = @($phaseEvents | Where-Object { $_.event -eq 'Presentation' })
+    $frameResponses = @($phaseEvents | Where-Object { $_.event -eq 'FrameResponse' })
+    $visible = $phase -eq 'VisibleMeasurement'
+    if ($visible) {
+      Assert-True ($phaseBatches.Count -gt 0) "missing_${phase}_batches"
+    }
+    $activity = Get-BatchAndFrameActivity $phaseBatches $frameResponses
     $result[$phase] = [ordered]@{
-      batch_cpu_p95 = Get-WorstEventWindow $phaseBatches 'batch_cpu_us' $process.origin_us 'p95'
-      mailbox_age_p95 = Get-WorstEventWindow $phaseBatches 'mailbox_age_us' $process.origin_us 'p95'
-      scope_begins_sum = Get-WorstEventWindow $phaseBatches 'scope_begins' $process.origin_us 'sum'
-      scope_finishes_sum = Get-WorstEventWindow $phaseBatches 'scope_finishes' $process.origin_us 'sum'
-      scope_polls_sum = Get-WorstEventWindow $phaseBatches 'scope_polls' $process.origin_us 'sum'
-      presentation_sum = Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'Presentation' }) '' $process.origin_us 'count'
-      input_to_next_present_p95 = if ($phase -eq 'VisibleMeasurement') {
+      batch_cpu_p95 = if ($visible) { Get-WorstEventWindow $phaseBatches 'batch_cpu_us' $process.origin_us 'p95' } else { $null }
+      mailbox_age_p95 = if ($visible) { Get-WorstEventWindow $phaseBatches 'mailbox_age_us' $process.origin_us 'p95' } else { $null }
+      scope_begins_sum = if ($visible) { Get-WorstEventWindow $phaseBatches 'scope_begins' $process.origin_us 'sum' } else { $null }
+      scope_finishes_sum = if ($visible) { Get-WorstEventWindow $phaseBatches 'scope_finishes' $process.origin_us 'sum' } else { $null }
+      scope_polls_sum = if ($visible) { Get-WorstEventWindow $phaseBatches 'scope_polls' $process.origin_us 'sum' } else { $null }
+      presentation_sum = if ($visible) { Get-WorstEventWindow $presentations '' $process.origin_us 'count' } else { $null }
+      presentation_activity_count = [UInt64]$presentations.Count
+      input_to_next_present_p95 = if ($visible) {
         Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'InputToNextPresent' }) 'input_to_next_present_us' $process.origin_us 'p95'
       } else {
         $null
       }
-      frame_response_p95 = Get-WorstEventWindow @($phaseEvents | Where-Object { $_.event -eq 'FrameResponse' }) 'frame_response_ms' $process.origin_us 'p95'
+      frame_response_p95 = if ($visible) { Get-WorstEventWindow $frameResponses 'frame_response_ms' $process.origin_us 'p95' } else { $null }
+      batch_activity_count = $activity.batch_activity_count
+      batch_source_updates_total = $activity.batch_source_updates_total
+      batch_cpu_total_us = $activity.batch_cpu_total_us
+      batch_scope_begins_total = $activity.batch_scope_begins_total
+      batch_scope_finishes_total = $activity.batch_scope_finishes_total
+      batch_scope_polls_total = $activity.batch_scope_polls_total
+      frame_response_activity_count = $activity.frame_response_activity_count
+      frame_response_total_ms = $activity.frame_response_total_ms
       process = $process
     }
   }
   $result['batch_count'] = $batchRows.Count
-  $result['scope_begins_total'] = [UInt64](($batchRows | ForEach-Object { Convert-U64 $_.scope_begins 'invalid_scope_begins' } | Measure-Object -Sum).Sum)
-  $result['scope_finishes_total'] = [UInt64](($batchRows | ForEach-Object { Convert-U64 $_.scope_finishes 'invalid_scope_finishes' } | Measure-Object -Sum).Sum)
-  $result['scope_polls_total'] = [UInt64](($batchRows | ForEach-Object { Convert-U64 $_.scope_polls 'invalid_scope_polls' } | Measure-Object -Sum).Sum)
+  $result['source_updates_total'] = Get-FieldTotal $batchRows 'source_updates' 'invalid_source_updates'
+  $result['scope_begins_total'] = Get-FieldTotal $batchRows 'scope_begins' 'invalid_scope_begins'
+  $result['scope_finishes_total'] = Get-FieldTotal $batchRows 'scope_finishes' 'invalid_scope_finishes'
+  $result['scope_polls_total'] = Get-FieldTotal $batchRows 'scope_polls' 'invalid_scope_polls'
   return $result
+}
+
+function Get-VisibleBatchCpu8msAndNoRegression([UInt64]$SerialWorstP95Us, [UInt64]$CandidateWorstP95Us) {
+  $noRegressionLimit = [Math]::Max(
+    [Math]::Ceiling(([decimal]$SerialWorstP95Us * 110) / 100),
+    [decimal]$SerialWorstP95Us + 500)
+  return [bool]((([decimal]$CandidateWorstP95Us -le 8000) -and
+    ([decimal]$CandidateWorstP95Us -le $noRegressionLimit)))
+}
+
+function Get-VisibleScopeAmplificationReduced50Percent($SerialVisible, $CandidateVisible) {
+  [UInt64]$serialSourceUpdates = $SerialVisible.batch_source_updates_total
+  [UInt64]$candidateSourceUpdates = $CandidateVisible.batch_source_updates_total
+  Assert-True ($serialSourceUpdates -gt 0) 'missing_visible_serial_source_updates'
+  Assert-True ($candidateSourceUpdates -gt 0) 'missing_visible_candidate_source_updates'
+  return [bool]((([decimal]$CandidateVisible.batch_scope_polls_total * 2 * [decimal]$serialSourceUpdates) -le
+    ([decimal]$SerialVisible.batch_scope_polls_total * [decimal]$candidateSourceUpdates)))
+}
+
+function Get-MinimizedPresentationPaused($Serial, $Candidate) {
+  return [bool](($Serial.MinimizedMeasurement.presentation_activity_count -eq 0) -and
+    ($Candidate.MinimizedMeasurement.presentation_activity_count -eq 0))
+}
+
+function Test-IdentityBearingRestorePresentation($Rows) {
+  return [bool](@($Rows | Where-Object {
+    $_.phase -eq 'Restore' -and $_.event -eq 'Presentation' -and
+    -not [string]::IsNullOrEmpty($_.session_id) -and
+    -not [string]::IsNullOrEmpty($_.generation) -and
+    -not [string]::IsNullOrEmpty($_.revision)
+  }).Count -gt 0)
 }
 
 function Get-PhaseGates($Serial, $Candidate) {
@@ -275,6 +340,7 @@ function Get-PhaseGates($Serial, $Candidate) {
     $cpuLimit = [Math]::Max([decimal]$serialPhase.process.cpu_worst_window_delta_us * 1.10,
       [decimal]$serialPhase.process.cpu_worst_window_delta_us + 500000)
     $inputApplicable = $phase -eq 'VisibleMeasurement'
+    $frameResponseApplicable = $phase -eq 'VisibleMeasurement'
     $phaseGates[$phase] = [ordered]@{
       cpu = ([decimal]$candidatePhase.process.cpu_worst_window_delta_us -le $cpuLimit)
       working_set_max = ([decimal]$candidatePhase.process.working_set_max_bytes -le
@@ -288,8 +354,13 @@ function Get-PhaseGates($Serial, $Candidate) {
       } else {
         $null
       }
-      frame_response = ([decimal]$candidatePhase.frame_response_p95.value -le
-        [decimal]$serialPhase.frame_response_p95.value)
+      frame_response_applicable = $frameResponseApplicable
+      frame_response = if ($frameResponseApplicable) {
+        ([decimal]$candidatePhase.frame_response_p95.value -le
+          [decimal]$serialPhase.frame_response_p95.value)
+      } else {
+        $null
+      }
     }
   }
   return $phaseGates
@@ -303,7 +374,9 @@ function Get-MandatoryPhasePredicates($PhaseGates) {
     if ($gate.input_to_next_present_applicable) {
       $mandatory += @($gate.input_to_next_present)
     }
-    $mandatory += @($gate.frame_response)
+    if ($gate.frame_response_applicable) {
+      $mandatory += @($gate.frame_response)
+    }
   }
   return $mandatory
 }
@@ -346,17 +419,21 @@ function New-SelfTestProcessRows([string]$RunId, [string]$Implementation) {
 function New-SelfTestMetricEventRows(
   [string]$Implementation,
   [UInt64]$VisibleInputValue,
-  [bool]$IncludeVisibleInput
+  [bool]$IncludeVisibleInput,
+  [bool]$IncludeMinimizedActivity = $true
 ) {
   $rows = @()
   foreach ($phase in $MeasuredPhases) {
+    if ($phase -eq 'MinimizedMeasurement' -and -not $IncludeMinimizedActivity) {
+      continue
+    }
     [UInt64]$phaseOrigin = if ($phase -eq 'VisibleMeasurement') { 0 } else { 40000000 }
     foreach ($second in 0, 5, 10, 15, 20, 25) {
       $timestamp = [string]($phaseOrigin + [UInt64]($second * 1000000))
       $rows += [pscustomobject]@{
         phase = $phase; event = if ($Implementation -eq 'serial') { 'SerialDrain' } else { 'CandidateBatch' }
         monotonic_us = $timestamp; batch_result = 'Success'; batch_cpu_us = '1'; mailbox_age_us = '1'
-        scope_begins = '1'; scope_finishes = '1'; scope_polls = '1'
+        source_updates = '1'; scope_begins = '1'; scope_finishes = '1'; scope_polls = '1'
         session_id = ''; generation = ''; revision = ''
       }
       $rows += [pscustomobject]@{
@@ -449,10 +526,62 @@ function Invoke-SelfTest {
   Assert-True (-not $phaseGates.MinimizedMeasurement.input_to_next_present_applicable -and
     $null -eq $phaseGates.MinimizedMeasurement.input_to_next_present) 'selftest_minimized_input_predicate_not_applicable'
   $phaseMandatory = Get-MandatoryPhasePredicates $phaseGates
-  Assert-True ($phaseMandatory.Count -eq 9 -and @($phaseMandatory | Where-Object { -not $_ }).Count -eq 0) 'selftest_mandatory_excludes_minimized_input'
+  Assert-True ($phaseMandatory.Count -eq 8 -and @($phaseMandatory | Where-Object { -not $_ }).Count -eq 0) 'selftest_mandatory_excludes_minimized_input'
   $phaseGates.VisibleMeasurement.input_to_next_present = $false
   $phaseMandatory = Get-MandatoryPhasePredicates $phaseGates
-  Assert-True ($phaseMandatory.Count -eq 9 -and @($phaseMandatory | Where-Object { -not $_ }).Count -eq 1) 'selftest_mandatory_includes_visible_input'
+  Assert-True ($phaseMandatory.Count -eq 8 -and @($phaseMandatory | Where-Object { -not $_ }).Count -eq 1) 'selftest_mandatory_includes_visible_input'
+
+  # Task 7: static minimized windows are valid measurements, but any actual
+  # presentation remains forbidden until Restore.
+  $task7Failures = @()
+  $idleSerialEvents = New-SelfTestMetricEventRows 'serial' 40 $true $false
+  $idleCandidateEvents = New-SelfTestMetricEventRows 'candidate' 20 $true $false
+  try {
+    $idleSerialStatistics = Get-RunStatistics $idleSerialEvents $metricProcessRows 'serial'
+    $idleCandidateStatistics = Get-RunStatistics $idleCandidateEvents $metricProcessRows 'candidate'
+    $idleMinimized = $idleCandidateStatistics.MinimizedMeasurement
+    if ($null -ne $idleMinimized.batch_cpu_p95 -or
+        $null -ne $idleMinimized.mailbox_age_p95 -or
+        $null -ne $idleMinimized.scope_begins_sum -or
+        $null -ne $idleMinimized.scope_finishes_sum -or
+        $null -ne $idleMinimized.scope_polls_sum -or
+        $null -ne $idleMinimized.frame_response_p95 -or
+        $idleMinimized.batch_activity_count -ne 0 -or
+        $idleMinimized.frame_response_activity_count -ne 0) {
+      $task7Failures += 'idle_minimized_statistics'
+    }
+  } catch {
+    $task7Failures += 'idle_minimized_statistics'
+  }
+  try {
+    $presentingCandidateEvents = @($idleCandidateEvents)
+    $presentingCandidateEvents += [pscustomobject]@{
+      phase = 'MinimizedMeasurement'; event = 'Presentation'; monotonic_us = '40000000'
+      session_id = ''; generation = ''; revision = ''
+    }
+    $presentingCandidateStatistics = Get-RunStatistics $presentingCandidateEvents $metricProcessRows 'candidate'
+    if (Get-MinimizedPresentationPaused $idleSerialStatistics $presentingCandidateStatistics) {
+      $task7Failures += 'minimized_presentation_rejection'
+    }
+  } catch {
+    $task7Failures += 'minimized_presentation_rejection'
+  }
+  try {
+    $scopeSerial = [pscustomobject]@{ batch_scope_polls_total = [UInt64]100; batch_source_updates_total = [UInt64]100 }
+    $scopeCandidateReduced = [pscustomobject]@{ batch_scope_polls_total = [UInt64]50; batch_source_updates_total = [UInt64]100 }
+    $scopeCandidateUnreduced = [pscustomobject]@{ batch_scope_polls_total = [UInt64]51; batch_source_updates_total = [UInt64]100 }
+    $scopeReduced = Get-VisibleScopeAmplificationReduced50Percent $scopeSerial $scopeCandidateReduced
+    $scopeUnreduced = Get-VisibleScopeAmplificationReduced50Percent $scopeSerial $scopeCandidateUnreduced
+    if ((Get-VisibleBatchCpu8msAndNoRegression 1000 1500) -ne $true -or
+        (Get-VisibleBatchCpu8msAndNoRegression 1000 1501) -ne $false -or
+        (Get-VisibleBatchCpu8msAndNoRegression 10000 8001) -ne $false -or
+        $scopeReduced -ne $true -or $scopeUnreduced -ne $false) {
+      $task7Failures += 'visible_bounded_predicates'
+    }
+  } catch {
+    $task7Failures += 'visible_bounded_predicates'
+  }
+  Assert-True ($task7Failures.Count -eq 0) ("selftest_task7_approved_behavior_absent_{0}" -f ($task7Failures -join '_'))
 
   Assert-FailsWith {
     Assert-RunRows (New-SelfTestEventRows 'serial-a' 'serial') (New-SelfTestProcessRows 'serial-b' 'serial') 'serial' 'serial'
@@ -528,15 +657,13 @@ $scopeTotalsExact = $candidate.scope_begins_total -eq $candidate.batch_count -an
 
 $visibleSerial = $serial.VisibleMeasurement
 $visibleCandidate = $candidate.VisibleMeasurement
-$latencyGate = $visibleCandidate.batch_cpu_p95.value -le 8000 -and
-  ([decimal]$visibleCandidate.batch_cpu_p95.value * 2) -le [decimal]$visibleSerial.batch_cpu_p95.value
+$visibleBatchCpuGate = Get-VisibleBatchCpu8msAndNoRegression $visibleSerial.batch_cpu_p95.value $visibleCandidate.batch_cpu_p95.value
+$visibleScopeAmplificationGate = Get-VisibleScopeAmplificationReduced50Percent $visibleSerial $visibleCandidate
+$minimizedPresentationPaused = Get-MinimizedPresentationPaused $serial $candidate
 $phaseGates = Get-PhaseGates $serial $candidate
-$restoreReceipt = @($candidateEventRows | Where-Object {
-  $_.phase -eq 'Restore' -and $_.event -eq 'Presentation' -and
-  -not [string]::IsNullOrEmpty($_.session_id) -and
-  -not [string]::IsNullOrEmpty($_.generation) -and
-  -not [string]::IsNullOrEmpty($_.revision)
-}).Count -gt 0
+$serialRestoreReceipt = Test-IdentityBearingRestorePresentation $serialEventRows
+$candidateRestoreReceipt = Test-IdentityBearingRestorePresentation $candidateEventRows
+$restoreReceiptPresent = $serialRestoreReceipt -and $candidateRestoreReceipt
 
 $report = [ordered]@{
   schema_version = 1
@@ -545,15 +672,18 @@ $report = [ordered]@{
   predicates = [ordered]@{
     candidate_batches_success_scope_exact = $scopeRowsExact
     candidate_scope_totals_equal_batch_count = $scopeTotalsExact
-    visible_batch_latency_8ms_and_50_percent = $latencyGate
+    visible_batch_cpu_8ms_and_no_regression = $visibleBatchCpuGate
+    visible_scope_amplification_reduced_50_percent = $visibleScopeAmplificationGate
+    minimized_presentation_paused = $minimizedPresentationPaused
     phase = $phaseGates
-    restore_receipt_present = $restoreReceipt
+    restore_identity_bearing_presentation_present = $restoreReceiptPresent
     restore_exact_color_and_working_input_requires_manual_evidence = $true
     fatal_no_present_requires_deterministic_fault_evidence = $true
   }
 }
 
-$mandatory = @($scopeRowsExact, $scopeTotalsExact, $latencyGate, $restoreReceipt) +
+$mandatory = @($scopeRowsExact, $scopeTotalsExact, $visibleBatchCpuGate,
+  $visibleScopeAmplificationGate, $minimizedPresentationPaused, $restoreReceiptPresent) +
   @(Get-MandatoryPhasePredicates $phaseGates)
 Assert-True (@($mandatory | Where-Object { -not $_ }).Count -eq 0) 'mandatory_performance_predicate_failed'
 
