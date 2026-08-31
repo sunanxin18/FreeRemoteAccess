@@ -49,6 +49,7 @@ struct DynamicResolutionRuntime {
 struct DynamicCapabilityEvidence {
     controlling_role: bool,
     matching_initial_server_state: bool,
+    single_display_configuration: bool,
     current_full_media_applied: bool,
     non_paused_media_activity: bool,
 }
@@ -123,6 +124,7 @@ impl DynamicResolutionRuntime {
         if self.armed
             || !self.evidence.controlling_role
             || !self.evidence.matching_initial_server_state
+            || !self.evidence.single_display_configuration
             || !self.evidence.current_full_media_applied
             || !self.evidence.non_paused_media_activity
         {
@@ -144,11 +146,15 @@ impl DynamicResolutionRuntime {
 
     fn observe_initial_server_state(
         &mut self,
-        observed: DisplaySize,
+        geometry: hpss::ServerStateGeometry,
         current_surface: DisplaySize,
     ) -> bool {
+        let Some(observed) = DisplaySize::new(geometry.width, geometry.height) else {
+            return false;
+        };
         if !self.armed && current_surface == self.initial_size && observed == current_surface {
             self.evidence.matching_initial_server_state = true;
+            self.evidence.single_display_configuration = geometry.display_count == 1;
         }
         self.maybe_arm()
     }
@@ -2307,7 +2313,7 @@ impl NetworkReaderRuntime {
             || write(&full),
             completed_at,
         )?;
-        prepared_dynamic.observe_initial_server_state(size, size);
+        prepared_dynamic.observe_initial_server_state(geometry, size);
         let admission = match admission_source {
             InitialGenerationAdmission::Existing => self
                 .initial_admission
@@ -2486,7 +2492,7 @@ impl NetworkReaderRuntime {
                                 surface.framebuffer.height as u16,
                             )
                             .expect("DisplaySurface dimensions are non-zero u16 values");
-                            dynamic.observe_initial_server_state(observed, current);
+                            dynamic.observe_initial_server_state(geometry, current);
                             commit_server_geometry(
                                 &mut dynamic,
                                 &mut self.receiver,
@@ -2729,6 +2735,15 @@ mod migrated_runtime_tests {
         server_state[26..28].copy_from_slice(&size.height.to_be_bytes());
         server_state[36..38].copy_from_slice(&1u16.to_be_bytes());
         server_state
+    }
+
+    fn server_state_geometry(size: DisplaySize, display_count: u16) -> hpss::ServerStateGeometry {
+        hpss::ServerStateGeometry {
+            message_version: 5,
+            display_count,
+            width: size.width,
+            height: size.height,
+        }
     }
 
     fn mvs_message(rect: MvsRect, total: u32, body: &[u8]) -> Vec<u8> {
@@ -3327,6 +3342,49 @@ mod migrated_runtime_tests {
     }
 
     #[test]
+    fn two_display_high_performance_confirmation_does_not_arm_dynamic_resolution() {
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let confirmed = DisplaySize::new(16, 24).unwrap();
+        let geometry = hpss::ServerStateGeometry {
+            message_version: 5,
+            display_count: 2,
+            width: confirmed.width,
+            height: confirmed.height,
+        };
+        let target = DisplaySize::new(24, 32).unwrap();
+        let (mut protocol_runtime, _) = traced_protocol_runtime(session_id);
+        let mut reader =
+            NetworkReaderRuntime::new(session_id, confirmed, true, requested_at, requested_at)
+                .unwrap();
+
+        let outcome = reader
+            .confirm_high_performance_at_with(
+                geometry,
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| Ok(()),
+                Instant::now,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            NetworkFrameOutcome::HighPerformanceConfirmed { size } if size == confirmed
+        ));
+        assert!(reader.is_high_performance_confirmed());
+        assert!(reader.publisher.is_active());
+        let mut dynamic = reader.dynamic_resolution.lock().unwrap();
+        assert!(!dynamic.observe_full_applied(1, confirmed));
+        assert_eq!(dynamic.target_disposition(target), TargetDisposition::Wait);
+        assert!(dynamic
+            .send_target_with(target, |_| panic!("多显示器配置不得发送动态分辨率请求"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn high_performance_confirmation_rejects_actual_port_capacity_before_write_or_state_replacement(
     ) {
         use std::io::Read as _;
@@ -3826,11 +3884,12 @@ mod migrated_runtime_tests {
         receiver.commit(prepared).unwrap();
     }
     fn arm_runtime(runtime: &mut DynamicResolutionRuntime, initial: DisplaySize, full_first: bool) {
+        let geometry = server_state_geometry(initial, 1);
         if full_first {
             assert!(!runtime.observe_full_applied(1, initial));
-            assert!(runtime.observe_initial_server_state(initial, initial));
+            assert!(runtime.observe_initial_server_state(geometry, initial));
         } else {
-            assert!(!runtime.observe_initial_server_state(initial, initial));
+            assert!(!runtime.observe_initial_server_state(geometry, initial));
             assert!(runtime.observe_full_applied(1, initial));
         }
     }
@@ -4018,7 +4077,8 @@ mod migrated_runtime_tests {
         let mismatch = DisplaySize::new(1024, 768).unwrap();
 
         let mut mismatch_runtime = DynamicResolutionRuntime::new(initial, true);
-        assert!(!mismatch_runtime.observe_initial_server_state(mismatch, initial));
+        assert!(!mismatch_runtime
+            .observe_initial_server_state(server_state_geometry(mismatch, 1), initial));
         assert!(!mismatch_runtime.observe_full_applied(1, initial));
         assert!(mismatch_runtime
             .send_target_with(target, |_| Ok(Instant::now()))
@@ -4026,7 +4086,7 @@ mod migrated_runtime_tests {
             .is_none());
 
         let mut disabled = DynamicResolutionRuntime::new(initial, false);
-        assert!(!disabled.observe_initial_server_state(initial, initial));
+        assert!(!disabled.observe_initial_server_state(server_state_geometry(initial, 1), initial));
         assert!(!disabled.observe_full_applied(1, initial));
         assert!(disabled
             .send_target_with(target, |_| Ok(Instant::now()))
@@ -5737,7 +5797,7 @@ mod migrated_runtime_tests {
         assert!(!dynamic
             .lock()
             .unwrap()
-            .observe_initial_server_state(initial, initial));
+            .observe_initial_server_state(server_state_geometry(initial, 1), initial));
         let mut receiver = MvsReceiveState::new(1);
         receiver.install_tables(&type_two_tables_fixture()).unwrap();
         let record = native_record(MvsRect {
