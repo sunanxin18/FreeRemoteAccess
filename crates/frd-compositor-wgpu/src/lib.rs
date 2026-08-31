@@ -52,11 +52,13 @@ fn require_context_match(matches: bool) -> Result<(), PresentError> {
 }
 
 trait FrameScopeBackend {
-    type Scope;
+    type Scope<'a>
+    where
+        Self: 'a;
     type CleanToken;
 
-    fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
-    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+    fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass>;
+    fn finish<'a>(&'a self, scope: Self::Scope<'a>) -> Result<Self::CleanToken, GpuFaultClass>;
 }
 
 trait RecordedFrameFlow<T> {
@@ -82,14 +84,17 @@ impl<'a> GpuContextFrameScopeBackend<'a> {
 }
 
 impl FrameScopeBackend for GpuContextFrameScopeBackend<'_> {
-    type Scope = frd_render_wgpu::GpuFaultScope;
+    type Scope<'a>
+        = frd_render_wgpu::GpuFaultScope<'a>
+    where
+        Self: 'a;
     type CleanToken = GpuCleanToken;
 
-    fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+    fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass> {
         self.context.begin_fault_scope()
     }
 
-    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+    fn finish<'a>(&'a self, scope: Self::Scope<'a>) -> Result<Self::CleanToken, GpuFaultClass> {
         scope.finish()
     }
 }
@@ -298,9 +303,13 @@ impl PresentationCompositor {
                         configuration.width = size.width;
                         configuration.height = size.height;
                         let token = self.configure_existing_with(&configuration)?;
-                        let context = self.context.clone();
+                        let Self {
+                            context,
+                            configuration: installed,
+                            ..
+                        } = self;
                         context.commit_if_unchanged(token, || {
-                            self.configuration = Some(configuration);
+                            *installed = Some(configuration);
                         })?;
                     } else {
                         self.configure_surface()?;
@@ -501,9 +510,13 @@ impl PresentationCompositor {
             .ok_or(PresentError::SurfaceDetached)?;
         let configuration = surface_configuration(surface, &self.context, size)?;
         let token = configure_surface_with(surface, &self.context, &configuration)?;
-        let context = self.context.clone();
+        let Self {
+            context,
+            configuration: installed,
+            ..
+        } = self;
         context.commit_if_unchanged(token, || {
-            self.configuration = Some(configuration);
+            *installed = Some(configuration);
         })?;
         Ok(())
     }
@@ -688,17 +701,23 @@ mod scope_tests {
     }
 
     impl FrameScopeBackend for RecordingFrameScopeBackend {
-        type Scope = ();
+        type Scope<'a>
+            = ()
+        where
+            Self: 'a;
         type CleanToken = ();
 
-        fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+        fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass> {
             self.events
                 .borrow_mut()
                 .push(LifecycleEvent::Begin(self.name));
             Ok(())
         }
 
-        fn finish(&self, _scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+        fn finish<'a>(
+            &'a self,
+            _scope: Self::Scope<'a>,
+        ) -> Result<Self::CleanToken, GpuFaultClass> {
             let mut events = self.events.borrow_mut();
             events.push(LifecycleEvent::Finish(self.name));
             events.push(LifecycleEvent::Poll(self.name));

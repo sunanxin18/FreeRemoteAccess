@@ -108,11 +108,20 @@ impl GpuContext {
         &self.queue
     }
 
-    pub fn begin_fault_scope(&self) -> Result<GpuFaultScope, GpuFaultClass> {
+    /// GPU 错误作用域借用创建它的上下文，不能把设备所有权延长到上下文之外。
+    ///
+    /// ```compile_fail
+    /// fn scope_cannot_outlive_context(context: frd_render_wgpu::GpuContext) {
+    ///     let scope = context.begin_fault_scope().unwrap();
+    ///     drop(context);
+    ///     scope.finish().unwrap();
+    /// }
+    /// ```
+    pub fn begin_fault_scope(&self) -> Result<GpuFaultScope<'_>, GpuFaultClass> {
         GpuFaultScope::new(
-            self.device.clone(),
-            self.observer.clone(),
-            self.scope_observer.clone(),
+            &self.device,
+            self.observer.as_ref(),
+            self.scope_observer.as_ref(),
             self.context_id,
         )
     }
@@ -253,37 +262,45 @@ mod fault_observer_tests {
 
 #[cfg(all(test, target_os = "windows"))]
 mod dx12_scope_smoke_tests {
+    use std::sync::Arc;
+
     use super::{GpuContext, GpuScopeObservation};
+
+    async fn dx12_context(label: &'static str) -> Option<GpuContext> {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::DX12;
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter = match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                println!("SKIP adapter_unavailable");
+                return None;
+            }
+        };
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some(label),
+                ..Default::default()
+            })
+            .await
+            .expect("DX12 adapter must create the smoke-test device");
+        Some(GpuContext::from_parts(instance, adapter, device, queue))
+    }
 
     #[test]
     fn dx12_scope_observation_smoke_reports_real_begin_finish_poll() {
         pollster::block_on(async {
-            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-            descriptor.backends = wgpu::Backends::DX12;
-            let instance = wgpu::Instance::new(descriptor);
-            let adapter = match instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                    ..Default::default()
-                })
-                .await
-            {
-                Ok(adapter) => adapter,
-                Err(_) => {
-                    println!("SKIP adapter_unavailable");
-                    return;
-                }
+            let Some(context) = dx12_context("FreeRemoteDesk scope observation smoke").await else {
+                return;
             };
-            let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("FreeRemoteDesk scope observation smoke"),
-                    ..Default::default()
-                })
-                .await
-                .expect("DX12 adapter must create the smoke-test device");
-            let context = GpuContext::from_parts(instance, adapter, device, queue);
             let before = context.scope_observation();
             context
                 .begin_fault_scope()
@@ -298,6 +315,44 @@ mod dx12_scope_smoke_tests {
                     polls: 1,
                 })
             );
+        });
+    }
+
+    #[test]
+    fn dx12_scope_borrows_context_observers_without_retaining_handles() {
+        pollster::block_on(async {
+            let Some(context) = dx12_context("FreeRemoteDesk borrowed scope smoke").await else {
+                return;
+            };
+            let before = (
+                Arc::strong_count(&context.observer),
+                Arc::strong_count(&context.scope_observer),
+            );
+
+            let scope = context
+                .begin_fault_scope()
+                .expect("scope acquisition must succeed");
+            assert_eq!(
+                (
+                    Arc::strong_count(&context.observer),
+                    Arc::strong_count(&context.scope_observer),
+                ),
+                before,
+                "scope begin must borrow stable observers instead of cloning their handles",
+            );
+
+            let token = scope.finish().expect("scope validation must succeed");
+            assert_eq!(
+                (
+                    Arc::strong_count(&context.observer),
+                    Arc::strong_count(&context.scope_observer),
+                ),
+                before,
+                "clean token must not retain an observer handle",
+            );
+            context
+                .commit_if_unchanged(token, || ())
+                .expect("clean token must commit against its original context");
         });
     }
 }

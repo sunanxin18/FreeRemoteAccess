@@ -188,11 +188,13 @@ struct DetachedRendererResources {
 }
 
 trait RecordScopeBackend {
-    type Scope;
+    type Scope<'a>
+    where
+        Self: 'a;
     type CleanToken;
 
-    fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
-    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+    fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass>;
+    fn finish<'a>(&'a self, scope: Self::Scope<'a>) -> Result<Self::CleanToken, GpuFaultClass>;
     fn commit_if_unchanged<R>(
         &self,
         token: Self::CleanToken,
@@ -217,14 +219,17 @@ impl<'a> GpuContextRecordScopeBackend<'a> {
 }
 
 impl RecordScopeBackend for GpuContextRecordScopeBackend<'_> {
-    type Scope = GpuFaultScope;
+    type Scope<'a>
+        = GpuFaultScope<'a>
+    where
+        Self: 'a;
     type CleanToken = GpuCleanToken;
 
-    fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+    fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass> {
         self.context.begin_fault_scope()
     }
 
-    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+    fn finish<'a>(&'a self, scope: Self::Scope<'a>) -> Result<Self::CleanToken, GpuFaultClass> {
         scope.finish()
     }
 
@@ -732,12 +737,14 @@ fn own_wgpu_prepared_resources(
 }
 
 trait BatchScopeBackend {
-    type Scope;
+    type Scope<'a>
+    where
+        Self: 'a;
     type CleanToken;
 
     fn observation(&self) -> GpuScopeObservation;
-    fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
-    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+    fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass>;
+    fn finish<'a>(&'a self, scope: Self::Scope<'a>) -> Result<Self::CleanToken, GpuFaultClass>;
     fn commit_if_unchanged<R>(
         &self,
         token: Self::CleanToken,
@@ -756,18 +763,21 @@ impl<'a> GpuContextBatchScopeBackend<'a> {
 }
 
 impl BatchScopeBackend for GpuContextBatchScopeBackend<'_> {
-    type Scope = GpuFaultScope;
+    type Scope<'a>
+        = GpuFaultScope<'a>
+    where
+        Self: 'a;
     type CleanToken = GpuCleanToken;
 
     fn observation(&self) -> GpuScopeObservation {
         self.context.scope_observation()
     }
 
-    fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+    fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass> {
         self.context.begin_fault_scope()
     }
 
-    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+    fn finish<'a>(&'a self, scope: Self::Scope<'a>) -> Result<Self::CleanToken, GpuFaultClass> {
         scope.finish()
     }
 
@@ -1801,19 +1811,25 @@ mod tests {
     }
 
     impl super::BatchScopeBackend for RecordingBatchScopeBackend {
-        type Scope = ObservedScopeLifecycle;
+        type Scope<'a>
+            = ObservedScopeLifecycle<'a>
+        where
+            Self: 'a;
         type CleanToken = ();
 
         fn observation(&self) -> GpuScopeObservation {
             self.observer.snapshot()
         }
 
-        fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
-            begin_observed_scope(self.observer.clone(), || Ok::<_, GpuFaultClass>(()))
+        fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass> {
+            begin_observed_scope(self.observer.as_ref(), || Ok::<_, GpuFaultClass>(()))
                 .map(|(_, lifecycle)| lifecycle)
         }
 
-        fn finish(&self, mut scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+        fn finish<'a>(
+            &'a self,
+            mut scope: Self::Scope<'a>,
+        ) -> Result<Self::CleanToken, GpuFaultClass> {
             scope.record_finish().unwrap();
             scope.record_poll().unwrap();
             self.finish_result
@@ -1882,15 +1898,21 @@ mod tests {
     }
 
     impl RecordScopeBackend for RecordingRecordScopeBackend {
-        type Scope = ObservedScopeLifecycle;
+        type Scope<'a>
+            = ObservedScopeLifecycle<'a>
+        where
+            Self: 'a;
         type CleanToken = ();
 
-        fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
-            begin_observed_scope(self.observer.clone(), || Ok::<_, GpuFaultClass>(()))
+        fn begin<'a>(&'a self) -> Result<Self::Scope<'a>, GpuFaultClass> {
+            begin_observed_scope(self.observer.as_ref(), || Ok::<_, GpuFaultClass>(()))
                 .map(|(_, lifecycle)| lifecycle)
         }
 
-        fn finish(&self, mut scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+        fn finish<'a>(
+            &'a self,
+            mut scope: Self::Scope<'a>,
+        ) -> Result<Self::CleanToken, GpuFaultClass> {
             scope.record_finish().unwrap();
             scope.record_poll().unwrap();
             self.finish_result

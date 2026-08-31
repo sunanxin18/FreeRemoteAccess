@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,8 +69,8 @@ impl ScopeLifecycleObserver for AtomicScopeLifecycleObserver {
     }
 }
 
-pub(crate) struct ObservedScopeLifecycle {
-    observer: Arc<dyn ScopeLifecycleObserver>,
+pub(crate) struct ObservedScopeLifecycle<'a> {
+    observer: &'a dyn ScopeLifecycleObserver,
     finish_recorded: bool,
     poll_recorded: bool,
 }
@@ -83,9 +83,9 @@ pub(crate) enum ScopeLifecycleError {
 }
 
 pub(crate) fn begin_observed_scope<T, E>(
-    observer: Arc<dyn ScopeLifecycleObserver>,
+    observer: &dyn ScopeLifecycleObserver,
     acquire: impl FnOnce() -> Result<T, E>,
-) -> Result<(T, ObservedScopeLifecycle), E> {
+) -> Result<(T, ObservedScopeLifecycle<'_>), E> {
     let acquired = acquire()?;
     observer.record(ScopeLifecycleEvent::Begin);
     Ok((
@@ -98,7 +98,7 @@ pub(crate) fn begin_observed_scope<T, E>(
     ))
 }
 
-impl ObservedScopeLifecycle {
+impl ObservedScopeLifecycle<'_> {
     pub(crate) fn record_finish(&mut self) -> Result<(), ScopeLifecycleError> {
         if self.finish_recorded {
             return Err(ScopeLifecycleError::DuplicateFinish);
@@ -152,7 +152,7 @@ pub(crate) struct GpuFaultObserver {
 }
 
 pub struct GpuCleanToken {
-    observer: Arc<GpuFaultObserver>,
+    observer_identity: usize,
     context_id: crate::GpuContextId,
     epoch: u64,
 }
@@ -184,7 +184,7 @@ impl GpuFaultObserver {
     }
 
     pub(crate) fn clean_token(
-        self: &Arc<Self>,
+        &self,
         context_id: crate::GpuContextId,
         epoch: u64,
     ) -> Result<GpuCleanToken, GpuFaultClass> {
@@ -196,19 +196,20 @@ impl GpuFaultObserver {
             return Err(GpuFaultClass::ObservationIncomplete);
         }
         Ok(GpuCleanToken {
-            observer: self.clone(),
+            observer_identity: self as *const Self as usize,
             context_id,
             epoch,
         })
     }
 
     pub(crate) fn commit_if_unchanged<R>(
-        self: &Arc<Self>,
+        &self,
         context_id: crate::GpuContextId,
         token: GpuCleanToken,
         commit: impl FnOnce() -> R,
     ) -> Result<R, GpuFaultClass> {
-        if context_id != token.context_id || !Arc::ptr_eq(self, &token.observer) {
+        if context_id != token.context_id || token.observer_identity != self as *const Self as usize
+        {
             return Err(GpuFaultClass::Internal);
         }
         let state = self.lock_state();
@@ -263,22 +264,22 @@ impl GpuFaultObserver {
 }
 
 #[must_use = "GPU 错误作用域必须调用 finish 才能完成故障观测"]
-pub struct GpuFaultScope {
-    device: wgpu::Device,
-    observer: Arc<GpuFaultObserver>,
+pub struct GpuFaultScope<'a> {
+    device: &'a wgpu::Device,
+    observer: &'a GpuFaultObserver,
     context_id: crate::GpuContextId,
     start_epoch: u64,
     validation: Option<wgpu::ErrorScopeGuard>,
     internal: Option<wgpu::ErrorScopeGuard>,
     out_of_memory: Option<wgpu::ErrorScopeGuard>,
-    lifecycle: ObservedScopeLifecycle,
+    lifecycle: ObservedScopeLifecycle<'a>,
 }
 
-impl GpuFaultScope {
+impl<'a> GpuFaultScope<'a> {
     pub(crate) fn new(
-        device: wgpu::Device,
-        observer: Arc<GpuFaultObserver>,
-        lifecycle_observer: Arc<dyn ScopeLifecycleObserver>,
+        device: &'a wgpu::Device,
+        observer: &'a GpuFaultObserver,
+        lifecycle_observer: &'a dyn ScopeLifecycleObserver,
         context_id: crate::GpuContextId,
     ) -> Result<Self, GpuFaultClass> {
         let start_epoch = observer.begin_operation()?;
@@ -480,7 +481,7 @@ mod scope_lifecycle_tests {
     fn scope_lifecycle_seam_records_begin_finish_poll_in_order() {
         let observer = Arc::new(RecordingObserver::default());
         let before = observer.snapshot();
-        let (_, mut lifecycle) = begin_observed_scope(observer.clone(), || Ok::<_, ()>(()))
+        let (_, mut lifecycle) = begin_observed_scope(observer.as_ref(), || Ok::<_, ()>(()))
             .expect("acquisition succeeds");
         lifecycle.record_finish().unwrap();
         lifecycle.record_poll().unwrap();
@@ -506,7 +507,7 @@ mod scope_lifecycle_tests {
     #[test]
     fn scope_lifecycle_failed_begin_records_nothing() {
         let observer = Arc::new(RecordingObserver::default());
-        let result = begin_observed_scope(observer.clone(), || Err::<(), _>("acquire"));
+        let result = begin_observed_scope(observer.as_ref(), || Err::<(), _>("acquire"));
         assert!(result.is_err());
         assert!(observer.0.lock().unwrap().is_empty());
     }
