@@ -810,9 +810,33 @@ where
         Ok(scope) => scope,
         Err(fault) => return Err(BatchApplyFailure::begin(Some(identity), fault)),
     };
-    let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(execute))
-        .unwrap_or(Err(RendererError::BatchExecutionPanicked));
-    let finish = backend.finish(scope);
+    let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(execute));
+    let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.finish(scope)));
+
+    let (finish, execution) = match (finish, execution) {
+        (Err(finish_panic), Err(execution_panic)) => {
+            let observation = backend.observation().checked_delta(before);
+            std::mem::forget(finish_panic);
+            std::mem::forget(execution_panic);
+            return Err(BatchApplyFailure {
+                identity: Some(identity),
+                primary: RendererError::BatchExecutionPanicked,
+                secondary_execution: None,
+                scope: observation.map(|observation| BatchScopeDiagnostics {
+                    observation,
+                    observed_fault: None,
+                }),
+            });
+        }
+        (Err(finish_panic), Ok(_execution)) => {
+            std::panic::resume_unwind(finish_panic);
+        }
+        (Ok(finish), Err(execution_panic)) => {
+            std::mem::forget(execution_panic);
+            (finish, Err(RendererError::BatchExecutionPanicked))
+        }
+        (Ok(finish), Ok(execution)) => (finish, execution),
+    };
     let observation = backend.observation().checked_delta(before);
 
     match (finish, execution) {
@@ -1808,6 +1832,7 @@ mod tests {
     struct RecordingBatchScopeBackend {
         observer: Arc<dyn ScopeLifecycleObserver>,
         finish_result: Result<(), GpuFaultClass>,
+        finish_panics: bool,
     }
 
     impl super::BatchScopeBackend for RecordingBatchScopeBackend {
@@ -1832,6 +1857,9 @@ mod tests {
         ) -> Result<Self::CleanToken, GpuFaultClass> {
             scope.record_finish().unwrap();
             scope.record_poll().unwrap();
+            if self.finish_panics {
+                std::panic::panic_any("batch finish panic");
+            }
             self.finish_result
         }
 
@@ -1862,6 +1890,7 @@ mod tests {
         let backend = RecordingBatchScopeBackend {
             observer: Arc::new(TestScopeObserver::default()),
             finish_result: Ok(()),
+            finish_panics: false,
         };
 
         let success = commit_scoped_batch(
@@ -2142,6 +2171,7 @@ mod tests {
         let backend = RecordingBatchScopeBackend {
             observer,
             finish_result: Ok(()),
+            finish_panics: false,
         };
         let identity = super::FrameBatchIdentity {
             session_id: SessionId::allocate(),
@@ -2180,6 +2210,7 @@ mod tests {
         let backend = RecordingBatchScopeBackend {
             observer,
             finish_result: Err(GpuFaultClass::Validation),
+            finish_panics: false,
         };
         let identity = super::FrameBatchIdentity {
             session_id: SessionId::allocate(),
@@ -2216,6 +2247,41 @@ mod tests {
         );
         assert_eq!(state.current_generation(), None);
         assert_eq!(resource, None);
+    }
+
+    #[test]
+    fn batch_double_panic_returns_execution_failure_after_single_observed_finish() {
+        let observer = Arc::new(TestScopeObserver::default());
+        let backend = RecordingBatchScopeBackend {
+            observer: observer.clone(),
+            finish_result: Ok(()),
+            finish_panics: true,
+        };
+        let identity = super::FrameBatchIdentity {
+            session_id: SessionId::allocate(),
+            generation: 4,
+            revision: 11,
+        };
+
+        let failure = execute_with_observed_scope(&backend, identity, || -> Result<(), _> {
+            std::panic::panic_any("batch execution panic");
+        })
+        .unwrap_err();
+
+        assert_eq!(failure.identity, Some(identity));
+        assert_eq!(failure.primary, RendererError::BatchExecutionPanicked);
+        assert_eq!(failure.secondary_execution, None);
+        assert_eq!(
+            failure.scope,
+            Some(BatchScopeDiagnostics {
+                observation: GpuScopeObservation {
+                    begins: 1,
+                    finishes: 1,
+                    polls: 1,
+                },
+                observed_fault: None,
+            })
+        );
     }
 
     #[test]
