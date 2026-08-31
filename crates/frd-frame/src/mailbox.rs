@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use frd_core::{PixelSize, SessionId};
 
-use crate::{PixelPatch, SurfaceUpdate};
+use crate::{PixelFormat, PixelPatch, SurfaceUpdate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PushOutcome {
@@ -151,6 +151,26 @@ impl FrameMailbox {
 
     pub fn queued_pixel_bytes(&self) -> usize {
         self.queued_pixel_bytes
+    }
+
+    /// 检查一个完整表面是否能在当前像素字节预算内一次发布。
+    pub fn supports_complete_surface(&self, size: PixelSize, format: PixelFormat) -> bool {
+        if size.width == 0 || size.height == 0 {
+            return false;
+        }
+        usize::try_from(size.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(size.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| {
+                usize::try_from(format.bytes_per_pixel())
+                    .ok()
+                    .and_then(|bytes_per_pixel| pixels.checked_mul(bytes_per_pixel))
+            })
+            .is_some_and(|bytes| bytes <= self.pixel_byte_limit)
     }
 
     fn push_reset(

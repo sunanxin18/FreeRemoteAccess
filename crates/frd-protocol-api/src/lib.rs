@@ -3,7 +3,7 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-use frd_core::{PhysicalViewport, SecretBytes, SessionId, SessionInput};
+use frd_core::{PhysicalViewport, PixelSize, SecretBytes, SessionId, SessionInput};
 use frd_frame::{FrameCompleteness, FrameMailbox, PixelFormat, SurfaceUpdate};
 use frd_media_api::{MediaFrame, MediaPublishError, MediaPublisher};
 
@@ -15,6 +15,7 @@ pub enum ProtocolError {
     UnregisteredProtocol,
     FactoryDescriptorMismatch,
     InvalidGeneration,
+    SurfaceCapacityExceeded,
     EventPortClosed,
     FramePortRejected,
     WakeFailed,
@@ -42,6 +43,7 @@ impl ProtocolError {
             Self::UnregisteredProtocol => "unregistered_protocol",
             Self::FactoryDescriptorMismatch => "factory_descriptor_mismatch",
             Self::InvalidGeneration => "invalid_generation",
+            Self::SurfaceCapacityExceeded => "surface_capacity_exceeded",
             Self::EventPortClosed => "event_port_closed",
             Self::FramePortRejected => "frame_port_rejected",
             Self::WakeFailed => "wake_failed",
@@ -499,6 +501,14 @@ pub trait RuntimeEventSink: Send {
 }
 
 pub trait SurfacePublisher: Send {
+    fn preflight_generation(
+        &self,
+        _size: PixelSize,
+        _format: PixelFormat,
+    ) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+
     fn publish(&self, update: SurfaceUpdate) -> Result<(), ProtocolError>;
 }
 
@@ -517,6 +527,19 @@ impl MailboxSurfacePublisher {
 }
 
 impl SurfacePublisher for MailboxSurfacePublisher {
+    fn preflight_generation(
+        &self,
+        size: PixelSize,
+        format: PixelFormat,
+    ) -> Result<(), ProtocolError> {
+        self.mailbox
+            .lock()
+            .map_err(|_| ProtocolError::FramePortRejected)?
+            .supports_complete_surface(size, format)
+            .then_some(())
+            .ok_or(ProtocolError::SurfaceCapacityExceeded)
+    }
+
     fn publish(&self, update: SurfaceUpdate) -> Result<(), ProtocolError> {
         match self
             .mailbox
@@ -592,6 +615,10 @@ impl ProtocolRuntime {
                 .is_some_and(|current| generation <= current)
         {
             return Err(ProtocolError::InvalidGeneration);
+        }
+        if let Err(error) = self.frames.preflight_generation(size, format) {
+            self.poison();
+            return Err(error);
         }
         if let Err(error) = self.events.publish(SessionEvent::SurfaceGenerationChanged {
             session_id,
@@ -864,6 +891,83 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_surface_preflight_rejects_oversized_generation_before_publication_and_poison_runtime(
+    ) {
+        let session_id = SessionId::allocate();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(4, 12)));
+        let mut runtime = ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(RecordingEvents(log.clone())),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            Box::new(RecordingWake(log.clone())),
+        );
+
+        let error = runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize::new(2, 2).unwrap(),
+                PixelFormat::Bgrx8UnormSrgb,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, ProtocolError::SurfaceCapacityExceeded);
+        assert_eq!(error.code(), "surface_capacity_exceeded");
+        assert!(runtime.requires_shutdown());
+        assert!(log.lock().expect("log lock").is_empty());
+        assert!(mailbox.lock().expect("mailbox lock").is_empty());
+        assert_eq!(
+            runtime.begin_generation(
+                session_id,
+                1,
+                PixelSize::new(1, 1).unwrap(),
+                PixelFormat::Bgrx8UnormSrgb,
+            ),
+            Err(ProtocolError::Terminal)
+        );
+    }
+
+    #[test]
+    fn mailbox_surface_preflight_accepts_exact_fit_in_event_reset_wake_order() {
+        let session_id = SessionId::allocate();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(4, 16)));
+        let mut runtime = ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(RecordingEvents(log.clone())),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            Box::new(MailboxInspectingWake {
+                mailbox: mailbox.clone(),
+                log: log.clone(),
+            }),
+        );
+
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize::new(2, 2).unwrap(),
+                PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("exact-fit surface is accepted");
+
+        assert_eq!(
+            *log.lock().expect("log lock"),
+            vec!["event", "reset", "wake"]
+        );
+        assert!(matches!(
+            mailbox.lock().expect("mailbox lock").pop(),
+            Some(SurfaceUpdate::Reset {
+                session_id: observed_session,
+                generation: 1,
+                size,
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }) if observed_session == session_id && size == PixelSize::new(2, 2).unwrap()
+        ));
+    }
+
+    #[test]
     fn adapter_runtime_publishes_identity_and_current_frames_with_one_wake_each() {
         let session_id = SessionId::allocate();
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -991,7 +1095,14 @@ mod tests {
             Box::new(MailboxSurfacePublisher::new(mailbox)),
             Box::new(RecordingWake(log.clone())),
         );
-        establish_generation(&mut runtime, session_id, 1);
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize::new(1, 1).expect("valid size"),
+                PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("generation fits the mailbox byte budget");
 
         assert_eq!(
             runtime.publish_surface(damage(session_id, 1, 1)),
@@ -1392,6 +1503,23 @@ mod tests {
     impl RuntimeWake for RecordingWake {
         fn wake(&self) -> Result<(), ProtocolError> {
             self.0.lock().expect("log lock").push("wake");
+            Ok(())
+        }
+    }
+
+    struct MailboxInspectingWake {
+        mailbox: Arc<Mutex<FrameMailbox>>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl RuntimeWake for MailboxInspectingWake {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            let mailbox = self.mailbox.lock().expect("mailbox lock");
+            assert_eq!(mailbox.len(), 1, "Reset must precede wake");
+            assert_eq!(mailbox.queued_pixel_bytes(), 0);
+            let mut log = self.log.lock().expect("log lock");
+            log.push("reset");
+            log.push("wake");
             Ok(())
         }
     }

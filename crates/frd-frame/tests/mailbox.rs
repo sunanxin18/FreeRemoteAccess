@@ -58,6 +58,45 @@ fn one_pixel_patch() -> PixelPatch {
 }
 
 #[test]
+fn complete_surface_capacity_accepts_exact_fit_and_rejects_excess_zero_and_overflow_without_mutation(
+) {
+    let session_id = session();
+    let mut exact_mailbox = FrameMailbox::new(4, 16);
+    assert_eq!(
+        exact_mailbox.push(reset(session_id, 1)),
+        PushOutcome::Queued
+    );
+
+    assert!(exact_mailbox
+        .supports_complete_surface(PixelSize::new(2, 2).unwrap(), PixelFormat::Bgra8UnormSrgb,));
+    assert!(!exact_mailbox
+        .supports_complete_surface(PixelSize::new(5, 1).unwrap(), PixelFormat::Bgra8UnormSrgb,));
+    assert!(!exact_mailbox.supports_complete_surface(
+        PixelSize {
+            width: u32::MAX,
+            height: u32::MAX,
+        },
+        PixelFormat::Bgra8UnormSrgb,
+    ));
+    assert!(!exact_mailbox.supports_complete_surface(
+        PixelSize {
+            width: 0,
+            height: 1,
+        },
+        PixelFormat::Bgra8UnormSrgb,
+    ));
+    assert_eq!(
+        (exact_mailbox.len(), exact_mailbox.queued_pixel_bytes()),
+        (1, 0)
+    );
+
+    let one_byte_short = FrameMailbox::new(4, 15);
+    assert!(!one_byte_short
+        .supports_complete_surface(PixelSize::new(2, 2).unwrap(), PixelFormat::Bgra8UnormSrgb,));
+    assert!(one_byte_short.is_empty());
+}
+
+#[test]
 fn accepts_patch_with_exact_stride_length_and_surface_bounds() {
     let session_id = session();
     let mut mailbox = FrameMailbox::new(4, 64);

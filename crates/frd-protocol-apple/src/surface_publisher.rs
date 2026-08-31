@@ -567,7 +567,8 @@ mod tests {
 
     use frd_core::{PixelRect, PixelSize, SessionId};
     use frd_frame::{
-        FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
+        FrameCompleteness, FrameMailbox, FrameTransactionCompiler, PixelBuffer, PixelFormat,
+        PixelPatch, SurfaceUpdate,
     };
     use frd_protocol_api::{
         MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
@@ -741,6 +742,43 @@ mod tests {
             }] if *observed_session == session_id && *observed_size == size
         ));
         assert_eq!(*recorders.wakes.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn apple_activation_propagates_mailbox_capacity_failure_without_startup_input_or_wake() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let (_commands, command_rx) = mpsc::channel();
+        let recorders = Arc::new(PublicationRecorders::default());
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(4, 12)));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(recorders.clone())),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            None,
+            Box::new(RecordingPublicationWake(recorders.clone())),
+        );
+        let mut publisher = AppleSurfacePublisher::pending(session_id);
+
+        let error = publisher
+            .activate_initial_generation(&mut runtime, size)
+            .unwrap_err();
+
+        assert_eq!(error, ProtocolError::SurfaceCapacityExceeded);
+        assert_eq!(error.code(), "surface_capacity_exceeded");
+        assert!(!publisher.is_active());
+        assert!(runtime.requires_shutdown());
+        assert!(recorders.events.lock().unwrap().is_empty());
+        assert_eq!(*recorders.wakes.lock().unwrap(), 0);
+
+        let mut mailbox = mailbox.lock().unwrap();
+        assert!(mailbox.is_empty());
+        let updates: Vec<_> = std::iter::from_fn(|| mailbox.pop_enqueued()).collect();
+        drop(mailbox);
+        let mut compiler = FrameTransactionCompiler::new(session_id);
+        assert!(compiler.compile(updates).unwrap().is_empty());
+        assert!(!compiler.has_buffered_input());
     }
 
     #[test]
