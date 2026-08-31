@@ -182,6 +182,65 @@ function Assert-FileRowIdentity(
   return [string]$runIds[0]
 }
 
+function Get-OptionalRowField($Row, [string]$Name) {
+  $property = $Row.PSObject.Properties[$Name]
+  if ($null -eq $property) { return '' }
+  return [string]$property.Value
+}
+
+function Assert-EventIdentityRows($Rows, [string]$Kind) {
+  $activeSession = $null
+  $activeGeneration = $null
+  $restorePresentationCount = 0
+  foreach ($row in $Rows) {
+    $sessionText = Get-OptionalRowField $row 'session_id'
+    $generationText = Get-OptionalRowField $row 'generation'
+    $revisionText = Get-OptionalRowField $row 'revision'
+    $hasSession = -not [string]::IsNullOrEmpty($sessionText)
+    $hasGeneration = -not [string]::IsNullOrEmpty($generationText)
+    $hasRevision = -not [string]::IsNullOrEmpty($revisionText)
+    $isPresentation = [string]$row.event -ceq 'Presentation'
+    if (-not $hasSession -and -not $hasGeneration -and -not $hasRevision) {
+      Assert-True (-not $isPresentation) "invalid_${Kind}_presentation_identity_shape"
+      continue
+    }
+
+    # Some measurements are scoped only to a session/generation. Once an event
+    # carries a revision it is an identity-bearing receipt and must carry the
+    # complete triple. Presentation is always such a receipt.
+    Assert-True ($hasSession -and $hasGeneration) "invalid_${Kind}_event_identity_shape"
+    if ($isPresentation) {
+      Assert-True $hasRevision "invalid_${Kind}_presentation_identity_shape"
+    }
+
+    $session = Convert-U64 $sessionText "invalid_${Kind}_event_session_id"
+    $generation = Convert-U64 $generationText "invalid_${Kind}_event_generation"
+    Assert-True ($session -gt 0) "invalid_${Kind}_event_session_id_zero"
+    Assert-True ($generation -gt 0) "invalid_${Kind}_event_generation_zero"
+    if ($hasRevision) {
+      $revision = Convert-U64 $revisionText "invalid_${Kind}_event_revision"
+      Assert-True ($revision -gt 0) "invalid_${Kind}_event_revision_zero"
+    }
+
+    if ($null -ne $activeSession) {
+      Assert-True ($session -eq [UInt64]$activeSession) "invalid_${Kind}_event_session_mismatch"
+    }
+    $isRestorePresentation = [string]$row.phase -ceq 'Restore' -and
+      [string]$row.event -ceq 'Presentation'
+    if ($isRestorePresentation) {
+      Assert-True ($null -ne $activeSession -and $null -ne $activeGeneration -and
+        $session -eq [UInt64]$activeSession -and
+        $generation -eq [UInt64]$activeGeneration) "invalid_${Kind}_restore_presentation_current_identity"
+      $restorePresentationCount += 1
+    }
+    $activeSession = $session
+    $activeGeneration = $generation
+  }
+  return [pscustomobject]@{
+    restore_identity_bearing_presentation_present = [bool]($restorePresentationCount -gt 0)
+  }
+}
+
 function Assert-RunRows(
   $Events,
   $ProcessRows,
@@ -228,7 +287,13 @@ function Assert-RunRows(
       $timestamp -lt $lower -or ($hasUpper -and $timestamp -ge $upper)
     }).Count -eq 0) "invalid_${Kind}_events_phase_interval"
   }
-  return $eventRunId
+  $identity = Assert-EventIdentityRows $Events "${Kind}_events"
+  Assert-MonotonicEvents $Events
+  return [pscustomobject]@{
+    run_id = $eventRunId
+    restore_identity_bearing_presentation_present =
+      [bool]$identity.restore_identity_bearing_presentation_present
+  }
 }
 
 function Assert-MonotonicEvents($Rows) {
@@ -359,15 +424,6 @@ function Get-VisibleScopeAmplificationReduced50Percent($SerialVisible, $Candidat
 function Get-MinimizedPresentationPaused($Serial, $Candidate) {
   return [bool](($Serial.MinimizedMeasurement.presentation_activity_count -eq 0) -and
     ($Candidate.MinimizedMeasurement.presentation_activity_count -eq 0))
-}
-
-function Test-IdentityBearingRestorePresentation($Rows) {
-  return [bool](@($Rows | Where-Object {
-    $_.phase -eq 'Restore' -and $_.event -eq 'Presentation' -and
-    -not [string]::IsNullOrEmpty($_.session_id) -and
-    -not [string]::IsNullOrEmpty($_.generation) -and
-    -not [string]::IsNullOrEmpty($_.revision)
-  }).Count -gt 0)
 }
 
 function Get-PhaseGates($Serial, $Candidate) {
@@ -573,7 +629,190 @@ function New-SelfTestMetricProcessRows {
   return $rows
 }
 
+function New-SelfTestComparisonRow([string]$Header, [System.Collections.IDictionary]$Values) {
+  $row = [ordered]@{}
+  foreach ($field in $Header.Split(',')) { $row[$field] = '' }
+  foreach ($entry in $Values.GetEnumerator()) { $row[[string]$entry.Key] = [string]$entry.Value }
+  return [pscustomobject]$row
+}
+
+function New-SelfTestComparisonEventRows(
+  [string]$RunId,
+  [ValidateSet('serial','candidate')][string]$Implementation,
+  [UInt64]$RestoreSessionId,
+  [UInt64]$RestoreGeneration,
+  [UInt64]$RestoreRevision
+) {
+  $rows = @()
+  $newBoundary = {
+    param([string]$Phase, [UInt64]$Timestamp)
+    New-SelfTestComparisonRow $EventHeader ([ordered]@{
+      schema_version = '1'; run_id = $RunId; implementation = $Implementation
+      phase = $Phase; event = 'PhaseBoundary'; monotonic_us = [string]$Timestamp
+    })
+  }
+  $rows += & $newBoundary 'VisibleWarmup' 0
+  $rows += & $newBoundary 'VisibleMeasurement' 1000000
+  [UInt64]$revision = 1
+  foreach ($second in 0, 5, 10, 15, 20, 25) {
+    [UInt64]$timestamp = 1000000 + [UInt64]($second * 1000000)
+    $batchEvent = if ($Implementation -eq 'serial') { 'SerialDrain' } else { 'CandidateBatch' }
+    $batchRevision = if ($Implementation -eq 'candidate') { [string]$revision } else { '' }
+    $batchScopes = if ($Implementation -eq 'candidate') { '1' } else { '2' }
+    $rows += New-SelfTestComparisonRow $EventHeader ([ordered]@{
+      schema_version = '1'; run_id = $RunId; implementation = $Implementation
+      phase = 'VisibleMeasurement'; event = $batchEvent; batch_result = 'Success'
+      monotonic_us = [string]$timestamp; session_id = '1'; generation = '1'; revision = $batchRevision
+      source_updates = '1'; transactions = '1'; rectangles = '1'; batch_cpu_us = '1000'
+      mailbox_age_us = '1000'; scope_begins = $batchScopes; scope_finishes = $batchScopes
+      scope_polls = $batchScopes
+    })
+    $rows += New-SelfTestComparisonRow $EventHeader ([ordered]@{
+      schema_version = '1'; run_id = $RunId; implementation = $Implementation
+      phase = 'VisibleMeasurement'; event = 'Presentation'; monotonic_us = [string]$timestamp
+      session_id = '1'; generation = '1'; revision = [string]$revision
+    })
+    $rows += New-SelfTestComparisonRow $EventHeader ([ordered]@{
+      schema_version = '1'; run_id = $RunId; implementation = $Implementation
+      phase = 'VisibleMeasurement'; event = 'FrameResponse'; monotonic_us = [string]$timestamp
+      session_id = '1'; generation = '1'; frame_response_ms = '1'
+    })
+    $rows += New-SelfTestComparisonRow $EventHeader ([ordered]@{
+      schema_version = '1'; run_id = $RunId; implementation = $Implementation
+      phase = 'VisibleMeasurement'; event = 'InputToNextPresent'; monotonic_us = [string]$timestamp
+      session_id = '1'; generation = '1'
+      input_to_next_present_us = if ($Implementation -eq 'serial') { '40' } else { '20' }
+    })
+    $revision += 1
+  }
+  $rows += & $newBoundary 'MinimizedWarmup' 32000000
+  $rows += & $newBoundary 'MinimizedMeasurement' 33000000
+  $rows += & $newBoundary 'Restore' 64000000
+  $rows += New-SelfTestComparisonRow $EventHeader ([ordered]@{
+    schema_version = '1'; run_id = $RunId; implementation = $Implementation
+    phase = 'Restore'; event = 'Presentation'; monotonic_us = '64000001'
+    session_id = [string]$RestoreSessionId; generation = [string]$RestoreGeneration
+    revision = [string]$RestoreRevision
+  })
+  return $rows
+}
+
+function New-SelfTestComparisonProcessRows(
+  [string]$RunId,
+  [ValidateSet('serial','candidate')][string]$Implementation
+) {
+  $rows = @()
+  foreach ($phaseAndOrigin in @(
+    [pscustomobject]@{ phase = 'VisibleMeasurement'; origin = [UInt64]1000000 },
+    [pscustomobject]@{ phase = 'MinimizedMeasurement'; origin = [UInt64]33000000 }
+  )) {
+    foreach ($second in 0..30) {
+      $rows += New-SelfTestComparisonRow $ProcessHeader ([ordered]@{
+        schema_version = '1'; run_id = $RunId; implementation = $Implementation
+        phase = $phaseAndOrigin.phase; second = [string]$second
+        monotonic_us = [string]($phaseAndOrigin.origin + [UInt64]($second * 1000000))
+        process_cpu_total_us = [string]($second * 100); process_cpu_delta_us = '100'
+        working_set_bytes = [string](1000 + $second)
+      })
+    }
+  }
+  return $rows
+}
+
+function Write-SelfTestComparisonCsv([string]$Path, [string]$Header, $Rows) {
+  $fields = $Header.Split(',')
+  $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try {
+    $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
+    try {
+      $writer.WriteLine($Header)
+      foreach ($row in $Rows) {
+        $values = @($fields | ForEach-Object { [string]$row.$_ })
+        Assert-True (@($values | Where-Object { $_ -match '[,\r\n"]' }).Count -eq 0) 'selftest_unsafe_csv_value'
+        $writer.WriteLine(($values -join ','))
+      }
+    } finally { $writer.Dispose() }
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Assert-SelfTestProductionForgeryRejected(
+  [UInt64]$RestoreSessionId,
+  [UInt64]$RestoreGeneration,
+  [UInt64]$RestoreRevision,
+  [string]$ExpectedCode,
+  [string]$FixtureName
+) {
+  $fixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ("frd-restore-identity-{0}" -f [Guid]::NewGuid())
+  [void](New-Item -ItemType Directory -Path $fixtureDirectory)
+  try {
+    $serialEvents = Join-Path $fixtureDirectory 'serial-events.csv'
+    $serialProcess = Join-Path $fixtureDirectory 'serial-process.csv'
+    $candidateEvents = Join-Path $fixtureDirectory 'candidate-events.csv'
+    $candidateProcess = Join-Path $fixtureDirectory 'candidate-process.csv'
+    $output = Join-Path $fixtureDirectory 'comparison.json'
+    Write-SelfTestComparisonCsv $serialEvents $EventHeader (New-SelfTestComparisonEventRows 'serial-a' 'serial' $RestoreSessionId $RestoreGeneration $RestoreRevision)
+    Write-SelfTestComparisonCsv $serialProcess $ProcessHeader (New-SelfTestComparisonProcessRows 'serial-a' 'serial')
+    Write-SelfTestComparisonCsv $candidateEvents $EventHeader (New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7)
+    Write-SelfTestComparisonCsv $candidateProcess $ProcessHeader (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate')
+    $hostExecutable = if (Test-Path -LiteralPath (Join-Path $PSHOME 'pwsh.exe')) {
+      Join-Path $PSHOME 'pwsh.exe'
+    } else {
+      Join-Path $PSHOME 'powershell.exe'
+    }
+    $childStdout = Join-Path $fixtureDirectory 'child.stdout.txt'
+    $childStderr = Join-Path $fixtureDirectory 'child.stderr.txt'
+    $child = Start-Process -FilePath $hostExecutable -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
+      '-SerialEvents', $serialEvents, '-SerialProcessSamples', $serialProcess,
+      '-CandidateEvents', $candidateEvents, '-CandidateProcessSamples', $candidateProcess,
+      '-OutputPath', $output
+    ) -Wait -PassThru -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
+    $childOutput = @(
+      Get-Content -LiteralPath $childStdout -ErrorAction SilentlyContinue
+      Get-Content -LiteralPath $childStderr -ErrorAction SilentlyContinue
+    )
+    $childExitCode = $child.ExitCode
+    Assert-True ($childExitCode -ne 0) "selftest_${FixtureName}_not_rejected"
+    Assert-True (-not (Test-Path -LiteralPath $output)) "selftest_${FixtureName}_created_output"
+    Assert-True (($childOutput -join "`n") -match [regex]::Escape($ExpectedCode)) "selftest_${FixtureName}_wrong_failure"
+  } finally {
+    Remove-Item -LiteralPath $fixtureDirectory -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Invoke-SelfTest {
+  Assert-SelfTestProductionForgeryRejected 1 2 7 `
+    'invalid_serial_events_restore_presentation_current_identity' 'isolated_restore_generation'
+  Assert-SelfTestProductionForgeryRejected 9 1 7 `
+    'invalid_serial_events_event_session_mismatch' 'isolated_restore_session'
+  Assert-SelfTestProductionForgeryRejected 0 0 0 `
+    'invalid_serial_events_event_session_id_zero' 'zero_restore_identity'
+  Assert-FailsWith {
+    Assert-RunRows (New-SelfTestComparisonEventRows 'serial-a' 'serial' 0 0 0) `
+      (New-SelfTestComparisonProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_event_session_id_zero'
+  Assert-FailsWith {
+    Assert-RunRows (New-SelfTestComparisonEventRows 'serial-a' 'serial' 9 1 7) `
+      (New-SelfTestComparisonProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_event_session_mismatch'
+  Assert-FailsWith {
+    Assert-RunRows (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 2 7) `
+      (New-SelfTestComparisonProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_restore_presentation_current_identity'
+  Assert-FailsWith {
+    $events = New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7
+    $events[-1].session_id = ''
+    $events[-1].generation = ''
+    $events[-1].revision = ''
+    Assert-RunRows $events (New-SelfTestComparisonProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  } 'invalid_serial_events_presentation_identity_shape'
+  $revisionEvolution = Assert-RunRows `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 9) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') 'serial' 'serial'
+  Assert-True $revisionEvolution.restore_identity_bearing_presentation_present `
+    'selftest_legitimate_revision_evolution_rejected'
   Assert-True ((Get-NearestRankP95 ([UInt64[]](1..20))) -eq 19) 'selftest_nearest_rank_p95'
   Assert-True ((Get-Median ([UInt64[]]@(9, 1, 5, 3, 7))) -eq 5) 'selftest_odd_median'
   $largeExactRows = @(
@@ -849,8 +1088,8 @@ $serialEventRows = Assert-HeadersAndRows $SerialEvents $EventHeader 'serial_even
 $serialProcessRows = Assert-HeadersAndRows $SerialProcessSamples $ProcessHeader 'serial_process' $ProcessSampleRowLimit
 $candidateEventRows = Assert-HeadersAndRows $CandidateEvents $EventHeader 'candidate_events' $EventRowCapacity
 $candidateProcessRows = Assert-HeadersAndRows $CandidateProcessSamples $ProcessHeader 'candidate_process' $ProcessSampleRowLimit
-[void](Assert-RunRows $serialEventRows $serialProcessRows 'serial' 'serial')
-[void](Assert-RunRows $candidateEventRows $candidateProcessRows 'candidate' 'candidate')
+$serialRun = Assert-RunRows $serialEventRows $serialProcessRows 'serial' 'serial'
+$candidateRun = Assert-RunRows $candidateEventRows $candidateProcessRows 'candidate' 'candidate'
 $serial = Get-RunStatistics $serialEventRows $serialProcessRows 'serial'
 $candidate = Get-RunStatistics $candidateEventRows $candidateProcessRows 'candidate'
 
@@ -869,8 +1108,8 @@ $visibleBatchCpuGate = Get-VisibleBatchCpu8msAndNoRegression $visibleSerial.batc
 $visibleScopeAmplificationGate = Get-VisibleScopeAmplificationReduced50Percent $visibleSerial $visibleCandidate
 $minimizedPresentationPaused = Get-MinimizedPresentationPaused $serial $candidate
 $phaseGates = Get-PhaseGates $serial $candidate
-$serialRestoreReceipt = Test-IdentityBearingRestorePresentation $serialEventRows
-$candidateRestoreReceipt = Test-IdentityBearingRestorePresentation $candidateEventRows
+$serialRestoreReceipt = [bool]$serialRun.restore_identity_bearing_presentation_present
+$candidateRestoreReceipt = [bool]$candidateRun.restore_identity_bearing_presentation_present
 $restoreReceiptPresent = $serialRestoreReceipt -and $candidateRestoreReceipt
 
 $report = [ordered]@{
