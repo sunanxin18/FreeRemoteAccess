@@ -187,6 +187,63 @@ struct DetachedRendererResources {
     _pass: Option<RemotePass>,
 }
 
+trait RecordScopeBackend {
+    type Scope;
+    type CleanToken;
+
+    fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
+    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+}
+
+struct GpuContextRecordScopeBackend {
+    context: GpuContext,
+}
+
+impl GpuContextRecordScopeBackend {
+    fn new(context: GpuContext) -> Self {
+        Self { context }
+    }
+}
+
+impl RecordScopeBackend for GpuContextRecordScopeBackend {
+    type Scope = GpuFaultScope;
+    type CleanToken = GpuCleanToken;
+
+    fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+        self.context.begin_fault_scope()
+    }
+
+    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+        scope.finish()
+    }
+}
+
+#[derive(Debug)]
+struct ScopedRecord<T, R> {
+    clean_token: T,
+    recorded: R,
+}
+
+fn execute_record_with_fault_scope<B, R>(
+    backend: &B,
+    record: impl FnOnce() -> Result<R, RendererError>,
+) -> Result<ScopedRecord<B::CleanToken, R>, RendererError>
+where
+    B: RecordScopeBackend,
+{
+    let scope = backend.begin()?;
+    let recorded = record();
+    let finish = backend.finish(scope);
+    match (finish, recorded) {
+        (Err(fault), _) => Err(RendererError::GpuFault(fault)),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(clean_token), Ok(recorded)) => Ok(ScopedRecord {
+            clean_token,
+            recorded,
+        }),
+    }
+}
+
 pub struct RemoteRenderer {
     context: GpuContext,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -328,32 +385,36 @@ impl RemoteRenderer {
             (None, Some(_)) => return Err(RendererError::InvalidGeometry),
             _ => {}
         }
-        let scope = self.context.begin_fault_scope()?;
-        let replacement_pass = if self
-            .pass
-            .as_ref()
-            .is_none_or(|pass| !pass.matches(target_format))
-        {
-            Some(RemotePass::new(
-                self.context.device(),
-                &self.bind_group_layout,
-                target_format,
-            )?)
-        } else {
-            None
-        };
-        let remote = self.remote.as_ref();
-        replacement_pass
-            .as_ref()
-            .or(self.pass.as_ref())
-            .expect("远端 pass 已创建")
-            .record(
-                encoder,
-                target,
-                remote.map(|texture| &texture.bind_group),
-                viewport.map(|viewport| viewport.content),
-            );
-        let token = scope.finish()?;
+        let scope_backend = GpuContextRecordScopeBackend::new(self.context.clone());
+        let scoped = execute_record_with_fault_scope(&scope_backend, || {
+            let replacement_pass = if self
+                .pass
+                .as_ref()
+                .is_none_or(|pass| !pass.matches(target_format))
+            {
+                Some(RemotePass::new(
+                    self.context.device(),
+                    &self.bind_group_layout,
+                    target_format,
+                )?)
+            } else {
+                None
+            };
+            let remote = self.remote.as_ref();
+            replacement_pass
+                .as_ref()
+                .or(self.pass.as_ref())
+                .expect("远端 pass 已创建")
+                .record(
+                    encoder,
+                    target,
+                    remote.map(|texture| &texture.bind_group),
+                    viewport.map(|viewport| viewport.content),
+                );
+            Ok(replacement_pass)
+        })?;
+        let token = scoped.clean_token;
+        let replacement_pass = scoped.recorded;
         let context = self.context.clone();
         let (old_pass, pending_receipt) = context
             .commit_if_unchanged(token, || {
@@ -1305,9 +1366,10 @@ mod tests {
     use super::{
         commit_planned_batch_after_gpu, commit_planned_update_after_gpu,
         commit_reset_resource_after_gpu, confirm_presented_with_commit, execute_planned_operations,
-        execute_with_observed_scope, BatchApplySuccess, BatchScopeDiagnostics,
-        PlannedOperationExecutor, PreparedBatchResources, RecoveryRequirement, RemoteColorPolicy,
-        RemoteUpdateState, RendererError,
+        execute_record_with_fault_scope, execute_with_observed_scope, BatchApplySuccess,
+        BatchScopeDiagnostics, PlannedOperationExecutor, PreparedBatchResources,
+        RecordScopeBackend, RecoveryRequirement, RemoteColorPolicy, RemoteUpdateState,
+        RendererError,
     };
     use crate::gpu_fault::{begin_observed_scope, ObservedScopeLifecycle, ScopeLifecycleEvent};
     use crate::{
@@ -1679,6 +1741,27 @@ mod tests {
         }
     }
 
+    struct RecordingRecordScopeBackend {
+        observer: Arc<dyn ScopeLifecycleObserver>,
+        finish_result: Result<(), GpuFaultClass>,
+    }
+
+    impl RecordScopeBackend for RecordingRecordScopeBackend {
+        type Scope = ObservedScopeLifecycle;
+        type CleanToken = ();
+
+        fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+            begin_observed_scope(self.observer.clone(), || Ok::<_, GpuFaultClass>(()))
+                .map(|(_, lifecycle)| lifecycle)
+        }
+
+        fn finish(&self, mut scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+            scope.record_finish().unwrap();
+            scope.record_poll().unwrap();
+            self.finish_result
+        }
+    }
+
     #[derive(Default)]
     struct TestScopeObserver {
         observation: std::sync::Mutex<GpuScopeObservation>,
@@ -1697,6 +1780,64 @@ mod tests {
         fn snapshot(&self) -> GpuScopeObservation {
             *self.observation.lock().unwrap()
         }
+    }
+
+    #[test]
+    fn record_operation_error_still_finishes_and_polls_exactly_once() {
+        let observer = Arc::new(TestScopeObserver::default());
+        let backend = RecordingRecordScopeBackend {
+            observer: observer.clone(),
+            finish_result: Ok(()),
+        };
+
+        let error = execute_record_with_fault_scope(&backend, || {
+            Err::<(), _>(RendererError::UnsupportedTargetFormat)
+        })
+        .unwrap_err();
+
+        assert_eq!(error, RendererError::UnsupportedTargetFormat);
+        assert_eq!(
+            observer.snapshot(),
+            GpuScopeObservation {
+                begins: 1,
+                finishes: 1,
+                polls: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn record_finish_gpu_fault_wins_and_prepared_state_is_not_committed() {
+        let observer = Arc::new(TestScopeObserver::default());
+        let backend = RecordingRecordScopeBackend {
+            observer: observer.clone(),
+            finish_result: Err(GpuFaultClass::DeviceLost),
+        };
+        let mut committed_pass = None;
+        let mut returned_receipt = None;
+
+        let result = execute_record_with_fault_scope(&backend, || {
+            Err::<(&str, Option<u64>), _>(RendererError::UnsupportedTargetFormat)
+        });
+        if let Ok(scoped) = &result {
+            committed_pass = Some(scoped.recorded.0);
+            returned_receipt = scoped.recorded.1;
+        }
+
+        assert_eq!(
+            result.map(|_| ()),
+            Err(RendererError::GpuFault(GpuFaultClass::DeviceLost))
+        );
+        assert_eq!(committed_pass, None);
+        assert_eq!(returned_receipt, None);
+        assert_eq!(
+            observer.snapshot(),
+            GpuScopeObservation {
+                begins: 1,
+                finishes: 1,
+                polls: 1,
+            }
+        );
     }
 
     #[test]

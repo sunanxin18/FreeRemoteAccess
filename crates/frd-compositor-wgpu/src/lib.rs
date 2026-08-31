@@ -51,6 +51,63 @@ fn require_context_match(matches: bool) -> Result<(), PresentError> {
     matches.then_some(()).ok_or(PresentError::ContextMismatch)
 }
 
+trait FrameScopeBackend {
+    type Scope;
+    type CleanToken;
+
+    fn begin(&self) -> Result<Self::Scope, GpuFaultClass>;
+    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass>;
+}
+
+struct GpuContextFrameScopeBackend {
+    context: GpuContext,
+}
+
+impl GpuContextFrameScopeBackend {
+    fn new(context: GpuContext) -> Self {
+        Self { context }
+    }
+}
+
+impl FrameScopeBackend for GpuContextFrameScopeBackend {
+    type Scope = frd_render_wgpu::GpuFaultScope;
+    type CleanToken = GpuCleanToken;
+
+    fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+        self.context.begin_fault_scope()
+    }
+
+    fn finish(&self, scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+        scope.finish()
+    }
+}
+
+#[derive(Debug)]
+struct ScopedFrame<T, R> {
+    clean_token: T,
+    recorded: R,
+}
+
+fn execute_frame_with_fault_scope<B, R>(
+    backend: &B,
+    record_and_present: impl FnOnce() -> Result<R, PresentError>,
+) -> Result<ScopedFrame<B::CleanToken, R>, PresentError>
+where
+    B: FrameScopeBackend,
+{
+    let scope = backend.begin()?;
+    let recorded = record_and_present();
+    let finish = backend.finish(scope);
+    match (finish, recorded) {
+        (Err(fault), _) => Err(PresentError::GpuFault(fault)),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(clean_token), Ok(recorded)) => Ok(ScopedFrame {
+            clean_token,
+            recorded,
+        }),
+    }
+}
+
 pub struct PresentationCompositor {
     context: GpuContext,
     presentation: PresentationSurface,
@@ -151,12 +208,12 @@ impl PresentationCompositor {
             .as_ref()
             .ok_or(PresentError::SurfaceDetached)?
             .format;
-        let acquisition_scope = self.context.begin_fault_scope()?;
-        let acquired = self
+        let surface = self
             .presentation
             .surface()
-            .ok_or(PresentError::SurfaceDetached)?
-            .get_current_texture();
+            .ok_or(PresentError::SurfaceDetached)?;
+        let acquisition_scope = self.context.begin_fault_scope()?;
+        let acquired = surface.get_current_texture();
         let acquisition_token = acquisition_scope.finish()?;
         self.context.commit_if_unchanged(acquisition_token, || ())?;
         let acquired = AcquiredFrame::from(acquired);
@@ -168,29 +225,32 @@ impl PresentationCompositor {
                     AcquiredFrame::Success(texture) | AcquiredFrame::Suboptimal(texture) => texture,
                     _ => unreachable!("渲染动作必须包含 SurfaceTexture"),
                 };
-                let frame_scope = self.context.begin_fault_scope()?;
-                let view = texture
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-                let mut encoder =
-                    self.context
-                        .device()
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                let scope_backend = GpuContextFrameScopeBackend::new(self.context.clone());
+                let scoped = execute_frame_with_fault_scope(&scope_backend, || {
+                    let view = texture
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let mut encoder = self.context.device().create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
                             label: Some("FreeRemoteDesk presentation encoder"),
-                        });
-                let receipt = if explicit_viewport {
-                    remote.record_in(&mut encoder, &view, viewport, target_format)?
-                } else {
-                    remote.record(&mut encoder, &view, physical_size, target_format)?
-                };
-                overlay(&mut encoder, &view);
-                hooks.before_submit();
-                self.context.queue().submit([encoder.finish()]);
-                self.context.queue().present(texture);
+                        },
+                    );
+                    let receipt = if explicit_viewport {
+                        remote.record_in(&mut encoder, &view, viewport, target_format)?
+                    } else {
+                        remote.record(&mut encoder, &view, physical_size, target_format)?
+                    };
+                    overlay(&mut encoder, &view);
+                    hooks.before_submit();
+                    self.context.queue().submit([encoder.finish()]);
+                    self.context.queue().present(texture);
+                    Ok(receipt)
+                })?;
                 // submit/present 在 wgpu 30 中不返回逐帧 Result；同一错误作用域和共享
                 // observer 负责在确认回执前收集同步验证错误与设备丢失。finish 使用
                 // 非阻塞 Poll，不把呈现路径变成等待 GPU 完成的 fence。
-                let frame_token = frame_scope.finish()?;
+                let frame_token = scoped.clean_token;
+                let receipt = scoped.recorded;
                 if action == AcquisitionAction::RenderThenReconfigure {
                     self.reconfigure_existing()?;
                 }
@@ -451,5 +511,206 @@ mod api_tests {
             Err(PresentError::ContextMismatch)
         );
         assert_eq!(super::require_context_match(true), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use frd_render_wgpu::{GpuFaultClass, RendererError};
+
+    use super::{execute_frame_with_fault_scope, FrameScopeBackend, PresentError};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ScopeName {
+        Inner,
+        Outer,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LifecycleEvent {
+        Begin(ScopeName),
+        CreateView,
+        CreateEncoder,
+        Record,
+        Finish(ScopeName),
+        Poll(ScopeName),
+        Overlay,
+        BeforeSubmit,
+        Submit,
+        Present,
+        ConfirmReceipt,
+        FramePresented,
+    }
+
+    struct RecordingFrameScopeBackend {
+        name: ScopeName,
+        events: Rc<RefCell<Vec<LifecycleEvent>>>,
+        finish_result: Result<(), GpuFaultClass>,
+    }
+
+    impl FrameScopeBackend for RecordingFrameScopeBackend {
+        type Scope = ();
+        type CleanToken = ();
+
+        fn begin(&self) -> Result<Self::Scope, GpuFaultClass> {
+            self.events
+                .borrow_mut()
+                .push(LifecycleEvent::Begin(self.name));
+            Ok(())
+        }
+
+        fn finish(&self, _scope: Self::Scope) -> Result<Self::CleanToken, GpuFaultClass> {
+            let mut events = self.events.borrow_mut();
+            events.push(LifecycleEvent::Finish(self.name));
+            events.push(LifecycleEvent::Poll(self.name));
+            self.finish_result
+        }
+    }
+
+    #[test]
+    fn outer_frame_scope_closes_when_record_fails_without_presentation_callbacks() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outer = RecordingFrameScopeBackend {
+            name: ScopeName::Outer,
+            events: events.clone(),
+            finish_result: Ok(()),
+        };
+
+        let error = execute_frame_with_fault_scope(&outer, || {
+            events.borrow_mut().push(LifecycleEvent::CreateView);
+            events.borrow_mut().push(LifecycleEvent::CreateEncoder);
+            events.borrow_mut().push(LifecycleEvent::Record);
+            let receipt = Err::<Option<u64>, _>(PresentError::Renderer(
+                RendererError::UnsupportedTargetFormat,
+            ))?;
+            events.borrow_mut().push(LifecycleEvent::Overlay);
+            events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
+            events.borrow_mut().push(LifecycleEvent::Submit);
+            events.borrow_mut().push(LifecycleEvent::Present);
+            Ok(receipt)
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            PresentError::Renderer(RendererError::UnsupportedTargetFormat)
+        );
+        assert_eq!(
+            *events.borrow(),
+            [
+                LifecycleEvent::Begin(ScopeName::Outer),
+                LifecycleEvent::CreateView,
+                LifecycleEvent::CreateEncoder,
+                LifecycleEvent::Record,
+                LifecycleEvent::Finish(ScopeName::Outer),
+                LifecycleEvent::Poll(ScopeName::Outer),
+            ]
+        );
+    }
+
+    #[test]
+    fn outer_gpu_fault_wins_after_inner_gpu_fault_and_both_scopes_close() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outer = RecordingFrameScopeBackend {
+            name: ScopeName::Outer,
+            events: events.clone(),
+            finish_result: Err(GpuFaultClass::DeviceLost),
+        };
+        let inner = RecordingFrameScopeBackend {
+            name: ScopeName::Inner,
+            events: events.clone(),
+            finish_result: Err(GpuFaultClass::Validation),
+        };
+
+        let result = execute_frame_with_fault_scope(&outer, || {
+            events.borrow_mut().push(LifecycleEvent::CreateView);
+            events.borrow_mut().push(LifecycleEvent::CreateEncoder);
+            let inner_result = execute_frame_with_fault_scope(&inner, || {
+                events.borrow_mut().push(LifecycleEvent::Record);
+                Ok(())
+            });
+            inner_result?;
+            events.borrow_mut().push(LifecycleEvent::Overlay);
+            events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
+            events.borrow_mut().push(LifecycleEvent::Submit);
+            events.borrow_mut().push(LifecycleEvent::Present);
+            Ok(())
+        });
+
+        assert_eq!(
+            result.map(|_| ()),
+            Err(PresentError::GpuFault(GpuFaultClass::DeviceLost))
+        );
+        assert_eq!(
+            *events.borrow(),
+            [
+                LifecycleEvent::Begin(ScopeName::Outer),
+                LifecycleEvent::CreateView,
+                LifecycleEvent::CreateEncoder,
+                LifecycleEvent::Begin(ScopeName::Inner),
+                LifecycleEvent::Record,
+                LifecycleEvent::Finish(ScopeName::Inner),
+                LifecycleEvent::Poll(ScopeName::Inner),
+                LifecycleEvent::Finish(ScopeName::Outer),
+                LifecycleEvent::Poll(ScopeName::Outer),
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_nested_scopes_preserve_presentation_and_confirmation_order() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outer = RecordingFrameScopeBackend {
+            name: ScopeName::Outer,
+            events: events.clone(),
+            finish_result: Ok(()),
+        };
+        let inner = RecordingFrameScopeBackend {
+            name: ScopeName::Inner,
+            events: events.clone(),
+            finish_result: Ok(()),
+        };
+
+        let scoped = execute_frame_with_fault_scope(&outer, || {
+            events.borrow_mut().push(LifecycleEvent::CreateView);
+            events.borrow_mut().push(LifecycleEvent::CreateEncoder);
+            let inner = execute_frame_with_fault_scope(&inner, || {
+                events.borrow_mut().push(LifecycleEvent::Record);
+                Ok(41_u64)
+            })?;
+            events.borrow_mut().push(LifecycleEvent::Overlay);
+            events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
+            events.borrow_mut().push(LifecycleEvent::Submit);
+            events.borrow_mut().push(LifecycleEvent::Present);
+            Ok(inner.recorded)
+        })
+        .unwrap();
+        assert_eq!(scoped.recorded, 41);
+        events.borrow_mut().push(LifecycleEvent::ConfirmReceipt);
+        events.borrow_mut().push(LifecycleEvent::FramePresented);
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                LifecycleEvent::Begin(ScopeName::Outer),
+                LifecycleEvent::CreateView,
+                LifecycleEvent::CreateEncoder,
+                LifecycleEvent::Begin(ScopeName::Inner),
+                LifecycleEvent::Record,
+                LifecycleEvent::Finish(ScopeName::Inner),
+                LifecycleEvent::Poll(ScopeName::Inner),
+                LifecycleEvent::Overlay,
+                LifecycleEvent::BeforeSubmit,
+                LifecycleEvent::Submit,
+                LifecycleEvent::Present,
+                LifecycleEvent::Finish(ScopeName::Outer),
+                LifecycleEvent::Poll(ScopeName::Outer),
+                LifecycleEvent::ConfirmReceipt,
+                LifecycleEvent::FramePresented,
+            ]
+        );
     }
 }
