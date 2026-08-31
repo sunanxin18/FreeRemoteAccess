@@ -251,7 +251,7 @@ impl AppleSurfacePublisher {
             || admission.generation() != self.generation
             || admission.format() != PixelFormat::Bgrx8UnormSrgb
         {
-            return Err(ProtocolError::FramePortRejected);
+            return runtime.reject_invalid_generation_admission(admission);
         }
         let size = admission.size();
         runtime.begin_admitted_generation(admission)?;
@@ -309,7 +309,7 @@ impl AppleSurfacePublisher {
             || admission.generation() <= self.generation
             || admission.format() != PixelFormat::Bgrx8UnormSrgb
         {
-            return Err(ProtocolError::FramePortRejected);
+            return runtime.reject_invalid_generation_admission(admission);
         }
         let generation = admission.generation();
         let size = admission.size();
@@ -820,6 +820,39 @@ mod tests {
             }] if *observed_session == session_id && *observed_size == size
         ));
         assert_eq!(*recorders.wakes.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn stale_apple_generation_admission_poison_runtime_without_republication() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(1234, 567).unwrap();
+        let (mut runtime, recorders) = runtime_with_publication_recorders(session_id);
+        let mut publisher = AppleSurfacePublisher::begin(&mut runtime, session_id, size).unwrap();
+        let stale = publisher
+            .admit_next_generation(&mut runtime, 2, size)
+            .unwrap();
+        let current = publisher
+            .admit_next_generation(&mut runtime, 2, size)
+            .unwrap();
+
+        publisher
+            .begin_admitted_next_generation(&mut runtime, current)
+            .unwrap();
+        assert_eq!(publisher.generation(), 2);
+        assert_eq!(recorders.events.lock().unwrap().len(), 2);
+        assert_eq!(recorders.frames.lock().unwrap().len(), 2);
+        assert_eq!(*recorders.wakes.lock().unwrap(), 2);
+
+        let error = publisher
+            .begin_admitted_next_generation(&mut runtime, stale)
+            .unwrap_err();
+        assert_eq!(
+            (error, runtime.requires_shutdown()),
+            (ProtocolError::InvalidGeneration, true)
+        );
+        assert_eq!(recorders.events.lock().unwrap().len(), 2);
+        assert_eq!(recorders.frames.lock().unwrap().len(), 2);
+        assert_eq!(*recorders.wakes.lock().unwrap(), 2);
     }
 
     #[test]

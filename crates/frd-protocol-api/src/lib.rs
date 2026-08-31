@@ -667,6 +667,20 @@ impl ProtocolRuntime {
         })
     }
 
+    /// 消费协议适配器无法绑定到其当前状态的 generation admission。
+    ///
+    /// 非终态 runtime 必须 fail-closed，且该拒绝不会发布 event、Reset 或 wake。
+    pub fn reject_invalid_generation_admission(
+        &mut self,
+        _admission: GenerationAdmission,
+    ) -> Result<(), ProtocolError> {
+        if self.terminal {
+            return Err(ProtocolError::Terminal);
+        }
+        self.poison();
+        Err(ProtocolError::InvalidGeneration)
+    }
+
     /// 按 event、Reset、单次 wake 的顺序消费一次准入并发布 generation。
     /// 任一端口失败后进入终态；不会伪称回滚已发布的 event/Reset。
     pub fn begin_admitted_generation(
