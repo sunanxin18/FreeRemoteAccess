@@ -36,7 +36,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
 |---|---|---|---|---|
-| macOS | Screen Sharing / Remote Management | `frd-protocol-apple`：严格 Apple High Performance HPSS/MVS | Windows | **开发中**；当前产品仅允许加密 High Performance 路径，设计见 [`Apple High Performance Session`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md)。既有账号密码、共享会话画面/输入及媒体证据早于严格虚拟显示确认门禁，不能证明当前产品模式已被 stock macOS 接受 |
+| macOS | Screen Sharing / Remote Management | `frd-protocol-apple`：严格 Apple High Performance HPSS/MVS | Windows | **开发中**；当前产品仅允许加密 High Performance 路径，设计见 [`Apple High Performance Session`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md)。既有账号密码、共享会话画面/输入及媒体证据早于严格虚拟显示确认门禁，不能证明当前产品模式已被 stock macOS 接受；离线实现允许 `display_count=2` 确认 High Performance 并激活 publisher，但动态分辨率只允许 `display_count=1` |
 | Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；私有 adapter 已实现服务器身份验证、TLS、CredSSP/NLA、licensing 与 activation，2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录、首帧或输入互操作；完整离线门禁、构建哈希和未验证边界见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md)；不得要求安装 FreeRemoteDesk 服务端 |
 | Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
 
@@ -50,12 +50,12 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
-| High Performance 虚拟显示与实体显示器置黑 | `frd-protocol-apple` 严格确认门禁 | **开发中** | 产品只选择加密 `APPLE_SRP`，发送现有 `0x1d` 后等待严格 `0x451 ServerState`，确认前不公开 generation/readiness；自动化门禁不能替代实体显示器置黑/恢复与完整远程桌面的真机观察，见 [`设计`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md) |
+| High Performance 虚拟显示与实体显示器置黑 | `frd-protocol-apple` 严格确认门禁 | **开发中** | 产品只选择加密 `APPLE_SRP`，发送现有 `0x1d` 后等待严格 `0x451 ServerState`，确认前不公开 generation/readiness；`display_count=2` 的匹配状态仍可确认 High Performance 并激活 publisher，单显示器限制只属于动态分辨率 eligibility；自动化门禁不能替代实体显示器置黑/恢复与完整远程桌面的真机观察，见 [`设计`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md) |
 | 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-31 保留固定捕获仅证明采样候选 `c57dc77` 的 Windows wgpu frame-transaction 路径在有界 Apple HPSS/MVS 真机比较中通过；范围、run id 与二进制身份见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。这不包含后置 runtime 正确性修复，也不包含严格 High Performance 虚拟显示/实体显示器置黑与恢复门禁。 |
 | 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。2026-08-31 的 `c57dc77` 采样候选通过固定真机比较：每个成功 `CandidateBatch` 行的 batch-apply scope 恰有一个 begin/finish/poll，源更新归一化的 scope-amplification 门禁、输入/FrameResponse 及 CPU/内存门禁均通过；该结论不涵盖 acquisition、record 或 presentation scope，证据范围与非结论见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
 | 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |
-| 动态分辨率 | 实验性 resized `0x09` + generation 切换 | **实验性** | 默认关闭；尚无足够 Apple 线协议互操作证据，见 `AGENTS.md` P1 |
+| 动态分辨率 | 实验性 resized `0x09` + generation 切换 | **实验性** | 默认关闭；离线 eligibility 只接受匹配初始 `ServerState` 的 `display_count=1`，`display_count=2` 仅关闭 dynamic、不会关闭已确认的 High Performance 或 publisher；尚无足够 Apple 线协议互操作证据，见 `AGENTS.md` P1 |
 | Mac→Windows 音频 | Apple UDP/SRTP + AAC-ELD | **受限验证** | 已认证、解码非静音 48 kHz 双声道并通过 Windows 输出；未宣称任意丢包与长时间 rollover |
 | UDP 媒体传输 | Apple Message 1/2、`0x1c`、SRTP/SRTCP | **受限验证** | 音频和视频 socket 已完成有界真机互操作；长时间网络稳定性未覆盖 |
 | Windows→Mac 麦克风 | Apple Audio Chat / IDS 路径 | **不支持** | 原生用户名密码 HPSS 会话没有已恢复的 Audio Chat 分支；Apple ID 与服务端助手均超出产品边界 |
@@ -67,10 +67,33 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 Apple startup、初始确认、动态 viewport 请求、精确 ACK 和服务端 geometry 路径都
 必须在 CPU surface 分配/替换、resized/full wire 写入、私有状态修改以及 generation
 event、`Reset`、wake 之前取得 admission；失败为 terminal，初始路径不留下部分
-状态，已有动态 surface 与控制状态原子保留。该 `43fb0f3` 修复以及后续
-panic/unwind、Restore identity 修复均发生在 Task 7 真机采样之后，目前只有离线
-验证，没有新的 Mac 真机采样。`43db868` 只用当前 comparator 重放相同 retained
-CSV，不是 recapture；最终离线 Release 哈希也不能替换采样二进制哈希。
+状态，已有动态 surface 与控制状态原子保留。后续 `4a080cf` 又关闭 admission
+所有权边界：跨 runtime、stale 或其他无效 opaque token 会先 poison 目标 runtime，
+再返回 `InvalidGeneration`，且本次拒绝不新增 event、`Reset` 或 wake；直接传给
+`admit_generation` 的错误输入仍只返回 `InvalidGeneration`，不会 poison，可恢复。
+`8a32038` 只把 dynamic eligibility 收紧到单显示器，不把两显示器配置误判为
+High Performance 失败。
+
+`aa560a3` 已把项目自有热路径中的 `wgpu::Device`、fault observer handle 与
+`GpuContext` clone 降为零，但这不是“绝对零 GPU clone”：wgpu 30 的每次
+`push_error_scope` 会在内部 clone 一个 `DispatchDevice`，每个 FRD fault scope
+调用三次；常规呈现的 acquisition、frame、record 合计 9 次上游 clone，
+`CandidateBatch` 另有 3 次。这组固定上游 clone 被接受，不能归入项目自有
+handle-clone 回归。
+
+这些 runtime/GPU 修复和当前 comparator 提交链
+`cd01e78`、`18498ed`、`dec2cd6`、`3bde039`、`3db3b53`、`50354fa`
+都发生在 Task 7 真机采样之后。唯一 Mac live 二进制仍是 serial `44a62ad`
+（SHA-256 `8CED2D0DB0788D34152AE498461A18F0255B103B3C20F87FCD2026932DD4C421`）
+与 candidate `c57dc77`
+（SHA-256 `4D1AECB691463E813F3C36122C9BC83464BB697028113C7AFE5814A0F102207F`）。
+`50354fa` 仅重放相同 retained CSV：Windows PowerShell 5.1 输出 15,888 B、
+SHA-256 `B6E8B860618E83DA0F851D4AC1A337ACA00F04CB47E16A950CFD5EB3FFF2AD64`；
+pwsh 7 输出 6,354 B、SHA-256
+`7651B13855D77C2D87BC805ABE4FC3D80B9750ACB8C68DBCB635F337831C850A`。
+两者仅 JSON 空白格式不同，解析后语义相等且均为 14/14；不是 recapture。
+`43db868` 的 42,283,520 B / `AFDB...AE69` 只是先前离线闭包构建，不能冒充
+当前最终构建或替换上述采样哈希；新的最终 Release 身份须由主集成代理验证后补记。
 
 ### Windows 客户端连接 Windows 功能明细
 
@@ -112,7 +135,9 @@ HPSS/ARD/MVS 路径。
   运行证据为唯一协议基准，补齐 resized `0x09` 的真机互操作门禁；确认服务端
   精确接受新尺寸后，再以一个原子 generation 切换同步替换 surface 尺寸、MVS
   decoder 状态、wgpu texture 与输入坐标变换，并要求新 generation 的完整
-  type-0 baseline。没有该证据前不得用本地缩放或自定义协议冒充远端 resize。
+  type-0 baseline。即使 High Performance 已在两显示器配置下确认，dynamic
+  eligibility 仍只允许 `display_count=1`；没有该证据前不得用本地缩放或自定义
+  协议冒充远端 resize。
 
 ---
 

@@ -238,47 +238,60 @@ The candidate runtime capture identity was
 `4D1AECB691463E813F3C36122C9BC83464BB697028113C7AFE5814A0F102207F`.
 Comparator corrections `e0a29e647804f478198252e5b90e9575ce150762` and
 `d57eee9574e8703e7b0beebf40dc3abfdc3ebdbf` changed neither measured runtime
-binary.
+binary. These serial and candidate identities remain the only binaries sampled
+against the Mac; every commit and replay described below is offline evidence.
 
-Runtime correctness commits
-`a1099a641f7b1213a88b0059f625941c8a8ef779`,
-`fed72c61d9d335472a8ca0de9e5c0bda6f22d625`,
-`0e775379cdc065064f0957b44c73955079c17a8d`, and
-`91d7c2c422b249870395fe7693133d957d4a4ca2` were applied after both captures.
-They introduced the actual-port 64 MiB complete-surface preflight and closed and
-bound the production record/presentation scope lifecycle, including the hot-path
-context borrowing used by the integrated flow. Follow-up runtime commits
-`43fb0f3fcc06f53a74e1de0671909b58cecc9653` and
-`3a7bd2be41f5b10f79ef1e97362f1fab3373419b` are also post-measurement.
-`43fb0f3` turns capacity approval into an opaque admission from the actual frame
-port and requires it on Apple startup, initial confirmation, dynamic viewport,
-exact acknowledgement, and server-geometry paths before CPU surface
-allocation/replacement, resized/full wire writes, private-state mutation,
-generation events, `Reset`, or wake. Rejection is terminal, leaves no partial
-initial state, and atomically retains an existing dynamic surface and control
-state. `3a7bd2b` closes each successfully started GPU scope exactly once before
-resuming an operation panic and preserves `BatchExecutionPanicked` for a batch
-execution panic. None of these commits was present in either sampled binary,
-and no new Mac run or recapture exercised them.
+Runtime correctness commits `a1099a6`, `fed72c6`, `0e77537`, `91d7c2c`,
+`43fb0f3`, and `3a7bd2b` were applied after both captures. They introduced the
+actual-port 64 MiB complete-surface preflight, bound production scope lifecycle,
+made generation admission precede CPU allocation/replacement, wire writes,
+private-state mutation, generation event, `Reset`, and wake, and preserved the
+original operation panic after exactly-once scope closure. Rejection leaves no
+partial initial state and atomically retains an existing dynamic surface/control
+state. None was present in either sampled binary.
 
-Comparator-only hardening in `323d6e0aea1cb0bd075f90dcc1973edbc9278f66`,
-`d36e045541587e56f3af1dee0c0d4477d0686793`, and
-`4344183dadf0e2fb205baa61e38d75395c95ea97` caps each event input at 32,768
-rows, caps each process input at 62 rows, and requires every event timestamp to
-remain inside its declared half-open phase interval. Follow-up comparator commit
-`43db868a637ed1fdf13fa8301f900e513b540afa` also requires a complete, nonzero
-Presentation identity; a Restore receipt must belong to one current session and
-the current generation, while revisions remain monotonic. Its retained output
-`target/validation/task7-scheme-a-final-integrated-43db868.json` has SHA-256
-`B6E8B860618E83DA0F851D4AC1A337ACA00F04CB47E16A950CFD5EB3FFF2AD64`, is
-byte-identical to the preceding retained replay with that SHA-256, and keeps all
-14 mandatory predicates true. This is the same old retained CSV replay, not a
-recapture or new Mac measurement.
+Further offline runtime commits `4a080cf`, `8a32038`, and `aa560a3` close three
+additional contracts. `4a080cf` makes consuming a cross-runtime, stale, or
+otherwise invalid opaque admission token poison the target runtime before
+returning `InvalidGeneration`; that rejected consume adds no generation event,
+`Reset`, or wake. Invalid input passed directly to `admit_generation` remains
+recoverable and does not poison. `8a32038` keeps matching `display_count=2`
+valid for Apple High Performance confirmation and publisher activation, but
+only `display_count=1` can satisfy dynamic-resolution eligibility.
 
-The final Release built at this closure is 42,283,520 bytes with SHA-256
-`AFDB76ABA09468C9410B5FAC7E4FB5A46B67D0D928B6275512B207BAC3B2AE69`.
-It is offline build evidence only and must not replace either sampled Release
-SHA-256 above.
+`aa560a3` removes all project-owned hot-path `wgpu::Device`, fault-observer
+handle, and `GpuContext` clones in the affected paths. This is not an absolute
+zero-GPU-clone claim: wgpu 30 internally clones one `DispatchDevice` for every
+`push_error_scope`, and each FRD fault scope pushes three scopes. Routine
+presentation acquisition, frame, and record therefore total nine fixed upstream
+clones; a `CandidateBatch` adds three. This upstream cost is accepted and is
+distinct from the now-zero project-owned handle clones.
+
+The integrated comparator sequence `cd01e78`, `18498ed`, `dec2cd6`, `3bde039`,
+`3db3b53`, and `50354fa` accepts only the exact case-sensitive event taxonomy
+and Ordinal file/run identity. Restore freezes the current session/generation at
+its boundary. Events must stay in declared half-open phase intervals; each
+measured phase requires process S0..S30 at 1 s +/-100 ms, with every five-second
+window spanning 5 s +/-200 ms. Event-specific required/allowed/empty shapes
+reject populated nonapplicable fields. Populated numeric event fields must be
+canonical unsigned-64 decimal text; exact duplicate rows are rejected. A
+successful installed-surface `CandidateBatch` may omit revision while retaining
+session/generation. `run_id` is full-string ASCII `[A-Za-z0-9_-]`, length 1..64,
+and any `StableFault` remains fail-closed.
+
+The retained captures were not resampled. At `50354fa`, Windows PowerShell 5.1
+produced 15,888 bytes with SHA-256
+`B6E8B860618E83DA0F851D4AC1A337ACA00F04CB47E16A950CFD5EB3FFF2AD64`;
+pwsh 7 produced 6,354 bytes with SHA-256
+`7651B13855D77C2D87BC805ABE4FC3D80B9750ACB8C68DBCB635F337831C850A`.
+Only JSON whitespace formatting differs: parsed semantics are equal and both
+keep all 14 mandatory predicates true. These are offline replays, not recaptures.
+
+The 42,283,520-byte executable with SHA-256
+`AFDB76ABA09468C9410B5FAC7E4FB5A46B67D0D928B6275512B207BAC3B2AE69`
+is the prior `43db868` offline closure build, not the current final Release. It
+must not replace either sampled hash; the primary integrator will record a new
+final Release identity only after independent verification.
 
 The serial run was `serial_capacity_click_20260831_23`: 3,660 event rows, 62
 process rows, all five phases, 25 `InputToNextPresent` rows, and zero
