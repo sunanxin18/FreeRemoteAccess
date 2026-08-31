@@ -1,7 +1,24 @@
 use anyhow::{bail, Context, Result};
 use frd_core::{PixelRect, PixelSize, SessionId};
 use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
-use frd_protocol_api::{ProtocolError, ProtocolRuntime};
+use frd_protocol_api::{GenerationAdmission, ProtocolError, ProtocolRuntime};
+
+#[cfg(test)]
+thread_local! {
+    static DISPLAY_SURFACE_ALLOCATION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_display_surface_allocation_count() {
+    DISPLAY_SURFACE_ALLOCATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn display_surface_allocation_count() -> usize {
+    DISPLAY_SURFACE_ALLOCATION_COUNT.with(std::cell::Cell::get)
+}
 
 const FULL_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TYPE_ONE_PATCHES: usize = 32;
@@ -63,6 +80,8 @@ impl DisplaySurface {
         if generation == 0 {
             bail!("Apple surface generation 必须非零");
         }
+        #[cfg(test)]
+        DISPLAY_SURFACE_ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
         Ok(Self {
             generation,
             framebuffer: CpuFramebuffer::new(size.width as usize, size.height as usize)?,
@@ -195,20 +214,47 @@ impl AppleSurfacePublisher {
         Ok(publisher)
     }
 
+    #[cfg(test)]
     pub(crate) fn activate_initial_generation(
         &mut self,
         runtime: &mut ProtocolRuntime,
         size: PixelSize,
     ) -> Result<(), ProtocolError> {
+        let admission = self.admit_initial_generation(runtime, size)?;
+        self.activate_admitted_initial_generation(runtime, admission)
+    }
+
+    pub(crate) fn admit_initial_generation(
+        &self,
+        runtime: &mut ProtocolRuntime,
+        size: PixelSize,
+    ) -> Result<GenerationAdmission, ProtocolError> {
         if self.generation != 1 || self.is_active() {
             return Err(ProtocolError::FramePortRejected);
         }
-        runtime.begin_generation(
+        runtime.admit_generation(
             self.session_id,
             self.generation,
             size,
             PixelFormat::Bgrx8UnormSrgb,
-        )?;
+        )
+    }
+
+    pub(crate) fn activate_admitted_initial_generation(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        admission: GenerationAdmission,
+    ) -> Result<(), ProtocolError> {
+        if self.generation != 1
+            || self.is_active()
+            || admission.session_id() != self.session_id
+            || admission.generation() != self.generation
+            || admission.format() != PixelFormat::Bgrx8UnormSrgb
+        {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        let size = admission.size();
+        runtime.begin_admitted_generation(admission)?;
         self.active_size = Some(size);
         Ok(())
     }
@@ -221,21 +267,53 @@ impl AppleSurfacePublisher {
         self.generation
     }
 
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_next_generation(
         &mut self,
         runtime: &mut ProtocolRuntime,
         generation: u64,
         size: PixelSize,
     ) -> Result<(), ProtocolError> {
+        let admission = self.admit_next_generation(runtime, generation, size)?;
+        self.begin_admitted_next_generation(runtime, admission)
+    }
+
+    pub(crate) fn admit_next_generation(
+        &self,
+        runtime: &mut ProtocolRuntime,
+        generation: u64,
+        size: PixelSize,
+    ) -> Result<GenerationAdmission, ProtocolError> {
         if !self.is_active() {
             return Err(ProtocolError::FramePortRejected);
         }
-        runtime.begin_generation(
+        runtime.admit_generation(
             self.session_id,
             generation,
             size,
             PixelFormat::Bgrx8UnormSrgb,
-        )?;
+        )
+    }
+
+    pub(crate) fn begin_admitted_next_generation(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        admission: GenerationAdmission,
+    ) -> Result<(), ProtocolError> {
+        if !self.is_active()
+            || admission.session_id() != self.session_id
+            || admission.generation() <= self.generation
+            || admission.format() != PixelFormat::Bgrx8UnormSrgb
+        {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        let generation = admission.generation();
+        let size = admission.size();
+        runtime.begin_admitted_generation(admission)?;
         self.generation = generation;
         self.active_size = Some(size);
         self.revision = 0;

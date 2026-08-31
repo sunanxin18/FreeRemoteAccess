@@ -42,6 +42,7 @@ enum HighPerformanceStartupState {
     Failed,
 }
 
+#[derive(Clone)]
 pub(crate) struct HighPerformanceStartupGate {
     requested_at: Instant,
     state: HighPerformanceStartupState,

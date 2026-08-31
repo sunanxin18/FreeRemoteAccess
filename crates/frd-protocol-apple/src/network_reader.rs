@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use frd_core::{PhysicalViewport, PixelRect, PixelSize};
-use frd_frame::{PixelBuffer, PixelPatch};
-use frd_protocol_api::{FrameResponseTiming, ProtocolError, ProtocolRuntime};
+use frd_frame::{PixelBuffer, PixelFormat, PixelPatch};
+use frd_protocol_api::{FrameResponseTiming, GenerationAdmission, ProtocolError, ProtocolRuntime};
 
 use crate::connection::AppleWriterHandle;
 use crate::dynamic_resolution::{
@@ -24,6 +24,10 @@ use crate::media_runtime::ViewerMediaState;
 use crate::mvs;
 use crate::mvs_stream::{MvsRecord, MvsRecordAssembler, MvsRect};
 use crate::protocol;
+#[cfg(test)]
+use crate::surface_publisher::{
+    display_surface_allocation_count, reset_display_surface_allocation_count,
+};
 use crate::surface_publisher::{
     AppleSurfacePublisher, CpuFramebuffer as Framebuffer, DisplaySurface, MvsFrameKind,
     PublicationOutcome, MAX_TYPE_ONE_PATCHES,
@@ -34,6 +38,7 @@ const PENDING_MEDIA_CONTROL_BUDGET: usize = 8;
 struct DynamicResolutionRuntime {
     controller: DynamicResolutionController,
     pending_since: Option<Instant>,
+    pending_generation_admission: Option<PendingGenerationAdmission>,
     initial_size: DisplaySize,
     opt_in: bool,
     evidence: DynamicCapabilityEvidence,
@@ -75,6 +80,23 @@ struct ServerGeometryCommit {
     commit: GeometryCommit,
     disposition: ServerGeometryDisposition,
     previous: DisplaySize,
+    admission: GenerationAdmission,
+}
+
+struct PendingGenerationAdmission {
+    target: DisplaySize,
+    generation: u64,
+    admission: GenerationAdmission,
+}
+
+enum ServerGeometryAdmission {
+    PendingRequest,
+    ServerInitiated(GenerationAdmission),
+}
+
+enum InitialGenerationAdmission {
+    Existing,
+    Replacement(GenerationAdmission),
 }
 
 impl DynamicResolutionRuntime {
@@ -86,6 +108,7 @@ impl DynamicResolutionRuntime {
         Self {
             controller: DynamicResolutionController::new(initial_size, enabled, capability),
             pending_since: None,
+            pending_generation_admission: None,
             initial_size,
             opt_in: enabled,
             evidence: DynamicCapabilityEvidence {
@@ -283,6 +306,7 @@ impl DynamicResolutionRuntime {
         let timed_out = self.controller.timeout_pending();
         if timed_out {
             self.pending_since = None;
+            self.pending_generation_admission.take();
         }
         timed_out
     }
@@ -341,6 +365,8 @@ fn commit_server_geometry(
     receiver: &mut MvsReceiveState,
     surface: &mut DisplaySurface,
     media_state: &mut ViewerMediaState,
+    protocol_runtime: &mut ProtocolRuntime,
+    publisher: &AppleSurfacePublisher,
     observed: DisplaySize,
     before_generation_commit: impl FnOnce() -> Result<()>,
 ) -> Result<Option<ServerGeometryCommit>> {
@@ -363,12 +389,49 @@ fn commit_server_geometry(
     if plan.disposition == ServerGeometryDisposition::Unchanged {
         return Ok(None);
     }
+    let admission_source = match plan.disposition {
+        ServerGeometryDisposition::RequestedAck => {
+            let pending = runtime
+                .pending_generation_admission
+                .as_ref()
+                .context("动态分辨率 ACK 缺少发送前 generation admission")?;
+            if pending.target != observed
+                || pending.generation != generation
+                || pending.admission.session_id() != publisher.session_id()
+                || pending.admission.generation() != generation
+                || pending.admission.size() != replacement_size
+                || pending.admission.format() != PixelFormat::Bgrx8UnormSrgb
+            {
+                bail!("动态分辨率 ACK 与发送前 generation admission 不一致");
+            }
+            ServerGeometryAdmission::PendingRequest
+        }
+        ServerGeometryDisposition::ServerInitiated => ServerGeometryAdmission::ServerInitiated(
+            publisher
+                .admit_next_generation(protocol_runtime, generation, replacement_size)
+                .map_err(|error| anyhow::anyhow!(error.code()))?,
+        ),
+        ServerGeometryDisposition::Unchanged => unreachable!("unchanged 已在上方返回"),
+    };
     let replacement = DisplaySurface::new(generation, replacement_size)?;
     before_generation_commit()?;
     media_state.reset_generation(generation)?;
     runtime.apply_server_geometry_plan(plan, observed, current)?;
     receiver.reset(generation);
     *surface = replacement;
+    let admission = match admission_source {
+        ServerGeometryAdmission::PendingRequest => {
+            runtime
+                .pending_generation_admission
+                .take()
+                .expect("已验证的 pending generation admission 必须仍存在")
+                .admission
+        }
+        ServerGeometryAdmission::ServerInitiated(admission) => {
+            runtime.pending_generation_admission.take();
+            admission
+        }
+    };
     Ok(Some(ServerGeometryCommit {
         commit: GeometryCommit {
             generation,
@@ -376,6 +439,7 @@ fn commit_server_geometry(
         },
         disposition: plan.disposition,
         previous: current,
+        admission,
     }))
 }
 
@@ -793,6 +857,7 @@ where
 
 struct FullBoundaryOutcome {
     dynamic_request: Option<ResolutionRequest>,
+    dynamic_timed_out: bool,
     incremental_sent: bool,
 }
 
@@ -853,8 +918,32 @@ where
         };
     Ok(FullBoundaryOutcome {
         dynamic_request: tick.dynamic_request,
+        dynamic_timed_out: tick.dynamic_timed_out,
         incremental_sent,
     })
+}
+
+fn reconcile_dynamic_generation_admission(
+    request: Option<ResolutionRequest>,
+    timed_out: bool,
+    new_admission: Option<PendingGenerationAdmission>,
+    pending_admission: &mut Option<PendingGenerationAdmission>,
+) -> Result<()> {
+    if timed_out {
+        pending_admission.take();
+    }
+    match (request, new_admission) {
+        (Some(request), Some(admission))
+            if request.target == admission.target
+                && request.generation.checked_add(1) == Some(admission.generation)
+                && pending_admission.is_none() =>
+        {
+            *pending_admission = Some(admission);
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => bail!("动态分辨率请求与 generation admission 生命周期不一致"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1691,14 +1780,24 @@ fn service_network_reader_tick(
     viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
     dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
     writer: &AppleWriterHandle,
+    protocol_runtime: &mut ProtocolRuntime,
+    publisher: &AppleSurfacePublisher,
     now: Instant,
 ) -> Result<ReaderTickOutcome> {
-    let size = current_surface_size(surface);
+    let (size, surface_generation) = {
+        let surface = surface.lock().unwrap();
+        (
+            DisplaySize::new(surface.width() as u16, surface.height() as u16)
+                .expect("DisplaySurface dimensions are non-zero u16 values"),
+            surface.generation,
+        )
+    };
     let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
     // 固定锁序：queue → runtime → Apple writer。surface 已在上方解锁。
     let mut queue = viewport_requests.lock().unwrap();
     let mut runtime = dynamic_resolution.lock().unwrap();
-    service_reader_tick_at(
+    let mut new_admission = None;
+    let outcome = service_reader_tick_at(
         receiver,
         requests,
         &mut queue,
@@ -1707,11 +1806,31 @@ fn service_network_reader_tick(
         thread::sleep,
         || send_encrypted(writer, &full),
         |target| {
+            let generation = surface_generation
+                .checked_add(1)
+                .context("动态分辨率 generation 溢出")?;
+            let pixel_size = PixelSize::new(target.width.into(), target.height.into())
+                .context("动态分辨率目标尺寸无效")?;
+            let admission = publisher
+                .admit_next_generation(protocol_runtime, generation, pixel_size)
+                .map_err(|error| anyhow::anyhow!(error.code()))?;
             let query = hpss::build_display_query(target);
             send_encrypted(writer, &query)?;
+            new_admission = Some(PendingGenerationAdmission {
+                target,
+                generation,
+                admission,
+            });
             Ok(Instant::now())
         },
-    )
+    )?;
+    reconcile_dynamic_generation_admission(
+        outcome.dynamic_request,
+        outcome.dynamic_timed_out,
+        new_admission,
+        &mut runtime.pending_generation_admission,
+    )?;
+    Ok(outcome)
 }
 
 #[allow(
@@ -1725,14 +1844,24 @@ fn finish_network_full_boundary(
     viewport_requests: &Arc<Mutex<ViewportRequestQueue>>,
     dynamic_resolution: &Arc<Mutex<DynamicResolutionRuntime>>,
     writer: &AppleWriterHandle,
+    protocol_runtime: &mut ProtocolRuntime,
+    publisher: &AppleSurfacePublisher,
     now: Instant,
 ) -> Result<FullBoundaryOutcome> {
-    let size = current_surface_size(surface);
+    let (size, surface_generation) = {
+        let surface = surface.lock().unwrap();
+        (
+            DisplaySize::new(surface.width() as u16, surface.height() as u16)
+                .expect("DisplaySurface dimensions are non-zero u16 values"),
+            surface.generation,
+        )
+    };
     let full = protocol::msg_fb_update_request(false, 0, 0, size.width, size.height)?;
     let incremental = incremental_request_after_full_apply(size.width, size.height)?;
     let mut queue = viewport_requests.lock().unwrap();
     let mut runtime = dynamic_resolution.lock().unwrap();
-    finish_full_boundary_at(
+    let mut new_admission = None;
+    let outcome = finish_full_boundary_at(
         receiver,
         requests,
         &mut queue,
@@ -1741,12 +1870,32 @@ fn finish_network_full_boundary(
         thread::sleep,
         || send_encrypted(writer, &full),
         |target| {
+            let generation = surface_generation
+                .checked_add(1)
+                .context("动态分辨率 generation 溢出")?;
+            let pixel_size = PixelSize::new(target.width.into(), target.height.into())
+                .context("动态分辨率目标尺寸无效")?;
+            let admission = publisher
+                .admit_next_generation(protocol_runtime, generation, pixel_size)
+                .map_err(|error| anyhow::anyhow!(error.code()))?;
             let query = hpss::build_display_query(target);
             send_encrypted(writer, &query)?;
+            new_admission = Some(PendingGenerationAdmission {
+                target,
+                generation,
+                admission,
+            });
             Ok(Instant::now())
         },
         || send_encrypted(writer, &incremental),
-    )
+    )?;
+    reconcile_dynamic_generation_admission(
+        outcome.dynamic_request,
+        outcome.dynamic_timed_out,
+        new_admission,
+        &mut runtime.pending_generation_admission,
+    )?;
+    Ok(outcome)
 }
 
 fn log_reader_tick(outcome: &ReaderTickOutcome) {
@@ -1868,6 +2017,8 @@ fn handle_complete_mvs_record(
             viewport_requests,
             dynamic_resolution,
             writer,
+            protocol_runtime,
+            publisher,
             Instant::now(),
         )?;
         if let Some(request) = boundary.dynamic_request {
@@ -1908,6 +2059,7 @@ pub(crate) struct NetworkReaderRuntime {
     viewport_requests: Arc<Mutex<ViewportRequestQueue>>,
     dynamic_resolution: Arc<Mutex<DynamicResolutionRuntime>>,
     publisher: AppleSurfacePublisher,
+    initial_admission: Option<GenerationAdmission>,
     startup_gate: HighPerformanceStartupGate,
     initial_full_sent_at: Instant,
     dynamic_resolution_enabled: bool,
@@ -1915,12 +2067,69 @@ pub(crate) struct NetworkReaderRuntime {
 }
 
 impl NetworkReaderRuntime {
+    pub(crate) fn admit_initial_generation(
+        protocol_runtime: &mut ProtocolRuntime,
+        session_id: frd_core::SessionId,
+        initial_size: DisplaySize,
+    ) -> Result<GenerationAdmission, ProtocolError> {
+        let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
+            .ok_or(ProtocolError::FramePortRejected)?;
+        AppleSurfacePublisher::pending(session_id).admit_initial_generation(protocol_runtime, size)
+    }
+
+    pub(crate) fn new_admitted(
+        session_id: frd_core::SessionId,
+        initial_size: DisplaySize,
+        dynamic_resolution_enabled: bool,
+        startup_gate_origin: Instant,
+        initial_full_sent_at: Instant,
+        initial_admission: GenerationAdmission,
+    ) -> Result<Self, ProtocolError> {
+        let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
+            .ok_or(ProtocolError::FramePortRejected)?;
+        let generation = 1;
+        if initial_admission.session_id() != session_id
+            || initial_admission.generation() != generation
+            || initial_admission.size() != size
+            || initial_admission.format() != PixelFormat::Bgrx8UnormSrgb
+        {
+            return Err(ProtocolError::InvalidGeneration);
+        }
+        Self::build(
+            session_id,
+            initial_size,
+            dynamic_resolution_enabled,
+            startup_gate_origin,
+            initial_full_sent_at,
+            Some(initial_admission),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         session_id: frd_core::SessionId,
         initial_size: DisplaySize,
         dynamic_resolution_enabled: bool,
         startup_gate_origin: Instant,
         initial_full_sent_at: Instant,
+    ) -> Result<Self, ProtocolError> {
+        Self::build(
+            session_id,
+            initial_size,
+            dynamic_resolution_enabled,
+            startup_gate_origin,
+            initial_full_sent_at,
+            None,
+        )
+    }
+
+    fn build(
+        session_id: frd_core::SessionId,
+        initial_size: DisplaySize,
+        dynamic_resolution_enabled: bool,
+        startup_gate_origin: Instant,
+        initial_full_sent_at: Instant,
+        initial_admission: Option<GenerationAdmission>,
     ) -> Result<Self, ProtocolError> {
         let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
             .ok_or(ProtocolError::FramePortRejected)?;
@@ -1938,6 +2147,7 @@ impl NetworkReaderRuntime {
                 dynamic_resolution_enabled,
             ))),
             publisher,
+            initial_admission,
             startup_gate: HighPerformanceStartupGate::new(startup_gate_origin),
             initial_full_sent_at,
             dynamic_resolution_enabled,
@@ -1994,7 +2204,12 @@ impl NetworkReaderRuntime {
         Ok(())
     }
 
-    pub(crate) fn service_tick(&mut self, writer: &AppleWriterHandle, now: Instant) -> Result<()> {
+    pub(crate) fn service_tick(
+        &mut self,
+        writer: &AppleWriterHandle,
+        protocol_runtime: &mut ProtocolRuntime,
+        now: Instant,
+    ) -> Result<()> {
         if !self.publisher.is_active() {
             if !self.startup_gate.is_awaiting() {
                 return Err(HighPerformanceUnavailable.into());
@@ -2009,6 +2224,8 @@ impl NetworkReaderRuntime {
             &self.viewport_requests,
             &self.dynamic_resolution,
             writer,
+            protocol_runtime,
+            &self.publisher,
             now,
         )?;
         log_reader_tick(&outcome);
@@ -2037,12 +2254,17 @@ impl NetworkReaderRuntime {
         W: FnMut(&[u8]) -> Result<()>,
         C: FnOnce() -> Instant,
     {
-        let confirmation = match self
-            .startup_gate
-            .observe_server_state_at(geometry, observed_at)?
+        let mut prepared_startup_gate = self.startup_gate.clone();
+        let observation = match prepared_startup_gate.observe_server_state_at(geometry, observed_at)
         {
-            HighPerformanceObservation::Confirmed(_) => self
-                .startup_gate
+            Ok(observation) => observation,
+            Err(error) => {
+                self.startup_gate = prepared_startup_gate;
+                return Err(error.into());
+            }
+        };
+        let confirmation = match observation {
+            HighPerformanceObservation::Confirmed(_) => prepared_startup_gate
                 .confirmation()
                 .ok_or(HighPerformanceUnavailable)?,
             HighPerformanceObservation::Duplicate if self.publisher.is_active() => {
@@ -2055,6 +2277,20 @@ impl NetworkReaderRuntime {
         let size = confirmation.size;
         let pixel_size = PixelSize::new(size.width.into(), size.height.into())
             .ok_or(HighPerformanceUnavailable)?;
+        let admission_source = match self.initial_admission.as_ref() {
+            Some(admission)
+                if admission.generation() == 1
+                    && admission.size() == pixel_size
+                    && admission.format() == PixelFormat::Bgrx8UnormSrgb =>
+            {
+                InitialGenerationAdmission::Existing
+            }
+            Some(_) | None => InitialGenerationAdmission::Replacement(
+                self.publisher
+                    .admit_initial_generation(protocol_runtime, pixel_size)
+                    .map_err(|error| anyhow::anyhow!(error.code()))?,
+            ),
+        };
         let prepared_receiver = MvsReceiveState::new(1);
         let prepared_surface =
             DisplaySurface::new(1, pixel_size).map_err(|_| HighPerformanceUnavailable)?;
@@ -2072,13 +2308,24 @@ impl NetworkReaderRuntime {
             completed_at,
         )?;
         prepared_dynamic.observe_initial_server_state(size, size);
+        let admission = match admission_source {
+            InitialGenerationAdmission::Existing => self
+                .initial_admission
+                .take()
+                .expect("已验证的 initial generation admission 必须仍存在"),
+            InitialGenerationAdmission::Replacement(admission) => {
+                self.initial_admission.take();
+                admission
+            }
+        };
+        self.startup_gate = prepared_startup_gate;
         self.receiver = prepared_receiver;
         self.requests = prepared_requests;
         self.surface = Arc::new(Mutex::new(prepared_surface));
         self.viewport_requests = Arc::new(Mutex::new(prepared_viewport));
         self.dynamic_resolution = Arc::new(Mutex::new(prepared_dynamic));
         self.publisher
-            .activate_initial_generation(protocol_runtime, pixel_size)
+            .activate_admitted_initial_generation(protocol_runtime, admission)
             .map_err(|error| anyhow::anyhow!(error.code()))?;
         Ok(NetworkFrameOutcome::HighPerformanceConfirmed { size })
     }
@@ -2112,9 +2359,13 @@ impl NetworkReaderRuntime {
     ) -> Result<NetworkFrameOutcome> {
         let parsed_media = parse_media(&message);
         if !self.publisher.is_active() && is_server_state_envelope_encoding_candidate(&message) {
-            self.receiver.abort_assembly();
-            let geometry = hpss::parse_server_state_geometry(&message)
-                .map_err(|_| HighPerformanceUnavailable)?;
+            let geometry = match hpss::parse_server_state_geometry(&message) {
+                Ok(geometry) => geometry,
+                Err(_) => {
+                    self.receiver.abort_assembly();
+                    return Err(HighPerformanceUnavailable.into());
+                }
+            };
             self.ensure_server_state_generation_coherence(media_state)?;
             return self.confirm_high_performance_at_with(
                 geometry,
@@ -2241,6 +2492,8 @@ impl NetworkReaderRuntime {
                                 &mut self.receiver,
                                 &mut surface,
                                 media_state,
+                                protocol_runtime,
+                                &self.publisher,
                                 observed,
                                 before_generation_commit,
                             )?
@@ -2249,6 +2502,7 @@ impl NetworkReaderRuntime {
                             commit,
                             disposition,
                             previous,
+                            admission,
                         }) = commit
                         {
                             eprintln!(
@@ -2263,11 +2517,8 @@ impl NetworkReaderRuntime {
                             if disposition == ServerGeometryDisposition::ServerInitiated {
                                 self.viewport_requests.lock().unwrap().drop_latest();
                             }
-                            let size =
-                                PixelSize::new(commit.size.width.into(), commit.size.height.into())
-                                    .context("动态分辨率确认尺寸非法")?;
                             self.publisher
-                                .begin_next_generation(protocol_runtime, commit.generation, size)
+                                .begin_admitted_next_generation(protocol_runtime, admission)
                                 .map_err(|error| anyhow::anyhow!(error.code()))?;
                             self.requests.reset_generation(commit.generation);
                             request_full_update(
@@ -2518,6 +2769,38 @@ mod migrated_runtime_tests {
             Box::new(TracingProtocolWake(trace.clone())),
         );
         (runtime, trace)
+    }
+
+    fn mailbox_protocol_runtime(
+        session_id: frd_core::SessionId,
+        pixel_budget: usize,
+    ) -> (
+        ProtocolRuntime,
+        Arc<Mutex<frd_frame::FrameMailbox>>,
+        Arc<ProtocolTrace>,
+    ) {
+        let trace = Arc::new(ProtocolTrace::default());
+        let mailbox = Arc::new(Mutex::new(frd_frame::FrameMailbox::new(8, pixel_budget)));
+        let (_commands, command_rx) = std::sync::mpsc::channel();
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(TracingProtocolEvents(trace.clone())),
+            Box::new(frd_protocol_api::MailboxSurfacePublisher::new(
+                mailbox.clone(),
+            )),
+            None,
+            Box::new(TracingProtocolWake(trace.clone())),
+        );
+        (runtime, mailbox, trace)
+    }
+
+    fn active_protocol_publisher(size: PixelSize) -> (ProtocolRuntime, AppleSurfacePublisher) {
+        let session_id = frd_core::SessionId::allocate();
+        let (mut protocol_runtime, _) = traced_protocol_runtime(session_id);
+        let publisher = AppleSurfacePublisher::begin(&mut protocol_runtime, session_id, size)
+            .expect("initial generation publication succeeds");
+        (protocol_runtime, publisher)
     }
 
     fn socket_writer() -> (
@@ -2778,7 +3061,11 @@ mod migrated_runtime_tests {
             )
             .unwrap();
         reader
-            .service_tick(&writer, requested_at + Duration::from_secs(3))
+            .service_tick(
+                &writer,
+                &mut protocol_runtime,
+                requested_at + Duration::from_secs(3),
+            )
             .unwrap();
         assert!(reader.receiver.is_pending());
         assert_eq!(reader.receiver.awaiting_full(), awaiting_full_before);
@@ -3040,6 +3327,104 @@ mod migrated_runtime_tests {
     }
 
     #[test]
+    fn high_performance_confirmation_rejects_actual_port_capacity_before_write_or_state_replacement(
+    ) {
+        use std::io::Read as _;
+
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(64, 64).unwrap();
+        let oversized = DisplaySize::new(72, 64).unwrap();
+        let (mut protocol_runtime, mailbox, trace) =
+            mailbox_protocol_runtime(session_id, 64 * 64 * 4);
+        let initial_admission = NetworkReaderRuntime::admit_initial_generation(
+            &mut protocol_runtime,
+            session_id,
+            initial,
+        )
+        .unwrap();
+        reset_display_surface_allocation_count();
+        let mut reader = NetworkReaderRuntime::new_admitted(
+            session_id,
+            initial,
+            false,
+            requested_at,
+            requested_at,
+            initial_admission,
+        )
+        .unwrap();
+        let allocations_before = display_surface_allocation_count();
+        let (_connection, writer, mut peer) = socket_writer();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut media = test_media_state();
+        let release_calls = std::cell::Cell::new(0usize);
+        let mut before_generation_commit = || {
+            release_calls.set(release_calls.get() + 1);
+            Ok(())
+        };
+        let partial = MvsRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        reader
+            .handle_frame_at(
+                mvs_message(partial, 2, &[0]),
+                &writer,
+                &mut media,
+                &mut protocol_runtime,
+                &mut before_generation_commit,
+                requested_at + Duration::from_millis(500),
+            )
+            .unwrap();
+        assert!(reader.receiver.is_pending());
+        let incomplete_since_before = reader.receiver.incomplete_since;
+
+        let error = expect_network_frame_error(reader.handle_frame_at(
+            server_state_message(oversized),
+            &writer,
+            &mut media,
+            &mut protocol_runtime,
+            &mut before_generation_commit,
+            requested_at + Duration::from_secs(1),
+        ));
+
+        assert_eq!(error.to_string(), "surface_capacity_exceeded");
+        assert!(protocol_runtime.requires_shutdown());
+        assert_eq!(
+            release_calls.get(),
+            0,
+            "容量拒绝前不得进入 generation commit"
+        );
+        assert!(!reader.publisher.is_active());
+        assert!(reader.startup_gate.is_awaiting());
+        assert!(reader.initial_admission.is_some());
+        assert_eq!(reader.receiver.generation, 1);
+        assert!(reader.receiver.is_pending(), "容量拒绝不得清空未完成 MVS");
+        assert_eq!(reader.receiver.incomplete_since, incomplete_since_before);
+        assert_eq!(reader.requests.generation, 1);
+        assert_eq!(display_surface_allocation_count(), allocations_before);
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!(surface.generation, 1);
+        assert_eq!((surface.width(), surface.height()), (64, 64));
+        drop(surface);
+        assert!(trace.entries.lock().unwrap().is_empty());
+        assert!(mailbox.lock().unwrap().is_empty());
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
     fn pending_viewport_is_never_queued_or_replayed_by_confirmation() {
         let session_id = frd_core::SessionId::allocate();
         let requested_at = Instant::now();
@@ -3166,14 +3551,18 @@ mod migrated_runtime_tests {
         let session_id = frd_core::SessionId::allocate();
         let requested_at = Instant::now();
         let initial = DisplaySize::new(8, 8).unwrap();
-        let (_protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
         let mut reader =
             NetworkReaderRuntime::new(session_id, initial, false, requested_at, requested_at)
                 .unwrap();
         let (_connection, writer, _) = socket_writer();
 
         let error = reader
-            .service_tick(&writer, requested_at + Duration::from_secs(5))
+            .service_tick(
+                &writer,
+                &mut protocol_runtime,
+                requested_at + Duration::from_secs(5),
+            )
             .unwrap_err();
         assert_eq!(
             error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
@@ -3493,11 +3882,38 @@ mod migrated_runtime_tests {
         {
             let mut dynamic = reader.dynamic_resolution.lock().unwrap();
             arm_runtime(&mut dynamic, initial, false);
-            dynamic
-                .send_target_with(target, |_| Ok(Instant::now()))
-                .unwrap()
-                .unwrap();
         }
+        reader.requests.consume_mvs_response();
+        let viewport = PhysicalViewport::new(
+            PixelSize::new(target.width.into(), target.height.into()).unwrap(),
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: target.width.into(),
+                height: target.height.into(),
+            },
+            PixelSize::new(initial.width.into(), initial.height.into()).unwrap(),
+        )
+        .unwrap();
+        let viewport_observed_at = requested_at + Duration::from_secs(2);
+        reader.observe_viewport(viewport, viewport_observed_at);
+        reader
+            .service_tick(
+                &writer,
+                &mut protocol_runtime,
+                viewport_observed_at + Duration::from_millis(250),
+            )
+            .unwrap();
+        assert!(reader
+            .dynamic_resolution
+            .lock()
+            .unwrap()
+            .pending_generation_admission
+            .is_some());
+        let expected_query = hpss::build_display_query(target);
+        let mut query = vec![0u8; expected_query.len()];
+        peer.read_exact(&mut query).unwrap();
+        assert_eq!(query, expected_query);
         let mut media = ViewerMediaState::new(
             crate::media_negotiation::AudioMediaFlow::MacToPc,
             1,
@@ -3638,6 +4054,8 @@ mod migrated_runtime_tests {
             "127.0.0.1".parse().unwrap(),
         )
         .unwrap();
+        let (mut protocol_runtime, publisher) =
+            active_protocol_publisher(PixelSize::new(1440, 2560).unwrap());
 
         assert_eq!(
             commit_server_geometry(
@@ -3645,6 +4063,8 @@ mod migrated_runtime_tests {
                 &mut receiver,
                 &mut surface,
                 &mut media,
+                &mut protocol_runtime,
+                &publisher,
                 server_initiated,
                 || Ok(()),
             )
@@ -3738,12 +4158,16 @@ mod migrated_runtime_tests {
             "127.0.0.1".parse().unwrap(),
         )
         .unwrap();
+        let (mut protocol_runtime, publisher) =
+            active_protocol_publisher(PixelSize::new(1440, 2560).unwrap());
 
         let error = match commit_server_geometry(
             &mut runtime,
             &mut receiver,
             &mut surface,
             &mut media,
+            &mut protocol_runtime,
+            &publisher,
             server_initiated,
             || Err(anyhow::anyhow!("injected ReleaseAll failure")),
         ) {
@@ -3778,6 +4202,8 @@ mod migrated_runtime_tests {
             "127.0.0.1".parse().unwrap(),
         )
         .unwrap();
+        let (mut protocol_runtime, publisher) =
+            active_protocol_publisher(PixelSize::new(1440, 2560).unwrap());
         let mut releases = 0usize;
 
         assert!(commit_server_geometry(
@@ -3785,6 +4211,8 @@ mod migrated_runtime_tests {
             &mut receiver,
             &mut surface,
             &mut media,
+            &mut protocol_runtime,
+            &publisher,
             size,
             || {
                 releases += 1;
@@ -3797,6 +4225,231 @@ mod migrated_runtime_tests {
         assert_eq!(surface.generation, 1);
         assert_eq!((surface.width(), surface.height()), (1440, 2560));
         assert_eq!(receiver.generation, 1);
+    }
+
+    #[test]
+    fn active_server_geometry_rejects_actual_port_capacity_before_transition_or_full_request() {
+        use std::io::Read as _;
+
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(1, 1).unwrap();
+        let oversized = DisplaySize::new(3, 2).unwrap();
+        let (mut protocol_runtime, mailbox, trace) = mailbox_protocol_runtime(session_id, 16);
+        let initial_admission = NetworkReaderRuntime::admit_initial_generation(
+            &mut protocol_runtime,
+            session_id,
+            initial,
+        )
+        .unwrap();
+        reset_display_surface_allocation_count();
+        let mut reader = NetworkReaderRuntime::new_admitted(
+            session_id,
+            initial,
+            false,
+            requested_at,
+            requested_at,
+            initial_admission,
+        )
+        .unwrap();
+        reader
+            .confirm_high_performance_at_with(
+                hpss::parse_server_state_geometry(&server_state_message(initial)).unwrap(),
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| Ok(()),
+                Instant::now,
+            )
+            .unwrap();
+        assert!(matches!(
+            mailbox.lock().unwrap().pop(),
+            Some(frd_frame::SurfaceUpdate::Reset { generation: 1, .. })
+        ));
+        trace.entries.lock().unwrap().clear();
+
+        let (_connection, writer, mut peer) = socket_writer();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut media = test_media_state();
+        let releases = std::cell::Cell::new(0usize);
+        let mut before_generation_commit = || {
+            releases.set(releases.get() + 1);
+            Ok(())
+        };
+        let dynamic_before = {
+            let dynamic = reader.dynamic_resolution.lock().unwrap();
+            (
+                dynamic.controller.state().clone(),
+                dynamic.pending_since,
+                dynamic.armed,
+                dynamic.pending_generation_admission.is_some(),
+            )
+        };
+        let allocations_before = display_surface_allocation_count();
+
+        let error = expect_network_frame_error(reader.handle_frame_at(
+            server_state_message(oversized),
+            &writer,
+            &mut media,
+            &mut protocol_runtime,
+            &mut before_generation_commit,
+            requested_at + Duration::from_secs(2),
+        ));
+
+        assert_eq!(error.to_string(), "surface_capacity_exceeded");
+        assert!(protocol_runtime.requires_shutdown());
+        assert_eq!(releases.get(), 0, "容量拒绝前不得进入 generation commit");
+        assert_eq!(reader.publisher.generation(), 1);
+        assert_eq!(reader.receiver.generation, 1);
+        assert_eq!(reader.requests.generation, 1);
+        assert_eq!(media.generation(), 1);
+        assert_eq!(display_surface_allocation_count(), allocations_before);
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!(surface.generation, 1);
+        assert_eq!((surface.width(), surface.height()), (1, 1));
+        drop(surface);
+        let dynamic_after = {
+            let dynamic = reader.dynamic_resolution.lock().unwrap();
+            (
+                dynamic.controller.state().clone(),
+                dynamic.pending_since,
+                dynamic.armed,
+                dynamic.pending_generation_admission.is_some(),
+            )
+        };
+        assert_eq!(dynamic_after, dynamic_before);
+        assert!(trace.entries.lock().unwrap().is_empty());
+        assert!(mailbox.lock().unwrap().is_empty());
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn dynamic_viewport_rejects_actual_port_capacity_before_wire_or_pending_state() {
+        use std::io::Read as _;
+
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(64, 64).unwrap();
+        let oversized = DisplaySize::new(72, 64).unwrap();
+        let (mut protocol_runtime, mailbox, trace) =
+            mailbox_protocol_runtime(session_id, 64 * 64 * 4);
+        let initial_admission = NetworkReaderRuntime::admit_initial_generation(
+            &mut protocol_runtime,
+            session_id,
+            initial,
+        )
+        .unwrap();
+        reset_display_surface_allocation_count();
+        let mut reader = NetworkReaderRuntime::new_admitted(
+            session_id,
+            initial,
+            true,
+            requested_at,
+            requested_at,
+            initial_admission,
+        )
+        .unwrap();
+        reader
+            .confirm_high_performance_at_with(
+                hpss::parse_server_state_geometry(&server_state_message(initial)).unwrap(),
+                requested_at + Duration::from_secs(1),
+                &mut protocol_runtime,
+                |_| {},
+                |_| Ok(()),
+                Instant::now,
+            )
+            .unwrap();
+        assert!(matches!(
+            mailbox.lock().unwrap().pop(),
+            Some(frd_frame::SurfaceUpdate::Reset { generation: 1, .. })
+        ));
+        trace.entries.lock().unwrap().clear();
+        reader.requests.consume_mvs_response();
+        {
+            let mut dynamic = reader.dynamic_resolution.lock().unwrap();
+            assert!(dynamic.observe_full_applied(1, initial));
+        }
+        let viewport = PhysicalViewport::new(
+            PixelSize::new(oversized.width.into(), oversized.height.into()).unwrap(),
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: oversized.width.into(),
+                height: oversized.height.into(),
+            },
+            PixelSize::new(initial.width.into(), initial.height.into()).unwrap(),
+        )
+        .unwrap();
+        let observed_at = requested_at + Duration::from_secs(2);
+        reader.observe_viewport(viewport, observed_at);
+        let dynamic_before = {
+            let dynamic = reader.dynamic_resolution.lock().unwrap();
+            (
+                dynamic.controller.state().clone(),
+                dynamic.pending_since,
+                dynamic.armed,
+                dynamic.pending_generation_admission.is_some(),
+            )
+        };
+        let allocations_before = display_surface_allocation_count();
+        let (_connection, writer, mut peer) = socket_writer();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let error = reader
+            .service_tick(
+                &writer,
+                &mut protocol_runtime,
+                observed_at + Duration::from_millis(250),
+            )
+            .expect_err("超出实际 frame port 的 viewport 必须在写网前失败");
+
+        assert_eq!(error.to_string(), "surface_capacity_exceeded");
+        assert!(protocol_runtime.requires_shutdown());
+        assert_eq!(reader.publisher.generation(), 1);
+        assert_eq!(reader.receiver.generation, 1);
+        assert_eq!(reader.requests.generation, 1);
+        assert_eq!(display_surface_allocation_count(), allocations_before);
+        let surface = reader.surface.lock().unwrap();
+        assert_eq!(surface.generation, 1);
+        assert_eq!((surface.width(), surface.height()), (64, 64));
+        drop(surface);
+        let dynamic_after = {
+            let dynamic = reader.dynamic_resolution.lock().unwrap();
+            (
+                dynamic.controller.state().clone(),
+                dynamic.pending_since,
+                dynamic.armed,
+                dynamic.pending_generation_admission.is_some(),
+            )
+        };
+        assert_eq!(dynamic_after, dynamic_before);
+        assert_eq!(
+            reader.viewport_requests.lock().unwrap().latest,
+            Some((oversized, observed_at))
+        );
+        assert!(trace.entries.lock().unwrap().is_empty());
+        assert!(mailbox.lock().unwrap().is_empty());
+        let mut byte = [0u8; 1];
+        assert!(matches!(
+            peer.read(&mut byte),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        writer.shutdown().unwrap();
     }
 
     #[test]

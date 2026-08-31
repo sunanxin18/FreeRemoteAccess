@@ -554,7 +554,41 @@ impl SurfacePublisher for MailboxSurfacePublisher {
     }
 }
 
+/// 一次无副作用的 generation 端口准入结果。
+///
+/// 字段保持私有，且该值不可复制；只有完成准入的同一个 `ProtocolRuntime`
+/// 才能消费它。协议适配器可在分配解码 surface 或发送几何相关请求前取得
+/// admission，随后用同一份尺寸、像素格式与 frame port 契约提交 Startup。
+#[derive(Debug)]
+pub struct GenerationAdmission {
+    runtime_identity: Arc<()>,
+    previous_generation: Option<u64>,
+    session_id: SessionId,
+    generation: u64,
+    size: PixelSize,
+    format: PixelFormat,
+}
+
+impl GenerationAdmission {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn size(&self) -> PixelSize {
+        self.size
+    }
+
+    pub fn format(&self) -> PixelFormat {
+        self.format
+    }
+}
+
 pub struct ProtocolRuntime {
+    runtime_identity: Arc<()>,
     session_id: SessionId,
     current_generation: Option<u64>,
     commands: Receiver<SessionCommand>,
@@ -575,6 +609,7 @@ impl ProtocolRuntime {
         wake: Box<dyn RuntimeWake>,
     ) -> Self {
         Self {
+            runtime_identity: Arc::new(()),
             session_id,
             current_generation: None,
             commands,
@@ -596,15 +631,17 @@ impl ProtocolRuntime {
         Self::new(session_id, commands, events, frames, None, wake)
     }
 
-    /// 按 event、Reset、单次 wake 的顺序发布新的 generation。
-    /// 任一端口失败后进入终态；不会伪称回滚已发布的 event/Reset。
-    pub fn begin_generation(
+    /// 对新的 generation 做无副作用 frame-port 准入。
+    ///
+    /// 端口拒绝会立即令 runtime 进入终态；成功只返回绑定当前 runtime 与
+    /// generation 状态的 opaque admission，不发布 event、Reset 或 wake。
+    pub fn admit_generation(
         &mut self,
         session_id: SessionId,
         generation: u64,
         size: frd_core::PixelSize,
         format: PixelFormat,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<GenerationAdmission, ProtocolError> {
         if self.terminal {
             return Err(ProtocolError::Terminal);
         }
@@ -620,19 +657,48 @@ impl ProtocolRuntime {
             self.poison();
             return Err(error);
         }
-        if let Err(error) = self.events.publish(SessionEvent::SurfaceGenerationChanged {
+        Ok(GenerationAdmission {
+            runtime_identity: self.runtime_identity.clone(),
+            previous_generation: self.current_generation,
             session_id,
             generation,
             size,
+            format,
+        })
+    }
+
+    /// 按 event、Reset、单次 wake 的顺序消费一次准入并发布 generation。
+    /// 任一端口失败后进入终态；不会伪称回滚已发布的 event/Reset。
+    pub fn begin_admitted_generation(
+        &mut self,
+        admission: GenerationAdmission,
+    ) -> Result<(), ProtocolError> {
+        if self.terminal {
+            return Err(ProtocolError::Terminal);
+        }
+        if !Arc::ptr_eq(&admission.runtime_identity, &self.runtime_identity)
+            || admission.session_id != self.session_id
+            || admission.previous_generation != self.current_generation
+            || admission.generation == 0
+            || self
+                .current_generation
+                .is_some_and(|current| admission.generation <= current)
+        {
+            return Err(ProtocolError::InvalidGeneration);
+        }
+        if let Err(error) = self.events.publish(SessionEvent::SurfaceGenerationChanged {
+            session_id: admission.session_id,
+            generation: admission.generation,
+            size: admission.size,
         }) {
             self.poison();
             return Err(error);
         }
         if let Err(error) = self.frames.publish(SurfaceUpdate::Reset {
-            session_id,
-            generation,
-            size,
-            format,
+            session_id: admission.session_id,
+            generation: admission.generation,
+            size: admission.size,
+            format: admission.format,
         }) {
             self.poison();
             return Err(error);
@@ -641,8 +707,21 @@ impl ProtocolRuntime {
             self.poison();
             return Err(error);
         }
-        self.current_generation = Some(generation);
+        self.current_generation = Some(admission.generation);
         Ok(())
+    }
+
+    /// 准入与发布的兼容入口。需要在昂贵准备之前 fail-closed 的适配器应显式
+    /// 使用 `admit_generation` / `begin_admitted_generation` 两阶段契约。
+    pub fn begin_generation(
+        &mut self,
+        session_id: SessionId,
+        generation: u64,
+        size: frd_core::PixelSize,
+        format: PixelFormat,
+    ) -> Result<(), ProtocolError> {
+        let admission = self.admit_generation(session_id, generation, size, format)?;
+        self.begin_admitted_generation(admission)
     }
 
     /// `true` 时 `ProtocolSession::run` / coordinator 必须关闭并 join 该会话。
@@ -888,6 +967,78 @@ mod tests {
             *log.lock().expect("log lock"),
             vec!["event", "reset", "wake"]
         );
+    }
+
+    #[test]
+    fn generation_admission_defers_publication_and_commits_the_exact_contract() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(800, 600).expect("valid size");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(RecordingEvents(log.clone())),
+            Box::new(RecordingFrames(log.clone())),
+            Box::new(RecordingWake(log.clone())),
+        );
+
+        let admission = runtime
+            .admit_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)
+            .expect("preflight accepts generation");
+
+        assert!(log.lock().expect("log lock").is_empty());
+        assert_eq!(admission.session_id(), session_id);
+        assert_eq!(admission.generation(), 1);
+        assert_eq!(admission.size(), size);
+        assert_eq!(admission.format(), PixelFormat::Bgrx8UnormSrgb);
+        runtime
+            .begin_admitted_generation(admission)
+            .expect("admitted generation commits");
+        assert_eq!(
+            *log.lock().expect("log lock"),
+            vec!["event", "reset", "wake"]
+        );
+    }
+
+    #[test]
+    fn generation_admission_cannot_cross_runtime_or_outlive_generation_state() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(800, 600).expect("valid size");
+        let first_log = Arc::new(Mutex::new(Vec::new()));
+        let second_log = Arc::new(Mutex::new(Vec::new()));
+        let mut first = ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(RecordingEvents(first_log.clone())),
+            Box::new(RecordingFrames(first_log.clone())),
+            Box::new(RecordingWake(first_log.clone())),
+        );
+        let mut second = ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(RecordingEvents(second_log.clone())),
+            Box::new(RecordingFrames(second_log.clone())),
+            Box::new(RecordingWake(second_log.clone())),
+        );
+
+        let foreign = first
+            .admit_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)
+            .unwrap();
+        assert_eq!(
+            second.begin_admitted_generation(foreign),
+            Err(ProtocolError::InvalidGeneration)
+        );
+        assert!(first_log.lock().unwrap().is_empty());
+        assert!(second_log.lock().unwrap().is_empty());
+
+        let stale = first
+            .admit_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)
+            .unwrap();
+        first
+            .begin_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)
+            .unwrap();
+        assert_eq!(
+            first.begin_admitted_generation(stale),
+            Err(ProtocolError::InvalidGeneration)
+        );
+        assert_eq!(*first_log.lock().unwrap(), vec!["event", "reset", "wake"]);
     }
 
     #[test]

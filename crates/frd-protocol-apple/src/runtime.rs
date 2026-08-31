@@ -481,7 +481,9 @@ fn run_authenticated_session_inner(
     if !connection.is_encrypted() {
         return Err(HighPerformanceUnavailable.into());
     }
-
+    let initial_admission =
+        NetworkReaderRuntime::admit_initial_generation(&mut runtime, session_id, initial_size)
+            .map_err(|error| anyhow::anyhow!(error.code()))?;
     // Same verified startup ordering and timing as the legacy HPSS viewer.
     std::thread::sleep(Duration::from_millis(200));
     preserve_startup_transport_error(
@@ -507,12 +509,13 @@ fn run_authenticated_session_inner(
     let writer = connection.writer_handle()?;
 
     let mut media = ViewerMediaState::new(audio_flow, 1, media_server_address)?;
-    let mut reader = NetworkReaderRuntime::new(
+    let mut reader = NetworkReaderRuntime::new_admitted(
         session_id,
         initial_size,
         dynamic_resolution_enabled,
         startup_gate_origin,
         initial_full_sent_at,
+        initial_admission,
     )
     .map_err(|error| anyhow::anyhow!(error.code()))?;
     let mut pointer = PointerWireState::default();
@@ -557,7 +560,7 @@ fn run_authenticated_session_inner(
             if reader.is_high_performance_confirmed() {
                 media.service_active(&mut runtime, reader.generation(), now)?;
             }
-            reader.service_tick(&writer, now)?;
+            reader.service_tick(&writer, &mut runtime, now)?;
 
             let message = match connection.read_app_frame_step() {
                 Ok(Some(message)) => message,
@@ -669,14 +672,14 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Mutex,
+        mpsc, Arc, Mutex,
     };
     use std::thread;
     use std::time::{Duration, Instant};
 
     use frd_protocol_api::{
-        ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand,
-        SessionEvent, SurfacePublisher,
+        MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
+        SessionCommand, SessionEvent, SurfacePublisher,
     };
 
     struct NoopWake;
@@ -1312,6 +1315,62 @@ mod tests {
     impl SurfacePublisher for RecordingFrames {
         fn publish(&self, update: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
             self.0.send(update).map_err(|_| ProtocolError::Terminal)
+        }
+    }
+
+    #[test]
+    fn production_startup_rejects_actual_surface_capacity_before_any_wire_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut connection = crate::AppleConnection::new(client);
+        connection
+            .set_crypto(crate::session::SessionCrypto::from_key_iv(
+                [0x31; 16], [0x42; 16],
+            ))
+            .unwrap();
+
+        let session_id = frd_core::SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::channel();
+        let mailbox = Arc::new(Mutex::new(frd_frame::FrameMailbox::new(8, 12)));
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events_tx)),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+
+        let exit = super::run_established_hpss_session(
+            connection,
+            "surface-capacity-test".to_owned(),
+            frd_core::PixelSize::new(2, 2).unwrap(),
+            runtime,
+            session_id,
+            false,
+            crate::media_negotiation::AudioMediaFlow::MacToPc,
+        );
+
+        assert!(matches!(
+            exit,
+            frd_protocol_api::ProtocolExit::Failed(ref error)
+                if error.code() == super::APPLE_RUNTIME_FAILED
+        ));
+        assert!(mailbox.lock().unwrap().is_empty());
+        assert!(events_rx.try_iter().next().is_none());
+        let mut byte = [0u8; 1];
+        match peer.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            other => panic!("容量拒绝前写出了 wire 数据: {other:?}"),
         }
     }
 
