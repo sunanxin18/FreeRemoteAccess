@@ -1,6 +1,11 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod cli;
 
-use std::{io::Write, process::ExitCode, sync::Arc};
+use std::{process::ExitCode, sync::Arc};
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+use std::io::Write;
 
 use clap::{error::ErrorKind, Parser};
 use frd_app::{AppLaunch, ProductPolicy};
@@ -19,6 +24,10 @@ use frd_protocol_rdp::RdpProtocolFactory;
 use frd_shell_desktop::{
     AudioOutputFactory, DesktopApplication, DesktopPlatformStores, DesktopUserEvent,
     DesktopWindowConfiguration, FatalComponent, FatalOperation, FatalReason, FatalReport,
+};
+#[cfg(all(windows, not(debug_assertions)))]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -260,9 +269,32 @@ fn runner_decision(outcome: RunnerOutcome) -> RunnerDecision {
 fn emit_runner_outcome(outcome: RunnerOutcome) -> ExitCode {
     let decision = runner_decision(outcome);
     if let Some(line) = decision.stderr {
-        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        emit_fatal_report(&line);
     }
     decision.exit_code
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn emit_fatal_report(line: &str) {
+    let text = line.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let title = "FreeRemoteDesk 启动失败"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn emit_fatal_report(line: &str) {
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 #[cfg(test)]
