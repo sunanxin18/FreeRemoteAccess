@@ -97,7 +97,7 @@ process 数值规范与逐秒 CPU delta，并隐藏后台 PowerShell 窗口；`2
 `43db868` 的 42,283,520 B / `AFDB...AE69` 只是先前离线闭包构建，不能冒充
 当前最终构建或替换上述采样哈希。`183b99d` 把 Windows Release 改为 GUI subsystem，
 正常启动不再附带 console，fatal 由原生错误对话框显示。当前离线闭包 Release 为
-42,291,712 B，SHA-256 `3A679F998E3A7DBD1EF2EAC6D0DAF442A653021A8EB4F6B245D52178144CC345`，
+42,292,736 B，SHA-256 `21D307C64C6C153F4592FD1B1DC0C20856868F6DE239EDDD8DE087B6B894F6FC`，
 PE subsystem 2；这是构建证据，不是新的 Mac 互操作证据。
 
 ### Windows 客户端连接 Windows 功能明细

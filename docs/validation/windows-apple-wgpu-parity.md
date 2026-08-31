@@ -311,8 +311,8 @@ must not replace either sampled hash. The independently verified current final
 artifact identity is recorded below.
 
 The final offline closure build at
-`target\release\freeremotedesk-windows.exe` is 42,291,712 bytes with SHA-256
-`3A679F998E3A7DBD1EF2EAC6D0DAF442A653021A8EB4F6B245D52178144CC345` and
+`target\release\freeremotedesk-windows.exe` is 42,292,736 bytes with SHA-256
+`21D307C64C6C153F4592FD1B1DC0C20856868F6DE239EDDD8DE087B6B894F6FC` and
 PE subsystem 2 (Windows GUI). This is build evidence only and is not a new Mac
 capture, login, display, input, or High Performance interoperability result.
 
