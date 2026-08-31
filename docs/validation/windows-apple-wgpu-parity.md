@@ -250,6 +250,13 @@ original operation panic after exactly-once scope closure. Rejection leaves no
 partial initial state and atomically retains an existing dynamic surface/control
 state. None was present in either sampled binary.
 
+Follow-up offline fixes close three further confirmed runtime defects.
+`42194bc` preserves the typed batch-execution panic when scope finish also
+panics, while retaining GPU-fault precedence and actual observation deltas.
+`af57bd5` routes Apple publisher wrapper rejection through the target runtime's
+terminal poison path. `3e375c0` replaces the more-than-32 type-1 global
+bounding fallback with deterministic local spatial groups capped at 32.
+
 Further offline runtime commits `4a080cf`, `8a32038`, and `aa560a3` close three
 additional contracts. `4a080cf` makes consuming a cross-runtime, stale, or
 otherwise invalid opaque admission token poison the target runtime before
@@ -268,7 +275,7 @@ clones; a `CandidateBatch` adds three. This upstream cost is accepted and is
 distinct from the now-zero project-owned handle clones.
 
 The integrated comparator sequence `cd01e78`, `18498ed`, `dec2cd6`, `3bde039`,
-`3db3b53`, and `50354fa` accepts only the exact case-sensitive event taxonomy
+`3db3b53`, `50354fa`, and `f7339cd` accepts only the exact case-sensitive event taxonomy
 and Ordinal file/run identity. Restore freezes the current session/generation at
 its boundary. Events must stay in declared half-open phase intervals; each
 measured phase requires process S0..S30 at 1 s +/-100 ms, with every five-second
@@ -278,6 +285,12 @@ canonical unsigned-64 decimal text; exact duplicate rows are rejected. A
 successful installed-surface `CandidateBatch` may omit revision while retaining
 session/generation. `run_id` is full-string ASCII `[A-Za-z0-9_-]`, length 1..64,
 and any `StableFault` remains fail-closed.
+Process rows additionally require an exact field set and canonical unsigned
+decimal text; S0 delta is empty and every S1..S30 delta exactly matches adjacent
+nondecreasing CPU totals. Five-second CPU still uses endpoint totals. The three
+comparator child PowerShell processes are hidden. `2520452` changes only the
+capture runner encoding to UTF-8 BOM plus CRLF so both Windows PowerShell 5.1
+and pwsh 7 parse the same script text.
 
 The retained captures were not resampled. At `50354fa`, Windows PowerShell 5.1
 produced 15,888 bytes with SHA-256
@@ -287,11 +300,21 @@ pwsh 7 produced 6,354 bytes with SHA-256
 Only JSON whitespace formatting differs: parsed semantics are equal and both
 keep all 14 mandatory predicates true. These are offline replays, not recaptures.
 
+`183b99d` changes the Windows product release from PE Console subsystem 3 to
+Windows GUI subsystem 2. Debug builds retain stderr; release fatal reports use
+the native Windows error dialog instead of becoming silent.
+
 The 42,283,520-byte executable with SHA-256
 `AFDB76ABA09468C9410B5FAC7E4FB5A46B67D0D928B6275512B207BAC3B2AE69`
 is the prior `43db868` offline closure build, not the current final Release. It
-must not replace either sampled hash; the primary integrator will record a new
-final Release identity only after independent verification.
+must not replace either sampled hash. The independently verified current final
+artifact identity is recorded below.
+
+The final offline closure build at
+`target\release\freeremotedesk-windows.exe` is 42,291,712 bytes with SHA-256
+`3A679F998E3A7DBD1EF2EAC6D0DAF442A653021A8EB4F6B245D52178144CC345` and
+PE subsystem 2 (Windows GUI). This is build evidence only and is not a new Mac
+capture, login, display, input, or High Performance interoperability result.
 
 The serial run was `serial_capacity_click_20260831_23`: 3,660 event rows, 62
 process rows, all five phases, 25 `InputToNextPresent` rows, and zero

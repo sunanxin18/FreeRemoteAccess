@@ -52,7 +52,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
 | High Performance 虚拟显示与实体显示器置黑 | `frd-protocol-apple` 严格确认门禁 | **开发中** | 产品只选择加密 `APPLE_SRP`，发送现有 `0x1d` 后等待严格 `0x451 ServerState`，确认前不公开 generation/readiness；`display_count=2` 的匹配状态仍可确认 High Performance 并激活 publisher，单显示器限制只属于动态分辨率 eligibility；自动化门禁不能替代实体显示器置黑/恢复与完整远程桌面的真机观察，见 [`设计`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md) |
 | 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-31 保留固定捕获仅证明采样候选 `c57dc77` 的 Windows wgpu frame-transaction 路径在有界 Apple HPSS/MVS 真机比较中通过；范围、run id 与二进制身份见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。这不包含后置 runtime 正确性修复，也不包含严格 High Performance 虚拟显示/实体显示器置黑与恢复门禁。 |
-| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。2026-08-31 的 `c57dc77` 采样候选通过固定真机比较：每个成功 `CandidateBatch` 行的 batch-apply scope 恰有一个 begin/finish/poll，源更新归一化的 scope-amplification 门禁、输入/FrameResponse 及 CPU/内存门禁均通过；该结论不涵盖 acquisition、record 或 presentation scope，证据范围与非结论见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。 |
+| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。`3e375c0` 还把超过 32 个稀疏 dirty rect 确定性分为最多 32 个局部 patch，禁止退化为近整屏的全局包围矩形。2026-08-31 的 `c57dc77` 采样候选通过固定真机比较；后置修复只有离线证据，范围与非结论见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
 | 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |
 | 动态分辨率 | 实验性 resized `0x09` + generation 切换 | **实验性** | 默认关闭；离线 eligibility 只接受匹配初始 `ServerState` 的 `display_count=1`，`display_count=2` 仅关闭 dynamic、不会关闭已确认的 High Performance 或 publisher；尚无足够 Apple 线协议互操作证据，见 `AGENTS.md` P1 |
@@ -67,8 +67,8 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 Apple startup、初始确认、动态 viewport 请求、精确 ACK 和服务端 geometry 路径都
 必须在 CPU surface 分配/替换、resized/full wire 写入、私有状态修改以及 generation
 event、`Reset`、wake 之前取得 admission；失败为 terminal，初始路径不留下部分
-状态，已有动态 surface 与控制状态原子保留。后续 `4a080cf` 又关闭 admission
-所有权边界：跨 runtime、stale 或其他无效 opaque token 会先 poison 目标 runtime，
+状态，已有动态 surface 与控制状态原子保留。`4a080cf` 与 wrapper 修复 `af57bd5`
+共同关闭 admission 所有权边界：跨 runtime、stale 或其他无效 opaque token 会先 poison 目标 runtime，
 再返回 `InvalidGeneration`，且本次拒绝不新增 event、`Reset` 或 wake；直接传给
 `admit_generation` 的错误输入仍只返回 `InvalidGeneration`，不会 poison，可恢复。
 `8a32038` 只把 dynamic eligibility 收紧到单显示器，不把两显示器配置误判为
@@ -81,8 +81,8 @@ High Performance 失败。
 `CandidateBatch` 另有 3 次。这组固定上游 clone 被接受，不能归入项目自有
 handle-clone 回归。
 
-这些 runtime/GPU 修复和当前 comparator 提交链
-`cd01e78`、`18498ed`、`dec2cd6`、`3bde039`、`3db3b53`、`50354fa`
+这些 runtime/GPU 修复（含 `42194bc` 的 batch 双 panic 收敛）和当前 comparator 提交链
+`cd01e78`、`18498ed`、`dec2cd6`、`3bde039`、`3db3b53`、`50354fa`、`f7339cd`
 都发生在 Task 7 真机采样之后。唯一 Mac live 二进制仍是 serial `44a62ad`
 （SHA-256 `8CED2D0DB0788D34152AE498461A18F0255B103B3C20F87FCD2026932DD4C421`）
 与 candidate `c57dc77`
@@ -91,9 +91,14 @@ handle-clone 回归。
 SHA-256 `B6E8B860618E83DA0F851D4AC1A337ACA00F04CB47E16A950CFD5EB3FFF2AD64`；
 pwsh 7 输出 6,354 B、SHA-256
 `7651B13855D77C2D87BC805ABE4FC3D80B9750ACB8C68DBCB635F337831C850A`。
-两者仅 JSON 空白格式不同，解析后语义相等且均为 14/14；不是 recapture。
+两者仅 JSON 空白格式不同，解析后语义相等且均为 14/14；`f7339cd` 进一步校验
+process 数值规范与逐秒 CPU delta，并隐藏后台 PowerShell 窗口；`2520452` 让采集器
+以 UTF-8 BOM/CRLF 同时兼容 Windows PowerShell 5.1 与 pwsh 7。它们都不是 recapture。
 `43db868` 的 42,283,520 B / `AFDB...AE69` 只是先前离线闭包构建，不能冒充
-当前最终构建或替换上述采样哈希；新的最终 Release 身份须由主集成代理验证后补记。
+当前最终构建或替换上述采样哈希。`183b99d` 把 Windows Release 改为 GUI subsystem，
+正常启动不再附带 console，fatal 由原生错误对话框显示。当前离线闭包 Release 为
+42,291,712 B，SHA-256 `3A679F998E3A7DBD1EF2EAC6D0DAF442A653021A8EB4F6B245D52178144CC345`，
+PE subsystem 2；这是构建证据，不是新的 Mac 互操作证据。
 
 ### Windows 客户端连接 Windows 功能明细
 
