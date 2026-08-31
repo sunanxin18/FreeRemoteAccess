@@ -1,4 +1,4 @@
-[CmdletBinding(DefaultParameterSetName='Capture')]
+﻿[CmdletBinding(DefaultParameterSetName='Capture')]
 param(
   [Parameter(Mandatory=$true, ParameterSetName='Capture')][ValidateSet('serial','candidate')][string]$Implementation,
   [Parameter(Mandatory=$true, ParameterSetName='Capture')][ValidatePattern('^[A-Za-z0-9_-]{1,64}$')][string]$RunId,
