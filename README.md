@@ -63,12 +63,14 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **开发中** | 自动化状态机、非敏感元数据及本机进程唯一凭据库往返已通过；按本矩阵定义，授权 Mac GUI 的 TransportReady 提交与取消保存删除链路尚未完成有界真机验证，见 `docs/validation/windows-secure-login.md` |
 | 文件传输 | 未选择 | **计划中** | 需先确认各原生服务端支持的协议与安全边界 |
 
-当前桌面 frame port 在发布 generation event、`Reset` 或 wake 前，对完整 surface
-执行 64 MiB 容量预检；零尺寸、算术溢出或超限均 fail-closed，不发布部分
-generation 状态。该预检及后续 record/presentation scope 生命周期修复发生在上述
-Task 7 真机采样之后，目前仅有离线验证，没有新的 Mac 真机采样。`4344183` 也只用
-当前 comparator 重放相同 retained CSV，不是 recapture，不能把当前 Release 哈希
-替换为采样二进制哈希。
+当前桌面 frame port 以自身真实 64 MiB 预算签发不透明 generation admission。
+Apple startup、初始确认、动态 viewport 请求、精确 ACK 和服务端 geometry 路径都
+必须在 CPU surface 分配/替换、resized/full wire 写入、私有状态修改以及 generation
+event、`Reset`、wake 之前取得 admission；失败为 terminal，初始路径不留下部分
+状态，已有动态 surface 与控制状态原子保留。该 `43fb0f3` 修复以及后续
+panic/unwind、Restore identity 修复均发生在 Task 7 真机采样之后，目前只有离线
+验证，没有新的 Mac 真机采样。`43db868` 只用当前 comparator 重放相同 retained
+CSV，不是 recapture；最终离线 Release 哈希也不能替换采样二进制哈希。
 
 ### Windows 客户端连接 Windows 功能明细
 

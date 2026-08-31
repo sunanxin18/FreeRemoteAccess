@@ -245,19 +245,40 @@ Runtime correctness commits
 `fed72c61d9d335472a8ca0de9e5c0bda6f22d625`,
 `0e775379cdc065064f0957b44c73955079c17a8d`, and
 `91d7c2c422b249870395fe7693133d957d4a4ca2` were applied after both captures.
-They add the 64 MiB complete-surface preflight and close/bind the production
-record/presentation scope lifecycle, including the hot-path context borrowing
-used by the integrated flow. None was present in either sampled binary, and no
-new Mac run or recapture exercised them. A current Release artifact therefore
-must not replace either sampled SHA-256 above.
+They introduced the actual-port 64 MiB complete-surface preflight and closed and
+bound the production record/presentation scope lifecycle, including the hot-path
+context borrowing used by the integrated flow. Follow-up runtime commits
+`43fb0f3fcc06f53a74e1de0671909b58cecc9653` and
+`3a7bd2be41f5b10f79ef1e97362f1fab3373419b` are also post-measurement.
+`43fb0f3` turns capacity approval into an opaque admission from the actual frame
+port and requires it on Apple startup, initial confirmation, dynamic viewport,
+exact acknowledgement, and server-geometry paths before CPU surface
+allocation/replacement, resized/full wire writes, private-state mutation,
+generation events, `Reset`, or wake. Rejection is terminal, leaves no partial
+initial state, and atomically retains an existing dynamic surface and control
+state. `3a7bd2b` closes each successfully started GPU scope exactly once before
+resuming an operation panic and preserves `BatchExecutionPanicked` for a batch
+execution panic. None of these commits was present in either sampled binary,
+and no new Mac run or recapture exercised them.
 
 Comparator-only hardening in `323d6e0aea1cb0bd075f90dcc1973edbc9278f66`,
 `d36e045541587e56f3af1dee0c0d4477d0686793`, and
 `4344183dadf0e2fb205baa61e38d75395c95ea97` caps each event input at 32,768
 rows, caps each process input at 62 rows, and requires every event timestamp to
-remain inside its declared half-open phase interval. The comparator through
-`4344183` replayed the same retained CSVs and reproduced the recorded result.
-That was an offline reanalysis, not a new runtime capture or Mac measurement.
+remain inside its declared half-open phase interval. Follow-up comparator commit
+`43db868a637ed1fdf13fa8301f900e513b540afa` also requires a complete, nonzero
+Presentation identity; a Restore receipt must belong to one current session and
+the current generation, while revisions remain monotonic. Its retained output
+`target/validation/task7-scheme-a-final-integrated-43db868.json` has SHA-256
+`B6E8B860618E83DA0F851D4AC1A337ACA00F04CB47E16A950CFD5EB3FFF2AD64`, is
+byte-identical to the preceding retained replay with that SHA-256, and keeps all
+14 mandatory predicates true. This is the same old retained CSV replay, not a
+recapture or new Mac measurement.
+
+The final Release built at this closure is 42,283,520 bytes with SHA-256
+`AFDB76ABA09468C9410B5FAC7E4FB5A46B67D0D928B6275512B207BAC3B2AE69`.
+It is offline build evidence only and must not replace either sampled Release
+SHA-256 above.
 
 The serial run was `serial_capacity_click_20260831_23`: 3,660 event rows, 62
 process rows, all five phases, 25 `InputToNextPresent` rows, and zero
@@ -322,6 +343,8 @@ The minimized process-CPU, maximum-working-set, and trend gates all pass.
 Both Restore phases contain an identity-bearing Presentation: serial
 `(session=1,generation=1,revision=3106)` and candidate
 `(session=1,generation=1,revision=3305)`.
+The `43db868` replay revalidated these unchanged rows under the stricter current
+session/generation contract; it did not recapture them.
 
 ### Fault and result boundary
 
@@ -335,13 +358,17 @@ once fatal, input/binding/presentation are detached and no failed texture is
 recorded, submitted, or presented. They do not claim that a live GPU fault
 occurred.
 
-The post-measurement `fed72c6`, `0e77537`, and `91d7c2c` production
-record/presentation helpers have deterministic helper evidence for exactly-once
-finish/poll on error paths, GPU-fault precedence, and commit/receipt
-suppression. The separate Windows DX12 smoke proves only that one clean scope
-on the real backend observes `{1,1,1}`. Both are offline evidence: neither was
-part of the `c57dc77` capture, observed a live GPU fault, or reconnected to the
-Mac.
+The post-measurement `fed72c6`, `0e77537`, `91d7c2c`, and `3a7bd2b`
+production record/presentation helpers have deterministic helper evidence for
+exactly-once finish/poll on error paths, GPU-fault precedence, and commit/receipt
+suppression. `3a7bd2b` additionally proves offline that record/presentation and
+the acquisition, configuration, and recovery operations close a successfully
+started scope before resuming the original panic; a simultaneous finish panic
+does not replace the operation panic, and the batch wrapper retains the typed
+`BatchExecutionPanicked` contract. The separate Windows DX12 smoke proves only
+that one clean scope on the real backend observes `{1,1,1}`. Both evidence sets
+are offline: neither was part of the `c57dc77` capture, observed a live GPU
+fault, or reconnected to the Mac.
 
 Every mandatory comparator predicate passed: visible CPU, working set,
 input, and `FrameResponse`; minimized CPU, working set, and trend; exact
