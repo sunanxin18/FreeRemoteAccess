@@ -52,13 +52,13 @@ function Get-WorstEventWindow($Rows, [string]$Field, [UInt64]$OriginUs, [Validat
       $timestamp = Convert-U64 $_.monotonic_us 'invalid_event_timestamp'
       $timestamp -ge $lower -and $timestamp -lt $upper
     })
-    $values = if ($Mode -eq 'count') {
+    $values = @(if ($Mode -eq 'count') {
       @($windowRows | ForEach-Object { [UInt64]1 })
     } else {
       @($windowRows | Where-Object {
         -not [string]::IsNullOrEmpty([string]$_.$Field)
       } | ForEach-Object { Convert-U64 $_.$Field "invalid_$Field" })
-    }
+    })
     Assert-True ($values.Count -gt 0) "incomplete_${Field}_window_$start"
     $value = if ($Mode -eq 'p95') {
       Get-NearestRankP95 ([UInt64[]]$values)
@@ -314,6 +314,17 @@ function Invoke-SelfTest {
   }
   $worstSum = Get-WorstEventWindow $sumRows 'sample' 0 'sum'
   Assert-True ($worstSum.value -eq 10 -and $worstSum.start_second -eq 0) 'selftest_worst_sum_earliest_tie'
+  $singleValueRows = @()
+  foreach ($second in 0, 5, 10, 15, 20, 25) {
+    $value = if ($second -eq 10) { 90 } else { 1 }
+    $singleValueRows += [pscustomobject]@{
+      monotonic_us = [string]($second * 1000000); sample = [string]$value
+    }
+  }
+  $singleValueP95 = Get-WorstEventWindow $singleValueRows 'sample' 0 'p95'
+  Assert-True ($singleValueP95.value -eq 90 -and $singleValueP95.start_second -eq 6) 'selftest_single_value_window_p95'
+  $singleValueCount = Get-WorstEventWindow $singleValueRows '' 0 'count'
+  Assert-True ($singleValueCount.value -eq 1 -and $singleValueCount.start_second -eq 0) 'selftest_single_value_window_count'
   $samples = @()
   foreach ($second in 0..30) {
     $samples += [pscustomobject]@{
