@@ -177,7 +177,11 @@ function Assert-FileRowIdentity(
   $runId = $null
   foreach ($row in $Rows) {
     Assert-True ([string]$row.schema_version -eq '1') "invalid_${Kind}_schema_version"
-    Assert-True ([string]$row.run_id -match '^[A-Za-z0-9_-]{1,64}$') "invalid_${Kind}_run_id"
+    Assert-True ([regex]::IsMatch(
+      [string]$row.run_id,
+      '\A[A-Za-z0-9_-]{1,64}\z',
+      [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )) "invalid_${Kind}_run_id"
     Assert-True ([string]$row.implementation -ceq $ExpectedImplementation) "invalid_${Kind}_implementation"
     Assert-True ($AllowedPhases -ccontains [string]$row.phase) "invalid_${Kind}_phase"
     if ($null -eq $runId) {
@@ -934,8 +938,10 @@ function Write-SelfTestComparisonCsv([string]$Path, [string]$Header, $Rows) {
     try {
       $writer.WriteLine($Header)
       foreach ($row in $Rows) {
-        $values = @($fields | ForEach-Object { [string]$row.$_ })
-        Assert-True (@($values | Where-Object { $_ -match '[,\r\n"]' }).Count -eq 0) 'selftest_unsafe_csv_value'
+        $values = @($fields | ForEach-Object {
+          $value = [string]$row.$_
+          if ($value -match '[,\r\n"]') { '"' + $value.Replace('"', '""') + '"' } else { $value }
+        })
         $writer.WriteLine(($values -join ','))
       }
     } finally { $writer.Dispose() }
@@ -1075,6 +1081,15 @@ function Assert-SelfTestTopLevelAccepted(
 }
 
 function Invoke-SelfTest {
+  $multilineCandidateEvents = New-SelfTestComparisonEventRows "candidate-a`n" 'candidate' 1 1 7
+  $multilineCandidateProcess = New-SelfTestComparisonProcessRows "candidate-a`n" 'candidate'
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $multilineCandidateEvents `
+    $multilineCandidateProcess `
+    'invalid_candidate_events_run_id' 'multiline_candidate_run_id'
+
   $duplicatedCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
   $duplicateCandidateBatch = @($duplicatedCandidateEvents | Where-Object {
     $_.event -ceq 'CandidateBatch'
