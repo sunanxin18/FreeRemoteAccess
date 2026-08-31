@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
@@ -341,6 +342,36 @@ impl GpuFaultScope {
     }
 }
 
+/// 在作用域成功开始后运行操作，并在传播 panic 前显式尝试完成作用域。
+/// 此函数仅为相邻 compositor crate 复用同一 GPU 作用域生命周期原语而公开。
+#[doc(hidden)]
+pub fn complete_scope_before_resuming_unwind<S, O, F>(
+    scope: S,
+    operation: impl FnOnce() -> O,
+    finish: impl FnOnce(S) -> F,
+) -> (F, O) {
+    let operation = catch_unwind(AssertUnwindSafe(operation));
+    let finish = catch_unwind(AssertUnwindSafe(|| finish(scope)));
+
+    match (operation, finish) {
+        (Ok(operation), Ok(finish)) => (finish, operation),
+        (Err(operation_panic), Ok(finish)) => {
+            drop(finish);
+            resume_unwind(operation_panic)
+        }
+        (Ok(operation), Err(finish_panic)) => {
+            drop(operation);
+            resume_unwind(finish_panic)
+        }
+        (Err(operation_panic), Err(finish_panic)) => {
+            // operation panic 是原始语义故障。遗忘第二个 payload，避免其析构在
+            // 恢复原始展开期间再次 panic。
+            std::mem::forget(finish_panic);
+            resume_unwind(operation_panic)
+        }
+    }
+}
+
 fn poll_error_scope(future: impl Future<Output = Option<wgpu::Error>>) -> Option<GpuFaultClass> {
     let mut future = std::pin::pin!(future);
     let mut context = Context::from_waker(Waker::noop());
@@ -409,10 +440,13 @@ mod linearization_tests {
 
 #[cfg(test)]
 mod scope_lifecycle_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use super::{
-        begin_observed_scope, GpuScopeObservation, ScopeLifecycleEvent, ScopeLifecycleObserver,
+        begin_observed_scope, complete_scope_before_resuming_unwind, GpuScopeObservation,
+        ScopeLifecycleEvent, ScopeLifecycleObserver,
     };
 
     #[derive(Default)]
@@ -475,5 +509,28 @@ mod scope_lifecycle_tests {
         let result = begin_observed_scope(observer.clone(), || Err::<(), _>("acquire"));
         assert!(result.is_err());
         assert!(observer.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn operation_panic_remains_primary_when_scope_finish_also_panics() {
+        const OPERATION_PANIC: &str = "operation panic";
+        const FINISH_PANIC: &str = "finish panic";
+
+        let finish_calls = Rc::new(Cell::new(0));
+        let observed_finish_calls = finish_calls.clone();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            complete_scope_before_resuming_unwind(
+                (),
+                || std::panic::panic_any(OPERATION_PANIC),
+                |_| {
+                    observed_finish_calls.set(observed_finish_calls.get() + 1);
+                    std::panic::panic_any(FINISH_PANIC);
+                },
+            )
+        }))
+        .unwrap_err();
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&OPERATION_PANIC));
+        assert_eq!(finish_calls.get(), 1);
     }
 }

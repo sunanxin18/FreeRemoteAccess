@@ -4,8 +4,8 @@ use frd_frame::SurfaceUpdate;
 use frd_frame::{FrameCompleteness, FrameReset, FrameTransaction, PixelFormat, PixelPatch};
 
 use crate::{
-    pass::RemotePass, GpuCleanToken, GpuContext, GpuContextId, GpuFaultClass, GpuFaultScope,
-    GpuScopeObservation,
+    gpu_fault::complete_scope_before_resuming_unwind, pass::RemotePass, GpuCleanToken, GpuContext,
+    GpuContextId, GpuFaultClass, GpuFaultScope, GpuScopeObservation,
 };
 
 const MAX_REMOTE_TEXTURE_BYTES: u64 = 256 * 1024 * 1024;
@@ -246,8 +246,8 @@ where
     R: PreparedRecordCommit,
 {
     let scope = backend.begin()?;
-    let recorded = record();
-    let finish = backend.finish(scope);
+    let (finish, recorded) =
+        complete_scope_before_resuming_unwind(scope, record, |scope| backend.finish(scope));
     match (finish, recorded) {
         (Err(fault), _) => Err(RendererError::GpuFault(fault)),
         (Ok(_), Err(error)) => Err(error),
@@ -288,8 +288,12 @@ pub struct RemoteRenderer {
 impl RemoteRenderer {
     pub fn new(context: GpuContext) -> Result<Self, RendererError> {
         let scope = context.begin_fault_scope()?;
-        let (bind_group_layout, sampler) = create_sampling_resources(context.device());
-        let token = scope.finish()?;
+        let (finish, (bind_group_layout, sampler)) = complete_scope_before_resuming_unwind(
+            scope,
+            || create_sampling_resources(context.device()),
+            |scope| scope.finish(),
+        );
+        let token = finish?;
         let commit_context = context.clone();
         commit_context
             .commit_if_unchanged(token, || Self {
@@ -480,8 +484,12 @@ impl RemoteRenderer {
         install_peer: impl FnOnce() -> R,
     ) -> Result<(Option<RecoveryRequirement>, R), RendererError> {
         let scope = context.begin_fault_scope()?;
-        let (bind_group_layout, sampler) = create_sampling_resources(context.device());
-        let token = scope.finish()?;
+        let (finish, (bind_group_layout, sampler)) = complete_scope_before_resuming_unwind(
+            scope,
+            || create_sampling_resources(context.device()),
+            |scope| scope.finish(),
+        );
+        let token = finish?;
         let commit_context = context.clone();
         let prepared = PreparedRendererRecovery {
             context,
@@ -1975,6 +1983,46 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, RendererError::UnsupportedTargetFormat);
+        assert_eq!(commit_calls.get(), 0);
+        assert!(state.borrow().pass.is_none());
+        assert_eq!(state.borrow().receipt, None);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(
+            observer.snapshot(),
+            GpuScopeObservation {
+                begins: 1,
+                finishes: 1,
+                polls: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn record_operation_panic_finishes_and_polls_before_resuming_original_payload() {
+        const RECORD_PANIC: &str = "record operation panic";
+
+        let observer = Arc::new(TestScopeObserver::default());
+        let commit_calls = Rc::new(std::cell::Cell::new(0));
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let state = Rc::new(RefCell::new(FakeRecordState::default()));
+        let backend = RecordingRecordScopeBackend {
+            observer: observer.clone(),
+            finish_result: Ok(()),
+            commit_calls: commit_calls.clone(),
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_record_with_fault_scope::<_, FakePreparedRecord>(&backend, || {
+                let _prepared = PreparedResource {
+                    id: 4,
+                    drops: drops.clone(),
+                };
+                std::panic::panic_any(RECORD_PANIC);
+            })
+        }))
+        .unwrap_err();
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&RECORD_PANIC));
         assert_eq!(commit_calls.get(), 0);
         assert!(state.borrow().pass.is_none());
         assert_eq!(state.borrow().receipt, None);

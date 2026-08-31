@@ -4,8 +4,8 @@ mod surface;
 use frd_core::{ContentViewport, PixelSize};
 use frd_protocol_api::PresentationEvent;
 use frd_render_wgpu::{
-    GpuCleanToken, GpuContext, GpuContextError, GpuFaultClass, RecoveryRequirement, RemoteRenderer,
-    RendererError,
+    complete_scope_before_resuming_unwind, GpuCleanToken, GpuContext, GpuContextError,
+    GpuFaultClass, RecoveryRequirement, RemoteRenderer, RendererError,
 };
 
 use state::{
@@ -103,14 +103,19 @@ where
     R: RecordedFrameFlow<B::CleanToken>,
 {
     let scope = backend.begin()?;
-    let recorded = record_and_present().map(|mut recorded| {
-        recorded.overlay();
-        recorded.before_submit();
-        recorded.submit();
-        recorded.present();
-        recorded
-    });
-    let finish = backend.finish(scope);
+    let (finish, recorded) = complete_scope_before_resuming_unwind(
+        scope,
+        || {
+            record_and_present().map(|mut recorded| {
+                recorded.overlay();
+                recorded.before_submit();
+                recorded.submit();
+                recorded.present();
+                recorded
+            })
+        },
+        |scope| backend.finish(scope),
+    );
     match (finish, recorded) {
         (Err(fault), _) => Err(PresentError::GpuFault(fault)),
         (Ok(_), Err(error)) => Err(error),
@@ -359,8 +364,12 @@ impl PresentationCompositor {
             .surface()
             .ok_or(PresentError::SurfaceDetached)?;
         let acquisition_scope = self.context.begin_fault_scope()?;
-        let acquired = surface.get_current_texture();
-        let acquisition_token = acquisition_scope.finish()?;
+        let (finish, acquired) = complete_scope_before_resuming_unwind(
+            acquisition_scope,
+            || surface.get_current_texture(),
+            |scope| scope.finish(),
+        );
+        let acquisition_token = finish?;
         self.context.commit_if_unchanged(acquisition_token, || ())?;
         let acquired = AcquiredFrame::from(acquired);
         let action = acquired.action();
@@ -551,8 +560,12 @@ fn configure_surface_with(
     configuration: &wgpu::SurfaceConfiguration,
 ) -> Result<GpuCleanToken, PresentError> {
     let scope = context.begin_fault_scope()?;
-    surface.configure(context.device(), configuration);
-    scope.finish().map_err(PresentError::from)
+    let (finish, ()) = complete_scope_before_resuming_unwind(
+        scope,
+        || surface.configure(context.device(), configuration),
+        |scope| scope.finish(),
+    );
+    finish.map_err(PresentError::from)
 }
 
 impl Drop for PresentationCompositor {
@@ -757,6 +770,129 @@ mod scope_tests {
         }
 
         fn emit_event(self) -> Self::Output {}
+    }
+
+    #[derive(Clone, Copy)]
+    enum PanicStage {
+        Overlay,
+        BeforeSubmit,
+    }
+
+    struct PanickingRecordedFrame {
+        events: Rc<RefCell<Vec<LifecycleEvent>>>,
+        drops: Rc<std::cell::Cell<u64>>,
+        stage: PanicStage,
+    }
+
+    impl Drop for PanickingRecordedFrame {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    impl RecordedFrameFlow<()> for PanickingRecordedFrame {
+        type Output = ();
+
+        fn overlay(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::Overlay);
+            if matches!(self.stage, PanicStage::Overlay) {
+                std::panic::panic_any("presentation overlay panic");
+            }
+        }
+
+        fn before_submit(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::BeforeSubmit);
+            if matches!(self.stage, PanicStage::BeforeSubmit) {
+                std::panic::panic_any("presentation hook panic");
+            }
+        }
+
+        fn submit(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::Submit);
+        }
+
+        fn present(&mut self) {
+            self.events.borrow_mut().push(LifecycleEvent::Present);
+        }
+
+        fn reconfigure_after_finish(&mut self) -> Result<(), PresentError> {
+            self.events.borrow_mut().push(LifecycleEvent::Reconfigure);
+            Ok(())
+        }
+
+        fn confirm_presented(&mut self, _token: ()) -> Result<(), PresentError> {
+            self.events
+                .borrow_mut()
+                .push(LifecycleEvent::ConfirmReceipt);
+            Ok(())
+        }
+
+        fn emit_event(self) -> Self::Output {
+            self.events
+                .borrow_mut()
+                .push(LifecycleEvent::FramePresented);
+        }
+    }
+
+    fn assert_presentation_panic_closes_scope(
+        stage: PanicStage,
+        expected_payload: &'static str,
+        expected_events: &[LifecycleEvent],
+    ) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let backend = RecordingFrameScopeBackend {
+            name: ScopeName::Outer,
+            events: events.clone(),
+            finish_result: Ok(()),
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_frame_with_fault_scope(&backend, || {
+                events.borrow_mut().push(LifecycleEvent::Record);
+                Ok(PanickingRecordedFrame {
+                    events: events.clone(),
+                    drops: drops.clone(),
+                    stage,
+                })
+            })
+        }))
+        .unwrap_err();
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&expected_payload));
+        assert_eq!(&*events.borrow(), expected_events);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn overlay_panic_closes_scope_before_resuming_without_presentation_callbacks() {
+        assert_presentation_panic_closes_scope(
+            PanicStage::Overlay,
+            "presentation overlay panic",
+            &[
+                LifecycleEvent::Begin(ScopeName::Outer),
+                LifecycleEvent::Record,
+                LifecycleEvent::Overlay,
+                LifecycleEvent::Finish(ScopeName::Outer),
+                LifecycleEvent::Poll(ScopeName::Outer),
+            ],
+        );
+    }
+
+    #[test]
+    fn hook_panic_closes_scope_before_resuming_without_submit_or_confirmation() {
+        assert_presentation_panic_closes_scope(
+            PanicStage::BeforeSubmit,
+            "presentation hook panic",
+            &[
+                LifecycleEvent::Begin(ScopeName::Outer),
+                LifecycleEvent::Record,
+                LifecycleEvent::Overlay,
+                LifecycleEvent::BeforeSubmit,
+                LifecycleEvent::Finish(ScopeName::Outer),
+                LifecycleEvent::Poll(ScopeName::Outer),
+            ],
+        );
     }
 
     #[test]

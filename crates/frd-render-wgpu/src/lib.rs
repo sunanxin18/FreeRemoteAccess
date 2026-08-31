@@ -2,7 +2,10 @@ mod gpu_fault;
 mod pass;
 mod remote_texture;
 
-pub use gpu_fault::{GpuCleanToken, GpuFaultClass, GpuFaultScope, GpuScopeObservation};
+pub use gpu_fault::{
+    complete_scope_before_resuming_unwind, GpuCleanToken, GpuFaultClass, GpuFaultScope,
+    GpuScopeObservation,
+};
 pub use remote_texture::{
     BatchApplyFailure, BatchApplyOutcome, BatchApplySuccess, BatchScopeDiagnostics,
     ConfirmedPresentation, FrameBatchIdentity, InstalledSurface, PresentationReceipt,
