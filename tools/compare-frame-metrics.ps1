@@ -200,6 +200,53 @@ function Get-OptionalRowField($Row, [string]$Name) {
   return [string]$property.Value
 }
 
+function Convert-CanonicalU64($Value, [string]$Code) {
+  $text = [string]$Value
+  $parsed = Convert-U64 $text $Code
+  $canonical = $parsed.ToString([Globalization.CultureInfo]::InvariantCulture)
+  Assert-True ($canonical -ceq $text) $Code
+  return [UInt64]$parsed
+}
+
+function Assert-ProcessFieldShapeRows($Rows, [string]$Kind) {
+  $requiredFields = $ProcessHeader.Split(',')
+  foreach ($row in $Rows) {
+    $propertyNames = @($row.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    Assert-True ($propertyNames.Count -eq $requiredFields.Count) "invalid_${Kind}_process_fields"
+    foreach ($field in $requiredFields) {
+      Assert-True ($propertyNames -ccontains $field) "invalid_${Kind}_process_fields"
+    }
+
+    $second = Convert-CanonicalU64 (Get-OptionalRowField $row 'second') `
+      "invalid_${Kind}_process_fields"
+    Assert-True ($second -le 30) "invalid_${Kind}_process_fields"
+    foreach ($field in @('monotonic_us', 'process_cpu_total_us', 'working_set_bytes')) {
+      [void](Convert-CanonicalU64 (Get-OptionalRowField $row $field) `
+        "invalid_${Kind}_process_fields")
+    }
+  }
+
+  foreach ($phase in $MeasuredPhases) {
+    $samples = Get-PhaseSamples $Rows $phase
+    $previousCpu = $null
+    foreach ($sample in $samples) {
+      $second = Convert-CanonicalU64 $sample.second "invalid_${Kind}_process_fields"
+      $cpu = Convert-CanonicalU64 $sample.process_cpu_total_us "invalid_${Kind}_process_fields"
+      $deltaText = Get-OptionalRowField $sample 'process_cpu_delta_us'
+      if ($second -eq 0) {
+        Assert-True ([string]::IsNullOrEmpty($deltaText)) "invalid_${Kind}_process_cpu_delta"
+      } else {
+        $delta = Convert-CanonicalU64 $deltaText "invalid_${Kind}_process_cpu_delta"
+        Assert-True ($null -ne $previousCpu -and $cpu -ge [UInt64]$previousCpu) `
+          'non_monotonic_process_cpu'
+        Assert-True ($delta -eq ($cpu - [UInt64]$previousCpu)) `
+          "invalid_${Kind}_process_cpu_delta"
+      }
+      $previousCpu = $cpu
+    }
+  }
+}
+
 function Assert-EventIdentityRows($Rows, [string]$Kind) {
   $activeSession = $null
   $activeGeneration = $null
@@ -453,6 +500,7 @@ function Assert-RunRows(
   foreach ($phase in $MeasuredPhases) {
     Assert-True ($processPhases -ccontains $phase) "invalid_${Kind}_process_phase_set"
   }
+  Assert-ProcessFieldShapeRows $ProcessRows $Kind
 
   $boundaries = @($Events | Where-Object { $_.event -ceq 'PhaseBoundary' })
   Assert-True ($boundaries.Count -eq $allPhases.Count) "invalid_${Kind}_events_phase_boundaries"
@@ -739,6 +787,9 @@ function New-SelfTestProcessRows([string]$RunId, [string]$Implementation) {
         schema_version = '1'; run_id = $RunId; implementation = $Implementation
         phase = $phase; second = [string]$second
         monotonic_us = [string]($origin + [UInt64]($second * 1000000))
+        process_cpu_total_us = [string]($second * 100)
+        process_cpu_delta_us = if ($second -eq 0) { '' } else { '100' }
+        working_set_bytes = [string](1000 + $second)
       }
     }
   }
@@ -777,7 +828,8 @@ function New-SelfTestProcessCsv(
           $second = if ($phaseAndCount.phase -eq 'VisibleMeasurement' -and
               $index -eq $VisibleDuplicateSecond) { 30 } else { [Math]::Min($index, 30) }
           $timestamp = $phaseAndCount.origin + ($second * 1000000)
-          $writer.WriteLine("1,serial-a,serial,$($phaseAndCount.phase),$second,$timestamp,0,0,1000")
+          $delta = if ($second -eq 0) { '' } else { '0' }
+          $writer.WriteLine("1,serial-a,serial,$($phaseAndCount.phase),$second,$timestamp,0,$delta,1000")
         }
       }
     } finally { $writer.Dispose() }
@@ -833,7 +885,9 @@ function New-SelfTestMetricProcessRows {
     foreach ($second in 0..30) {
       $rows += [pscustomobject]@{
         phase = $phase; second = [string]$second; monotonic_us = [string]($phaseOrigin + [UInt64]($second * 1000000))
-        process_cpu_total_us = [string]($second * 100); working_set_bytes = [string](1000 + $second)
+        process_cpu_total_us = [string]($second * 100)
+        process_cpu_delta_us = if ($second -eq 0) { '' } else { '100' }
+        working_set_bytes = [string](1000 + $second)
       }
     }
   }
@@ -922,7 +976,8 @@ function New-SelfTestComparisonProcessRows(
         schema_version = '1'; run_id = $RunId; implementation = $Implementation
         phase = $phaseAndOrigin.phase; second = [string]$second
         monotonic_us = [string]($phaseAndOrigin.origin + [UInt64]($second * 1000000))
-        process_cpu_total_us = [string]($second * 100); process_cpu_delta_us = '100'
+        process_cpu_total_us = [string]($second * 100)
+        process_cpu_delta_us = if ($second -eq 0) { '' } else { '100' }
         working_set_bytes = [string](1000 + $second)
       })
     }
@@ -981,7 +1036,8 @@ function Assert-SelfTestProductionForgeryRejected(
       '-SerialEvents', $serialEvents, '-SerialProcessSamples', $serialProcess,
       '-CandidateEvents', $candidateEvents, '-CandidateProcessSamples', $candidateProcess,
       '-OutputPath', $output
-    ) -Wait -PassThru -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
+    ) -WindowStyle Hidden -Wait -PassThru `
+      -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
     $childOutput = @(
       Get-Content -LiteralPath $childStdout -ErrorAction SilentlyContinue
       Get-Content -LiteralPath $childStderr -ErrorAction SilentlyContinue
@@ -1027,7 +1083,8 @@ function Assert-SelfTestTopLevelRejected(
       '-SerialEvents', $serialEvents, '-SerialProcessSamples', $serialProcess,
       '-CandidateEvents', $candidateEvents, '-CandidateProcessSamples', $candidateProcess,
       '-OutputPath', $output
-    ) -Wait -PassThru -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
+    ) -WindowStyle Hidden -Wait -PassThru `
+      -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
     $stdout = @(Get-Content -LiteralPath $childStdout -ErrorAction SilentlyContinue)
     $stderr = @(Get-Content -LiteralPath $childStderr -ErrorAction SilentlyContinue)
     Assert-True ($child.ExitCode -ne 0) "selftest_${FixtureName}_not_rejected"
@@ -1070,7 +1127,8 @@ function Assert-SelfTestTopLevelAccepted(
       '-SerialEvents', $serialEvents, '-SerialProcessSamples', $serialProcess,
       '-CandidateEvents', $candidateEvents, '-CandidateProcessSamples', $candidateProcess,
       '-OutputPath', $output
-    ) -Wait -PassThru -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
+    ) -WindowStyle Hidden -Wait -PassThru `
+      -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
     $stderr = @(Get-Content -LiteralPath $childStderr -ErrorAction SilentlyContinue)
     Assert-True ($child.ExitCode -eq 0) "selftest_${FixtureName}_rejected"
     Assert-True (Test-Path -LiteralPath $output -PathType Leaf) "selftest_${FixtureName}_missing_output"
@@ -1278,6 +1336,49 @@ function Invoke-SelfTest {
     (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
     'invalid_serial_process_phase_interval' 'out_of_phase_process_sample'
 
+  $nonEmptyS0DeltaProcess = New-SelfTestComparisonProcessRows 'serial-a' 'serial'
+  $nonEmptyS0DeltaProcess[0].process_cpu_delta_us = '0'
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    $nonEmptyS0DeltaProcess `
+    (New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_serial_process_cpu_delta' 'nonempty_s0_process_cpu_delta'
+
+  $mismatchedS1DeltaProcess = New-SelfTestComparisonProcessRows 'serial-a' 'serial'
+  $mismatchedS1DeltaProcess[1].process_cpu_delta_us = '99'
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    $mismatchedS1DeltaProcess `
+    (New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_serial_process_cpu_delta' 'mismatched_s1_process_cpu_delta'
+
+  foreach ($nonCanonicalMutation in @(
+    [pscustomobject]@{ field = 'second'; value = '01'; name = 'second' },
+    [pscustomobject]@{ field = 'monotonic_us'; value = '01000000'; name = 'monotonic_us' },
+    [pscustomobject]@{ field = 'process_cpu_total_us'; value = '00'; name = 'process_cpu_total_us' },
+    [pscustomobject]@{ field = 'working_set_bytes'; value = '01000'; name = 'working_set_bytes' }
+  )) {
+    $nonCanonicalProcess = New-SelfTestComparisonProcessRows 'serial-a' 'serial'
+    $nonCanonicalProcess[0].($nonCanonicalMutation.field) = $nonCanonicalMutation.value
+    Assert-SelfTestTopLevelRejected `
+      (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+      $nonCanonicalProcess `
+      (New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7) `
+      (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+      'invalid_serial_process_fields' "noncanonical_process_$($nonCanonicalMutation.name)"
+  }
+
+  $nonCanonicalDeltaProcess = New-SelfTestComparisonProcessRows 'serial-a' 'serial'
+  $nonCanonicalDeltaProcess[1].process_cpu_delta_us = '+100'
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    $nonCanonicalDeltaProcess `
+    (New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_serial_process_cpu_delta' 'noncanonical_process_cpu_delta'
+
   Assert-SelfTestProductionForgeryRejected 1 2 7 `
     'invalid_serial_events_restore_presentation_current_identity' 'isolated_restore_generation'
   Assert-SelfTestProductionForgeryRejected 9 1 7 `
@@ -1360,6 +1461,7 @@ function Invoke-SelfTest {
       phase = 'VisibleMeasurement'; second = [string]$second
       monotonic_us = [string]($second * 1000000)
       process_cpu_total_us = [string]($second * 100)
+      process_cpu_delta_us = if ($second -eq 0) { '' } else { '100' }
       working_set_bytes = [string](1000 + $second)
     }
   }
