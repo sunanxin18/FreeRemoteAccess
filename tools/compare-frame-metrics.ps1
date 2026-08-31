@@ -336,6 +336,89 @@ function Get-CanonicalEventRowKey($Row) {
   return $builder.ToString()
 }
 
+function Assert-EventFieldShapeRows($Rows, [string]$Kind) {
+  $commonFields = @('schema_version', 'run_id', 'implementation', 'phase', 'event', 'monotonic_us')
+  $numericFields = @(
+    'monotonic_us', 'session_id', 'generation', 'revision', 'source_updates',
+    'transactions', 'rectangles', 'batch_cpu_us', 'mailbox_age_us',
+    'scope_begins', 'scope_finishes', 'scope_polls', 'process_cpu_total_us',
+    'process_cpu_delta_us', 'working_set_bytes', 'frame_response_ms',
+    'input_to_next_present_us'
+  )
+  foreach ($row in $Rows) {
+    $event = [string]$row.event
+    $allowedFields = @($commonFields)
+    $requiredFields = @($commonFields)
+    switch -CaseSensitive ($event) {
+      'PhaseBoundary' {}
+      'Presentation' {
+        $allowedFields += @('session_id', 'generation', 'revision')
+        $requiredFields += @('session_id', 'generation', 'revision')
+      }
+      'FrameResponse' {
+        $allowedFields += @('session_id', 'generation', 'frame_response_ms')
+        $requiredFields += @('session_id', 'generation', 'frame_response_ms')
+      }
+      'InputToNextPresent' {
+        $allowedFields += @('session_id', 'generation', 'input_to_next_present_us')
+        $requiredFields += @('session_id', 'generation', 'input_to_next_present_us')
+      }
+      'SerialDrain' {
+        $batchFields = @(
+          'batch_result', 'session_id', 'generation', 'source_updates', 'transactions',
+          'rectangles', 'batch_cpu_us', 'mailbox_age_us', 'scope_begins',
+          'scope_finishes', 'scope_polls'
+        )
+        $allowedFields += $batchFields
+        $requiredFields += $batchFields
+      }
+      'CandidateBatch' {
+        $batchFields = @(
+          'batch_result', 'session_id', 'generation', 'source_updates', 'transactions',
+          'rectangles', 'batch_cpu_us', 'mailbox_age_us', 'scope_begins',
+          'scope_finishes', 'scope_polls'
+        )
+        $allowedFields += $batchFields + @('revision')
+        $requiredFields += $batchFields
+      }
+      'StableFault' {
+        $failureFields = @(
+          'batch_result', 'batch_failure_class', 'source_updates', 'transactions',
+          'batch_cpu_us', 'mailbox_age_us'
+        )
+        $allowedFields += $failureFields + @(
+          'session_id', 'generation', 'revision', 'scope_begins', 'scope_finishes',
+          'scope_polls', 'gpu_fault_code'
+        )
+        $requiredFields += $failureFields
+      }
+      default { throw "invalid_${Kind}_event" }
+    }
+
+    foreach ($field in $EventFields) {
+      $value = Get-OptionalRowField $row $field
+      if ($requiredFields -ccontains $field) {
+        Assert-True (-not [string]::IsNullOrEmpty($value)) "invalid_${Kind}_event_fields"
+      } elseif (-not ($allowedFields -ccontains $field)) {
+        Assert-True ([string]::IsNullOrEmpty($value)) "invalid_${Kind}_event_fields"
+      }
+      if (($numericFields -ccontains $field) -and
+          -not [string]::IsNullOrEmpty($value)) {
+        [void](Convert-U64 $value "invalid_${Kind}_event_fields")
+      }
+    }
+
+    if ($event -ceq 'SerialDrain' -or $event -ceq 'CandidateBatch') {
+      Assert-True ([string]$row.batch_result -ceq 'Success') "invalid_${Kind}_event_fields"
+    } elseif ($event -ceq 'StableFault') {
+      Assert-True (@('SerialFailure', 'CompileFailure', 'RendererFailure') -ccontains
+        [string]$row.batch_result) "invalid_${Kind}_event_fields"
+      Assert-True (@('Compiler', 'RendererPlanning', 'RendererExecution', 'Gpu') -ccontains
+        [string]$row.batch_failure_class) "invalid_${Kind}_event_fields"
+    }
+  }
+}
+
 function Assert-NoDuplicateEventRows($Rows, [string]$Kind) {
   $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
   foreach ($row in $Rows) {
@@ -354,8 +437,6 @@ function Assert-RunRows(
   $eventRunId = Assert-FileRowIdentity $Events $ExpectedImplementation "${Kind}_events" $allPhases
   $processRunId = Assert-FileRowIdentity $ProcessRows $ExpectedImplementation "${Kind}_process" $MeasuredPhases
   Assert-True ($eventRunId -ceq $processRunId) "${Kind}_run_identity_mismatch"
-  Assert-NoDuplicateEventRows $Events "${Kind}_events"
-
   $eventPhases = @($Events | Select-Object -ExpandProperty phase -Unique)
   Assert-True ($eventPhases.Count -eq $allPhases.Count) "invalid_${Kind}_events_phase_set"
   foreach ($phase in $allPhases) {
@@ -391,6 +472,9 @@ function Assert-RunRows(
       $timestamp -lt $lower -or ($hasUpper -and $timestamp -ge $upper)
     }).Count -eq 0) "invalid_${Kind}_events_phase_interval"
   }
+  $identity = Assert-EventIdentityRows $Events "${Kind}_events"
+  Assert-EventFieldShapeRows $Events "${Kind}_events"
+  Assert-NoDuplicateEventRows $Events "${Kind}_events"
   $phaseIntervals = @{
     VisibleMeasurement = [pscustomobject]@{
       lower = [UInt64]$boundaryTimestamps[1]
@@ -402,7 +486,6 @@ function Assert-RunRows(
     }
   }
   Assert-ProcessTimelineRows $ProcessRows $phaseIntervals $Kind
-  $identity = Assert-EventIdentityRows $Events "${Kind}_events"
   Assert-MonotonicEvents $Events
   return [pscustomobject]@{
     run_id = $eventRunId
@@ -1007,6 +1090,28 @@ function Invoke-SelfTest {
     (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
     'duplicate_candidate_events_event_row' 'duplicate_candidate_batch'
 
+  $ignoredFieldCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
+  $ignoredFieldSourceBatch = @($ignoredFieldCandidateEvents | Where-Object {
+    $_.event -ceq 'CandidateBatch'
+  })[0]
+  $ignoredFieldBatch = New-SelfTestComparisonRow $EventHeader ([ordered]@{})
+  foreach ($field in $EventFields) {
+    $ignoredFieldBatch.$field = [string]$ignoredFieldSourceBatch.$field
+  }
+  $ignoredFieldBatch.gpu_fault_code = 'IGNORED'
+  $ignoredFieldIndex = [Array]::IndexOf($ignoredFieldCandidateEvents, $ignoredFieldSourceBatch)
+  $ignoredFieldCandidateEvents = @(
+    $ignoredFieldCandidateEvents[0..$ignoredFieldIndex]
+    $ignoredFieldBatch
+    $ignoredFieldCandidateEvents[($ignoredFieldIndex + 1)..($ignoredFieldCandidateEvents.Count - 1)]
+  )
+  Assert-SelfTestTopLevelRejected `
+    (New-SelfTestComparisonEventRows 'serial-a' 'serial' 1 1 7) `
+    (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
+    $ignoredFieldCandidateEvents `
+    (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
+    'invalid_candidate_events_event_fields' 'ignored_gpu_fault_duplicate_candidate_batch'
+
   $lowercaseSuccessEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
   $lowercaseSuccessBatch = @($lowercaseSuccessEvents | Where-Object {
     $_.event -ceq 'CandidateBatch'
@@ -1017,7 +1122,7 @@ function Invoke-SelfTest {
     (New-SelfTestComparisonProcessRows 'serial-a' 'serial') `
     $lowercaseSuccessEvents `
     (New-SelfTestComparisonProcessRows 'candidate-a' 'candidate') `
-    'non_success_performance_batch' 'lowercase_candidate_batch_success'
+    'invalid_candidate_events_event_fields' 'lowercase_candidate_batch_success'
 
   $installedSurfaceCandidateEvents = New-SelfTestComparisonEventRows 'candidate-a' 'candidate' 1 1 7
   $installedSurfaceCandidateBatch = @($installedSurfaceCandidateEvents | Where-Object {
