@@ -24,6 +24,7 @@
 - A GPU fault may occur after one or more `queue.write_texture` calls. After a scope begins, execution never uses `?` or returns before exactly one `finish`; an observed GPU fault wins over a simultaneous execution error. CPU staged state must not commit, and the shell must block input, detach both `RemoteRenderer` and `RemoteBinding`, clear pending-write bookkeeping, publish stable typed details, and perform no record/submit/present of that texture.
 - `FramePresented` remains possible only after an actual swapchain submit and present confirms the exact final receipt. A batch commit, empty submit, redraw request, or upload is not presentation.
 - Keep `RuntimeWakeGate`, mailbox capacity/overflow behavior, generation events, full-baseline input gate, and blocked-presentation empty-submit behavior intact except for the explicitly described batch wiring.
+- Before a generation event, `Reset`, or wake can be published, preflight `width * height * bytes_per_pixel` against the actual frame-port budget; the desktop binding uses 64 MiB. Zero, arithmetic overflow, or an over-capacity complete surface returns the typed `SurfaceCapacityExceeded` error without partial generation state, CPU-surface allocation, or an impossible atomic Startup.
 - Runtime drain returns separate `ui_redraw_needed` and `frame_redraw_needed` facts. Mailbox non-emptiness is never a redraw fact; a frame redraw requires a clean presentable final boundary.
 - Scope begin/finish/poll counts come only from the real renderer scope observer. They remain separate from the four `BatchApplyOutcome` product facts and are never hard-coded from batch non-emptiness.
 - Metrics use only the dedicated fixed-schema bounded file sink. Do not redirect or parse general stderr, and do not emit credentials, endpoints, pixels, payloads, clipboard/audio content, or free-form errors.
@@ -333,7 +334,7 @@ impl ObservedScopeLifecycle {
 }
 ```
 
-The production `AtomicScopeLifecycleObserver` owns three `AtomicU64`s; the deterministic test observer owns a `Mutex<Vec<ScopeLifecycleEvent>>`. `GpuContext` retains the production observer and exposes `scope_observation()`. `GpuFaultScope::new` calls `begin_observed_scope` only after `begin_operation` succeeds and all three wgpu guards are owned. `GpuFaultScope::finish` retains the result of `record_finish` on its first line, pops the wgpu scopes, retains the result of `record_poll` immediately before the real `device.poll(wgpu::PollType::Poll)`, then combines lifecycle/GPU results; it never uses `?` before the actual poll. A lifecycle error maps to `GpuFaultClass::ObservationIncomplete` only after poll unless a higher-priority GPU fault wins. The lifecycle object rejects a duplicate/out-of-order finish or poll with the private `ScopeLifecycleError`; ownership makes those states unreachable in production, and no other code increments counters. The pure seam tests require no adapter. Add the real Windows DX12 smoke separately with `wgpu::Backends::DX12`; its only permitted skip is adapter acquisition returning `None`, printed exactly as `SKIP adapter_unavailable`. Live Task 7 candidate rows remain the acceptance proof for the real production path. No shell code may synthesize values from update counts or a constant.
+The production `AtomicScopeLifecycleObserver` owns three `AtomicU64`s; the deterministic test observer owns a `Mutex<Vec<ScopeLifecycleEvent>>`. `GpuContext` retains the production observer and exposes `scope_observation()`. `GpuFaultScope::new` calls `begin_observed_scope` only after `begin_operation` succeeds and all three wgpu guards are owned. `GpuFaultScope::finish` retains the result of `record_finish` on its first line, pops the wgpu scopes, retains the result of `record_poll` immediately before the real `device.poll(wgpu::PollType::Poll)`, then combines lifecycle/GPU results; it never uses `?` before the actual poll. A lifecycle error maps to `GpuFaultClass::ObservationIncomplete` only after poll unless a higher-priority GPU fault wins. The lifecycle object rejects a duplicate/out-of-order finish or poll with the private `ScopeLifecycleError`; ownership makes those states unreachable in production, and no other code increments counters. The pure seam tests require no adapter. Add the real Windows DX12 smoke separately with `wgpu::Backends::DX12`; its only permitted skip is adapter acquisition returning `None`, printed exactly as `SKIP adapter_unavailable`. Live Task 7 candidate rows prove only the sampled `c57dc77` successful `CandidateBatch` batch-apply counts; they do not prove the later production record/presentation scope-lifecycle fixes. Deterministic production-helper tests prove the error/fault/commit paths, while the separate DX12 smoke proves only one clean real-backend scope observes `{1,1,1}`. No shell code may synthesize values from update counts or a constant.
 
 Add this test-only executor dependency to `crates/frd-render-wgpu/Cargo.toml`, matching the shell crate, and accept the corresponding `Cargo.lock` package-dependency update:
 
@@ -584,6 +585,8 @@ For S0, `process_cpu_delta_us` is empty. For S1..S30 it is the current total min
 
 `tools/compare-frame-metrics.ps1` accepts serial/candidate app-event and process-sample CSV paths. `VisibleMeasurement` enumerates every half-open window `[t,t+5)` for integer `t=0..25` for batch CPU, mailbox age, scope counts, Presentation, InputToNextPresent, and FrameResponse. Use nearest-rank p95 `sorted[(count * 95 + 99) / 100 - 1]`; ties retain the earliest window. Scope/cadence use the greatest window sum. `MinimizedMeasurement` still requires complete S0..S30 process samples, but static-workload event latency/window fields are N/A; it reports observed Batch/FrameResponse activity counts and totals, and requires zero observed Presentation rows. CPU uses `process_cpu_total_us[S(t+5)] - process_cpu_total_us[S(t)]`; working-set maximum uses S0..S30; first median uses S1..S5 and last median uses S26..S30. `-SelfTest` runs deterministic fixtures and exits nonzero on any mismatch.
 
+Before statistics, cap each event CSV at 32,768 rows and each process CSV at 62 rows. A valid process CSV has exactly those 62 rows: S0..S30 for each of the two measured phases. Every event row must remain inside the half-open interval for its declared phase, from that phase's boundary through but excluding the next boundary; Restore has no later boundary. Event row 32,769, process row 63, a missing/duplicate S0..S30 sample, or an event outside its declared phase fails closed and produces no comparison output.
+
 Use this exact comparison-script boundary:
 
 ```powershell
@@ -597,7 +600,7 @@ param(
 )
 ```
 
-Its output includes the exact Task 7 predicates: every `CandidateBatch` row in a performance run has `batch_result=Success` and scope `{1,1,1}`, aggregate candidate begins=finishes=polls=successful non-empty batches, `visible_batch_cpu_8ms_and_no_regression`, `visible_scope_amplification_reduced_50_percent`, the unchanged visible CPU/working-set/input/frame-response gates, minimized CPU/working-set gates, `minimized_presentation_paused`, and identity-bearing Restore Presentations from serial and candidate. It exits nonzero for a non-success performance batch, false mandatory predicate, incomplete applicable visible window, missing S0..S30 sample, schema/capacity error, or non-monotonic identity/timestamp.
+Its output includes the exact Task 7 predicates: every `CandidateBatch` row in a performance run has `batch_result=Success` and scope `{1,1,1}`, aggregate candidate begins=finishes=polls=successful non-empty batches, `visible_batch_cpu_8ms_and_no_regression`, `visible_scope_amplification_reduced_50_percent`, the unchanged visible CPU/working-set/input/frame-response gates, minimized CPU/working-set gates, `minimized_presentation_paused`, and identity-bearing Restore Presentations from serial and candidate. It exits nonzero for a non-success performance batch, false mandatory predicate, incomplete applicable visible window, missing S0..S30 sample, schema/capacity error, an event outside its declared phase interval, or non-monotonic identity/timestamp.
 
 - [ ] **Step 9: Run focused GREEN and build the serial release**
 
@@ -1643,7 +1646,7 @@ Read the final `transaction.rs`, renderer batch function, and shell drain/fatal 
 4. Startup becomes executable only as Reset plus matching FullBaseline; Incremental-first is the exact typed fatal; binding installs only in the atomic clean batch;
 5. every accepted transaction, patch, row, byte, padded-stride crop, and overlapping write remains FIFO-equivalent to serial;
 6. clean commit returns all four product facts atomically, separate from actual scope diagnostics;
-7. deterministic lifecycle seam and real DX12 smoke (unless adapter unavailable) observe the real begin/finish/poll sites, and both error paths finish/poll exactly once with GPU fault precedence;
+7. deterministic production-helper lifecycle seams prove that batch execution plus record/presentation error paths finish/poll every started scope exactly once with GPU fault precedence and clean-token-gated commit/receipt publication; the separate real DX12 smoke (unless adapter unavailable) proves one clean real-backend scope observes `{1,1,1}`;
 8. each successful CandidateBatch row contains observed `{1,1,1}`, constants fail the fakeable seam, and whole-run/window aggregate sums equal successful non-empty candidate batch count;
 9. compiler/renderer fatal cannot reach remote record, queue submit, surface present, or `FramePresented`, does not invoke full-snapshot recovery, and its complete six-key detail fits 160 bytes without truncation;
 10. serial emits one `SerialDrain` row per non-empty drain, candidate emits one CandidateBatch per successful non-empty batch, and age uses the earliest constituent enqueue retained across drains with checked subtraction;
@@ -1665,7 +1668,7 @@ Expected: all fourteen are demonstrable from exact call paths and recorded tests
 
 **Inputs and result:**
 
-- Consume only the retained valid fixed-schema captures `serial_capacity_click_20260831_23` and `candidate_capacity_click_20260831_23`. Each has five phases, complete measured-phase S0..S30 process samples, and zero `StableFault` rows.
+- Consume only the retained valid fixed-schema captures `serial_capacity_click_20260831_23` and `candidate_capacity_click_20260831_23`. Each stays below the 32,768-row event limit, has exactly 62 process rows containing measured-phase S0..S30, keeps every event inside its declared phase interval, has all five phases, and contains zero `StableFault` rows.
 - Produce a JSON comparison only when every mandatory predicate passes. A false predicate, incomplete applicable visible window, invalid schema/identity/order, or missing required process sample fails closed and leaves no output file.
 
 - [ ] **Step 1: Keep visible measurements complete and make static minimized measurements explicit N/A**
@@ -1711,3 +1714,10 @@ git commit -m "fix: correct frame metrics gate"
 ```
 
 Expected: only the comparator and this plan are tracked changes. The generated comparison JSON and the Task 7 implementation report remain untracked/ignored. Do not merge or push.
+
+### Post-measurement audit closure (2026-08-31)
+
+- The only Task 7 Mac measurements remain reconstructed serial `44a62ad690fbef2067df022f6b0f9bf678e5d6ef` with Release SHA-256 `8CED2D0DB0788D34152AE498461A18F0255B103B3C20F87FCD2026932DD4C421`, and candidate `c57dc7774a377622c7b0ed1486cec71180985788` with Release SHA-256 `4D1AECB691463E813F3C36122C9BC83464BB697028113C7AFE5814A0F102207F`.
+- Runtime correctness commits `a1099a641f7b1213a88b0059f625941c8a8ef779`, `fed72c61d9d335472a8ca0de9e5c0bda6f22d625`, `0e775379cdc065064f0957b44c73955079c17a8d`, and `91d7c2c422b249870395fe7693133d957d4a4ca2` are post-measurement. The 64 MiB preflight has offline source/test/workspace evidence. Deterministic production-helper tests cover record/presentation error, fault-precedence, and commit/receipt behavior; the separate Windows DX12 smoke observes only a clean real-backend scope `{1,1,1}`, and the integrated runtime has Release-build evidence. No new Mac run sampled any of them.
+- Comparator-only commits `323d6e0aea1cb0bd075f90dcc1973edbc9278f66`, `d36e045541587e56f3af1dee0c0d4477d0686793`, and `4344183dadf0e2fb205baa61e38d75395c95ea97` enforce the 32,768-event/62-process input limits and strict event phase intervals. The comparator through `4344183` replayed the same retained CSVs and reproduced the recorded predicates; that replay is offline reanalysis, not recapture.
+- Never substitute a current Release hash for either sampled hash above, and never use the post-measurement correctness fixes or comparator replay as new live-interoperability evidence.

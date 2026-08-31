@@ -51,8 +51,8 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 |---|---|---|---|
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
 | High Performance 虚拟显示与实体显示器置黑 | `frd-protocol-apple` 严格确认门禁 | **开发中** | 产品只选择加密 `APPLE_SRP`，发送现有 `0x1d` 后等待严格 `0x451 ServerState`，确认前不公开 generation/readiness；自动化门禁不能替代实体显示器置黑/恢复与完整远程桌面的真机观察，见 [`设计`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md) |
-| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-31 保留固定捕获证明 Windows wgpu frame-transaction 路径在有界 Apple HPSS/MVS 真机比较中通过；范围、run id 与二进制身份见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。这不包含严格 High Performance 虚拟显示/实体显示器置黑与恢复门禁。 |
-| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。2026-08-31 候选实现通过固定真机比较：每个成功 batch 恰有一个 scope begin/finish/poll，源更新归一化的 scope-amplification 门禁、输入/FrameResponse 及 CPU/内存门禁均通过；证据范围与非结论见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。 |
+| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-31 保留固定捕获仅证明采样候选 `c57dc77` 的 Windows wgpu frame-transaction 路径在有界 Apple HPSS/MVS 真机比较中通过；范围、run id 与二进制身份见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。这不包含后置 runtime 正确性修复，也不包含严格 High Performance 虚拟显示/实体显示器置黑与恢复门禁。 |
+| 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。2026-08-31 的 `c57dc77` 采样候选通过固定真机比较：每个成功 `CandidateBatch` 行的 batch-apply scope 恰有一个 begin/finish/poll，源更新归一化的 scope-amplification 门禁、输入/FrameResponse 及 CPU/内存门禁均通过；该结论不涵盖 acquisition、record 或 presentation scope，证据范围与非结论见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
 | 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |
 | 动态分辨率 | 实验性 resized `0x09` + generation 切换 | **实验性** | 默认关闭；尚无足够 Apple 线协议互操作证据，见 `AGENTS.md` P1 |
@@ -62,6 +62,13 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 剪贴板 | 能力边界已预留 | **计划中** | 当前 Windows 产品未完成端到端剪贴板集成 |
 | 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **开发中** | 自动化状态机、非敏感元数据及本机进程唯一凭据库往返已通过；按本矩阵定义，授权 Mac GUI 的 TransportReady 提交与取消保存删除链路尚未完成有界真机验证，见 `docs/validation/windows-secure-login.md` |
 | 文件传输 | 未选择 | **计划中** | 需先确认各原生服务端支持的协议与安全边界 |
+
+当前桌面 frame port 在发布 generation event、`Reset` 或 wake 前，对完整 surface
+执行 64 MiB 容量预检；零尺寸、算术溢出或超限均 fail-closed，不发布部分
+generation 状态。该预检及后续 record/presentation scope 生命周期修复发生在上述
+Task 7 真机采样之后，目前仅有离线验证，没有新的 Mac 真机采样。`4344183` 也只用
+当前 comparator 重放相同 retained CSV，不是 recapture，不能把当前 Release 哈希
+替换为采样二进制哈希。
 
 ### Windows 客户端连接 Windows 功能明细
 

@@ -240,6 +240,25 @@ Comparator corrections `e0a29e647804f478198252e5b90e9575ce150762` and
 `d57eee9574e8703e7b0beebf40dc3abfdc3ebdbf` changed neither measured runtime
 binary.
 
+Runtime correctness commits
+`a1099a641f7b1213a88b0059f625941c8a8ef779`,
+`fed72c61d9d335472a8ca0de9e5c0bda6f22d625`,
+`0e775379cdc065064f0957b44c73955079c17a8d`, and
+`91d7c2c422b249870395fe7693133d957d4a4ca2` were applied after both captures.
+They add the 64 MiB complete-surface preflight and close/bind the production
+record/presentation scope lifecycle, including the hot-path context borrowing
+used by the integrated flow. None was present in either sampled binary, and no
+new Mac run or recapture exercised them. A current Release artifact therefore
+must not replace either sampled SHA-256 above.
+
+Comparator-only hardening in `323d6e0aea1cb0bd075f90dcc1973edbc9278f66`,
+`d36e045541587e56f3af1dee0c0d4477d0686793`, and
+`4344183dadf0e2fb205baa61e38d75395c95ea97` caps each event input at 32,768
+rows, caps each process input at 62 rows, and requires every event timestamp to
+remain inside its declared half-open phase interval. The comparator through
+`4344183` replayed the same retained CSVs and reproduced the recorded result.
+That was an offline reanalysis, not a new runtime capture or Mac measurement.
+
 The serial run was `serial_capacity_click_20260831_23`: 3,660 event rows, 62
 process rows, all five phases, 25 `InputToNextPresent` rows, and zero
 `StableFault`. The candidate run was `candidate_capacity_click_20260831_23`:
@@ -275,9 +294,11 @@ claim. The source-normalized exact scope-amplification gate also passes:
 `992/3314 <= 0.5 * (3054/3054)`. Raw scope reduction is only supporting
 context, not the batch-CPU result. Candidate whole-run
 batch/begins/finishes/polls are exactly `2,496/2,496/2,496/2,496`, proving one
-observed begin, finish, and poll for every successful candidate batch. The
-visible `InputToNextPresent` requirement is at least 50% lower and passes;
-`FrameResponse` is no worse and passes.
+observed begin, finish, and poll for every successful `CandidateBatch` within
+the sampled batch-apply metric interval. It does not count or prove acquisition,
+record, submit, or presentation scopes. The visible `InputToNextPresent`
+requirement is at least 50% lower and passes; `FrameResponse` is no worse and
+passes.
 
 ### MinimizedMeasurement
 
@@ -313,6 +334,14 @@ focused suite, and the `fatal_redraw_requested_` focused suite prove only that,
 once fatal, input/binding/presentation are detached and no failed texture is
 recorded, submitted, or presented. They do not claim that a live GPU fault
 occurred.
+
+The post-measurement `fed72c6`, `0e77537`, and `91d7c2c` production
+record/presentation helpers have deterministic helper evidence for exactly-once
+finish/poll on error paths, GPU-fault precedence, and commit/receipt
+suppression. The separate Windows DX12 smoke proves only that one clean scope
+on the real backend observes `{1,1,1}`. Both are offline evidence: neither was
+part of the `c57dc77` capture, observed a live GPU fault, or reconnected to the
+Mac.
 
 Every mandatory comparator predicate passed: visible CPU, working set,
 input, and `FrameResponse`; minimized CPU, working set, and trend; exact
