@@ -684,6 +684,7 @@ impl ProtocolRuntime {
                 .current_generation
                 .is_some_and(|current| admission.generation <= current)
         {
+            self.poison();
             return Err(ProtocolError::InvalidGeneration);
         }
         if let Err(error) = self.events.publish(SessionEvent::SurfaceGenerationChanged {
@@ -1000,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_admission_cannot_cross_runtime_or_outlive_generation_state() {
+    fn cross_runtime_generation_admission_poison_target_without_publication() {
         let session_id = SessionId::allocate();
         let size = PixelSize::new(800, 600).expect("valid size");
         let first_log = Arc::new(Mutex::new(Vec::new()));
@@ -1025,20 +1026,46 @@ mod tests {
             second.begin_admitted_generation(foreign),
             Err(ProtocolError::InvalidGeneration)
         );
+        assert!(second.requires_shutdown());
+        assert!(!first.requires_shutdown());
         assert!(first_log.lock().unwrap().is_empty());
         assert!(second_log.lock().unwrap().is_empty());
+        assert_eq!(
+            second.begin_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            Err(ProtocolError::Terminal)
+        );
+        assert!(second_log.lock().unwrap().is_empty());
+    }
 
-        let stale = first
+    #[test]
+    fn stale_generation_admission_poison_runtime_without_republication() {
+        let session_id = SessionId::allocate();
+        let size = PixelSize::new(800, 600).expect("valid size");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(RecordingEvents(log.clone())),
+            Box::new(RecordingFrames(log.clone())),
+            Box::new(RecordingWake(log.clone())),
+        );
+
+        let stale = runtime
             .admit_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)
             .unwrap();
-        first
+        runtime
             .begin_generation(session_id, 1, size, PixelFormat::Bgrx8UnormSrgb)
             .unwrap();
         assert_eq!(
-            first.begin_admitted_generation(stale),
+            runtime.begin_admitted_generation(stale),
             Err(ProtocolError::InvalidGeneration)
         );
-        assert_eq!(*first_log.lock().unwrap(), vec!["event", "reset", "wake"]);
+        assert!(runtime.requires_shutdown());
+        assert_eq!(*log.lock().unwrap(), vec!["event", "reset", "wake"]);
+        assert_eq!(
+            runtime.begin_generation(session_id, 2, size, PixelFormat::Bgrx8UnormSrgb),
+            Err(ProtocolError::Terminal)
+        );
+        assert_eq!(*log.lock().unwrap(), vec!["event", "reset", "wake"]);
     }
 
     #[test]
