@@ -41,18 +41,18 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
-fn srgb_to_linear_channel(encoded: f32) -> f32 {
-    if encoded <= 0.04045 {
-        return encoded / 12.92;
+fn bt709_to_linear_channel(encoded: f32) -> f32 {
+    if encoded < 0.081 {
+        return encoded / 4.5;
     }
-    return pow((encoded + 0.055) / 1.055, 2.4);
+    return pow((encoded + 0.099) / 1.099, 1.0 / 0.45);
 }
 
-fn srgb_to_linear(encoded: vec3<f32>) -> vec3<f32> {
+fn bt709_to_linear(encoded: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(
-        srgb_to_linear_channel(encoded.r),
-        srgb_to_linear_channel(encoded.g),
-        srgb_to_linear_channel(encoded.b),
+        bt709_to_linear_channel(encoded.r),
+        bt709_to_linear_channel(encoded.g),
+        bt709_to_linear_channel(encoded.b),
     );
 }
 
@@ -63,5 +63,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let u = textureSample(u_tex, linear_sampler, uv).r - 0.5;
     let v = textureSample(v_tex, linear_sampler, uv).r - 0.5;
     let encoded_rgb = clamp(color.yuv_to_rgb * vec3<f32>(y, u, v), vec3(0.0), vec3(1.0));
-    return vec4<f32>(srgb_to_linear(encoded_rgb), 1.0);
+    return vec4<f32>(bt709_to_linear(encoded_rgb), 1.0);
 }

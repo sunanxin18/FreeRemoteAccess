@@ -1114,7 +1114,10 @@ mod tests {
                 "READBACK adapter_backend={:?} pixels={pixels:?}",
                 context.adapter().get_info().backend
             );
-            let expected: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [128, 128, 128]];
+            // The gray sample's matrix result is approximately
+            // [0.501232, 0.496254, 0.501859]. Inverse BT.709 followed by the
+            // attachment's sRGB encoding quantizes to [140, 138, 140].
+            let expected: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [140, 138, 140]];
             for (pixel, expected) in pixels.into_iter().zip(expected) {
                 for channel in 0..3 {
                     assert!(
