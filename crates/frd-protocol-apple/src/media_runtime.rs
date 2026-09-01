@@ -816,6 +816,74 @@ mod tests {
     }
 
     #[test]
+    fn startup_loss_waits_for_irap_before_publishing_cached_configuration() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(1, 0, false, &startup_parameter_set_ap())),
+        )
+        .unwrap();
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(258, 0, true, &[0x02, 0x01, 1])),
+        )
+        .unwrap();
+
+        for (sequence, timestamp, payload) in [
+            (259, 3_000, &[0x02, 0x01, 2][..]),
+            (260, 6_000, &[0x00, 0x01, 3][..]),
+        ] {
+            accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(video_rtp(sequence, timestamp, true, payload)),
+            )
+            .unwrap();
+        }
+        assert!(published.lock().unwrap().is_empty());
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(261, 9_000, true, &[0x26, 0x01, 4])),
+        )
+        .unwrap();
+
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 2);
+        assert!(matches!(&published[0], MediaFrame::VideoConfig(_)));
+        assert!(
+            matches!(&published[1], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.random_access() && access_unit.timestamp().ticks == 9_000)
+        );
+    }
+
+    #[test]
     fn authenticated_video_rtp_stage_precedes_downstream_failure_and_is_once_per_stream() {
         let session_id = SessionId::allocate();
         let (_commands, command_rx) = mpsc::channel();

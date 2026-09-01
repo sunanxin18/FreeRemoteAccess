@@ -137,6 +137,7 @@ struct BufferedPacket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitialConfigurationState {
     AwaitingConfigurationAu,
+    AwaitingRecoveryIrap,
     Configured,
 }
 
@@ -383,6 +384,17 @@ impl HevcAccessUnitAssembler {
             self.nals.push(bytes);
         }
 
+        if packet.marker
+            && self.initial_configuration == InitialConfigurationState::AwaitingRecoveryIrap
+            && !self
+                .nals
+                .iter()
+                .any(|nal| matches!(nal_type(nal), Some(16..=23)))
+        {
+            self.discard_access_unit();
+            return Ok(None);
+        }
+
         if !packet.marker {
             return Ok(None);
         }
@@ -412,7 +424,7 @@ impl HevcAccessUnitAssembler {
         if parameter_set_bytes > self.limits.max_access_unit_bytes {
             return Err(self.fail_access_unit_budget());
         }
-        if self.initial_configuration == InitialConfigurationState::AwaitingConfigurationAu
+        if self.initial_configuration != InitialConfigurationState::Configured
             && next_parameter_sets.iter().any(Option::is_none)
         {
             self.discard_access_unit();
@@ -512,6 +524,7 @@ impl HevcAccessUnitAssembler {
             return;
         };
         self.parameter_sets = [Some(vps), Some(sps), Some(pps)];
+        self.initial_configuration = InitialConfigurationState::AwaitingRecoveryIrap;
     }
 
     fn fail_access_unit_budget(&mut self) -> HevcAccessUnitError {
@@ -1028,17 +1041,26 @@ mod tests {
             Err(HevcAccessUnitError::ReorderWindowExceeded { limit: 256 })
         );
 
-        let output = assembler
+        assert!(assembler
             .push(packet(268, 3_000, true, &[0x02, 0x01, 5]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(269, 6_000, true, &[0x00, 0x01, 6]))
+            .unwrap()
+            .is_empty());
+
+        let output = assembler
+            .push(packet(270, 9_000, true, &[0x26, 0x01, 7]))
             .unwrap();
         assert_eq!(output.len(), 1);
-        assert!(!output[0].keyframe);
+        assert!(output[0].keyframe);
         assert!(output[0].parameter_sets_prepended);
         assert_eq!(
             output[0].data,
             [
                 0, 0, 0, 3, 0x40, 0x01, 1, 0, 0, 0, 3, 0x42, 0x01, 2, 0, 0, 0, 3, 0x44, 0x01, 3, 0,
-                0, 0, 3, 0x02, 0x01, 5,
+                0, 0, 3, 0x26, 0x01, 7,
             ]
         );
     }
