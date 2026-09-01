@@ -237,7 +237,9 @@ impl HighPerformanceStartupGate {
                 Ok(HighPerformanceObservation::Confirmed(confirmation))
             }
             HighPerformanceStartupState::Awaiting => {
-                self.fail(HighPerformanceDiagnostic::ConfirmationMalformed)
+                self.fail(HighPerformanceDiagnostic::ConfirmationTimeout {
+                    elapsed_ms: elapsed_ms(self.requested_at, observed_at),
+                })
             }
         }
     }
@@ -439,6 +441,7 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(error.code(), APPLE_HIGH_PERFORMANCE_UNAVAILABLE);
+            assert_eq!(error.stage_code(), "hp05_confirmation_timeout");
             assert_eq!(
                 gate.observe_server_state_at(
                     GEOMETRY,
@@ -446,7 +449,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .stage_code(),
-                "hp07_confirmation_malformed"
+                "hp05_confirmation_timeout"
             );
         }
     }
