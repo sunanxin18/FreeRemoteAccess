@@ -64,6 +64,7 @@ pub enum HevcAccessUnitError {
     ReorderByteBudgetExceeded { limit: usize },
     AccessUnitBudgetExceeded { limit: usize },
     MarkerBeforeFuCompletion,
+    MissingInitialParameterSets,
     MalformedLengthPrefixedAccessUnit,
     EmptyNalUnit,
     Depacketize(HevcRtpError),
@@ -103,6 +104,9 @@ impl fmt::Display for HevcAccessUnitError {
             Self::MarkerBeforeFuCompletion => {
                 formatter.write_str("HEVC RTP marker 到达时 FU 仍未完成")
             }
+            Self::MissingInitialParameterSets => {
+                formatter.write_str("HEVC 初始访问单元缺少 VPS/SPS/PPS")
+            }
             Self::MalformedLengthPrefixedAccessUnit => {
                 formatter.write_str("HEVC 访问单元 length-prefix 越界")
             }
@@ -130,6 +134,12 @@ struct BufferedPacket {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialConfigurationState {
+    AwaitingConfigurationAu,
+    Configured,
+}
+
 #[derive(Debug)]
 pub struct HevcAccessUnitAssembler {
     generation: u64,
@@ -143,6 +153,8 @@ pub struct HevcAccessUnitAssembler {
     nals: Vec<Vec<u8>>,
     access_unit_bytes: usize,
     parameter_sets: [Option<Vec<u8>>; 3],
+    initial_configuration: InitialConfigurationState,
+    complete_initial_ap_parameter_sets: Option<[Vec<u8>; 3]>,
     dropping_until_marker: bool,
     recovery_sequence: Option<u16>,
 }
@@ -167,7 +179,9 @@ impl HevcAccessUnitAssembler {
             nals: Vec::new(),
             access_unit_bytes: 0,
             parameter_sets: [None, None, None],
-            dropping_until_marker: true,
+            initial_configuration: InitialConfigurationState::AwaitingConfigurationAu,
+            complete_initial_ap_parameter_sets: None,
+            dropping_until_marker: false,
             recovery_sequence: None,
         })
     }
@@ -184,7 +198,9 @@ impl HevcAccessUnitAssembler {
         self.nals.clear();
         self.access_unit_bytes = 0;
         self.parameter_sets = [None, None, None];
-        self.dropping_until_marker = true;
+        self.initial_configuration = InitialConfigurationState::AwaitingConfigurationAu;
+        self.complete_initial_ap_parameter_sets = None;
+        self.dropping_until_marker = false;
         self.recovery_sequence = None;
     }
 
@@ -236,6 +252,7 @@ impl HevcAccessUnitAssembler {
             return Ok(Vec::new());
         }
         if usize::from(distance) >= self.limits.max_reorder_packets {
+            self.preserve_complete_initial_ap_parameter_sets();
             self.drop_at_packet_boundary(packet.sequence, packet.marker);
             return Err(HevcAccessUnitError::ReorderWindowExceeded {
                 limit: self.limits.max_reorder_packets,
@@ -323,6 +340,19 @@ impl HevcAccessUnitAssembler {
                     return Err(HevcAccessUnitError::Depacketize(error));
                 }
             };
+        if self.initial_configuration == InitialConfigurationState::AwaitingConfigurationAu
+            && nal_type(&packet.payload) == Some(48)
+        {
+            let mut parameter_sets: [Option<Vec<u8>>; 3] = [None, None, None];
+            for nal in &packet_nals {
+                if let Some(index) = parameter_set_index(nal.as_bytes()) {
+                    parameter_sets[index] = Some(nal.as_bytes().to_vec());
+                }
+            }
+            if let [Some(vps), Some(sps), Some(pps)] = parameter_sets {
+                self.complete_initial_ap_parameter_sets = Some([vps, sps, pps]);
+            }
+        }
         if packet.marker && packet_nals.is_empty() {
             self.discard_access_unit();
             self.dropping_until_marker = false;
@@ -382,13 +412,21 @@ impl HevcAccessUnitAssembler {
         if parameter_set_bytes > self.limits.max_access_unit_bytes {
             return Err(self.fail_access_unit_budget());
         }
+        if self.initial_configuration == InitialConfigurationState::AwaitingConfigurationAu
+            && next_parameter_sets.iter().any(Option::is_none)
+        {
+            self.discard_access_unit();
+            return Err(HevcAccessUnitError::MissingInitialParameterSets);
+        }
 
         let keyframe = self
             .nals
             .iter()
             .any(|nal| matches!(nal_type(nal), Some(16..=23)));
         let mut prefixes = Vec::new();
-        if keyframe {
+        if keyframe
+            || self.initial_configuration == InitialConfigurationState::AwaitingConfigurationAu
+        {
             for (index, parameter_set) in next_parameter_sets.iter().enumerate() {
                 if self
                     .nals
@@ -422,6 +460,8 @@ impl HevcAccessUnitAssembler {
         }
 
         self.parameter_sets = next_parameter_sets;
+        self.initial_configuration = InitialConfigurationState::Configured;
+        self.complete_initial_ap_parameter_sets = None;
         self.timestamp = None;
         self.nals.clear();
         self.access_unit_bytes = 0;
@@ -452,6 +492,8 @@ impl HevcAccessUnitAssembler {
         self.dropping_until_marker = !marker;
         self.recovery_sequence = (!marker).then_some(sequence);
         self.parameter_sets = [None, None, None];
+        self.initial_configuration = InitialConfigurationState::AwaitingConfigurationAu;
+        self.complete_initial_ap_parameter_sets = None;
     }
 
     fn discard_access_unit(&mut self) {
@@ -459,6 +501,17 @@ impl HevcAccessUnitAssembler {
         self.nals.clear();
         self.access_unit_bytes = 0;
         self.depacketizer.reset(self.generation);
+        self.complete_initial_ap_parameter_sets = None;
+    }
+
+    fn preserve_complete_initial_ap_parameter_sets(&mut self) {
+        if self.initial_configuration != InitialConfigurationState::AwaitingConfigurationAu {
+            return;
+        }
+        let Some([vps, sps, pps]) = self.complete_initial_ap_parameter_sets.take() else {
+            return;
+        };
+        self.parameter_sets = [Some(vps), Some(sps), Some(pps)];
     }
 
     fn fail_access_unit_budget(&mut self) -> HevcAccessUnitError {
@@ -560,6 +613,7 @@ fn append_length_prefixed(output: &mut Vec<u8>, nal: &[u8]) {
 mod tests {
     use super::{
         HevcAccessUnitAssembler, HevcAccessUnitError, HevcAccessUnitLimits, HevcRtpPacket,
+        InitialConfigurationState,
     };
 
     const GENERATION: u64 = 9;
@@ -580,42 +634,65 @@ mod tests {
         HevcAccessUnitAssembler::new(GENERATION, HevcAccessUnitLimits::default()).unwrap()
     }
 
+    fn recovering_assembler() -> HevcAccessUnitAssembler {
+        let mut assembler = assembler();
+        assembler.parameter_sets = [
+            Some(vec![0x40, 0x01, 1]),
+            Some(vec![0x42, 0x01, 2]),
+            Some(vec![0x44, 0x01, 3]),
+        ];
+        assembler.initial_configuration = InitialConfigurationState::Configured;
+        assembler.dropping_until_marker = true;
+        assembler
+    }
+
+    fn assume_configured(assembler: &mut HevcAccessUnitAssembler, next_sequence: u16) {
+        assembler.ssrc = Some(SSRC);
+        assembler.expected_sequence = Some(next_sequence);
+        assembler.parameter_sets = [
+            Some(vec![0x40, 0x01, 1]),
+            Some(vec![0x42, 0x01, 2]),
+            Some(vec![0x44, 0x01, 3]),
+        ];
+        assembler.initial_configuration = InitialConfigurationState::Configured;
+        assembler.dropping_until_marker = false;
+    }
+
     fn synchronize(assembler: &mut HevcAccessUnitAssembler, first_sequence: u16) {
-        assert!(assembler
-            .push(packet(
-                first_sequence.wrapping_sub(1),
-                0,
-                true,
-                &[0x02, 0x01, 0],
-            ))
-            .unwrap()
-            .is_empty());
+        let configuration = [
+            0x60, 0x01, 0, 3, 0x40, 0x01, 1, 0, 3, 0x42, 0x01, 2, 0, 3, 0x44, 0x01, 3,
+        ];
+        assert_eq!(
+            assembler
+                .push(packet(
+                    first_sequence.wrapping_sub(1),
+                    0,
+                    true,
+                    &configuration,
+                ))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
-    fn initial_middle_of_access_unit_is_dropped_through_the_first_marker() {
+    fn initial_access_unit_without_parameter_sets_fails_closed() {
         let mut assembler = assembler();
 
         assert!(assembler
             .push(packet(10, 1000, false, &[0x02, 0x01, 0xaa]))
             .unwrap()
             .is_empty());
-        assert!(assembler
-            .push(packet(11, 1000, true, &[0x02, 0x01, 0xbb]))
-            .unwrap()
-            .is_empty());
-
-        let output = assembler
-            .push(packet(12, 2000, true, &[0x02, 0x01, 0xcc]))
-            .unwrap();
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].timestamp, 2000);
-        assert_eq!(output[0].data, [0, 0, 0, 3, 0x02, 0x01, 0xcc]);
+        assert_eq!(
+            assembler.push(packet(11, 1000, true, &[0x02, 0x01, 0xbb])),
+            Err(HevcAccessUnitError::MissingInitialParameterSets)
+        );
     }
 
     #[test]
     fn late_old_marker_during_recovery_cannot_rewind_the_sequence_cursor() {
-        let mut assembler = assembler();
+        let mut assembler = recovering_assembler();
         assert!(assembler
             .push(packet(9, 900, true, &[0x02, 0x01, 0]))
             .unwrap()
@@ -648,7 +725,7 @@ mod tests {
 
     #[test]
     fn forward_recovery_marker_is_accepted_across_sequence_wrap() {
-        let mut assembler = assembler();
+        let mut assembler = recovering_assembler();
         assert!(assembler
             .push(packet(u16::MAX - 2, 900, true, &[0x02, 0x01, 0]))
             .unwrap()
@@ -681,7 +758,7 @@ mod tests {
 
     #[test]
     fn recovery_observation_rejects_marker_older_than_forward_non_marker() {
-        let mut assembler = assembler();
+        let mut assembler = recovering_assembler();
 
         assert!(assembler
             .push(packet(100, 1000, false, &[0x02, 0x01, 1]))
@@ -705,7 +782,7 @@ mod tests {
 
     #[test]
     fn recovery_cursor_tracks_multiple_forward_observations() {
-        let mut assembler = assembler();
+        let mut assembler = recovering_assembler();
 
         for sequence in [100, 105] {
             assert!(assembler
@@ -740,7 +817,7 @@ mod tests {
 
     #[test]
     fn recovery_cursor_advances_exactly_across_u16_wrap() {
-        let mut assembler = assembler();
+        let mut assembler = recovering_assembler();
 
         for sequence in [u16::MAX, 0] {
             assert!(assembler
@@ -768,7 +845,7 @@ mod tests {
 
     #[test]
     fn recovery_half_range_observation_is_ambiguous_and_fails_closed() {
-        let mut assembler = assembler();
+        let mut assembler = recovering_assembler();
 
         assert!(assembler
             .push(packet(0, 1000, false, &[0x02, 0x01, 1]))
@@ -937,6 +1014,36 @@ mod tests {
     }
 
     #[test]
+    fn initial_complete_parameter_set_ap_survives_only_reorder_window_loss() {
+        let mut assembler = assembler();
+        let configuration = [
+            0x60, 0x01, 0, 3, 0x40, 0x01, 1, 0, 3, 0x42, 0x01, 2, 0, 3, 0x44, 0x01, 3,
+        ];
+        assert!(assembler
+            .push(packet(10, 0, false, &configuration))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            assembler.push(packet(267, 0, true, &[0x02, 0x01, 4])),
+            Err(HevcAccessUnitError::ReorderWindowExceeded { limit: 256 })
+        );
+
+        let output = assembler
+            .push(packet(268, 3_000, true, &[0x02, 0x01, 5]))
+            .unwrap();
+        assert_eq!(output.len(), 1);
+        assert!(!output[0].keyframe);
+        assert!(output[0].parameter_sets_prepended);
+        assert_eq!(
+            output[0].data,
+            [
+                0, 0, 0, 3, 0x40, 0x01, 1, 0, 0, 0, 3, 0x42, 0x01, 2, 0, 0, 0, 3, 0x44, 0x01, 3, 0,
+                0, 0, 3, 0x02, 0x01, 5,
+            ]
+        );
+    }
+
+    #[test]
     fn timestamp_change_before_marker_drops_both_sides_of_the_boundary() {
         let mut assembler = assembler();
         synchronize(&mut assembler, 50);
@@ -998,10 +1105,12 @@ mod tests {
             sequence: 1,
             timestamp: 1,
             marker: true,
-            payload: &[0x02, 0x01, 4],
+            payload: &[
+                0x60, 0x01, 0, 3, 0x40, 0x01, 1, 0, 3, 0x42, 0x01, 2, 0, 3, 0x44, 0x01, 3,
+            ],
             ssrc: SSRC,
         };
-        assert!(assembler.push(boundary).unwrap().is_empty());
+        assert_eq!(assembler.push(boundary).unwrap().len(), 1);
         let fresh = HevcRtpPacket {
             generation: GENERATION + 1,
             sequence: 2,
@@ -1040,7 +1149,7 @@ mod tests {
             },
         )
         .unwrap();
-        synchronize(&mut bounded, 80);
+        assume_configured(&mut bounded, 80);
         bounded
             .push(packet(80, 17000, false, &[0x02, 0x01, 1]))
             .unwrap();
@@ -1061,7 +1170,7 @@ mod tests {
             },
         )
         .unwrap();
-        synchronize(&mut assembler, 90);
+        assume_configured(&mut assembler, 90);
         assembler
             .push(packet(90, 18000, false, &[0x02, 0x01, 0]))
             .unwrap();
@@ -1085,7 +1194,7 @@ mod tests {
             },
         )
         .unwrap();
-        synchronize(&mut assembler, 100);
+        assume_configured(&mut assembler, 100);
         let config = [
             0x60, 0x01, 0, 2, 0x40, 0x01, 0, 2, 0x42, 0x01, 0, 2, 0x44, 0x01,
         ];

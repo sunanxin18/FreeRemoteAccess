@@ -11,7 +11,9 @@ use crate::audio_codec::{
     ARD_AUDIO_SAMPLE_RATE_HZ,
 };
 use crate::connection::AppleWriterHandle;
-use crate::hevc_access_unit::{HevcAccessUnitAssembler, HevcAccessUnitLimits, HevcRtpPacket};
+use crate::hevc_access_unit::{
+    HevcAccessUnitAssembler, HevcAccessUnitError, HevcAccessUnitLimits, HevcRtpPacket,
+};
 use crate::high_performance_video::AppleHighPerformanceVideoAdapter;
 use crate::media_negotiation::{AudioMediaFlow, MediaStreamAnswer};
 use crate::media_protocol::MediaStreamPortAnnouncement;
@@ -90,17 +92,18 @@ impl VideoReceiveState {
         datagram: &[u8],
     ) -> Result<()> {
         let packet = parse_rtp_packet(datagram).context("解析 Apple HP 视频 RTP 数据报失败")?;
-        let access_units = self
-            .assembler
-            .push(HevcRtpPacket {
-                generation,
-                ssrc: packet.header.ssrc,
-                sequence: packet.header.sequence,
-                timestamp: packet.header.timestamp,
-                marker: packet.header.marker,
-                payload: packet.payload,
-            })
-            .context("组装 Apple HP HEVC 访问单元失败")?;
+        let access_units = match self.assembler.push(HevcRtpPacket {
+            generation,
+            ssrc: packet.header.ssrc,
+            sequence: packet.header.sequence,
+            timestamp: packet.header.timestamp,
+            marker: packet.header.marker,
+            payload: packet.payload,
+        }) {
+            Ok(access_units) => access_units,
+            Err(HevcAccessUnitError::ReorderWindowExceeded { .. }) => return Ok(()),
+            Err(error) => return Err(error).context("组装 Apple HP HEVC 访问单元失败"),
+        };
         for access_unit in access_units {
             self.adapter
                 .publish_access_unit(runtime, access_unit)
@@ -615,7 +618,7 @@ mod tests {
             &mut state,
             &mut runtime,
             MediaRole::VideoStream1,
-            MediaDatagram::Rtp(video_rtp(1, 1, true, &[0x02, 0x01, 0xaa])),
+            MediaDatagram::Rtp(video_rtp(1, 1, false, &startup_parameter_set_ap())),
         )
         .unwrap();
 
@@ -661,15 +664,6 @@ mod tests {
         )
         .unwrap();
 
-        accept_state_datagram(
-            &mut state,
-            &mut runtime,
-            MediaRole::VideoStream1,
-            MediaDatagram::Rtp(video_rtp(1, 1, true, &[0x02, 0x01, 0xaa])),
-        )
-        .unwrap();
-        assert!(published.lock().unwrap().is_empty());
-
         let mut aggregation = vec![0x60, 0x01];
         for nal in [
             &[0x40, 0x01, 0xaa][..],
@@ -684,7 +678,7 @@ mod tests {
             &mut state,
             &mut runtime,
             MediaRole::VideoStream1,
-            MediaDatagram::Rtp(video_rtp(2, 90_000, true, &aggregation)),
+            MediaDatagram::Rtp(video_rtp(1, 90_000, true, &aggregation)),
         )
         .unwrap();
 
@@ -696,6 +690,128 @@ mod tests {
             matches!(&published[1], MediaFrame::EncodedVideo(access_unit)
             if access_unit.identity().session_id == session_id
                 && access_unit.identity().stream_id == 1)
+        );
+    }
+
+    #[test]
+    fn apple_startup_configuration_au_is_not_discarded() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let aggregation = startup_parameter_set_ap();
+        for (sequence, marker, payload) in [
+            (10, false, aggregation.as_slice()),
+            (11, false, &[0x62, 0x01, 0x93, 0xaa][..]),
+            (12, false, &[0x62, 0x01, 0x13, 0xbb][..]),
+            (13, true, &[0x62, 0x01, 0x53, 0xcc][..]),
+        ] {
+            accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(video_rtp(sequence, 0, marker, payload)),
+            )
+            .unwrap();
+        }
+
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 2);
+        assert!(matches!(&published[0], MediaFrame::VideoConfig(config)
+            if config.as_input().identity.session_id == session_id
+                && config.as_input().identity.stream_id == 1));
+        assert!(
+            matches!(&published[1], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.identity().session_id == session_id
+                && access_unit.identity().stream_id == 1
+                && access_unit.timestamp().ticks == 0
+                && access_unit.random_access())
+        );
+    }
+
+    #[test]
+    fn captured_packet_loss_drops_one_au_and_recovers() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let aggregation = startup_parameter_set_ap();
+        for (sequence, marker, payload) in [
+            (1, false, aggregation.as_slice()),
+            (2, false, &[0x62, 0x01, 0x93, 0xaa][..]),
+            (3, true, &[0x62, 0x01, 0x53, 0xbb][..]),
+        ] {
+            accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(video_rtp(sequence, 0, marker, payload)),
+            )
+            .unwrap();
+        }
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(4, 3_000, false, &[0x02, 0x01, 0xdd])),
+        )
+        .unwrap();
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(261, 3_000, true, &[0x02, 0x01, 0xee])),
+        )
+        .expect("captured reorder-window loss must drop only the damaged AU");
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(262, 6_000, true, &[0x02, 0x01, 0xff])),
+        )
+        .expect("the next complete AU must remain publishable in the same stream");
+
+        assert!(!runtime.requires_shutdown());
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 3);
+        assert!(
+            matches!(&published[2], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.identity().session_id == session_id
+                && access_unit.generation() == 1
+                && access_unit.timestamp().ticks == 6_000)
         );
     }
 
@@ -756,6 +872,19 @@ mod tests {
         packet
     }
 
+    fn startup_parameter_set_ap() -> Vec<u8> {
+        let mut aggregation = vec![0x60, 0x01];
+        for nal in [
+            &[0x40, 0x01, 0xaa][..],
+            crate::hevc_sps::CAPTURED_MAIN444_8BIT_SPS,
+            &[0x44, 0x01, 0xbb],
+        ] {
+            aggregation.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            aggregation.extend_from_slice(nal);
+        }
+        aggregation
+    }
+
     #[test]
     fn pcm_full_or_closed_degrades_audio_once_without_poisoning_desktop_runtime() {
         for failure in [MediaPublishError::Full, MediaPublishError::Closed] {
@@ -810,7 +939,7 @@ mod tests {
                 &mut state,
                 &mut runtime,
                 MediaRole::VideoStream2,
-                MediaDatagram::Rtp(video_rtp(1, 1, true, &[0x02, 0x01, 0xaa])),
+                MediaDatagram::Rtp(video_rtp(1, 1, false, &startup_parameter_set_ap())),
             )
             .unwrap();
 
