@@ -1,0 +1,3 @@
+# No local changes are applied to the verified FFmpeg 8.1.2 source tree.
+# FreeRemoteDesk's MSVC ABI shim is maintained outside FFmpeg under
+# crates/frd-video-ffmpeg-plugin/src/ffmpeg_bridge.c.

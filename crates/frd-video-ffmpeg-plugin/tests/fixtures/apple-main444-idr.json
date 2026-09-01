@@ -1,0 +1,18 @@
+{
+  "codec": "hevc",
+  "profile": "main444-8",
+  "chroma": "yuv444",
+  "bit_depth": 8,
+  "bitstream_format": "annex-b",
+  "coded_width": 16,
+  "coded_height": 16,
+  "visible_width": 16,
+  "visible_height": 16,
+  "frame_count": 1,
+  "plane_stride_bytes": 16,
+  "plane_sha256": {
+    "y": "35854e72e7083b583ea6597960452e80ca5ac358c4cb90f93eb5374f6e5904cf",
+    "u": "5a5f307aa9ce504d9235634f15cf382e8914c49fbd8dd4d4c47136c917886f7b",
+    "v": "5a5f307aa9ce504d9235634f15cf382e8914c49fbd8dd4d4c47136c917886f7b"
+  }
+}

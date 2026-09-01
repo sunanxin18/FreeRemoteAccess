@@ -1,7 +1,7 @@
 //! FFmpeg 8.1.2 客户端解码插件的稳定 C ABI 入口。
 //!
-//! 默认构建不链接 FFmpeg，并以空 API 指针失败关闭。Task 5 提供固定 LGPL 动态库后，必须
-//! 显式启用 `native-ffmpeg`，且只有 native decoder 完整可用时才能返回 ABI 表。
+//! 默认构建不链接 FFmpeg，并以空 API 指针失败关闭。只有使用固定 LGPL 动态库显式启用
+//! `native-ffmpeg`，且 native decoder 完整可用时，插件才返回 ABI 表。
 
 mod decoder;
 

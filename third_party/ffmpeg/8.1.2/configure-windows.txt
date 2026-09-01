@@ -1,0 +1,21 @@
+./configure \
+  --prefix=<DIST_DIR> \
+  --arch=x86_64 \
+  --target-os=mingw32 \
+  --cross-prefix=x86_64-w64-mingw32- \
+  --disable-static \
+  --enable-shared \
+  --disable-programs \
+  --disable-doc \
+  --disable-everything \
+  --enable-decoder=hevc \
+  --enable-parser=hevc \
+  --enable-protocol=file \
+  --disable-gpl \
+  --disable-nonfree \
+  --disable-version3 \
+  --disable-autodetect \
+  --disable-network \
+  --disable-x86asm \
+  --disable-debug \
+  --enable-stripping
