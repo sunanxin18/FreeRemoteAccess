@@ -19,7 +19,10 @@ use frd_frame::{
     FrameTransaction, FrameTransactionCompiler, FrameTransactionError, PixelBuffer, PixelFormat,
     PixelPatch, SurfaceUpdate,
 };
-use frd_media_api::{AudioOutput, AudioOutputError, MediaFrame, MediaPublishError, MediaPublisher};
+use frd_media_api::{
+    AudioOutput, AudioOutputError, MediaFrame, MediaPublishError, MediaPublisher,
+    VideoStreamIdentity,
+};
 use frd_protocol_api::{
     ConnectRequest, MailboxSurfacePublisher, ProtocolCatalog, ProtocolError, ProtocolExit,
     ProtocolFactory, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCommand, SessionEvent,
@@ -62,7 +65,7 @@ use crate::platform::PlatformWindowChrome;
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::ui_fonts::system_font_definitions;
 use crate::video_decode_worker::{
-    VideoDecodeSender, VideoDecodeWorker, VideoWorkerEvent, VideoWorkerEvents,
+    VideoDecodeSender, VideoDecodeWorker, VideoFrameToken, VideoWorkerEvent, VideoWorkerEvents,
 };
 use crate::{
     ChromeHit, ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter,
@@ -666,19 +669,19 @@ impl SessionHost {
         events
     }
 
-    pub fn confirm_video_presented(&self, generation: u64) -> Result<(), SessionHostError> {
+    pub fn confirm_video_presented(&self, token: &VideoFrameToken) -> Result<(), SessionHostError> {
         self.active
             .as_ref()
             .ok_or(SessionHostError::NoActiveSession)?
             .video_events
-            .confirm_presented(generation)
+            .confirm_presented(token)
             .map_err(|_| SessionHostError::CommandClosed)
     }
 
-    pub fn video_is_ready(&self) -> bool {
+    pub fn video_is_ready(&self, identity: VideoStreamIdentity, generation: u64) -> bool {
         self.active
             .as_ref()
-            .is_some_and(|active| active.video_events.is_ready())
+            .is_some_and(|active| active.video_events.is_ready(identity, generation))
     }
 
     pub fn drain_frame_updates(&mut self) -> Vec<SurfaceUpdate> {
