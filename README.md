@@ -26,7 +26,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
 |---|---|---|---|---|---|
-| Windows | winit + egui + wgpu | 键盘、鼠标 | Release 构建与多尺寸 ICO 已集成，安装包仍开发中 | macOS；Windows RDP 开发中 | **开发中**；保留已验证的 Mac/原生标题栏路径，并已通过同一登录界面注册独立 RDP adapter；当前仅有离线验证，等待独立授权的原生 Windows 目标完成真机登录、首帧与输入门禁（`BLOCKED_LIVE`），见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md) |
+| Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成，Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
 | macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；必须保留 macOS 原生标题栏、字体和 Keychain 适配 |
 | Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；需实现窗口管理器适配与 Secret Service |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
@@ -36,9 +36,9 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 客户端平台/路径 | 状态 | 验证范围或阻塞点 |
 |---|---|---|
-| Windows native capability probe | **受限验证** | 2026-09-01 在单台 AMD Radeon 780M Windows 主机完成 D3D12 profile 探针；Main/Main10 报告 hardware exact，Main444 明确不可用。证据为 [`windows-video-capabilities-20260901.json`](docs/validation/windows-video-capabilities-20260901.json)，仅证明能力探针，不证明 native decoder 或远端会话首帧。 |
-| Windows FFmpeg 8.1.2 Main444 software backend | **已验证** | 固定签名源码构建的 LGPL 动态插件通过离线 Main444 fixture 精确解码；Windows package staging 会把三份 approved DLL 放入 `codecs/ffmpeg-8.1.2/windows-x86_64/`，并用 [`verify-windows-package.ps1`](tools/verify-windows-package.ps1) 校验实际 bytes、manifest、许可和无 shadow DLL。此状态只覆盖离线 fixture 与 package staging，不是安装器或 Apple HP 真机首帧证明。 |
-| Apple High Performance 真机首帧 | **开发中** | RTP/AU 与 decoder pipeline 已实现，但在 current generation 的 Main444 帧实际 present 前保持未就绪；Task 9 不提升真机首帧状态。 |
+| Windows native capability probe | **受限验证** | 2026-09-01 在单台 AMD Radeon 780M Windows 主机完成 D3D12 profile 探针；Main/Main10 报告 hardware exact，Main444 明确不可用。证据为 [`windows-video-capabilities-20260901.json`](docs/validation/windows-video-capabilities-20260901.json)，仅证明能力探针，不证明 native decoder 或远端会话首帧；Task 10 复跑结果见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
+| Windows FFmpeg 8.1.2 Main444 software backend | **受限验证** | 固定签名源码构建的 LGPL 动态插件通过离线 Main444 fixture 精确解码，DX12 YUV444 离屏颜色/crop 门禁与 Windows package staging/verifier 通过；codec present/absent 均不阻止 GUI 启动。此状态只覆盖离线 fixture、GPU readback 与 binary staging，不是 system-owned 安装器、可见 runtime backend 状态或 Apple HP 真机首帧证明，见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
+| Apple High Performance 真机首帧 | **开发中** | RTP/AU 与 decoder pipeline 已实现，但只有已 admission 的 current-generation surface 精确 `FramePresented(FullBaseline)` 才能进入 Ready 并开放输入。本轮独立 HP 尝试未发起到认证，未证明 authenticated RTP → Main444 config/AU → FFmpeg → exact present → Ready；不回退 Standard/MVS，见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
 | macOS / Linux native video backend | **计划中** | 尚无 native decoder、平台 shell 或 package 构建验证。 |
 | Android native video backend | **计划中** | 尚无 MediaCodec bridge、移动端 shell 或 package 构建验证。 |
 | HarmonyOS NEXT native video backend | **计划中** | 必须单独完成 ArkTS/ArkUI 与 native codec bridge POC；不是 Android 兼容层，当前不冒充 build 支持。 |
