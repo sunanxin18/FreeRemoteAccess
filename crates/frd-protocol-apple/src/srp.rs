@@ -448,6 +448,56 @@ pub(crate) fn expected_hamk(
         .context("SHA-512 输出长度内部错误")
 }
 
+fn receive_srp_response(
+    conn: &mut AppleConnection,
+    pub_a: &BigUint,
+    m1: &[u8; APPLE_SRP_PROOF_BYTES],
+    key: &[u8; APPLE_SRP_PROOF_BYTES],
+    observer: &mut crate::high_performance::HighPerformanceStageObserver<'_>,
+) -> Result<()> {
+    use crate::high_performance::HighPerformanceDiagnostic;
+
+    let first = match conn.read_u32() {
+        Ok(first) => first,
+        Err(error) => {
+            observer.observe(HighPerformanceDiagnostic::SrpResponseTransportFailed);
+            return Err(error);
+        }
+    };
+    if first == APPLE_SRP_RESPONSE_FAILURE_DISCRIMINATOR {
+        observer.observe(HighPerformanceDiagnostic::SrpServerRejected);
+        bail!("SRP 认证失败（凭据错误，或账号无屏幕共享权限）");
+    }
+    if usize::try_from(first).context("SRP 响应长度无法表示为 usize")?
+        != APPLE_SRP_RESPONSE_SUCCESS_LENGTH
+    {
+        observer.observe(HighPerformanceDiagnostic::SrpResponseMalformed);
+        bail!("SRP 响应长度异常: {first}");
+    }
+    let response_body = match conn.read_vec(APPLE_SRP_RESPONSE_SUCCESS_LENGTH) {
+        Ok(response_body) => response_body,
+        Err(error) => {
+            observer.observe(HighPerformanceDiagnostic::SrpResponseTransportFailed);
+            return Err(error);
+        }
+    };
+    let response = match parse_srp_response_body(&response_body) {
+        Ok(response) => response,
+        Err(error) => {
+            observer.observe(HighPerformanceDiagnostic::SrpResponseMalformed);
+            return Err(error);
+        }
+    };
+    let _opaque_tail = response.opaque_tail;
+    if response.proof != &expected_hamk(pub_a, m1, key)? {
+        observer.observe(HighPerformanceDiagnostic::SrpProofMismatch);
+        // 能走到这一步说明 M1 已被服务器接受，H_AMK 不一致只可能是中间人
+        bail!("SRP 服务器证明校验失败（疑似中间人攻击）");
+    }
+    observer.observe(HighPerformanceDiagnostic::SrpResponseAccepted);
+    Ok(())
+}
+
 /// 执行类型 36 认证。成功后连接处于 ClientInit 前状态（SecurityResult 已消费）。
 /// 返回 SRP 会话密钥 K = SHA512(S)——会话加密层的密钥种子（见 session.rs）。
 pub fn authenticate(
@@ -512,23 +562,7 @@ pub(crate) fn authenticate_with_observer(
     observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpStep2Written);
 
     // 响应：成功 = [u32 92][u32 88][0x40][64B H_AMK][23B]，失败直接是 u32 1
-    let first = conn.read_u32()?;
-    if first == APPLE_SRP_RESPONSE_FAILURE_DISCRIMINATOR {
-        bail!("SRP 认证失败（凭据错误，或账号无屏幕共享权限）");
-    }
-    if usize::try_from(first).context("SRP 响应长度无法表示为 usize")?
-        != APPLE_SRP_RESPONSE_SUCCESS_LENGTH
-    {
-        bail!("SRP 响应长度异常: {first}");
-    }
-    let response_body = conn.read_vec(APPLE_SRP_RESPONSE_SUCCESS_LENGTH)?;
-    let response = parse_srp_response_body(&response_body)?;
-    let _opaque_tail = response.opaque_tail;
-    if response.proof != &expected_hamk(&pub_a, &m1, &key)? {
-        // 能走到这一步说明 M1 已被服务器接受，H_AMK 不一致只可能是中间人
-        bail!("SRP 服务器证明校验失败（疑似中间人攻击）");
-    }
-    observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpResponseAccepted);
+    receive_srp_response(conn, &pub_a, &m1, &key, observer)?;
 
     // RFB SecurityResult
     if conn.read_u32()? != protocol::RFB_SECURITY_RESULT_OK {
@@ -623,6 +657,108 @@ mod tests {
         body.extend_from_slice(&[0x5a; 64]);
         body.extend_from_slice(&[0xa5; 23]);
         assert!(parse_srp_response_body(&body).is_err());
+    }
+
+    fn observe_srp_response(
+        response: &[u8],
+    ) -> (
+        Result<()>,
+        Vec<crate::high_performance::HighPerformanceDiagnostic>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response.to_vec();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&response).unwrap();
+        });
+
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let mut conn = AppleConnection::new(stream);
+        conn.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut stages = Vec::new();
+        let mut sink = |stage| stages.push(stage);
+        let mut observer = crate::high_performance::HighPerformanceStageObserver::for_protocol(
+            &frd_core::ProtocolId::apple_high_performance(),
+            &mut sink,
+        );
+        let pub_a = BigUint::from(2u8);
+        let m1 = [3u8; APPLE_SRP_PROOF_BYTES];
+        let key = [4u8; APPLE_SRP_PROOF_BYTES];
+        let result = receive_srp_response(&mut conn, &pub_a, &m1, &key, &mut observer);
+        drop(observer);
+        server.join().unwrap();
+        (result, stages)
+    }
+
+    #[test]
+    fn srp_response_transport_failure_has_closed_hp_stage() {
+        let (result, stages) = observe_srp_response(&[]);
+
+        assert!(result.is_err());
+        assert_eq!(
+            stages,
+            [crate::high_performance::HighPerformanceDiagnostic::SrpResponseTransportFailed]
+        );
+    }
+
+    #[test]
+    fn srp_response_failure_discriminator_has_closed_hp_stage() {
+        let (result, stages) =
+            observe_srp_response(&APPLE_SRP_RESPONSE_FAILURE_DISCRIMINATOR.to_be_bytes());
+
+        assert!(result.is_err());
+        assert_eq!(
+            stages,
+            [crate::high_performance::HighPerformanceDiagnostic::SrpServerRejected]
+        );
+    }
+
+    #[test]
+    fn malformed_srp_response_has_closed_hp_stage() {
+        let (result, stages) = observe_srp_response(&2u32.to_be_bytes());
+
+        assert!(result.is_err());
+        assert_eq!(
+            stages,
+            [crate::high_performance::HighPerformanceDiagnostic::SrpResponseMalformed]
+        );
+    }
+
+    #[test]
+    fn malformed_srp_response_body_has_closed_hp_stage() {
+        let mut response = (APPLE_SRP_RESPONSE_SUCCESS_LENGTH as u32)
+            .to_be_bytes()
+            .to_vec();
+        response.extend_from_slice(&(APPLE_SRP_RESPONSE_ITEMS_BYTES as u32).to_be_bytes());
+        response.push(APPLE_SRP_RESPONSE_TAG + 1);
+        response.extend_from_slice(&[0u8; APPLE_SRP_PROOF_BYTES]);
+        response.extend_from_slice(&[0u8; APPLE_SRP_RESPONSE_OPAQUE_TAIL_BYTES]);
+        let (result, stages) = observe_srp_response(&response);
+
+        assert!(result.is_err());
+        assert_eq!(
+            stages,
+            [crate::high_performance::HighPerformanceDiagnostic::SrpResponseMalformed]
+        );
+    }
+
+    #[test]
+    fn srp_response_proof_mismatch_has_closed_hp_stage() {
+        let mut response = (APPLE_SRP_RESPONSE_SUCCESS_LENGTH as u32)
+            .to_be_bytes()
+            .to_vec();
+        response.extend_from_slice(&(APPLE_SRP_RESPONSE_ITEMS_BYTES as u32).to_be_bytes());
+        response.push(APPLE_SRP_RESPONSE_TAG);
+        response.extend_from_slice(&[0u8; APPLE_SRP_PROOF_BYTES]);
+        response.extend_from_slice(&[0u8; APPLE_SRP_RESPONSE_OPAQUE_TAIL_BYTES]);
+        let (result, stages) = observe_srp_response(&response);
+
+        assert!(result.is_err());
+        assert_eq!(
+            stages,
+            [crate::high_performance::HighPerformanceDiagnostic::SrpProofMismatch]
+        );
     }
 
     #[test]

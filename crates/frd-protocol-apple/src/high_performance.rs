@@ -47,6 +47,10 @@ pub(crate) enum HighPerformanceDiagnostic {
     SrpChallengeAccepted,
     SrpProofComputed,
     SrpStep2Written,
+    SrpResponseTransportFailed,
+    SrpServerRejected,
+    SrpResponseMalformed,
+    SrpProofMismatch,
     SrpResponseAccepted,
     SrpAuthenticated,
     ClientInitWritten,
@@ -91,6 +95,10 @@ impl HighPerformanceDiagnostic {
             Self::SrpChallengeAccepted => "hp00_srp_challenge_accepted",
             Self::SrpProofComputed => "hp00_srp_proof_computed",
             Self::SrpStep2Written => "hp00_srp_step2_written",
+            Self::SrpResponseTransportFailed => "hp11_srp_response_transport_failed",
+            Self::SrpServerRejected => "hp12_srp_server_rejected",
+            Self::SrpResponseMalformed => "hp13_srp_response_malformed",
+            Self::SrpProofMismatch => "hp14_srp_proof_mismatch",
             Self::SrpResponseAccepted => "hp00_srp_response_accepted",
             Self::SrpAuthenticated => "hp00_srp_authenticated",
             Self::ClientInitWritten => "hp00_client_init_written",
@@ -155,6 +163,10 @@ impl fmt::Display for HighPerformanceDiagnostic {
             | Self::SrpChallengeAccepted
             | Self::SrpProofComputed
             | Self::SrpStep2Written
+            | Self::SrpResponseTransportFailed
+            | Self::SrpServerRejected
+            | Self::SrpResponseMalformed
+            | Self::SrpProofMismatch
             | Self::SrpResponseAccepted
             | Self::SrpAuthenticated
             | Self::ClientInitWritten
@@ -509,6 +521,22 @@ mod tests {
             (
                 HighPerformanceDiagnostic::SrpStep2Written,
                 "hp00_srp_step2_written",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpResponseTransportFailed,
+                "hp11_srp_response_transport_failed",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpServerRejected,
+                "hp12_srp_server_rejected",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpResponseMalformed,
+                "hp13_srp_response_malformed",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpProofMismatch,
+                "hp14_srp_proof_mismatch",
             ),
             (
                 HighPerformanceDiagnostic::SrpResponseAccepted,
