@@ -2,7 +2,8 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use frd_media_api::MediaFrame;
+use frd_core::SessionId;
+use frd_media_api::{MediaFrame, VideoStreamIdentity};
 use frd_protocol_api::{AudioState, ProtocolError, ProtocolRuntime, SessionEvent};
 
 use crate::audio_codec::{
@@ -10,9 +11,12 @@ use crate::audio_codec::{
     ARD_AUDIO_SAMPLE_RATE_HZ,
 };
 use crate::connection::AppleWriterHandle;
+use crate::hevc_access_unit::{HevcAccessUnitAssembler, HevcAccessUnitLimits, HevcRtpPacket};
+use crate::high_performance_video::AppleHighPerformanceVideoAdapter;
 use crate::media_negotiation::{AudioMediaFlow, MediaStreamAnswer};
 use crate::media_protocol::MediaStreamPortAnnouncement;
 use crate::media_transport::{MediaDatagram, MediaRole, MediaTransport, MediaTransportPhase};
+use crate::srtp::parse_rtp_packet;
 
 const MAX_PCM_PUBLICATION_SAMPLES: usize =
     ARD_AUDIO_SAMPLE_RATE_HZ as usize * ARD_AUDIO_CHANNEL_COUNT * 2;
@@ -43,26 +47,102 @@ pub(crate) struct ViewerMediaState {
     pub(crate) non_silent_audio_access_units: u64,
     pub(crate) concealed_audio_access_units: u64,
     pub(crate) authenticated_video_packets: u64,
+    video_stream_1: VideoReceiveState,
+    video_stream_2: VideoReceiveState,
     audio_degraded: bool,
 }
 
+struct VideoReceiveState {
+    assembler: HevcAccessUnitAssembler,
+    adapter: AppleHighPerformanceVideoAdapter,
+}
+
+impl VideoReceiveState {
+    fn new(identity: VideoStreamIdentity, generation: u64) -> Result<Self> {
+        Ok(Self {
+            assembler: HevcAccessUnitAssembler::new(generation, HevcAccessUnitLimits::default())
+                .context("创建 Apple HP HEVC AU 组装器失败")?,
+            adapter: AppleHighPerformanceVideoAdapter::new(identity, generation),
+        })
+    }
+
+    fn reset(&mut self, generation: u64) {
+        self.assembler.reset(generation);
+        self.adapter.reset(generation);
+    }
+
+    fn accept_rtp(
+        &mut self,
+        runtime: &mut ProtocolRuntime,
+        generation: u64,
+        datagram: &[u8],
+    ) -> Result<()> {
+        let packet = parse_rtp_packet(datagram).context("解析 Apple HP 视频 RTP 数据报失败")?;
+        let access_units = self
+            .assembler
+            .push(HevcRtpPacket {
+                generation,
+                ssrc: packet.header.ssrc,
+                sequence: packet.header.sequence,
+                timestamp: packet.header.timestamp,
+                marker: packet.header.marker,
+                payload: packet.payload,
+            })
+            .context("组装 Apple HP HEVC 访问单元失败")?;
+        for access_unit in access_units {
+            self.adapter
+                .publish_access_unit(runtime, access_unit)
+                .context("发布 Apple HP HEVC 访问单元失败")?;
+        }
+        Ok(())
+    }
+}
+
 impl ViewerMediaState {
+    #[cfg(test)]
     pub(crate) fn new(
         audio_flow: AudioMediaFlow,
         generation: u64,
         server_address: IpAddr,
     ) -> Result<Self> {
-        Self::new_with_transport_factory(audio_flow, || {
+        Self::new_for_session(
+            SessionId::allocate(),
+            audio_flow,
+            generation,
+            server_address,
+        )
+    }
+
+    pub(crate) fn new_for_session(
+        session_id: SessionId,
+        audio_flow: AudioMediaFlow,
+        generation: u64,
+        server_address: IpAddr,
+    ) -> Result<Self> {
+        Self::new_for_session_with_transport_factory(session_id, audio_flow, || {
             MediaTransport::new(generation, server_address)
         })
     }
 
+    #[cfg(test)]
     fn new_with_transport_factory<F>(audio_flow: AudioMediaFlow, factory: F) -> Result<Self>
+    where
+        F: FnOnce() -> MediaTransport,
+    {
+        Self::new_for_session_with_transport_factory(SessionId::allocate(), audio_flow, factory)
+    }
+
+    fn new_for_session_with_transport_factory<F>(
+        session_id: SessionId,
+        audio_flow: AudioMediaFlow,
+        factory: F,
+    ) -> Result<Self>
     where
         F: FnOnce() -> MediaTransport,
     {
         validate_hpss_audio_flow(audio_flow)?;
         let mut transport = factory();
+        let generation = transport.generation();
         transport.set_audio_flow(audio_flow)?;
         Ok(Self {
             transport,
@@ -73,6 +153,20 @@ impl ViewerMediaState {
             non_silent_audio_access_units: 0,
             concealed_audio_access_units: 0,
             authenticated_video_packets: 0,
+            video_stream_1: VideoReceiveState::new(
+                VideoStreamIdentity {
+                    session_id,
+                    stream_id: 1,
+                },
+                generation,
+            )?,
+            video_stream_2: VideoReceiveState::new(
+                VideoStreamIdentity {
+                    session_id,
+                    stream_id: 2,
+                },
+                generation,
+            )?,
             audio_degraded: false,
         })
     }
@@ -80,6 +174,8 @@ impl ViewerMediaState {
     pub(crate) fn reset_generation(&mut self, generation: u64) -> Result<()> {
         self.transport.reset_generation(generation)?;
         self.audio_receiver = ArdAudioReceiver::new().context("重建 Mac→PC AAC-ELD 接收器失败")?;
+        self.video_stream_1.reset(generation);
+        self.video_stream_2.reset(generation);
         self.audio_degraded = false;
         Ok(())
     }
@@ -137,6 +233,8 @@ impl ViewerMediaState {
             non_silent_audio_access_units,
             concealed_audio_access_units,
             authenticated_video_packets,
+            video_stream_1,
+            video_stream_2,
             audio_degraded,
         } = self;
         let summary = transport.drain_receive_round(generation, |role, datagram| {
@@ -148,8 +246,11 @@ impl ViewerMediaState {
                 non_silent_audio_access_units,
                 concealed_audio_access_units,
                 authenticated_video_packets,
+                video_stream_1,
+                video_stream_2,
                 audio_degraded,
                 runtime,
+                generation,
                 role,
                 datagram,
             )
@@ -171,8 +272,11 @@ fn accept_datagram(
     non_silent_audio_access_units: &mut u64,
     concealed_audio_access_units: &mut u64,
     authenticated_video_packets: &mut u64,
+    video_stream_1: &mut VideoReceiveState,
+    video_stream_2: &mut VideoReceiveState,
     audio_degraded: &mut bool,
     runtime: &mut ProtocolRuntime,
+    generation: u64,
     role: MediaRole,
     datagram: MediaDatagram,
 ) -> Result<()> {
@@ -200,7 +304,12 @@ fn accept_datagram(
             );
         }
         (MediaRole::Audio, MediaDatagram::Rtcp(_)) => {}
-        (MediaRole::VideoStream1 | MediaRole::VideoStream2, MediaDatagram::Rtp(_)) => {
+        (MediaRole::VideoStream1, MediaDatagram::Rtp(packet)) => {
+            video_stream_1.accept_rtp(runtime, generation, &packet)?;
+            *authenticated_video_packets = authenticated_video_packets.saturating_add(1);
+        }
+        (MediaRole::VideoStream2, MediaDatagram::Rtp(packet)) => {
+            video_stream_2.accept_rtp(runtime, generation, &packet)?;
             *authenticated_video_packets = authenticated_video_packets.saturating_add(1);
         }
         (MediaRole::VideoStream1 | MediaRole::VideoStream2, MediaDatagram::Rtcp(_)) => {}
@@ -299,8 +408,11 @@ mod tests {
             &mut state.non_silent_audio_access_units,
             &mut state.concealed_audio_access_units,
             &mut state.authenticated_video_packets,
+            &mut state.video_stream_1,
+            &mut state.video_stream_2,
             &mut state.audio_degraded,
             runtime,
+            state.transport.generation(),
             role,
             datagram,
         )
@@ -482,7 +594,7 @@ mod tests {
             &mut state,
             &mut runtime,
             MediaRole::VideoStream1,
-            MediaDatagram::Rtp(vec![0; 3]),
+            MediaDatagram::Rtp(video_rtp(1, 1, true, &[0x02, 0x01, 0xaa])),
         )
         .unwrap();
 
@@ -504,6 +616,75 @@ mod tests {
             1,
             "degraded audio must not retry the codec or republish failure"
         );
+    }
+
+    #[test]
+    fn authenticated_udp_video_routes_completed_au_through_the_unified_adapter() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(1, 1, true, &[0x02, 0x01, 0xaa])),
+        )
+        .unwrap();
+        assert!(published.lock().unwrap().is_empty());
+
+        let mut aggregation = vec![0x60, 0x01];
+        for nal in [
+            &[0x40, 0x01, 0xaa][..],
+            crate::hevc_sps::CAPTURED_MAIN444_8BIT_SPS,
+            &[0x44, 0x01, 0xbb],
+            &[0x26, 0x01, 0xcc],
+        ] {
+            aggregation.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            aggregation.extend_from_slice(nal);
+        }
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(2, 90_000, true, &aggregation)),
+        )
+        .unwrap();
+
+        let published = published.lock().unwrap();
+        assert!(matches!(&published[0], MediaFrame::VideoConfig(config)
+            if config.as_input().identity.session_id == session_id
+                && config.as_input().identity.stream_id == 1));
+        assert!(
+            matches!(&published[1], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.identity().session_id == session_id
+                && access_unit.identity().stream_id == 1)
+        );
+    }
+
+    fn video_rtp(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x80, 96 | if marker { 0x80 } else { 0 }];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&timestamp.to_be_bytes());
+        packet.extend_from_slice(&0x1020_3040_u32.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
     }
 
     #[test]
@@ -560,7 +741,7 @@ mod tests {
                 &mut state,
                 &mut runtime,
                 MediaRole::VideoStream2,
-                MediaDatagram::Rtp(vec![0; 3]),
+                MediaDatagram::Rtp(video_rtp(1, 1, true, &[0x02, 0x01, 0xaa])),
             )
             .unwrap();
 

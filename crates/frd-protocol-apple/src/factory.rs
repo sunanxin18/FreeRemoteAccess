@@ -25,7 +25,7 @@ const APPLE_AUTHENTICATION_FAILED: &str = "apple_authentication_failed";
 const APPLE_PROTOCOL_MISMATCH: &str = "apple_protocol_mismatch";
 const SECURITY_FAILURE_REASON_MAX_BYTES: usize = 4096;
 const PRODUCT_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
-    SessionEncodingProfile::AppleTcpMvs;
+    SessionEncodingProfile::AppleUdpMedia;
 
 fn apple_error(code: &'static str) -> ProtocolError {
     ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), code)
@@ -308,10 +308,10 @@ mod product_profile_tests {
     }
 
     #[test]
-    fn product_desktop_uses_the_verified_tcp_mvs_profile() {
+    fn product_desktop_registers_udp_video_only_after_the_unified_present_gate_exists() {
         assert_eq!(
             super::PRODUCT_SESSION_ENCODING_PROFILE,
-            SessionEncodingProfile::AppleTcpMvs
+            SessionEncodingProfile::AppleUdpMedia
         );
     }
 

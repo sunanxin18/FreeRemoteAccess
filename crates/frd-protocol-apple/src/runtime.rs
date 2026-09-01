@@ -508,7 +508,8 @@ fn run_authenticated_session_inner(
     connection.set_read_timeout(Some(APPLE_RUNTIME_READ_POLL))?;
     let writer = connection.writer_handle()?;
 
-    let mut media = ViewerMediaState::new(audio_flow, 1, media_server_address)?;
+    let mut media =
+        ViewerMediaState::new_for_session(session_id, audio_flow, 1, media_server_address)?;
     let mut reader = NetworkReaderRuntime::new_admitted(
         session_id,
         initial_size,

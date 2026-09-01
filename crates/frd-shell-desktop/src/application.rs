@@ -1294,6 +1294,24 @@ fn detach_video_for_matching_failure(
     false
 }
 
+fn disconnect_after_matching_video_failure(
+    configured: Option<VideoStreamEpoch>,
+    active: &mut Option<VideoBinding>,
+    identity: VideoStreamIdentity,
+    generation: u64,
+) -> Option<SessionCommand> {
+    if configured
+        != Some(VideoStreamEpoch {
+            identity,
+            generation,
+        })
+    {
+        return None;
+    }
+    let _ = detach_video_for_matching_failure(active, identity, generation);
+    Some(SessionCommand::Disconnect)
+}
+
 enum WindowPresentation {
     Pixel(Option<frd_protocol_api::PresentationEvent>),
     Video(Option<VideoPresentationReceipt>),
@@ -1310,6 +1328,16 @@ fn take_exact_presented_value<R: PartialEq, T>(
         return pending.take().map(|(_, value)| value);
     }
     None
+}
+
+fn video_ready_event_after_confirmation<T, E>(
+    candidate: Option<T>,
+    confirm: impl FnOnce(&T) -> Result<(), E>,
+    event: impl FnOnce(&T) -> frd_protocol_api::PresentationEvent,
+) -> Option<frd_protocol_api::PresentationEvent> {
+    let candidate = candidate?;
+    confirm(&candidate).ok()?;
+    Some(event(&candidate))
 }
 
 fn apply_compiled_drain(
@@ -1493,6 +1521,7 @@ struct DesktopWindowState {
     cursor_position: Option<(u32, u32)>,
     lifecycle: PresentationLifecycle,
     remote: Option<RemoteBinding>,
+    video_epoch: Option<VideoStreamEpoch>,
     video: Option<VideoBinding>,
     pending_video: Option<(VideoPresentationReceipt, VideoFrameToken)>,
     dpi_transition: DpiTransition,
@@ -1793,6 +1822,7 @@ impl FrameBatchFailureTarget for DesktopApplication {
             window.renderer.detach();
             window.video_renderer.detach();
             window.remote = None;
+            window.video_epoch = None;
             window.video = None;
             window.pending_video = None;
         }
@@ -2026,6 +2056,7 @@ impl DesktopApplication {
             cursor_position: None,
             lifecycle: PresentationLifecycle::new(physical_size),
             remote: None,
+            video_epoch: None,
             video: None,
             pending_video: None,
             dpi_transition: DpiTransition::default(),
@@ -2180,6 +2211,7 @@ impl DesktopApplication {
 
         let video_events = self.sessions.drain_video_worker_events();
         outcome.ui_redraw_needed |= !video_events.is_empty();
+        let mut video_disconnect = None;
         for (session_id, event) in video_events {
             match event {
                 VideoWorkerEvent::BackendSelected {
@@ -2188,11 +2220,13 @@ impl DesktopApplication {
                     ..
                 } if identity.session_id == session_id => {
                     if let Some(window) = self.window.as_mut() {
-                        match window.video_renderer.configure_stream(VideoStreamEpoch {
+                        let epoch = VideoStreamEpoch {
                             identity,
                             generation,
-                        }) {
+                        };
+                        match window.video_renderer.configure_stream(epoch) {
                             Ok(()) => {
+                                window.video_epoch = Some(epoch);
                                 window.video = None;
                                 window.pending_video = None;
                             }
@@ -2249,26 +2283,34 @@ impl DesktopApplication {
                     ..
                 } => {
                     if let Some(window) = self.window.as_mut() {
-                        let matches_current = detach_video_for_matching_failure(
+                        let disconnect = disconnect_after_matching_video_failure(
+                            window.video_epoch,
                             &mut window.video,
                             identity,
                             generation,
                         );
-                        if matches_current {
+                        if disconnect.is_some() {
                             window.video_renderer.detach();
+                            window.video_epoch = None;
                             window.pending_video = None;
+                            video_disconnect = disconnect;
                         }
                     }
                 }
                 VideoWorkerEvent::Stopped => {
                     if let Some(window) = self.window.as_mut() {
                         window.video_renderer.detach();
+                        window.video_epoch = None;
                         window.video = None;
                         window.pending_video = None;
                     }
                 }
                 VideoWorkerEvent::BackendSelected { .. } => {}
             }
+        }
+        if let Some(command) = video_disconnect {
+            self.block_and_release_input();
+            let _ = self.sessions.send_command(command);
         }
 
         if detach_remote {
@@ -2277,6 +2319,7 @@ impl DesktopApplication {
                 window.renderer.detach();
                 window.video_renderer.detach();
                 window.remote = None;
+                window.video_epoch = None;
                 window.video = None;
                 window.pending_video = None;
                 window.pending_texture_writes.clear();
@@ -2663,6 +2706,7 @@ impl DesktopApplication {
         }
 
         let mut video_token_to_confirm = None;
+        let video_presented_egui_context = window.egui_context.clone();
         let presentation_error = match render_result {
             Ok(WindowPresentation::Pixel(Some(event))) => {
                 let (session_id, generation, revision, completeness) = match &event {
@@ -2719,10 +2763,57 @@ impl DesktopApplication {
             Ok(WindowPresentation::Pixel(None) | WindowPresentation::Video(None)) => None,
             Err(error) => Some(error),
         };
-        if let Some(token) = video_token_to_confirm {
-            // worker 可能在 present 前已发布更新的 latest-frame token；此时精确确认
-            // 必须被拒绝，但它是正常背压竞争，不是 surface/GPU 致命错误。
-            let _ = self.sessions.confirm_video_presented(&token);
+        let video_presentation = video_ready_event_after_confirmation(
+            video_token_to_confirm,
+            |token| {
+                // worker 可能在 present 前已发布更新的 latest-frame token；此时精确确认
+                // 必须被拒绝，但它是正常背压竞争，不是 surface/GPU 致命错误。
+                self.sessions
+                    .confirm_video_presented(token)
+                    .map_err(|_| ())?;
+                self.sessions
+                    .video_is_ready(token.identity(), token.generation())
+                    .then_some(())
+                    .ok_or(())
+            },
+            |token| frd_protocol_api::PresentationEvent::FramePresented {
+                session_id: token.identity().session_id,
+                generation: token.generation(),
+                revision: token.publication_id(),
+                completeness: FrameCompleteness::FullBaseline,
+            },
+        );
+        if let Some(event) = video_presentation {
+            let frd_protocol_api::PresentationEvent::FramePresented {
+                session_id,
+                generation,
+                revision,
+                completeness,
+            } = event.clone();
+            debug_assert_eq!(completeness, FrameCompleteness::FullBaseline);
+            self.metrics.observe_full_baseline_presented(
+                MetricIdentity {
+                    session_id,
+                    generation,
+                },
+                revision,
+                std::time::Instant::now(),
+            );
+            self.launch.controller_mut().handle_presentation(event);
+            if matches!(
+                self.launch.controller().page(),
+                AppPage::RemoteSession { .. }
+            ) {
+                if let Some(release) = self.input.set_gate(InputGate::Interactive {
+                    session_id,
+                    generation,
+                }) {
+                    self.send_input(release);
+                }
+                video_presented_egui_context.memory_mut(|memory| memory.stop_text_input());
+                self.send_viewport_changed();
+                self.request_redraw();
+            }
         }
         self.publish_metrics_failure();
 
@@ -4018,7 +4109,7 @@ mod tests {
     };
     use frd_render_wgpu::{
         BatchApplyOutcome, BatchApplySuccess, BatchScopeDiagnostics, GpuScopeObservation,
-        InstalledSurface, PresentationReceipt,
+        InstalledSurface, PresentationReceipt, VideoStreamEpoch,
     };
     use frd_session::reserve_session_start;
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
@@ -4047,6 +4138,45 @@ mod tests {
             Some("exact worker token")
         );
         assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn ready_is_not_emitted_until_exact_current_generation_present_confirmation() {
+        let session_id = SessionId::allocate();
+        let event = PresentationEvent::FramePresented {
+            session_id,
+            generation: 7,
+            revision: 11,
+            completeness: FrameCompleteness::FullBaseline,
+        };
+
+        assert_eq!(
+            super::video_ready_event_after_confirmation::<u64, ()>(
+                None,
+                |_| Ok(()),
+                |_| { event.clone() }
+            ),
+            None,
+            "authentication, UDP activation, and AU completion do not carry a presented token"
+        );
+        assert_eq!(
+            super::video_ready_event_after_confirmation(
+                Some(11_u64),
+                |_| Err(()),
+                |_| { event.clone() }
+            ),
+            None,
+            "a stale or unpresented generation cannot become Ready"
+        );
+        assert_eq!(
+            super::video_ready_event_after_confirmation(
+                Some(11_u64),
+                |_| Ok::<(), ()>(()),
+                |_| event.clone(),
+            ),
+            Some(event),
+            "only exact successful present confirmation emits the neutral full-baseline event"
+        );
     }
 
     #[test]
@@ -4085,6 +4215,54 @@ mod tests {
             11
         ));
         assert_eq!(active, None);
+    }
+
+    #[test]
+    fn matching_video_decode_failure_disconnects_without_sibling_or_protocol_fallback() {
+        let session_id = SessionId::allocate();
+        let identity = VideoStreamIdentity {
+            session_id,
+            stream_id: 7,
+        };
+        let sibling = VideoStreamIdentity {
+            session_id,
+            stream_id: 8,
+        };
+        let binding = VideoBinding {
+            identity,
+            generation: 11,
+            size: PixelSize::new(1920, 1080).unwrap(),
+        };
+        let configured = Some(VideoStreamEpoch {
+            identity,
+            generation: 11,
+        });
+
+        let mut active = Some(binding);
+        assert!(super::disconnect_after_matching_video_failure(
+            configured,
+            &mut active,
+            sibling,
+            11
+        )
+        .is_none());
+        assert_eq!(active, Some(binding));
+        assert!(matches!(
+            super::disconnect_after_matching_video_failure(configured, &mut active, identity, 11),
+            Some(SessionCommand::Disconnect)
+        ));
+        assert_eq!(active, None);
+
+        let mut before_first_frame = None;
+        assert!(matches!(
+            super::disconnect_after_matching_video_failure(
+                configured,
+                &mut before_first_frame,
+                identity,
+                11,
+            ),
+            Some(SessionCommand::Disconnect)
+        ));
     }
 
     fn assert_metric_startup_fatal_before_launch(error: MetricSinkError) {

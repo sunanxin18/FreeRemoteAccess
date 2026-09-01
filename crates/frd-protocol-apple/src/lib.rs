@@ -11,6 +11,7 @@ pub mod hevc_access_unit;
 pub mod hevc_rtp;
 pub mod hevc_sps;
 mod high_performance;
+mod high_performance_video;
 pub mod hpss;
 pub mod media_negotiation;
 pub mod media_protocol;

@@ -64,6 +64,8 @@ pub enum HevcAccessUnitError {
     ReorderByteBudgetExceeded { limit: usize },
     AccessUnitBudgetExceeded { limit: usize },
     MarkerBeforeFuCompletion,
+    MalformedLengthPrefixedAccessUnit,
+    EmptyNalUnit,
     Depacketize(HevcRtpError),
 }
 
@@ -101,6 +103,10 @@ impl fmt::Display for HevcAccessUnitError {
             Self::MarkerBeforeFuCompletion => {
                 formatter.write_str("HEVC RTP marker 到达时 FU 仍未完成")
             }
+            Self::MalformedLengthPrefixedAccessUnit => {
+                formatter.write_str("HEVC 访问单元 length-prefix 越界")
+            }
+            Self::EmptyNalUnit => formatter.write_str("HEVC 访问单元包含空 NAL"),
             Self::Depacketize(error) => write!(formatter, "HEVC RTP 解包失败：{error}"),
         }
     }
@@ -467,6 +473,52 @@ impl HevcAccessUnitAssembler {
     fn clear_reorder(&mut self) {
         self.buffered.clear();
         self.buffered_bytes = 0;
+    }
+}
+
+impl HevcAccessUnit {
+    /// 严格拆分组装器产出的 4 字节大端 length-prefixed NAL 序列。
+    pub(crate) fn nal_units(&self) -> Result<Vec<&[u8]>, HevcAccessUnitError> {
+        let mut cursor = 0usize;
+        let mut nals = Vec::new();
+        while cursor < self.data.len() {
+            let prefix_end = cursor
+                .checked_add(4)
+                .ok_or(HevcAccessUnitError::MalformedLengthPrefixedAccessUnit)?;
+            let prefix = self
+                .data
+                .get(cursor..prefix_end)
+                .ok_or(HevcAccessUnitError::MalformedLengthPrefixedAccessUnit)?;
+            let length = usize::try_from(u32::from_be_bytes(prefix.try_into().unwrap()))
+                .map_err(|_| HevcAccessUnitError::MalformedLengthPrefixedAccessUnit)?;
+            if length == 0 {
+                return Err(HevcAccessUnitError::EmptyNalUnit);
+            }
+            let end = prefix_end
+                .checked_add(length)
+                .ok_or(HevcAccessUnitError::MalformedLengthPrefixedAccessUnit)?;
+            let nal = self
+                .data
+                .get(prefix_end..end)
+                .ok_or(HevcAccessUnitError::MalformedLengthPrefixedAccessUnit)?;
+            nals.push(nal);
+            cursor = end;
+        }
+        if nals.is_empty() {
+            return Err(HevcAccessUnitError::EmptyNalUnit);
+        }
+        Ok(nals)
+    }
+
+    /// 将内部 length-prefixed AU 转成中立 decoder 契约使用的 Annex B。
+    pub(crate) fn annex_b_bytes(&self) -> Result<Vec<u8>, HevcAccessUnitError> {
+        let nals = self.nal_units()?;
+        let mut output = Vec::with_capacity(self.data.len());
+        for nal in nals {
+            output.extend_from_slice(&[0, 0, 0, 1]);
+            output.extend_from_slice(nal);
+        }
+        Ok(output)
     }
 }
 
