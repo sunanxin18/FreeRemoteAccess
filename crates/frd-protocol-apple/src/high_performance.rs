@@ -313,6 +313,14 @@ impl HighPerformanceStartupGate {
         let Some(size) = DisplaySize::new(geometry.width, geometry.height) else {
             return self.fail(HighPerformanceDiagnostic::ConfirmationMalformed);
         };
+        self.confirm_size_at(size, observed_at)
+    }
+
+    pub(crate) fn confirm_size_at(
+        &mut self,
+        size: DisplaySize,
+        observed_at: Instant,
+    ) -> Result<HighPerformanceObservation, HighPerformanceUnavailable> {
         let confirmation = HighPerformanceConfirmation { size };
 
         match self.state {

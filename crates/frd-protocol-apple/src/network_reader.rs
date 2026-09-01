@@ -2153,6 +2153,7 @@ pub(crate) struct NetworkReaderRuntime {
     initial_full_sent_at: Instant,
     dynamic_resolution_enabled: bool,
     pending_media_controls: VecDeque<Media>,
+    media_startup_gate: Option<HighPerformanceStartupGate>,
 }
 
 impl NetworkReaderRuntime {
@@ -2166,6 +2167,7 @@ impl NetworkReaderRuntime {
         AppleSurfacePublisher::pending(session_id).admit_initial_generation(protocol_runtime, size)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_admitted(
         session_id: frd_core::SessionId,
         initial_size: DisplaySize,
@@ -2173,6 +2175,26 @@ impl NetworkReaderRuntime {
         startup_gate_origin: Instant,
         initial_full_sent_at: Instant,
         initial_admission: GenerationAdmission,
+    ) -> Result<Self, ProtocolError> {
+        Self::new_admitted_for_protocol(
+            session_id,
+            initial_size,
+            dynamic_resolution_enabled,
+            startup_gate_origin,
+            initial_full_sent_at,
+            initial_admission,
+            &frd_core::ProtocolId::apple_hpss_mvs(),
+        )
+    }
+
+    pub(crate) fn new_admitted_for_protocol(
+        session_id: frd_core::SessionId,
+        initial_size: DisplaySize,
+        dynamic_resolution_enabled: bool,
+        startup_gate_origin: Instant,
+        initial_full_sent_at: Instant,
+        initial_admission: GenerationAdmission,
+        protocol_id: &frd_core::ProtocolId,
     ) -> Result<Self, ProtocolError> {
         let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
             .ok_or(ProtocolError::FramePortRejected)?;
@@ -2191,6 +2213,7 @@ impl NetworkReaderRuntime {
             startup_gate_origin,
             initial_full_sent_at,
             Some(initial_admission),
+            protocol_id == &frd_core::ProtocolId::apple_high_performance(),
         )
     }
 
@@ -2209,6 +2232,7 @@ impl NetworkReaderRuntime {
             startup_gate_origin,
             initial_full_sent_at,
             None,
+            false,
         )
     }
 
@@ -2219,6 +2243,7 @@ impl NetworkReaderRuntime {
         startup_gate_origin: Instant,
         initial_full_sent_at: Instant,
         initial_admission: Option<GenerationAdmission>,
+        media_before_server_state: bool,
     ) -> Result<Self, ProtocolError> {
         let size = PixelSize::new(initial_size.width.into(), initial_size.height.into())
             .ok_or(ProtocolError::FramePortRejected)?;
@@ -2241,6 +2266,8 @@ impl NetworkReaderRuntime {
             initial_full_sent_at,
             dynamic_resolution_enabled,
             pending_media_controls: VecDeque::new(),
+            media_startup_gate: media_before_server_state
+                .then(|| HighPerformanceStartupGate::new(startup_gate_origin)),
         })
     }
 
@@ -2249,7 +2276,11 @@ impl NetworkReaderRuntime {
     }
 
     pub(crate) fn is_high_performance_confirmed(&self) -> bool {
-        self.startup_gate.is_confirmed() && self.publisher.is_active()
+        let startup_confirmed = self.media_startup_gate.as_ref().map_or_else(
+            || self.startup_gate.is_confirmed(),
+            HighPerformanceStartupGate::is_confirmed,
+        );
+        startup_confirmed && self.publisher.is_active()
     }
 
     pub(crate) fn take_buffered_media_control(&mut self) -> Option<Media> {
@@ -2299,6 +2330,12 @@ impl NetworkReaderRuntime {
         protocol_runtime: &mut ProtocolRuntime,
         now: Instant,
     ) -> Result<()> {
+        if let Some(media_startup_gate) = self.media_startup_gate.as_mut() {
+            if !media_startup_gate.is_confirmed() {
+                media_startup_gate.ensure_not_timed_out(now)?;
+                return Ok(());
+            }
+        }
         if !self.publisher.is_active() {
             if !self.startup_gate.is_awaiting() {
                 if self.startup_gate.is_confirmed() {
@@ -2328,6 +2365,55 @@ impl NetworkReaderRuntime {
         )?;
         log_reader_tick(&outcome);
         Ok(())
+    }
+
+    pub(crate) fn activate_media_startup_at(
+        &mut self,
+        protocol_runtime: &mut ProtocolRuntime,
+        observed_at: Instant,
+    ) -> Result<DisplaySize> {
+        let current = current_surface_size(&self.surface);
+        let Some(media_startup_gate) = self.media_startup_gate.as_ref() else {
+            return Err(HighPerformanceUnavailable::diagnosed(
+                HighPerformanceDiagnostic::ConfirmationMalformed,
+            )
+            .into());
+        };
+        let mut prepared_gate = media_startup_gate.clone();
+        prepared_gate.confirm_size_at(current, observed_at)?;
+
+        if !self.publisher.is_active() {
+            let pixel_size = PixelSize::new(current.width.into(), current.height.into())
+                .ok_or_else(|| {
+                    HighPerformanceUnavailable::diagnosed(
+                        HighPerformanceDiagnostic::ConfirmationMalformed,
+                    )
+                })?;
+            let admission = match self.initial_admission.take() {
+                Some(admission)
+                    if admission.generation() == 1
+                        && admission.size() == pixel_size
+                        && admission.format() == PixelFormat::Bgrx8UnormSrgb =>
+                {
+                    admission
+                }
+                Some(admission) => {
+                    protocol_runtime
+                        .reject_invalid_generation_admission(admission)
+                        .map_err(|error| anyhow::anyhow!(error.code()))?;
+                    unreachable!("reject_invalid_generation_admission always returns Err")
+                }
+                None => self
+                    .publisher
+                    .admit_initial_generation(protocol_runtime, pixel_size)
+                    .map_err(|error| anyhow::anyhow!(error.code()))?,
+            };
+            self.publisher
+                .activate_admitted_initial_generation(protocol_runtime, admission)
+                .map_err(|error| anyhow::anyhow!(error.code()))?;
+        }
+        self.media_startup_gate = Some(prepared_gate);
+        Ok(current)
     }
 
     fn buffer_pending_media_control(&mut self, media: Media) -> Result<()> {
@@ -2656,7 +2742,7 @@ impl NetworkReaderRuntime {
             }
             Ok(Media::State(_)) | Ok(Media::Cursor { .. }) => Ok(NetworkFrameOutcome::Consumed),
             Ok(media @ (Media::PortAnnouncement(_) | Media::StreamAnswer(_))) => {
-                if self.publisher.is_active() {
+                if self.publisher.is_active() || self.media_startup_gate.is_some() {
                     Ok(NetworkFrameOutcome::Media(media))
                 } else {
                     self.buffer_pending_media_control(media)?;
@@ -3793,6 +3879,50 @@ mod migrated_runtime_tests {
                 .stage_code(),
             "hp07_confirmation_malformed"
         );
+        assert!(trace.entries.lock().unwrap().is_empty());
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn product_high_performance_media_gate_keeps_the_five_second_deadline() {
+        let session_id = frd_core::SessionId::allocate();
+        let requested_at = Instant::now();
+        let initial = DisplaySize::new(8, 8).unwrap();
+        let (mut protocol_runtime, trace) = traced_protocol_runtime(session_id);
+        let admission = NetworkReaderRuntime::admit_initial_generation(
+            &mut protocol_runtime,
+            session_id,
+            initial,
+        )
+        .unwrap();
+        let mut reader = NetworkReaderRuntime::new_admitted_for_protocol(
+            session_id,
+            initial,
+            false,
+            requested_at,
+            requested_at,
+            admission,
+            &frd_core::ProtocolId::apple_high_performance(),
+        )
+        .unwrap();
+        let (_connection, writer, _) = socket_writer();
+
+        let error = reader
+            .service_tick(
+                &writer,
+                &mut protocol_runtime,
+                requested_at + Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .unwrap()
+                .stage_code(),
+            "hp05_confirmation_timeout"
+        );
+        assert!(!reader.publisher.is_active());
+        assert!(!reader.is_high_performance_confirmed());
         assert!(trace.entries.lock().unwrap().is_empty());
         writer.shutdown().unwrap();
     }
@@ -5402,6 +5532,24 @@ mod migrated_runtime_tests {
         let record = receiver.push_continuation(&[0x08]).unwrap().unwrap();
 
         assert_eq!(record.payload, vec![0x00, 0x08]);
+    }
+
+    #[test]
+    fn pending_record_does_not_swallow_complete_port_announcement() {
+        let mut receiver = MvsReceiveState::new(1);
+        let rect = MvsRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert!(receiver.begin(rect, 1024, &[0]).unwrap().is_none());
+
+        assert_eq!(
+            reader_frame_class(&receiver, &port_announcement_message(17_769)),
+            ReaderFrameClass::ControlOrMedia
+        );
+        assert!(receiver.is_pending());
     }
 
     #[test]

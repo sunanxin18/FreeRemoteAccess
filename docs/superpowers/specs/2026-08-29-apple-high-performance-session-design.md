@@ -44,11 +44,16 @@ The wire implementation remains bounded by the repository's ARD 3.10 evidence:
 2. Send the existing literal 308-byte `0x1d SetDisplayConfiguration` request.
 3. Preserve the established `0x1d`, `0x09`, non-incremental framebuffer request
    ordering and encrypted writer ownership.
-4. Treat only a strictly parsed `0x451 ServerState` received after the `0x1d`
-   write as the virtual-display acknowledgement.
-5. Use the width and height in that acknowledged `ServerState` as the initial
-   public surface geometry.
-6. Request a new non-incremental MVS baseline for that confirmed geometry.
+4. Handle a valid Media Message 1 port announcement immediately, including
+   before any optional `0x451 ServerState`, and reply with the existing exact
+   version-3 `0x1c` configuration.
+5. Treat a valid Media Message 2 answer as the media-control and UDP transport
+   milestone. In the media-first ordering, only then may the selected startup
+   geometry activate generation 1. Every ordering publishes `TransportReady`,
+   capabilities, and audio-starting state only at this milestone.
+6. If `ServerState` arrives first, keep the existing strict geometry commit. If
+   it arrives later, treat it as an optional geometry/consistency update; it
+   must never block Message 1 or Message 2.
 
 No new flag, packet, retry message, subtype, or undocumented field is added.
 The implementation must continue to use the literal builder regression in
@@ -56,101 +61,90 @@ The implementation must continue to use the literal builder regression in
 
 ## Current Defect
 
-`run_authenticated_session_inner` currently publishes `TransportReady` and
-`NetworkReaderRuntime::new` publishes generation 1 before sending or receiving
-the virtual-display configuration exchange. The app therefore knows only that
-authentication and HPSS transport succeeded; it does not know that macOS
-accepted the High Performance virtual display.
-
-The same early generation also permits physical-display transition pixels to
-enter the public framebuffer. If macOS blanks the hardware display before the
-virtual display is ready, those transition pixels can be mistaken for the
-remote desktop.
+The previous product runtime cached Message 1 until a `ServerState` activated
+the surface. Live A/B evidence disproved that prerequisite: the legacy direct
+path received authenticated video RTP while
+`virtual_display_confirmed=false`. Because the product path withheld `0x1c`,
+the server could not send Message 2 and both sides waited indefinitely. ARD's
+`handleAVCMediaEncoding` path likewise derives the client configuration from
+Message 1 without a `ServerState` precondition.
 
 ## Selected Architecture
 
-### Strict startup gate
+### Media-control startup gate
 
-Add an Apple-private `HighPerformanceStartupGate`. It has three states:
+The product HP identity owns an Apple-private media startup gate with three
+states:
 
-- `AwaitingServerState`: `0x1d` has been written, but no valid post-request
-  `ServerState` has been accepted.
-- `Confirmed`: the first valid post-request `ServerState` has supplied the
-  single virtual display geometry.
+- `AwaitingMessage2`: `0x1d` has been written, but the Message 1 → `0x1c` →
+  Message 2 media-control exchange is not complete.
+- `Confirmed`: `ViewerMediaState::handle_answer` has accepted Message 2 and
+  activated the generation-bound UDP/SRTP transport.
 - `Failed`: the acknowledgement was malformed, exceeded the product resource
   budget, or was absent until the bounded product deadline.
 
 The deadline is five seconds from the successful `0x1d` write. It is a local
 fail-closed product deadline, not an inferred ARD wire timeout, and it sends no
-extra packet. A ServerState observation carries its observation time into the
-gate; the gate checks the deadline and the geometry atomically, so a message
-observed at or after the deadline cannot confirm the session merely because the
-previous 100 ms reader tick happened before it.
+extra packet. A valid Message 2 completes this deadline; `ServerState` alone
+does not. Standard/TCP-MVS retains its independent ServerState gate and buffered
+media behavior.
 
 ### Deferred public generation
 
-Authentication may construct private receive and decode state, but it must not
-call `ProtocolRuntime::begin_generation`, publish `TransportReady`, publish a
-frame, or enable input before the startup gate confirms the virtual display.
+Authentication may construct private receive and decode state, but Message 1
+must not call `ProtocolRuntime::begin_generation`, publish `TransportReady`,
+publish a frame, or enable input. It only binds the generation-bound media
+sockets and sends the existing exact `0x1c` configuration.
 An unencrypted authenticated compatibility path is not eligible for the
 product High Performance route and must fail before `0x1d` is written. The
 product security selector therefore requires the encrypted Apple security type;
 legacy unencrypted authentication remains research-only and cannot be selected
 by `AppleProtocolFactory`.
 
-`AppleSurfacePublisher` therefore starts pending. On the first accepted
-`ServerState`, the Apple adapter performs one transactional startup commit:
+`AppleSurfacePublisher` therefore starts pending. After a valid Message 2, the
+Apple adapter performs one transactional media startup commit:
 
-1. strictly parse and validate the confirmed size against the existing Apple
-   framebuffer budget;
-2. allocate replacement generation-1 receiver, request, CPU surface, dynamic
-   state, and exact full-request bytes without changing public state;
-3. preserve only the timestamp of the earlier full write for wire-rate safety;
-   discard its in-flight/table/generation bookkeeping and all pre-confirmation
-   MVS assembly, decoder, pixels, and viewport targets;
-4. successfully write one existing non-incremental MVS request for the
-   confirmed size;
-5. install the prepared private state and call
-   `ProtocolRuntime::begin_generation` exactly once;
-6. return one private confirmation outcome; the runtime then publishes
+1. use the already selected, resource-checked startup geometry for the private
+   scratch generation; do not fabricate a `ServerState`;
+2. call `ViewerMediaState::handle_answer` to accept Message 2 and activate the
+   generation-bound UDP/SRTP transport;
+3. activate the already admitted generation 1 exactly once, without sending an
+   extra MVS full request;
+4. publish
    `TransportReady`, the existing capabilities, and any audio-start state
-   before reading the requested baseline response.
+   exactly once; then service the active UDP transport.
 
-All fallible private preparation and the confirmed-size wire write occur before
-public generation activation. A public event/frame port failure during
-`begin_generation` keeps the existing terminal, no-rollback API contract and
-must not publish readiness. A duplicate matching startup `ServerState` is
-idempotent. After the startup commit, matching geometry is unchanged and later
-changed geometry is handled only by the existing generation-bound transaction;
-the startup gate is not reused to reject a valid later resize.
+If a strict `ServerState` arrives before Message 2, the existing geometry commit
+and its exact full request remain valid, but they do not publish
+`TransportReady`. Message 2 still completes the media gate. A matching late
+`ServerState` is idempotent; changed late geometry uses the existing
+generation-bound geometry transaction. A public port failure retains the
+terminal, no-rollback API contract and must not publish readiness.
 
 ### Confirmation-before-frame rule
 
-MVS records that arrive before confirmation may be reassembled only to preserve
-the encrypted application-frame boundary, then are discarded. They must not be
-decoded, install tables, mutate the CPU surface or dynamic-resolution evidence,
-run recovery, publish a `SurfaceUpdate`, or send another full/incremental
-request. Structural pre-confirmation MVS failures reset private assembly and
-continue waiting for the confirmation deadline without a recovery write. The
-startup commit installs fresh decoder state and explicitly asks for a new full
-MVS record. While pending, the normal incomplete-MVS and dynamic-resolution
-tick is disabled; only the five-second startup deadline is serviced.
+The HP media gate does not use MVS traffic as proof of Message 2 and does not
+cache or swallow Message 1/Message 2 behind the MVS/ServerState state machine.
+When Message 2 arrives before `ServerState`, startup generation activation sends
+no additional MVS full request. Exact AVC/HEVC decode and compositor present,
+not a port announcement or transport event, remain the application Ready/input
+evidence.
 
-After confirmation, the existing Apple invariant remains unchanged: only a
-complete, current-generation, non-black type-0 transaction can publish the
-initial `FullBaseline`. Type-1 and incomplete type-0 records cannot establish
-the initial baseline.
+Standard/TCP-MVS retains its independent pre-confirmation discard/recovery
+behavior. Only a complete, current-generation, non-black type-0 transaction can
+publish its initial `FullBaseline`; type-1 and incomplete type-0 records cannot
+establish that baseline.
 
 ### UI and input gate
 
 The protocol-neutral stages keep their existing meaning:
 
-- `Connecting`: authentication or High Performance display confirmation is in
-  progress.
-- `TransportReady`: the Apple virtual display has been confirmed and generation
-  1 has been published.
+- `Connecting`: authentication or the High Performance media-control exchange
+  is in progress.
+- `TransportReady`: Message 2 has activated Apple UDP/SRTP transport and
+  generation 1 has been published. Message 1 alone never reaches this stage.
 - `RemoteSession`: the compositor has actually presented the current
-  generation's `FullBaseline`.
+  generation's exact decoded frame.
 
 The current `frd-app` presentation reducer and desktop `InputGate` remain
 protocol-neutral. They continue to enable input only after that presented full
@@ -159,10 +153,12 @@ the RDP adapter.
 
 ### Geometry and aspect ratio
 
-The acknowledged `ServerState` size is the only initial remote size exposed to
-the shell. `SurfaceGenerationChanged`, `SurfaceUpdate::Reset`,
-`RemoteBinding`, the wgpu texture, `ContentViewport::fit_in`, and inverse pointer
-mapping must all carry that same size and generation.
+The selected startup geometry is provisional until the decoded AVC/HEVC frame
+supplies exact geometry. `SurfaceGenerationChanged`, `SurfaceUpdate::Reset`,
+`RemoteBinding`, the decoder surface, the wgpu texture,
+`ContentViewport::fit_in`, and inverse pointer mapping must converge on the same
+current generation and exact decoded size. An optional `ServerState` may supply
+a consistent geometry update, but it is not the media-control prerequisite.
 
 The renderer uses aspect-preserving contain fit and may letterbox. It must not
 stretch the remote image or substitute the client window size for the confirmed
@@ -170,11 +166,12 @@ virtual-display size.
 
 ## Failure Behavior
 
-- Missing or malformed initial `ServerState`:
+- Missing or malformed required Message 1/Message 2 media control:
   `apple_high_performance_unavailable`.
 - Invalid or over-budget geometry: `apple_high_performance_unavailable`.
-- Peer close before confirmation: `apple_high_performance_unavailable`; peer
-  close after confirmation retains the ordinary `Closed` result.
+- Peer close before Message 2 transport activation:
+  `apple_high_performance_unavailable`; peer close after activation retains the
+  ordinary `Closed` result.
 - Failure after the startup commit: retain the existing typed Apple runtime
   failure behavior.
 - No failure path starts Standard, VNC, Curtain, or a second Apple session.
@@ -193,25 +190,29 @@ virtual-display size.
 ## Evidence and Product-Policy Boundary
 
 ARD 3.10 evidence fixes the existing literal `0x1d`, `0x09`, framebuffer
-request bytes/order and the strict `0x451` geometry envelope. Treating the first
-strict post-`0x1d` ServerState as product-level virtual-display confirmation,
-the five-second deadline, discarding pre-confirmation MVS, the fresh confirmed
-baseline request, the stable failure code, and delayed public generation are
-local fail-closed product policies. They do not claim an undocumented Apple
-flag or redefine the wire protocol.
+request bytes/order, Message 1 → version-3 `0x1c`, Message 2 handling, and the
+strict `0x451` geometry envelope. Live A/B evidence proves that authenticated
+video RTP does not require prior `virtual_display_confirmed` evidence. The
+five-second deadline, delayed generation activation, and exact-present UI/input
+gate remain local fail-closed product policies; they do not redefine Apple wire
+semantics.
 
 ## Verification
 
 Automated verification is intentionally limited to the core protocol contract:
 
-1. no public generation, `TransportReady`, frame, or input-capable state before
-   a valid post-`0x1d` `ServerState`;
-2. confirmation publishes exactly one generation with the acknowledged size
-   and requests a fresh full MVS baseline;
-3. a pre-confirmation MVS record cannot become the product baseline;
-4. malformed or missing confirmation produces
+1. Message 1 before optional `ServerState` immediately produces one exact
+   legal `0x1c`, without public generation, `TransportReady`, or an extra
+   framebuffer request;
+2. valid Message 2 activates UDP/SRTP, activates generation 1 if it is still
+   pending, and publishes `TransportReady`, capabilities, and audio-starting
+   state exactly once;
+3. ServerState-first and ServerState-late ordering cannot block or duplicate the
+   media-control milestone;
+4. malformed or missing Message 2 produces
    `apple_high_performance_unavailable` without fallback;
-5. a current-generation presented `FullBaseline` remains the sole input gate.
+5. a current-generation exact decoded frame presented by the compositor remains
+   the sole UI Ready and input gate.
 
 The bounded Windows-to-Mac gate must verify separately:
 

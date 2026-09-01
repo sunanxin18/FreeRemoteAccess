@@ -455,6 +455,12 @@ fn run_authenticated_session_with_media(
     clippy::too_many_arguments,
     reason = "媒体控制必须显式携带 generation、地址、writer 与发布门禁"
 )]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaControlOutcome {
+    AwaitingAnswer,
+    TransportActivated,
+}
+
 fn handle_media_control(
     control: Media,
     media: &mut ViewerMediaState,
@@ -463,10 +469,11 @@ fn handle_media_control(
     media_bind_address: std::net::IpAddr,
     writer: &AppleWriterHandle,
     audio_started: bool,
-) -> Result<()> {
+) -> Result<MediaControlOutcome> {
     match control {
         Media::PortAnnouncement(announcement) => {
-            media.handle_port_announcement(generation, announcement, media_bind_address, writer)
+            media.handle_port_announcement(generation, announcement, media_bind_address, writer)?;
+            Ok(MediaControlOutcome::AwaitingAnswer)
         }
         Media::StreamAnswer(answer) => {
             media.handle_answer(generation, answer)?;
@@ -475,12 +482,36 @@ fn handle_media_control(
                     .publish_event(SessionEvent::AudioState(AudioState::Playing))
                     .map_err(|error| anyhow::anyhow!(error.code()))?;
             }
-            Ok(())
+            Ok(MediaControlOutcome::TransportActivated)
         }
         Media::Mvs { .. } | Media::Cursor { .. } | Media::State(_) => {
             unreachable!("reader 只返回媒体控制消息")
         }
     }
+}
+
+fn publish_transport_readiness(
+    runtime: &mut ProtocolRuntime,
+    dynamic_resolution_enabled: bool,
+    udp_media_enabled: bool,
+) -> Result<bool> {
+    runtime
+        .publish_event(SessionEvent::StageChanged(ConnectionStage::TransportReady))
+        .map_err(|error| anyhow::anyhow!(error.code()))?;
+    runtime
+        .publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
+            dynamic_resolution: dynamic_resolution_enabled,
+            remote_audio: udp_media_enabled,
+            text_input: true,
+            ..SessionCapabilities::default()
+        }))
+        .map_err(|error| anyhow::anyhow!(error.code()))?;
+    if udp_media_enabled {
+        runtime
+            .publish_event(SessionEvent::AudioState(AudioState::Starting))
+            .map_err(|error| anyhow::anyhow!(error.code()))?;
+    }
+    Ok(udp_media_enabled)
 }
 
 // Keep the verified session wiring explicit; aggregating these arguments would
@@ -556,13 +587,14 @@ fn run_authenticated_session_inner(
 
     let mut media =
         ViewerMediaState::new_for_session(session_id, audio_flow, 1, media_server_address)?;
-    let mut reader = NetworkReaderRuntime::new_admitted(
+    let mut reader = NetworkReaderRuntime::new_admitted_for_protocol(
         session_id,
         initial_size,
         dynamic_resolution_enabled,
         startup_gate_origin,
         initial_full_sent_at,
         initial_admission,
+        protocol_id,
     )
     .map_err(|error| anyhow::anyhow!(error.code()))?;
     let mut pointer = PointerWireState::default();
@@ -643,29 +675,19 @@ fn run_authenticated_session_inner(
                         "[apple] High Performance 虚拟显示器已确认: {}x{}",
                         size.width, size.height
                     );
-                    if readiness_published {
-                        anyhow::bail!("Apple High Performance readiness 重复发布");
+                    if protocol_id != &frd_core::ProtocolId::apple_high_performance() {
+                        if readiness_published {
+                            anyhow::bail!("Apple High Performance readiness 重复发布");
+                        }
+                        audio_started = publish_transport_readiness(
+                            &mut runtime,
+                            dynamic_resolution_enabled,
+                            udp_media_enabled,
+                        )?;
+                        readiness_published = true;
                     }
-                    runtime
-                        .publish_event(SessionEvent::StageChanged(ConnectionStage::TransportReady))
-                        .map_err(|error| anyhow::anyhow!(error.code()))?;
-                    runtime
-                        .publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
-                            dynamic_resolution: dynamic_resolution_enabled,
-                            remote_audio: udp_media_enabled,
-                            text_input: true,
-                            ..SessionCapabilities::default()
-                        }))
-                        .map_err(|error| anyhow::anyhow!(error.code()))?;
-                    if udp_media_enabled {
-                        runtime
-                            .publish_event(SessionEvent::AudioState(AudioState::Starting))
-                            .map_err(|error| anyhow::anyhow!(error.code()))?;
-                        audio_started = true;
-                    }
-                    readiness_published = true;
                     while let Some(control) = reader.take_buffered_media_control() {
-                        handle_media_control(
+                        let _ = handle_media_control(
                             control,
                             &mut media,
                             &mut runtime,
@@ -677,13 +699,15 @@ fn run_authenticated_session_inner(
                     }
                 }
                 NetworkFrameOutcome::Media(control) => {
-                    if !readiness_published {
+                    let is_product_high_performance =
+                        protocol_id == &frd_core::ProtocolId::apple_high_performance();
+                    if !readiness_published && !is_product_high_performance {
                         return Err(HighPerformanceUnavailable::diagnosed(
                             HighPerformanceDiagnostic::ConfirmationMalformed,
                         )
                         .into());
                     }
-                    handle_media_control(
+                    let media_outcome = handle_media_control(
                         control,
                         &mut media,
                         &mut runtime,
@@ -692,6 +716,30 @@ fn run_authenticated_session_inner(
                         &writer,
                         audio_started,
                     )?;
+                    if media_outcome == MediaControlOutcome::TransportActivated
+                        && is_product_high_performance
+                    {
+                        let size =
+                            reader.activate_media_startup_at(&mut runtime, Instant::now())?;
+                        eprintln!(
+                            "[apple] High Performance 媒体传输已激活: {}x{}",
+                            size.width, size.height
+                        );
+                        if readiness_published {
+                            anyhow::bail!("Apple High Performance readiness 重复发布");
+                        }
+                        audio_started = publish_transport_readiness(
+                            &mut runtime,
+                            dynamic_resolution_enabled,
+                            udp_media_enabled,
+                        )?;
+                        readiness_published = true;
+                        if audio_started {
+                            runtime
+                                .publish_event(SessionEvent::AudioState(AudioState::Playing))
+                                .map_err(|error| anyhow::anyhow!(error.code()))?;
+                        }
+                    }
                 }
             }
         }
@@ -882,6 +930,69 @@ mod tests {
         ];
         message[26..28].copy_from_slice(&audio_port.to_be_bytes());
         message
+    }
+
+    fn media_stream_answer_message() -> Vec<u8> {
+        fn append_counted_object(destination: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+            if payload.len() < 15 {
+                destination.push(kind | payload.len() as u8);
+            } else {
+                assert!(payload.len() <= usize::from(u8::MAX));
+                destination.extend_from_slice(&[kind | 0x0f, 0x10, payload.len() as u8]);
+            }
+            destination.extend_from_slice(payload);
+        }
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&[0x08, 0x01]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let key = b"avcMediaStreamNegotiatorMediaBlob";
+        let objects = [
+            vec![0xd1, 1, 2],
+            {
+                let mut object = Vec::new();
+                append_counted_object(&mut object, 0x50, key);
+                object
+            },
+            {
+                let mut object = Vec::new();
+                append_counted_object(&mut object, 0x40, &compressed);
+                object
+            },
+        ];
+        let mut container = Vec::from(b"bplist00".as_slice());
+        let mut offsets = Vec::new();
+        for object in objects {
+            offsets.push(container.len() as u8);
+            container.extend_from_slice(&object);
+        }
+        let offset_table_offset = container.len() as u64;
+        container.extend_from_slice(&offsets);
+        container.extend_from_slice(&[0; 6]);
+        container.extend_from_slice(&[1, 1]);
+        container.extend_from_slice(&3u64.to_be_bytes());
+        container.extend_from_slice(&0u64.to_be_bytes());
+        container.extend_from_slice(&offset_table_offset.to_be_bytes());
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&(container.len() as u16).to_be_bytes());
+        body.extend_from_slice(&(container.len() as u16).to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&[0; 4]);
+        body.extend_from_slice(&container);
+        body.extend_from_slice(&container);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&[0; 8]);
+        frame.extend_from_slice(&crate::protocol::MEDIA_STREAM_CONTROL_ENCODING.to_be_bytes());
+        frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame
     }
 
     fn start_production_harness_with_events(
@@ -1314,6 +1425,191 @@ mod tests {
             harness.exit.recv_timeout(Duration::from_secs(2)).unwrap(),
             frd_protocol_api::ProtocolExit::Closed
         );
+        harness.worker.join().unwrap();
+    }
+
+    #[test]
+    fn product_high_performance_replies_to_port_announcement_before_optional_server_state() {
+        let mut harness = start_production_harness_for(
+            frd_core::PixelSize::new(8, 8).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            |trace| Box::new(TracingEvents(trace)),
+        );
+        harness.read_verified_startup();
+
+        harness.send_message(&port_announcement_message(17_767));
+        let media_configuration = harness.read_message();
+        assert_eq!(&media_configuration[..2], &[0x1c, 0x00]);
+        assert_eq!(
+            u16::from_be_bytes(media_configuration[2..4].try_into().unwrap()) as usize + 4,
+            media_configuration.len()
+        );
+        assert_eq!(&media_configuration[4..6], &3u16.to_be_bytes());
+        assert_ne!(&media_configuration[10..12], &[0, 0]);
+        assert_ne!(&media_configuration[12..14], &[0, 0]);
+        assert_eq!(&media_configuration[16..20], &[0, 0, 0, 0]);
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        let mut extra = [0u8; 1];
+        assert!(matches!(
+            harness.peer.read(&mut extra),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        harness.send_message(&media_stream_answer_message());
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::SurfaceGenerationChanged {
+                generation: 1,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(8, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Surface(frd_frame::SurfaceUpdate::Reset {
+                generation: 1,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(8, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::StageChanged(
+                frd_protocol_api::ConnectionStage::TransportReady
+            ))
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::CapabilitiesChanged(capabilities))
+                if capabilities.remote_audio
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::AudioState(
+                frd_protocol_api::AudioState::Starting
+            ))
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::AudioState(
+                frd_protocol_api::AudioState::Playing
+            ))
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+
+        harness.send_message(&server_state_message(8, 8));
+        harness
+            .peer
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        let mut extra = [0u8; 1];
+        assert!(matches!(
+            harness.peer.read(&mut extra),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        harness.worker.join().unwrap();
+    }
+
+    #[test]
+    fn product_high_performance_server_state_first_waits_for_message_two_transport_milestone() {
+        let mut harness = start_production_harness_for(
+            frd_core::PixelSize::new(8, 8).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            |trace| Box::new(TracingEvents(trace)),
+        );
+        harness.read_verified_startup();
+
+        harness.send_message(&server_state_message(16, 8));
+        assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 16, 0, 8]);
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::SurfaceGenerationChanged {
+                generation: 1,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(16, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Surface(frd_frame::SurfaceUpdate::Reset {
+                generation: 1,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(16, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        harness.send_message(&port_announcement_message(17_768));
+        assert_eq!(harness.read_message().first(), Some(&0x1c));
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        harness.send_message(&media_stream_answer_message());
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::StageChanged(
+                frd_protocol_api::ConnectionStage::TransportReady
+            ))
+        ));
+
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
         harness.worker.join().unwrap();
     }
 
