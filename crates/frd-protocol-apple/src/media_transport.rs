@@ -31,6 +31,9 @@ use crate::srtp::{
 
 pub const MAX_MEDIA_DATAGRAM_BYTES: usize = 65_507;
 pub const MAX_MEDIA_DATAGRAMS_PER_ROLE_PER_POLL: usize = 256;
+/// High Performance 视频会产生高码率突发流量。为每个媒体角色独立请求至少 4 MiB
+/// 的内核 UDP 接收队列，避免音频和视频共享容量或互相挤占。
+pub const MEDIA_SOCKET_RECEIVE_BUFFER_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MEDIA_CONTROL_REPORT_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const SRTP_UNAMBIGUOUS_INITIAL_SEQUENCE_MASK: u16 = u16::MAX >> 1;
 
@@ -56,10 +59,18 @@ pub enum MediaTransportPhase {
 struct BoundMediaSocket {
     role: MediaRole,
     socket: UdpSocket,
+    receive_buffer_actual_bytes: usize,
     remote: SocketAddr,
     outbound_control: Option<OutboundControlStream>,
     outbound_rtp: Option<OutboundRtpStream>,
     inbound_crypto: Option<InboundCryptoStream>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaSocketReceiveBufferCapacity {
+    pub role: MediaRole,
+    pub requested_bytes: usize,
+    pub actual_bytes: usize,
 }
 
 struct OutboundControlStream {
@@ -532,12 +543,29 @@ impl MediaTransport {
                 }
                 let socket = UdpSocket::bind(SocketAddr::new(bind_address, descriptor.port))
                     .with_context(|| format!("绑定 {role:?} UDP socket 失败"))?;
+                let socket_ref = socket2::SockRef::from(&socket);
+                socket_ref
+                    .set_recv_buffer_size(MEDIA_SOCKET_RECEIVE_BUFFER_REQUEST_BYTES)
+                    .with_context(|| {
+                        format!(
+                            "设置 {role:?} UDP 接收缓冲区为至少 {} 字节失败",
+                            MEDIA_SOCKET_RECEIVE_BUFFER_REQUEST_BYTES
+                        )
+                    })?;
+                let receive_buffer_actual_bytes = socket_ref
+                    .recv_buffer_size()
+                    .with_context(|| format!("读取 {role:?} UDP 实际接收缓冲区容量失败"))?;
                 socket
                     .set_nonblocking(true)
                     .with_context(|| format!("设置 {role:?} UDP 非阻塞模式失败"))?;
+                eprintln!(
+                    "[media] {role:?} UDP 接收缓冲区：请求 {} 字节，实际 {} 字节",
+                    MEDIA_SOCKET_RECEIVE_BUFFER_REQUEST_BYTES, receive_buffer_actual_bytes
+                );
                 sockets.push(BoundMediaSocket {
                     role,
                     socket,
+                    receive_buffer_actual_bytes,
                     remote: SocketAddr::new(self.server_address, descriptor.port),
                     outbound_control: None,
                     outbound_rtp: None,
@@ -560,6 +588,22 @@ impl MediaTransport {
                 Err(error)
             }
         }
+    }
+
+    pub fn receive_buffer_capacities(
+        &self,
+        generation: u64,
+    ) -> Result<Vec<MediaSocketReceiveBufferCapacity>> {
+        self.validate_generation(generation)?;
+        Ok(self
+            .sockets
+            .iter()
+            .map(|bound| MediaSocketReceiveBufferCapacity {
+                role: bound.role,
+                requested_bytes: MEDIA_SOCKET_RECEIVE_BUFFER_REQUEST_BYTES,
+                actual_bytes: bound.receive_buffer_actual_bytes,
+            })
+            .collect())
     }
 
     fn transition(
@@ -1644,6 +1688,50 @@ mod tests {
         assert!(transport
             .send_opaque(8, MediaRole::Audio, b"stale")
             .is_err());
+    }
+
+    #[test]
+    fn udp_transport_requests_high_rate_receive_capacity_and_reports_effective_value() {
+        const LOCAL_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+        const REMOTE_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+        const FOUR_MEBIBYTES: usize = 4 * 1024 * 1024;
+
+        let comparison = UdpSocket::bind((LOCAL_MEDIA_ADDRESS, 0)).unwrap();
+        let default_capacity = socket2::SockRef::from(&comparison)
+            .recv_buffer_size()
+            .unwrap();
+        let remote = UdpSocket::bind((REMOTE_MEDIA_ADDRESS, 0)).unwrap();
+        let announcement = parse_media_stream_port_announcement(&announcement_fixture(
+            remote.local_addr().unwrap().port(),
+            1,
+        ))
+        .unwrap();
+        let mut transport = MediaTransport::new(7, IpAddr::V4(REMOTE_MEDIA_ADDRESS));
+        transport.accept_port_announcement(7, announcement).unwrap();
+
+        transport
+            .bind_local_sockets(7, IpAddr::V4(LOCAL_MEDIA_ADDRESS))
+            .unwrap();
+
+        let capacities = transport.receive_buffer_capacities(7).unwrap();
+        assert_eq!(capacities.len(), 1);
+        let capacity = capacities[0];
+        assert_eq!(capacity.role, MediaRole::Audio);
+        assert!(capacity.requested_bytes >= FOUR_MEBIBYTES);
+        assert!(capacity.actual_bytes > 0);
+        let bound = transport.socket(7, MediaRole::Audio).unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&bound.socket)
+                .recv_buffer_size()
+                .unwrap(),
+            capacity.actual_bytes
+        );
+        if default_capacity < capacity.requested_bytes {
+            assert!(
+                capacity.actual_bytes > default_capacity,
+                "当平台默认容量低于请求值时，媒体 socket 必须实际扩大接收缓冲区"
+            );
+        }
     }
 
     #[test]

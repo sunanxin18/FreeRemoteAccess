@@ -40,7 +40,7 @@ const SCREEN_SHARING_ONE_VIDEO_CONFIGURATION_FLAGS: u32 =
 
 const SCREEN_SHARING_AUDIO_NEGOTIATOR_MODE: u8 = 8;
 const SCREEN_SHARING_REMOTE_MICROPHONE_NEGOTIATOR_MODE: u8 = 4;
-const SCREEN_SHARING_VIDEO_NEGOTIATOR_MODE: u8 = 5;
+const SCREEN_SHARING_PRODUCT_VIDEO_NEGOTIATOR_MODE: u8 = 7;
 const MEDIA_NEGOTIATOR_MODE_KEY: &str = "avcMediaStreamNegotiatorMode";
 const MEDIA_NEGOTIATOR_MEDIA_BLOB_KEY: &str = "avcMediaStreamNegotiatorMediaBlob";
 const MEDIA_STREAM_REMOTE_ENDPOINT_INFO_KEY: &str = "avcMediaStreamOptionRemoteEndpointInfo";
@@ -393,7 +393,7 @@ impl MediaNegotiatorMode {
         match self {
             Self::Audio => SCREEN_SHARING_AUDIO_NEGOTIATOR_MODE,
             Self::RemoteMicrophone => SCREEN_SHARING_REMOTE_MICROPHONE_NEGOTIATOR_MODE,
-            Self::Video => SCREEN_SHARING_VIDEO_NEGOTIATOR_MODE,
+            Self::Video => SCREEN_SHARING_PRODUCT_VIDEO_NEGOTIATOR_MODE,
         }
     }
 }
@@ -1408,6 +1408,51 @@ mod tests {
         }
     }
 
+    fn offer_plist_mode(offer: &MediaNegotiatorOffer) -> u64 {
+        let plist = BinaryPlistReader::new(&offer.bytes).unwrap();
+        let (entry_count, key_references_offset) = plist
+            .object_payload(
+                plist.root_object,
+                BINARY_PLIST_DICTIONARY_MARKER,
+                BINARY_PLIST_MAX_DICTIONARY_ENTRIES,
+                "测试 offer dictionary",
+            )
+            .unwrap();
+        let value_references_offset = key_references_offset + entry_count * plist.reference_size;
+        let value_object = (0..entry_count)
+            .find_map(|index| {
+                let key_object = plist
+                    .object_reference(
+                        key_references_offset + index * plist.reference_size,
+                        "测试 offer key",
+                    )
+                    .unwrap();
+                (plist.ascii_string(key_object, "测试 offer key").unwrap()
+                    == MEDIA_NEGOTIATOR_MODE_KEY)
+                    .then(|| {
+                        plist
+                            .object_reference(
+                                value_references_offset + index * plist.reference_size,
+                                "测试 offer value",
+                            )
+                            .unwrap()
+                    })
+            })
+            .expect("offer 必须包含 negotiator mode");
+        let offset = plist.offsets[value_object];
+        let marker = offer.bytes[offset];
+        assert_eq!(
+            marker & BINARY_PLIST_OBJECT_TYPE_MASK,
+            BINARY_PLIST_INTEGER_MARKER
+        );
+        let width = 1usize << usize::from(marker & BINARY_PLIST_OBJECT_INFO_MASK);
+        read_binary_plist_unsigned(
+            &offer.bytes[offset + 1..offset + 1 + width],
+            "测试 negotiator mode",
+        )
+        .unwrap()
+    }
+
     fn captured_answer_container() -> Vec<u8> {
         let fixture =
             crate::read_private_fixture_text("ard_re/fixtures/avc_mode_4_answer.bplist.hex");
@@ -1610,6 +1655,15 @@ mod tests {
             configuration.audio.viewer_to_server,
             configuration.video_stream_1.viewer_to_server
         );
+    }
+
+    #[test]
+    fn one_video_product_configuration_encodes_stock_screen_sharing_modes() {
+        let configuration = ClientMediaStreamConfiguration::generate_one_video().unwrap();
+
+        assert_eq!(offer_plist_mode(&configuration.audio.offer), 8);
+        assert_eq!(offer_plist_mode(&configuration.video_stream_1.offer), 7);
+        assert!(configuration.video_stream_2.is_none());
     }
 
     #[test]
