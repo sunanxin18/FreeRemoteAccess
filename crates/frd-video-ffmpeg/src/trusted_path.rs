@@ -22,7 +22,8 @@ struct VerifiedObject {
 
 #[derive(Clone, Copy)]
 enum ExpectedKind {
-    Directory,
+    AncestorDirectory,
+    SearchDirectory,
     RegularFile,
 }
 
@@ -32,33 +33,74 @@ pub(crate) fn prepare(
     dependency_names: &[&str],
     plugin_name: &str,
 ) -> Result<TrustedLoadPaths, ()> {
-    validate_absolute_clean_path(application_dir)?;
+    let codec_dir = production_codec_dir(application_dir, platform_name);
+    prepare_at_codec_dir(application_dir, &codec_dir, dependency_names, plugin_name)
+}
 
-    let codec_dir = application_dir
+fn production_codec_dir(application_dir: &Path, platform_name: &str) -> PathBuf {
+    application_dir
         .join("codecs")
         .join("ffmpeg-8.1.2")
-        .join(platform_name);
+        .join(platform_name)
+}
+
+#[cfg(test)]
+pub(crate) fn production_codec_dir_for_test(
+    application_dir: &Path,
+    platform_name: &str,
+) -> PathBuf {
+    production_codec_dir(application_dir, platform_name)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_existing_platform_for_test(
+    application_dir: &Path,
+    codec_dir: &Path,
+    dependency_names: &[&str],
+    plugin_name: &str,
+) -> Result<TrustedLoadPaths, ()> {
+    prepare_at_codec_dir(application_dir, codec_dir, dependency_names, plugin_name)
+}
+
+fn prepare_at_codec_dir(
+    application_dir: &Path,
+    codec_dir: &Path,
+    dependency_names: &[&str],
+    plugin_name: &str,
+) -> Result<TrustedLoadPaths, ()> {
+    validate_absolute_clean_path(application_dir)?;
+    validate_absolute_clean_path(codec_dir)?;
+    if !codec_dir.starts_with(application_dir) {
+        return Err(());
+    }
+    for name in dependency_names
+        .iter()
+        .copied()
+        .chain(std::iter::once(plugin_name))
+    {
+        validate_file_name(name)?;
+    }
+
     let dependencies = dependency_names
         .iter()
         .map(|name| codec_dir.join(name))
         .collect::<Vec<_>>();
     let plugin = codec_dir.join(plugin_name);
 
-    let mut directory_paths = application_dir
+    let mut directory_paths = codec_dir
         .ancestors()
         .map(Path::to_path_buf)
         .collect::<Vec<_>>();
     directory_paths.reverse();
-    directory_paths.extend([
-        application_dir.join("codecs"),
-        application_dir.join("codecs").join("ffmpeg-8.1.2"),
-        codec_dir.clone(),
-    ]);
-    directory_paths.dedup();
 
     let mut open_objects = Vec::new();
     for path in directory_paths {
-        open_objects.push(verify_object(path, ExpectedKind::Directory)?);
+        let kind = if path == application_dir || path == codec_dir {
+            ExpectedKind::SearchDirectory
+        } else {
+            ExpectedKind::AncestorDirectory
+        };
+        open_objects.push(verify_object(path, kind)?);
     }
     let first_library_index = open_objects.len();
     for path in dependencies.iter().chain(std::iter::once(&plugin)) {
@@ -96,23 +138,35 @@ pub(crate) fn prepare(
         }
     }
     let canonical_plugin = canonical_libraries.pop().ok_or(())?;
+    let dependencies = canonical_libraries
+        .into_iter()
+        .map(platform::loader_path)
+        .collect::<Result<Vec<_>, _>>()?;
+    let plugin = platform::loader_path(canonical_plugin)?;
 
     Ok(TrustedLoadPaths {
-        dependencies: canonical_libraries,
-        plugin: canonical_plugin,
+        dependencies,
+        plugin,
         _open_objects: open_objects,
     })
 }
 
 #[cfg(test)]
+impl TrustedLoadPaths {
+    pub(crate) fn retained_object_count_for_test(&self) -> usize {
+        self._open_objects.len()
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn verify_install_root(path: &Path) -> Result<(), ()> {
     validate_absolute_clean_path(path)?;
-    verify_object(path.to_path_buf(), ExpectedKind::Directory).map(|_| ())
+    verify_object(path.to_path_buf(), ExpectedKind::SearchDirectory).map(|_| ())
 }
 
 fn verify_object(path: PathBuf, kind: ExpectedKind) -> Result<VerifiedObject, ()> {
     let opened = platform::open_verified(&path, kind)?;
-    platform::verify_trust(&path, &opened.file)?;
+    platform::verify_trust(&path, &opened.file, kind)?;
     Ok(VerifiedObject {
         path,
         kind,
@@ -127,6 +181,14 @@ fn validate_absolute_clean_path(path: &Path) -> Result<(), ()> {
             .components()
             .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_file_name(name: &str) -> Result<(), ()> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return Err(());
     }
     Ok(())
@@ -148,6 +210,39 @@ mod platform {
     }
 
     #[cfg(windows)]
+    pub(super) fn loader_path(path: std::path::PathBuf) -> Result<std::path::PathBuf, ()> {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        const VERBATIM_UNC_PREFIX: &[u16] = &[
+            b'\\' as u16,
+            b'\\' as u16,
+            b'?' as u16,
+            b'\\' as u16,
+            b'U' as u16,
+            b'N' as u16,
+            b'C' as u16,
+            b'\\' as u16,
+        ];
+        let loader_wide = if wide.starts_with(VERBATIM_UNC_PREFIX) {
+            let mut ordinary_unc = vec![b'\\' as u16, b'\\' as u16];
+            ordinary_unc.extend_from_slice(&wide[VERBATIM_UNC_PREFIX.len()..]);
+            ordinary_unc
+        } else if wide.starts_with(VERBATIM_PREFIX) {
+            wide[VERBATIM_PREFIX.len()..].to_vec()
+        } else {
+            wide
+        };
+        let loader_path = std::path::PathBuf::from(OsString::from_wide(&loader_wide));
+        if !loader_path.is_absolute() {
+            return Err(());
+        }
+        Ok(loader_path)
+    }
+
+    #[cfg(windows)]
     pub(super) fn open_verified(path: &Path, expected: ExpectedKind) -> Result<OpenedObject, ()> {
         use std::fs::OpenOptions;
         use std::mem::MaybeUninit;
@@ -164,7 +259,9 @@ mod platform {
             return Err(());
         }
         match expected {
-            ExpectedKind::Directory if !before.is_dir() => return Err(()),
+            ExpectedKind::AncestorDirectory | ExpectedKind::SearchDirectory if !before.is_dir() => {
+                return Err(())
+            }
             ExpectedKind::RegularFile if !before.is_file() => return Err(()),
             _ => {}
         }
@@ -180,7 +277,9 @@ mod platform {
             return Err(());
         }
         match expected {
-            ExpectedKind::Directory if after.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 => {
+            ExpectedKind::AncestorDirectory | ExpectedKind::SearchDirectory
+                if after.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 =>
+            {
                 return Err(())
             }
             ExpectedKind::RegularFile
@@ -209,7 +308,11 @@ mod platform {
     }
 
     #[cfg(windows)]
-    pub(super) fn verify_trust(_path: &Path, file: &File) -> Result<(), ()> {
+    pub(super) fn verify_trust(
+        _path: &Path,
+        file: &File,
+        expected: ExpectedKind,
+    ) -> Result<(), ()> {
         use std::ffi::c_void;
         use std::os::windows::io::AsRawHandle;
         use std::ptr;
@@ -259,16 +362,38 @@ mod platform {
             return Err(());
         }
 
-        let dangerous = GENERIC_ALL
-            | GENERIC_WRITE
-            | DELETE
-            | FILE_WRITE_DATA
-            | FILE_APPEND_DATA
-            | FILE_WRITE_EA
-            | FILE_WRITE_ATTRIBUTES
-            | FILE_DELETE_CHILD
-            | WRITE_DAC
-            | WRITE_OWNER;
+        let dangerous = match expected {
+            // Creating a sibling does not replace an already-open exact child. Every ancestor
+            // itself must still deny deletion and security-descriptor takeover.
+            ExpectedKind::AncestorDirectory => {
+                GENERIC_ALL | DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER
+            }
+            // The application and codec directories participate in DLL resolution. Untrusted
+            // principals must not be able to add a candidate library there.
+            ExpectedKind::SearchDirectory => {
+                GENERIC_ALL
+                    | GENERIC_WRITE
+                    | DELETE
+                    | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | FILE_DELETE_CHILD
+                    | WRITE_DAC
+                    | WRITE_OWNER
+            }
+            ExpectedKind::RegularFile => {
+                GENERIC_ALL
+                    | GENERIC_WRITE
+                    | DELETE
+                    | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | WRITE_DAC
+                    | WRITE_OWNER
+            }
+        };
         // SAFETY: `dacl` belongs to the live security descriptor.
         let ace_count = unsafe { (*dacl).AceCount };
         for index in 0..u32::from(ace_count) {
@@ -359,7 +484,16 @@ mod platform {
     }
 
     #[cfg(not(windows))]
-    pub(super) fn verify_trust(_path: &Path, _file: &File) -> Result<(), ()> {
+    pub(super) fn loader_path(_path: std::path::PathBuf) -> Result<std::path::PathBuf, ()> {
+        Err(())
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn verify_trust(
+        _path: &Path,
+        _file: &File,
+        _expected: ExpectedKind,
+    ) -> Result<(), ()> {
         Err(())
     }
 }

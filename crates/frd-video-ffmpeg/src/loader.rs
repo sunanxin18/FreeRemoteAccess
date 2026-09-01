@@ -258,12 +258,12 @@ impl FfmpegDecoder {
         max_frames: usize,
         max_bytes: usize,
     ) -> Result<Box<[DecodedVideoFrame]>, VideoDecodeError> {
+        if let Some(frame) = self.pending_frame.take() {
+            return Ok(vec![frame].into_boxed_slice());
+        }
+
         let mut frames = Vec::new();
         let mut batch_bytes = 0usize;
-        if let Some(frame) = self.pending_frame.take() {
-            batch_bytes = decoded_frame_bytes(&frame);
-            frames.push(frame);
-        }
 
         while frames.len() < max_frames {
             let mut raw_frame = FrdDecodedFrame::default();
@@ -807,6 +807,11 @@ mod tests {
 
     #[cfg(windows)]
     use super::verify_trusted_install_chain;
+    #[cfg(windows)]
+    use super::{
+        ffmpeg_dependency_names, load_api, open_library, platform_directory_name,
+        plugin_library_name,
+    };
     use super::{
         frame_fits_decode_batch, validate_raw_frame_layout, FfmpegBackend, FfmpegDecoder,
         FRD_FFMPEG_ABI_VERSION, MAX_DECODE_BATCH_BYTES,
@@ -865,6 +870,54 @@ mod tests {
 
         verify_trusted_install_chain(&system_directory)
             .expect("System32 应满足受信 owner/DACL 门禁");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_production_trust_and_loader_path_accepts_three_system_libraries() {
+        let production_root = PathBuf::from(r"C:\Program Files\FreeRemoteDesk");
+        assert_eq!(
+            crate::trusted_path::production_codec_dir_for_test(
+                &production_root,
+                platform_directory_name(),
+            ),
+            production_root
+                .join("codecs")
+                .join("ffmpeg-8.1.2")
+                .join("windows-x86_64")
+        );
+        assert_eq!(
+            ffmpeg_dependency_names(),
+            &["avutil-60.dll", "avcodec-62.dll"]
+        );
+        assert_eq!(plugin_library_name(), "freeremotedesk_ffmpeg.dll");
+
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows 必须提供 SystemRoot"));
+        let system_directory = system_root.join("System32");
+        let trusted = crate::trusted_path::prepare_existing_platform_for_test(
+            &system_root,
+            &system_directory,
+            &["kernel32.dll", "user32.dll"],
+            "advapi32.dll",
+        )
+        .expect("完整 SystemRoot/System32 链和三个 DLL 应通过生产信任核心");
+        assert_eq!(trusted.dependencies.len(), 2);
+        assert_eq!(trusted.retained_object_count_for_test(), 6);
+
+        let dependencies = trusted
+            .dependencies
+            .iter()
+            .map(|path| open_library(path).expect("LoadLibraryEx 应安全加载受信依赖"))
+            .collect::<Vec<_>>();
+        assert_eq!(dependencies.len(), 2);
+        let plugin = open_library(&trusted.plugin).expect("LoadLibraryEx 应安全加载受信第三个 DLL");
+
+        let error = match load_api(&plugin) {
+            Ok(_) => panic!("system DLL 不应暴露 FreeRemoteDesk plugin 符号"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), VideoDecodeErrorCode::BackendUnavailable);
     }
 
     #[test]
@@ -1096,6 +1149,38 @@ mod tests {
     }
 
     #[test]
+    fn deferred_frame_is_returned_before_a_later_plugin_receive_error() {
+        let _guard = FAKE_FRAME_TEST_LOCK.lock().expect("fake frame 测试锁有效");
+        RELEASE_COUNT.store(0, Ordering::SeqCst);
+        FRAME_RECLAIM_CALL_COUNT.store(0, Ordering::SeqCst);
+        let backend = FfmpegBackend::from_raw_api_for_test(deferred_then_error_fake_api())
+            .expect("兼容 deferred-error API 应加载");
+        let mut decoder = FfmpegDecoder::create(Arc::clone(&backend.plugin), main444_config())
+            .expect("deferred-error decoder 应创建");
+
+        let first = decoder
+            .receive_frames_with_limits(8, 12)
+            .expect("首帧应返回并延后第二帧");
+        let deferred = decoder
+            .receive_frames_with_limits(8, 12)
+            .expect("延后帧必须在后续 plugin 错误前独立返回");
+        let error = decoder
+            .receive_frames_with_limits(8, 12)
+            .expect_err("再下一次 drain 才应暴露 plugin 错误");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].as_input().timestamp.ticks, 1);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].as_input().timestamp.ticks, 2);
+        assert_eq!(
+            error.code(),
+            VideoDecodeErrorCode::DecodeFailedAfterFirstFrame
+        );
+        assert_eq!(FRAME_RECLAIM_CALL_COUNT.load(Ordering::SeqCst), 3);
+        assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
     fn aggregate_plugin_plane_budget_is_rejected_before_copying_buffers() {
         let oversized_half = frd_media_api::MAX_DECODED_VIDEO_FRAME_BYTES / 2 + 1;
         let plane = FrdDecodedPlane {
@@ -1170,12 +1255,24 @@ mod tests {
         api
     }
 
+    fn deferred_then_error_fake_api() -> RawFrdFfmpegApiV1 {
+        let mut api = ready_fake_api();
+        api.create_decoder = deferred_then_error_create as *const () as usize;
+        api.receive = deferred_then_error_receive as *const () as usize;
+        api.destroy = deferred_then_error_destroy as *const () as usize;
+        api
+    }
+
     struct FakeDecoderState {
         emitted: bool,
     }
 
     struct BurstDecoderState {
         remaining: usize,
+    }
+
+    struct DeferredThenErrorState {
+        receive_calls: usize,
     }
 
     static RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1230,6 +1327,19 @@ mod tests {
         FrdStatus::OK
     }
 
+    unsafe extern "C" fn deferred_then_error_create(
+        _config: *const FrdVideoConfig,
+        handle: *mut FrdDecoderHandle,
+    ) -> FrdStatus {
+        if handle.is_null() {
+            return FrdStatus::INVALID_ARGUMENT;
+        }
+        let state = Box::new(DeferredThenErrorState { receive_calls: 0 });
+        // SAFETY: checked out pointer; allocation ownership transfers to the matching destroy.
+        unsafe { handle.write(Box::into_raw(state).cast::<c_void>()) };
+        FrdStatus::OK
+    }
+
     unsafe extern "C" fn burst_submit(
         _handle: FrdDecoderHandle,
         _data: *const u8,
@@ -1264,10 +1374,41 @@ mod tests {
         FrdStatus::OK
     }
 
+    unsafe extern "C" fn deferred_then_error_receive(
+        handle: FrdDecoderHandle,
+        frame: *mut FrdDecodedFrame,
+    ) -> FrdStatus {
+        if handle.is_null() || frame.is_null() {
+            return FrdStatus::INVALID_ARGUMENT;
+        }
+        // SAFETY: exclusive state came from `deferred_then_error_create`.
+        let state = unsafe { &mut *handle.cast::<DeferredThenErrorState>() };
+        state.receive_calls += 1;
+        if state.receive_calls > 2 {
+            return FrdStatus::DECODE_FAILED;
+        }
+        let output = FrdDecodedFrame {
+            timestamp_ticks: state.receive_calls as i64,
+            pixel_format: FRD_PIXEL_FORMAT_YUV_444_P8,
+            plane_count: 3,
+            planes: [fake_plane(0x10), fake_plane(0x80), fake_plane(0x80)],
+        };
+        // SAFETY: caller supplied host-owned writable output.
+        unsafe { frame.write(output) };
+        FrdStatus::OK
+    }
+
     unsafe extern "C" fn burst_destroy(handle: FrdDecoderHandle) {
         if !handle.is_null() {
             // SAFETY: allocation came from `burst_create` and is destroyed once.
             drop(unsafe { Box::from_raw(handle.cast::<BurstDecoderState>()) });
+        }
+    }
+
+    unsafe extern "C" fn deferred_then_error_destroy(handle: FrdDecoderHandle) {
+        if !handle.is_null() {
+            // SAFETY: allocation came from `deferred_then_error_create` and is destroyed once.
+            drop(unsafe { Box::from_raw(handle.cast::<DeferredThenErrorState>()) });
         }
     }
 
