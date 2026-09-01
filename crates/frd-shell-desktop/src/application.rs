@@ -1382,6 +1382,24 @@ fn video_surface_owner_matches(
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoSurfaceOwnerTransition {
+    WorkerStopped,
+    CleanupStarted,
+    CleanupComplete,
+}
+
+fn transition_video_surface_owner(
+    owner: &mut Option<VideoStreamEpoch>,
+    transition: VideoSurfaceOwnerTransition,
+) {
+    match transition {
+        VideoSurfaceOwnerTransition::WorkerStopped
+        | VideoSurfaceOwnerTransition::CleanupStarted => {}
+        VideoSurfaceOwnerTransition::CleanupComplete => *owner = None,
+    }
+}
+
 fn disconnect_after_matching_video_failure(
     configured: Option<VideoStreamEpoch>,
     active: &mut Option<VideoBinding>,
@@ -2416,7 +2434,10 @@ impl DesktopApplication {
                 VideoWorkerEvent::Stopped => {
                     if let Some(window) = self.window.as_mut() {
                         window.video_renderer.detach();
-                        window.video_owner = None;
+                        transition_video_surface_owner(
+                            &mut window.video_owner,
+                            VideoSurfaceOwnerTransition::WorkerStopped,
+                        );
                         window.video = None;
                         window.pending_video = None;
                     }
@@ -2444,7 +2465,10 @@ impl DesktopApplication {
                 window.renderer.detach();
                 window.video_renderer.detach();
                 window.remote = None;
-                window.video_owner = None;
+                transition_video_surface_owner(
+                    &mut window.video_owner,
+                    VideoSurfaceOwnerTransition::CleanupStarted,
+                );
                 window.video = None;
                 window.pending_video = None;
                 window.pending_texture_writes.clear();
@@ -3426,6 +3450,12 @@ impl DesktopApplication {
     ) {
         match self.sessions.accept_cleanup_outcome(outcome) {
             Ok(completion) => {
+                if let Some(window) = self.window.as_mut() {
+                    transition_video_surface_owner(
+                        &mut window.video_owner,
+                        VideoSurfaceOwnerTransition::CleanupComplete,
+                    );
+                }
                 if self
                     .launch
                     .controller_mut()
@@ -4468,6 +4498,70 @@ mod tests {
             }),
             "owner remains latched until session cleanup, so no sibling can silently fail over"
         );
+    }
+
+    #[test]
+    fn worker_stop_during_owner_failure_keeps_sibling_rejected_until_cleanup_completes() {
+        let session_id = SessionId::allocate();
+        let owner_identity = VideoStreamIdentity {
+            session_id,
+            stream_id: 1,
+        };
+        let sibling_identity = VideoStreamIdentity {
+            session_id,
+            stream_id: 2,
+        };
+        let mut owner = None;
+        assert!(super::admit_video_surface_owner(
+            &mut owner,
+            crate::video_decode_worker::VideoStreamAdmission {
+                identity: owner_identity,
+                generation: 11,
+            }
+        ));
+
+        let mut active = None;
+        assert!(super::disconnect_after_matching_video_failure(
+            owner,
+            &mut active,
+            owner_identity,
+            11,
+            VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
+            ProtocolId::apple_high_performance(),
+        )
+        .is_some());
+        super::transition_video_surface_owner(
+            &mut owner,
+            super::VideoSurfaceOwnerTransition::WorkerStopped,
+        );
+        super::transition_video_surface_owner(
+            &mut owner,
+            super::VideoSurfaceOwnerTransition::CleanupStarted,
+        );
+
+        assert!(!super::admit_video_surface_owner(
+            &mut owner,
+            crate::video_decode_worker::VideoStreamAdmission {
+                identity: sibling_identity,
+                generation: 11,
+            }
+        ));
+        assert!(!super::video_surface_owner_matches(
+            owner,
+            sibling_identity,
+            11
+        ));
+        assert!(super::video_surface_owner_matches(
+            owner,
+            owner_identity,
+            11
+        ));
+
+        super::transition_video_surface_owner(
+            &mut owner,
+            super::VideoSurfaceOwnerTransition::CleanupComplete,
+        );
+        assert_eq!(owner, None);
     }
 
     #[test]
