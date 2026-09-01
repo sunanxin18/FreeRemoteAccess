@@ -80,11 +80,6 @@ fn selection_tier(
         {
             Some(2)
         }
-        (VideoBackendKind::Native, VideoDecodeSupport::SoftwareExact(capability))
-            if capability.matches_exactly(query) =>
-        {
-            Some(3)
-        }
         (_, VideoDecodeSupport::Unsupported(_)) => None,
         _ => None,
     }
@@ -214,6 +209,27 @@ mod tests {
             .expect("应选择 FFmpeg software");
 
         assert_eq!(selection.backend_id.as_str(), "ffmpeg-software");
+    }
+
+    #[test]
+    fn registry_does_not_select_native_software_exact_support() {
+        let registry = VideoDecoderRegistry::new(vec![fake_factory(
+            "native-software",
+            VideoBackendKind::Native,
+            VideoBackendAvailability::DecoderReady,
+            VideoDecodeSupport::SoftwareExact(main444_capability("native-software")),
+        )]);
+
+        let error = registry
+            .select(&main444_query())
+            .expect_err("native software 不在批准的选择 tier 中");
+
+        assert_eq!(error.code(), VideoDecodeErrorCode::BackendUnavailable);
+        assert_eq!(error.diagnostics().len(), 1);
+        assert_eq!(
+            error.diagnostics()[0].support,
+            VideoDecodeSupport::SoftwareExact(main444_capability("native-software"))
+        );
     }
 
     #[test]
