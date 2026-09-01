@@ -1383,6 +1383,34 @@ fn video_surface_owner_matches(
         })
 }
 
+#[derive(Default)]
+struct OwnedVideoStageTrace {
+    owner: Option<VideoStreamEpoch>,
+    trace: MediaStageTrace,
+}
+
+impl OwnedVideoStageTrace {
+    fn admit(&mut self, owner: VideoStreamEpoch) {
+        if self.owner == Some(owner) {
+            return;
+        }
+        self.owner = Some(owner);
+        self.trace = MediaStageTrace::default();
+    }
+
+    fn observe_uploaded(&mut self, owner: VideoStreamEpoch, size: PixelSize) -> bool {
+        if self.owner != Some(owner) {
+            return false;
+        }
+        self.trace.observe(MediaStageDiagnostic::FrameUploaded {
+            generation: owner.generation,
+            stream_id: owner.identity.stream_id,
+            width: size.width,
+            height: size.height,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VideoSurfaceOwnerTransition {
     WorkerStopped,
@@ -1405,7 +1433,7 @@ trait VideoSurfaceDrainTarget {
     fn video_owner(&self) -> Option<VideoStreamEpoch>;
     fn video_owner_mut(&mut self) -> &mut Option<VideoStreamEpoch>;
     fn active_video_mut(&mut self) -> &mut Option<VideoBinding>;
-    fn reset_for_admission(&mut self);
+    fn reset_for_admission(&mut self, epoch: VideoStreamEpoch);
     fn configure_video_stream(&mut self, epoch: VideoStreamEpoch)
         -> Result<(), VideoRendererError>;
     fn upload_video_frame(
@@ -1438,8 +1466,12 @@ fn drain_video_surface_events<T: VideoSurfaceDrainTarget>(
         if admission.identity.session_id != session_id {
             continue;
         }
+        let epoch = VideoStreamEpoch {
+            identity: admission.identity,
+            generation: admission.generation,
+        };
         if admit_video_surface_owner(target.video_owner_mut(), admission) {
-            target.reset_for_admission();
+            target.reset_for_admission(epoch);
         }
     }
 
@@ -1756,7 +1788,7 @@ struct DesktopWindowState {
     video_owner: Option<VideoStreamEpoch>,
     video: Option<VideoBinding>,
     pending_video: Option<(VideoPresentationReceipt, VideoFrameToken)>,
-    video_stage_trace: MediaStageTrace,
+    video_stage_trace: OwnedVideoStageTrace,
     dpi_transition: DpiTransition,
     pending_texture_writes: PendingTextureWrites,
     focus_session_chrome: bool,
@@ -1793,11 +1825,11 @@ impl VideoSurfaceDrainTarget for DesktopWindowState {
         &mut self.video
     }
 
-    fn reset_for_admission(&mut self) {
+    fn reset_for_admission(&mut self, epoch: VideoStreamEpoch) {
         self.video_renderer.detach();
         self.video = None;
         self.pending_video = None;
-        self.video_stage_trace = MediaStageTrace::default();
+        self.video_stage_trace.admit(epoch);
     }
 
     fn configure_video_stream(
@@ -1816,13 +1848,13 @@ impl VideoSurfaceDrainTarget for DesktopWindowState {
         frame: DecodedVideoFrame,
     ) -> Result<(), VideoRendererError> {
         let upload = self.video_renderer.upload_frame(frame)?;
-        self.video_stage_trace
-            .observe(MediaStageDiagnostic::FrameUploaded {
+        self.video_stage_trace.observe_uploaded(
+            VideoStreamEpoch {
+                identity: token.identity(),
                 generation: token.generation(),
-                stream_id: token.identity().stream_id,
-                width: upload.layout.visible_size().width,
-                height: upload.layout.visible_size().height,
-            });
+            },
+            upload.layout.visible_size(),
+        );
         self.video = Some(VideoBinding {
             identity: token.identity(),
             generation: token.generation(),
@@ -2361,7 +2393,7 @@ impl DesktopApplication {
             video_owner: None,
             video: None,
             pending_video: None,
-            video_stage_trace: MediaStageTrace::default(),
+            video_stage_trace: OwnedVideoStageTrace::default(),
             dpi_transition: DpiTransition::default(),
             pending_texture_writes: PendingTextureWrites::default(),
             focus_session_chrome: false,
@@ -4703,7 +4735,7 @@ mod tests {
             &mut self.active
         }
 
-        fn reset_for_admission(&mut self) {
+        fn reset_for_admission(&mut self, _epoch: VideoStreamEpoch) {
             self.detach_count += 1;
             self.active = None;
             self.pending = None;
@@ -4976,6 +5008,49 @@ mod tests {
         for (code, expected) in cases {
             assert_eq!(super::video_decode_terminal_code(code), expected);
         }
+    }
+
+    #[test]
+    fn upload_stage_trace_is_once_for_same_owner_and_rearms_only_for_a_new_owner_epoch() {
+        let session_id = SessionId::allocate();
+        let identity = VideoStreamIdentity {
+            session_id,
+            stream_id: 1,
+        };
+        let owner = VideoStreamEpoch {
+            identity,
+            generation: 7,
+        };
+        let mut trace = super::OwnedVideoStageTrace::default();
+
+        trace.admit(owner);
+        assert!(trace.observe_uploaded(owner, PixelSize::new(1440, 2560).unwrap()));
+        trace.admit(owner);
+        assert!(!trace.observe_uploaded(owner, PixelSize::new(1440, 2560).unwrap()));
+        assert!(!trace.observe_uploaded(
+            VideoStreamEpoch {
+                identity: VideoStreamIdentity {
+                    session_id,
+                    stream_id: 2,
+                },
+                generation: 7,
+            },
+            PixelSize::new(1440, 2560).unwrap(),
+        ));
+        assert!(!trace.observe_uploaded(
+            VideoStreamEpoch {
+                identity,
+                generation: 6,
+            },
+            PixelSize::new(1440, 2560).unwrap(),
+        ));
+
+        let next = VideoStreamEpoch {
+            identity,
+            generation: 8,
+        };
+        trace.admit(next);
+        assert!(trace.observe_uploaded(next, PixelSize::new(1920, 1080).unwrap()));
     }
 
     fn assert_metric_startup_fatal_before_launch(error: MetricSinkError) {

@@ -75,6 +75,14 @@ impl VideoReceiveState {
         self.stage_trace = MediaStageTrace::default();
     }
 
+    fn observe_authenticated_rtp(&mut self, generation: u64) {
+        self.stage_trace
+            .observe(MediaStageDiagnostic::AuthenticatedVideoRtp {
+                generation,
+                stream_id: self.adapter.stream_id(),
+            });
+    }
+
     fn accept_rtp(
         &mut self,
         runtime: &mut ProtocolRuntime,
@@ -98,11 +106,6 @@ impl VideoReceiveState {
                 .publish_access_unit(runtime, access_unit)
                 .context("发布 Apple HP HEVC 访问单元失败")?;
         }
-        self.stage_trace
-            .observe(MediaStageDiagnostic::AuthenticatedVideoRtp {
-                generation,
-                stream_id: self.adapter.stream_id(),
-            });
         Ok(())
     }
 }
@@ -321,10 +324,12 @@ fn accept_datagram(
         }
         (MediaRole::Audio, MediaDatagram::Rtcp(_)) => {}
         (MediaRole::VideoStream1, MediaDatagram::Rtp(packet)) => {
+            video_stream_1.observe_authenticated_rtp(generation);
             video_stream_1.accept_rtp(runtime, generation, &packet)?;
             *authenticated_video_packets = authenticated_video_packets.saturating_add(1);
         }
         (MediaRole::VideoStream2, MediaDatagram::Rtp(packet)) => {
+            video_stream_2.observe_authenticated_rtp(generation);
             video_stream_2.accept_rtp(runtime, generation, &packet)?;
             *authenticated_video_packets = authenticated_video_packets.saturating_add(1);
         }
@@ -692,6 +697,54 @@ mod tests {
             if access_unit.identity().session_id == session_id
                 && access_unit.identity().stream_id == 1)
         );
+    }
+
+    #[test]
+    fn authenticated_video_rtp_stage_precedes_downstream_failure_and_is_once_per_stream() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(Arc::new(Mutex::new(Vec::new()))))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            assert!(accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(vec![0x80]),
+            )
+            .is_err());
+        }
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtcp(vec![0x80]),
+        )
+        .unwrap();
+        let _ = accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::Audio,
+            MediaDatagram::Rtp(vec![0x80]),
+        );
+
+        assert_eq!(state.video_stream_1.stage_trace.observed_stage_count(), 1);
+        assert_eq!(state.video_stream_2.stage_trace.observed_stage_count(), 0);
     }
 
     fn video_rtp(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {

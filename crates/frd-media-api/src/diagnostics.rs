@@ -189,4 +189,8 @@ impl MediaStageTrace {
         eprintln!("{diagnostic}");
         true
     }
+
+    pub fn observed_stage_count(&self) -> u32 {
+        self.observed.count_ones()
+    }
 }
