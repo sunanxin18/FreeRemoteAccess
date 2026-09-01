@@ -24,6 +24,7 @@ pub enum VideoContractError {
     PlaneBufferTooShort,
     PlaneBudgetExceeded,
     EmptyPlaneSet,
+    DecodedFrameLayoutMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +133,7 @@ impl VideoParameterSets {
         sps: Box<[u8]>,
         pps: Box<[u8]>,
     ) -> Result<Self, VideoContractError> {
+        let mut total_bytes = 0usize;
         for parameter_set in vps
             .iter()
             .map(Box::as_ref)
@@ -140,7 +142,10 @@ impl VideoParameterSets {
             if parameter_set.is_empty() {
                 return Err(VideoContractError::EmptyParameterSet);
             }
-            if parameter_set.len() > MAX_VIDEO_PARAMETER_SET_BYTES {
+            total_bytes = total_bytes
+                .checked_add(parameter_set.len())
+                .ok_or(VideoContractError::ParameterSetBudgetExceeded)?;
+            if total_bytes > MAX_VIDEO_PARAMETER_SET_BYTES {
                 return Err(VideoContractError::ParameterSetBudgetExceeded);
             }
         }
@@ -283,12 +288,7 @@ impl VideoPlane {
             .ok()
             .and_then(|stride| stride.checked_mul(height as usize))
             .ok_or(VideoContractError::PlaneBufferLengthOverflow)?;
-        if required > MAX_DECODED_VIDEO_FRAME_BYTES {
-            return Err(VideoContractError::PlaneBudgetExceeded);
-        }
-        if bytes.len() < required {
-            return Err(VideoContractError::PlaneBufferTooShort);
-        }
+        validate_plane_buffer_length(required, bytes.len())?;
         Ok(Self {
             width,
             height,
@@ -336,6 +336,7 @@ impl DecodedVideoFrame {
         if frame.planes.is_empty() {
             return Err(VideoContractError::EmptyPlaneSet);
         }
+        validate_decoded_frame_layout(frame.format, frame.coded_size, &frame.planes)?;
         let total = frame.planes.iter().try_fold(0usize, |total, plane| {
             total
                 .checked_add(plane.bytes.len())
@@ -359,14 +360,108 @@ fn rect_is_within(rect: PixelRect, size: PixelSize) -> bool {
     end.x <= size.width && end.y <= size.height
 }
 
+fn validate_decoded_frame_layout(
+    format: VideoPixelFormat,
+    coded_size: PixelSize,
+    planes: &[VideoPlane],
+) -> Result<(), VideoContractError> {
+    match format {
+        VideoPixelFormat::Yuv420P8 => {
+            let chroma_width = ceil_half(coded_size.width)?;
+            let chroma_height = ceil_half(coded_size.height)?;
+            validate_plane_layout(
+                planes,
+                &[
+                    (coded_size.width, coded_size.height, coded_size.width),
+                    (chroma_width, chroma_height, chroma_width),
+                    (chroma_width, chroma_height, chroma_width),
+                ],
+            )
+        }
+        VideoPixelFormat::Yuv444P8 => validate_plane_layout(
+            planes,
+            &[
+                (coded_size.width, coded_size.height, coded_size.width),
+                (coded_size.width, coded_size.height, coded_size.width),
+                (coded_size.width, coded_size.height, coded_size.width),
+            ],
+        ),
+        VideoPixelFormat::Nv12 => {
+            let chroma_height = ceil_half(coded_size.height)?;
+            validate_plane_layout(
+                planes,
+                &[
+                    (coded_size.width, coded_size.height, coded_size.width),
+                    (coded_size.width, chroma_height, coded_size.width),
+                ],
+            )
+        }
+        VideoPixelFormat::P010 => {
+            let chroma_height = ceil_half(coded_size.height)?;
+            let stride = coded_size
+                .width
+                .checked_mul(2)
+                .ok_or(VideoContractError::DecodedFrameLayoutMismatch)?;
+            validate_plane_layout(
+                planes,
+                &[
+                    (coded_size.width, coded_size.height, stride),
+                    (coded_size.width, chroma_height, stride),
+                ],
+            )
+        }
+    }
+}
+
+fn ceil_half(value: u32) -> Result<u32, VideoContractError> {
+    value
+        .checked_add(1)
+        .map(|value| value / 2)
+        .ok_or(VideoContractError::DecodedFrameLayoutMismatch)
+}
+
+fn validate_plane_layout(
+    planes: &[VideoPlane],
+    expected: &[(u32, u32, u32)],
+) -> Result<(), VideoContractError> {
+    if planes.len() != expected.len() {
+        return Err(VideoContractError::DecodedFrameLayoutMismatch);
+    }
+    for (plane, &(width, height, minimum_stride)) in planes.iter().zip(expected) {
+        if plane.width != width || plane.height != height || plane.stride_bytes < minimum_stride {
+            return Err(VideoContractError::DecodedFrameLayoutMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_plane_buffer_length(
+    required_bytes: usize,
+    actual_bytes: usize,
+) -> Result<(), VideoContractError> {
+    if required_bytes > MAX_DECODED_VIDEO_FRAME_BYTES
+        || actual_bytes > MAX_DECODED_VIDEO_FRAME_BYTES
+    {
+        return Err(VideoContractError::PlaneBudgetExceeded);
+    }
+    if actual_bytes < required_bytes {
+        return Err(VideoContractError::PlaneBufferTooShort);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use frd_core::{PixelRect, PixelSize, SessionId};
 
     use super::{
-        ChromaFormat, ChromaLocation, VideoBitstreamFormat, VideoCodec, VideoColorimetry,
-        VideoContractError, VideoParameterSets, VideoPlane, VideoProfile, VideoRange,
-        VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity, VideoTimeBase,
+        validate_plane_buffer_length, ChromaFormat, ChromaLocation, DecodedVideoFrame,
+        DecodedVideoFrameInput, VideoBitstreamFormat, VideoCodec, VideoColorimetry,
+        VideoContractError, VideoParameterSets, VideoPixelFormat, VideoPlane, VideoProfile,
+        VideoRange, VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity, VideoTimeBase,
+        VideoTimestamp, MAX_DECODED_VIDEO_FRAME_BYTES, MAX_VIDEO_PARAMETER_SET_BYTES,
     };
 
     fn test_config_with_visible_rect(visible_rect: PixelRect) -> VideoStreamConfigInput {
@@ -430,6 +525,158 @@ mod tests {
             vec![0x44].into_boxed_slice(),
         );
 
-        assert_eq!(result, Err(VideoContractError::ParameterSetBudgetExceeded));
+        assert!(matches!(
+            result,
+            Err(VideoContractError::ParameterSetBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn parameter_sets_accept_exact_one_mib_aggregate_budget() {
+        let result = VideoParameterSets::try_new(
+            Some(vec![0x20].into_boxed_slice()),
+            vec![0x42; MAX_VIDEO_PARAMETER_SET_BYTES - 2].into_boxed_slice(),
+            vec![0x44].into_boxed_slice(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parameter_sets_reject_aggregate_over_one_mib_budget() {
+        let result = VideoParameterSets::try_new(
+            None,
+            vec![0x42; MAX_VIDEO_PARAMETER_SET_BYTES].into_boxed_slice(),
+            vec![0x44].into_boxed_slice(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(VideoContractError::ParameterSetBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn decoded_frame_rejects_wrong_plane_count_for_each_format() {
+        for format in [
+            VideoPixelFormat::Yuv420P8,
+            VideoPixelFormat::Yuv444P8,
+            VideoPixelFormat::Nv12,
+            VideoPixelFormat::P010,
+        ] {
+            assert!(matches!(
+                DecodedVideoFrame::try_new(test_frame(format, vec![test_plane(5, 3, 5)])),
+                Err(VideoContractError::DecodedFrameLayoutMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn decoded_frame_rejects_wrong_plane_layout_for_each_format() {
+        let cases = [
+            (
+                VideoPixelFormat::Yuv420P8,
+                vec![
+                    test_plane(5, 3, 5),
+                    test_plane(2, 2, 2),
+                    test_plane(3, 2, 3),
+                ],
+            ),
+            (
+                VideoPixelFormat::Yuv444P8,
+                vec![
+                    test_plane(5, 3, 5),
+                    test_plane(4, 3, 4),
+                    test_plane(5, 3, 5),
+                ],
+            ),
+            (
+                VideoPixelFormat::Nv12,
+                vec![test_plane(5, 3, 5), test_plane(3, 2, 3)],
+            ),
+            (
+                VideoPixelFormat::P010,
+                vec![test_plane(5, 3, 10), test_plane(5, 2, 5)],
+            ),
+        ];
+
+        for (format, planes) in cases {
+            assert!(matches!(
+                DecodedVideoFrame::try_new(test_frame(format, planes)),
+                Err(VideoContractError::DecodedFrameLayoutMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn decoded_frame_accepts_canonical_layout_for_each_format() {
+        for (format, planes) in [
+            (
+                VideoPixelFormat::Yuv420P8,
+                vec![
+                    test_plane(5, 3, 5),
+                    test_plane(3, 2, 3),
+                    test_plane(3, 2, 3),
+                ],
+            ),
+            (
+                VideoPixelFormat::Yuv444P8,
+                vec![
+                    test_plane(5, 3, 5),
+                    test_plane(5, 3, 5),
+                    test_plane(5, 3, 5),
+                ],
+            ),
+            (
+                VideoPixelFormat::Nv12,
+                vec![test_plane(5, 3, 5), test_plane(5, 2, 5)],
+            ),
+            (
+                VideoPixelFormat::P010,
+                vec![test_plane(5, 3, 10), test_plane(5, 2, 10)],
+            ),
+        ] {
+            assert!(DecodedVideoFrame::try_new(test_frame(format, planes)).is_ok());
+        }
+    }
+
+    #[test]
+    fn plane_buffer_length_rejects_an_actual_buffer_over_the_budget_without_allocating_it() {
+        let result = validate_plane_buffer_length(1, MAX_DECODED_VIDEO_FRAME_BYTES + 1);
+
+        assert_eq!(result, Err(VideoContractError::PlaneBudgetExceeded));
+    }
+
+    fn test_plane(width: u32, height: u32, stride_bytes: u32) -> VideoPlane {
+        VideoPlane::try_new(
+            width,
+            height,
+            stride_bytes,
+            vec![0; stride_bytes as usize * height as usize].into_boxed_slice(),
+        )
+        .expect("测试 plane 有效")
+    }
+
+    fn test_frame(format: VideoPixelFormat, planes: Vec<VideoPlane>) -> DecodedVideoFrameInput {
+        DecodedVideoFrameInput {
+            identity: VideoStreamIdentity {
+                session_id: SessionId::allocate(),
+                stream_id: 1,
+            },
+            generation: 1,
+            timestamp: VideoTimestamp {
+                ticks: 1,
+                timescale: NonZeroU32::new(90_000).expect("测试 timestamp timebase 非零"),
+            },
+            coded_size: PixelSize::new(5, 3).expect("测试 coded 尺寸有效"),
+            visible_rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 3,
+            },
+            format,
+            planes: planes.into_boxed_slice(),
+        }
     }
 }
