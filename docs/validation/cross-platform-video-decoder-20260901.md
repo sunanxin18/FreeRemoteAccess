@@ -6,7 +6,8 @@
 native capability probe、固定 FFmpeg Main444 fixture、DX12 YUV444 离屏颜色门禁、
 Windows package staging/verifier，以及 codec present/absent 的单实例 GUI 启动检查。
 
-统一视频解码器当前只能标记为 **受限验证**：离线解码、渲染和 package staging
+统一视频解码器的离线/本机范围当前只能标记为 **受限验证**，Task 10 的最终验收则为
+**BLOCKED**：离线解码、渲染和 package staging
 均有直接证据，但 Apple High Performance 未完成本轮真机认证、RTP、FFmpeg、当前
 generation 精确 present 与 Ready 闭环；Apple Standard 的独立尝试终止于
 `apple_connection_failed`；RDP 没有独立真实 Windows server。本记录不把任一缺口由
@@ -17,7 +18,7 @@ generation 精确 present 与 Ready 闭环；Apple Standard 的独立尝试终�
 | 产品选择 | runtime identity | encoding profile | 本轮结论 |
 |---|---|---|---|
 | Apple Standard/MVS | `apple-hpss-mvs` | `AppleTcpMvs` | 独立尝试，未到首帧/Ready；不得由 HP 或历史 MVS 证据替代 |
-| Apple High Performance | `apple-high-performance` | `AppleUdpMedia` | 独立选择，未到网络认证；不得自动回退 Standard/MVS |
+| Apple High Performance | `apple-high-performance` | `AppleUdpMedia` | environment-provider auto-connect 已发起真实会话，稳定终止于 `apple_high_performance_unavailable`；不得自动回退 Standard/MVS |
 | RDP | 独立 RDP identity | RDP adapter | 离线回归通过；无真实 Windows server，未真机验证 |
 
 产品 Ready 与输入开放仍只接受已 admission 的 current-generation surface 的精确
@@ -35,6 +36,26 @@ upload 或 redraw 单独都不构成 Ready。
 - FFmpeg package contract：FFmpeg `8.1.2`、libavcodec major `62`、固定
   `codecs/ffmpeg-8.1.2/windows-x86_64`；staged manifest 同时含 build provenance hash
   与 corresponding-source asset hash。
+
+以上非敏感构建身份由下列命令直接取得；命令输出未写入生成物或提交：
+
+```powershell
+[Environment]::OSVersion.Version.ToString()
+rustc --version
+cargo --version
+cargo run -p frd-video-capabilities -- --json
+$exe = Get-Item -LiteralPath target/release/freeremotedesk-windows.exe
+$exe.Length
+Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName
+$manifest = Get-Content -Raw target/package-task10/ffmpeg-manifest.json | ConvertFrom-Json
+$manifest | Select-Object ffmpegVersion,libavcodecMajor,codecDirectory,buildProvenanceSha256,correspondingSource,files
+Get-ChildItem -File target/package-task10/codecs/ffmpeg-8.1.2/windows-x86_64 |
+  Get-FileHash -Algorithm SHA256
+```
+
+GPU adapter/profile 取自上述 capability probe 的 JSON，而非通用设备枚举；DX12 backend
+取自本记录后述 GPU readback 测试输出。Release build 的“通过”由精确 build 命令与 exit `0`
+支持；未保留可审计的 stopwatch artifact，因此不再保留一次性构建耗时数值。
 
 ## 编译与核心回归
 
@@ -67,7 +88,7 @@ cargo build --release -p freeremotedesk-windows
 | `frd-shell-desktop` | 130 passed；测试刻意触发并捕获 decoder boundary panic，无失败 |
 | `frd-protocol-apple` | 422 passed、9 ignored；auth 4、session 1 passed |
 | `frd-protocol-rdp` | 110 passed |
-| Windows Release GUI | build passed，56.30 s |
+| Windows Release GUI | build passed；未保留 stopwatch artifact，不报告一次性耗时 |
 
 未观察到本变更引入的新 warning。编译与测试只证明静态/离线门禁，不证明真机互操作。
 
@@ -148,6 +169,9 @@ DLL shadow、未批准 runtime DLL、current-directory shadow、staged byte tamp
 `freeremotedesk_ffmpeg.dll`；manifest、LGPL、notice、固定 build provenance 与对应源码 hash
 均存在。
 
+manifest 身份与 hash 的读取命令见“环境与构建身份”；独立 verifier 会重新计算 staged bytes
+并与 manifest 比较，而不是只检查字段存在。`target/package-task10` 是本地生成目录，未提交。
+
 这是可验证的 binary staging directory，不是 MSI/MSIX，也不是 system-owned install ACL
 正向证明。GitHub-hosted workflow 本轮未执行。
 
@@ -181,10 +205,22 @@ Standard end-to-end 成功，所以 README 不提升 Standard 状态。
 ## Apple High Performance 真机
 
 High Performance 以独立 `apple-high-performance` / `AppleUdpMedia` 产品选择在全新 GUI
-PID 中显式选择。协议身份切换按设计清除了 Standard profile 的已加载 secret。为了不在
-argv、日志或报告暴露目标/凭据，自动化只尝试本地 GUI 的保密字段注入；Windows UI
-automation 无法可靠写入 egui 密码字段，表单保持 `password_required`，因此本轮没有真正
-发起 HP 网络会话。精确证据边界为：
+PID 中通过 CLI auto-connect 发起。私有 PowerShell wrapper 在单一进程内从 gitignored
+凭据源读取地址、用户名和密码，只把用户名/密码设置到子进程 environment，地址参数也只由
+运行时变量构造；命令、输出、artifact 与本文均不含目标身份或 credential material。CLI
+使用 environment username/password provider 与 `--connect`，没有 GUI 密码注入，也没有
+Standard/MVS fallback。
+
+```powershell
+pwsh -NoProfile -File target/task10-private-hp.ps1
+```
+
+wrapper 先确认无既有 GUI，再启动一个精确 PID；真实 auto-connect 稳定显示
+`apple_high_performance_unavailable`。当前 typed product error 同时覆盖严格 SRP offer/加密
+门禁与确认期内未取得可接受 virtual-display ServerState 等 fail-closed 分支，生产 UI 没有再
+公开更窄子阶段，因此本文不把它臆测成认证成功或某一个 ServerState 分支。捕获时 metrics CSV
+为 0 event rows、0 `PhaseBoundary`、0 `Presentation`、0 process samples；随后只关闭该记录 PID，
+确认退出、process environment 清空且 GUI 进程为 0。精确证据边界为：
 
 - 未证明本轮 HP 认证；
 - 未证明 authenticated RTP；
@@ -204,8 +240,10 @@ automation 无法可靠写入 egui 密码字段，表单保持 `password_require
 
 ## 60 秒性能预算
 
-本轮没有满足“真实 HP current-generation frame 持续 present”的会话，因此没有启动一个
-会被误解为 HP 性能证明的 60 秒窗口。现有 frame metrics sink 能观察通用 frame batch、
+本轮真实 HP auto-connect 没有满足“current-generation exact present/Ready 且持续更新”，
+因此 `tools/run-frame-metrics.ps1` 未进入由 `FramePresented(FullBaseline)` 启动的
+`VisibleWarmup`，也没有运行会被误解为 HP 性能证明的 60 秒窗口。根据 Task 10 条件门禁，
+这使最终验收为 **BLOCKED**；不以 idle GUI 数值代替。现有 frame metrics sink 能观察通用 frame batch、
 mailbox age、process CPU、working set、frame response 与 input-to-next-present，但没有生产字段
 直接记录下列 Task 10 指标：
 
@@ -251,7 +289,8 @@ pattern 类，Task 10 新文档与报告的同组安全扫描为 0。由于不�
   package staging；不是 Apple HP live-first-frame。
 - Windows package：**受限验证**，仅 staging/verifier，不是 installer/CI release。
 - Apple Standard/MVS：**开发中**，本轮独立 live attempt 未通过。
-- Apple High Performance：**开发中**，本轮未发起到认证；Ready 闭环未证明。
+- Apple High Performance：**开发中**，本轮真实 environment-provider auto-connect 稳定返回
+  `apple_high_performance_unavailable`；更窄内部阶段未公开，Ready 闭环未证明。
 - RDP：**开发中**，无真实 Windows server。
 - 其他客户端平台 native backend：**计划中**。
 
