@@ -43,6 +43,19 @@ pub(crate) enum HighPerformanceDiagnostic {
     ConfirmationCommitWriteClosed,
     PendingControlBudget,
     NamedSrpSelected,
+    SrpStep1Written,
+    SrpChallengeAccepted,
+    SrpProofComputed,
+    SrpStep2Written,
+    SrpResponseAccepted,
+    SrpAuthenticated,
+    ClientInitWritten,
+    ServerInitAccepted,
+    EncryptionRequestWritten,
+    EncryptionInfoAccepted,
+    EncryptionActivated,
+    RuntimeHandoff,
+    AuthenticationFailed,
     SetDisplayWritten {
         server_init_width: u16,
         server_init_height: u16,
@@ -74,6 +87,19 @@ impl HighPerformanceDiagnostic {
             Self::ConfirmationCommitWriteClosed => "hp08_confirmation_commit_write_closed",
             Self::PendingControlBudget => "hp09_pending_control_budget",
             Self::NamedSrpSelected => "hp00_named_srp_selected",
+            Self::SrpStep1Written => "hp00_srp_step1_written",
+            Self::SrpChallengeAccepted => "hp00_srp_challenge_accepted",
+            Self::SrpProofComputed => "hp00_srp_proof_computed",
+            Self::SrpStep2Written => "hp00_srp_step2_written",
+            Self::SrpResponseAccepted => "hp00_srp_response_accepted",
+            Self::SrpAuthenticated => "hp00_srp_authenticated",
+            Self::ClientInitWritten => "hp00_client_init_written",
+            Self::ServerInitAccepted => "hp00_server_init_accepted",
+            Self::EncryptionRequestWritten => "hp00_encryption_request_written",
+            Self::EncryptionInfoAccepted => "hp00_encryption_info_accepted",
+            Self::EncryptionActivated => "hp00_encryption_activated",
+            Self::RuntimeHandoff => "hp00_runtime_handoff",
+            Self::AuthenticationFailed => "hp10_authentication_failed",
             Self::SetDisplayWritten { .. } => "hp00_set_display_written",
             Self::ServerStateAccepted { .. } => "hp00_server_state_accepted",
         }
@@ -124,7 +150,45 @@ impl fmt::Display for HighPerformanceDiagnostic {
             | Self::ConfirmationMalformed
             | Self::ConfirmationCommitWriteClosed
             | Self::PendingControlBudget
-            | Self::NamedSrpSelected => Ok(()),
+            | Self::NamedSrpSelected
+            | Self::SrpStep1Written
+            | Self::SrpChallengeAccepted
+            | Self::SrpProofComputed
+            | Self::SrpStep2Written
+            | Self::SrpResponseAccepted
+            | Self::SrpAuthenticated
+            | Self::ClientInitWritten
+            | Self::ServerInitAccepted
+            | Self::EncryptionRequestWritten
+            | Self::EncryptionInfoAccepted
+            | Self::EncryptionActivated
+            | Self::RuntimeHandoff
+            | Self::AuthenticationFailed => Ok(()),
+        }
+    }
+}
+
+pub(crate) struct HighPerformanceStageObserver<'a> {
+    sink: Option<&'a mut dyn FnMut(HighPerformanceDiagnostic)>,
+}
+
+impl<'a> HighPerformanceStageObserver<'a> {
+    pub(crate) fn for_protocol(
+        protocol_id: &frd_core::ProtocolId,
+        sink: &'a mut dyn FnMut(HighPerformanceDiagnostic),
+    ) -> Self {
+        Self {
+            sink: (protocol_id == &frd_core::ProtocolId::apple_high_performance()).then_some(sink),
+        }
+    }
+
+    pub(crate) const fn disabled() -> Self {
+        Self { sink: None }
+    }
+
+    pub(crate) fn observe(&mut self, diagnostic: HighPerformanceDiagnostic) {
+        if let Some(sink) = self.sink.as_mut() {
+            sink(diagnostic);
         }
     }
 }
@@ -429,6 +493,58 @@ mod tests {
             (
                 HighPerformanceDiagnostic::SecurityOfferReceived,
                 "hp00_security_offer_received",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpStep1Written,
+                "hp00_srp_step1_written",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpChallengeAccepted,
+                "hp00_srp_challenge_accepted",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpProofComputed,
+                "hp00_srp_proof_computed",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpStep2Written,
+                "hp00_srp_step2_written",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpResponseAccepted,
+                "hp00_srp_response_accepted",
+            ),
+            (
+                HighPerformanceDiagnostic::SrpAuthenticated,
+                "hp00_srp_authenticated",
+            ),
+            (
+                HighPerformanceDiagnostic::ClientInitWritten,
+                "hp00_client_init_written",
+            ),
+            (
+                HighPerformanceDiagnostic::ServerInitAccepted,
+                "hp00_server_init_accepted",
+            ),
+            (
+                HighPerformanceDiagnostic::EncryptionRequestWritten,
+                "hp00_encryption_request_written",
+            ),
+            (
+                HighPerformanceDiagnostic::EncryptionInfoAccepted,
+                "hp00_encryption_info_accepted",
+            ),
+            (
+                HighPerformanceDiagnostic::EncryptionActivated,
+                "hp00_encryption_activated",
+            ),
+            (
+                HighPerformanceDiagnostic::RuntimeHandoff,
+                "hp00_runtime_handoff",
+            ),
+            (
+                HighPerformanceDiagnostic::AuthenticationFailed,
+                "hp10_authentication_failed",
             ),
         ] {
             assert_eq!(

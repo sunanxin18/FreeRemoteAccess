@@ -14,7 +14,9 @@ use frd_wire_rfb::{
 
 use crate::auth::{select_apple_security_type_parts, APPLE_CREDENTIALS_REQUIRED};
 use crate::connection::AppleConnection;
-use crate::high_performance::{HighPerformanceDiagnostic, APPLE_HIGH_PERFORMANCE_UNAVAILABLE};
+use crate::high_performance::{
+    HighPerformanceDiagnostic, HighPerformanceStageObserver, APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
+};
 use crate::protocol::{self, security};
 use crate::session::{self, SessionEncodingProfile};
 use crate::{ard, rsa_srp, srp};
@@ -29,29 +31,6 @@ const PRODUCT_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
 const HIGH_PERFORMANCE_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
     SessionEncodingProfile::AppleUdpMedia;
 
-struct HighPerformanceStageObserver<'a> {
-    enabled: bool,
-    sink: &'a mut dyn FnMut(HighPerformanceDiagnostic),
-}
-
-impl<'a> HighPerformanceStageObserver<'a> {
-    fn for_protocol(
-        protocol_id: &frd_core::ProtocolId,
-        sink: &'a mut dyn FnMut(HighPerformanceDiagnostic),
-    ) -> Self {
-        Self {
-            enabled: protocol_id == &frd_core::ProtocolId::apple_high_performance(),
-            sink,
-        }
-    }
-
-    fn observe(&mut self, diagnostic: HighPerformanceDiagnostic) {
-        if self.enabled {
-            (self.sink)(diagnostic);
-        }
-    }
-}
-
 fn product_error(protocol_id: frd_core::ProtocolId, code: &'static str) -> ProtocolError {
     ProtocolError::adapter(protocol_id, code)
 }
@@ -60,23 +39,26 @@ fn select_product_high_performance_security(
     offered: &[u8],
     credentials: &Credentials,
 ) -> Result<u8, ProtocolError> {
-    select_product_high_performance_security_for(
+    let mut observer = HighPerformanceStageObserver::disabled();
+    select_product_high_performance_security_for_with_observer(
         frd_core::ProtocolId::apple_hpss_mvs(),
         offered,
         credentials,
+        &mut observer,
     )
 }
 
-fn select_product_high_performance_security_for(
+fn select_product_high_performance_security_for_with_observer(
     protocol_id: frd_core::ProtocolId,
     offered: &[u8],
     credentials: &Credentials,
+    observer: &mut HighPerformanceStageObserver<'_>,
 ) -> Result<u8, ProtocolError> {
     if credentials.username.is_empty() || credentials.password.expose().is_empty() {
         return Err(product_error(protocol_id, APPLE_CREDENTIALS_REQUIRED));
     }
     let diagnostic = diagnostic_for_product_high_performance_security_offer(offered);
-    diagnostic.emit();
+    observer.observe(diagnostic);
     if diagnostic == HighPerformanceDiagnostic::NamedSrpSelected {
         Ok(security::APPLE_SRP)
     } else {
@@ -272,11 +254,20 @@ impl ProtocolSession for AppleProtocolSession {
         {
             return ProtocolExit::Failed(error);
         }
-        match connect_authenticated_for_profile(&self.request, self.encoding_profile) {
+        let mut sink = |diagnostic: HighPerformanceDiagnostic| diagnostic.emit();
+        let mut observer =
+            HighPerformanceStageObserver::for_protocol(&self.request.protocol_id, &mut sink);
+        match connect_authenticated_for_profile_with_observer(
+            &self.request,
+            self.encoding_profile,
+            &mut observer,
+        ) {
             Ok(established) => {
                 // Authentication is complete; do not retain the credential
                 // buffer for the long-running HPSS/MVS session.
                 self.request.credentials.take();
+                observer.observe(HighPerformanceDiagnostic::RuntimeHandoff);
+                drop(observer);
                 crate::runtime::run_authenticated_session(
                     established,
                     self.runtime,
@@ -296,6 +287,7 @@ fn connect_authenticated(
     connect_authenticated_for_profile(request, PRODUCT_SESSION_ENCODING_PROFILE)
 }
 
+#[cfg(test)]
 fn connect_authenticated_for_profile(
     request: &ConnectRequest,
     encoding_profile: SessionEncodingProfile,
@@ -326,37 +318,71 @@ fn connect_authenticated_for_profile_with_observer(
         .credentials
         .as_ref()
         .ok_or_else(|| product_error(protocol_id.clone(), APPLE_CREDENTIALS_REQUIRED))?;
-    select_product_high_performance_security_for(protocol_id.clone(), &offered, credentials)?;
-    let password = std::str::from_utf8(credentials.password.expose())
-        .map_err(|_| product_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED))?;
-    let authenticated = authenticate_negotiated(
+    select_product_high_performance_security_for_with_observer(
+        protocol_id.clone(),
+        &offered,
+        credentials,
+        observer,
+    )?;
+    let password = std::str::from_utf8(credentials.password.expose()).map_err(|_| {
+        observer.observe(HighPerformanceDiagnostic::AuthenticationFailed);
+        product_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED)
+    })?;
+    let authenticated = authenticate_negotiated_with_observer(
         connection,
         version,
         offered,
         &credentials.username,
         password,
+        observer,
     )
-    .map_err(|error| error.into_protocol_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED))?;
-    finish_product_authenticated_session(authenticated, encoding_profile, protocol_id)
+    .map_err(|error| {
+        observer.observe(HighPerformanceDiagnostic::AuthenticationFailed);
+        error.into_protocol_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED)
+    })?;
+    finish_product_authenticated_session_with_observer(
+        authenticated,
+        encoding_profile,
+        protocol_id,
+        observer,
+    )
 }
 
+#[cfg(test)]
 fn finish_product_authenticated_session(
     authenticated: AppleAuthenticated,
     profile: SessionEncodingProfile,
     protocol_id: frd_core::ProtocolId,
 ) -> Result<EstablishedAppleSession, ProtocolError> {
+    let mut observer = HighPerformanceStageObserver::disabled();
+    finish_product_authenticated_session_with_observer(
+        authenticated,
+        profile,
+        protocol_id,
+        &mut observer,
+    )
+}
+
+fn finish_product_authenticated_session_with_observer(
+    authenticated: AppleAuthenticated,
+    profile: SessionEncodingProfile,
+    protocol_id: frd_core::ProtocolId,
+    observer: &mut HighPerformanceStageObserver<'_>,
+) -> Result<EstablishedAppleSession, ProtocolError> {
     if authenticated.security_type != security::APPLE_SRP || authenticated.srp_key.is_none() {
-        HighPerformanceDiagnostic::EncryptionInvariant.emit();
+        observer.observe(HighPerformanceDiagnostic::EncryptionInvariant);
         return Err(product_error(
             protocol_id,
             APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
         ));
     }
-    let established = finish_authenticated_session(authenticated, profile).map_err(|error| {
-        error.into_protocol_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED)
-    })?;
+    let established = finish_authenticated_session_with_observer(authenticated, profile, observer)
+        .map_err(|error| {
+            observer.observe(HighPerformanceDiagnostic::AuthenticationFailed);
+            error.into_protocol_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED)
+        })?;
     if !established.connection.is_encrypted() {
-        HighPerformanceDiagnostic::EncryptionInvariant.emit();
+        observer.observe(HighPerformanceDiagnostic::EncryptionInvariant);
         return Err(product_error(
             protocol_id,
             APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
@@ -577,6 +603,7 @@ mod product_profile_tests {
                 crate::high_performance::HighPerformanceDiagnostic::TcpConnected,
                 crate::high_performance::HighPerformanceDiagnostic::RfbBannerAccepted,
                 crate::high_performance::HighPerformanceDiagnostic::SecurityOfferReceived,
+                crate::high_performance::HighPerformanceDiagnostic::NamedSrpNotOffered,
             ]
         );
     }
@@ -601,6 +628,153 @@ mod product_profile_tests {
             crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
         );
         assert!(stages.is_empty());
+    }
+
+    #[test]
+    fn explicit_high_performance_authentication_return_emits_terminal_marker() {
+        let (stages, error) = run_preoffer_route(
+            SessionEncodingProfile::AppleUdpMedia,
+            frd_core::ProtocolId::apple_high_performance(),
+            |mut stream| {
+                stream.write_all(b"RFB 003.008\n").unwrap();
+                let mut echoed_banner = [0_u8; 12];
+                stream.read_exact(&mut echoed_banner).unwrap();
+                stream
+                    .write_all(&[1, crate::protocol::security::APPLE_SRP])
+                    .unwrap();
+                let mut selection_and_step1_prefix = [0_u8; 6];
+                stream.read_exact(&mut selection_and_step1_prefix).unwrap();
+                assert_eq!(
+                    selection_and_step1_prefix[0],
+                    crate::protocol::security::APPLE_SRP
+                );
+                assert_eq!(
+                    selection_and_step1_prefix[1],
+                    crate::protocol::security::APPLE_SRP
+                );
+            },
+        );
+
+        assert_eq!(error.code(), "apple_authentication_failed");
+        assert_eq!(
+            stages,
+            [
+                crate::high_performance::HighPerformanceDiagnostic::TcpConnected,
+                crate::high_performance::HighPerformanceDiagnostic::RfbBannerAccepted,
+                crate::high_performance::HighPerformanceDiagnostic::SecurityOfferReceived,
+                crate::high_performance::HighPerformanceDiagnostic::NamedSrpSelected,
+                crate::high_performance::HighPerformanceDiagnostic::SrpStep1Written,
+                crate::high_performance::HighPerformanceDiagnostic::AuthenticationFailed,
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_high_performance_invalid_password_text_emits_terminal_marker() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"RFB 003.008\n").unwrap();
+            let mut echoed_banner = [0_u8; 12];
+            stream.read_exact(&mut echoed_banner).unwrap();
+            stream
+                .write_all(&[1, crate::protocol::security::APPLE_SRP])
+                .unwrap();
+        });
+
+        let protocol_id = frd_core::ProtocolId::apple_high_performance();
+        let mut request = request(address, protocol_id.clone());
+        let mut invalid_password = frd_core::SecretBuffer::new(vec![0xff]);
+        request.credentials.as_mut().unwrap().password = invalid_password.take();
+        let mut stages = Vec::new();
+        let mut sink = |stage| stages.push(stage);
+        let mut observer =
+            super::HighPerformanceStageObserver::for_protocol(&protocol_id, &mut sink);
+
+        let error = match super::connect_authenticated_for_profile_with_observer(
+            &request,
+            SessionEncodingProfile::AppleUdpMedia,
+            &mut observer,
+        ) {
+            Ok(_) => panic!("invalid password text must fail authentication"),
+            Err(error) => error,
+        };
+        drop(observer);
+        server.join().unwrap();
+
+        assert_eq!(error.code(), "apple_authentication_failed");
+        assert_eq!(
+            stages,
+            [
+                crate::high_performance::HighPerformanceDiagnostic::TcpConnected,
+                crate::high_performance::HighPerformanceDiagnostic::RfbBannerAccepted,
+                crate::high_performance::HighPerformanceDiagnostic::SecurityOfferReceived,
+                crate::high_performance::HighPerformanceDiagnostic::NamedSrpSelected,
+                crate::high_performance::HighPerformanceDiagnostic::AuthenticationFailed,
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_high_performance_finalization_routes_session_boundaries_in_order() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut client_init = [0u8; 1];
+            stream.read_exact(&mut client_init).unwrap();
+            assert_eq!(
+                client_init,
+                [crate::protocol::apple_session::ENCRYPTED_SESSION_CLIENT_INIT]
+            );
+
+            let mut server_init = vec![0x00, 0x02, 0x00, 0x02];
+            server_init
+                .extend_from_slice(&[32, 24, 0, 1, 0, 0xff, 0, 0xff, 0, 0xff, 16, 8, 0, 0, 0, 0]);
+            server_init.extend_from_slice(&0u32.to_be_bytes());
+            stream.write_all(&server_init).unwrap();
+
+            let mut session_requests = vec![0u8; 66 + 24];
+            stream.read_exact(&mut session_requests).unwrap();
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+        let authenticated = super::AppleAuthenticated {
+            connection: crate::AppleConnection::new(stream),
+            security_type: crate::protocol::security::APPLE_SRP,
+            srp_key: Some([0xabu8; 64]),
+        };
+        let protocol_id = frd_core::ProtocolId::apple_high_performance();
+        let mut stages = Vec::new();
+        let mut sink = |stage| stages.push(stage);
+        let mut observer = crate::high_performance::HighPerformanceStageObserver::for_protocol(
+            &protocol_id,
+            &mut sink,
+        );
+
+        let error = match super::finish_product_authenticated_session_with_observer(
+            authenticated,
+            SessionEncodingProfile::AppleUdpMedia,
+            protocol_id,
+            &mut observer,
+        ) {
+            Ok(_) => panic!("withheld EncryptionInfo must fail finalization"),
+            Err(error) => error,
+        };
+        drop(observer);
+        server.join().unwrap();
+
+        assert_eq!(error.code(), "apple_authentication_failed");
+        assert_eq!(
+            stages,
+            [
+                crate::high_performance::HighPerformanceDiagnostic::ClientInitWritten,
+                crate::high_performance::HighPerformanceDiagnostic::ServerInitAccepted,
+                crate::high_performance::HighPerformanceDiagnostic::EncryptionRequestWritten,
+                crate::high_performance::HighPerformanceDiagnostic::AuthenticationFailed,
+            ]
+        );
     }
 
     #[test]
@@ -815,11 +989,30 @@ fn read_reason(connection: &mut AppleConnection) -> Result<()> {
 }
 
 pub fn authenticate_negotiated(
+    connection: AppleConnection,
+    version: (u8, u8),
+    offered: impl AsRef<[u8]>,
+    username: &str,
+    password: &str,
+) -> Result<AppleAuthenticated, AppleHandshakeError> {
+    let mut observer = HighPerformanceStageObserver::disabled();
+    authenticate_negotiated_with_observer(
+        connection,
+        version,
+        offered,
+        username,
+        password,
+        &mut observer,
+    )
+}
+
+fn authenticate_negotiated_with_observer(
     mut connection: AppleConnection,
     version: (u8, u8),
     offered: impl AsRef<[u8]>,
     username: &str,
     password: &str,
+    observer: &mut HighPerformanceStageObserver<'_>,
 ) -> Result<AppleAuthenticated, AppleHandshakeError> {
     let security_type =
         select_apple_security_type_parts(offered.as_ref(), username, password.as_bytes())
@@ -841,7 +1034,7 @@ pub fn authenticate_negotiated(
             None
         }
         security::APPLE_SRP => Some(
-            srp::authenticate(&mut connection, username, password)
+            srp::authenticate_with_observer(&mut connection, username, password, observer)
                 .map_err(AppleHandshakeError::transport)?,
         ),
         _ => unreachable!("严格 Apple selector 只返回已实现类型"),
@@ -858,6 +1051,15 @@ pub fn finish_authenticated_session(
     authenticated: AppleAuthenticated,
     profile: SessionEncodingProfile,
 ) -> Result<EstablishedAppleSession, AppleHandshakeError> {
+    let mut observer = HighPerformanceStageObserver::disabled();
+    finish_authenticated_session_with_observer(authenticated, profile, &mut observer)
+}
+
+fn finish_authenticated_session_with_observer(
+    authenticated: AppleAuthenticated,
+    profile: SessionEncodingProfile,
+    observer: &mut HighPerformanceStageObserver<'_>,
+) -> Result<EstablishedAppleSession, AppleHandshakeError> {
     let AppleAuthenticated {
         mut connection,
         security_type,
@@ -872,6 +1074,7 @@ pub fn finish_authenticated_session(
             protocol::apple_session::SHARED_CLIENT_INIT
         }])
         .map_err(AppleHandshakeError::transport)?;
+    observer.observe(HighPerformanceDiagnostic::ClientInitWritten);
     let header = connection
         .read_vec(SERVER_INIT_HEADER_BYTES)
         .map_err(AppleHandshakeError::transport)?;
@@ -883,11 +1086,17 @@ pub fn finish_authenticated_session(
             .map_err(AppleHandshakeError::transport)?,
     );
     let server_init = decode_server_init(&server_init).map_err(AppleHandshakeError::transport)?;
+    observer.observe(HighPerformanceDiagnostic::ServerInitAccepted);
     connection.set_read_timeout(None).ok();
 
     if let Some(srp_key) = srp_key {
-        let crypto = session::establish_with_table(&mut connection, &srp_key, profile)
-            .map_err(AppleHandshakeError::transport)?;
+        let crypto = session::establish_with_table_with_observer(
+            &mut connection,
+            &srp_key,
+            profile,
+            observer,
+        )
+        .map_err(AppleHandshakeError::transport)?;
         connection
             .set_crypto(crypto)
             .map_err(AppleHandshakeError::transport)?;

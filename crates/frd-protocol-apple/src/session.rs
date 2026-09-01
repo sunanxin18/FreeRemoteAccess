@@ -406,11 +406,22 @@ pub fn establish_with_table(
     srp_key: &[u8; 64],
     encoding_profile: SessionEncodingProfile,
 ) -> Result<SessionCrypto> {
+    let mut observer = crate::high_performance::HighPerformanceStageObserver::disabled();
+    establish_with_table_with_observer(conn, srp_key, encoding_profile, &mut observer)
+}
+
+pub(crate) fn establish_with_table_with_observer(
+    conn: &mut AppleConnection,
+    srp_key: &[u8; 64],
+    encoding_profile: SessionEncodingProfile,
+    observer: &mut crate::high_performance::HighPerformanceStageObserver<'_>,
+) -> Result<SessionCrypto> {
     let initial_key = SessionCrypto::initial_key(srp_key);
 
     // 1) SelectSession + cmd=1(AES) —— 服务器随即明文下发 52B EncryptionInfo
     conn.write_all(&build_select_session()?)?;
     conn.write_all(&build_set_encryption(encoding_profile)?)?;
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::EncryptionRequestWritten);
 
     // 服务器随即明文回 52B EncryptionInfo；异常时打印首字节辅助定位
     let info = match conn.read_vec(ENCRYPTION_INFO_LEN) {
@@ -421,11 +432,13 @@ pub fn establish_with_table(
     };
     let (counter, crypto) = SessionCrypto::parse_encryption_info(&initial_key, &info)
         .context("解析服务器 EncryptionInfo 失败")?;
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::EncryptionInfoAccepted);
 
     // 2) 激活加密流；此后双向全部为加密帧。
     //    cmd=2 后需稍等服务器完成会话状态迁移（3→4）并吐出初始突发，
     //    过早发送应用层帧会被服务器直接断连（实测 <600ms 必断）
     conn.write_all(&build_encryption_activation()?)?;
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::EncryptionActivated);
     let _ = counter; // 服务器侧计数器（实测恒为 1），帧计数独立从 0 起
     std::thread::sleep(std::time::Duration::from_millis(600));
     Ok(crypto)
@@ -434,6 +447,9 @@ pub fn establish_with_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     // 下列字节序列来自实施前的已验证生产报文快照；它们是独立的 Candidate 线缆证据，
     // 不得由生产 builder、常量或辅助函数生成。
@@ -538,6 +554,74 @@ mod tests {
             build_encryption_activation().unwrap(),
             ENCRYPTION_ACTIVATION_FIXTURE
         );
+    }
+
+    #[test]
+    fn encryption_session_routes_success_markers_and_disabled_observer_is_neutral() {
+        fn run(
+            protocol_id: frd_core::ProtocolId,
+        ) -> Vec<crate::high_performance::HighPerformanceDiagnostic> {
+            let srp_key = [0xabu8; 64];
+            let initial_key = SessionCrypto::initial_key(&srp_key);
+            let mut encryption_info = ENCRYPTION_INFO_HDR.to_vec();
+            encryption_info.extend_from_slice(&1u32.to_be_bytes());
+            encryption_info.extend_from_slice(&ecb_enc(&initial_key, &[0x11; 16]));
+            encryption_info.extend_from_slice(&ecb_enc(&initial_key, &[0x22; 16]));
+            assert_eq!(encryption_info.len(), ENCRYPTION_INFO_LEN);
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = vec![
+                    0u8;
+                    SESSION_SELECT_FIXTURE.len()
+                        + AES_APPLE_UDP_MEDIA_NEGOTIATION_FIXTURE.len()
+                ];
+                stream.read_exact(&mut request).unwrap();
+                assert_eq!(
+                    &request[..SESSION_SELECT_FIXTURE.len()],
+                    SESSION_SELECT_FIXTURE
+                );
+                assert_eq!(
+                    &request[SESSION_SELECT_FIXTURE.len()..],
+                    AES_APPLE_UDP_MEDIA_NEGOTIATION_FIXTURE
+                );
+                stream.write_all(&encryption_info).unwrap();
+                let mut activation = [0u8; ENCRYPTION_ACTIVATION_FIXTURE.len()];
+                stream.read_exact(&mut activation).unwrap();
+                assert_eq!(activation, ENCRYPTION_ACTIVATION_FIXTURE);
+            });
+
+            let stream = TcpStream::connect(address).unwrap();
+            let mut connection = AppleConnection::new(stream);
+            let mut stages = Vec::new();
+            let mut sink = |stage| stages.push(stage);
+            let mut observer = crate::high_performance::HighPerformanceStageObserver::for_protocol(
+                &protocol_id,
+                &mut sink,
+            );
+            establish_with_table_with_observer(
+                &mut connection,
+                &srp_key,
+                SessionEncodingProfile::AppleUdpMedia,
+                &mut observer,
+            )
+            .unwrap();
+            drop(observer);
+            server.join().unwrap();
+            stages
+        }
+
+        assert_eq!(
+            run(frd_core::ProtocolId::apple_high_performance()),
+            [
+                crate::high_performance::HighPerformanceDiagnostic::EncryptionRequestWritten,
+                crate::high_performance::HighPerformanceDiagnostic::EncryptionInfoAccepted,
+                crate::high_performance::HighPerformanceDiagnostic::EncryptionActivated,
+            ]
+        );
+        assert!(run(frd_core::ProtocolId::apple_hpss_mvs()).is_empty());
     }
 
     #[test]

@@ -455,6 +455,16 @@ pub fn authenticate(
     username: &str,
     password: &str,
 ) -> Result<[u8; APPLE_SRP_PROOF_BYTES]> {
+    let mut observer = crate::high_performance::HighPerformanceStageObserver::disabled();
+    authenticate_with_observer(conn, username, password, &mut observer)
+}
+
+pub(crate) fn authenticate_with_observer(
+    conn: &mut AppleConnection,
+    username: &str,
+    password: &str,
+    observer: &mut crate::high_performance::HighPerformanceStageObserver<'_>,
+) -> Result<[u8; APPLE_SRP_PROOF_BYTES]> {
     // step1：[36][u32][TLV]；用户名在第二个 %s 字段（服务器用它查 OD 记录）
     let payload = initial_auth_payload(username)?;
     let outer_length = checked_u32_frame_length(payload.len(), "SRP step1 外层帧")?;
@@ -470,6 +480,7 @@ pub fn authenticate(
     step1.extend_from_slice(&outer_length);
     step1.extend_from_slice(&payload);
     conn.write_all(&step1)?;
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpStep1Written);
 
     // 挑战：[u32 L][u32 L-4][项…]
     let total = usize::try_from(conn.read_u32()?).context("SRP 挑战长度无法表示为 usize")?;
@@ -480,11 +491,13 @@ pub fn authenticate(
     let challenge_items = parse_srp_challenge_frame(&body)?;
     let chal =
         parse_challenge(challenge_items).context("SRP 挑战解析失败（服务器版本可能不兼容）")?;
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpChallengeAccepted);
 
     // SRP 数学
     let mut rnd = [0u8; 64];
     getrandom::getrandom(&mut rnd).map_err(|e| anyhow::anyhow!("系统随机数失败: {e}"))?;
     let (pub_a, m1, key) = srp_compute(&chal, password, rnd)?;
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpProofComputed);
 
     // step2：state 9 的消息不带 [36] 前缀；M1 紧跟 A，选项串原样回传，末尾 16B nonce
     let mut nonce = [0u8; APPLE_SRP_NONCE_BYTES];
@@ -496,6 +509,7 @@ pub fn authenticate(
     builder.push_sized_u8(&nonce)?;
     let step2 = prepend_u32_frame_length(builder.finish()?, "SRP step2 外层帧")?;
     conn.write_all(&step2)?;
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpStep2Written);
 
     // 响应：成功 = [u32 92][u32 88][0x40][64B H_AMK][23B]，失败直接是 u32 1
     let first = conn.read_u32()?;
@@ -514,11 +528,13 @@ pub fn authenticate(
         // 能走到这一步说明 M1 已被服务器接受，H_AMK 不一致只可能是中间人
         bail!("SRP 服务器证明校验失败（疑似中间人攻击）");
     }
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpResponseAccepted);
 
     // RFB SecurityResult
     if conn.read_u32()? != protocol::RFB_SECURITY_RESULT_OK {
         bail!("SRP 认证被服务器拒绝（SecurityResult != 0）");
     }
+    observer.observe(crate::high_performance::HighPerformanceDiagnostic::SrpAuthenticated);
     Ok(key)
 }
 
@@ -814,7 +830,25 @@ mod tests {
 
         let stream = std::net::TcpStream::connect(addr).unwrap();
         let mut conn = AppleConnection::new(stream);
-        authenticate(&mut conn, user, pass).unwrap();
+        let mut stages = Vec::new();
+        let mut sink = |stage| stages.push(stage);
+        let mut observer = crate::high_performance::HighPerformanceStageObserver::for_protocol(
+            &frd_core::ProtocolId::apple_high_performance(),
+            &mut sink,
+        );
+        authenticate_with_observer(&mut conn, user, pass, &mut observer).unwrap();
+        drop(observer);
         server.join().unwrap();
+        assert_eq!(
+            stages,
+            [
+                crate::high_performance::HighPerformanceDiagnostic::SrpStep1Written,
+                crate::high_performance::HighPerformanceDiagnostic::SrpChallengeAccepted,
+                crate::high_performance::HighPerformanceDiagnostic::SrpProofComputed,
+                crate::high_performance::HighPerformanceDiagnostic::SrpStep2Written,
+                crate::high_performance::HighPerformanceDiagnostic::SrpResponseAccepted,
+                crate::high_performance::HighPerformanceDiagnostic::SrpAuthenticated,
+            ]
+        );
     }
 }
