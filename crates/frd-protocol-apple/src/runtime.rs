@@ -37,7 +37,7 @@ fn startup_display_size(
     server_init: DisplaySize,
 ) -> DisplaySize {
     if protocol_id == &frd_core::ProtocolId::apple_high_performance()
-        && server_init.height <= server_init.width
+        && server_init.width > server_init.height
     {
         // Current-target ARD transcript: a landscape ServerInit precedes the
         // 1440x2560 virtual-display request. This is product-identity scoped,
@@ -1004,6 +1004,19 @@ mod tests {
                 0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x07, 0x80,
             ],
             [0x03, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x07, 0x80],
+        );
+    }
+
+    #[test]
+    fn high_performance_square_server_init_preserves_existing_geometry() {
+        assert_startup_geometry(
+            frd_core::PixelSize::new(1200, 1200).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            [
+                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x04, 0xb0,
+            ],
+            [0x03, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x04, 0xb0],
         );
     }
 
