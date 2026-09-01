@@ -1,7 +1,7 @@
 use crate::{
     VideoBackendAvailability, VideoBackendDiagnostic, VideoBackendId, VideoBackendKind,
-    VideoDecodeError, VideoDecodeErrorCode, VideoDecodeQuery, VideoDecodeSupport,
-    VideoDecoderFactory,
+    VideoDecodeError, VideoDecodeErrorCode, VideoDecodeQuery, VideoDecodeSupport, VideoDecoder,
+    VideoDecoderFactory, VideoStreamConfig,
 };
 
 pub struct VideoDecoderRegistry {
@@ -17,6 +17,61 @@ impl VideoDecoderRegistry {
         &self,
         query: &VideoDecodeQuery,
     ) -> Result<VideoDecoderSelection, VideoDecodeError> {
+        let (diagnostics, mut candidates) = self.evaluate(query);
+        candidates.sort_by_key(|candidate| (candidate.tier, candidate.registration_index));
+        let Some(candidate) = candidates.into_iter().next() else {
+            return Err(VideoDecodeError::with_diagnostics(
+                VideoDecodeErrorCode::BackendUnavailable,
+                diagnostics,
+            ));
+        };
+
+        Ok(VideoDecoderSelection {
+            backend_id: candidate.backend_id,
+            support: candidate.support,
+            diagnostics,
+        })
+    }
+
+    /// 按精确 tier 选择并创建同一个工厂的 decoder；创建成功后不再尝试其他候选。
+    pub fn select_and_create(
+        &self,
+        query: &VideoDecodeQuery,
+        config: &VideoStreamConfig,
+    ) -> Result<CreatedVideoDecoder, VideoDecodeError> {
+        let (diagnostics, mut candidates) = self.evaluate(query);
+        candidates.sort_by_key(|candidate| (candidate.tier, candidate.registration_index));
+        if candidates.is_empty() {
+            return Err(VideoDecodeError::with_diagnostics(
+                VideoDecodeErrorCode::BackendUnavailable,
+                diagnostics,
+            ));
+        }
+
+        for candidate in candidates {
+            let factory = &self.factories[candidate.registration_index];
+            if let Ok(decoder) = factory.create(config) {
+                return Ok(CreatedVideoDecoder {
+                    selection: VideoDecoderSelection {
+                        backend_id: candidate.backend_id,
+                        support: candidate.support,
+                        diagnostics,
+                    },
+                    decoder,
+                });
+            }
+        }
+
+        Err(VideoDecodeError::with_diagnostics(
+            VideoDecodeErrorCode::DecoderCreationFailed,
+            diagnostics,
+        ))
+    }
+
+    fn evaluate(
+        &self,
+        query: &VideoDecodeQuery,
+    ) -> (Box<[VideoBackendDiagnostic]>, Vec<SelectionCandidate>) {
         let mut diagnostics = Vec::with_capacity(self.factories.len());
         let mut candidates = Vec::new();
 
@@ -34,28 +89,25 @@ impl VideoDecoderRegistry {
 
             if availability == VideoBackendAvailability::DecoderReady {
                 if let Some(tier) = selection_tier(kind, &support, query) {
-                    candidates.push((tier, registration_index, backend_id, support));
+                    candidates.push(SelectionCandidate {
+                        tier,
+                        registration_index,
+                        backend_id,
+                        support,
+                    });
                 }
             }
         }
 
-        let diagnostics = diagnostics.into_boxed_slice();
-        let Some((_, _, backend_id, support)) = candidates
-            .into_iter()
-            .min_by_key(|(tier, registration_index, _, _)| (*tier, *registration_index))
-        else {
-            return Err(VideoDecodeError::with_diagnostics(
-                VideoDecodeErrorCode::BackendUnavailable,
-                diagnostics,
-            ));
-        };
-
-        Ok(VideoDecoderSelection {
-            backend_id,
-            support,
-            diagnostics,
-        })
+        (diagnostics.into_boxed_slice(), candidates)
     }
+}
+
+struct SelectionCandidate {
+    tier: u8,
+    registration_index: usize,
+    backend_id: VideoBackendId,
+    support: VideoDecodeSupport,
 }
 
 /// 注册顺序只用于相同 tier 的稳定决胜；不得依赖枚举或发现顺序。
@@ -92,15 +144,37 @@ pub struct VideoDecoderSelection {
     pub diagnostics: Box<[VideoBackendDiagnostic]>,
 }
 
+pub struct CreatedVideoDecoder {
+    selection: VideoDecoderSelection,
+    decoder: Box<dyn VideoDecoder>,
+}
+
+impl CreatedVideoDecoder {
+    pub fn selection(&self) -> &VideoDecoderSelection {
+        &self.selection
+    }
+
+    pub fn into_parts(self) -> (VideoDecoderSelection, Box<dyn VideoDecoder>) {
+        (self.selection, self.decoder)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use frd_core::PixelSize;
 
     use crate::{
-        ChromaFormat, VideoBackendAvailability, VideoBackendId, VideoBackendKind,
-        VideoDecodeCapability, VideoDecodeErrorCode, VideoDecodeQuery, VideoDecodeSupport,
-        VideoDecoder, VideoDecoderFactory, VideoDecoderRegistry, VideoPixelFormat, VideoProfile,
-        VideoUnsupportedReason,
+        ChromaFormat, ChromaLocation, DecodeOutcome, EncodedVideoAccessUnit,
+        VideoBackendAvailability, VideoBackendId, VideoBackendKind, VideoBitstreamFormat,
+        VideoCodec, VideoColorimetry, VideoDecodeCapability, VideoDecodeError,
+        VideoDecodeErrorCode, VideoDecodeQuery, VideoDecodeSupport, VideoDecoder,
+        VideoDecoderFactory, VideoDecoderRegistry, VideoParameterSets, VideoPixelFormat,
+        VideoProfile, VideoRange, VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity,
+        VideoTimeBase, VideoUnsupportedReason,
     };
 
     #[test]
@@ -294,6 +368,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registry_create_falls_through_only_after_an_exact_candidate_fails_creation() {
+        let first_creates = Arc::new(AtomicUsize::new(0));
+        let second_creates = Arc::new(AtomicUsize::new(0));
+        let second_submits = Arc::new(AtomicUsize::new(0));
+        let registry = VideoDecoderRegistry::new(vec![
+            creating_factory(
+                "duplicate-id",
+                first_creates.clone(),
+                Err(VideoDecodeErrorCode::DecoderCreationFailed),
+            ),
+            creating_factory(
+                "duplicate-id",
+                second_creates.clone(),
+                Ok(second_submits.clone()),
+            ),
+        ]);
+
+        let config = main444_config();
+        let created = registry
+            .select_and_create(&main444_query(), &config)
+            .expect("首个精确候选创建失败后应尝试同 tier 的下一个工厂");
+        let (selection, mut decoder) = created.into_parts();
+        let error = decoder
+            .submit(test_access_unit(&config))
+            .expect_err("第二个同 id 工厂创建的 decoder 应被原子返回并被调用");
+
+        assert_eq!(selection.backend_id.as_str(), "duplicate-id");
+        assert_eq!(
+            error.code(),
+            VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame
+        );
+        assert_eq!(selection.diagnostics.len(), 2);
+        assert_eq!(first_creates.load(Ordering::Acquire), 1);
+        assert_eq!(second_creates.load(Ordering::Acquire), 1);
+        assert_eq!(second_submits.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn registry_does_not_create_lower_candidates_after_the_selected_decoder_exists() {
+        let first_creates = Arc::new(AtomicUsize::new(0));
+        let second_creates = Arc::new(AtomicUsize::new(0));
+        let first_submits = Arc::new(AtomicUsize::new(0));
+        let registry = VideoDecoderRegistry::new(vec![
+            creating_factory("first", first_creates.clone(), Ok(first_submits.clone())),
+            creating_factory(
+                "second",
+                second_creates.clone(),
+                Ok(Arc::new(AtomicUsize::new(0))),
+            ),
+        ]);
+
+        let config = main444_config();
+        let created = registry
+            .select_and_create(&main444_query(), &config)
+            .expect("首个精确候选应创建成功");
+        let (_, mut decoder) = created.into_parts();
+        let error = decoder
+            .submit(test_access_unit(&config))
+            .expect_err("测试 decoder 在 AU 开始后失败");
+
+        assert_eq!(
+            error.code(),
+            VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame
+        );
+        assert_eq!(first_creates.load(Ordering::Acquire), 1);
+        assert_eq!(first_submits.load(Ordering::Acquire), 1);
+        assert_eq!(second_creates.load(Ordering::Acquire), 0);
+    }
+
     fn main444_query() -> VideoDecodeQuery {
         VideoDecodeQuery {
             codec: crate::VideoCodec::Hevc,
@@ -304,6 +448,54 @@ mod tests {
             frame_rate: None,
             preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
         }
+    }
+
+    fn main444_config() -> VideoStreamConfig {
+        VideoStreamConfig::try_new(VideoStreamConfigInput {
+            identity: VideoStreamIdentity {
+                session_id: frd_core::SessionId::allocate(),
+                stream_id: 7,
+            },
+            generation: 3,
+            codec: VideoCodec::Hevc,
+            profile: VideoProfile::HevcMain4448,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1920, 1080).expect("测试尺寸有效"),
+            visible_rect: frd_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            time_base: VideoTimeBase::try_new(90_000).expect("测试 timebase 有效"),
+            bitstream_format: VideoBitstreamFormat::AnnexB,
+            colorimetry: VideoColorimetry::Bt709,
+            range: VideoRange::Limited,
+            chroma_location: ChromaLocation::Left,
+            parameter_sets: VideoParameterSets::try_new(
+                Some(vec![0x40].into_boxed_slice()),
+                vec![0x42].into_boxed_slice(),
+                vec![0x44].into_boxed_slice(),
+            )
+            .expect("测试参数集有效"),
+        })
+        .expect("测试配置有效")
+    }
+
+    fn test_access_unit(config: &VideoStreamConfig) -> EncodedVideoAccessUnit {
+        let input = config.as_input();
+        EncodedVideoAccessUnit::try_new(
+            input.identity,
+            input.generation,
+            crate::VideoTimestamp {
+                ticks: 1,
+                timescale: NonZeroU32::new(90_000).expect("测试 timebase 非零"),
+            },
+            true,
+            vec![0, 0, 0, 1, 0x26].into_boxed_slice(),
+        )
+        .expect("测试 AU 有效")
     }
 
     fn hevc_main10_capability(backend_id: &str) -> VideoDecodeCapability {
@@ -377,6 +569,77 @@ mod tests {
             _config: &crate::VideoStreamConfig,
         ) -> Result<Box<dyn VideoDecoder>, crate::VideoDecodeError> {
             unreachable!("registry 测试只查询能力，不创建 decoder")
+        }
+    }
+
+    fn creating_factory(
+        backend_id: &str,
+        create_count: Arc<AtomicUsize>,
+        outcome: Result<Arc<AtomicUsize>, VideoDecodeErrorCode>,
+    ) -> Box<dyn VideoDecoderFactory> {
+        Box::new(CreatingFactory {
+            backend_id: VideoBackendId::new(backend_id),
+            create_count,
+            outcome,
+        })
+    }
+
+    struct CreatingFactory {
+        backend_id: VideoBackendId,
+        create_count: Arc<AtomicUsize>,
+        outcome: Result<Arc<AtomicUsize>, VideoDecodeErrorCode>,
+    }
+
+    impl crate::VideoCapabilityProvider for CreatingFactory {
+        fn backend_id(&self) -> VideoBackendId {
+            self.backend_id.clone()
+        }
+
+        fn backend_kind(&self) -> VideoBackendKind {
+            VideoBackendKind::Ffmpeg
+        }
+
+        fn availability(&self) -> VideoBackendAvailability {
+            VideoBackendAvailability::DecoderReady
+        }
+
+        fn query(&self, _query: &VideoDecodeQuery) -> VideoDecodeSupport {
+            VideoDecodeSupport::SoftwareExact(main444_capability(self.backend_id.as_str()))
+        }
+    }
+
+    impl VideoDecoderFactory for CreatingFactory {
+        fn create(
+            &self,
+            _config: &VideoStreamConfig,
+        ) -> Result<Box<dyn VideoDecoder>, VideoDecodeError> {
+            self.create_count.fetch_add(1, Ordering::AcqRel);
+            match &self.outcome {
+                Ok(submit_count) => Ok(Box::new(SubmitFailureDecoder(submit_count.clone()))),
+                Err(code) => Err(VideoDecodeError::new(*code)),
+            }
+        }
+    }
+
+    struct SubmitFailureDecoder(Arc<AtomicUsize>);
+
+    impl VideoDecoder for SubmitFailureDecoder {
+        fn submit(
+            &mut self,
+            _access_unit: EncodedVideoAccessUnit,
+        ) -> Result<DecodeOutcome, VideoDecodeError> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Err(VideoDecodeError::new(
+                VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
+            ))
+        }
+
+        fn flush(&mut self) -> Result<Box<[crate::DecodedVideoFrame]>, VideoDecodeError> {
+            Ok(Box::default())
+        }
+
+        fn reset(&mut self, _generation: u64) -> Result<(), VideoDecodeError> {
+            Ok(())
         }
     }
 }

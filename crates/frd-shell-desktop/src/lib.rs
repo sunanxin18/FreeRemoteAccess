@@ -8,6 +8,7 @@ mod lifecycle;
 mod platform;
 mod repaint;
 mod ui_fonts;
+mod video_decode_worker;
 mod window_chrome;
 
 pub use application::{
@@ -19,6 +20,10 @@ pub use cleanup::{BackgroundCleanupFailure, BackgroundCleanupOutcome};
 pub use fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 pub use input::{InputGate, InputOwnership, InputRouter};
 pub use lifecycle::PresentationOperation;
+pub use video_decode_worker::{
+    VideoDecodeSender, VideoDecoderDiagnostics, VideoWorkerEvent, VideoWorkerEvents,
+    VideoWorkerSendError,
+};
 pub use window_chrome::{
     ChromeHit, ChromeHitRegions, ChromeLayout, ChromeRect, NativeChromeInsets, WindowChromeAction,
     WindowChromeAdapter, WindowChromeError, TITLE_BAR_HEIGHT_POINTS,

@@ -61,6 +61,9 @@ use crate::lifecycle::{
 use crate::platform::PlatformWindowChrome;
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::ui_fonts::system_font_definitions;
+use crate::video_decode_worker::{
+    VideoDecodeSender, VideoDecodeWorker, VideoWorkerEvent, VideoWorkerEvents,
+};
 use crate::{
     ChromeHit, ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter,
     WindowChromeAdapter, TITLE_BAR_HEIGHT_POINTS,
@@ -192,14 +195,44 @@ impl RuntimeWake for SharedWake {
     }
 }
 
-struct AudioMediaPublisher(mpsc::SyncSender<MediaFrame>);
+struct DesktopMediaPublisher {
+    audio: mpsc::SyncSender<MediaFrame>,
+    video: VideoDecodeSender,
+}
 
-impl MediaPublisher for AudioMediaPublisher {
+impl DesktopMediaPublisher {
+    fn new(audio: mpsc::SyncSender<MediaFrame>, video: VideoDecodeSender) -> Self {
+        Self { audio, video }
+    }
+}
+
+impl MediaPublisher for DesktopMediaPublisher {
     fn publish(&self, frame: MediaFrame) -> Result<(), MediaPublishError> {
-        self.0.try_send(frame).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => MediaPublishError::Full,
-            mpsc::TrySendError::Disconnected(_) => MediaPublishError::Closed,
-        })
+        match frame {
+            frame @ MediaFrame::Pcm { .. } => {
+                self.audio.try_send(frame).map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => MediaPublishError::Full,
+                    mpsc::TrySendError::Disconnected(_) => MediaPublishError::Closed,
+                })
+            }
+            MediaFrame::VideoConfig(config) => self
+                .video
+                .try_send_config(config)
+                .map_err(map_video_publish_error),
+            MediaFrame::EncodedVideo(access_unit) => self
+                .video
+                .try_send_access_unit(access_unit)
+                .map_err(map_video_publish_error),
+        }
+    }
+}
+
+fn map_video_publish_error(
+    error: crate::video_decode_worker::VideoWorkerSendError,
+) -> MediaPublishError {
+    match error {
+        crate::video_decode_worker::VideoWorkerSendError::Full => MediaPublishError::Full,
+        crate::video_decode_worker::VideoWorkerSendError::Closed => MediaPublishError::Closed,
     }
 }
 
@@ -277,6 +310,7 @@ struct PendingLiveSessionPorts {
     commands: mpsc::Sender<SessionCommand>,
     events: mpsc::Receiver<SessionEvent>,
     mailbox: Arc<Mutex<FrameMailbox>>,
+    video_events: VideoWorkerEvents,
 }
 
 struct LiveSessionPorts {
@@ -284,6 +318,7 @@ struct LiveSessionPorts {
     commands: mpsc::Sender<SessionCommand>,
     events: mpsc::Receiver<SessionEvent>,
     mailbox: Arc<Mutex<FrameMailbox>>,
+    video_events: VideoWorkerEvents,
     frame_compiler: FrameTransactionCompiler,
 }
 
@@ -294,6 +329,7 @@ impl PendingLiveSessionPorts {
             commands: self.commands,
             events: self.events,
             mailbox: self.mailbox,
+            video_events: self.video_events,
             frame_compiler: FrameTransactionCompiler::new(self.session_id),
         }
     }
@@ -314,6 +350,7 @@ struct LiveSessionCleanup {
     commands: Option<mpsc::Sender<SessionCommand>>,
     protocol_worker: Option<JoinHandle<()>>,
     audio_worker: Option<JoinHandle<()>>,
+    video_worker: Option<VideoDecodeWorker>,
     mailbox: Option<Arc<Mutex<FrameMailbox>>>,
 }
 
@@ -327,13 +364,23 @@ impl CleanupOperations for LiveSessionCleanup {
 
     fn shutdown_writer(&mut self) -> Result<(), CleanupError> {
         drop(self.commands.take());
+        if let Some(worker) = &self.video_worker {
+            worker.request_stop();
+        }
         Ok(())
     }
 
     fn join_workers_and_audio(&mut self) -> Result<(), CleanupError> {
         let (protocol_pending, protocol_panicked) = poll_worker(&mut self.protocol_worker);
         let (audio_pending, audio_panicked) = poll_worker(&mut self.audio_worker);
-        if protocol_pending || audio_pending || protocol_panicked || audio_panicked {
+        let (video_pending, video_panicked) = poll_video_worker(&mut self.video_worker);
+        if protocol_pending
+            || audio_pending
+            || video_pending
+            || protocol_panicked
+            || audio_panicked
+            || video_panicked
+        {
             Err(CleanupError::JoinWorkersAndAudio)
         } else {
             Ok(())
@@ -362,6 +409,23 @@ fn poll_worker(worker: &mut Option<JoinHandle<()>>) -> (bool, bool) {
         .join()
         .is_err();
     (false, panicked)
+}
+
+fn poll_video_worker(worker: &mut Option<VideoDecodeWorker>) -> (bool, bool) {
+    let Some(video) = worker.as_mut() else {
+        return (false, false);
+    };
+    match video.poll_join() {
+        Ok(false) => (true, false),
+        Ok(true) => {
+            worker.take();
+            (false, false)
+        }
+        Err(_) => {
+            worker.take();
+            (false, true)
+        }
+    }
 }
 
 pub struct SessionHost {
@@ -589,6 +653,32 @@ impl SessionHost {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn drain_video_worker_events(&mut self) -> Vec<(SessionId, VideoWorkerEvent)> {
+        let Some(active) = self.active.as_ref() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        while let Some(event) = active.video_events.try_recv() {
+            events.push((active.session_id, event));
+        }
+        events
+    }
+
+    pub fn confirm_video_presented(&self, generation: u64) -> Result<(), SessionHostError> {
+        self.active
+            .as_ref()
+            .ok_or(SessionHostError::NoActiveSession)?
+            .video_events
+            .confirm_presented(generation)
+            .map_err(|_| SessionHostError::CommandClosed)
+    }
+
+    pub fn video_is_ready(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.video_events.is_ready())
     }
 
     pub fn drain_frame_updates(&mut self) -> Vec<SurfaceUpdate> {
@@ -883,49 +973,68 @@ fn launch_live_session(
         FRAME_MAILBOX_ENTRY_LIMIT,
         FRAME_MAILBOX_PIXEL_LIMIT,
     )));
+    let video_wake = wake.clone();
+    let video_worker = VideoDecodeWorker::spawn(Arc::new(move || {
+        let _ = video_wake.wake();
+    }))
+    .map_err(|_| ProtocolError::Terminal)?;
+    let video_sender = video_worker.sender();
+    let video_events = video_worker.events();
     let (media_tx, media_rx) = mpsc::sync_channel(MEDIA_MAILBOX_ENTRY_LIMIT);
     let runtime = ProtocolRuntime::new(
         session_id,
         command_rx,
         Box::new(ChannelEventSink(event_tx.clone())),
         Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
-        Some(Box::new(AudioMediaPublisher(media_tx))),
+        Some(Box::new(DesktopMediaPublisher::new(media_tx, video_sender))),
         Box::new(SharedWake(wake.clone())),
     );
-    let session = factory.create(request, runtime)?;
+    let session = match factory.create(request, runtime) {
+        Ok(session) => session,
+        Err(error) => {
+            stop_unpublished_video_worker(video_worker);
+            return Err(error);
+        }
+    };
     if cancelled.load(Ordering::Acquire) {
+        stop_unpublished_video_worker(video_worker);
         return Err(ProtocolError::Terminal);
     }
 
     let (audio_start_tx, audio_start_rx) = mpsc::channel();
     let audio_events = event_tx.clone();
     let audio_wake = wake.clone();
-    let audio_worker = worker_spawner
-        .spawn(
-            WorkerKind::Audio,
-            format!("frd-audio-{}", session_id.get()),
-            Box::new(move || {
-                if audio_start_rx.recv().is_err() {
-                    return;
-                }
-                let degraded = match catch_unwind(AssertUnwindSafe(|| {
-                    run_audio_worker(audio_factory, media_rx)
-                })) {
-                    Ok(AudioWorkerExit::Closed) => false,
-                    Ok(AudioWorkerExit::Failed) | Err(_) => true,
-                };
-                if degraded {
-                    let _ = audio_events.send(SessionEvent::AudioState(
-                        frd_protocol_api::AudioState::Failed,
-                    ));
-                    let _ = audio_wake.wake();
-                }
-            }),
-        )
-        .map_err(|_| ProtocolError::Terminal)?;
+    let audio_worker = match worker_spawner.spawn(
+        WorkerKind::Audio,
+        format!("frd-audio-{}", session_id.get()),
+        Box::new(move || {
+            if audio_start_rx.recv().is_err() {
+                return;
+            }
+            let degraded = match catch_unwind(AssertUnwindSafe(|| {
+                drain_audio_media(audio_factory, media_rx)
+            })) {
+                Ok(AudioWorkerExit::Closed) => false,
+                Ok(AudioWorkerExit::Failed) | Err(_) => true,
+            };
+            if degraded {
+                let _ = audio_events.send(SessionEvent::AudioState(
+                    frd_protocol_api::AudioState::Failed,
+                ));
+                let _ = audio_wake.wake();
+            }
+        }),
+    ) {
+        Ok(worker) => worker,
+        Err(_) => {
+            stop_unpublished_video_worker(video_worker);
+            return Err(ProtocolError::Terminal);
+        }
+    };
     if cancelled.load(Ordering::Acquire) {
         drop(audio_start_tx);
         let _ = audio_worker.join();
+        stop_unpublished_video_worker(video_worker);
         return Err(ProtocolError::Terminal);
     }
     let (start_barrier, protocol_start_waiter) = ProtocolStartBarrier::new();
@@ -950,6 +1059,7 @@ fn launch_live_session(
             // The audio start barrier is then aborted, so no platform open can run.
             drop(audio_start_tx);
             let _ = audio_worker.join();
+            stop_unpublished_video_worker(video_worker);
             return Err(ProtocolError::Terminal);
         }
     };
@@ -960,6 +1070,7 @@ fn launch_live_session(
             commands: Some(command_tx.clone()),
             protocol_worker: Some(protocol_worker),
             audio_worker: Some(audio_worker),
+            video_worker: Some(video_worker),
             mailbox: Some(mailbox.clone()),
         },
         PendingLiveSessionPorts {
@@ -967,9 +1078,15 @@ fn launch_live_session(
             commands: command_tx,
             events: event_rx,
             mailbox,
+            video_events,
         },
         start_barrier,
     ))
+}
+
+fn stop_unpublished_video_worker(worker: VideoDecodeWorker) {
+    worker.request_stop();
+    let _ = worker.join_timeout(std::time::Duration::from_secs(1));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -978,7 +1095,7 @@ enum AudioWorkerExit {
     Failed,
 }
 
-fn run_audio_worker(
+fn drain_audio_media(
     factory: Arc<dyn AudioOutputFactory>,
     media: mpsc::Receiver<MediaFrame>,
 ) -> AudioWorkerExit {
@@ -3685,7 +3802,10 @@ mod tests {
         FrameTransactionError, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
     };
     use frd_media_api::{
-        AudioOutput, AudioOutputError, EncodedVideoAccessUnit, MediaFrame, VideoStreamIdentity,
+        AudioOutput, AudioOutputError, ChromaFormat, ChromaLocation, EncodedVideoAccessUnit,
+        MediaFrame, MediaPublisher, VideoBitstreamFormat, VideoCodec, VideoColorimetry,
+        VideoDecodeError, VideoDecodeErrorCode, VideoParameterSets, VideoProfile, VideoRange,
+        VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity, VideoTimeBase,
         VideoTimestamp,
     };
     use frd_platform_api::{PlatformCapabilities, PlatformError, ServerIdentityStore};
@@ -3851,6 +3971,7 @@ mod tests {
                 commands,
                 events,
                 mailbox,
+                video_events: crate::video_decode_worker::VideoWorkerEvents::new(None),
             }
             .accept(),
         );
@@ -5329,7 +5450,7 @@ mod tests {
         let video_only_factory: Arc<dyn AudioOutputFactory> =
             Arc::new(CountingAudioFactory(video_only_opens.clone()));
         let video_only_worker =
-            std::thread::spawn(move || super::run_audio_worker(video_only_factory, video_only_rx));
+            std::thread::spawn(move || super::drain_audio_media(video_only_factory, video_only_rx));
         video_only_tx
             .send(MediaFrame::EncodedVideo(test_video_access_unit(1, 0xaa)))
             .unwrap();
@@ -5352,7 +5473,7 @@ mod tests {
             pcm_frames: pcm_frames.clone(),
         });
         let video_then_pcm_worker = std::thread::spawn(move || {
-            super::run_audio_worker(video_then_pcm_factory, video_then_pcm_rx)
+            super::drain_audio_media(video_then_pcm_factory, video_then_pcm_rx)
         });
         video_then_pcm_tx
             .send(MediaFrame::EncodedVideo(test_video_access_unit(2, 0xbb)))
@@ -5377,6 +5498,122 @@ mod tests {
         );
         assert_eq!(video_then_pcm_opens.load(Ordering::Acquire), 1);
         assert_eq!(*pcm_frames.lock().unwrap(), vec![vec![7_i16, -8_i16]]);
+    }
+
+    #[test]
+    fn audio_drain_remains_independent_while_video_backend_load_is_blocked() {
+        let (load_entered_tx, load_entered_rx) = mpsc::channel();
+        let (release_load_tx, release_load_rx) = mpsc::channel();
+        let video_worker =
+            crate::video_decode_worker::VideoDecodeWorker::spawn_with_registry_loader(Box::new(
+                move || {
+                    load_entered_tx.send(()).unwrap();
+                    release_load_rx.recv().unwrap();
+                    Err(VideoDecodeError::new(
+                        VideoDecodeErrorCode::BackendUnavailable,
+                    ))
+                },
+            ))
+            .expect("测试 video worker 应启动");
+        let (audio_tx, audio_rx) = mpsc::sync_channel(4);
+        let publisher = super::DesktopMediaPublisher::new(audio_tx, video_worker.sender());
+        let pcm_frames = Arc::new(Mutex::new(Vec::new()));
+        let audio_factory: Arc<dyn AudioOutputFactory> = Arc::new(RecordingAudioFactory {
+            open_count: Arc::new(AtomicUsize::new(0)),
+            pcm_frames: pcm_frames.clone(),
+        });
+        let audio_worker =
+            std::thread::spawn(move || super::drain_audio_media(audio_factory, audio_rx));
+        let identity = VideoStreamIdentity {
+            session_id: SessionId::allocate(),
+            stream_id: 9,
+        };
+
+        publisher
+            .publish(MediaFrame::VideoConfig(test_video_config(identity, 1)))
+            .unwrap();
+        load_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("video loader 应进入阻塞点");
+        publisher
+            .publish(MediaFrame::EncodedVideo(test_video_access_unit_for(
+                identity, 1, 1, 0x26,
+            )))
+            .unwrap();
+        publisher
+            .publish(MediaFrame::Pcm {
+                sample_rate_hz: 48_000,
+                channels: 2,
+                samples: vec![3_i16, -4_i16].into_boxed_slice(),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pcm_frames.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "video loader 阻塞时 PCM 仍应独立 drain"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(*pcm_frames.lock().unwrap(), vec![vec![3_i16, -4_i16]]);
+
+        drop(publisher);
+        assert_eq!(audio_worker.join().unwrap(), super::AudioWorkerExit::Closed);
+        release_load_tx.send(()).unwrap();
+        video_worker.request_stop();
+        video_worker
+            .join_timeout(Duration::from_secs(1))
+            .expect("测试 video worker 应有界退出");
+    }
+
+    fn test_video_config(identity: VideoStreamIdentity, generation: u64) -> VideoStreamConfig {
+        VideoStreamConfig::try_new(VideoStreamConfigInput {
+            identity,
+            generation,
+            codec: VideoCodec::Hevc,
+            profile: VideoProfile::HevcMain4448,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: 8,
+            coded_size: frd_core::PixelSize::new(2, 2).unwrap(),
+            visible_rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            time_base: VideoTimeBase::try_new(90_000).unwrap(),
+            bitstream_format: VideoBitstreamFormat::AnnexB,
+            colorimetry: VideoColorimetry::Bt709,
+            range: VideoRange::Limited,
+            chroma_location: ChromaLocation::Left,
+            parameter_sets: VideoParameterSets::try_new(
+                Some(vec![0x40].into_boxed_slice()),
+                vec![0x42].into_boxed_slice(),
+                vec![0x44].into_boxed_slice(),
+            )
+            .unwrap(),
+        })
+        .unwrap()
+    }
+
+    fn test_video_access_unit_for(
+        identity: VideoStreamIdentity,
+        generation: u64,
+        ticks: u64,
+        byte: u8,
+    ) -> EncodedVideoAccessUnit {
+        EncodedVideoAccessUnit::try_new(
+            identity,
+            generation,
+            VideoTimestamp {
+                ticks,
+                timescale: NonZeroU32::new(90_000).unwrap(),
+            },
+            true,
+            vec![byte].into_boxed_slice(),
+        )
+        .unwrap()
     }
 
     fn test_video_access_unit(ticks: u64, byte: u8) -> EncodedVideoAccessUnit {

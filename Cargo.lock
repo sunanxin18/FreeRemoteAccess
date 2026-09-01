@@ -2017,6 +2017,7 @@ dependencies = [
  "frd-session",
  "frd-ui-egui",
  "frd-ui-model",
+ "frd-video-ffmpeg",
  "pollster",
  "wgpu",
  "windows-sys 0.59.0",

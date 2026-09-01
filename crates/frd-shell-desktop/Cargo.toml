@@ -12,6 +12,7 @@ frd-compositor-wgpu = { path = "../frd-compositor-wgpu" }
 frd-core = { path = "../frd-core" }
 frd-frame = { path = "../frd-frame" }
 frd-media-api = { path = "../frd-media-api" }
+frd-video-ffmpeg = { path = "../frd-video-ffmpeg" }
 frd-platform-api = { path = "../frd-platform-api" }
 frd-protocol-api = { path = "../frd-protocol-api" }
 frd-render-wgpu = { path = "../frd-render-wgpu" }
