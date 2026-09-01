@@ -1,7 +1,11 @@
 //! 协议和平台之间传递媒体数据的中立契约。
 
+pub mod decoder;
+pub mod registry;
 pub mod video;
 
+pub use decoder::*;
+pub use registry::*;
 pub use video::*;
 
 /// 可移动的协议无关媒体载荷。所有具体解码器和设备后端都在此边界之外。
