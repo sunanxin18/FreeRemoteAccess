@@ -21,7 +21,8 @@ use frd_frame::{
 };
 use frd_media_api::{
     AudioOutput, AudioOutputError, DecodedVideoFrame, MediaFrame, MediaPublishError,
-    MediaPublisher, VideoDecodeErrorCode, VideoStreamIdentity,
+    MediaPublisher, MediaStageDiagnostic, MediaStageTrace, VideoDecodeErrorCode,
+    VideoStreamIdentity,
 };
 use frd_protocol_api::{
     ConnectRequest, MailboxSurfacePublisher, ProtocolCatalog, ProtocolError, ProtocolExit,
@@ -1755,6 +1756,7 @@ struct DesktopWindowState {
     video_owner: Option<VideoStreamEpoch>,
     video: Option<VideoBinding>,
     pending_video: Option<(VideoPresentationReceipt, VideoFrameToken)>,
+    video_stage_trace: MediaStageTrace,
     dpi_transition: DpiTransition,
     pending_texture_writes: PendingTextureWrites,
     focus_session_chrome: bool,
@@ -1795,6 +1797,7 @@ impl VideoSurfaceDrainTarget for DesktopWindowState {
         self.video_renderer.detach();
         self.video = None;
         self.pending_video = None;
+        self.video_stage_trace = MediaStageTrace::default();
     }
 
     fn configure_video_stream(
@@ -1813,6 +1816,13 @@ impl VideoSurfaceDrainTarget for DesktopWindowState {
         frame: DecodedVideoFrame,
     ) -> Result<(), VideoRendererError> {
         let upload = self.video_renderer.upload_frame(frame)?;
+        self.video_stage_trace
+            .observe(MediaStageDiagnostic::FrameUploaded {
+                generation: token.generation(),
+                stream_id: token.identity().stream_id,
+                width: upload.layout.visible_size().width,
+                height: upload.layout.visible_size().height,
+            });
         self.video = Some(VideoBinding {
             identity: token.identity(),
             generation: token.generation(),
@@ -2351,6 +2361,7 @@ impl DesktopApplication {
             video_owner: None,
             video: None,
             pending_video: None,
+            video_stage_trace: MediaStageTrace::default(),
             dpi_transition: DpiTransition::default(),
             pending_texture_writes: PendingTextureWrites::default(),
             focus_session_chrome: false,

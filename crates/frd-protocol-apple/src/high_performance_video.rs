@@ -4,9 +4,10 @@ use std::num::NonZeroU32;
 
 use frd_core::{PixelRect, PixelSize};
 use frd_media_api::{
-    ChromaFormat, ChromaLocation, EncodedVideoAccessUnit, MediaFrame, VideoBitstreamFormat,
-    VideoCodec, VideoColorimetry, VideoParameterSets, VideoProfile, VideoRange, VideoStreamConfig,
-    VideoStreamConfigInput, VideoStreamIdentity, VideoTimeBase, VideoTimestamp,
+    ChromaFormat, ChromaLocation, EncodedVideoAccessUnit, MediaFrame, MediaStageDiagnostic,
+    MediaStageTrace, VideoBitstreamFormat, VideoCodec, VideoColorimetry, VideoParameterSets,
+    VideoProfile, VideoRange, VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity,
+    VideoTimeBase, VideoTimestamp,
 };
 use frd_protocol_api::ProtocolRuntime;
 
@@ -48,6 +49,7 @@ pub(crate) struct AppleHighPerformanceVideoAdapter {
     generation: u64,
     parameter_sets: [Option<Vec<u8>>; 3],
     configured_parameter_sets: Option<[Option<Vec<u8>>; 3]>,
+    stage_trace: MediaStageTrace,
 }
 
 impl AppleHighPerformanceVideoAdapter {
@@ -57,6 +59,7 @@ impl AppleHighPerformanceVideoAdapter {
             generation,
             parameter_sets: [None, None, None],
             configured_parameter_sets: None,
+            stage_trace: MediaStageTrace::default(),
         }
     }
 
@@ -64,6 +67,11 @@ impl AppleHighPerformanceVideoAdapter {
         self.generation = generation;
         self.parameter_sets = [None, None, None];
         self.configured_parameter_sets = None;
+        self.stage_trace = MediaStageTrace::default();
+    }
+
+    pub(crate) const fn stream_id(&self) -> u32 {
+        self.identity.stream_id
     }
 
     pub(crate) fn publish_access_unit(
@@ -100,6 +108,7 @@ impl AppleHighPerformanceVideoAdapter {
             }
         }
 
+        let mut published_config_size = None;
         if self.configured_parameter_sets.is_none() {
             let Some(sps_bytes) = next_parameter_sets[1].as_deref() else {
                 self.parameter_sets = next_parameter_sets;
@@ -122,6 +131,7 @@ impl AppleHighPerformanceVideoAdapter {
             .map_err(|_| AppleHighPerformanceVideoError::InvalidStreamConfig)?;
             let config =
                 build_video_config(self.identity, self.generation, sps, Some(parameter_sets))?;
+            published_config_size = Some(config.as_input().coded_size);
             runtime
                 .publish_media(MediaFrame::VideoConfig(config))
                 .map_err(|_| AppleHighPerformanceVideoError::MediaPublicationFailed)?;
@@ -145,7 +155,17 @@ impl AppleHighPerformanceVideoAdapter {
         .map_err(|_| AppleHighPerformanceVideoError::MalformedAccessUnit)?;
         runtime
             .publish_media(MediaFrame::EncodedVideo(access_unit))
-            .map_err(|_| AppleHighPerformanceVideoError::MediaPublicationFailed)
+            .map_err(|_| AppleHighPerformanceVideoError::MediaPublicationFailed)?;
+        if let Some(size) = published_config_size {
+            self.stage_trace
+                .observe(MediaStageDiagnostic::HevcAccessUnitPublished {
+                    generation: self.generation,
+                    stream_id: self.identity.stream_id,
+                    width: size.width,
+                    height: size.height,
+                });
+        }
+        Ok(())
     }
 }
 

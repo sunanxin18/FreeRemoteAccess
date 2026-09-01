@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use frd_core::SessionId;
-use frd_media_api::{MediaFrame, VideoStreamIdentity};
+use frd_media_api::{MediaFrame, MediaStageDiagnostic, MediaStageTrace, VideoStreamIdentity};
 use frd_protocol_api::{AudioState, ProtocolError, ProtocolRuntime, SessionEvent};
 
 use crate::audio_codec::{
@@ -50,11 +50,13 @@ pub(crate) struct ViewerMediaState {
     video_stream_1: VideoReceiveState,
     video_stream_2: VideoReceiveState,
     audio_degraded: bool,
+    control_stage_trace: MediaStageTrace,
 }
 
 struct VideoReceiveState {
     assembler: HevcAccessUnitAssembler,
     adapter: AppleHighPerformanceVideoAdapter,
+    stage_trace: MediaStageTrace,
 }
 
 impl VideoReceiveState {
@@ -63,12 +65,14 @@ impl VideoReceiveState {
             assembler: HevcAccessUnitAssembler::new(generation, HevcAccessUnitLimits::default())
                 .context("创建 Apple HP HEVC AU 组装器失败")?,
             adapter: AppleHighPerformanceVideoAdapter::new(identity, generation),
+            stage_trace: MediaStageTrace::default(),
         })
     }
 
     fn reset(&mut self, generation: u64) {
         self.assembler.reset(generation);
         self.adapter.reset(generation);
+        self.stage_trace = MediaStageTrace::default();
     }
 
     fn accept_rtp(
@@ -94,6 +98,11 @@ impl VideoReceiveState {
                 .publish_access_unit(runtime, access_unit)
                 .context("发布 Apple HP HEVC 访问单元失败")?;
         }
+        self.stage_trace
+            .observe(MediaStageDiagnostic::AuthenticatedVideoRtp {
+                generation,
+                stream_id: self.adapter.stream_id(),
+            });
         Ok(())
     }
 }
@@ -168,6 +177,7 @@ impl ViewerMediaState {
                 generation,
             )?,
             audio_degraded: false,
+            control_stage_trace: MediaStageTrace::default(),
         })
     }
 
@@ -177,6 +187,7 @@ impl ViewerMediaState {
         self.video_stream_1.reset(generation);
         self.video_stream_2.reset(generation);
         self.audio_degraded = false;
+        self.control_stage_trace = MediaStageTrace::default();
         Ok(())
     }
 
@@ -201,6 +212,8 @@ impl ViewerMediaState {
         let configuration = self.transport.prepare_configuration(generation)?;
         writer.send_private_message(&configuration)?;
         self.transport.mark_configuration_sent(generation)?;
+        self.control_stage_trace
+            .observe(MediaStageDiagnostic::Message1ConfigurationWritten { generation });
         Ok(())
     }
 
@@ -211,6 +224,8 @@ impl ViewerMediaState {
     ) -> Result<()> {
         self.transport.accept_answer(generation, answer)?;
         self.transport.activate(generation)?;
+        self.control_stage_trace
+            .observe(MediaStageDiagnostic::Message2TransportActive { generation });
         Ok(())
     }
 
@@ -236,6 +251,7 @@ impl ViewerMediaState {
             video_stream_1,
             video_stream_2,
             audio_degraded,
+            control_stage_trace: _,
         } = self;
         let summary = transport.drain_receive_round(generation, |role, datagram| {
             accept_datagram(

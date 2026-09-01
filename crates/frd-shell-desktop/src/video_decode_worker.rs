@@ -7,10 +7,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use frd_media_api::{
-    ChromaFormat, DecodeOutcome, DecodedVideoFrame, EncodedVideoAccessUnit, VideoDecodeError,
-    VideoDecodeErrorCode, VideoDecodeQuery, VideoDecoder, VideoDecoderRegistry,
-    VideoDecoderSelection, VideoPixelFormat, VideoStreamConfig, VideoStreamIdentity,
-    VideoTimestamp,
+    ChromaFormat, DecodeOutcome, DecodedVideoFrame, EncodedVideoAccessUnit, MediaDecoderBackend,
+    MediaDecoderMode, MediaStageDiagnostic, MediaStageTrace, MediaVideoOutput, VideoBackendKind,
+    VideoDecodeError, VideoDecodeErrorCode, VideoDecodeQuery, VideoDecodeSupport, VideoDecoder,
+    VideoDecoderRegistry, VideoDecoderSelection, VideoPixelFormat, VideoStreamConfig,
+    VideoStreamIdentity, VideoTimestamp,
 };
 
 pub const VIDEO_ACCESS_UNIT_ENTRY_LIMIT: usize = 64;
@@ -381,6 +382,7 @@ struct VideoEventState {
     admissions: VecDeque<VideoStreamAdmission>,
     controls: VecDeque<ControlPublication>,
     streams: HashMap<VideoStreamIdentity, StreamPresentationState>,
+    stage_traces: HashMap<(VideoStreamIdentity, u64), MediaStageTrace>,
     next_epoch: u64,
     next_sequence: u64,
 }
@@ -401,6 +403,7 @@ impl VideoWorkerEvents {
                     admissions: VecDeque::new(),
                     controls: VecDeque::new(),
                     streams: HashMap::new(),
+                    stage_traces: HashMap::new(),
                     next_epoch: 1,
                     next_sequence: 1,
                 }),
@@ -457,6 +460,16 @@ impl VideoWorkerEvents {
     }
 
     fn publish_selected(&self, epoch: StreamEpoch, diagnostics: VideoDecoderDiagnostics) {
+        let stage =
+            selected_decoder_stage(diagnostics.selection()).map(|(backend, mode, output)| {
+                MediaStageDiagnostic::DecoderSelected {
+                    generation: epoch.generation,
+                    stream_id: epoch.identity.stream_id,
+                    backend,
+                    mode,
+                    output,
+                }
+            });
         self.publish_epoch_control(
             epoch,
             VideoWorkerEvent::BackendSelected {
@@ -466,6 +479,9 @@ impl VideoWorkerEvents {
             },
             false,
         );
+        if let Some(stage) = stage {
+            self.observe_stage(epoch, stage);
+        }
     }
 
     fn publish_failure(
@@ -531,6 +547,8 @@ impl VideoWorkerEvents {
         if input.identity != epoch.identity || input.generation != epoch.generation {
             return;
         }
+        let timestamp = input.timestamp;
+        let coded_size = input.coded_size;
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().expect("video event mutex poisoned");
         if state
@@ -545,7 +563,7 @@ impl VideoWorkerEvents {
         let token = VideoFrameToken {
             identity: epoch.identity,
             generation: epoch.generation,
-            timestamp: input.timestamp,
+            timestamp,
             publication_id,
         };
         let stream = state
@@ -556,6 +574,16 @@ impl VideoWorkerEvents {
         stream.latest_frame = Some(frame);
         stream.latest_sequence = Some(publication_id);
         stream.delivered_token = None;
+        observe_stage_in_state(
+            &mut state,
+            epoch,
+            MediaStageDiagnostic::FrameDecoded {
+                generation: epoch.generation,
+                stream_id: epoch.identity.stream_id,
+                width: coded_size.width,
+                height: coded_size.height,
+            },
+        );
         wake.notify_all();
         drop(state);
         self.notify_wake();
@@ -651,22 +679,33 @@ impl VideoWorkerEvents {
 
     pub fn confirm_presented(&self, token: &VideoFrameToken) -> Result<(), VideoDecodeErrorCode> {
         let mut state = self.shared.0.lock().expect("video event mutex poisoned");
-        let Some(stream) = state.streams.get_mut(&token.identity) else {
-            return Err(VideoDecodeErrorCode::StaleStreamOrGeneration);
+        let epoch = {
+            let Some(stream) = state.streams.get_mut(&token.identity) else {
+                return Err(VideoDecodeErrorCode::StaleStreamOrGeneration);
+            };
+            if stream.epoch.generation != token.generation
+                || stream.latest_token != Some(*token)
+                || stream.delivered_token != Some(*token)
+            {
+                return Err(VideoDecodeErrorCode::StaleStreamOrGeneration);
+            }
+            if stream.terminal {
+                stream.latest_token = None;
+                stream.delivered_token = None;
+                stream.ready = false;
+            } else {
+                stream.ready = true;
+            }
+            stream.epoch
         };
-        if stream.epoch.generation != token.generation
-            || stream.latest_token != Some(*token)
-            || stream.delivered_token != Some(*token)
-        {
-            return Err(VideoDecodeErrorCode::StaleStreamOrGeneration);
-        }
-        if stream.terminal {
-            stream.latest_token = None;
-            stream.delivered_token = None;
-            stream.ready = false;
-        } else {
-            stream.ready = true;
-        }
+        observe_stage_in_state(
+            &mut state,
+            epoch,
+            MediaStageDiagnostic::FramePresented {
+                generation: epoch.generation,
+                stream_id: epoch.identity.stream_id,
+            },
+        );
         Ok(())
     }
 
@@ -722,6 +761,31 @@ impl VideoWorkerEvents {
             wake();
         }
     }
+
+    fn observe_stage(&self, epoch: StreamEpoch, diagnostic: MediaStageDiagnostic) {
+        let mut state = self.shared.0.lock().expect("video event mutex poisoned");
+        observe_stage_in_state(&mut state, epoch, diagnostic);
+    }
+}
+
+fn observe_stage_in_state(
+    state: &mut VideoEventState,
+    epoch: StreamEpoch,
+    diagnostic: MediaStageDiagnostic,
+) {
+    if state
+        .streams
+        .get(&epoch.identity)
+        .map(|stream| stream.epoch)
+        != Some(epoch)
+    {
+        return;
+    }
+    state
+        .stage_traces
+        .entry((epoch.identity, epoch.generation))
+        .or_default()
+        .observe(diagnostic);
 }
 
 fn accept_config_in_state(
@@ -739,6 +803,11 @@ fn accept_config_in_state(
         generation,
         serial,
     };
+    state
+        .stage_traces
+        .retain(|(old_identity, old_generation), _| {
+            *old_identity != identity || *old_generation == generation
+        });
     state
         .controls
         .retain(|control| control.epoch.is_none_or(|old| old.identity != identity));
@@ -846,8 +915,34 @@ fn pop_event(state: &mut VideoEventState) -> Option<VideoWorkerEvent> {
     let control = state.controls.pop_front()?;
     if control.event == VideoWorkerEvent::Stopped {
         state.streams.clear();
+        state.stage_traces.clear();
     }
     Some(control.event)
+}
+
+fn selected_decoder_stage(
+    selection: &VideoDecoderSelection,
+) -> Option<(MediaDecoderBackend, MediaDecoderMode, MediaVideoOutput)> {
+    let backend = selection
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.backend_id == selection.backend_id)
+        .map(|diagnostic| match diagnostic.kind {
+            VideoBackendKind::Native => MediaDecoderBackend::Native,
+            VideoBackendKind::Ffmpeg => MediaDecoderBackend::Ffmpeg,
+        })?;
+    let (mode, capability) = match &selection.support {
+        VideoDecodeSupport::HardwareExact(capability) => (MediaDecoderMode::Hardware, capability),
+        VideoDecodeSupport::SoftwareExact(capability) => (MediaDecoderMode::Software, capability),
+        VideoDecodeSupport::Unsupported(_) => return None,
+    };
+    let output = match capability.output_formats.first()? {
+        VideoPixelFormat::Yuv444P8 => MediaVideoOutput::Yuv444p8,
+        VideoPixelFormat::Nv12 => MediaVideoOutput::Nv12,
+        VideoPixelFormat::Yuv420P8 => MediaVideoOutput::Yuv420p8,
+        VideoPixelFormat::P010 => MediaVideoOutput::P010,
+    };
+    Some((backend, mode, output))
 }
 
 fn take_frame_from_state(
@@ -1571,6 +1666,23 @@ mod tests {
         assert_eq!(
             byte_queue.try_push_access_unit(test_au(7, 17, false, 1)),
             Err(VideoWorkerSendError::Full)
+        );
+    }
+
+    #[test]
+    fn selected_decoder_stage_uses_controlled_backend_mode_and_output() {
+        let config = test_config_for(identity_for(SessionId::allocate(), 1), 7);
+        let selection = registry(DecoderScript::Echo, Arc::new(AtomicUsize::new(0)))
+            .select(&super::query_for_config(&config))
+            .unwrap();
+
+        assert_eq!(
+            super::selected_decoder_stage(&selection),
+            Some((
+                frd_media_api::MediaDecoderBackend::Ffmpeg,
+                frd_media_api::MediaDecoderMode::Software,
+                frd_media_api::MediaVideoOutput::Yuv444p8,
+            ))
         );
     }
 
@@ -2496,9 +2608,15 @@ mod tests {
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>();
             assert_eq!(
-                lines,
-                vec![SAFE_CODE; 4],
-                "guarded {mode} child stderr 只能包含每次 panic 的固定安全码"
+                lines.iter().filter(|line| **line == SAFE_CODE).count(),
+                4,
+                "guarded {mode} child stderr 必须保留每次 panic 的固定安全码"
+            );
+            assert!(
+                lines.iter().all(|line| {
+                    *line == SAFE_CODE || line.starts_with("[frd-media-stage] stage=")
+                }),
+                "guarded {mode} child stderr 只能包含 panic 安全码或固定媒体阶段标记"
             );
         }
 
