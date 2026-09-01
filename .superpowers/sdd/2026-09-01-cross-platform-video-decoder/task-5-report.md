@@ -28,7 +28,7 @@
 
 空缓存时脚本从上述 ffmpeg.org URL 下载。本次本地 source cache 最初因 ffmpeg.org archive 传输长期停滞而由 XMission 的 FFmpeg release mirror 预填；该文件与官方发布物 hash 完全一致，并由 ffmpeg.org 发布公钥与 detached signature 验证为同一官方签名内容。此镜像只用于被忽略的本地缓存，不出现在构建脚本或产品元数据中。
 
-对应源代码位置：本地被忽略的 `.codex-target/ffmpeg-8.1.2/source-cache/ffmpeg-8.1.2.tar.xz` 与解压树 `.codex-target/ffmpeg-8.1.2/windows-x86_64/Release/source/ffmpeg-8.1.2/`；分发时也可从上述官方 URL 提供确切对应源码。本提交不包含 DLL 或构建树，并保存 FFmpeg 原始 `COPYING.LGPLv2.1` 与“无源码修改”的 `changes.diff`。
+对应源代码构建输入位于本地被忽略的 `.codex-target/ffmpeg-8.1.2/source-cache/ffmpeg-8.1.2.tar.xz`；解压树现在只存在于每次唯一 attempt 中并在构建后清理。本提交不包含 DLL 或构建树，并保存 FFmpeg 原始 `LICENSE.LGPLv2.1` 与“无源码修改”的 `changes.diff`。第 9 节给出 distributor-controlled 对应源码发布要求。
 
 ## 2. 构建命令、配置与工具 provenance
 
@@ -138,3 +138,70 @@ Direct-load fixture test 只从被忽略的 dev bundle 绝对路径加载 DLL，
 - native bundle 不提交，production 安装仍需后续 packaging 在满足 LGPL 对应源码义务的同时设置 Task 4 要求的 system-owned ACL；开发目录 direct-load 不能作为 release readiness 证据。
 - source/build tree 和 portable fixture authoring tool 都在 ignored output。空缓存构建需要网络可访问 ffmpeg.org，并要求已有 WSL MinGW 与 Visual Studio C++ toolchain；脚本不会安装它们或启动持久服务。
 - FFmpeg DLL 的本地 build hash 会受 PE/build timestamp 影响，因此只记录在 ignored provenance/output；可复现门禁是 exact signed source、固定 configure、固定当前工具 provenance 与 fixture checksum，而不是提交 DLL hash。
+
+## 9. 修复轮 1/5：构建来源、bundle 与对应源码分发加固
+
+日期：2026-09-01。针对 review 的 4 个 Important finding 完成修复；本节取代第 1、2、6 节中关于复用解压树、仅依赖 upstream URL 以及手工准备 native test 环境的旧描述。修复提交信息为 `fix: harden FFmpeg build and source packaging`，最终 commit hash 随提交结果返回。
+
+### 9.1 4 个 finding 的处置
+
+1. `tools/build-ffmpeg-windows.ps1` 不再读取稳定 `source`、`dist` 或 `configure-command.txt` cache。每次普通 build 都在持有 configuration lock 时重新校验 archive hash、固定 GPG fingerprint 与 `VALIDSIG`，再把 archive 解压到唯一 `.attempt-<pid>-<guid>`，无条件重新 configure/build/install。旧脚本遗留的稳定源码/build/configure tree 会被删除，attempt 在 lock 释放前清理。`-ForceRebuild` 只额外清理中断遗留物，不是获得可信 fresh build 的前提。
+2. codec bundle 先在空的同级 staging directory 构造，文件集合必须精确等于 `avcodec-62.dll`、`avutil-60.dll`、`freeremotedesk_ffmpeg.dll`；再用 `dumpbin /dependents` 检查三个文件的精确 PE import set。只有 staging 的文件集/import 全部通过后，才通过同卷 directory rename 可恢复地替换当前 bundle；发布后再次验证 exact set/import。旧 bundle 中的 stale/GPL/nonfree/unrelated DLL 不会被保留，含 `libx265.dll` 等未批准文件的 staging 会在替换前失败。
+3. 对应源码不再以 upstream URL 或开发机 ignored 目录作为发布完成证据。固定的分发 asset 是 `FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip`，精确包含 `ffmpeg-8.1.2.tar.xz`、detached signature、`LICENSE.LGPLv2.1`、`changes.diff`、`SOURCE-MANIFEST.txt`。build 校验 archive/signature 输入 hash、ZIP exact member set 和 ZIP 内 archive/signature hash。本次 staging asset SHA-256 为 `35A47C42B3B47C87A7E0F7296B23E268EAC1E296135C9D7AED7C5B796B70E305`。Task 9 必须由 FreeRemoteDesk 分发者把这个固定 ZIP 作为每个 Windows binary package 同一 distributor-controlled release/download 页面的 sibling asset 发布，并让 binary package/installer 明确指向它；`.codex-target/.../release-assets` 只是 ignored staging，不是合规分发位置。
+4. build script 新增 `-RunNativeTests`。它在同一个 fresh `pwsh -NoProfile` 进程中通过 `VsDevCmd` 初始化 `cl.exe`/`lib.exe`，把当前 unique attempt 的 `dist` 设为 `FFMPEG_DIR`，把已验证 codec bundle 加入 process `PATH`，然后运行 native unit test 和 fixture integration test；调用者无需预设这三个环境条件。没有为开发目录放宽 Task 4 production install ACL/trust policy。
+
+共享、可测试的文件系统门禁位于 `tools/ffmpeg-build-common.psm1`；覆盖测试位于 `tools/tests/ffmpeg-build-common.Tests.ps1`。MSVC C shim、raw ABI、thread/ownership/reclaim/bounded-output 合同没有改变。
+
+### 9.2 RED → GREEN
+
+先写四项脚本安全测试，再改 build 实现。初始 RED 命令：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Pester -Script 'tools\tests\ffmpeg-build-common.Tests.ps1' -EnableExit"
+```
+
+初始实现不存在时，tampered extraction、stale bundle replacement 与 corresponding-source staging 三项失败；unapproved bundle 测试因“函数不存在也抛异常”的测试写法产生一次 false positive。切换到仓库可用的 Pester/pwsh 并收紧该断言后，中间结果为 2 passed / 2 failed，分别暴露 Pester 3 `Should Throw` 兼容性与 ZIP 排序预期问题。修正测试本身后，最终 GREEN 命令与实际摘要：
+
+```powershell
+pwsh -NoProfile -Command "Import-Module Pester -Force; Invoke-Pester -Script 'tools\tests\ffmpeg-build-common.Tests.ps1' -EnableExit"
+```
+
+结果：`Passed: 4 Failed: 0`（最终复跑 786 ms）。四项分别验证：已污染的 extracted tree 被 signed-archive fresh extraction 完全替换；旧 bundle 的 `stale-gpl.dll` 被移除且只剩精确三文件；含 `libx265.dll` 的 staging 在替换前拒绝且当前 bundle 保留；对应源码 ZIP 的 exact members、manifest package/location/hash 字段正确。
+
+### 9.3 完整构建、污染注入与自包含 native 测试
+
+构建前在旧稳定 source tree 写入 `TAMPERED-SOURCE-MARKER.txt`，并在旧 codec bundle 写入 `stale-gpl.dll`，然后从未预设 `FFMPEG_DIR`、VS developer environment 或 runtime DLL `PATH` 的新 PowerShell 运行文档入口：
+
+```powershell
+pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -RunNativeTests
+```
+
+命令 exit 0。实际构建摘要：source hash/fingerprint/`VALIDSIG` 通过；`source_extraction=fresh-per-build`；configure 为第 2 节所列固定 Release LGPL line；license 为 `LGPL version 2.1 or later`，enabled decoder/parser 为 HEVC，external libraries/hwaccels 为空；shared FFmpeg、MSVC import libraries 与 C shim/plugin 构建通过；exact codec/import gate 通过。旧 source marker 和 `stale-gpl.dll` 均为 `False`，最终 bundle 只有 3 个批准 DLL。脚本内测试结果为 native `6 passed; 0 failed`，fixture `2 passed; 0 failed`。对应源码 ZIP 生成并校验通过。
+
+构建产物检查命令调用 `Assert-ExactDirectoryFiles`、`Assert-CorrespondingSourcePackage` 与 PowerShell AST parser；实际摘要为：
+
+```text
+ARTIFACT_GATE_OK exact_codec=3 tampered_marker=false stale_gpl=false source_package=valid ast=valid
+```
+
+build provenance 记录了 exact official URLs、三个输入 hash、固定 release fingerprint、`signature=VALID`、fresh extraction、完整 configure line、tool versions、exact codec set/import gate、对应源码 asset path/hash。没有提交源码 ZIP、DLL、attempt/build tree 或 portable build cache。
+
+### 9.4 回归矩阵
+
+- `pwsh -NoProfile -Command "Import-Module Pester -Force; Invoke-Pester -Script 'tools\tests\ffmpeg-build-common.Tests.ps1' -EnableExit"` → 4 passed，0 failed。
+- `pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -RunNativeTests` → build exit 0；native 6 passed；fixture 2 passed；exact bundle/source-package gates 通过。
+- 将 `.codex-target/.../Release/codec` 同卷临时改名，在 `finally` 恢复，然后运行 `cargo test --locked -p frd-video-ffmpeg` → loader 22 passed，0 failed；missing plugin 仍 fail-closed，Task 4 trust/ACL/ABI/reclaim tests 未放宽。
+- `cargo test --locked -p frd-video-ffmpeg-plugin --lib` → default/native-disabled 1 passed，0 failed。
+- `cargo build --locked --workspace` → 通过，包括 default GUI；只有既存 root MVS dead-code warnings，没有 FFmpeg import/link requirement。
+- `cargo fmt --all -- --check` → 通过。
+- `git diff --check` → 通过；仅提示 Windows working copy 未来会把 build script LF 转为 CRLF，无 whitespace error。
+
+### 9.5 修复文件与剩余关注点
+
+- `tools/build-ffmpeg-windows.ps1`
+- `tools/ffmpeg-build-common.psm1`
+- `tools/tests/ffmpeg-build-common.Tests.ps1`
+- `third_party/ffmpeg/8.1.2/README.md`
+- 本报告。
+
+仍需 Task 9 真正把固定对应源码 ZIP 与每个 Windows binary package 发布在同一 distributor-controlled release/download location，并配置 Task 4 system-owned install ACL；本任务只生成并验证 release asset staging，不能声称 packaging 已完成。软件 exact 的证据仍只限 synthetic HEVC Main444 8-bit fixture，不代表 hardware exact、Apple live transport framing 或普遍流兼容性。既有 Apple HP/README/root CLI dirty files 未编辑、未 stage、未提交。

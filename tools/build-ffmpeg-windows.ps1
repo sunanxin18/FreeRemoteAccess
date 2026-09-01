@@ -3,7 +3,8 @@ param(
     [ValidateSet("Release", "Debug")]
     [string]$Configuration = "Release",
     [string]$WslDistribution = "ubuntu24.04",
-    [switch]$ForceRebuild
+    [switch]$ForceRebuild,
+    [switch]$RunNativeTests
 )
 
 Set-StrictMode -Version Latest
@@ -15,27 +16,33 @@ $ReleaseFingerprint = "FCF986EA15E6E293A5644F10B4322F04D67658D8"
 $SourceUrl = "https://ffmpeg.org/releases/ffmpeg-$Version.tar.xz"
 $SignatureUrl = "$SourceUrl.asc"
 $KeyUrl = "https://ffmpeg.org/ffmpeg-devel.asc"
+$ApprovedBundleFiles = @("avcodec-62.dll", "avutil-60.dll", "freeremotedesk_ffmpeg.dll")
+$CorrespondingSourcePackageName = "FreeRemoteDesk-ffmpeg-$Version-corresponding-source.zip"
 
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+Import-Module (Join-Path $PSScriptRoot "ffmpeg-build-common.psm1") -Force
 $BuildRoot = Join-Path $RepoRoot ".codex-target\ffmpeg-$Version"
 $SourceCache = Join-Path $BuildRoot "source-cache"
 $GpgHome = Join-Path $BuildRoot "gnupg"
 $ConfigurationRoot = Join-Path $BuildRoot "windows-x86_64\$Configuration"
-$SourceParent = Join-Path $ConfigurationRoot "source"
-$SourceDir = Join-Path $SourceParent "ffmpeg-$Version"
-$DistDir = Join-Path $ConfigurationRoot "dist"
 $CodecDir = Join-Path $ConfigurationRoot "codec"
+$ReleaseAssetsDirectory = Join-Path $BuildRoot "release-assets"
 $Archive = Join-Path $SourceCache "ffmpeg-$Version.tar.xz"
 $Signature = "$Archive.asc"
 $SigningKey = Join-Path $SourceCache "ffmpeg-devel.asc"
 $ProvenanceLog = Join-Path $ConfigurationRoot "build-provenance.txt"
+$ThirdPartyRoot = Join-Path $RepoRoot "third_party\ffmpeg\$Version"
+$AttemptId = "$PID-$([Guid]::NewGuid().ToString('N'))"
+$AttemptRoot = Join-Path $ConfigurationRoot ".attempt-$AttemptId"
+$SourceParent = Join-Path $AttemptRoot "source"
+$SourceDir = Join-Path $SourceParent "ffmpeg-$Version"
+$DistDir = Join-Path $AttemptRoot "dist"
+$CodecStage = Join-Path $ConfigurationRoot ".codec.stage-$AttemptId"
+$ConfigureRecord = Join-Path $AttemptRoot "configure-command.txt"
+$BuildLockPath = Join-Path $BuildRoot "windows-x86_64-$Configuration.lock"
 
 function Assert-UnderBuildRoot([string]$Path) {
-    $root = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\') + '\'
-    $candidate = [IO.Path]::GetFullPath($Path)
-    if (-not $candidate.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "拒绝操作构建根目录之外的路径: $candidate"
-    }
+    Assert-PathUnderRoot -Path $Path -AllowedRoot $BuildRoot
 }
 
 function Download-IfMissing([string]$Url, [string]$Destination) {
@@ -116,15 +123,83 @@ function Import-VisualStudioEnvironment([string]$DevCmd) {
     }
 }
 
+function Get-PeImports([string]$Dumpbin, [string]$File) {
+    $output = & $Dumpbin /nologo /dependents $File
+    if ($LASTEXITCODE -ne 0) {
+        throw "无法检查 PE imports: $File"
+    }
+    $imports = @(
+        $output | ForEach-Object {
+            if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') {
+                $Matches[1]
+            }
+        }
+    )
+    if ($imports.Count -eq 0) {
+        throw "PE import 集合为空或无法解析: $File"
+    }
+    return $imports
+}
+
+function Assert-ExactPeImports(
+    [string]$Dumpbin,
+    [string]$File,
+    [string[]]$ExpectedImports
+) {
+    $actual = @(Get-PeImports -Dumpbin $Dumpbin -File $File | Sort-Object)
+    $expected = @($ExpectedImports | Sort-Object)
+    $actualKey = (($actual | ForEach-Object { $_.ToLowerInvariant() }) -join "|")
+    $expectedKey = (($expected | ForEach-Object { $_.ToLowerInvariant() }) -join "|")
+    if ($actualKey -cne $expectedKey) {
+        throw "PE imports 不匹配: $File；实际 [$($actual -join ', ')]，要求 [$($expected -join ', ')]"
+    }
+}
+
+function Assert-ApprovedBundleImports([string]$Dumpbin, [string]$BundleDirectory) {
+    Assert-ExactPeImports -Dumpbin $Dumpbin -File (Join-Path $BundleDirectory "freeremotedesk_ffmpeg.dll") -ExpectedImports @(
+        "avcodec-62.dll",
+        "avutil-60.dll",
+        "api-ms-win-core-synch-l1-2-0.dll",
+        "kernel32.dll",
+        "ntdll.dll",
+        "VCRUNTIME140.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll",
+        "api-ms-win-crt-runtime-l1-1-0.dll"
+    )
+    Assert-ExactPeImports -Dumpbin $Dumpbin -File (Join-Path $BundleDirectory "avcodec-62.dll") -ExpectedImports @(
+        "KERNEL32.dll",
+        "msvcrt.dll",
+        "avutil-60.dll"
+    )
+    Assert-ExactPeImports -Dumpbin $Dumpbin -File (Join-Path $BundleDirectory "avutil-60.dll") -ExpectedImports @(
+        "bcrypt.dll",
+        "KERNEL32.dll",
+        "msvcrt.dll"
+    )
+}
+
 New-Item -ItemType Directory -Force -Path $BuildRoot, $SourceCache, $GpgHome | Out-Null
+$buildLock = $null
 Push-Location $RepoRoot
 try {
+    try {
+        $buildLock = [IO.File]::Open(
+            $BuildLockPath,
+            [IO.FileMode]::OpenOrCreate,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+    }
+    catch {
+        throw "同一 configuration 的 FFmpeg build 已在运行: $BuildLockPath"
+    }
+
     Download-IfMissing $SourceUrl $Archive
     Download-IfMissing $SignatureUrl $Signature
     Download-IfMissing $KeyUrl $SigningKey
 
     $actualHash = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
-    if ($actualHash -ne $ArchiveSha256) {
+    if ($actualHash -cne $ArchiveSha256) {
         throw "FFmpeg 源码 SHA-256 不匹配: $actualHash"
     }
     $signatureHash = (Get-FileHash -LiteralPath $Signature -Algorithm SHA256).Hash
@@ -135,9 +210,7 @@ try {
     $oldGpgHome = $env:GNUPGHOME
     $env:GNUPGHOME = $gpgRelative
     try {
-        # Git for Windows records helper paths as /usr/bin/*. Public-key import is usable without
-        # an agent, so disable agent startup and let the exact fingerprint/signature gates below
-        # decide success instead of trusting import's environment-sensitive exit code.
+        # 公钥验证无需 agent；精确 fingerprint 与 VALIDSIG 是不可省略的成功门禁。
         & $gpg --batch --no-autostart --import $SigningKey 2>&1 | Out-Host
         $fingerprints = (& $gpg --batch --no-autostart --with-colons --fingerprint "FFmpeg release signing key") -join "`n"
         if ($fingerprints -notmatch "fpr:::::::::${ReleaseFingerprint}:") {
@@ -152,17 +225,33 @@ try {
         $env:GNUPGHOME = $oldGpgHome
     }
 
-    if ($ForceRebuild -and (Test-Path -LiteralPath $ConfigurationRoot)) {
-        Assert-UnderBuildRoot $ConfigurationRoot
-        Remove-Item -LiteralPath $ConfigurationRoot -Recurse -Force
-    }
-    New-Item -ItemType Directory -Force -Path $ConfigurationRoot, $SourceParent | Out-Null
-    if (-not (Test-Path -LiteralPath $SourceDir)) {
-        & tar.exe -xf $Archive -C $SourceParent
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $SourceDir)) {
-            throw "解压 FFmpeg 源码失败"
+    New-Item -ItemType Directory -Force -Path $ConfigurationRoot, $AttemptRoot | Out-Null
+    # 旧版脚本留下的 source/dist/configure cache 从不再使用；每次 build 都从签名归档 fresh 解压。
+    foreach ($legacy in @(
+        (Join-Path $ConfigurationRoot "source"),
+        (Join-Path $ConfigurationRoot "dist"),
+        (Join-Path $ConfigurationRoot "configure-command.txt")
+    )) {
+        if (Test-Path -LiteralPath $legacy) {
+            Assert-UnderBuildRoot $legacy
+            Remove-Item -LiteralPath $legacy -Recurse -Force
         }
     }
+    if ($ForceRebuild) {
+        Get-ChildItem -LiteralPath $ConfigurationRoot -Force | Where-Object {
+            $_.Name -like '.attempt-*' -or $_.Name -like '.codec.stage-*' -or $_.Name -like '*.previous-*'
+        } | Where-Object { $_.FullName -ne $AttemptRoot } | ForEach-Object {
+            Assert-UnderBuildRoot $_.FullName
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
+    }
+
+    $SourceDir = Expand-VerifiedArchiveFresh `
+        -Archive $Archive `
+        -ExpectedArchiveSha256 $ArchiveSha256 `
+        -DestinationParent $SourceParent `
+        -ExpectedDirectoryName "ffmpeg-$Version" `
+        -AllowedRoot $BuildRoot
 
     & wsl.exe --distribution $WslDistribution -- bash -lc 'command -v bash >/dev/null && command -v make >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null'
     if ($LASTEXITCODE -ne 0) {
@@ -197,17 +286,8 @@ try {
         $configureArgs += "--enable-debug", "--disable-stripping"
     }
     $configureCommand = "./configure " + (($configureArgs | ForEach-Object { Quote-Bash $_ }) -join " ")
-    $configureRecord = Join-Path $ConfigurationRoot "configure-command.txt"
-    if (Test-Path -LiteralPath (Join-Path $SourceDir "ffbuild\config.mak")) {
-        $recorded = Get-Content -Raw -LiteralPath $configureRecord -ErrorAction SilentlyContinue
-        if ($recorded.Trim() -ne $configureCommand) {
-            throw "缓存的 configure 参数不同；请使用 -ForceRebuild"
-        }
-    }
-    else {
-        Invoke-Wsl $sourceWsl $configureCommand "FFmpeg configure"
-        Set-Content -LiteralPath $configureRecord -Value $configureCommand -Encoding UTF8
-    }
+    Invoke-Wsl $sourceWsl $configureCommand "FFmpeg configure"
+    Set-Content -LiteralPath $ConfigureRecord -Value $configureCommand -Encoding UTF8
     Invoke-Wsl $sourceWsl "make -j4" "FFmpeg build"
     Invoke-Wsl $sourceWsl "make install" "FFmpeg install"
 
@@ -229,6 +309,7 @@ try {
 
     $libExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\lib.exe"
     $clExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe"
+    $dumpbinExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe"
     foreach ($library in @(
         @{ Name = "avutil"; Definition = "avutil-60.def" },
         @{ Name = "avcodec"; Definition = "avcodec-62.def" }
@@ -256,12 +337,36 @@ try {
         throw "native FFmpeg plugin 构建失败"
     }
 
-    New-Item -ItemType Directory -Force -Path $CodecDir | Out-Null
-    Copy-Item -Force -LiteralPath (Join-Path $DistDir "bin\avutil-60.dll") -Destination $CodecDir
-    Copy-Item -Force -LiteralPath (Join-Path $DistDir "bin\avcodec-62.dll") -Destination $CodecDir
-    Copy-Item -Force -LiteralPath $plugin -Destination $CodecDir
+    New-Item -ItemType Directory -Force -Path $CodecStage | Out-Null
+    Copy-Item -LiteralPath (Join-Path $DistDir "bin\avutil-60.dll") -Destination $CodecStage
+    Copy-Item -LiteralPath (Join-Path $DistDir "bin\avcodec-62.dll") -Destination $CodecStage
+    Copy-Item -LiteralPath $plugin -Destination $CodecStage
+    Assert-ExactDirectoryFiles -Directory $CodecStage -ApprovedFileNames $ApprovedBundleFiles
+    Assert-ApprovedBundleImports -Dumpbin $dumpbinExe -BundleDirectory $CodecStage
+
+    $correspondingSourcePackage = New-CorrespondingSourcePackage `
+        -SourceArchive $Archive `
+        -ExpectedArchiveSha256 $ArchiveSha256 `
+        -Signature $Signature `
+        -ExpectedSignatureSha256 $signatureHash `
+        -License (Join-Path $ThirdPartyRoot "LICENSE.LGPLv2.1") `
+        -Changes (Join-Path $ThirdPartyRoot "changes.diff") `
+        -ReleaseAssetsDirectory $ReleaseAssetsDirectory `
+        -PackageFileName $CorrespondingSourcePackageName `
+        -SourceUrl $SourceUrl `
+        -AllowedRoot $BuildRoot
+
+    Publish-ExactDirectory `
+        -StagingDirectory $CodecStage `
+        -DestinationDirectory $CodecDir `
+        -ApprovedFileNames $ApprovedBundleFiles `
+        -AllowedRoot $BuildRoot | Out-Null
+    Assert-ExactDirectoryFiles -Directory $CodecDir -ApprovedFileNames $ApprovedBundleFiles
+    Assert-ApprovedBundleImports -Dumpbin $dumpbinExe -BundleDirectory $CodecDir
 
     $toolProvenance = & wsl.exe --distribution $WslDistribution -- bash -lc 'printf "bash="; bash --version | head -1; printf "make="; make --version | head -1; printf "cc="; x86_64-w64-mingw32-gcc --version | head -1'
+    $provenanceStage = "$ProvenanceLog.stage-$AttemptId"
+    Assert-UnderBuildRoot $provenanceStage
     @(
         "source_url=$SourceUrl",
         "signature_url=$SignatureUrl",
@@ -271,21 +376,59 @@ try {
         "signing_key_sha256=$signingKeyHash",
         "release_fingerprint=$ReleaseFingerprint",
         "signature=VALID",
+        "source_extraction=fresh-per-build",
         "wsl_distribution=$WslDistribution",
         "msvc_cl=$clExe",
         "msvc_cl_version=$((Get-Item -LiteralPath $clExe).VersionInfo.FileVersion)",
         "configuration=$Configuration",
         "configure=$configureCommand",
+        "codec_files=$($ApprovedBundleFiles -join ',')",
+        "codec_imports=VALID",
+        "corresponding_source_package=$correspondingSourcePackage",
+        "corresponding_source_package_sha256=$((Get-FileHash -LiteralPath $correspondingSourcePackage -Algorithm SHA256).Hash)",
         $toolProvenance
-    ) | Set-Content -LiteralPath $ProvenanceLog -Encoding UTF8
+    ) | Set-Content -LiteralPath $provenanceStage -Encoding UTF8
+    Move-Item -Force -LiteralPath $provenanceStage -Destination $ProvenanceLog
 
-    Write-Host "FFmpeg $Version LGPL shared build complete."
+    if ($RunNativeTests) {
+        $oldPath = $env:PATH
+        $env:PATH = "$CodecDir;$($env:PATH)"
+        try {
+            & cargo.exe test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg --lib -- --nocapture
+            if ($LASTEXITCODE -ne 0) {
+                throw "native FFmpeg plugin 单元测试失败"
+            }
+            & cargo.exe test --locked -p frd-video-ffmpeg-plugin --test main444_decode -- --nocapture
+            if ($LASTEXITCODE -ne 0) {
+                throw "Main444 fixture integration test 失败"
+            }
+        }
+        finally {
+            $env:PATH = $oldPath
+        }
+    }
+
+    Write-Host "FFmpeg $Version LGPL shared build complete from a fresh verified extraction."
     Write-Host "Codec bundle: $CodecDir"
     foreach ($file in Get-ChildItem -LiteralPath $CodecDir -File | Sort-Object Name) {
         $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
         Write-Host "$($file.Name) $($file.Length) bytes SHA256=$hash"
     }
+    Write-Host "Corresponding-source release asset: $correspondingSourcePackage"
 }
 finally {
-    Pop-Location
+    try {
+        foreach ($temporary in @($AttemptRoot, $CodecStage)) {
+            if (Test-Path -LiteralPath $temporary) {
+                Assert-UnderBuildRoot $temporary
+                Remove-Item -LiteralPath $temporary -Recurse -Force
+            }
+        }
+    }
+    finally {
+        if ($null -ne $buildLock) {
+            $buildLock.Dispose()
+        }
+        Pop-Location
+    }
 }
