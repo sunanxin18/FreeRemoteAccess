@@ -1,7 +1,8 @@
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::io;
+use std::io::{self, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,59 @@ pub const VIDEO_ACCESS_UNIT_ENTRY_LIMIT: usize = 64;
 pub const VIDEO_ACCESS_UNIT_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const VIDEO_STREAM_IDENTITY_LIMIT: usize = 4;
 const VIDEO_EVENT_LIMIT: usize = 64;
+const DECODER_BOUNDARY_PANIC_CODE: &str = "freeremotedesk_decoder_boundary_panic";
+
+static INSTALL_DECODER_BOUNDARY_PANIC_HOOK: Once = Once::new();
+
+thread_local! {
+    static DECODER_BOUNDARY_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct DecoderBoundaryGuard;
+
+impl DecoderBoundaryGuard {
+    fn enter() -> Self {
+        DECODER_BOUNDARY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for DecoderBoundaryGuard {
+    fn drop(&mut self) {
+        let _ = DECODER_BOUNDARY_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn install_decoder_boundary_panic_hook() {
+    INSTALL_DECODER_BOUNDARY_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let guarded = DECODER_BOUNDARY_DEPTH
+                .try_with(|depth| depth.get() != 0)
+                .unwrap_or(false);
+            if guarded {
+                let _ = writeln!(io::stderr().lock(), "{DECODER_BOUNDARY_PANIC_CODE}");
+            } else {
+                previous(panic_info);
+            }
+        }));
+    });
+}
+
+fn call_decoder_boundary<T>(
+    call: impl FnOnce() -> Result<T, VideoDecodeError>,
+) -> Result<T, VideoDecodeError> {
+    let _guard = DecoderBoundaryGuard::enter();
+    match catch_unwind(AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(payload) => {
+            drop(payload);
+            Err(VideoDecodeError::new(
+                VideoDecodeErrorCode::BackendUnavailable,
+            ))
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoDecoderDiagnostics(VideoDecoderSelection);
@@ -1105,6 +1159,7 @@ impl VideoDecodeWorker {
         loader: StreamRegistryLoader,
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> io::Result<Self> {
+        install_decoder_boundary_panic_hook();
         let events = VideoWorkerEvents::new(wake);
         let router = VideoRouter::new(events.clone());
         let supervisor_router = router.clone();
@@ -1304,7 +1359,7 @@ fn run_stream_worker(
                     continue;
                 }
                 if let Some(mut previous) = active.take() {
-                    match previous.decoder.flush() {
+                    match call_decoder_boundary(|| previous.decoder.flush()) {
                         Ok(frames) => publish_current_frames(&events, &mut previous, frames),
                         Err(error) => {
                             events.publish_failure(epoch, error.code(), previous.after_first_frame);
@@ -1313,7 +1368,7 @@ fn run_stream_worker(
                     }
                 }
                 if registry.is_none() {
-                    match loader(identity) {
+                    match call_decoder_boundary(|| loader(identity)) {
                         Ok(loaded) => registry = Some(loaded),
                         Err(error) => {
                             events.publish_failure(epoch, error.code(), false);
@@ -1321,10 +1376,13 @@ fn run_stream_worker(
                         }
                     }
                 }
-                let created = registry
-                    .as_ref()
-                    .expect("loaded registry remains available")
-                    .select_and_create(&query_for_config(&config), &config);
+                let query = query_for_config(&config);
+                let created = call_decoder_boundary(|| {
+                    registry
+                        .as_ref()
+                        .expect("loaded registry remains available")
+                        .select_and_create(&query, &config)
+                });
                 match created {
                     Ok(created) => {
                         let (selection, decoder) = created.into_parts();
@@ -1348,7 +1406,7 @@ fn run_stream_worker(
                 if decoder.epoch != epoch || !events.is_current(epoch) {
                     continue;
                 }
-                match decoder.decoder.submit(access_unit) {
+                match call_decoder_boundary(|| decoder.decoder.submit(access_unit)) {
                     Ok(DecodeOutcome::NeedMoreData) => {}
                     Ok(DecodeOutcome::Frames(frames)) => {
                         publish_current_frames(&events, decoder, frames)
@@ -1363,7 +1421,7 @@ fn run_stream_worker(
     }
 
     if let Some(mut active) = active {
-        match active.decoder.flush() {
+        match call_decoder_boundary(|| active.decoder.flush()) {
             Ok(frames) => publish_current_frames(&events, &mut active, frames),
             Err(error) => {
                 events.publish_failure(active.epoch, error.code(), active.after_first_frame)
@@ -1410,6 +1468,7 @@ fn publish_current_frames(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
@@ -2355,6 +2414,74 @@ mod tests {
     }
 
     #[test]
+    fn decoder_boundary_panic_hook_hides_secrets_and_forwards_unguarded_panics() {
+        const SAFE_CODE: &str = "freeremotedesk_decoder_boundary_panic";
+        const GUARDED_CASES: [(&str, &str); 4] = [
+            ("loader", "sensitive loader panic details must not escape"),
+            ("selection", "sensitive selection panic details"),
+            ("submit", "sensitive submit panic details"),
+            ("flush", "sensitive flush panic details"),
+        ];
+
+        for (mode, secret) in GUARDED_CASES {
+            let output = run_panic_hook_child(mode);
+            assert!(
+                output.status.success(),
+                "guarded {mode} child 应完成既有 terminal/cap 回收断言，status={}",
+                output.status
+            );
+            let stderr = String::from_utf8(output.stderr).expect("child stderr 应为 UTF-8");
+            assert!(
+                !stderr.contains(secret),
+                "guarded {mode} child stderr 不得包含 panic payload"
+            );
+            let lines = stderr
+                .lines()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lines,
+                vec![SAFE_CODE; 4],
+                "guarded {mode} child stderr 只能包含每次 panic 的固定安全码"
+            );
+        }
+
+        let output = run_panic_hook_child("unguarded");
+        assert!(
+            !output.status.success(),
+            "unguarded child panic 应保持 test process failure"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("child stderr 应为 UTF-8");
+        assert!(
+            stderr.contains("freeremotedesk_unguarded_panic_sentinel"),
+            "unguarded panic 应转发到 previous hook"
+        );
+        assert!(
+            !stderr.contains(SAFE_CODE),
+            "unguarded panic 不得被 decoder boundary hook 改写"
+        );
+    }
+
+    #[test]
+    fn decoder_boundary_panic_hook_child() {
+        let Ok(mode) = std::env::var("FRD_VIDEO_DECODER_PANIC_HOOK_CHILD") else {
+            return;
+        };
+        match mode.as_str() {
+            "loader" => assert_panics_release_capacity(PanicSite::Loader),
+            "selection" => assert_panics_release_capacity(PanicSite::Selection),
+            "submit" => assert_panics_release_capacity(PanicSite::Submit),
+            "flush" => assert_panics_release_capacity(PanicSite::Flush),
+            "unguarded" => {
+                let worker = worker_with_script(DecoderScript::Echo, Arc::new(AtomicUsize::new(0)));
+                stop(worker);
+                panic!("freeremotedesk_unguarded_panic_sentinel");
+            }
+            _ => panic!("未知 decoder panic-hook child mode"),
+        }
+    }
+
+    #[test]
     fn ready_retained_frame_drains_before_fatal_without_becoming_ready_again() {
         let identity = test_identity();
         let worker = worker_with_script(
@@ -2411,8 +2538,22 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PanicSite {
         Loader,
+        Selection,
         Submit,
         Flush,
+    }
+
+    fn run_panic_hook_child(mode: &str) -> std::process::Output {
+        Command::new(std::env::current_exe().expect("应取得当前 test binary"))
+            .args([
+                "--exact",
+                "video_decode_worker::tests::decoder_boundary_panic_hook_child",
+                "--nocapture",
+            ])
+            .env("FRD_VIDEO_DECODER_PANIC_HOOK_CHILD", mode)
+            .env_remove("RUST_BACKTRACE")
+            .output()
+            .expect("应启动 decoder panic-hook child test")
     }
 
     fn assert_panics_release_capacity(site: PanicSite) {
@@ -2428,6 +2569,7 @@ mod tests {
                 let script = if call < 4 {
                     match site {
                         PanicSite::Loader => DecoderScript::Echo,
+                        PanicSite::Selection => DecoderScript::PanicSelection,
                         PanicSite::Submit => DecoderScript::PanicSubmit,
                         PanicSite::Flush => DecoderScript::PanicFlush,
                     }
@@ -2445,11 +2587,11 @@ mod tests {
                 .sender()
                 .try_send_config(test_config_for(identity, 7))
                 .unwrap();
-            if !matches!(site, PanicSite::Loader) {
+            if matches!(site, PanicSite::Submit | PanicSite::Flush) {
                 recv_backend_selected_for(&worker, identity, 7);
             }
             match site {
-                PanicSite::Loader => {}
+                PanicSite::Loader | PanicSite::Selection => {}
                 PanicSite::Submit => worker
                     .sender()
                     .try_send_access_unit(test_au_for(identity, 7, 1, true, 1))
@@ -2513,6 +2655,7 @@ mod tests {
         FailBefore,
         FrameThenFail,
         TwoFramesThenFail,
+        PanicSelection,
         PanicSubmit,
         PanicFlush,
         FlushFrame(Arc<AtomicUsize>),
@@ -2555,6 +2698,9 @@ mod tests {
         }
 
         fn query(&self, _query: &VideoDecodeQuery) -> VideoDecodeSupport {
+            if matches!(&self.script, DecoderScript::PanicSelection) {
+                panic!("sensitive selection panic details");
+            }
             VideoDecodeSupport::SoftwareExact(VideoDecodeCapability {
                 backend_id: self.backend_id(),
                 codec: VideoCodec::Hevc,
@@ -2627,6 +2773,7 @@ mod tests {
                 DecoderScript::TwoFramesThenFail => Err(VideoDecodeError::new(
                     VideoDecodeErrorCode::DecodeFailedAfterFirstFrame,
                 )),
+                DecoderScript::PanicSelection => Ok(DecodeOutcome::NeedMoreData),
                 DecoderScript::PanicSubmit => panic!("sensitive submit panic details"),
                 DecoderScript::PanicFlush => Ok(DecodeOutcome::NeedMoreData),
                 DecoderScript::BlockingFailure {
