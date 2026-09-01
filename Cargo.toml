@@ -27,6 +27,7 @@ members = [
     "tools/frd-legacy-minifb-lab",
     "tools/frd-wgpu-smoke",
     "tools/frd-icon-assets",
+    "tools/frd-video-capabilities",
 ]
 
 [workspace.dependencies]

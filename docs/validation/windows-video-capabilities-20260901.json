@@ -1,0 +1,100 @@
+{
+  "schema": "frd.windows_video_capabilities.v1",
+  "backend_id": "windows-d3d12-video-probe",
+  "availability": "probe_only",
+  "probe_status": "ok",
+  "error_code": null,
+  "adapters": [
+    {
+      "luid": "0x0000000000010afe",
+      "description": "AMD Radeon 780M Graphics",
+      "profile_guids": [
+        "0x107af0e0ef1a4d19aba867a163073d13",
+        "0x1b81be68a0c711d3b98400c04f2e73c5",
+        "0x463707f8a1d04585876d83aa6d60b89e",
+        "0x5b11d51b2f4c4452bcc309f2a1160cc0",
+        "0xa4c749ef6ecf48aa844850a7a1165ff7",
+        "0xb8be4ccbcf5346ba8d59d6b8a6da5d2a"
+      ],
+      "errors": []
+    }
+  ],
+  "queries": [
+    {
+      "name": "h264_high_420_8",
+      "codec": "h264",
+      "profile": "h264_high",
+      "chroma": "yuv420",
+      "bit_depth": 8,
+      "coded_size": {
+        "width": 1920,
+        "height": 1080
+      },
+      "frame_rate": {
+        "numerator": 60,
+        "denominator": 1
+      },
+      "preferred_outputs": [
+        "nv12"
+      ],
+      "support": "profile_unavailable"
+    },
+    {
+      "name": "hevc_main_420_8",
+      "codec": "hevc",
+      "profile": "hevc_main",
+      "chroma": "yuv420",
+      "bit_depth": 8,
+      "coded_size": {
+        "width": 1920,
+        "height": 1080
+      },
+      "frame_rate": {
+        "numerator": 60,
+        "denominator": 1
+      },
+      "preferred_outputs": [
+        "nv12"
+      ],
+      "support": "hardware_exact"
+    },
+    {
+      "name": "hevc_main10_420_10",
+      "codec": "hevc",
+      "profile": "hevc_main10",
+      "chroma": "yuv420",
+      "bit_depth": 10,
+      "coded_size": {
+        "width": 1920,
+        "height": 1080
+      },
+      "frame_rate": {
+        "numerator": 60,
+        "denominator": 1
+      },
+      "preferred_outputs": [
+        "p010"
+      ],
+      "support": "hardware_exact"
+    },
+    {
+      "name": "hevc_main444_444_8",
+      "codec": "hevc",
+      "profile": "hevc_main444_8",
+      "chroma": "yuv444",
+      "bit_depth": 8,
+      "coded_size": {
+        "width": 1920,
+        "height": 1080
+      },
+      "frame_rate": {
+        "numerator": 60,
+        "denominator": 1
+      },
+      "preferred_outputs": [
+        "yuv444p8"
+      ],
+      "support": "profile_unavailable"
+    }
+  ]
+}

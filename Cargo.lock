@@ -1919,6 +1919,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "windows",
  "windows-sys 0.59.0",
 ]
 
@@ -2040,6 +2041,17 @@ dependencies = [
  "frd-core",
  "frd-platform-api",
  "frd-protocol-api",
+]
+
+[[package]]
+name = "frd-video-capabilities"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-media-api",
+ "frd-platform-windows",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

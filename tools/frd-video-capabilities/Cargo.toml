@@ -1,0 +1,11 @@
+[package]
+name = "frd-video-capabilities"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frd-core = { path = "../../crates/frd-core" }
+frd-media-api = { path = "../../crates/frd-media-api" }
+frd-platform-windows = { path = "../../crates/frd-platform-windows" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -4,6 +4,7 @@ mod credentials;
 mod secure_credentials;
 mod server_identity;
 mod single_instance;
+mod video_capabilities;
 
 pub use audio::WindowsAudioOutput;
 pub use connection_profiles::WindowsConnectionProfileStore;
@@ -12,4 +13,7 @@ pub use secure_credentials::WindowsCredentialStore;
 pub use server_identity::DpapiServerIdentityStore;
 pub use single_instance::{
     WindowsSingleInstanceError, WindowsSingleInstanceGuard, WINDOWS_INSTANCE_ALREADY_RUNNING,
+};
+pub use video_capabilities::{
+    WindowsVideoAdapter, WindowsVideoCapabilityProvider, WindowsVideoProbeErrorCode,
 };
