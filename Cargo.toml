@@ -11,6 +11,8 @@ members = [
     "crates/frd-wire-rfb",
     "crates/frd-frame",
     "crates/frd-media-api",
+    "crates/frd-video-ffmpeg",
+    "crates/frd-video-ffmpeg-plugin",
     "crates/frd-protocol-api",
     "crates/frd-session",
     "crates/frd-ui-model",
