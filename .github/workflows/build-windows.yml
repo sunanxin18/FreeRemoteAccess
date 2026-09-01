@@ -1,0 +1,79 @@
+name: Windows package
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/freeremotedesk-windows/**"
+      - "crates/frd-video-ffmpeg/**"
+      - "crates/frd-video-ffmpeg-plugin/**"
+      - "packaging/windows/**"
+      - "third_party/ffmpeg/8.1.2/**"
+      - "tools/build-ffmpeg-windows.ps1"
+      - "tools/ffmpeg-build-common.psm1"
+      - "tools/stage-windows-package.ps1"
+      - "tools/verify-windows-package.ps1"
+      - "tools/tests/ffmpeg-build-common.Tests.ps1"
+      - "tools/tests/windows-package.Tests.ps1"
+      - ".github/workflows/build-windows.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/freeremotedesk-windows/**"
+      - "crates/frd-video-ffmpeg/**"
+      - "crates/frd-video-ffmpeg-plugin/**"
+      - "packaging/windows/**"
+      - "third_party/ffmpeg/8.1.2/**"
+      - "tools/build-ffmpeg-windows.ps1"
+      - "tools/ffmpeg-build-common.psm1"
+      - "tools/stage-windows-package.ps1"
+      - "tools/verify-windows-package.ps1"
+      - "tools/tests/ffmpeg-build-common.Tests.ps1"
+      - "tools/tests/windows-package.Tests.ps1"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable Ubuntu 24.04 build environment
+        shell: pwsh
+        run: |
+          wsl.exe --install --distribution Ubuntu-24.04 --no-launch
+          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential mingw-w64 pkg-config xz-utils"
+
+      - name: Build signed-source FFmpeg bundle and fixture tests
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -WslDistribution Ubuntu-24.04 -RunNativeTests
+
+      - name: Build Windows GUI without implicit codec copying
+        shell: pwsh
+        run: cargo build --locked --release -p freeremotedesk-windows
+
+      - name: Stage and verify Windows binary package
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/stage-windows-package.ps1 -PackageRoot target/package-test
+          pwsh -NoProfile -File tools/verify-windows-package.ps1 -PackageRoot target/package-test
+          Import-Module Pester -Force
+          Invoke-Pester -Script tools/tests/windows-package.Tests.ps1 -EnableExit
+
+      - name: Upload Windows binary package
+        uses: actions/upload-artifact@v4
+        with:
+          name: freeremotedesk-windows-package
+          path: target/package-test
+          if-no-files-found: error
+
+      - name: Upload corresponding FFmpeg source sibling asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: freeremotedesk-ffmpeg-8.1.2-corresponding-source
+          path: .codex-target/ffmpeg-8.1.2/release-assets/FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip
+          if-no-files-found: error

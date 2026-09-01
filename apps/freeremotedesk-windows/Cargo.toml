@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[package.metadata.freeremotedesk-windows-package]
+stage-script = "../../tools/stage-windows-package.ps1"
+verify-script = "../../tools/verify-windows-package.ps1"
+ffmpeg-manifest = "../../packaging/windows/ffmpeg-manifest.json"
+codec-directory = "codecs/ffmpeg-8.1.2/windows-x86_64"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 frd-app = { path = "../../crates/frd-app" }
@@ -31,4 +37,5 @@ ico = "0.4"
 serde_json = "1"
 
 [build-dependencies]
+serde_json = "1"
 winresource = "0.1"

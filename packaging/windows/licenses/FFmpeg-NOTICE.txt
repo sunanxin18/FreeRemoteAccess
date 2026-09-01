@@ -1,0 +1,36 @@
+FreeRemoteDesk 可选 FFmpeg 视频后端通知
+=====================================
+
+本 Windows 客户端包可在以下版本化目录中包含 FFmpeg 8.1.2 动态库及
+FreeRemoteDesk 的动态加载插件：
+
+  codecs/ffmpeg-8.1.2/windows-x86_64/
+
+FFmpeg 以 GNU Lesser General Public License 2.1 或更高版本许可。本构建关闭
+GPL、nonfree、version3、network 和外部库自动探测，只启用所需的 HEVC decoder、
+HEVC parser 与 file protocol。完整固定 configure 参数和每个 staged 文件的
+SHA-256 位于包根目录 ffmpeg-manifest.json。
+
+官方源码：
+  https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+
+完整对应源码分发件：
+  FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip
+
+分发者必须在与 Windows 二进制包相同的 release/download 页面把上述 ZIP 作为
+sibling asset 发布。ZIP 包含已签名的原始源码归档、detached signature、LGPL
+许可、changes.diff 和 SOURCE-MANIFEST.txt；上游 URL 不能替代分发者提供完整
+对应源码的义务。
+
+替换与重新链接
+--------------
+
+FFmpeg 和 FreeRemoteDesk 插件保持动态链接。接收者可替换版本化 codec 目录中的
+兼容 LGPL DLL，并使用对应源码、changes.diff、固定 configure 参数和
+tools/build-ffmpeg-windows.ps1 重新构建 FFmpeg，再与未修改的客户端重新链接。
+替换后应重新生成 ffmpeg-manifest.json 的实际 SHA-256 并运行
+tools/verify-windows-package.ps1。专有分发不得移除、限制或以安装器策略阻止这些
+替换和重新链接权利。
+
+安装或卸载此可选后端只改变 Windows 客户端安装目录。FreeRemoteDesk 不会在 Mac
+服务端安装、运行或要求任何配套组件、守护进程、代理或 codec。

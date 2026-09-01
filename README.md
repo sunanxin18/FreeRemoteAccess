@@ -32,6 +32,17 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
 | HarmonyOS NEXT 手机/PC | ArkUI/HUKS 边界设计 | 触控/键鼠计划中 | 计划中 | 尚无 | **计划中**；不是 Android 兼容层，须单独完成 ArkUI、HUKS 和构建 POC |
 
+### 视频解码后端状态
+
+| 客户端平台/路径 | 状态 | 验证范围或阻塞点 |
+|---|---|---|
+| Windows native capability probe | **受限验证** | 2026-09-01 在单台 AMD Radeon 780M Windows 主机完成 D3D12 profile 探针；Main/Main10 报告 hardware exact，Main444 明确不可用。证据为 [`windows-video-capabilities-20260901.json`](docs/validation/windows-video-capabilities-20260901.json)，仅证明能力探针，不证明 native decoder 或远端会话首帧。 |
+| Windows FFmpeg 8.1.2 Main444 software backend | **已验证** | 固定签名源码构建的 LGPL 动态插件通过离线 Main444 fixture 精确解码；Windows package staging 会把三份 approved DLL 放入 `codecs/ffmpeg-8.1.2/windows-x86_64/`，并用 [`verify-windows-package.ps1`](tools/verify-windows-package.ps1) 校验实际 bytes、manifest、许可和无 shadow DLL。此状态只覆盖离线 fixture 与 package staging，不是安装器或 Apple HP 真机首帧证明。 |
+| Apple High Performance 真机首帧 | **开发中** | RTP/AU 与 decoder pipeline 已实现，但在 current generation 的 Main444 帧实际 present 前保持未就绪；Task 9 不提升真机首帧状态。 |
+| macOS / Linux native video backend | **计划中** | 尚无 native decoder、平台 shell 或 package 构建验证。 |
+| Android native video backend | **计划中** | 尚无 MediaCodec bridge、移动端 shell 或 package 构建验证。 |
+| HarmonyOS NEXT native video backend | **计划中** | 必须单独完成 ArkTS/ArkUI 与 native codec bridge POC；不是 Android 兼容层，当前不冒充 build 支持。 |
+
 ### 原生服务端目标
 
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |

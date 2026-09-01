@@ -1,0 +1,69 @@
+{
+  "schema": "freeremotedesk.windows.ffmpeg-package.v1",
+  "ffmpegVersion": "8.1.2",
+  "platform": "windows-x86_64",
+  "codecDirectory": "codecs/ffmpeg-8.1.2/windows-x86_64",
+  "libavcodecMajor": 62,
+  "source": {
+    "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+    "signatureUrl": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz.asc",
+    "archiveSha256": "464BEB5E7BF0C311E68B45AE2F04E9CC2AF88851ABB4082231742A74D97B524C",
+    "releaseFingerprint": "FCF986EA15E6E293A5644F10B4322F04D67658D8",
+    "configureArguments": [
+      "--arch=x86_64",
+      "--target-os=mingw32",
+      "--cross-prefix=x86_64-w64-mingw32-",
+      "--disable-static",
+      "--enable-shared",
+      "--disable-programs",
+      "--disable-doc",
+      "--disable-everything",
+      "--enable-decoder=hevc",
+      "--enable-parser=hevc",
+      "--enable-protocol=file",
+      "--disable-gpl",
+      "--disable-nonfree",
+      "--disable-version3",
+      "--disable-autodetect",
+      "--disable-network",
+      "--disable-x86asm",
+      "--disable-debug",
+      "--enable-stripping"
+    ]
+  },
+  "correspondingSource": {
+    "asset": "FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip",
+    "sha256": null,
+    "distribution": "sibling-release-asset",
+    "replaceInstructions": "可用兼容的 LGPL 动态库替换安装目录中版本化 codec 子目录的 DLL，并重新运行 package verifier。",
+    "relinkInstructions": "修改后的 FFmpeg 可按已发布的完整对应源码和固定 configure 参数重新构建，再与未修改的 FreeRemoteDesk 客户端重新链接。"
+  },
+  "buildProvenanceSha256": null,
+  "files": [
+    {
+      "path": "codecs/ffmpeg-8.1.2/windows-x86_64/avcodec-62.dll",
+      "role": "ffmpeg-libavcodec",
+      "sha256": null
+    },
+    {
+      "path": "codecs/ffmpeg-8.1.2/windows-x86_64/avutil-60.dll",
+      "role": "ffmpeg-libavutil",
+      "sha256": null
+    },
+    {
+      "path": "codecs/ffmpeg-8.1.2/windows-x86_64/freeremotedesk_ffmpeg.dll",
+      "role": "freeremotedesk-ffmpeg-plugin",
+      "sha256": null
+    },
+    {
+      "path": "licenses/FFmpeg-LGPL-2.1-or-later.txt",
+      "role": "license",
+      "sha256": null
+    },
+    {
+      "path": "licenses/FFmpeg-NOTICE.txt",
+      "role": "notice",
+      "sha256": null
+    }
+  ]
+}
