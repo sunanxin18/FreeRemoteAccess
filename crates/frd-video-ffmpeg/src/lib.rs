@@ -2,5 +2,7 @@
 
 pub mod abi;
 mod loader;
+#[cfg(windows)]
+mod trusted_path;
 
 pub use loader::FfmpegBackend;

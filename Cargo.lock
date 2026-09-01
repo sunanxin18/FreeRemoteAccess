@@ -2143,6 +2143,7 @@ dependencies = [
  "frd-core",
  "frd-media-api",
  "libloading",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -1,6 +1,8 @@
 use std::fmt;
-use std::mem::MaybeUninit;
-use std::path::{Component, Path, PathBuf};
+use std::mem;
+use std::path::Path;
+#[cfg(test)]
+use std::path::{Component, PathBuf};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
@@ -18,11 +20,16 @@ use libloading::{Library, Symbol};
 
 pub use crate::abi::FRD_FFMPEG_ABI_VERSION;
 use crate::abi::{
-    FrdByteSlice, FrdDecodedFrame, FrdDecoderHandle, FrdFfmpegApiV1, FrdGetFfmpegApiV1,
-    FrdOwnedBuffer, FrdStatus, FrdVideoConfig, FRD_BITSTREAM_ANNEX_B, FRD_CHROMA_YUV_444,
-    FRD_CODEC_HEVC, FRD_FFMPEG_API_SYMBOL, FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_444_P8,
+    FrdByteSlice, FrdCreateDecoderFn, FrdDecodedFrame, FrdDecoderHandle, FrdDestroyFn, FrdFlushFn,
+    FrdGetFfmpegApiV1, FrdOwnedBuffer, FrdReceiveFn, FrdReclaimFrameFn, FrdStatus, FrdSubmitFn,
+    FrdVideoConfig, RawFrdFfmpegApiV1, FRD_API_CONTRACT_REQUIRED, FRD_BITSTREAM_ANNEX_B,
+    FRD_CHROMA_YUV_444, FRD_CODEC_HEVC, FRD_FFMPEG_API_SYMBOL, FRD_FFMPEG_API_V1_ALIGNMENT,
+    FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_444_P8,
     FRD_PROFILE_HEVC_MAIN_444_8, FRD_SUBMIT_RANDOM_ACCESS,
 };
+
+const MAX_DECODE_FRAMES_PER_BATCH: usize = 8;
+const MAX_DECODE_BATCH_BYTES: usize = MAX_DECODED_VIDEO_FRAME_BYTES;
 
 /// 已通过固定路径、ABI 和 libavcodec 版本门禁的可选 FFmpeg backend。
 pub struct FfmpegBackend {
@@ -30,8 +37,20 @@ pub struct FfmpegBackend {
 }
 
 struct LoadedPlugin {
-    api: FrdFfmpegApiV1,
+    api: CallableFfmpegApiV1,
     _libraries: Vec<Library>,
+}
+
+#[derive(Clone, Copy)]
+struct CallableFfmpegApiV1 {
+    abi_version: u32,
+    avcodec_major: u32,
+    create_decoder: FrdCreateDecoderFn,
+    submit: FrdSubmitFn,
+    receive: FrdReceiveFn,
+    flush: FrdFlushFn,
+    destroy: FrdDestroyFn,
+    reclaim_frame: FrdReclaimFrameFn,
 }
 
 impl fmt::Debug for FfmpegBackend {
@@ -45,8 +64,40 @@ impl fmt::Debug for FfmpegBackend {
 }
 
 impl FfmpegBackend {
-    /// 只从应用目录下固定版本、固定平台子目录加载；失败只禁用该 backend。
-    pub fn load_from(application_dir: impl AsRef<Path>) -> Result<Self, VideoDecodeError> {
+    /// 从当前可执行文件目录下的固定、受信版本目录加载；失败只禁用该 backend。
+    pub fn load() -> Result<Self, VideoDecodeError> {
+        #[cfg(not(windows))]
+        {
+            return Err(backend_unavailable());
+        }
+
+        #[cfg(windows)]
+        {
+            let executable = std::env::current_exe().map_err(|_| backend_unavailable())?;
+            let application_dir = executable.parent().ok_or_else(backend_unavailable)?;
+            let trusted = crate::trusted_path::prepare(
+                application_dir,
+                platform_directory_name(),
+                ffmpeg_dependency_names(),
+                plugin_library_name(),
+            )
+            .map_err(|_| backend_unavailable())?;
+            let mut libraries = Vec::new();
+            for path in &trusted.dependencies {
+                libraries.push(open_library(path)?);
+            }
+            let plugin = open_library(&trusted.plugin)?;
+            let api = load_api(&plugin)?;
+            libraries.push(plugin);
+            Self::from_validated_api(api, libraries)
+        }
+    }
+
+    /// 测试专用路径注入，不执行生产受信 ACL/owner 门禁。
+    #[cfg(test)]
+    fn load_from_application_dir_for_test(
+        application_dir: impl AsRef<Path>,
+    ) -> Result<Self, VideoDecodeError> {
         let codec_dir = canonical_codec_dir(application_dir.as_ref())?;
         let mut libraries = Vec::new();
 
@@ -60,17 +111,13 @@ impl FfmpegBackend {
         let api = load_api(&plugin)?;
         libraries.push(plugin);
 
-        Self::from_api(api, libraries)
+        Self::from_validated_api(api, libraries)
     }
 
-    fn from_api(api: FrdFfmpegApiV1, libraries: Vec<Library>) -> Result<Self, VideoDecodeError> {
-        if api.abi_version != FRD_FFMPEG_ABI_VERSION
-            || api.avcodec_major != FRD_FFMPEG_AVCODEC_MAJOR
-        {
-            return Err(VideoDecodeError::new(
-                VideoDecodeErrorCode::BackendVersionMismatch,
-            ));
-        }
+    fn from_validated_api(
+        api: CallableFfmpegApiV1,
+        libraries: Vec<Library>,
+    ) -> Result<Self, VideoDecodeError> {
         Ok(Self {
             plugin: Arc::new(LoadedPlugin {
                 api,
@@ -80,9 +127,15 @@ impl FfmpegBackend {
     }
 
     #[cfg(test)]
-    fn from_api_for_test(api: FrdFfmpegApiV1) -> Result<Self, VideoDecodeError> {
-        Self::from_api(api, Vec::new())
+    fn from_raw_api_for_test(api: RawFrdFfmpegApiV1) -> Result<Self, VideoDecodeError> {
+        let api = validate_raw_api(api)?;
+        Self::from_validated_api(api, Vec::new())
     }
+}
+
+#[cfg(all(test, windows))]
+fn verify_trusted_install_chain(application_dir: &Path) -> Result<(), VideoDecodeError> {
+    crate::trusted_path::verify_install_root(application_dir).map_err(|_| backend_unavailable())
 }
 
 impl VideoCapabilityProvider for FfmpegBackend {
@@ -169,6 +222,7 @@ struct FfmpegDecoder {
     handle: SendDecoderHandle,
     config: VideoStreamConfig,
     emitted_frame: bool,
+    pending_frame: Option<DecodedVideoFrame>,
 }
 
 /// The plugin ABI gives exclusive ownership of a decoder handle to the caller and permits moving
@@ -191,33 +245,58 @@ impl FfmpegDecoder {
             handle,
             config,
             emitted_frame: false,
+            pending_frame: None,
         })
     }
 
     fn receive_frames(&mut self) -> Result<Box<[DecodedVideoFrame]>, VideoDecodeError> {
-        const MAX_FRAMES_PER_CALL: usize = 64;
+        self.receive_frames_with_limits(MAX_DECODE_FRAMES_PER_BATCH, MAX_DECODE_BATCH_BYTES)
+    }
 
+    fn receive_frames_with_limits(
+        &mut self,
+        max_frames: usize,
+        max_bytes: usize,
+    ) -> Result<Box<[DecodedVideoFrame]>, VideoDecodeError> {
         let mut frames = Vec::new();
-        for _ in 0..MAX_FRAMES_PER_CALL {
-            let mut raw_frame = MaybeUninit::<FrdDecodedFrame>::uninit();
-            // SAFETY: the handle is exclusively owned, the plugin is retained, and `receive`
-            // initializes the complete output only when it returns `OK`.
-            let status =
-                unsafe { (self.plugin.api.receive)(self.handle.0, raw_frame.as_mut_ptr()) };
+        let mut batch_bytes = 0usize;
+        if let Some(frame) = self.pending_frame.take() {
+            batch_bytes = decoded_frame_bytes(&frame);
+            frames.push(frame);
+        }
+
+        while frames.len() < max_frames {
+            let mut raw_frame = FrdDecodedFrame::default();
+            // SAFETY: output storage is host-owned and zeroed. The validated ABI requires
+            // `reclaim_frame` to accept this storage after every status, including partial error.
+            let status = unsafe { (self.plugin.api.receive)(self.handle.0, &mut raw_frame) };
+            let raw_frame = ReceivedFrameGuard {
+                api: self.plugin.api,
+                handle: self.handle.0,
+                frame: raw_frame,
+            };
             if status == FrdStatus::NEED_MORE_DATA || status == FrdStatus::END_OF_STREAM {
                 return Ok(frames.into_boxed_slice());
             }
             if status != FrdStatus::OK {
                 return Err(self.decode_error());
             }
-            // SAFETY: `OK` is the ABI guarantee that every field of `FrdDecodedFrame` was written.
-            let raw_frame = unsafe { raw_frame.assume_init() };
-            let frame = convert_frame(&self.config, raw_frame)?;
+            let frame = convert_frame(&self.config, &raw_frame.frame)?;
+            let frame_bytes = decoded_frame_bytes(&frame);
+            if !frames.is_empty()
+                && !frame_fits_decode_batch_with_limit(batch_bytes, frame_bytes, max_bytes)
+            {
+                self.pending_frame = Some(frame);
+                return Ok(frames.into_boxed_slice());
+            }
+            batch_bytes = batch_bytes
+                .checked_add(frame_bytes)
+                .ok_or_else(|| self.decode_error())?;
             self.emitted_frame = true;
             frames.push(frame);
         }
 
-        Err(self.decode_error())
+        Ok(frames.into_boxed_slice())
     }
 
     fn decode_error(&self) -> VideoDecodeError {
@@ -293,8 +372,33 @@ impl VideoDecoder for FfmpegDecoder {
         self.handle = next_handle;
         self.config = next_config;
         self.emitted_frame = false;
+        self.pending_frame = None;
         Ok(())
     }
+}
+
+fn decoded_frame_bytes(frame: &DecodedVideoFrame) -> usize {
+    frame
+        .as_input()
+        .planes
+        .iter()
+        .map(|plane| plane.bytes().len())
+        .sum()
+}
+
+#[cfg(test)]
+fn frame_fits_decode_batch(current_bytes: usize, next_frame_bytes: usize) -> bool {
+    frame_fits_decode_batch_with_limit(current_bytes, next_frame_bytes, MAX_DECODE_BATCH_BYTES)
+}
+
+fn frame_fits_decode_batch_with_limit(
+    current_bytes: usize,
+    next_frame_bytes: usize,
+    max_bytes: usize,
+) -> bool {
+    current_bytes
+        .checked_add(next_frame_bytes)
+        .is_some_and(|total| total <= max_bytes)
 }
 
 impl Drop for FfmpegDecoder {
@@ -305,7 +409,7 @@ impl Drop for FfmpegDecoder {
 }
 
 fn create_decoder_handle(
-    api: FrdFfmpegApiV1,
+    api: CallableFfmpegApiV1,
     config: &VideoStreamConfig,
 ) -> Result<SendDecoderHandle, VideoDecodeError> {
     let raw_config = abi_video_config(config);
@@ -313,7 +417,17 @@ fn create_decoder_handle(
     // SAFETY: every pointer in `raw_config` borrows validated `config` storage for this call. The
     // ABI requires the plugin to copy any configuration bytes it retains.
     let status = unsafe { (api.create_decoder)(&raw_config, &mut handle) };
-    if status != FrdStatus::OK || handle.is_null() {
+    if status != FrdStatus::OK {
+        if !handle.is_null() {
+            // SAFETY: the validated CREATE_NON_NULL_OWNED contract makes every non-null output
+            // host-owned and destroyable even when create returns an error.
+            unsafe { (api.destroy)(handle) };
+        }
+        return Err(VideoDecodeError::new(
+            VideoDecodeErrorCode::DecoderCreationFailed,
+        ));
+    }
+    if handle.is_null() {
         return Err(VideoDecodeError::new(
             VideoDecodeErrorCode::DecoderCreationFailed,
         ));
@@ -347,15 +461,15 @@ fn byte_slice(bytes: &[u8]) -> FrdByteSlice {
 
 fn convert_frame(
     config: &VideoStreamConfig,
-    raw_frame: FrdDecodedFrame,
+    raw_frame: &FrdDecodedFrame,
 ) -> Result<DecodedVideoFrame, VideoDecodeError> {
-    let buffers = raw_frame.planes.map(|plane| PluginPlaneBuffer { plane });
-    validate_raw_frame_layout(config, &raw_frame)?;
+    validate_raw_frame_layout(config, raw_frame)?;
     let timestamp_ticks = u64::try_from(raw_frame.timestamp_ticks)
         .map_err(|_| VideoDecodeError::new(VideoDecodeErrorCode::DecodedFrameLayoutInvalid))?;
-    let planes = buffers
+    let planes = raw_frame
+        .planes
         .iter()
-        .map(PluginPlaneBuffer::copy_plane)
+        .map(copy_plugin_plane)
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
     let input = config.as_input();
@@ -391,7 +505,6 @@ fn validate_raw_frame_layout(
             || plane.stride_bytes < plane.width
             || plane.buffer.data.is_null()
             || plane.buffer.len == 0
-            || plane.buffer.release.is_none()
         {
             return Err(invalid());
         }
@@ -412,51 +525,37 @@ fn validate_raw_frame_layout(
     Ok(())
 }
 
-struct PluginPlaneBuffer {
-    plane: crate::abi::FrdDecodedPlane,
+struct ReceivedFrameGuard {
+    api: CallableFfmpegApiV1,
+    handle: FrdDecoderHandle,
+    frame: FrdDecodedFrame,
 }
 
-impl PluginPlaneBuffer {
-    fn copy_plane(&self) -> Result<VideoPlane, VideoDecodeError> {
-        let FrdOwnedBuffer {
-            data, len, release, ..
-        } = self.plane.buffer;
-        if data.is_null() || len == 0 || len > MAX_DECODED_VIDEO_FRAME_BYTES || release.is_none() {
-            return Err(VideoDecodeError::new(
-                VideoDecodeErrorCode::DecodedFrameLayoutInvalid,
-            ));
-        }
-        // SAFETY: an `OK` frame guarantees that `data..data+len` is readable until its matching
-        // release callback is invoked. Length is bounded before constructing the slice.
-        let bytes = unsafe { slice::from_raw_parts(data, len) }
-            .to_vec()
-            .into_boxed_slice();
-        VideoPlane::try_new(
-            self.plane.width,
-            self.plane.height,
-            self.plane.stride_bytes,
-            bytes,
-        )
-        .map_err(|_| VideoDecodeError::new(VideoDecodeErrorCode::DecodedFrameLayoutInvalid))
-    }
-}
-
-impl Drop for PluginPlaneBuffer {
+impl Drop for ReceivedFrameGuard {
     fn drop(&mut self) {
-        if let Some(release) = self.plane.buffer.release {
-            // SAFETY: the callback and context originate with this exact buffer. This guard owns
-            // the one required release and runs after any product-side copy attempt.
-            unsafe {
-                release(
-                    self.plane.buffer.release_context,
-                    self.plane.buffer.data,
-                    self.plane.buffer.len,
-                )
-            };
-        }
+        // SAFETY: the validated contract requires this callback to reclaim host-zeroed, partial,
+        // successful and error outputs. This guard is created once per receive and drops once.
+        unsafe { (self.api.reclaim_frame)(self.handle, &mut self.frame) };
     }
 }
 
+fn copy_plugin_plane(plane: &crate::abi::FrdDecodedPlane) -> Result<VideoPlane, VideoDecodeError> {
+    let FrdOwnedBuffer { data, len } = plane.buffer;
+    if data.is_null() || len == 0 || len > MAX_DECODED_VIDEO_FRAME_BYTES {
+        return Err(VideoDecodeError::new(
+            VideoDecodeErrorCode::DecodedFrameLayoutInvalid,
+        ));
+    }
+    // SAFETY: validated layout guarantees `data..data+len` is readable until the enclosing
+    // receive guard invokes the plugin's frame-level reclaim callback.
+    let bytes = unsafe { slice::from_raw_parts(data, len) }
+        .to_vec()
+        .into_boxed_slice();
+    VideoPlane::try_new(plane.width, plane.height, plane.stride_bytes, bytes)
+        .map_err(|_| VideoDecodeError::new(VideoDecodeErrorCode::DecodedFrameLayoutInvalid))
+}
+
+#[cfg(test)]
 fn canonical_codec_dir(application_dir: &Path) -> Result<PathBuf, VideoDecodeError> {
     if !application_dir.is_absolute()
         || application_dir
@@ -483,6 +582,7 @@ fn canonical_codec_dir(application_dir: &Path) -> Result<PathBuf, VideoDecodeErr
     Ok(codec_dir)
 }
 
+#[cfg(test)]
 fn canonical_library_path(codec_dir: &Path, name: &str) -> Result<PathBuf, VideoDecodeError> {
     let path = codec_dir
         .join(name)
@@ -494,7 +594,7 @@ fn canonical_library_path(codec_dir: &Path, name: &str) -> Result<PathBuf, Video
     Ok(path)
 }
 
-fn load_api(plugin: &Library) -> Result<FrdFfmpegApiV1, VideoDecodeError> {
+fn load_api(plugin: &Library) -> Result<CallableFfmpegApiV1, VideoDecodeError> {
     // SAFETY: `plugin` remains loaded while the symbol is read. The symbol name and function
     // signature are the versioned FreeRemoteDesk plugin ABI, and the returned table is copied
     // before the temporary `Symbol` borrow ends.
@@ -503,26 +603,58 @@ fn load_api(plugin: &Library) -> Result<FrdFfmpegApiV1, VideoDecodeError> {
             .get(FRD_FFMPEG_API_SYMBOL)
             .map_err(|_| backend_unavailable())?
     };
-    // SAFETY: a plugin from the canonical product codec directory owns this versioned export.
-    // A null pointer means its native codec prerequisites are unavailable. The ABI version is
-    // the first field and the table has static plugin lifetime by contract.
-    let api = unsafe { get_api() };
-    if api.is_null() {
+    let mut raw_api = RawFrdFfmpegApiV1::default();
+    // SAFETY: the host owns correctly aligned, zeroed storage of exactly the advertised size.
+    // The getter contract forbids writes beyond `output_size`; all output fields are integers, so
+    // partial or arbitrary C writes remain valid Rust data until explicit validation below.
+    let status = unsafe { get_api(&mut raw_api, mem::size_of::<RawFrdFfmpegApiV1>()) };
+    if status != FrdStatus::OK {
         return Err(backend_unavailable());
     }
-    // Read the leading version word before the full table so an older or newer layout is never
-    // interpreted as `FrdFfmpegApiV1`.
-    // SAFETY: the versioned export contract requires every non-null result to expose at least its
-    // leading `u32` ABI version for negotiation.
-    let abi_version = unsafe { api.cast::<u32>().read() };
-    if abi_version != FRD_FFMPEG_ABI_VERSION {
+    validate_raw_api(raw_api)
+}
+
+fn validate_raw_api(raw: RawFrdFfmpegApiV1) -> Result<CallableFfmpegApiV1, VideoDecodeError> {
+    if raw.struct_size != FRD_FFMPEG_API_V1_SIZE
+        || raw.struct_alignment != FRD_FFMPEG_API_V1_ALIGNMENT
+        || raw.abi_version != FRD_FFMPEG_ABI_VERSION
+        || raw.avcodec_major != FRD_FFMPEG_AVCODEC_MAJOR
+        || raw.contract_flags & FRD_API_CONTRACT_REQUIRED != FRD_API_CONTRACT_REQUIRED
+        || raw.reserved != 0
+        || raw.create_decoder == 0
+        || raw.submit == 0
+        || raw.receive == 0
+        || raw.flush == 0
+        || raw.destroy == 0
+        || raw.reclaim_frame == 0
+    {
         return Err(VideoDecodeError::new(
             VideoDecodeErrorCode::BackendVersionMismatch,
         ));
     }
-    // SAFETY: after the leading version matches, the export contract guarantees an immutable
-    // static `FrdFfmpegApiV1`. The library handle is retained for all copied function pointers.
-    Ok(unsafe { api.read() })
+
+    const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdCreateDecoderFn>());
+    const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdSubmitFn>());
+    const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdReceiveFn>());
+    const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdFlushFn>());
+    const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdDestroyFn>());
+    const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdReclaimFrameFn>());
+
+    // SAFETY: every slot is a non-zero `uintptr_t` written by the trusted, version-matched plugin
+    // getter. Size/alignment/contract validation completed before any integer is converted into a
+    // callable Rust value. The plugin image is retained for the lifetime of these pointers.
+    Ok(unsafe {
+        CallableFfmpegApiV1 {
+            abi_version: raw.abi_version,
+            avcodec_major: raw.avcodec_major,
+            create_decoder: mem::transmute::<usize, FrdCreateDecoderFn>(raw.create_decoder),
+            submit: mem::transmute::<usize, FrdSubmitFn>(raw.submit),
+            receive: mem::transmute::<usize, FrdReceiveFn>(raw.receive),
+            flush: mem::transmute::<usize, FrdFlushFn>(raw.flush),
+            destroy: mem::transmute::<usize, FrdDestroyFn>(raw.destroy),
+            reclaim_frame: mem::transmute::<usize, FrdReclaimFrameFn>(raw.reclaim_frame),
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -533,8 +665,9 @@ fn open_library(path: &Path) -> Result<Library, VideoDecodeError> {
     };
 
     let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
-    // SAFETY: the path was canonicalized beneath the product codec directory. These flags make
-    // LoadLibraryExW resolve adjacent FFmpeg dependencies and trusted default directories only.
+    // SAFETY: the production path is canonical, handle-identity checked, non-reparse, and held
+    // open beneath a trusted install chain. These flags resolve adjacent FFmpeg dependencies and
+    // trusted default directories only.
     unsafe { WindowsLibrary::load_with_flags(path, flags) }
         .map(Into::into)
         .map_err(|_| backend_unavailable())
@@ -544,8 +677,9 @@ fn open_library(path: &Path) -> Result<Library, VideoDecodeError> {
 fn open_library(path: &Path) -> Result<Library, VideoDecodeError> {
     use libloading::os::unix::{Library as UnixLibrary, RTLD_LOCAL, RTLD_NOW};
 
-    // SAFETY: the path was canonicalized beneath the product codec directory. RTLD_NOW fails
-    // before registration on unresolved symbols and RTLD_LOCAL prevents global symbol export.
+    // SAFETY: the production path is canonical, identity checked, non-symlink, and rooted under
+    // non-writable system-owned ancestors. RTLD_NOW fails on unresolved symbols and RTLD_LOCAL
+    // prevents global symbol export.
     unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_LOCAL) }
         .map(Into::into)
         .map_err(|_| backend_unavailable())
@@ -653,6 +787,7 @@ mod tests {
     use std::ffi::c_void;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use frd_core::{PixelRect, PixelSize, SessionId};
     use frd_media_api::{
@@ -665,20 +800,71 @@ mod tests {
     };
 
     use crate::abi::{
-        FrdDecodedFrame, FrdDecodedPlane, FrdDecoderHandle, FrdFfmpegApiV1, FrdOwnedBuffer,
-        FrdStatus, FrdVideoConfig, FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_444_P8,
+        FrdDecodedFrame, FrdDecodedPlane, FrdDecoderHandle, FrdOwnedBuffer, FrdStatus,
+        FrdVideoConfig, RawFrdFfmpegApiV1, FRD_API_CONTRACT_REQUIRED, FRD_FFMPEG_API_V1_ALIGNMENT,
+        FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_444_P8,
     };
 
-    use super::{validate_raw_frame_layout, FfmpegBackend, FRD_FFMPEG_ABI_VERSION};
+    #[cfg(windows)]
+    use super::verify_trusted_install_chain;
+    use super::{
+        frame_fits_decode_batch, validate_raw_frame_layout, FfmpegBackend, FfmpegDecoder,
+        FRD_FFMPEG_ABI_VERSION, MAX_DECODE_BATCH_BYTES,
+    };
 
     #[test]
     fn missing_plugin_is_backend_unavailable_not_process_failure() {
-        let result = FfmpegBackend::load_from(test_dir("missing"));
+        let result = FfmpegBackend::load_from_application_dir_for_test(test_dir("missing"));
 
         assert_eq!(
             result.expect_err("缺失插件必须失败关闭").code(),
             VideoDecodeErrorCode::BackendUnavailable
         );
+    }
+
+    #[test]
+    fn production_loader_is_bound_to_the_current_executable_directory() {
+        let result = FfmpegBackend::load();
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.code() == VideoDecodeErrorCode::BackendUnavailable
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_public_loader_fails_closed_until_a_platform_trust_adapter_exists() {
+        assert_eq!(
+            FfmpegBackend::load()
+                .expect_err("非 Windows 尚无受信安装 adapter")
+                .code(),
+            VideoDecodeErrorCode::BackendUnavailable
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn writable_test_directory_is_not_a_trusted_install_chain() {
+        let root = test_dir("untrusted-install-root");
+        std::fs::create_dir_all(&root).expect("测试目录应创建");
+
+        let result = verify_trusted_install_chain(&root);
+
+        assert_eq!(
+            result.expect_err("当前用户可写目录必须拒绝").code(),
+            VideoDecodeErrorCode::BackendUnavailable
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_directory_satisfies_the_trusted_owner_and_acl_policy() {
+        let system_root = std::env::var_os("SystemRoot").expect("Windows 必须提供 SystemRoot");
+        let system_directory = PathBuf::from(system_root).join("System32");
+
+        verify_trusted_install_chain(&system_directory)
+            .expect("System32 应满足受信 owner/DACL 门禁");
     }
 
     #[test]
@@ -696,7 +882,7 @@ mod tests {
         let mut api = fake_api(FRD_FFMPEG_ABI_VERSION);
         api.avcodec_major = FRD_FFMPEG_AVCODEC_MAJOR + 1;
 
-        let result = FfmpegBackend::from_api_for_test(api);
+        let result = FfmpegBackend::from_raw_api_for_test(api);
 
         assert_eq!(
             result.expect_err("不兼容 libavcodec 必须拒绝").code(),
@@ -705,8 +891,52 @@ mod tests {
     }
 
     #[test]
+    fn raw_api_rejects_every_null_required_callback_before_typed_conversion() {
+        for callback_index in 0..6 {
+            let mut api = compatible_raw_api();
+            match callback_index {
+                0 => api.create_decoder = 0,
+                1 => api.submit = 0,
+                2 => api.receive = 0,
+                3 => api.flush = 0,
+                4 => api.destroy = 0,
+                5 => api.reclaim_frame = 0,
+                _ => unreachable!(),
+            }
+
+            let result = FfmpegBackend::from_raw_api_for_test(api);
+
+            assert_eq!(
+                result.expect_err("required callback 为空必须拒绝").code(),
+                VideoDecodeErrorCode::BackendVersionMismatch,
+                "callback index {callback_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_api_rejects_size_alignment_and_threading_contract_mismatch() {
+        let mut wrong_size = compatible_raw_api();
+        wrong_size.struct_size -= 1;
+        let mut wrong_alignment = compatible_raw_api();
+        wrong_alignment.struct_alignment *= 2;
+        let mut missing_contract = compatible_raw_api();
+        missing_contract.contract_flags = 0;
+
+        for api in [wrong_size, wrong_alignment, missing_contract] {
+            let result = FfmpegBackend::from_raw_api_for_test(api);
+            assert_eq!(
+                result
+                    .expect_err("ABI header/contract 不匹配必须拒绝")
+                    .code(),
+                VideoDecodeErrorCode::BackendVersionMismatch
+            );
+        }
+    }
+
+    #[test]
     fn relative_application_directory_is_rejected_without_searching_current_directory() {
-        let result = FfmpegBackend::load_from(PathBuf::from("codecs"));
+        let result = FfmpegBackend::load_from_application_dir_for_test(PathBuf::from("codecs"));
 
         assert_eq!(
             result.expect_err("相对目录必须拒绝").code(),
@@ -719,7 +949,7 @@ mod tests {
         let base = test_dir("parent-traversal");
         let traversing = base.join("child").join("..");
 
-        let result = FfmpegBackend::load_from(traversing);
+        let result = FfmpegBackend::load_from_application_dir_for_test(traversing);
 
         assert_eq!(
             result.expect_err("包含父目录遍历的路径必须拒绝").code(),
@@ -764,10 +994,29 @@ mod tests {
     }
 
     #[test]
+    fn non_ok_create_with_non_null_handle_is_destroyed_exactly_once() {
+        CREATE_FAILURE_DESTROY_COUNT.store(0, Ordering::SeqCst);
+        let mut api = compatible_raw_api();
+        api.create_decoder = failing_create_with_handle as *const () as usize;
+        api.destroy = destroy_failed_create_handle as *const () as usize;
+        let backend = FfmpegBackend::from_raw_api_for_test(api).expect("兼容 fake API 应加载");
+
+        let result = backend.create(&main444_config());
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.code() == VideoDecodeErrorCode::DecoderCreationFailed
+        ));
+        assert_eq!(CREATE_FAILURE_DESTROY_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn received_planes_are_released_by_the_originating_plugin_callbacks() {
+        let _guard = FAKE_FRAME_TEST_LOCK.lock().expect("fake frame 测试锁有效");
         RELEASE_COUNT.store(0, Ordering::SeqCst);
-        let backend =
-            FfmpegBackend::from_api_for_test(ready_fake_api()).expect("兼容 fake plugin 应可加载");
+        FRAME_RECLAIM_CALL_COUNT.store(0, Ordering::SeqCst);
+        let backend = FfmpegBackend::from_raw_api_for_test(ready_fake_api())
+            .expect("兼容 fake plugin 应可加载");
         let config = main444_config();
         let input = config.as_input();
         let access_unit = EncodedVideoAccessUnit::try_new(
@@ -787,6 +1036,63 @@ mod tests {
 
         assert!(matches!(outcome, DecodeOutcome::Frames(ref frames) if frames.len() == 1));
         assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 3);
+        assert_eq!(FRAME_RECLAIM_CALL_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn validation_failure_reclaims_partial_frame_exactly_once() {
+        assert_partial_frame_reclaimed_once(
+            receive_malformed_partial_frame,
+            VideoDecodeErrorCode::DecodedFrameLayoutInvalid,
+        );
+    }
+
+    #[test]
+    fn plugin_receive_error_reclaims_partial_frame_exactly_once() {
+        assert_partial_frame_reclaimed_once(
+            receive_error_with_partial_frame,
+            VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
+        );
+    }
+
+    #[test]
+    fn frame_count_cap_returns_valid_batch_and_leaves_output_for_next_drain() {
+        let _guard = FAKE_FRAME_TEST_LOCK.lock().expect("fake frame 测试锁有效");
+        let backend =
+            FfmpegBackend::from_raw_api_for_test(burst_fake_api()).expect("兼容 burst API 应加载");
+        let config = main444_config();
+        let mut decoder = backend.create(&config).expect("burst decoder 应创建");
+
+        let first = decoder
+            .submit(test_access_unit(&config))
+            .expect("达到 cap 应返回有效批次");
+        let second = decoder.flush().expect("下一次 drain 应取回余下帧");
+
+        assert!(matches!(first, DecodeOutcome::Frames(ref frames) if frames.len() == 8));
+        assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_batch_byte_budget_defers_overflowing_frame() {
+        assert!(frame_fits_decode_batch(MAX_DECODE_BATCH_BYTES - 5, 5));
+        assert!(!frame_fits_decode_batch(MAX_DECODE_BATCH_BYTES - 5, 6));
+        assert!(!frame_fits_decode_batch(usize::MAX, 1));
+
+        let _guard = FAKE_FRAME_TEST_LOCK.lock().expect("fake frame 测试锁有效");
+        let backend =
+            FfmpegBackend::from_raw_api_for_test(burst_fake_api()).expect("兼容 burst API 应加载");
+        let mut decoder = FfmpegDecoder::create(Arc::clone(&backend.plugin), main444_config())
+            .expect("burst decoder 应创建");
+
+        let first = decoder
+            .receive_frames_with_limits(8, 12)
+            .expect("首个 12-byte frame 应返回");
+        let second = decoder
+            .receive_frames_with_limits(8, 12)
+            .expect("超预算 frame 应留待下一次 drain");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
     }
 
     #[test]
@@ -799,8 +1105,6 @@ mod tests {
             buffer: FrdOwnedBuffer {
                 data: std::ptr::NonNull::<u8>::dangling().as_ptr(),
                 len: oversized_half,
-                release: Some(stub_release),
-                release_context: std::ptr::null_mut(),
             },
         };
         let frame = FrdDecodedFrame {
@@ -821,38 +1125,84 @@ mod tests {
     fn load_fake_plugin_with_abi(
         abi_version: u32,
     ) -> Result<FfmpegBackend, frd_media_api::VideoDecodeError> {
-        FfmpegBackend::from_api_for_test(fake_api(abi_version))
+        FfmpegBackend::from_raw_api_for_test(fake_api(abi_version))
     }
 
-    fn fake_api(abi_version: u32) -> FrdFfmpegApiV1 {
-        FrdFfmpegApiV1 {
-            abi_version,
-            avcodec_major: FRD_FFMPEG_AVCODEC_MAJOR,
-            create_decoder: stub_create,
-            submit: stub_submit,
-            receive: stub_receive,
-            flush: stub_flush,
-            destroy: stub_destroy,
-        }
+    fn fake_api(abi_version: u32) -> RawFrdFfmpegApiV1 {
+        let mut api = compatible_raw_api();
+        api.abi_version = abi_version;
+        api
     }
 
-    fn ready_fake_api() -> FrdFfmpegApiV1 {
-        FrdFfmpegApiV1 {
+    fn compatible_raw_api() -> RawFrdFfmpegApiV1 {
+        RawFrdFfmpegApiV1 {
+            struct_size: FRD_FFMPEG_API_V1_SIZE,
+            struct_alignment: FRD_FFMPEG_API_V1_ALIGNMENT,
             abi_version: FRD_FFMPEG_ABI_VERSION,
             avcodec_major: FRD_FFMPEG_AVCODEC_MAJOR,
-            create_decoder: fake_create,
-            submit: fake_submit,
-            receive: fake_receive,
-            flush: stub_flush,
-            destroy: fake_destroy,
+            contract_flags: FRD_API_CONTRACT_REQUIRED,
+            reserved: 0,
+            create_decoder: stub_create as *const () as usize,
+            submit: stub_submit as *const () as usize,
+            receive: stub_receive as *const () as usize,
+            flush: stub_flush as *const () as usize,
+            destroy: stub_destroy as *const () as usize,
+            reclaim_frame: stub_reclaim_frame as *const () as usize,
         }
+    }
+
+    fn ready_fake_api() -> RawFrdFfmpegApiV1 {
+        let mut api = compatible_raw_api();
+        api.create_decoder = fake_create as *const () as usize;
+        api.submit = fake_submit as *const () as usize;
+        api.receive = fake_receive as *const () as usize;
+        api.destroy = fake_destroy as *const () as usize;
+        api.reclaim_frame = fake_reclaim_frame as *const () as usize;
+        api
+    }
+
+    fn burst_fake_api() -> RawFrdFfmpegApiV1 {
+        let mut api = ready_fake_api();
+        api.create_decoder = burst_create as *const () as usize;
+        api.submit = burst_submit as *const () as usize;
+        api.receive = burst_receive as *const () as usize;
+        api.destroy = burst_destroy as *const () as usize;
+        api
     }
 
     struct FakeDecoderState {
         emitted: bool,
     }
 
+    struct BurstDecoderState {
+        remaining: usize,
+    }
+
     static RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_RECLAIM_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static FAKE_FRAME_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CREATE_FAILURE_DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn failing_create_with_handle(
+        _config: *const FrdVideoConfig,
+        handle: *mut FrdDecoderHandle,
+    ) -> FrdStatus {
+        if handle.is_null() {
+            return FrdStatus::INVALID_ARGUMENT;
+        }
+        let allocation = Box::new(7_u8);
+        // SAFETY: checked out pointer; ownership transfers to required destroy-on-non-null rule.
+        unsafe { handle.write(Box::into_raw(allocation).cast::<c_void>()) };
+        FrdStatus::DECODE_FAILED
+    }
+
+    unsafe extern "C" fn destroy_failed_create_handle(handle: FrdDecoderHandle) {
+        if !handle.is_null() {
+            // SAFETY: handle came from `failing_create_with_handle` and must be reclaimed once.
+            drop(unsafe { Box::from_raw(handle.cast::<u8>()) });
+            CREATE_FAILURE_DESTROY_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     unsafe extern "C" fn fake_create(
         _config: *const FrdVideoConfig,
@@ -865,6 +1215,60 @@ mod tests {
         // SAFETY: the out pointer was checked and the allocation is transferred to `fake_destroy`.
         unsafe { handle.write(Box::into_raw(state).cast::<c_void>()) };
         FrdStatus::OK
+    }
+
+    unsafe extern "C" fn burst_create(
+        _config: *const FrdVideoConfig,
+        handle: *mut FrdDecoderHandle,
+    ) -> FrdStatus {
+        if handle.is_null() {
+            return FrdStatus::INVALID_ARGUMENT;
+        }
+        let state = Box::new(BurstDecoderState { remaining: 10 });
+        // SAFETY: checked out pointer; allocation ownership transfers to `burst_destroy`.
+        unsafe { handle.write(Box::into_raw(state).cast::<c_void>()) };
+        FrdStatus::OK
+    }
+
+    unsafe extern "C" fn burst_submit(
+        _handle: FrdDecoderHandle,
+        _data: *const u8,
+        _len: usize,
+        _timestamp: i64,
+        _flags: u32,
+    ) -> FrdStatus {
+        FrdStatus::OK
+    }
+
+    unsafe extern "C" fn burst_receive(
+        handle: FrdDecoderHandle,
+        frame: *mut FrdDecodedFrame,
+    ) -> FrdStatus {
+        if handle.is_null() || frame.is_null() {
+            return FrdStatus::INVALID_ARGUMENT;
+        }
+        // SAFETY: exclusive state came from `burst_create`.
+        let state = unsafe { &mut *handle.cast::<BurstDecoderState>() };
+        if state.remaining == 0 {
+            return FrdStatus::NEED_MORE_DATA;
+        }
+        state.remaining -= 1;
+        let output = FrdDecodedFrame {
+            timestamp_ticks: (10 - state.remaining) as i64,
+            pixel_format: FRD_PIXEL_FORMAT_YUV_444_P8,
+            plane_count: 3,
+            planes: [fake_plane(0x10), fake_plane(0x80), fake_plane(0x80)],
+        };
+        // SAFETY: caller supplied host-owned writable output.
+        unsafe { frame.write(output) };
+        FrdStatus::OK
+    }
+
+    unsafe extern "C" fn burst_destroy(handle: FrdDecoderHandle) {
+        if !handle.is_null() {
+            // SAFETY: allocation came from `burst_create` and is destroyed once.
+            drop(unsafe { Box::from_raw(handle.cast::<BurstDecoderState>()) });
+        }
     }
 
     unsafe extern "C" fn fake_submit(
@@ -909,25 +1313,118 @@ mod tests {
     }
 
     fn fake_plane(value: u8) -> FrdDecodedPlane {
-        let allocation = Box::new(vec![value; 4]);
-        let data = allocation.as_ptr();
+        let allocation = vec![value; 4].into_boxed_slice();
+        let len = allocation.len();
+        let data = Box::into_raw(allocation).cast::<u8>();
         FrdDecodedPlane {
             width: 2,
             height: 2,
             stride_bytes: 2,
-            buffer: FrdOwnedBuffer {
-                data,
-                len: allocation.len(),
-                release: Some(fake_release),
-                release_context: Box::into_raw(allocation).cast::<c_void>(),
-            },
+            buffer: FrdOwnedBuffer { data, len },
         }
     }
 
-    unsafe extern "C" fn fake_release(context: *mut c_void, _data: *const u8, _len: usize) {
-        // SAFETY: `fake_plane` transfers exactly one `Box<Vec<u8>>` into this callback context.
-        drop(unsafe { Box::from_raw(context.cast::<Vec<u8>>()) });
-        RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
+    unsafe extern "C" fn fake_reclaim_frame(
+        _handle: FrdDecoderHandle,
+        frame: *mut FrdDecodedFrame,
+    ) {
+        if frame.is_null() {
+            return;
+        }
+        FRAME_RECLAIM_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: host supplies writable frame storage. Every non-null plane was allocated by
+        // `fake_plane`; clearing it makes this callback idempotent for partial/zero output.
+        for plane in unsafe { &mut (*frame).planes } {
+            if !plane.buffer.data.is_null() && plane.buffer.len != 0 {
+                let allocation = std::ptr::slice_from_raw_parts_mut(
+                    plane.buffer.data.cast_mut(),
+                    plane.buffer.len,
+                );
+                drop(unsafe { Box::from_raw(allocation) });
+                plane.buffer = FrdOwnedBuffer::default();
+                RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn assert_partial_frame_reclaimed_once(
+        receive: unsafe extern "C" fn(FrdDecoderHandle, *mut FrdDecodedFrame) -> FrdStatus,
+        expected_error: VideoDecodeErrorCode,
+    ) {
+        let _guard = FAKE_FRAME_TEST_LOCK.lock().expect("fake frame 测试锁有效");
+        RELEASE_COUNT.store(0, Ordering::SeqCst);
+        FRAME_RECLAIM_CALL_COUNT.store(0, Ordering::SeqCst);
+        let mut api = ready_fake_api();
+        api.receive = receive as *const () as usize;
+        let backend = FfmpegBackend::from_raw_api_for_test(api).expect("兼容 fake API 应加载");
+        let config = main444_config();
+        let access_unit = test_access_unit(&config);
+        let mut decoder = backend.create(&config).expect("fake decoder 应可创建");
+
+        let result = decoder.submit(access_unit);
+
+        assert!(matches!(result, Err(ref error) if error.code() == expected_error));
+        assert_eq!(FRAME_RECLAIM_CALL_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    unsafe extern "C" fn receive_malformed_partial_frame(
+        _handle: FrdDecoderHandle,
+        frame: *mut FrdDecodedFrame,
+    ) -> FrdStatus {
+        if frame.is_null() {
+            return FrdStatus::INVALID_ARGUMENT;
+        }
+        let output = FrdDecodedFrame {
+            timestamp_ticks: 1,
+            pixel_format: FRD_PIXEL_FORMAT_YUV_444_P8,
+            plane_count: 1,
+            planes: [
+                fake_plane(0x10),
+                FrdDecodedPlane::default(),
+                FrdDecodedPlane::default(),
+            ],
+        };
+        // SAFETY: caller provided host-owned writable output storage.
+        unsafe { frame.write(output) };
+        FrdStatus::OK
+    }
+
+    unsafe extern "C" fn receive_error_with_partial_frame(
+        _handle: FrdDecoderHandle,
+        frame: *mut FrdDecodedFrame,
+    ) -> FrdStatus {
+        if frame.is_null() {
+            return FrdStatus::INVALID_ARGUMENT;
+        }
+        let output = FrdDecodedFrame {
+            timestamp_ticks: 0,
+            pixel_format: 0,
+            plane_count: 1,
+            planes: [
+                fake_plane(0x10),
+                FrdDecodedPlane::default(),
+                FrdDecodedPlane::default(),
+            ],
+        };
+        // SAFETY: caller provided host-owned writable output storage; error may be partial.
+        unsafe { frame.write(output) };
+        FrdStatus::DECODE_FAILED
+    }
+
+    fn test_access_unit(config: &VideoStreamConfig) -> EncodedVideoAccessUnit {
+        let input = config.as_input();
+        EncodedVideoAccessUnit::try_new(
+            input.identity,
+            input.generation,
+            VideoTimestamp {
+                ticks: 1,
+                timescale: input.time_base.ticks_per_second(),
+            },
+            true,
+            vec![0, 0, 0, 1, 0x26].into_boxed_slice(),
+        )
+        .expect("测试访问单元有效")
     }
 
     unsafe extern "C" fn stub_create(
@@ -960,7 +1457,11 @@ mod tests {
 
     unsafe extern "C" fn stub_destroy(_handle: FrdDecoderHandle) {}
 
-    unsafe extern "C" fn stub_release(_context: *mut c_void, _data: *const u8, _len: usize) {}
+    unsafe extern "C" fn stub_reclaim_frame(
+        _handle: FrdDecoderHandle,
+        _frame: *mut FrdDecodedFrame,
+    ) {
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir()

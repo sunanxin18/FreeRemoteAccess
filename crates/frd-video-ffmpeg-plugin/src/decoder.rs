@@ -1,8 +1,9 @@
-use std::ptr;
+use frd_video_ffmpeg::abi::{FrdStatus, RawFrdFfmpegApiV1};
 
-use frd_video_ffmpeg::abi::FrdFfmpegApiV1;
-
-pub(crate) fn api() -> *const FrdFfmpegApiV1 {
+pub(crate) fn populate_api(output: *mut RawFrdFfmpegApiV1, output_size: usize) -> FrdStatus {
+    if output.is_null() || output_size < std::mem::size_of::<RawFrdFfmpegApiV1>() {
+        return FrdStatus::INVALID_ARGUMENT;
+    }
     #[cfg(feature = "native-ffmpeg")]
     {
         // The pinned native dependency is intentionally queried here, but Task 4 has no decoder
@@ -11,7 +12,7 @@ pub(crate) fn api() -> *const FrdFfmpegApiV1 {
         let _native_prerequisites_present = native_prerequisites_present();
     }
 
-    ptr::null()
+    FrdStatus::UNSUPPORTED
 }
 
 #[cfg(feature = "native-ffmpeg")]
