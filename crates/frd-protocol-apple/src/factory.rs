@@ -401,8 +401,10 @@ fn literal_socket_address(host: &str, port: u16) -> Option<SocketAddr> {
 #[allow(clippy::items_after_test_module)]
 mod product_profile_tests {
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use frd_frame::SurfaceUpdate;
     use frd_protocol_api::{
@@ -778,6 +780,74 @@ mod product_profile_tests {
     }
 
     #[test]
+    fn finish_authenticated_session_keeps_handshake_timeout_through_encryption_info() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (peer_ready_tx, peer_ready_rx) = mpsc::channel();
+        let (peer_release_tx, peer_release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut client_init = [0u8; 1];
+            stream.read_exact(&mut client_init).unwrap();
+            assert_eq!(
+                client_init,
+                [crate::protocol::apple_session::ENCRYPTED_SESSION_CLIENT_INIT]
+            );
+
+            let mut server_init = vec![0x00, 0x02, 0x00, 0x02];
+            server_init
+                .extend_from_slice(&[32, 24, 0, 1, 0, 0xff, 0, 0xff, 0, 0xff, 16, 8, 0, 0, 0, 0]);
+            server_init.extend_from_slice(&0u32.to_be_bytes());
+            stream.write_all(&server_init).unwrap();
+
+            let mut session_requests = vec![0u8; 66 + 24];
+            stream.read_exact(&mut session_requests).unwrap();
+            peer_ready_tx.send(()).unwrap();
+            peer_release_rx.recv().unwrap();
+            stream.shutdown(Shutdown::Both).unwrap();
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let shutdown = stream.try_clone().unwrap();
+        let authenticated = super::AppleAuthenticated {
+            connection: crate::AppleConnection::new(stream),
+            security_type: crate::protocol::security::APPLE_SRP,
+            srp_key: Some([0xabu8; 64]),
+        };
+        let (result_tx, result_rx) = mpsc::channel();
+        let finisher = thread::spawn(move || {
+            result_tx
+                .send(super::finish_authenticated_session(
+                    authenticated,
+                    SessionEncodingProfile::AppleUdpMedia,
+                ))
+                .unwrap();
+        });
+
+        peer_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+
+        shutdown.shutdown(Shutdown::Both).unwrap();
+        peer_release_tx.send(()).unwrap();
+        server.join().unwrap();
+        finisher.join().unwrap();
+
+        let error = match result.expect("withheld EncryptionInfo must not block the finisher") {
+            Ok(_) => panic!("withheld EncryptionInfo must fail finalization"),
+            Err(error) => error,
+        };
+        match error {
+            super::AppleHandshakeError::Transport(_) => {}
+            super::AppleHandshakeError::Protocol(error) => {
+                panic!("withheld EncryptionInfo must time out, got {error:?}");
+            }
+        }
+    }
+
+    #[test]
     fn product_high_performance_security_rejects_every_offer_without_named_srp() {
         let factory = super::AppleProtocolFactory;
         for offered in [
@@ -1087,7 +1157,6 @@ fn finish_authenticated_session_with_observer(
     );
     let server_init = decode_server_init(&server_init).map_err(AppleHandshakeError::transport)?;
     observer.observe(HighPerformanceDiagnostic::ServerInitAccepted);
-    connection.set_read_timeout(None).ok();
 
     if let Some(srp_key) = srp_key {
         let crypto = session::establish_with_table_with_observer(
@@ -1101,6 +1170,7 @@ fn finish_authenticated_session_with_observer(
             .set_crypto(crypto)
             .map_err(AppleHandshakeError::transport)?;
     }
+    connection.set_read_timeout(None).ok();
 
     Ok(EstablishedAppleSession {
         connection,
