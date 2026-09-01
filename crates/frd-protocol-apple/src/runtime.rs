@@ -32,8 +32,20 @@ use crate::protocol;
 
 const APPLE_RUNTIME_FAILED: &str = "apple_runtime_failed";
 const APPLE_RUNTIME_READ_POLL: Duration = Duration::from_millis(100);
-fn startup_display_size(server_init: DisplaySize) -> DisplaySize {
-    server_init
+fn startup_display_size(
+    protocol_id: &frd_core::ProtocolId,
+    server_init: DisplaySize,
+) -> DisplaySize {
+    if protocol_id == &frd_core::ProtocolId::apple_high_performance()
+        && server_init.height <= server_init.width
+    {
+        // Current-target ARD transcript: a landscape ServerInit precedes the
+        // 1440x2560 virtual-display request. This is product-identity scoped,
+        // not a global Apple geometry rule.
+        DisplaySize::new(1440, 2560).expect("captured Apple HP geometry is valid")
+    } else {
+        server_init
+    }
 }
 
 fn adapter_error(protocol_id: frd_core::ProtocolId) -> ProtocolError {
@@ -432,6 +444,7 @@ fn run_authenticated_session_with_media(
         dynamic_resolution_enabled,
         audio_flow,
         udp_media_enabled,
+        &protocol_id,
     ) {
         Ok(()) => ProtocolExit::Closed,
         Err(error) => protocol_exit_for_runtime_error(protocol_id, error),
@@ -482,13 +495,14 @@ fn run_authenticated_session_inner(
     dynamic_resolution_enabled: bool,
     audio_flow: AudioMediaFlow,
     udp_media_enabled: bool,
+    protocol_id: &frd_core::ProtocolId,
 ) -> Result<()> {
     let server_init_size = DisplaySize::new(
         u16::try_from(initial_pixel_size.width).context("Apple 初始宽度超出 u16")?,
         u16::try_from(initial_pixel_size.height).context("Apple 初始高度超出 u16")?,
     )
     .context("Apple 初始显示尺寸无效")?;
-    let initial_size = startup_display_size(server_init_size);
+    let initial_size = startup_display_size(protocol_id, server_init_size);
     let media_server_address = connection.peer_addr()?.ip();
     let media_bind_address = connection.local_addr()?.ip();
     if !connection.is_encrypted() {
@@ -836,6 +850,13 @@ mod tests {
             assert_eq!(display_query.first(), Some(&0x09));
             assert_eq!(self.read_message(), [3, 0, 0, 0, 0, 0, 0, 8, 0, 8]);
         }
+
+        fn read_startup_requests(&mut self) -> (Vec<u8>, Vec<u8>) {
+            let set_display = self.read_message();
+            assert_eq!(set_display.first(), Some(&0x1d));
+            assert_eq!(set_display.len(), 308);
+            (self.read_message(), self.read_message())
+        }
     }
 
     fn server_state_message(width: u16, height: u16) -> Vec<u8> {
@@ -867,6 +888,20 @@ mod tests {
         udp_media_enabled: bool,
         make_events: impl FnOnce(mpsc::Sender<RuntimeTrace>) -> Box<dyn RuntimeEventSink>,
     ) -> ProductionHarness {
+        start_production_harness_for(
+            frd_core::PixelSize::new(8, 8).unwrap(),
+            udp_media_enabled,
+            frd_core::ProtocolId::apple_hpss_mvs(),
+            make_events,
+        )
+    }
+
+    fn start_production_harness_for(
+        initial_pixel_size: frd_core::PixelSize,
+        udp_media_enabled: bool,
+        protocol_id: frd_core::ProtocolId,
+        make_events: impl FnOnce(mpsc::Sender<RuntimeTrace>) -> Box<dyn RuntimeEventSink>,
+    ) -> ProductionHarness {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (peer, _) = listener.accept().unwrap();
@@ -894,13 +929,13 @@ mod tests {
             let result = super::run_authenticated_session_with_media(
                 connection,
                 "production-session-test".to_owned(),
-                frd_core::PixelSize::new(8, 8).unwrap(),
+                initial_pixel_size,
                 runtime,
                 session_id,
                 false,
                 crate::media_negotiation::AudioMediaFlow::MacToPc,
                 udp_media_enabled,
-                frd_core::ProtocolId::apple_hpss_mvs(),
+                protocol_id,
             );
             exit_tx.send(result).unwrap();
         });
@@ -921,13 +956,84 @@ mod tests {
         })
     }
 
+    fn close_pending_production_harness(harness: ProductionHarness) {
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        harness.worker.join().unwrap();
+    }
+
+    fn assert_startup_geometry(
+        initial_pixel_size: frd_core::PixelSize,
+        udp_media_enabled: bool,
+        protocol_id: frd_core::ProtocolId,
+        expected_display_query: [u8; 16],
+        expected_framebuffer_request: [u8; 10],
+    ) {
+        let mut harness = start_production_harness_for(
+            initial_pixel_size,
+            udp_media_enabled,
+            protocol_id,
+            |trace| Box::new(TracingEvents(trace)),
+        );
+        let (display_query, framebuffer_request) = harness.read_startup_requests();
+        assert_eq!(display_query, expected_display_query);
+        assert_eq!(framebuffer_request, expected_framebuffer_request);
+        close_pending_production_harness(harness);
+    }
+
     #[test]
-    fn startup_geometry_preserves_the_authenticated_server_init() {
+    fn high_performance_landscape_server_init_uses_captured_startup_geometry() {
+        assert_startup_geometry(
+            frd_core::PixelSize::new(1920, 1080).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            [
+                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x05, 0xa0, 0x0a, 0x00,
+            ],
+            [0x03, 0, 0, 0, 0, 0, 0x05, 0xa0, 0x0a, 0x00],
+        );
+    }
+
+    #[test]
+    fn high_performance_portrait_server_init_preserves_existing_virtual_geometry() {
+        assert_startup_geometry(
+            frd_core::PixelSize::new(1200, 1920).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            [
+                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x07, 0x80,
+            ],
+            [0x03, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x07, 0x80],
+        );
+    }
+
+    #[test]
+    fn standard_landscape_server_init_is_unchanged_even_with_udp_media_enabled() {
+        assert_startup_geometry(
+            frd_core::PixelSize::new(1920, 1080).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_hpss_mvs(),
+            [
+                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x07, 0x80, 0x04, 0x38,
+            ],
+            [0x03, 0, 0, 0, 0, 0, 0x07, 0x80, 0x04, 0x38],
+        );
+    }
+
+    #[test]
+    fn standard_startup_geometry_preserves_the_authenticated_server_init() {
         let landscape = crate::dynamic_resolution::DisplaySize::new(1920, 1080).unwrap();
         let portrait = crate::dynamic_resolution::DisplaySize::new(1440, 2560).unwrap();
+        let protocol_id = frd_core::ProtocolId::apple_hpss_mvs();
 
-        assert_eq!(super::startup_display_size(landscape), landscape);
-        assert_eq!(super::startup_display_size(portrait), portrait);
+        assert_eq!(
+            super::startup_display_size(&protocol_id, landscape),
+            landscape
+        );
+        assert_eq!(
+            super::startup_display_size(&protocol_id, portrait),
+            portrait
+        );
     }
 
     #[test]
