@@ -138,6 +138,7 @@ pub struct HevcAccessUnitAssembler {
     access_unit_bytes: usize,
     parameter_sets: [Option<Vec<u8>>; 3],
     dropping_until_marker: bool,
+    recovery_sequence: Option<u16>,
 }
 
 impl HevcAccessUnitAssembler {
@@ -161,6 +162,7 @@ impl HevcAccessUnitAssembler {
             access_unit_bytes: 0,
             parameter_sets: [None, None, None],
             dropping_until_marker: true,
+            recovery_sequence: None,
         })
     }
 
@@ -177,6 +179,7 @@ impl HevcAccessUnitAssembler {
         self.access_unit_bytes = 0;
         self.parameter_sets = [None, None, None];
         self.dropping_until_marker = true;
+        self.recovery_sequence = None;
     }
 
     /// 接收一个已认证 RTP 包；同一次调用可能排空重排队列并发布多个 AU。
@@ -204,13 +207,18 @@ impl HevcAccessUnitAssembler {
         }
 
         if self.dropping_until_marker {
-            if packet.marker
-                && self
-                    .expected_sequence
-                    .is_none_or(|cursor| serial_at_or_after(packet.sequence, cursor))
-            {
+            let relation = self
+                .recovery_sequence
+                .map_or(SerialRelation::Forward, |cursor| {
+                    serial_relation(packet.sequence, cursor)
+                });
+            if relation == SerialRelation::Forward {
+                self.recovery_sequence = Some(packet.sequence);
+            }
+            if packet.marker && relation != SerialRelation::OlderOrAmbiguous {
                 self.dropping_until_marker = false;
                 self.expected_sequence = Some(packet.sequence.wrapping_add(1));
+                self.recovery_sequence = None;
                 self.clear_reorder();
             }
             return Ok(Vec::new());
@@ -286,6 +294,7 @@ impl HevcAccessUnitAssembler {
             if previous != packet.timestamp {
                 self.discard_access_unit();
                 self.dropping_until_marker = !packet.marker;
+                self.recovery_sequence = (!packet.marker).then_some(packet.sequence);
                 return Err(HevcAccessUnitError::TimestampChangedBeforeMarker {
                     previous,
                     actual: packet.timestamp,
@@ -304,12 +313,14 @@ impl HevcAccessUnitAssembler {
                 Err(error) => {
                     self.discard_access_unit();
                     self.dropping_until_marker = !packet.marker;
+                    self.recovery_sequence = (!packet.marker).then_some(packet.sequence);
                     return Err(HevcAccessUnitError::Depacketize(error));
                 }
             };
         if packet.marker && packet_nals.is_empty() {
             self.discard_access_unit();
             self.dropping_until_marker = false;
+            self.recovery_sequence = None;
             return Err(HevcAccessUnitError::MarkerBeforeFuCompletion);
         }
 
@@ -327,6 +338,7 @@ impl HevcAccessUnitAssembler {
                 .ok_or_else(|| {
                     self.discard_access_unit();
                     self.dropping_until_marker = !packet.marker;
+                    self.recovery_sequence = (!packet.marker).then_some(packet.sequence);
                     HevcAccessUnitError::AccessUnitBudgetExceeded {
                         limit: self.limits.max_access_unit_bytes,
                     }
@@ -423,6 +435,7 @@ impl HevcAccessUnitAssembler {
         self.clear_reorder();
         self.expected_sequence = Some(sequence.wrapping_add(1));
         self.dropping_until_marker = !marker;
+        self.recovery_sequence = (!marker).then_some(sequence);
     }
 
     fn discard_stream(&mut self, ssrc: u32, sequence: u16, marker: bool) {
@@ -431,6 +444,7 @@ impl HevcAccessUnitAssembler {
         self.ssrc = Some(ssrc);
         self.expected_sequence = Some(sequence.wrapping_add(1));
         self.dropping_until_marker = !marker;
+        self.recovery_sequence = (!marker).then_some(sequence);
         self.parameter_sets = [None, None, None];
     }
 
@@ -444,6 +458,7 @@ impl HevcAccessUnitAssembler {
     fn fail_access_unit_budget(&mut self) -> HevcAccessUnitError {
         self.discard_access_unit();
         self.dropping_until_marker = false;
+        self.recovery_sequence = None;
         HevcAccessUnitError::AccessUnitBudgetExceeded {
             limit: self.limits.max_access_unit_bytes,
         }
@@ -459,8 +474,19 @@ fn nal_type(nal: &[u8]) -> Option<u8> {
     nal.first().map(|first| (first >> 1) & 0x3f)
 }
 
-fn serial_at_or_after(sequence: u16, cursor: u16) -> bool {
-    sequence.wrapping_sub(cursor) < 0x8000
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SerialRelation {
+    Equal,
+    Forward,
+    OlderOrAmbiguous,
+}
+
+fn serial_relation(sequence: u16, cursor: u16) -> SerialRelation {
+    match sequence.wrapping_sub(cursor) {
+        0 => SerialRelation::Equal,
+        1..=0x7fff => SerialRelation::Forward,
+        _ => SerialRelation::OlderOrAmbiguous,
+    }
 }
 
 fn parameter_set_index(nal: &[u8]) -> Option<usize> {
@@ -599,6 +625,119 @@ mod tests {
             .unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].timestamp, 3000);
+    }
+
+    #[test]
+    fn recovery_observation_rejects_marker_older_than_forward_non_marker() {
+        let mut assembler = assembler();
+
+        assert!(assembler
+            .push(packet(100, 1000, false, &[0x02, 0x01, 1]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(99, 900, true, &[0x02, 0x01, 2]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(100, 1000, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
+
+        let output = assembler
+            .push(packet(101, 2000, true, &[0x02, 0x01, 4]))
+            .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].timestamp, 2000);
+    }
+
+    #[test]
+    fn recovery_cursor_tracks_multiple_forward_observations() {
+        let mut assembler = assembler();
+
+        for sequence in [100, 105] {
+            assert!(assembler
+                .push(packet(sequence, 1000, false, &[0x02, 0x01, 1]))
+                .unwrap()
+                .is_empty());
+        }
+        assert!(assembler
+            .push(packet(103, 1000, true, &[0x02, 0x01, 2]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(104, 1000, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(106, 1000, true, &[0x02, 0x01, 4]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler.recovery_sequence.is_none());
+        assert!(assembler.buffered.is_empty());
+        assert_eq!(assembler.buffered_bytes, 0);
+
+        assert_eq!(
+            assembler
+                .push(packet(107, 2000, true, &[0x02, 0x01, 5]))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_cursor_advances_exactly_across_u16_wrap() {
+        let mut assembler = assembler();
+
+        for sequence in [u16::MAX, 0] {
+            assert!(assembler
+                .push(packet(sequence, 1000, false, &[0x02, 0x01, 1]))
+                .unwrap()
+                .is_empty());
+        }
+        assert!(assembler
+            .push(packet(u16::MAX, 1000, true, &[0x02, 0x01, 2]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(0, 1000, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            assembler
+                .push(packet(1, 2000, true, &[0x02, 0x01, 4]))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_half_range_observation_is_ambiguous_and_fails_closed() {
+        let mut assembler = assembler();
+
+        assert!(assembler
+            .push(packet(0, 1000, false, &[0x02, 0x01, 1]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(0x8000, 1000, true, &[0x02, 0x01, 2]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(1, 1000, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            assembler
+                .push(packet(2, 2000, true, &[0x02, 0x01, 4]))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

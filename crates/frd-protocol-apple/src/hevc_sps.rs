@@ -13,9 +13,10 @@ pub const MAX_HEVC_SPS_NAL_BYTES: usize = 64 * 1024;
 const MAIN444_8_REXT_CONSTRAINT_MASK: u64 =
     (1u64 << 43) | (1u64 << 42) | (1u64 << 41) | (1u64 << 35);
 const MAX_SHORT_TERM_REF_PIC_SETS: u32 = 64;
-const MAX_REFS_PER_SHORT_TERM_SET: u32 = 64;
+const MAX_DPB_SIZE_MINUS1: u32 = 15;
 const MAX_LONG_TERM_REFS: u32 = 32;
 const MAX_HRD_CPB_CNT_MINUS1: u32 = 31;
+const MAX_DELTA_POC_MINUS1: u32 = (1 << 15) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HevcSps {
@@ -252,7 +253,17 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Result<HevcSps, HevcSpsError> {
         return Err(HevcSpsError::InvalidBitDepth(bit_depth_chroma_minus8));
     }
 
-    parse_sps_suffix(&mut bits, max_sub_layers_minus1)?;
+    parse_sps_suffix(
+        &mut bits,
+        max_sub_layers_minus1,
+        8 + bit_depth_luma_minus8,
+        8 + bit_depth_chroma_minus8,
+        if separate_colour_plane_flag {
+            0
+        } else {
+            chroma_format_idc
+        },
+    )?;
 
     Ok(HevcSps {
         general_profile_space,
@@ -279,6 +290,9 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Result<HevcSps, HevcSpsError> {
 fn parse_sps_suffix(
     bits: &mut BitReader<'_>,
     max_sub_layers_minus1: u8,
+    bit_depth_luma: u32,
+    bit_depth_chroma: u32,
+    chroma_array_type: u8,
 ) -> Result<(), HevcSpsError> {
     let log2_max_pic_order_cnt_lsb_minus4 = bits.read_ue()?;
     validate_max(
@@ -293,13 +307,25 @@ fn parse_sps_suffix(
     } else {
         max_sub_layers_minus1
     };
-    for _ in first_layer..=max_sub_layers_minus1 {
+    let mut highest_max_dec_pic_buffering_minus1 = None;
+    let mut previous_max_dec_pic_buffering_minus1 = None;
+    let mut previous_max_num_reorder_pics = None;
+    for layer in first_layer..=max_sub_layers_minus1 {
         let max_dec_pic_buffering_minus1 = bits.read_ue()?;
         validate_max(
             "sps_max_dec_pic_buffering_minus1",
             max_dec_pic_buffering_minus1,
-            MAX_REFS_PER_SHORT_TERM_SET,
+            MAX_DPB_SIZE_MINUS1,
         )?;
+        if previous_max_dec_pic_buffering_minus1
+            .is_some_and(|previous| max_dec_pic_buffering_minus1 < previous)
+        {
+            return Err(HevcSpsError::InvalidRange {
+                field: "sps_max_dec_pic_buffering_minus1 sub-layer ordering",
+                value: max_dec_pic_buffering_minus1,
+                maximum: previous_max_dec_pic_buffering_minus1.unwrap(),
+            });
+        }
         let max_num_reorder_pics = bits.read_ue()?;
         if max_num_reorder_pics > max_dec_pic_buffering_minus1 {
             return Err(HevcSpsError::InvalidRange {
@@ -308,8 +334,26 @@ fn parse_sps_suffix(
                 maximum: max_dec_pic_buffering_minus1,
             });
         }
-        bits.read_ue()?; // sps_max_latency_increase_plus1
+        if previous_max_num_reorder_pics.is_some_and(|previous| max_num_reorder_pics < previous) {
+            return Err(HevcSpsError::InvalidRange {
+                field: "sps_max_num_reorder_pics sub-layer ordering",
+                value: max_num_reorder_pics,
+                maximum: previous_max_num_reorder_pics.unwrap(),
+            });
+        }
+        validate_max(
+            "sps_max_latency_increase_plus1",
+            bits.read_ue()?,
+            u32::MAX - 1,
+        )?;
+        previous_max_dec_pic_buffering_minus1 = Some(max_dec_pic_buffering_minus1);
+        previous_max_num_reorder_pics = Some(max_num_reorder_pics);
+        if layer == max_sub_layers_minus1 {
+            highest_max_dec_pic_buffering_minus1 = Some(max_dec_pic_buffering_minus1);
+        }
     }
+    let max_dec_pic_buffering_minus1 =
+        highest_max_dec_pic_buffering_minus1.expect("至少解析最高 temporal sub-layer");
 
     let log2_min_luma_coding_block_size_minus3 = bits.read_ue()?;
     validate_max(
@@ -324,6 +368,8 @@ fn parse_sps_suffix(
         log2_diff_max_min_luma_coding_block_size,
         3,
     )?;
+    let min_cb_log2_size_y = log2_min_luma_coding_block_size_minus3 + 3;
+    let ctb_log2_size_y = min_cb_log2_size_y + log2_diff_max_min_luma_coding_block_size;
     let log2_min_luma_transform_block_size_minus2 = bits.read_ue()?;
     validate_max(
         "log2_min_luma_transform_block_size_minus2",
@@ -331,14 +377,29 @@ fn parse_sps_suffix(
         3,
     )?;
     let log2_diff_max_min_luma_transform_block_size = bits.read_ue()?;
-    validate_sum_max(
-        "log2_diff_max_min_luma_transform_block_size",
-        log2_min_luma_transform_block_size_minus2,
-        log2_diff_max_min_luma_transform_block_size,
-        3,
+    let min_tb_log2_size_y = log2_min_luma_transform_block_size_minus2 + 2;
+    if min_tb_log2_size_y >= min_cb_log2_size_y {
+        return Err(HevcSpsError::InvalidRange {
+            field: "MinTbLog2SizeY",
+            value: min_tb_log2_size_y,
+            maximum: min_cb_log2_size_y - 1,
+        });
+    }
+    let max_tb_log2_size_y = min_tb_log2_size_y
+        .checked_add(log2_diff_max_min_luma_transform_block_size)
+        .ok_or(HevcSpsError::ExpGolombOverflow)?;
+    validate_max("MaxTbLog2SizeY", max_tb_log2_size_y, ctb_log2_size_y.min(5))?;
+    let max_transform_hierarchy_depth = ctb_log2_size_y - min_tb_log2_size_y;
+    validate_max(
+        "max_transform_hierarchy_depth_inter",
+        bits.read_ue()?,
+        max_transform_hierarchy_depth,
     )?;
-    validate_max("max_transform_hierarchy_depth_inter", bits.read_ue()?, 32)?;
-    validate_max("max_transform_hierarchy_depth_intra", bits.read_ue()?, 32)?;
+    validate_max(
+        "max_transform_hierarchy_depth_intra",
+        bits.read_ue()?,
+        max_transform_hierarchy_depth,
+    )?;
 
     if bits.read_bit()? && bits.read_bit()? {
         skip_scaling_list_data(bits)?;
@@ -346,20 +407,38 @@ fn parse_sps_suffix(
     bits.read_bit()?; // amp_enabled_flag
     bits.read_bit()?; // sample_adaptive_offset_enabled_flag
     if bits.read_bit()? {
-        bits.read_bits(4)?; // pcm_sample_bit_depth_luma_minus1
-        bits.read_bits(4)?; // pcm_sample_bit_depth_chroma_minus1
+        let pcm_bit_depth_luma = bits.read_bits(4)? as u32 + 1;
+        validate_max("PcmBitDepthY", pcm_bit_depth_luma, bit_depth_luma)?;
+        let pcm_bit_depth_chroma = bits.read_bits(4)? as u32 + 1;
+        if chroma_array_type != 0 {
+            validate_max("PcmBitDepthC", pcm_bit_depth_chroma, bit_depth_chroma)?;
+        }
         let log2_min_pcm_luma_coding_block_size_minus3 = bits.read_ue()?;
+        let min_pcm_log2_size_y = log2_min_pcm_luma_coding_block_size_minus3
+            .checked_add(3)
+            .ok_or(HevcSpsError::ExpGolombOverflow)?;
+        let minimum_pcm_log2_size_y = min_cb_log2_size_y.min(5);
+        let maximum_pcm_log2_size_y = ctb_log2_size_y.min(5);
+        if min_pcm_log2_size_y < minimum_pcm_log2_size_y {
+            return Err(HevcSpsError::InvalidRange {
+                field: "Log2MinIpcmCbSizeY",
+                value: min_pcm_log2_size_y,
+                maximum: minimum_pcm_log2_size_y,
+            });
+        }
         validate_max(
-            "log2_min_pcm_luma_coding_block_size_minus3",
-            log2_min_pcm_luma_coding_block_size_minus3,
-            2,
+            "Log2MinIpcmCbSizeY",
+            min_pcm_log2_size_y,
+            maximum_pcm_log2_size_y,
         )?;
         let log2_diff_max_min_pcm_luma_coding_block_size = bits.read_ue()?;
-        validate_sum_max(
-            "log2_diff_max_min_pcm_luma_coding_block_size",
-            log2_min_pcm_luma_coding_block_size_minus3,
-            log2_diff_max_min_pcm_luma_coding_block_size,
-            2,
+        let max_pcm_log2_size_y = min_pcm_log2_size_y
+            .checked_add(log2_diff_max_min_pcm_luma_coding_block_size)
+            .ok_or(HevcSpsError::ExpGolombOverflow)?;
+        validate_max(
+            "Log2MaxIpcmCbSizeY",
+            max_pcm_log2_size_y,
+            maximum_pcm_log2_size_y,
         )?;
         bits.read_bit()?; // pcm_loop_filter_disabled_flag
     }
@@ -370,7 +449,11 @@ fn parse_sps_suffix(
         num_short_term_ref_pic_sets,
         MAX_SHORT_TERM_REF_PIC_SETS,
     )?;
-    skip_short_term_ref_pic_sets(bits, num_short_term_ref_pic_sets)?;
+    skip_short_term_ref_pic_sets(
+        bits,
+        num_short_term_ref_pic_sets,
+        max_dec_pic_buffering_minus1,
+    )?;
 
     if bits.read_bit()? {
         let num_long_term_ref_pics_sps = bits.read_ue()?;
@@ -415,9 +498,15 @@ fn skip_scaling_list_data(bits: &mut BitReader<'_>) -> Result<(), HevcSpsError> 
         for matrix_id in (0..6usize).step_by(matrix_step) {
             if !bits.read_bit()? {
                 let delta = bits.read_ue()?;
-                validate_max("scaling_list_pred_matrix_id_delta", delta, matrix_id as u32)?;
+                let maximum_delta = if size_id == 3 {
+                    matrix_id as u32 / 3
+                } else {
+                    matrix_id as u32
+                };
+                validate_max("scaling_list_pred_matrix_id_delta", delta, maximum_delta)?;
                 continue;
             }
+            let mut next_coefficient = 8i32;
             if size_id > 1 {
                 let dc_minus8 = bits.read_se()?;
                 if !(-7..=247).contains(&dc_minus8) {
@@ -427,6 +516,7 @@ fn skip_scaling_list_data(bits: &mut BitReader<'_>) -> Result<(), HevcSpsError> 
                         maximum: 247,
                     });
                 }
+                next_coefficient = dc_minus8 + 8;
             }
             let coefficient_count = 64usize.min(1usize << (4 + (size_id << 1)));
             for _ in 0..coefficient_count {
@@ -438,48 +528,197 @@ fn skip_scaling_list_data(bits: &mut BitReader<'_>) -> Result<(), HevcSpsError> 
                         maximum: 128,
                     });
                 }
+                next_coefficient = (next_coefficient + delta + 256) % 256;
+                if next_coefficient == 0 {
+                    return Err(HevcSpsError::InvalidRange {
+                        field: "ScalingList",
+                        value: 0,
+                        maximum: 255,
+                    });
+                }
             }
         }
     }
     Ok(())
 }
 
-fn skip_short_term_ref_pic_sets(bits: &mut BitReader<'_>, count: u32) -> Result<(), HevcSpsError> {
-    let mut delta_poc_counts = [0u32; MAX_SHORT_TERM_REF_PIC_SETS as usize];
+#[derive(Default)]
+struct ShortTermRefPicSet {
+    negative: Vec<i32>,
+    positive: Vec<i32>,
+}
+
+impl ShortTermRefPicSet {
+    fn len(&self) -> usize {
+        self.negative.len() + self.positive.len()
+    }
+}
+
+fn skip_short_term_ref_pic_sets(
+    bits: &mut BitReader<'_>,
+    count: u32,
+    max_dec_pic_buffering_minus1: u32,
+) -> Result<(), HevcSpsError> {
+    let mut reference_sets: Vec<ShortTermRefPicSet> = Vec::with_capacity(count as usize);
     for index in 0..count as usize {
         let inter_prediction = index != 0 && bits.read_bit()?;
-        let delta_poc_count = if inter_prediction {
-            bits.read_bit()?; // delta_rps_sign
-            bits.read_ue()?; // abs_delta_rps_minus1
-            let reference_count = delta_poc_counts[index - 1];
-            let mut used_count = 0u32;
-            for _ in 0..=reference_count {
+        let reference_set = if inter_prediction {
+            let delta_rps_sign = bits.read_bit()?;
+            let abs_delta_rps_minus1 = bits.read_ue()?;
+            validate_max(
+                "abs_delta_rps_minus1",
+                abs_delta_rps_minus1,
+                MAX_DELTA_POC_MINUS1,
+            )?;
+            let delta_rps_magnitude = i32::try_from(abs_delta_rps_minus1 + 1)
+                .map_err(|_| HevcSpsError::ExpGolombOverflow)?;
+            let delta_rps = if delta_rps_sign {
+                -delta_rps_magnitude
+            } else {
+                delta_rps_magnitude
+            };
+            let reference = &reference_sets[index - 1];
+            let mut use_delta_flags = Vec::with_capacity(reference.len() + 1);
+            for _ in 0..=reference.len() {
                 let used_by_current = bits.read_bit()?;
                 let use_delta = used_by_current || bits.read_bit()?;
-                if use_delta {
-                    used_count += 1;
-                }
+                use_delta_flags.push(use_delta);
             }
-            used_count
+            derive_inter_predicted_ref_pic_set(reference, delta_rps, &use_delta_flags)?
         } else {
             let negative = bits.read_ue()?;
+            validate_max("num_negative_pics", negative, max_dec_pic_buffering_minus1)?;
             let positive = bits.read_ue()?;
-            let total = negative
-                .checked_add(positive)
-                .ok_or(HevcSpsError::ExpGolombOverflow)?;
-            validate_max("NumDeltaPocs", total, MAX_REFS_PER_SHORT_TERM_SET)?;
+            validate_max(
+                "num_positive_pics",
+                positive,
+                max_dec_pic_buffering_minus1 - negative,
+            )?;
+            let mut reference_set = ShortTermRefPicSet {
+                negative: Vec::with_capacity(negative as usize),
+                positive: Vec::with_capacity(positive as usize),
+            };
+            let mut previous_delta_poc = 0i32;
             for _ in 0..negative {
-                bits.read_ue()?;
+                let delta_poc_minus1 = bits.read_ue()?;
+                validate_max(
+                    "delta_poc_s0_minus1",
+                    delta_poc_minus1,
+                    MAX_DELTA_POC_MINUS1,
+                )?;
+                let delta = i32::try_from(delta_poc_minus1 + 1)
+                    .map_err(|_| HevcSpsError::ExpGolombOverflow)?;
+                previous_delta_poc = previous_delta_poc
+                    .checked_sub(delta)
+                    .ok_or(HevcSpsError::ExpGolombOverflow)?;
+                if previous_delta_poc >= 0 {
+                    return Err(HevcSpsError::InvalidRange {
+                        field: "DeltaPocS0",
+                        value: previous_delta_poc.unsigned_abs(),
+                        maximum: i32::MAX as u32,
+                    });
+                }
+                reference_set.negative.push(previous_delta_poc);
                 bits.read_bit()?;
             }
+            previous_delta_poc = 0;
             for _ in 0..positive {
-                bits.read_ue()?;
+                let delta_poc_minus1 = bits.read_ue()?;
+                validate_max(
+                    "delta_poc_s1_minus1",
+                    delta_poc_minus1,
+                    MAX_DELTA_POC_MINUS1,
+                )?;
+                let delta = i32::try_from(delta_poc_minus1 + 1)
+                    .map_err(|_| HevcSpsError::ExpGolombOverflow)?;
+                previous_delta_poc = previous_delta_poc
+                    .checked_add(delta)
+                    .ok_or(HevcSpsError::ExpGolombOverflow)?;
+                if previous_delta_poc <= 0 {
+                    return Err(HevcSpsError::InvalidRange {
+                        field: "DeltaPocS1",
+                        value: previous_delta_poc.unsigned_abs(),
+                        maximum: i32::MAX as u32,
+                    });
+                }
+                reference_set.positive.push(previous_delta_poc);
                 bits.read_bit()?;
             }
-            total
+            reference_set
         };
-        validate_max("NumDeltaPocs", delta_poc_count, MAX_REFS_PER_SHORT_TERM_SET)?;
-        delta_poc_counts[index] = delta_poc_count;
+        validate_max(
+            "NumDeltaPocs",
+            u32::try_from(reference_set.len()).map_err(|_| HevcSpsError::ExpGolombOverflow)?,
+            max_dec_pic_buffering_minus1,
+        )?;
+        validate_delta_poc_order(&reference_set)?;
+        reference_sets.push(reference_set);
+    }
+    Ok(())
+}
+
+fn derive_inter_predicted_ref_pic_set(
+    reference: &ShortTermRefPicSet,
+    delta_rps: i32,
+    use_delta_flags: &[bool],
+) -> Result<ShortTermRefPicSet, HevcSpsError> {
+    if use_delta_flags.len() != reference.len() + 1 {
+        return Err(HevcSpsError::UnsupportedSyntax(
+            "short-term RPS reference flag count",
+        ));
+    }
+    let mut derived = ShortTermRefPicSet::default();
+    let negative_count = reference.negative.len();
+
+    for index in (0..reference.positive.len()).rev() {
+        let delta_poc = reference.positive[index]
+            .checked_add(delta_rps)
+            .ok_or(HevcSpsError::ExpGolombOverflow)?;
+        if delta_poc < 0 && use_delta_flags[negative_count + index] {
+            derived.negative.push(delta_poc);
+        }
+    }
+    if delta_rps < 0 && use_delta_flags[reference.len()] {
+        derived.negative.push(delta_rps);
+    }
+    for (index, delta_poc) in reference.negative.iter().enumerate() {
+        let delta_poc = delta_poc
+            .checked_add(delta_rps)
+            .ok_or(HevcSpsError::ExpGolombOverflow)?;
+        if delta_poc < 0 && use_delta_flags[index] {
+            derived.negative.push(delta_poc);
+        }
+    }
+
+    for index in (0..reference.negative.len()).rev() {
+        let delta_poc = reference.negative[index]
+            .checked_add(delta_rps)
+            .ok_or(HevcSpsError::ExpGolombOverflow)?;
+        if delta_poc > 0 && use_delta_flags[index] {
+            derived.positive.push(delta_poc);
+        }
+    }
+    if delta_rps > 0 && use_delta_flags[reference.len()] {
+        derived.positive.push(delta_rps);
+    }
+    for (index, delta_poc) in reference.positive.iter().enumerate() {
+        let delta_poc = delta_poc
+            .checked_add(delta_rps)
+            .ok_or(HevcSpsError::ExpGolombOverflow)?;
+        if delta_poc > 0 && use_delta_flags[negative_count + index] {
+            derived.positive.push(delta_poc);
+        }
+    }
+    Ok(derived)
+}
+
+fn validate_delta_poc_order(reference: &ShortTermRefPicSet) -> Result<(), HevcSpsError> {
+    if reference.negative.windows(2).any(|pair| pair[0] <= pair[1])
+        || reference.positive.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(HevcSpsError::UnsupportedSyntax(
+            "short-term RPS delta POC ordering",
+        ));
     }
     Ok(())
 }
@@ -568,6 +807,9 @@ fn skip_hrd_parameters(
     let nal_hrd_parameters_present = bits.read_bit()?;
     let vcl_hrd_parameters_present = bits.read_bit()?;
     let mut sub_pic_hrd_params_present = false;
+    let mut bit_rate_scale = 0u32;
+    let mut cpb_size_scale = 0u32;
+    let mut cpb_size_du_scale = 0u32;
     if nal_hrd_parameters_present || vcl_hrd_parameters_present {
         sub_pic_hrd_params_present = bits.read_bit()?;
         if sub_pic_hrd_params_present {
@@ -576,10 +818,10 @@ fn skip_hrd_parameters(
             bits.read_bit()?;
             bits.read_bits(5)?;
         }
-        bits.read_bits(4)?;
-        bits.read_bits(4)?;
+        bit_rate_scale = bits.read_bits(4)? as u32;
+        cpb_size_scale = bits.read_bits(4)? as u32;
         if sub_pic_hrd_params_present {
-            bits.read_bits(4)?;
+            cpb_size_du_scale = bits.read_bits(4)? as u32;
         }
         bits.read_bits(5)?;
         bits.read_bits(5)?;
@@ -590,7 +832,7 @@ fn skip_hrd_parameters(
         let fixed_pic_rate_general = bits.read_bit()?;
         let fixed_pic_rate_within_cvs = fixed_pic_rate_general || bits.read_bit()?;
         let low_delay_hrd = if fixed_pic_rate_within_cvs {
-            bits.read_ue()?;
+            validate_max("elemental_duration_in_tc_minus1", bits.read_ue()?, 2047)?;
             false
         } else {
             bits.read_bit()?
@@ -598,10 +840,24 @@ fn skip_hrd_parameters(
         let cpb_cnt_minus1 = if low_delay_hrd { 0 } else { bits.read_ue()? };
         validate_max("cpb_cnt_minus1", cpb_cnt_minus1, MAX_HRD_CPB_CNT_MINUS1)?;
         if nal_hrd_parameters_present {
-            skip_sub_layer_hrd_parameters(bits, cpb_cnt_minus1, sub_pic_hrd_params_present)?;
+            skip_sub_layer_hrd_parameters(
+                bits,
+                cpb_cnt_minus1,
+                sub_pic_hrd_params_present,
+                bit_rate_scale,
+                cpb_size_scale,
+                cpb_size_du_scale,
+            )?;
         }
         if vcl_hrd_parameters_present {
-            skip_sub_layer_hrd_parameters(bits, cpb_cnt_minus1, sub_pic_hrd_params_present)?;
+            skip_sub_layer_hrd_parameters(
+                bits,
+                cpb_cnt_minus1,
+                sub_pic_hrd_params_present,
+                bit_rate_scale,
+                cpb_size_scale,
+                cpb_size_du_scale,
+            )?;
         }
     }
     Ok(())
@@ -611,17 +867,80 @@ fn skip_sub_layer_hrd_parameters(
     bits: &mut BitReader<'_>,
     cpb_cnt_minus1: u32,
     sub_pic_hrd_params_present: bool,
+    bit_rate_scale: u32,
+    cpb_size_scale: u32,
+    cpb_size_du_scale: u32,
 ) -> Result<(), HevcSpsError> {
-    for _ in 0..=cpb_cnt_minus1 {
-        bits.read_ue()?;
-        bits.read_ue()?;
+    let mut previous_bit_rate = None;
+    let mut previous_cpb_size = None;
+    let mut previous_cpb_size_du = None;
+    let mut previous_bit_rate_du = None;
+    for index in 0..=cpb_cnt_minus1 {
+        let bit_rate_value_minus1 = bits.read_ue()?;
+        validate_max("bit_rate_value_minus1", bit_rate_value_minus1, u32::MAX - 1)?;
+        let bit_rate = scaled_hrd_value(bit_rate_value_minus1, 6, bit_rate_scale)?;
+        if index != 0 && previous_bit_rate.is_some_and(|previous| bit_rate <= previous) {
+            return Err(HevcSpsError::UnsupportedSyntax(
+                "HRD bit_rate_value_minus1 ordering",
+            ));
+        }
+
+        let cpb_size_value_minus1 = bits.read_ue()?;
+        validate_max("cpb_size_value_minus1", cpb_size_value_minus1, u32::MAX - 1)?;
+        let cpb_size = scaled_hrd_value(cpb_size_value_minus1, 4, cpb_size_scale)?;
+        if let Some(previous) = previous_cpb_size {
+            if cpb_size > previous {
+                return Err(HevcSpsError::UnsupportedSyntax(
+                    "HRD cpb_size_value_minus1 ordering",
+                ));
+            }
+        }
+
         if sub_pic_hrd_params_present {
-            bits.read_ue()?;
-            bits.read_ue()?;
+            let cpb_size_du_value_minus1 = bits.read_ue()?;
+            validate_max(
+                "cpb_size_du_value_minus1",
+                cpb_size_du_value_minus1,
+                u32::MAX - 1,
+            )?;
+            let cpb_size_du = scaled_hrd_value(cpb_size_du_value_minus1, 4, cpb_size_du_scale)?;
+            if let Some(previous) = previous_cpb_size_du {
+                if cpb_size_du > previous {
+                    return Err(HevcSpsError::UnsupportedSyntax(
+                        "HRD cpb_size_du_value_minus1 ordering",
+                    ));
+                }
+            }
+
+            let bit_rate_du_value_minus1 = bits.read_ue()?;
+            validate_max(
+                "bit_rate_du_value_minus1",
+                bit_rate_du_value_minus1,
+                u32::MAX - 1,
+            )?;
+            let bit_rate_du = scaled_hrd_value(bit_rate_du_value_minus1, 6, bit_rate_scale)?;
+            if index != 0 && previous_bit_rate_du.is_some_and(|previous| bit_rate_du <= previous) {
+                return Err(HevcSpsError::UnsupportedSyntax(
+                    "HRD bit_rate_du_value_minus1 ordering",
+                ));
+            }
+            previous_cpb_size_du = Some(cpb_size_du);
+            previous_bit_rate_du = Some(bit_rate_du);
         }
         bits.read_bit()?;
+        previous_bit_rate = Some(bit_rate);
+        previous_cpb_size = Some(cpb_size);
     }
     Ok(())
+}
+
+fn scaled_hrd_value(value_minus1: u32, base_shift: u32, scale: u32) -> Result<u64, HevcSpsError> {
+    let shift = base_shift
+        .checked_add(scale)
+        .ok_or(HevcSpsError::ExpGolombOverflow)?;
+    (u64::from(value_minus1) + 1)
+        .checked_shl(shift)
+        .ok_or(HevcSpsError::ExpGolombOverflow)
 }
 
 fn validate_max(field: &'static str, value: u32, maximum: u32) -> Result<(), HevcSpsError> {
@@ -775,7 +1094,167 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hevc_sps, HevcSps, HevcSpsError, MAX_HEVC_SPS_NAL_BYTES};
+    use super::{
+        parse_hevc_sps, skip_hrd_parameters, skip_scaling_list_data, skip_short_term_ref_pic_sets,
+        BitReader, HevcSps, HevcSpsError, MAX_HEVC_SPS_NAL_BYTES,
+    };
+
+    #[derive(Default)]
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bit_len: usize,
+    }
+
+    impl BitWriter {
+        fn bit(&mut self, value: bool) {
+            if self.bit_len % 8 == 0 {
+                self.bytes.push(0);
+            }
+            if value {
+                let shift = 7 - self.bit_len % 8;
+                *self.bytes.last_mut().unwrap() |= 1 << shift;
+            }
+            self.bit_len += 1;
+        }
+
+        fn bits(&mut self, value: u64, width: usize) {
+            for shift in (0..width).rev() {
+                self.bit((value >> shift) & 1 != 0);
+            }
+        }
+
+        fn ue(&mut self, value: u32) {
+            let code_num = u64::from(value) + 1;
+            let width = (u64::BITS - code_num.leading_zeros()) as usize;
+            for _ in 1..width {
+                self.bit(false);
+            }
+            self.bits(code_num, width);
+        }
+
+        fn rbsp_trailing_bits(&mut self) {
+            self.bit(true);
+            while self.bit_len % 8 != 0 {
+                self.bit(false);
+            }
+        }
+
+        fn into_bytes(self) -> Vec<u8> {
+            self.bytes
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SuffixFixture {
+        max_dec_pic_buffering_minus1: u32,
+        min_cb_minus3: u32,
+        diff_cb: u32,
+        min_tb_minus2: u32,
+        diff_tb: u32,
+        hierarchy_inter: u32,
+        hierarchy_intra: u32,
+        pcm_luma_minus1: Option<u8>,
+        pcm_chroma_minus1: u8,
+        min_pcm_minus3: u32,
+        diff_pcm: u32,
+        negative_refs: u32,
+        negative_delta_minus1: u32,
+    }
+
+    impl Default for SuffixFixture {
+        fn default() -> Self {
+            Self {
+                max_dec_pic_buffering_minus1: 15,
+                min_cb_minus3: 0,
+                diff_cb: 2,
+                min_tb_minus2: 0,
+                diff_tb: 3,
+                hierarchy_inter: 3,
+                hierarchy_intra: 3,
+                pcm_luma_minus1: None,
+                pcm_chroma_minus1: 7,
+                min_pcm_minus3: 0,
+                diff_pcm: 2,
+                negative_refs: 0,
+                negative_delta_minus1: 0,
+            }
+        }
+    }
+
+    fn write_suffix(writer: &mut BitWriter, fixture: SuffixFixture) {
+        writer.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        writer.bit(false); // ordering info only at the highest sub-layer
+        writer.ue(fixture.max_dec_pic_buffering_minus1);
+        writer.ue(0); // sps_max_num_reorder_pics
+        writer.ue(0); // sps_max_latency_increase_plus1
+        writer.ue(fixture.min_cb_minus3);
+        writer.ue(fixture.diff_cb);
+        writer.ue(fixture.min_tb_minus2);
+        writer.ue(fixture.diff_tb);
+        writer.ue(fixture.hierarchy_inter);
+        writer.ue(fixture.hierarchy_intra);
+        writer.bit(false); // scaling_list_enabled_flag
+        writer.bit(false); // amp_enabled_flag
+        writer.bit(false); // sample_adaptive_offset_enabled_flag
+        writer.bit(fixture.pcm_luma_minus1.is_some());
+        if let Some(pcm_luma_minus1) = fixture.pcm_luma_minus1 {
+            writer.bits(u64::from(pcm_luma_minus1), 4);
+            writer.bits(u64::from(fixture.pcm_chroma_minus1), 4);
+            writer.ue(fixture.min_pcm_minus3);
+            writer.ue(fixture.diff_pcm);
+            writer.bit(false); // pcm_loop_filter_disabled_flag
+        }
+        writer.ue(u32::from(fixture.negative_refs != 0));
+        if fixture.negative_refs != 0 {
+            writer.ue(fixture.negative_refs);
+            writer.ue(0);
+            for _ in 0..fixture.negative_refs {
+                writer.ue(fixture.negative_delta_minus1);
+                writer.bit(false);
+            }
+        }
+        writer.bit(false); // long_term_ref_pics_present_flag
+        writer.bit(false); // sps_temporal_mvp_enabled_flag
+        writer.bit(false); // strong_intra_smoothing_enabled_flag
+        writer.bit(false); // vui_parameters_present_flag
+        writer.bit(false); // sps_extension_present_flag
+        writer.rbsp_trailing_bits();
+    }
+
+    fn fixture_sps(fixture: SuffixFixture) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.bits(0, 4); // sps_video_parameter_set_id
+        writer.bits(0, 3); // sps_max_sub_layers_minus1
+        writer.bit(true); // sps_temporal_id_nesting_flag
+        writer.bits(0, 2); // general_profile_space
+        writer.bit(false); // general_tier_flag
+        writer.bits(4, 5); // general_profile_idc
+        writer.bits(0, 32); // general_profile_compatibility_flags
+        writer.bits(0, 48); // general_constraint_indicator_flags
+        writer.bits(120, 8); // general_level_idc
+        writer.ue(0); // sps_seq_parameter_set_id
+        writer.ue(3); // chroma_format_idc
+        writer.bit(false); // separate_colour_plane_flag
+        writer.ue(64);
+        writer.ue(64);
+        writer.bit(false); // conformance_window_flag
+        writer.ue(0); // bit_depth_luma_minus8
+        writer.ue(0); // bit_depth_chroma_minus8
+        write_suffix(&mut writer, fixture);
+
+        let rbsp = writer.into_bytes();
+        let mut nal = vec![0x42, 0x01];
+        let mut zero_count = 0usize;
+        for byte in rbsp {
+            if zero_count >= 2 && byte <= 3 {
+                nal.push(3);
+                zero_count = 0;
+            }
+            nal.push(byte);
+            zero_count = if byte == 0 { zero_count + 1 } else { 0 };
+        }
+        nal
+    }
 
     const CAPTURED_MAIN444_8BIT_SPS: &[u8] = &[
         0x42, 0x01, 0x01, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0xbe, 0x08, 0x00, 0x00, 0x03, 0x00,
@@ -904,6 +1383,178 @@ mod tests {
         let mut extra_rbsp = CAPTURED_MAIN444_8BIT_SPS.to_vec();
         extra_rbsp.push(0x80);
         assert!(parse_hevc_sps(&extra_rbsp).is_err());
+    }
+
+    #[test]
+    fn malformed_supported_suffix_ranges_are_rejected_table_driven() {
+        let baseline = SuffixFixture::default();
+        assert!(parse_hevc_sps(&fixture_sps(baseline)).is_ok());
+
+        let cases = [
+            (
+                "decoded picture buffer exceeds the normative absolute maximum",
+                SuffixFixture {
+                    max_dec_pic_buffering_minus1: 16,
+                    ..baseline
+                },
+            ),
+            (
+                "transform hierarchy exceeds CTB to minimum-TB depth",
+                SuffixFixture {
+                    hierarchy_inter: 4,
+                    ..baseline
+                },
+            ),
+            (
+                "maximum transform block exceeds CTB",
+                SuffixFixture {
+                    diff_cb: 0,
+                    diff_tb: 2,
+                    hierarchy_inter: 1,
+                    hierarchy_intra: 1,
+                    ..baseline
+                },
+            ),
+            (
+                "PCM luma depth exceeds SPS bit depth",
+                SuffixFixture {
+                    pcm_luma_minus1: Some(8),
+                    ..baseline
+                },
+            ),
+            (
+                "minimum PCM block is below minimum coding block",
+                SuffixFixture {
+                    min_cb_minus3: 2,
+                    diff_cb: 0,
+                    pcm_luma_minus1: Some(7),
+                    ..baseline
+                },
+            ),
+            (
+                "short-term negative reference count exceeds DPB",
+                SuffixFixture {
+                    negative_refs: 16,
+                    ..baseline
+                },
+            ),
+            (
+                "short-term delta_poc_minus1 exceeds 15 bits",
+                SuffixFixture {
+                    negative_refs: 1,
+                    negative_delta_minus1: 1 << 15,
+                    ..baseline
+                },
+            ),
+        ];
+
+        for (name, fixture) in cases {
+            assert!(
+                parse_hevc_sps(&fixture_sps(fixture)).is_err(),
+                "{name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_list_size_three_uses_matrix_id_divided_by_three() {
+        let mut writer = BitWriter::default();
+        for size_id in 0..4usize {
+            let step = if size_id == 3 { 3 } else { 1 };
+            for matrix_id in (0..6usize).step_by(step) {
+                writer.bit(false);
+                writer.ue(if size_id == 3 && matrix_id == 3 { 2 } else { 0 });
+            }
+        }
+        let bytes = writer.into_bytes();
+
+        assert!(skip_scaling_list_data(&mut BitReader::new(&bytes)).is_err());
+    }
+
+    #[test]
+    fn direct_short_term_delta_poc_range_is_bounded() {
+        let mut writer = BitWriter::default();
+        writer.ue(1); // num_negative_pics
+        writer.ue(0); // num_positive_pics
+        writer.ue(1 << 15); // delta_poc_s0_minus1
+        writer.bit(false);
+        let bytes = writer.into_bytes();
+
+        assert!(skip_short_term_ref_pic_sets(&mut BitReader::new(&bytes), 1, 15).is_err());
+    }
+
+    #[test]
+    fn inter_predicted_short_term_set_cannot_exceed_the_dpb() {
+        let mut writer = BitWriter::default();
+        writer.ue(15); // set zero: num_negative_pics
+        writer.ue(0);
+        for _ in 0..15 {
+            writer.ue(0);
+            writer.bit(false);
+        }
+        writer.bit(true); // set one: inter_ref_pic_set_prediction_flag
+        writer.bit(true); // delta_rps_sign, so DeltaRps is -1
+        writer.ue(0); // abs_delta_rps_minus1
+        for _ in 0..=15 {
+            writer.bit(true); // used_by_curr_pic_flag; selects all 16 derived entries
+        }
+        let bytes = writer.into_bytes();
+
+        assert!(skip_short_term_ref_pic_sets(&mut BitReader::new(&bytes), 2, 15).is_err());
+    }
+
+    #[test]
+    fn hrd_elemental_duration_and_sub_pic_ordering_are_bounded() {
+        let mut invalid_duration = BitWriter::default();
+        invalid_duration.bit(true); // nal_hrd_parameters_present_flag
+        invalid_duration.bit(false); // vcl_hrd_parameters_present_flag
+        invalid_duration.bit(false); // sub_pic_hrd_params_present_flag
+        invalid_duration.bits(0, 4); // bit_rate_scale
+        invalid_duration.bits(0, 4); // cpb_size_scale
+        invalid_duration.bits(0, 5);
+        invalid_duration.bits(0, 5);
+        invalid_duration.bits(0, 5);
+        invalid_duration.bit(true); // fixed_pic_rate_general_flag
+        invalid_duration.ue(2048); // elemental_duration_in_tc_minus1
+        invalid_duration.ue(0); // cpb_cnt_minus1
+        invalid_duration.ue(0); // bit_rate_value_minus1
+        invalid_duration.ue(0); // cpb_size_value_minus1
+        invalid_duration.bit(false); // cbr_flag
+        let invalid_duration = invalid_duration.into_bytes();
+        assert!(
+            skip_hrd_parameters(&mut BitReader::new(&invalid_duration), 0).is_err(),
+            "elemental_duration_in_tc_minus1 above 2047 must be rejected"
+        );
+
+        let mut invalid_sub_pic_order = BitWriter::default();
+        invalid_sub_pic_order.bit(true);
+        invalid_sub_pic_order.bit(false);
+        invalid_sub_pic_order.bit(true);
+        invalid_sub_pic_order.bits(0, 8);
+        invalid_sub_pic_order.bits(0, 5);
+        invalid_sub_pic_order.bit(false);
+        invalid_sub_pic_order.bits(0, 5);
+        invalid_sub_pic_order.bits(0, 4); // bit_rate_scale
+        invalid_sub_pic_order.bits(0, 4); // cpb_size_scale
+        invalid_sub_pic_order.bits(0, 4); // cpb_size_du_scale
+        invalid_sub_pic_order.bits(0, 5);
+        invalid_sub_pic_order.bits(0, 5);
+        invalid_sub_pic_order.bits(0, 5);
+        invalid_sub_pic_order.bit(true);
+        invalid_sub_pic_order.ue(0);
+        invalid_sub_pic_order.ue(1); // cpb_cnt_minus1
+        for cpb_size_du in [0, 1] {
+            invalid_sub_pic_order.ue(0); // equal bit rates are invalid after entry zero
+            invalid_sub_pic_order.ue(0);
+            invalid_sub_pic_order.ue(cpb_size_du); // increasing CPB DU sizes are invalid
+            invalid_sub_pic_order.ue(0); // equal DU bit rates are invalid after entry zero
+            invalid_sub_pic_order.bit(false);
+        }
+        let invalid_sub_pic_order = invalid_sub_pic_order.into_bytes();
+        assert!(
+            skip_hrd_parameters(&mut BitReader::new(&invalid_sub_pic_order), 0).is_err(),
+            "HRD and sub-picture value ordering must be validated"
+        );
     }
 
     #[test]
