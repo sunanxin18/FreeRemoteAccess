@@ -33,27 +33,27 @@ fn startup_display_size(server_init: DisplaySize) -> DisplaySize {
     server_init
 }
 
-fn adapter_error() -> ProtocolError {
-    ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), APPLE_RUNTIME_FAILED)
+fn adapter_error(protocol_id: frd_core::ProtocolId) -> ProtocolError {
+    ProtocolError::adapter(protocol_id, APPLE_RUNTIME_FAILED)
 }
 
-fn high_performance_unavailable_error() -> ProtocolError {
-    ProtocolError::adapter(
-        frd_core::ProtocolId::apple_hpss_mvs(),
-        APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
-    )
+fn high_performance_unavailable_error(protocol_id: frd_core::ProtocolId) -> ProtocolError {
+    ProtocolError::adapter(protocol_id, APPLE_HIGH_PERFORMANCE_UNAVAILABLE)
 }
 
-fn protocol_exit_for_runtime_error(error: anyhow::Error) -> ProtocolExit {
+fn protocol_exit_for_runtime_error(
+    protocol_id: frd_core::ProtocolId,
+    error: anyhow::Error,
+) -> ProtocolExit {
     if error
         .chain()
         .any(|cause| cause.is::<HighPerformanceUnavailable>())
     {
-        ProtocolExit::Failed(high_performance_unavailable_error())
+        ProtocolExit::Failed(high_performance_unavailable_error(protocol_id))
     } else if is_peer_closed(&error) {
         ProtocolExit::Closed
     } else {
-        ProtocolExit::Failed(adapter_error())
+        ProtocolExit::Failed(adapter_error(protocol_id))
     }
 }
 
@@ -359,6 +359,7 @@ pub(crate) fn run_authenticated_session(
     established: EstablishedAppleSession,
     runtime: ProtocolRuntime,
     session_id: SessionId,
+    protocol_id: frd_core::ProtocolId,
 ) -> ProtocolExit {
     let EstablishedAppleSession {
         connection,
@@ -373,6 +374,7 @@ pub(crate) fn run_authenticated_session(
         false,
         AudioMediaFlow::MacToPc,
         metadata.encoding_profile == crate::session::SessionEncodingProfile::AppleUdpMedia,
+        protocol_id,
     )
 }
 
@@ -396,6 +398,7 @@ pub fn run_established_hpss_session(
         dynamic_resolution_enabled,
         audio_flow,
         true,
+        frd_core::ProtocolId::apple_hpss_mvs(),
     )
 }
 
@@ -409,6 +412,7 @@ fn run_authenticated_session_with_media(
     dynamic_resolution_enabled: bool,
     audio_flow: AudioMediaFlow,
     udp_media_enabled: bool,
+    protocol_id: frd_core::ProtocolId,
 ) -> ProtocolExit {
     match run_authenticated_session_inner(
         connection,
@@ -421,7 +425,7 @@ fn run_authenticated_session_with_media(
         udp_media_enabled,
     ) {
         Ok(()) => ProtocolExit::Closed,
-        Err(error) => protocol_exit_for_runtime_error(error),
+        Err(error) => protocol_exit_for_runtime_error(protocol_id, error),
     }
 }
 
@@ -862,6 +866,7 @@ mod tests {
                 false,
                 crate::media_negotiation::AudioMediaFlow::MacToPc,
                 udp_media_enabled,
+                frd_core::ProtocolId::apple_hpss_mvs(),
             );
             exit_tx.send(result).unwrap();
         });
@@ -1214,6 +1219,7 @@ mod tests {
             false,
             crate::media_negotiation::AudioMediaFlow::MacToPc,
             false,
+            frd_core::ProtocolId::apple_hpss_mvs(),
         );
 
         assert!(matches!(
@@ -1289,11 +1295,23 @@ mod tests {
 
         assert!(matches!(
             super::protocol_exit_for_runtime_error(
+                frd_core::ProtocolId::apple_hpss_mvs(),
                 crate::high_performance::HighPerformanceUnavailable.into()
             ),
             frd_protocol_api::ProtocolExit::Failed(ref error)
                 if error.code()
                     == crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+                    && error.protocol_id() == Some(&frd_core::ProtocolId::apple_hpss_mvs())
+        ));
+        assert!(matches!(
+            super::protocol_exit_for_runtime_error(
+                frd_core::ProtocolId::apple_high_performance(),
+                anyhow::anyhow!("raw backend text must be redacted")
+            ),
+            frd_protocol_api::ProtocolExit::Failed(ref error)
+                if error.code() == "apple_runtime_failed"
+                    && error.protocol_id()
+                        == Some(&frd_core::ProtocolId::apple_high_performance())
         ));
     }
 

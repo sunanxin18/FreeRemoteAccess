@@ -39,7 +39,8 @@ pub use connection::{
 };
 pub use factory::{
     authenticate_negotiated, finish_authenticated_session, AppleAuthenticated, AppleHandshakeError,
-    AppleProtocolFactory, AppleProtocolSession, AppleSessionMetadata, EstablishedAppleSession,
+    AppleHighPerformanceProtocolFactory, AppleProtocolFactory, AppleProtocolSession,
+    AppleSessionMetadata, EstablishedAppleSession,
 };
 pub use runtime::run_established_hpss_session;
 pub use session::{SessionCrypto, SessionEncodingProfile};

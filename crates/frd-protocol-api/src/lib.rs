@@ -112,8 +112,15 @@ impl CredentialRequirements {
 
 impl From<ProtocolId> for ProtocolDescriptor {
     fn from(id: ProtocolId) -> Self {
+        let display_name = if id == ProtocolId::apple_hpss_mvs() {
+            "Apple Standard/MVS".to_owned()
+        } else if id == ProtocolId::apple_high_performance() {
+            "Apple High Performance".to_owned()
+        } else {
+            id.as_str().to_owned()
+        };
         Self {
-            display_name: id.as_str().to_owned(),
+            display_name,
             default_port: default_port_for(&id),
             credential_requirements: CredentialRequirements::username_password(),
             id,
@@ -181,7 +188,10 @@ fn default_protocol_for(target: TargetSystem) -> Option<ProtocolId> {
 
 fn target_permits_protocol(target: TargetSystem, protocol_id: &ProtocolId) -> bool {
     match target {
-        TargetSystem::MacOs => *protocol_id == ProtocolId::apple_hpss_mvs(),
+        TargetSystem::MacOs => {
+            *protocol_id == ProtocolId::apple_hpss_mvs()
+                || *protocol_id == ProtocolId::apple_high_performance()
+        }
         TargetSystem::Windows => *protocol_id == ProtocolId::rdp(),
         TargetSystem::Linux => *protocol_id == ProtocolId::rfb(),
         TargetSystem::Custom => true,
@@ -896,6 +906,40 @@ mod tests {
         assert_eq!(
             catalog.select(TargetSystem::MacOs, ProtocolSelection::Automatic),
             Ok(ProtocolId::apple_hpss_mvs())
+        );
+    }
+
+    #[test]
+    fn apple_modes_are_independent_while_automatic_remains_standard_mvs() {
+        let catalog = ProtocolCatalog::new([
+            ProtocolId::apple_hpss_mvs(),
+            ProtocolId::apple_high_performance(),
+        ]);
+
+        assert_eq!(
+            catalog.select(TargetSystem::MacOs, ProtocolSelection::Automatic),
+            Ok(ProtocolId::apple_hpss_mvs())
+        );
+        assert_eq!(
+            catalog.select(
+                TargetSystem::MacOs,
+                ProtocolSelection::Explicit(ProtocolId::apple_high_performance()),
+            ),
+            Ok(ProtocolId::apple_high_performance())
+        );
+        assert_eq!(
+            catalog
+                .descriptor(&ProtocolId::apple_hpss_mvs())
+                .unwrap()
+                .display_name,
+            "Apple Standard/MVS"
+        );
+        assert_eq!(
+            catalog
+                .descriptor(&ProtocolId::apple_high_performance())
+                .unwrap()
+                .display_name,
+            "Apple High Performance"
         );
     }
 

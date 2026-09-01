@@ -25,26 +25,41 @@ const APPLE_AUTHENTICATION_FAILED: &str = "apple_authentication_failed";
 const APPLE_PROTOCOL_MISMATCH: &str = "apple_protocol_mismatch";
 const SECURITY_FAILURE_REASON_MAX_BYTES: usize = 4096;
 const PRODUCT_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
+    SessionEncodingProfile::AppleTcpMvs;
+const HIGH_PERFORMANCE_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
     SessionEncodingProfile::AppleUdpMedia;
 
-fn apple_error(code: &'static str) -> ProtocolError {
-    ProtocolError::adapter(frd_core::ProtocolId::apple_hpss_mvs(), code)
+fn product_error(protocol_id: frd_core::ProtocolId, code: &'static str) -> ProtocolError {
+    ProtocolError::adapter(protocol_id, code)
 }
 
 fn select_product_high_performance_security(
     offered: &[u8],
     credentials: &Credentials,
 ) -> Result<u8, ProtocolError> {
+    select_product_high_performance_security_for(
+        frd_core::ProtocolId::apple_hpss_mvs(),
+        offered,
+        credentials,
+    )
+}
+
+fn select_product_high_performance_security_for(
+    protocol_id: frd_core::ProtocolId,
+    offered: &[u8],
+    credentials: &Credentials,
+) -> Result<u8, ProtocolError> {
     if credentials.username.is_empty() || credentials.password.expose().is_empty() {
-        return Err(apple_error(APPLE_CREDENTIALS_REQUIRED));
+        return Err(product_error(protocol_id, APPLE_CREDENTIALS_REQUIRED));
     }
     offered
         .contains(&security::APPLE_SRP)
         .then_some(security::APPLE_SRP)
-        .ok_or_else(|| apple_error(APPLE_HIGH_PERFORMANCE_UNAVAILABLE))
+        .ok_or_else(|| product_error(protocol_id, APPLE_HIGH_PERFORMANCE_UNAVAILABLE))
 }
 
 pub struct AppleProtocolFactory;
+pub struct AppleHighPerformanceProtocolFactory;
 
 #[derive(Debug)]
 pub enum AppleHandshakeError {
@@ -75,10 +90,14 @@ impl AppleHandshakeError {
         }
     }
 
-    fn into_protocol_error(self, fallback: &'static str) -> ProtocolError {
+    fn into_protocol_error(
+        self,
+        protocol_id: frd_core::ProtocolId,
+        fallback: &'static str,
+    ) -> ProtocolError {
         match self {
-            Self::Protocol(error) => error,
-            Self::Transport(_) => apple_error(fallback),
+            Self::Protocol(error) => product_error(protocol_id, error.code()),
+            Self::Transport(_) => product_error(protocol_id, fallback),
         }
     }
 }
@@ -122,23 +141,64 @@ impl ProtocolFactory for AppleProtocolFactory {
         request: ConnectRequest,
         runtime: ProtocolRuntime,
     ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
-        if request.protocol_id != frd_core::ProtocolId::apple_hpss_mvs() {
-            return Err(apple_error(APPLE_PROTOCOL_MISMATCH));
-        }
-        let credentials = request
-            .credentials
-            .as_ref()
-            .ok_or_else(|| apple_error(APPLE_CREDENTIALS_REQUIRED))?;
-        if credentials.username.is_empty() || credentials.password.expose().is_empty() {
-            return Err(apple_error(APPLE_CREDENTIALS_REQUIRED));
-        }
-        Ok(Box::new(AppleProtocolSession { request, runtime }))
+        create_product_session(
+            frd_core::ProtocolId::apple_hpss_mvs(),
+            PRODUCT_SESSION_ENCODING_PROFILE,
+            request,
+            runtime,
+        )
     }
+}
+
+impl ProtocolFactory for AppleHighPerformanceProtocolFactory {
+    fn descriptor(&self) -> ProtocolDescriptor {
+        ProtocolDescriptor::from(frd_core::ProtocolId::apple_high_performance())
+    }
+
+    fn create(
+        &self,
+        request: ConnectRequest,
+        runtime: ProtocolRuntime,
+    ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
+        create_product_session(
+            frd_core::ProtocolId::apple_high_performance(),
+            HIGH_PERFORMANCE_SESSION_ENCODING_PROFILE,
+            request,
+            runtime,
+        )
+    }
+}
+
+fn create_product_session(
+    expected_protocol_id: frd_core::ProtocolId,
+    encoding_profile: SessionEncodingProfile,
+    request: ConnectRequest,
+    runtime: ProtocolRuntime,
+) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
+    if request.protocol_id != expected_protocol_id {
+        return Err(product_error(expected_protocol_id, APPLE_PROTOCOL_MISMATCH));
+    }
+    let credentials = request
+        .credentials
+        .as_ref()
+        .ok_or_else(|| product_error(expected_protocol_id.clone(), APPLE_CREDENTIALS_REQUIRED))?;
+    if credentials.username.is_empty() || credentials.password.expose().is_empty() {
+        return Err(product_error(
+            expected_protocol_id,
+            APPLE_CREDENTIALS_REQUIRED,
+        ));
+    }
+    Ok(Box::new(AppleProtocolSession {
+        request,
+        runtime,
+        encoding_profile,
+    }))
 }
 
 pub struct AppleProtocolSession {
     request: ConnectRequest,
     runtime: ProtocolRuntime,
+    encoding_profile: SessionEncodingProfile,
 }
 
 impl ProtocolSession for AppleProtocolSession {
@@ -149,7 +209,7 @@ impl ProtocolSession for AppleProtocolSession {
         {
             return ProtocolExit::Failed(error);
         }
-        match connect_authenticated(&self.request) {
+        match connect_authenticated_for_profile(&self.request, self.encoding_profile) {
             Ok(established) => {
                 // Authentication is complete; do not retain the credential
                 // buffer for the long-running HPSS/MVS session.
@@ -158,6 +218,7 @@ impl ProtocolSession for AppleProtocolSession {
                     established,
                     self.runtime,
                     self.request.session_id,
+                    self.request.protocol_id.clone(),
                 )
             }
             Err(error) => ProtocolExit::Failed(error),
@@ -165,26 +226,35 @@ impl ProtocolSession for AppleProtocolSession {
     }
 }
 
+#[cfg(test)]
 fn connect_authenticated(
     request: &ConnectRequest,
 ) -> Result<EstablishedAppleSession, ProtocolError> {
+    connect_authenticated_for_profile(request, PRODUCT_SESSION_ENCODING_PROFILE)
+}
+
+fn connect_authenticated_for_profile(
+    request: &ConnectRequest,
+    encoding_profile: SessionEncodingProfile,
+) -> Result<EstablishedAppleSession, ProtocolError> {
+    let protocol_id = request.protocol_id.clone();
     let stream = match literal_socket_address(request.endpoint.host(), request.endpoint.port()) {
         Some(address) => TcpStream::connect(address),
         None => TcpStream::connect((request.endpoint.host(), request.endpoint.port())),
     }
-    .map_err(|_| apple_error(APPLE_CONNECTION_FAILED))?;
+    .map_err(|_| product_error(protocol_id.clone(), APPLE_CONNECTION_FAILED))?;
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut connection = AppleConnection::new(stream);
-    let (version, offered) =
-        negotiate(&mut connection).map_err(|_| apple_error(APPLE_NEGOTIATION_FAILED))?;
+    let (version, offered) = negotiate(&mut connection)
+        .map_err(|_| product_error(protocol_id.clone(), APPLE_NEGOTIATION_FAILED))?;
     let credentials = request
         .credentials
         .as_ref()
-        .ok_or_else(|| apple_error(APPLE_CREDENTIALS_REQUIRED))?;
-    select_product_high_performance_security(&offered, credentials)?;
+        .ok_or_else(|| product_error(protocol_id.clone(), APPLE_CREDENTIALS_REQUIRED))?;
+    select_product_high_performance_security_for(protocol_id.clone(), &offered, credentials)?;
     let password = std::str::from_utf8(credentials.password.expose())
-        .map_err(|_| apple_error(APPLE_AUTHENTICATION_FAILED))?;
+        .map_err(|_| product_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED))?;
     let authenticated = authenticate_negotiated(
         connection,
         version,
@@ -192,21 +262,29 @@ fn connect_authenticated(
         &credentials.username,
         password,
     )
-    .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
-    finish_product_authenticated_session(authenticated, PRODUCT_SESSION_ENCODING_PROFILE)
+    .map_err(|error| error.into_protocol_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED))?;
+    finish_product_authenticated_session(authenticated, encoding_profile, protocol_id)
 }
 
 fn finish_product_authenticated_session(
     authenticated: AppleAuthenticated,
     profile: SessionEncodingProfile,
+    protocol_id: frd_core::ProtocolId,
 ) -> Result<EstablishedAppleSession, ProtocolError> {
     if authenticated.security_type != security::APPLE_SRP || authenticated.srp_key.is_none() {
-        return Err(apple_error(APPLE_HIGH_PERFORMANCE_UNAVAILABLE));
+        return Err(product_error(
+            protocol_id,
+            APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
+        ));
     }
-    let established = finish_authenticated_session(authenticated, profile)
-        .map_err(|error| error.into_protocol_error(APPLE_AUTHENTICATION_FAILED))?;
+    let established = finish_authenticated_session(authenticated, profile).map_err(|error| {
+        error.into_protocol_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED)
+    })?;
     if !established.connection.is_encrypted() {
-        return Err(apple_error(APPLE_HIGH_PERFORMANCE_UNAVAILABLE));
+        return Err(product_error(
+            protocol_id,
+            APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
+        ));
     }
     Ok(established)
 }
@@ -223,6 +301,8 @@ mod product_profile_tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+
+    use frd_protocol_api::ProtocolFactory;
 
     use crate::session::SessionEncodingProfile;
 
@@ -292,6 +372,7 @@ mod product_profile_tests {
         let error = match super::finish_product_authenticated_session(
             authenticated,
             SessionEncodingProfile::AppleTcpMvs,
+            frd_core::ProtocolId::apple_hpss_mvs(),
         ) {
             Ok(_) => panic!("未加密产品会话不得进入 runtime"),
             Err(error) => error,
@@ -308,10 +389,22 @@ mod product_profile_tests {
     }
 
     #[test]
-    fn product_desktop_registers_udp_video_only_after_the_unified_present_gate_exists() {
+    fn standard_and_high_performance_factories_keep_independent_identities_and_profiles() {
         assert_eq!(
             super::PRODUCT_SESSION_ENCODING_PROFILE,
+            SessionEncodingProfile::AppleTcpMvs
+        );
+        assert_eq!(
+            super::HIGH_PERFORMANCE_SESSION_ENCODING_PROFILE,
             SessionEncodingProfile::AppleUdpMedia
+        );
+        assert_eq!(
+            super::AppleProtocolFactory.descriptor().id,
+            frd_core::ProtocolId::apple_hpss_mvs()
+        );
+        assert_eq!(
+            super::AppleHighPerformanceProtocolFactory.descriptor().id,
+            frd_core::ProtocolId::apple_high_performance()
         );
     }
 

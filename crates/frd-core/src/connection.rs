@@ -31,6 +31,10 @@ impl ProtocolId {
         Self("apple-hpss-mvs".to_owned())
     }
 
+    pub fn apple_high_performance() -> Self {
+        Self("apple-high-performance".to_owned())
+    }
+
     pub fn rdp() -> Self {
         Self("rdp".to_owned())
     }

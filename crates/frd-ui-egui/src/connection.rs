@@ -521,7 +521,7 @@ fn target_option_label(
     }
 }
 
-fn protocol_option_label(
+pub(crate) fn protocol_option_label(
     choice: &ProtocolChoice,
     target: Option<TargetSystem>,
     catalog: &ProtocolCatalog,

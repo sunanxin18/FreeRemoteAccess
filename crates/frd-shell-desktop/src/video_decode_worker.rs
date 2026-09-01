@@ -112,6 +112,12 @@ pub struct DecodedVideoFrameHandoff {
     frame: DecodedVideoFrame,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoStreamAdmission {
+    pub identity: VideoStreamIdentity,
+    pub generation: u64,
+}
+
 impl DecodedVideoFrameHandoff {
     pub const fn token(&self) -> &VideoFrameToken {
         &self.token
@@ -372,6 +378,7 @@ struct ControlPublication {
 }
 
 struct VideoEventState {
+    admissions: VecDeque<VideoStreamAdmission>,
     controls: VecDeque<ControlPublication>,
     streams: HashMap<VideoStreamIdentity, StreamPresentationState>,
     next_epoch: u64,
@@ -391,6 +398,7 @@ impl VideoWorkerEvents {
         Self {
             shared: Arc::new((
                 Mutex::new(VideoEventState {
+                    admissions: VecDeque::new(),
                     controls: VecDeque::new(),
                     streams: HashMap::new(),
                     next_epoch: 1,
@@ -561,6 +569,37 @@ impl VideoWorkerEvents {
         take_frame_from_state(&mut state, identity)
     }
 
+    pub fn try_recv_admission(&self) -> Option<VideoStreamAdmission> {
+        self.shared
+            .0
+            .lock()
+            .expect("video event mutex poisoned")
+            .admissions
+            .pop_front()
+    }
+
+    pub fn recv_admission_timeout(&self, timeout: Duration) -> Option<VideoStreamAdmission> {
+        let deadline = Instant::now() + timeout;
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().expect("video event mutex poisoned");
+        loop {
+            if let Some(admission) = state.admissions.pop_front() {
+                return Some(admission);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next, wait) = wake
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .expect("video event mutex poisoned while waiting for admission");
+            state = next;
+            if wait.timed_out() && state.admissions.is_empty() {
+                return None;
+            }
+        }
+    }
+
     pub fn has_latest_frame(&self, identity: VideoStreamIdentity) -> bool {
         self.shared
             .0
@@ -716,6 +755,19 @@ fn accept_config_in_state(
         },
     );
     epoch
+}
+
+fn enqueue_admission(state: &mut VideoEventState, epoch: StreamEpoch) {
+    state
+        .admissions
+        .retain(|admission| admission.identity != epoch.identity);
+    while state.admissions.len() >= VIDEO_STREAM_IDENTITY_LIMIT {
+        state.admissions.pop_front();
+    }
+    state.admissions.push_back(VideoStreamAdmission {
+        identity: epoch.identity,
+        generation: epoch.generation,
+    });
 }
 
 fn enqueue_epoch_control(
@@ -925,9 +977,13 @@ impl VideoRouter {
             .expect("stream route was inserted")
             .input
             .try_push_config(epoch, config);
+        if result.is_ok() {
+            enqueue_admission(&mut output, epoch);
+        }
         output_wake.notify_all();
         drop(output);
         if result.is_ok() {
+            self.events.notify_wake();
             wake.notify_all();
         }
         result

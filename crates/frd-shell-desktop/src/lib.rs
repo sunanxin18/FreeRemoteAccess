@@ -22,7 +22,7 @@ pub use input::{InputGate, InputOwnership, InputRouter};
 pub use lifecycle::PresentationOperation;
 pub use video_decode_worker::{
     DecodedVideoFrameHandoff, VideoDecodeSender, VideoDecoderDiagnostics, VideoFrameToken,
-    VideoWorkerEvent, VideoWorkerEvents, VideoWorkerSendError,
+    VideoStreamAdmission, VideoWorkerEvent, VideoWorkerEvents, VideoWorkerSendError,
 };
 pub use window_chrome::{
     ChromeHit, ChromeHitRegions, ChromeLayout, ChromeRect, NativeChromeInsets, WindowChromeAction,

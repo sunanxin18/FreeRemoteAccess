@@ -202,7 +202,7 @@ mod tests {
     use frd_frame::SurfaceUpdate;
     use frd_media_api::{
         ChromaFormat, MediaFrame, MediaPublishError, MediaPublisher, VideoBitstreamFormat,
-        VideoProfile, VideoStreamIdentity,
+        VideoParameterSets, VideoProfile, VideoStreamIdentity,
     };
     use frd_protocol_api::{
         ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent,
@@ -212,7 +212,9 @@ mod tests {
     use crate::hevc_access_unit::HevcAccessUnit;
     use crate::hevc_sps::{parse_hevc_sps, CAPTURED_MAIN444_8BIT_SPS};
 
-    use super::{build_video_config, AppleHighPerformanceVideoAdapter};
+    use super::{
+        build_video_config, AppleHighPerformanceVideoAdapter, AppleHighPerformanceVideoError,
+    };
 
     const GENERATION: u64 = 7;
 
@@ -354,7 +356,17 @@ mod tests {
                 ..captured
             },
         ] {
-            assert!(build_video_config(identity, GENERATION, incompatible, None).is_err());
+            let parameter_sets = VideoParameterSets::try_new(
+                Some(vec![0x40, 0x01, 0xaa].into_boxed_slice()),
+                CAPTURED_MAIN444_8BIT_SPS.to_vec().into_boxed_slice(),
+                vec![0x44, 0x01, 0xbb].into_boxed_slice(),
+            )
+            .unwrap();
+            assert_eq!(
+                build_video_config(identity, GENERATION, incompatible, Some(parameter_sets))
+                    .unwrap_err(),
+                AppleHighPerformanceVideoError::UnsupportedStreamConfig
+            );
         }
     }
 }

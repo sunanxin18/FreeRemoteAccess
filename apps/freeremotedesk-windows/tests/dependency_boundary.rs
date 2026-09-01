@@ -137,6 +137,12 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
     assert_eq!(main_source.matches(&apple_crate).count(), 1);
     assert_eq!(main_source.matches(&rdp_crate).count(), 1);
     assert_eq!(main_source.matches("AppleProtocolFactory").count(), 2);
+    assert_eq!(
+        main_source
+            .matches("AppleHighPerformanceProtocolFactory")
+            .count(),
+        2
+    );
     assert_eq!(main_source.matches("RdpProtocolFactory").count(), 2);
     assert_eq!(
         main_source
@@ -144,6 +150,13 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
             .count(),
         1,
         "the product registers exactly the approved Apple factory"
+    );
+    assert_eq!(
+        main_source
+            .matches("Arc::new(AppleHighPerformanceProtocolFactory)")
+            .count(),
+        1,
+        "the product registers exactly one explicit Apple High Performance factory"
     );
     assert_eq!(
         main_source.matches("Arc::new(RdpProtocolFactory)").count(),

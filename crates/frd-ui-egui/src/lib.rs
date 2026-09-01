@@ -194,3 +194,32 @@ fn explicit_protocol_disables_incompatible_target_in_multi_protocol_catalog() {
         &ProtocolChoice::Explicit(ProtocolId::apple_hpss_mvs()),
     ));
 }
+
+#[cfg(test)]
+#[test]
+fn apple_mode_options_use_distinct_product_labels() {
+    use frd_core::{ProtocolId, TargetSystem};
+    use frd_ui_model::ProtocolChoice;
+
+    let catalog = frd_protocol_api::ProtocolCatalog::new([
+        ProtocolId::apple_hpss_mvs(),
+        ProtocolId::apple_high_performance(),
+    ]);
+
+    assert_eq!(
+        connection::protocol_option_label(
+            &ProtocolChoice::Explicit(ProtocolId::apple_hpss_mvs()),
+            Some(TargetSystem::MacOs),
+            &catalog,
+        ),
+        "Apple Standard/MVS"
+    );
+    assert_eq!(
+        connection::protocol_option_label(
+            &ProtocolChoice::Explicit(ProtocolId::apple_high_performance()),
+            Some(TargetSystem::MacOs),
+            &catalog,
+        ),
+        "Apple High Performance"
+    );
+}
