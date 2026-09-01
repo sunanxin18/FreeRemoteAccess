@@ -20,8 +20,8 @@ use frd_frame::{
     PixelPatch, SurfaceUpdate,
 };
 use frd_media_api::{
-    AudioOutput, AudioOutputError, MediaFrame, MediaPublishError, MediaPublisher,
-    VideoDecodeErrorCode, VideoStreamIdentity,
+    AudioOutput, AudioOutputError, DecodedVideoFrame, MediaFrame, MediaPublishError,
+    MediaPublisher, VideoDecodeErrorCode, VideoStreamIdentity,
 };
 use frd_protocol_api::{
     ConnectRequest, MailboxSurfacePublisher, ProtocolCatalog, ProtocolError, ProtocolExit,
@@ -1400,6 +1400,131 @@ fn transition_video_surface_owner(
     }
 }
 
+trait VideoSurfaceDrainTarget {
+    fn video_owner(&self) -> Option<VideoStreamEpoch>;
+    fn video_owner_mut(&mut self) -> &mut Option<VideoStreamEpoch>;
+    fn active_video_mut(&mut self) -> &mut Option<VideoBinding>;
+    fn reset_for_admission(&mut self);
+    fn configure_video_stream(&mut self, epoch: VideoStreamEpoch)
+        -> Result<(), VideoRendererError>;
+    fn upload_video_frame(
+        &mut self,
+        token: VideoFrameToken,
+        frame: DecodedVideoFrame,
+    ) -> Result<(), VideoRendererError>;
+    fn detach_after_video_failure(&mut self);
+    fn video_worker_stopped(&mut self);
+}
+
+#[derive(Default)]
+struct VideoSurfaceDrainOutcome {
+    ui_redraw_needed: bool,
+    frame_redraw_needed: bool,
+    failure: Option<(SessionId, VideoFailureAction)>,
+}
+
+fn drain_video_surface_events<T: VideoSurfaceDrainTarget>(
+    target: &mut T,
+    admissions: Vec<(SessionId, VideoStreamAdmission)>,
+    events: Vec<(SessionId, VideoWorkerEvent)>,
+    active_protocol_id: Option<ProtocolId>,
+) -> Result<VideoSurfaceDrainOutcome, FatalReport> {
+    let mut outcome = VideoSurfaceDrainOutcome {
+        ui_redraw_needed: !events.is_empty(),
+        ..VideoSurfaceDrainOutcome::default()
+    };
+    for (session_id, admission) in admissions {
+        if admission.identity.session_id != session_id {
+            continue;
+        }
+        if admit_video_surface_owner(target.video_owner_mut(), admission) {
+            target.reset_for_admission();
+        }
+    }
+
+    for (session_id, event) in events {
+        match event {
+            VideoWorkerEvent::BackendSelected {
+                identity,
+                generation,
+                ..
+            } if identity.session_id == session_id => {
+                let epoch = VideoStreamEpoch {
+                    identity,
+                    generation,
+                };
+                if target.video_owner() != Some(epoch) {
+                    continue;
+                }
+                match target.configure_video_stream(epoch) {
+                    Ok(()) | Err(VideoRendererError::StaleStreamOrGeneration) => {}
+                    Err(error) => {
+                        return Err(FatalReport::presentation(
+                            PresentationOperation::Redraw,
+                            PresentError::from(error),
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            VideoWorkerEvent::FrameDecoded(handoff) => {
+                let (token, frame) = handoff.into_parts();
+                let input = frame.as_input();
+                if token.identity().session_id != session_id
+                    || token.identity() != input.identity
+                    || token.generation() != input.generation
+                    || token.timestamp() != input.timestamp
+                    || !video_surface_owner_matches(
+                        target.video_owner(),
+                        token.identity(),
+                        token.generation(),
+                    )
+                {
+                    continue;
+                }
+                match target.upload_video_frame(token, frame) {
+                    Ok(()) => outcome.frame_redraw_needed = true,
+                    Err(VideoRendererError::StaleStreamOrGeneration) => {}
+                    Err(error) => {
+                        return Err(FatalReport::presentation(
+                            PresentationOperation::Redraw,
+                            PresentError::from(error),
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            VideoWorkerEvent::DecodeFailed {
+                identity,
+                generation,
+                code,
+                ..
+            } => {
+                let Some(protocol_id) = active_protocol_id.clone() else {
+                    continue;
+                };
+                let disconnect = disconnect_after_matching_video_failure(
+                    target.video_owner(),
+                    target.active_video_mut(),
+                    identity,
+                    generation,
+                    code,
+                    protocol_id,
+                );
+                if disconnect.is_some() {
+                    target.detach_after_video_failure();
+                    outcome.failure = disconnect.map(|action| (session_id, action));
+                }
+            }
+            VideoWorkerEvent::Stopped => target.video_worker_stopped(),
+            VideoWorkerEvent::BackendSelected { .. } => {}
+        }
+    }
+    Ok(outcome)
+}
+
 fn disconnect_after_matching_video_failure(
     configured: Option<VideoStreamEpoch>,
     active: &mut Option<VideoBinding>,
@@ -1650,6 +1775,67 @@ impl DesktopWindowState {
         self.chrome_layout = Some(layout);
         self.chrome.publish_hit_regions(ChromeHitRegions { layout });
         Some(layout)
+    }
+}
+
+impl VideoSurfaceDrainTarget for DesktopWindowState {
+    fn video_owner(&self) -> Option<VideoStreamEpoch> {
+        self.video_owner
+    }
+
+    fn video_owner_mut(&mut self) -> &mut Option<VideoStreamEpoch> {
+        &mut self.video_owner
+    }
+
+    fn active_video_mut(&mut self) -> &mut Option<VideoBinding> {
+        &mut self.video
+    }
+
+    fn reset_for_admission(&mut self) {
+        self.video_renderer.detach();
+        self.video = None;
+        self.pending_video = None;
+    }
+
+    fn configure_video_stream(
+        &mut self,
+        epoch: VideoStreamEpoch,
+    ) -> Result<(), VideoRendererError> {
+        self.video_renderer.configure_stream(epoch)?;
+        self.video = None;
+        self.pending_video = None;
+        Ok(())
+    }
+
+    fn upload_video_frame(
+        &mut self,
+        token: VideoFrameToken,
+        frame: DecodedVideoFrame,
+    ) -> Result<(), VideoRendererError> {
+        let upload = self.video_renderer.upload_frame(frame)?;
+        self.video = Some(VideoBinding {
+            identity: token.identity(),
+            generation: token.generation(),
+            size: upload.layout.visible_size(),
+        });
+        self.pending_video = Some((upload.receipt, token));
+        self.pending_texture_writes.record_batch(true);
+        Ok(())
+    }
+
+    fn detach_after_video_failure(&mut self) {
+        self.video_renderer.detach();
+        self.pending_video = None;
+    }
+
+    fn video_worker_stopped(&mut self) {
+        self.video_renderer.detach();
+        transition_video_surface_owner(
+            &mut self.video_owner,
+            VideoSurfaceOwnerTransition::WorkerStopped,
+        );
+        self.video = None;
+        self.pending_video = None;
     }
 }
 
@@ -2316,135 +2502,19 @@ impl DesktopApplication {
         }
 
         let video_admissions = self.sessions.drain_video_admissions();
-        for (session_id, admission) in video_admissions {
-            if admission.identity.session_id != session_id {
-                continue;
-            }
-            if let Some(window) = self.window.as_mut() {
-                if admit_video_surface_owner(&mut window.video_owner, admission) {
-                    window.video_renderer.detach();
-                    window.video = None;
-                    window.pending_video = None;
-                }
-            }
-        }
-
         let video_events = self.sessions.drain_video_worker_events();
-        outcome.ui_redraw_needed |= !video_events.is_empty();
         let active_protocol_id = self.sessions.active_protocol_id();
-        let mut video_failure = None;
-        for (session_id, event) in video_events {
-            match event {
-                VideoWorkerEvent::BackendSelected {
-                    identity,
-                    generation,
-                    ..
-                } if identity.session_id == session_id => {
-                    if let Some(window) = self.window.as_mut() {
-                        let epoch = VideoStreamEpoch {
-                            identity,
-                            generation,
-                        };
-                        if window.video_owner != Some(epoch) {
-                            continue;
-                        }
-                        match window.video_renderer.configure_stream(epoch) {
-                            Ok(()) => {
-                                window.video = None;
-                                window.pending_video = None;
-                            }
-                            Err(VideoRendererError::StaleStreamOrGeneration) => {}
-                            Err(error) => {
-                                return Err(FatalReport::presentation(
-                                    PresentationOperation::Redraw,
-                                    PresentError::from(error),
-                                    None,
-                                    None,
-                                ));
-                            }
-                        }
-                    }
-                }
-                VideoWorkerEvent::FrameDecoded(handoff) => {
-                    let (token, frame) = handoff.into_parts();
-                    let input = frame.as_input();
-                    if token.identity().session_id != session_id
-                        || token.identity() != input.identity
-                        || token.generation() != input.generation
-                        || token.timestamp() != input.timestamp
-                    {
-                        continue;
-                    }
-                    let Some(window) = self.window.as_mut() else {
-                        continue;
-                    };
-                    if !video_surface_owner_matches(
-                        window.video_owner,
-                        token.identity(),
-                        token.generation(),
-                    ) {
-                        continue;
-                    }
-                    match window.video_renderer.upload_frame(frame) {
-                        Ok(upload) => {
-                            window.video = Some(VideoBinding {
-                                identity: token.identity(),
-                                generation: token.generation(),
-                                size: upload.layout.visible_size(),
-                            });
-                            window.pending_video = Some((upload.receipt, token));
-                            window.pending_texture_writes.record_batch(true);
-                            outcome.frame_redraw_needed = true;
-                        }
-                        Err(VideoRendererError::StaleStreamOrGeneration) => {}
-                        Err(error) => {
-                            return Err(FatalReport::presentation(
-                                PresentationOperation::Redraw,
-                                PresentError::from(error),
-                                None,
-                                None,
-                            ));
-                        }
-                    }
-                }
-                VideoWorkerEvent::DecodeFailed {
-                    identity,
-                    generation,
-                    code,
-                    ..
-                } => {
-                    if let (Some(window), Some(protocol_id)) =
-                        (self.window.as_mut(), active_protocol_id.clone())
-                    {
-                        let disconnect = disconnect_after_matching_video_failure(
-                            window.video_owner,
-                            &mut window.video,
-                            identity,
-                            generation,
-                            code,
-                            protocol_id,
-                        );
-                        if disconnect.is_some() {
-                            window.video_renderer.detach();
-                            window.pending_video = None;
-                            video_failure = disconnect.map(|action| (session_id, action));
-                        }
-                    }
-                }
-                VideoWorkerEvent::Stopped => {
-                    if let Some(window) = self.window.as_mut() {
-                        window.video_renderer.detach();
-                        transition_video_surface_owner(
-                            &mut window.video_owner,
-                            VideoSurfaceOwnerTransition::WorkerStopped,
-                        );
-                        window.video = None;
-                        window.pending_video = None;
-                    }
-                }
-                VideoWorkerEvent::BackendSelected { .. } => {}
+        let video_drain = if let Some(window) = self.window.as_mut() {
+            drain_video_surface_events(window, video_admissions, video_events, active_protocol_id)?
+        } else {
+            VideoSurfaceDrainOutcome {
+                ui_redraw_needed: !video_events.is_empty(),
+                ..VideoSurfaceDrainOutcome::default()
             }
-        }
+        };
+        outcome.ui_redraw_needed |= video_drain.ui_redraw_needed;
+        outcome.frame_redraw_needed |= video_drain.frame_redraw_needed;
+        let video_failure = video_drain.failure;
         if let Some((session_id, action)) = video_failure {
             self.block_and_release_input();
             self.launch
@@ -4250,9 +4320,13 @@ mod tests {
         FrameTransactionError, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
     };
     use frd_media_api::{
-        AudioOutput, AudioOutputError, ChromaFormat, ChromaLocation, EncodedVideoAccessUnit,
-        MediaFrame, MediaPublisher, VideoBitstreamFormat, VideoCodec, VideoColorimetry,
-        VideoDecodeError, VideoDecodeErrorCode, VideoParameterSets, VideoProfile, VideoRange,
+        AudioOutput, AudioOutputError, ChromaFormat, ChromaLocation, DecodeOutcome,
+        DecodedVideoFrame, DecodedVideoFrameInput, EncodedVideoAccessUnit, MediaFrame,
+        MediaPublisher, VideoBackendAvailability, VideoBackendId, VideoBackendKind,
+        VideoBitstreamFormat, VideoCapabilityProvider, VideoCodec, VideoColorimetry,
+        VideoDecodeCapability, VideoDecodeError, VideoDecodeErrorCode, VideoDecodeQuery,
+        VideoDecodeSupport, VideoDecoder, VideoDecoderFactory, VideoDecoderRegistry,
+        VideoParameterSets, VideoPixelFormat, VideoPlane, VideoProfile, VideoRange,
         VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity, VideoTimeBase,
         VideoTimestamp,
     };
@@ -4278,7 +4352,7 @@ mod tests {
         FrameDrainFailure, PendingLiveSessionPorts, RemoteBinding, RuntimeDrainCallback,
         RuntimeDrainCallbackTarget, RuntimeDrainOutcome, RuntimeWakeGate, SessionHost,
         TestLaunchOutcome, UnavailableCredentialStore, UnavailableProfileStore, VideoBinding,
-        WakeSink, WorkerKind, WorkerSpawner,
+        VideoSurfaceDrainTarget, WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
 
@@ -4500,6 +4574,165 @@ mod tests {
         );
     }
 
+    fn test_decoded_video_frame(
+        identity: VideoStreamIdentity,
+        generation: u64,
+        timestamp: VideoTimestamp,
+    ) -> DecodedVideoFrame {
+        let plane = || VideoPlane::try_new(2, 2, 2, vec![0x80; 4].into_boxed_slice()).unwrap();
+        DecodedVideoFrame::try_new(DecodedVideoFrameInput {
+            identity,
+            generation,
+            timestamp,
+            coded_size: PixelSize::new(2, 2).unwrap(),
+            visible_rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            format: VideoPixelFormat::Yuv444P8,
+            colorimetry: VideoColorimetry::Bt709,
+            range: VideoRange::Limited,
+            planes: vec![plane(), plane(), plane()].into_boxed_slice(),
+        })
+        .unwrap()
+    }
+
+    struct RoutingVideoFactory;
+
+    impl VideoCapabilityProvider for RoutingVideoFactory {
+        fn backend_id(&self) -> VideoBackendId {
+            VideoBackendId::new("routing-test")
+        }
+
+        fn backend_kind(&self) -> VideoBackendKind {
+            VideoBackendKind::Ffmpeg
+        }
+
+        fn availability(&self) -> VideoBackendAvailability {
+            VideoBackendAvailability::DecoderReady
+        }
+
+        fn query(&self, _query: &VideoDecodeQuery) -> VideoDecodeSupport {
+            VideoDecodeSupport::SoftwareExact(VideoDecodeCapability {
+                backend_id: self.backend_id(),
+                codec: VideoCodec::Hevc,
+                profile: VideoProfile::HevcMain4448,
+                chroma: ChromaFormat::Yuv444,
+                bit_depth: 8,
+                max_coded_size: PixelSize::new(2, 2).unwrap(),
+                output_formats: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+                requires_bitstream_conversion: false,
+            })
+        }
+    }
+
+    impl VideoDecoderFactory for RoutingVideoFactory {
+        fn create(
+            &self,
+            config: &VideoStreamConfig,
+        ) -> Result<Box<dyn VideoDecoder>, VideoDecodeError> {
+            Ok(Box::new(RoutingVideoDecoder(config.clone())))
+        }
+    }
+
+    struct RoutingVideoDecoder(VideoStreamConfig);
+
+    impl VideoDecoder for RoutingVideoDecoder {
+        fn submit(
+            &mut self,
+            access_unit: EncodedVideoAccessUnit,
+        ) -> Result<DecodeOutcome, VideoDecodeError> {
+            if self.0.as_input().identity.stream_id == 1 {
+                return Err(VideoDecodeError::new(
+                    VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
+                ));
+            }
+            Ok(DecodeOutcome::Frames(
+                vec![test_decoded_video_frame(
+                    access_unit.identity(),
+                    access_unit.generation(),
+                    access_unit.timestamp(),
+                )]
+                .into_boxed_slice(),
+            ))
+        }
+
+        fn flush(&mut self) -> Result<Box<[DecodedVideoFrame]>, VideoDecodeError> {
+            Ok(Box::default())
+        }
+
+        fn reset(&mut self, _generation: u64) -> Result<(), VideoDecodeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingVideoSurface {
+        owner: Option<VideoStreamEpoch>,
+        active: Option<VideoBinding>,
+        configured: Vec<VideoStreamEpoch>,
+        uploaded: Vec<crate::video_decode_worker::VideoFrameToken>,
+        pending: Option<crate::video_decode_worker::VideoFrameToken>,
+        detach_count: usize,
+        stop_count: usize,
+    }
+
+    impl VideoSurfaceDrainTarget for RecordingVideoSurface {
+        fn video_owner(&self) -> Option<VideoStreamEpoch> {
+            self.owner
+        }
+
+        fn video_owner_mut(&mut self) -> &mut Option<VideoStreamEpoch> {
+            &mut self.owner
+        }
+
+        fn active_video_mut(&mut self) -> &mut Option<VideoBinding> {
+            &mut self.active
+        }
+
+        fn reset_for_admission(&mut self) {
+            self.detach_count += 1;
+            self.active = None;
+            self.pending = None;
+        }
+
+        fn configure_video_stream(
+            &mut self,
+            epoch: VideoStreamEpoch,
+        ) -> Result<(), frd_render_wgpu::VideoRendererError> {
+            self.configured.push(epoch);
+            Ok(())
+        }
+
+        fn upload_video_frame(
+            &mut self,
+            token: crate::video_decode_worker::VideoFrameToken,
+            _frame: DecodedVideoFrame,
+        ) -> Result<(), frd_render_wgpu::VideoRendererError> {
+            self.uploaded.push(token);
+            self.pending = Some(token);
+            Ok(())
+        }
+
+        fn detach_after_video_failure(&mut self) {
+            self.detach_count += 1;
+            self.pending = None;
+        }
+
+        fn video_worker_stopped(&mut self) {
+            self.detach_count += 1;
+            self.stop_count += 1;
+            super::transition_video_surface_owner(
+                &mut self.owner,
+                super::VideoSurfaceOwnerTransition::WorkerStopped,
+            );
+            self.active = None;
+            self.pending = None;
+        }
+    }
+
     #[test]
     fn worker_stop_during_owner_failure_keeps_sibling_rejected_until_cleanup_completes() {
         let session_id = SessionId::allocate();
@@ -4511,57 +4744,173 @@ mod tests {
             session_id,
             stream_id: 2,
         };
-        let mut owner = None;
-        assert!(super::admit_video_surface_owner(
-            &mut owner,
-            crate::video_decode_worker::VideoStreamAdmission {
+        let worker =
+            crate::video_decode_worker::VideoDecodeWorker::spawn_with_stream_registry_loader(
+                Arc::new(|_identity| {
+                    Ok(VideoDecoderRegistry::new(vec![Box::new(
+                        RoutingVideoFactory,
+                    )]))
+                }),
+            )
+            .unwrap();
+
+        worker
+            .sender()
+            .try_send_config(test_video_config(owner_identity, 11))
+            .unwrap();
+        let owner_admission = worker
+            .events()
+            .recv_admission_timeout(Duration::from_secs(1))
+            .unwrap();
+        let owner_selected = worker
+            .events()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            &owner_selected,
+            crate::video_decode_worker::VideoWorkerEvent::BackendSelected {
+                identity,
+                generation: 11,
+                ..
+            } if *identity == owner_identity
+        ));
+        let mut surface = RecordingVideoSurface::default();
+        let selected = super::drain_video_surface_events(
+            &mut surface,
+            vec![(session_id, owner_admission)],
+            vec![(session_id, owner_selected)],
+            Some(ProtocolId::apple_high_performance()),
+        )
+        .unwrap();
+        assert!(selected.failure.is_none());
+        assert_eq!(
+            surface.configured,
+            vec![VideoStreamEpoch {
                 identity: owner_identity,
                 generation: 11,
-            }
-        ));
-
-        let mut active = None;
-        assert!(super::disconnect_after_matching_video_failure(
-            owner,
-            &mut active,
-            owner_identity,
-            11,
-            VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
-            ProtocolId::apple_high_performance(),
-        )
-        .is_some());
-        super::transition_video_surface_owner(
-            &mut owner,
-            super::VideoSurfaceOwnerTransition::WorkerStopped,
+            }]
         );
+
+        worker
+            .sender()
+            .try_send_access_unit(test_video_access_unit_for(owner_identity, 11, 1, 0x26))
+            .unwrap();
+        let owner_failure = worker
+            .events()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            &owner_failure,
+            crate::video_decode_worker::VideoWorkerEvent::DecodeFailed {
+                identity,
+                generation: 11,
+                code: VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
+                ..
+            } if *identity == owner_identity
+        ));
+        let failed = super::drain_video_surface_events(
+            &mut surface,
+            Vec::new(),
+            vec![
+                (session_id, owner_failure),
+                (
+                    session_id,
+                    crate::video_decode_worker::VideoWorkerEvent::Stopped,
+                ),
+            ],
+            Some(ProtocolId::apple_high_performance()),
+        )
+        .unwrap();
+        assert!(failed.failure.is_some());
+        assert_eq!(surface.stop_count, 1);
         super::transition_video_surface_owner(
-            &mut owner,
+            &mut surface.owner,
             super::VideoSurfaceOwnerTransition::CleanupStarted,
         );
 
-        assert!(!super::admit_video_surface_owner(
-            &mut owner,
-            crate::video_decode_worker::VideoStreamAdmission {
-                identity: sibling_identity,
+        worker
+            .sender()
+            .try_send_config(test_video_config(sibling_identity, 11))
+            .unwrap();
+        let sibling_admission = worker
+            .events()
+            .recv_admission_timeout(Duration::from_secs(1))
+            .unwrap();
+        let sibling_selected = worker
+            .events()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            &sibling_selected,
+            crate::video_decode_worker::VideoWorkerEvent::BackendSelected {
+                identity,
                 generation: 11,
-            }
+                ..
+            } if *identity == sibling_identity
         ));
-        assert!(!super::video_surface_owner_matches(
-            owner,
-            sibling_identity,
-            11
+        worker
+            .sender()
+            .try_send_access_unit(test_video_access_unit_for(sibling_identity, 11, 2, 0x26))
+            .unwrap();
+        let sibling_frame = worker
+            .events()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            &sibling_frame,
+            crate::video_decode_worker::VideoWorkerEvent::FrameDecoded(handoff)
+                if handoff.token().identity() == sibling_identity
+                    && handoff.token().generation() == 11
         ));
-        assert!(super::video_surface_owner_matches(
-            owner,
-            owner_identity,
-            11
-        ));
+        let sibling = super::drain_video_surface_events(
+            &mut surface,
+            vec![(session_id, sibling_admission)],
+            vec![(session_id, sibling_selected), (session_id, sibling_frame)],
+            Some(ProtocolId::apple_high_performance()),
+        )
+        .unwrap();
+
+        assert!(sibling.failure.is_none());
+        assert!(!sibling.frame_redraw_needed);
+        assert_eq!(surface.configured.len(), 1);
+        assert!(surface.uploaded.is_empty());
+        assert!(surface.pending.is_none());
+        assert_eq!(surface.detach_count, 3);
+        let ready = super::video_ready_event_after_confirmation::<_, ()>(
+            surface.pending,
+            |_| Ok(()),
+            |_| PresentationEvent::FramePresented {
+                session_id,
+                generation: 11,
+                revision: 1,
+                completeness: FrameCompleteness::FullBaseline,
+            },
+        );
+        assert_eq!(ready, None);
+        let mut input = crate::InputRouter::default();
+        if ready.is_some() {
+            let _ = input.set_gate(crate::InputGate::Interactive {
+                session_id,
+                generation: 11,
+            });
+        }
+        assert_eq!(input.interactive_epoch(), None);
+        assert_eq!(
+            surface.owner,
+            Some(VideoStreamEpoch {
+                identity: owner_identity,
+                generation: 11,
+            })
+        );
 
         super::transition_video_surface_owner(
-            &mut owner,
+            &mut surface.owner,
             super::VideoSurfaceOwnerTransition::CleanupComplete,
         );
-        assert_eq!(owner, None);
+        assert_eq!(surface.owner, None);
+
+        worker.request_stop();
+        worker.join_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
