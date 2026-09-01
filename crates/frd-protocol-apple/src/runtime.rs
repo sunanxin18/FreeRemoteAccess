@@ -20,7 +20,10 @@ use frd_protocol_api::{
 use crate::connection::{is_peer_closed, is_timeout, AppleWriterHandle};
 use crate::dynamic_resolution::DisplaySize;
 use crate::factory::EstablishedAppleSession;
-use crate::high_performance::{HighPerformanceUnavailable, APPLE_HIGH_PERFORMANCE_UNAVAILABLE};
+use crate::high_performance::{
+    HighPerformanceDiagnostic, HighPerformanceUnavailable, StartupRequestMessage,
+    APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
+};
 use crate::hpss::{self, Media};
 use crate::media_negotiation::AudioMediaFlow;
 use crate::media_runtime::ViewerMediaState;
@@ -74,10 +77,13 @@ fn is_startup_transport_close(error: &anyhow::Error) -> bool {
             })
 }
 
-fn preserve_startup_transport_error<T>(result: Result<T>) -> Result<T> {
+fn preserve_startup_transport_error<T>(
+    result: Result<T>,
+    diagnostic: HighPerformanceDiagnostic,
+) -> Result<T> {
     result.map_err(|error| {
         if is_startup_transport_close(&error) {
-            HighPerformanceUnavailable.into()
+            HighPerformanceUnavailable::diagnosed(diagnostic).into()
         } else {
             error
         }
@@ -89,7 +95,10 @@ pub(crate) fn preserve_pending_confirmation_result<T>(
     result: Result<T>,
 ) -> Result<T> {
     if was_pending {
-        preserve_startup_transport_error(result)
+        preserve_startup_transport_error(
+            result,
+            HighPerformanceDiagnostic::ConfirmationCommitWriteClosed,
+        )
     } else {
         result
     }
@@ -483,7 +492,10 @@ fn run_authenticated_session_inner(
     let media_server_address = connection.peer_addr()?.ip();
     let media_bind_address = connection.local_addr()?.ip();
     if !connection.is_encrypted() {
-        return Err(HighPerformanceUnavailable.into());
+        return Err(HighPerformanceUnavailable::diagnosed(
+            HighPerformanceDiagnostic::EncryptionInvariant,
+        )
+        .into());
     }
     let initial_admission =
         NetworkReaderRuntime::admit_initial_generation(&mut runtime, session_id, initial_size)
@@ -494,20 +506,36 @@ fn run_authenticated_session_inner(
         connection
             .write_all(&hpss::build_set_display_config(&display_name))
             .context("发送 Apple SetDisplayConfiguration 失败"),
+        HighPerformanceDiagnostic::SetDisplayWriteClosed,
     )?;
+    HighPerformanceDiagnostic::SetDisplayWritten {
+        server_init_width: server_init_size.width,
+        server_init_height: server_init_size.height,
+        startup_width: initial_size.width,
+        startup_height: initial_size.height,
+    }
+    .emit();
     let startup_gate_origin = Instant::now();
     std::thread::sleep(Duration::from_millis(150));
     preserve_startup_transport_error(
         connection.write_all(&hpss::build_display_query(initial_size)),
+        HighPerformanceDiagnostic::StartupRequestWriteClosed {
+            message: StartupRequestMessage::DisplayQuery,
+        },
     )?;
     std::thread::sleep(Duration::from_millis(120));
-    preserve_startup_transport_error(connection.write_all(&protocol::msg_fb_update_request(
-        false,
-        0,
-        0,
-        initial_size.width,
-        initial_size.height,
-    )?))?;
+    preserve_startup_transport_error(
+        connection.write_all(&protocol::msg_fb_update_request(
+            false,
+            0,
+            0,
+            initial_size.width,
+            initial_size.height,
+        )?),
+        HighPerformanceDiagnostic::StartupRequestWriteClosed {
+            message: StartupRequestMessage::FramebufferUpdate,
+        },
+    )?;
     let initial_full_sent_at = Instant::now();
     connection.set_read_timeout(Some(APPLE_RUNTIME_READ_POLL))?;
     let writer = connection.writer_handle()?;
@@ -575,7 +603,10 @@ fn run_authenticated_session_inner(
                     if !reader.is_high_performance_confirmed()
                         && is_startup_transport_close(&error) =>
                 {
-                    return Err(HighPerformanceUnavailable.into());
+                    return Err(HighPerformanceUnavailable::diagnosed(
+                        HighPerformanceDiagnostic::ConfirmationPeerClosed,
+                    )
+                    .into());
                 }
                 Err(error) => return Err(error),
             };
@@ -633,7 +664,10 @@ fn run_authenticated_session_inner(
                 }
                 NetworkFrameOutcome::Media(control) => {
                     if !readiness_published {
-                        return Err(HighPerformanceUnavailable.into());
+                        return Err(HighPerformanceUnavailable::diagnosed(
+                            HighPerformanceDiagnostic::ConfirmationMalformed,
+                        )
+                        .into());
                     }
                     handle_media_control(
                         control,
@@ -1266,10 +1300,9 @@ mod tests {
                 .context("handle_frame confirmation write")),
             )
             .unwrap_err();
-            assert_eq!(
-                pending_error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
-                Some(&crate::high_performance::HighPerformanceUnavailable)
-            );
+            assert!(pending_error
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .is_some());
 
             let confirmed_error = super::preserve_pending_confirmation_result::<()>(
                 false,
@@ -1293,10 +1326,47 @@ mod tests {
         ));
         assert!(!super::is_startup_transport_close(&unrelated));
 
+        let set_display = super::preserve_startup_transport_error::<()>(
+            Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "synthetic set-display close",
+            ))),
+            crate::high_performance::HighPerformanceDiagnostic::SetDisplayWriteClosed,
+        )
+        .unwrap_err();
+        assert_eq!(
+            set_display
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .unwrap()
+                .stage_code(),
+            "hp03_set_display_write_closed"
+        );
+
+        let full_request = super::preserve_startup_transport_error::<()>(
+            Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "synthetic startup full-request close",
+            ))),
+            crate::high_performance::HighPerformanceDiagnostic::StartupRequestWriteClosed {
+                message: crate::high_performance::StartupRequestMessage::FramebufferUpdate,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            full_request
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .unwrap()
+                .stage_code(),
+            "hp04_startup_request_write_closed"
+        );
+
         assert!(matches!(
             super::protocol_exit_for_runtime_error(
                 frd_core::ProtocolId::apple_hpss_mvs(),
-                crate::high_performance::HighPerformanceUnavailable.into()
+                crate::high_performance::HighPerformanceUnavailable::diagnosed(
+                    crate::high_performance::HighPerformanceDiagnostic::ConfirmationMalformed
+                )
+                .into()
             ),
             frd_protocol_api::ProtocolExit::Failed(ref error)
                 if error.code()

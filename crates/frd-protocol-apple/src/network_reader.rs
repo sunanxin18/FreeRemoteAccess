@@ -17,7 +17,8 @@ use crate::dynamic_resolution::{
     ResolutionRequest,
 };
 use crate::high_performance::{
-    HighPerformanceObservation, HighPerformanceStartupGate, HighPerformanceUnavailable,
+    HighPerformanceDiagnostic, HighPerformanceObservation, HighPerformanceStartupGate,
+    HighPerformanceUnavailable,
 };
 use crate::hpss::{self, encoding, parse_media, Media};
 use crate::media_runtime::ViewerMediaState;
@@ -2300,7 +2301,16 @@ impl NetworkReaderRuntime {
     ) -> Result<()> {
         if !self.publisher.is_active() {
             if !self.startup_gate.is_awaiting() {
-                return Err(HighPerformanceUnavailable.into());
+                if self.startup_gate.is_confirmed() {
+                    return Err(HighPerformanceUnavailable::diagnosed(
+                        HighPerformanceDiagnostic::ConfirmationMalformed,
+                    )
+                    .into());
+                }
+                return self
+                    .startup_gate
+                    .ensure_not_timed_out(now)
+                    .map_err(Into::into);
             }
             self.startup_gate.ensure_not_timed_out(now)?;
             return Ok(());
@@ -2322,7 +2332,10 @@ impl NetworkReaderRuntime {
 
     fn buffer_pending_media_control(&mut self, media: Media) -> Result<()> {
         if self.pending_media_controls.len() >= PENDING_MEDIA_CONTROL_BUDGET {
-            return Err(HighPerformanceUnavailable.into());
+            return Err(HighPerformanceUnavailable::diagnosed(
+                HighPerformanceDiagnostic::PendingControlBudget,
+            )
+            .into());
         }
         self.pending_media_controls.push_back(media);
         Ok(())
@@ -2352,19 +2365,30 @@ impl NetworkReaderRuntime {
             }
         };
         let confirmation = match observation {
-            HighPerformanceObservation::Confirmed(_) => prepared_startup_gate
-                .confirmation()
-                .ok_or(HighPerformanceUnavailable)?,
+            HighPerformanceObservation::Confirmed(_) => {
+                prepared_startup_gate.confirmation().ok_or_else(|| {
+                    HighPerformanceUnavailable::diagnosed(
+                        HighPerformanceDiagnostic::ConfirmationMalformed,
+                    )
+                })?
+            }
             HighPerformanceObservation::Duplicate if self.publisher.is_active() => {
                 return Ok(NetworkFrameOutcome::Consumed);
             }
             HighPerformanceObservation::Duplicate => {
-                return Err(HighPerformanceUnavailable.into());
+                return Err(HighPerformanceUnavailable::diagnosed(
+                    HighPerformanceDiagnostic::ConfirmationMalformed,
+                )
+                .into());
             }
         };
         let size = confirmation.size;
-        let pixel_size = PixelSize::new(size.width.into(), size.height.into())
-            .ok_or(HighPerformanceUnavailable)?;
+        let pixel_size =
+            PixelSize::new(size.width.into(), size.height.into()).ok_or_else(|| {
+                HighPerformanceUnavailable::diagnosed(
+                    HighPerformanceDiagnostic::ConfirmationMalformed,
+                )
+            })?;
         let admission_source = match self.initial_admission.as_ref() {
             Some(admission)
                 if admission.generation() == 1
@@ -2380,8 +2404,9 @@ impl NetworkReaderRuntime {
             ),
         };
         let prepared_receiver = MvsReceiveState::new(1);
-        let prepared_surface =
-            DisplaySurface::new(1, pixel_size).map_err(|_| HighPerformanceUnavailable)?;
+        let prepared_surface = DisplaySurface::new(1, pixel_size).map_err(|_| {
+            HighPerformanceUnavailable::diagnosed(HighPerformanceDiagnostic::ConfirmationMalformed)
+        })?;
         let mut prepared_dynamic =
             DynamicResolutionRuntime::new(size, self.dynamic_resolution_enabled);
         let prepared_viewport = ViewportRequestQueue::default();
@@ -2415,6 +2440,12 @@ impl NetworkReaderRuntime {
         self.publisher
             .activate_admitted_initial_generation(protocol_runtime, admission)
             .map_err(|error| anyhow::anyhow!(error.code()))?;
+        HighPerformanceDiagnostic::ServerStateAccepted {
+            accepted_width: size.width,
+            accepted_height: size.height,
+            elapsed_ms: self.startup_gate.elapsed_ms_at(observed_at),
+        }
+        .emit();
         Ok(NetworkFrameOutcome::HighPerformanceConfirmed { size })
     }
 
@@ -2451,7 +2482,10 @@ impl NetworkReaderRuntime {
                 Ok(geometry) => geometry,
                 Err(_) => {
                     self.receiver.abort_assembly();
-                    return Err(HighPerformanceUnavailable.into());
+                    return Err(HighPerformanceUnavailable::diagnosed(
+                        HighPerformanceDiagnostic::ConfirmationMalformed,
+                    )
+                    .into());
                 }
             };
             self.ensure_server_state_generation_coherence(media_state)?;
@@ -3345,9 +3379,15 @@ mod migrated_runtime_tests {
             &mut before_generation_commit,
             requested_at + Duration::from_secs(1),
         ));
+        assert!(error
+            .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+            .is_some());
         assert_eq!(
-            error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
-            Some(&crate::high_performance::HighPerformanceUnavailable)
+            error
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .unwrap()
+                .stage_code(),
+            "hp09_pending_control_budget"
         );
         writer.shutdown().unwrap();
     }
@@ -3673,10 +3713,18 @@ mod migrated_runtime_tests {
                 crate::runtime::preserve_pending_confirmation_result(was_pending, result),
             );
 
-            assert_eq!(
-                error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
-                Some(&crate::high_performance::HighPerformanceUnavailable),
+            assert!(
+                error
+                    .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                    .is_some(),
                 "kind={kind:?}"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                    .unwrap()
+                    .stage_code(),
+                "hp08_confirmation_commit_write_closed"
             );
             assert!(trace.entries.lock().unwrap().is_empty());
             assert!(!reader.publisher.is_active());
@@ -3704,9 +3752,15 @@ mod migrated_runtime_tests {
                 requested_at + Duration::from_secs(5),
             )
             .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+            .is_some());
         assert_eq!(
-            error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
-            Some(&crate::high_performance::HighPerformanceUnavailable)
+            error
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .unwrap()
+                .stage_code(),
+            "hp05_confirmation_timeout"
         );
         assert!(trace.entries.lock().unwrap().is_empty());
         writer.shutdown().unwrap();
@@ -3729,9 +3783,15 @@ mod migrated_runtime_tests {
             &mut before_generation_commit,
             requested_at + Duration::from_secs(1),
         ));
+        assert!(error
+            .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+            .is_some());
         assert_eq!(
-            error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
-            Some(&crate::high_performance::HighPerformanceUnavailable)
+            error
+                .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                .unwrap()
+                .stage_code(),
+            "hp07_confirmation_malformed"
         );
         assert!(trace.entries.lock().unwrap().is_empty());
         writer.shutdown().unwrap();
@@ -3798,9 +3858,10 @@ mod migrated_runtime_tests {
                     &mut before_generation_commit,
                     requested_at + Duration::from_secs(1),
                 ));
-                assert_eq!(
-                    error.downcast_ref::<crate::high_performance::HighPerformanceUnavailable>(),
-                    Some(&crate::high_performance::HighPerformanceUnavailable),
+                assert!(
+                    error
+                        .downcast_ref::<crate::high_performance::HighPerformanceUnavailable>()
+                        .is_some(),
                     "case={malformed_case}, pending={pending_mvs}"
                 );
                 assert!(!reader.receiver.is_pending());

@@ -14,7 +14,7 @@ use frd_wire_rfb::{
 
 use crate::auth::{select_apple_security_type_parts, APPLE_CREDENTIALS_REQUIRED};
 use crate::connection::AppleConnection;
-use crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE;
+use crate::high_performance::{HighPerformanceDiagnostic, APPLE_HIGH_PERFORMANCE_UNAVAILABLE};
 use crate::protocol::{self, security};
 use crate::session::{self, SessionEncodingProfile};
 use crate::{ard, rsa_srp, srp};
@@ -52,10 +52,26 @@ fn select_product_high_performance_security_for(
     if credentials.username.is_empty() || credentials.password.expose().is_empty() {
         return Err(product_error(protocol_id, APPLE_CREDENTIALS_REQUIRED));
     }
-    offered
-        .contains(&security::APPLE_SRP)
-        .then_some(security::APPLE_SRP)
-        .ok_or_else(|| product_error(protocol_id, APPLE_HIGH_PERFORMANCE_UNAVAILABLE))
+    let diagnostic = diagnostic_for_product_high_performance_security_offer(offered);
+    diagnostic.emit();
+    if diagnostic == HighPerformanceDiagnostic::NamedSrpSelected {
+        Ok(security::APPLE_SRP)
+    } else {
+        Err(product_error(
+            protocol_id,
+            APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
+        ))
+    }
+}
+
+fn diagnostic_for_product_high_performance_security_offer(
+    offered: &[u8],
+) -> HighPerformanceDiagnostic {
+    if offered.contains(&security::APPLE_SRP) {
+        HighPerformanceDiagnostic::NamedSrpSelected
+    } else {
+        HighPerformanceDiagnostic::NamedSrpNotOffered
+    }
 }
 
 pub struct AppleProtocolFactory;
@@ -272,6 +288,7 @@ fn finish_product_authenticated_session(
     protocol_id: frd_core::ProtocolId,
 ) -> Result<EstablishedAppleSession, ProtocolError> {
     if authenticated.security_type != security::APPLE_SRP || authenticated.srp_key.is_none() {
+        HighPerformanceDiagnostic::EncryptionInvariant.emit();
         return Err(product_error(
             protocol_id,
             APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
@@ -281,6 +298,7 @@ fn finish_product_authenticated_session(
         error.into_protocol_error(protocol_id.clone(), APPLE_AUTHENTICATION_FAILED)
     })?;
     if !established.connection.is_encrypted() {
+        HighPerformanceDiagnostic::EncryptionInvariant.emit();
         return Err(product_error(
             protocol_id,
             APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
@@ -335,6 +353,10 @@ mod product_profile_tests {
                 crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
             );
         }
+        assert_eq!(
+            super::diagnostic_for_product_high_performance_security_offer(&[]),
+            crate::high_performance::HighPerformanceDiagnostic::NamedSrpNotOffered
+        );
     }
 
     #[test]
@@ -351,6 +373,12 @@ mod product_profile_tests {
             .unwrap();
 
         assert_eq!(selected, crate::protocol::security::APPLE_SRP);
+        assert_eq!(
+            super::diagnostic_for_product_high_performance_security_offer(&[
+                crate::protocol::security::APPLE_SRP,
+            ]),
+            crate::high_performance::HighPerformanceDiagnostic::NamedSrpSelected
+        );
     }
 
     #[test]

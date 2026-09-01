@@ -8,11 +8,130 @@ pub(crate) const APPLE_HIGH_PERFORMANCE_UNAVAILABLE: &str = "apple_high_performa
 const STARTUP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HighPerformanceUnavailable;
+pub(crate) enum StartupRequestMessage {
+    DisplayQuery,
+    FramebufferUpdate,
+}
+
+impl fmt::Display for StartupRequestMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DisplayQuery => "09",
+            Self::FramebufferUpdate => "03",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HighPerformanceDiagnostic {
+    NamedSrpNotOffered,
+    EncryptionInvariant,
+    SetDisplayWriteClosed,
+    StartupRequestWriteClosed {
+        message: StartupRequestMessage,
+    },
+    ConfirmationTimeout {
+        elapsed_ms: u64,
+    },
+    ConfirmationPeerClosed,
+    ConfirmationMalformed,
+    ConfirmationCommitWriteClosed,
+    PendingControlBudget,
+    NamedSrpSelected,
+    SetDisplayWritten {
+        server_init_width: u16,
+        server_init_height: u16,
+        startup_width: u16,
+        startup_height: u16,
+    },
+    ServerStateAccepted {
+        accepted_width: u16,
+        accepted_height: u16,
+        elapsed_ms: u64,
+    },
+}
+
+impl HighPerformanceDiagnostic {
+    pub(crate) const fn stage_code(self) -> &'static str {
+        match self {
+            Self::NamedSrpNotOffered => "hp01_named_srp_not_offered",
+            Self::EncryptionInvariant => "hp02_encryption_invariant",
+            Self::SetDisplayWriteClosed => "hp03_set_display_write_closed",
+            Self::StartupRequestWriteClosed { .. } => "hp04_startup_request_write_closed",
+            Self::ConfirmationTimeout { .. } => "hp05_confirmation_timeout",
+            Self::ConfirmationPeerClosed => "hp06_confirmation_peer_closed",
+            Self::ConfirmationMalformed => "hp07_confirmation_malformed",
+            Self::ConfirmationCommitWriteClosed => "hp08_confirmation_commit_write_closed",
+            Self::PendingControlBudget => "hp09_pending_control_budget",
+            Self::NamedSrpSelected => "hp00_named_srp_selected",
+            Self::SetDisplayWritten { .. } => "hp00_set_display_written",
+            Self::ServerStateAccepted { .. } => "hp00_server_state_accepted",
+        }
+    }
+
+    pub(crate) fn emit(self) {
+        #[cfg(debug_assertions)]
+        eprintln!("{self}");
+    }
+}
+
+impl fmt::Display for HighPerformanceDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "[apple-hp-stage] stage={}", self.stage_code())?;
+        match self {
+            Self::StartupRequestWriteClosed { message } => {
+                write!(formatter, " message={message}")
+            }
+            Self::ConfirmationTimeout { elapsed_ms } => {
+                write!(formatter, " elapsed_ms={elapsed_ms}")
+            }
+            Self::SetDisplayWritten {
+                server_init_width,
+                server_init_height,
+                startup_width,
+                startup_height,
+            } => write!(
+                formatter,
+                " server_init_width={server_init_width} server_init_height={server_init_height} startup_width={startup_width} startup_height={startup_height}"
+            ),
+            Self::ServerStateAccepted {
+                accepted_width,
+                accepted_height,
+                elapsed_ms,
+            } => write!(
+                formatter,
+                " accepted_width={accepted_width} accepted_height={accepted_height} elapsed_ms={elapsed_ms}"
+            ),
+            Self::NamedSrpNotOffered
+            | Self::EncryptionInvariant
+            | Self::SetDisplayWriteClosed
+            | Self::ConfirmationPeerClosed
+            | Self::ConfirmationMalformed
+            | Self::ConfirmationCommitWriteClosed
+            | Self::PendingControlBudget
+            | Self::NamedSrpSelected => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HighPerformanceUnavailable {
+    diagnostic: HighPerformanceDiagnostic,
+}
 
 impl HighPerformanceUnavailable {
+    pub(crate) fn diagnosed(diagnostic: HighPerformanceDiagnostic) -> Self {
+        diagnostic.emit();
+        Self { diagnostic }
+    }
+
     pub(crate) const fn code(self) -> &'static str {
         APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn stage_code(self) -> &'static str {
+        self.diagnostic.stage_code()
     }
 }
 
@@ -39,7 +158,7 @@ pub(crate) enum HighPerformanceObservation {
 enum HighPerformanceStartupState {
     Awaiting,
     Confirmed(HighPerformanceConfirmation),
-    Failed,
+    Failed(HighPerformanceUnavailable),
 }
 
 #[derive(Clone)]
@@ -67,8 +186,12 @@ impl HighPerformanceStartupGate {
     pub(crate) fn confirmation(&self) -> Option<HighPerformanceConfirmation> {
         match self.state {
             HighPerformanceStartupState::Confirmed(confirmation) => Some(confirmation),
-            HighPerformanceStartupState::Awaiting | HighPerformanceStartupState::Failed => None,
+            HighPerformanceStartupState::Awaiting | HighPerformanceStartupState::Failed(_) => None,
         }
+    }
+
+    pub(crate) fn elapsed_ms_at(&self, now: Instant) -> u64 {
+        elapsed_ms(self.requested_at, now)
     }
 
     pub(crate) fn ensure_not_timed_out(
@@ -76,10 +199,14 @@ impl HighPerformanceStartupGate {
         now: Instant,
     ) -> Result<(), HighPerformanceUnavailable> {
         match self.state {
-            HighPerformanceStartupState::Failed => Err(HighPerformanceUnavailable),
+            HighPerformanceStartupState::Failed(error) => Err(error),
             HighPerformanceStartupState::Confirmed(_) => Ok(()),
             HighPerformanceStartupState::Awaiting if self.is_before_deadline(now) => Ok(()),
-            HighPerformanceStartupState::Awaiting => self.fail(),
+            HighPerformanceStartupState::Awaiting => {
+                self.fail(HighPerformanceDiagnostic::ConfirmationTimeout {
+                    elapsed_ms: elapsed_ms(self.requested_at, now),
+                })
+            }
         }
     }
 
@@ -88,37 +215,49 @@ impl HighPerformanceStartupGate {
         geometry: ServerStateGeometry,
         observed_at: Instant,
     ) -> Result<HighPerformanceObservation, HighPerformanceUnavailable> {
-        if matches!(self.state, HighPerformanceStartupState::Failed) {
-            return Err(HighPerformanceUnavailable);
+        if let HighPerformanceStartupState::Failed(error) = self.state {
+            return Err(error);
         }
 
         let Some(size) = DisplaySize::new(geometry.width, geometry.height) else {
-            return self.fail();
+            return self.fail(HighPerformanceDiagnostic::ConfirmationMalformed);
         };
         let confirmation = HighPerformanceConfirmation { size };
 
         match self.state {
-            HighPerformanceStartupState::Failed => Err(HighPerformanceUnavailable),
+            HighPerformanceStartupState::Failed(error) => Err(error),
             HighPerformanceStartupState::Confirmed(existing) if existing == confirmation => {
                 Ok(HighPerformanceObservation::Duplicate)
             }
-            HighPerformanceStartupState::Confirmed(_) => self.fail(),
+            HighPerformanceStartupState::Confirmed(_) => {
+                self.fail(HighPerformanceDiagnostic::ConfirmationMalformed)
+            }
             HighPerformanceStartupState::Awaiting if self.is_before_deadline(observed_at) => {
                 self.state = HighPerformanceStartupState::Confirmed(confirmation);
                 Ok(HighPerformanceObservation::Confirmed(confirmation))
             }
-            HighPerformanceStartupState::Awaiting => self.fail(),
+            HighPerformanceStartupState::Awaiting => {
+                self.fail(HighPerformanceDiagnostic::ConfirmationMalformed)
+            }
         }
     }
 
-    fn fail<T>(&mut self) -> Result<T, HighPerformanceUnavailable> {
-        self.state = HighPerformanceStartupState::Failed;
-        Err(HighPerformanceUnavailable)
+    fn fail<T>(
+        &mut self,
+        diagnostic: HighPerformanceDiagnostic,
+    ) -> Result<T, HighPerformanceUnavailable> {
+        let error = HighPerformanceUnavailable::diagnosed(diagnostic);
+        self.state = HighPerformanceStartupState::Failed(error);
+        Err(error)
     }
 
     fn is_before_deadline(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.requested_at) < STARTUP_CONFIRMATION_TIMEOUT
     }
+}
+
+fn elapsed_ms(started_at: Instant, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(started_at).as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -128,8 +267,8 @@ mod tests {
     use anyhow::Error;
 
     use super::{
-        HighPerformanceObservation, HighPerformanceStartupGate, HighPerformanceUnavailable,
-        APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
+        HighPerformanceDiagnostic, HighPerformanceObservation, HighPerformanceStartupGate,
+        HighPerformanceUnavailable, StartupRequestMessage, APPLE_HIGH_PERFORMANCE_UNAVAILABLE,
     };
     use crate::hpss::{
         parse_server_state_geometry, ServerStateGeometry,
@@ -243,12 +382,44 @@ mod tests {
             .ensure_not_timed_out(requested_at + Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(error.code(), APPLE_HIGH_PERFORMANCE_UNAVAILABLE);
+        assert_eq!(error.stage_code(), "hp05_confirmation_timeout");
         assert!(!gate.is_awaiting());
         assert!(!gate.is_confirmed());
         assert_eq!(
             gate.ensure_not_timed_out(requested_at + Duration::from_secs(6))
-                .unwrap_err(),
-            HighPerformanceUnavailable
+                .unwrap_err()
+                .stage_code(),
+            "hp05_confirmation_timeout"
+        );
+    }
+
+    #[test]
+    fn high_performance_diagnostic_formatter_exposes_only_closed_vocabulary_fields() {
+        assert_eq!(
+            HighPerformanceDiagnostic::StartupRequestWriteClosed {
+                message: StartupRequestMessage::DisplayQuery,
+            }
+            .to_string(),
+            "[apple-hp-stage] stage=hp04_startup_request_write_closed message=09"
+        );
+        assert_eq!(
+            HighPerformanceDiagnostic::SetDisplayWritten {
+                server_init_width: 1920,
+                server_init_height: 1080,
+                startup_width: 1920,
+                startup_height: 1080,
+            }
+            .to_string(),
+            "[apple-hp-stage] stage=hp00_set_display_written server_init_width=1920 server_init_height=1080 startup_width=1920 startup_height=1080"
+        );
+        assert_eq!(
+            HighPerformanceDiagnostic::ServerStateAccepted {
+                accepted_width: 1440,
+                accepted_height: 2560,
+                elapsed_ms: 371,
+            }
+            .to_string(),
+            "[apple-hp-stage] stage=hp00_server_state_accepted accepted_width=1440 accepted_height=2560 elapsed_ms=371"
         );
     }
 
@@ -273,8 +444,9 @@ mod tests {
                     GEOMETRY,
                     requested_at + Duration::from_secs(observed_after_seconds + 1),
                 )
-                .unwrap_err(),
-                HighPerformanceUnavailable
+                .unwrap_err()
+                .stage_code(),
+                "hp07_confirmation_malformed"
             );
         }
     }
@@ -301,8 +473,9 @@ mod tests {
         assert_eq!(error.code(), APPLE_HIGH_PERFORMANCE_UNAVAILABLE);
         assert_eq!(
             gate.ensure_not_timed_out(requested_at + Duration::from_secs(3))
-                .unwrap_err(),
-            HighPerformanceUnavailable
+                .unwrap_err()
+                .stage_code(),
+            "hp07_confirmation_malformed"
         );
     }
 
@@ -332,24 +505,23 @@ mod tests {
             assert_eq!(error.code(), APPLE_HIGH_PERFORMANCE_UNAVAILABLE);
             assert_eq!(
                 gate.ensure_not_timed_out(requested_at + Duration::from_secs(2))
-                    .unwrap_err(),
-                HighPerformanceUnavailable
+                    .unwrap_err()
+                    .stage_code(),
+                "hp07_confirmation_malformed"
             );
         }
     }
 
     #[test]
     fn strict_startup_unavailable_error_has_stable_code_and_survives_anyhow_downcast() {
-        let unavailable = HighPerformanceUnavailable;
+        let unavailable =
+            HighPerformanceUnavailable::diagnosed(HighPerformanceDiagnostic::ConfirmationMalformed);
         let error: Error = unavailable.into();
 
-        assert_eq!(
-            HighPerformanceUnavailable.code(),
-            APPLE_HIGH_PERFORMANCE_UNAVAILABLE
-        );
+        assert_eq!(unavailable.code(), APPLE_HIGH_PERFORMANCE_UNAVAILABLE);
         assert_eq!(
             error.downcast_ref::<HighPerformanceUnavailable>(),
-            Some(&HighPerformanceUnavailable)
+            Some(&unavailable)
         );
     }
 }
