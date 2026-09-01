@@ -1,6 +1,7 @@
 mod gpu_fault;
 mod pass;
 mod remote_texture;
+mod video_texture;
 
 pub use gpu_fault::{
     complete_scope_before_resuming_unwind, GpuCleanToken, GpuFaultClass, GpuFaultScope,
@@ -10,6 +11,10 @@ pub use remote_texture::{
     BatchApplyFailure, BatchApplyOutcome, BatchApplySuccess, BatchScopeDiagnostics,
     ConfirmedPresentation, FrameBatchIdentity, InstalledSurface, PresentationReceipt,
     RecoveryRequirement, RemoteRenderer, RendererError,
+};
+pub use video_texture::{
+    ConfirmedVideoPresentation, VideoColorSelection, VideoFrameLayout, VideoPresentationReceipt,
+    VideoRenderer, VideoRendererError, VideoStreamEpoch, VideoUploadOutcome,
 };
 
 pub(crate) use gpu_fault::{

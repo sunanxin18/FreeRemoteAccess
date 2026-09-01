@@ -322,6 +322,9 @@ pub struct DecodedVideoFrameInput {
     pub coded_size: PixelSize,
     pub visible_rect: PixelRect,
     pub format: VideoPixelFormat,
+    /// 协议已规范化的颜色元数据；`Unspecified` 是显式产品默认门禁，不得继承上一流。
+    pub colorimetry: VideoColorimetry,
+    pub range: VideoRange,
     pub planes: Box<[VideoPlane]>,
 }
 
@@ -676,7 +679,26 @@ mod tests {
                 height: 3,
             },
             format,
+            colorimetry: VideoColorimetry::Bt709,
+            range: VideoRange::Limited,
             planes: planes.into_boxed_slice(),
         }
+    }
+
+    #[test]
+    fn decoded_frame_preserves_explicit_neutral_color_metadata() {
+        let planes = vec![
+            test_plane(5, 3, 5),
+            test_plane(5, 3, 5),
+            test_plane(5, 3, 5),
+        ];
+        let mut input = test_frame(VideoPixelFormat::Yuv444P8, planes);
+        input.colorimetry = VideoColorimetry::Unspecified;
+        input.range = VideoRange::Full;
+
+        let frame = DecodedVideoFrame::try_new(input).unwrap();
+
+        assert_eq!(frame.as_input().colorimetry, VideoColorimetry::Unspecified);
+        assert_eq!(frame.as_input().range, VideoRange::Full);
     }
 }

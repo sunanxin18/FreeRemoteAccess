@@ -5,7 +5,8 @@ use frd_core::{ContentViewport, PixelSize};
 use frd_protocol_api::PresentationEvent;
 use frd_render_wgpu::{
     complete_scope_before_resuming_unwind, GpuCleanToken, GpuContext, GpuContextError,
-    GpuFaultClass, RecoveryRequirement, RemoteRenderer, RendererError,
+    GpuFaultClass, RecoveryRequirement, RemoteRenderer, RendererError, VideoPresentationReceipt,
+    VideoRenderer, VideoRendererError,
 };
 
 use state::{
@@ -38,6 +39,31 @@ impl From<RendererError> for PresentError {
 impl From<GpuFaultClass> for PresentError {
     fn from(value: GpuFaultClass) -> Self {
         Self::GpuFault(value)
+    }
+}
+
+impl From<VideoRendererError> for PresentError {
+    fn from(value: VideoRendererError) -> Self {
+        match value {
+            VideoRendererError::GpuFault(fault) => Self::GpuFault(fault),
+            VideoRendererError::StalePresentationReceipt => {
+                Self::Renderer(RendererError::StalePresentationReceipt)
+            }
+            VideoRendererError::StaleStreamOrGeneration => {
+                Self::Renderer(RendererError::StaleUpdate)
+            }
+            VideoRendererError::InvalidGeometry => Self::Renderer(RendererError::InvalidGeometry),
+            VideoRendererError::TextureDimensionUnsupported => {
+                Self::Renderer(RendererError::TextureDimensionUnsupported)
+            }
+            VideoRendererError::UnsupportedTargetFormat => {
+                Self::Renderer(RendererError::UnsupportedTargetFormat)
+            }
+            VideoRendererError::UnsupportedPixelFormat
+            | VideoRendererError::UnsupportedColorimetry => {
+                Self::Renderer(RendererError::UnsupportedPixelFormat)
+            }
+        }
     }
 }
 
@@ -264,6 +290,129 @@ where
     }
 }
 
+struct WgpuRecordedVideoFrame<'a, O> {
+    context: &'a GpuContext,
+    presentation: &'a PresentationSurface,
+    configuration: &'a Option<wgpu::SurfaceConfiguration>,
+    action: AcquisitionAction,
+    video: &'a mut VideoRenderer,
+    texture: Option<wgpu::SurfaceTexture>,
+    view: wgpu::TextureView,
+    encoder: Option<wgpu::CommandEncoder>,
+    receipt: Option<VideoPresentationReceipt>,
+    overlay: Option<O>,
+    hooks: &'a dyn PresentationHooks,
+    presented: Option<VideoPresentationReceipt>,
+}
+
+impl<'a, O> WgpuRecordedVideoFrame<'a, O>
+where
+    O: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+{
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        context: &'a GpuContext,
+        presentation: &'a PresentationSurface,
+        configuration: &'a Option<wgpu::SurfaceConfiguration>,
+        action: AcquisitionAction,
+        video: &'a mut VideoRenderer,
+        texture: wgpu::SurfaceTexture,
+        viewport: Option<ContentViewport>,
+        explicit_viewport: bool,
+        physical_size: PixelSize,
+        target_format: wgpu::TextureFormat,
+        overlay: O,
+        hooks: &'a dyn PresentationHooks,
+    ) -> Result<Self, PresentError> {
+        let view = texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder =
+            context
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("FreeRemoteDesk video presentation encoder"),
+                });
+        let receipt = if explicit_viewport {
+            video.record_in(&mut encoder, &view, viewport, target_format)?
+        } else {
+            video.record(&mut encoder, &view, physical_size, target_format)?
+        };
+        Ok(Self {
+            context,
+            presentation,
+            configuration,
+            action,
+            video,
+            texture: Some(texture),
+            view,
+            encoder: Some(encoder),
+            receipt,
+            overlay: Some(overlay),
+            hooks,
+            presented: None,
+        })
+    }
+}
+
+impl<O> RecordedFrameFlow<GpuCleanToken> for WgpuRecordedVideoFrame<'_, O>
+where
+    O: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+{
+    type Output = Option<VideoPresentationReceipt>;
+
+    fn overlay(&mut self) {
+        self.overlay.take().expect("叠加层回调只调用一次")(
+            self.encoder.as_mut().expect("视频呈现编码器尚未提交"),
+            &self.view,
+        );
+    }
+
+    fn before_submit(&mut self) {
+        self.hooks.before_submit();
+    }
+
+    fn submit(&mut self) {
+        let encoder = self.encoder.take().expect("视频呈现编码器只提交一次");
+        self.context.queue().submit([encoder.finish()]);
+    }
+
+    fn present(&mut self) {
+        let texture = self.texture.take().expect("视频呈现纹理只提交一次");
+        self.context.queue().present(texture);
+    }
+
+    fn reconfigure_after_finish(&mut self) -> Result<(), PresentError> {
+        if self.action != AcquisitionAction::RenderThenReconfigure {
+            return Ok(());
+        }
+        let configuration = self
+            .configuration
+            .as_ref()
+            .ok_or(PresentError::SurfaceDetached)?;
+        let surface = self
+            .presentation
+            .surface()
+            .ok_or(PresentError::SurfaceDetached)?;
+        let token = configure_surface_with(surface, self.context, configuration)?;
+        self.context.commit_if_unchanged(token, || ())?;
+        Ok(())
+    }
+
+    fn confirm_presented(&mut self, token: GpuCleanToken) -> Result<(), PresentError> {
+        if let Some(receipt) = self.receipt {
+            self.presented = Some(self.video.confirm_presented(token, receipt)?.into_receipt());
+        } else {
+            self.context.commit_if_unchanged(token, || ())?;
+        }
+        Ok(())
+    }
+
+    fn emit_event(self) -> Self::Output {
+        self.presented
+    }
+}
+
 pub struct PresentationCompositor {
     context: GpuContext,
     presentation: PresentationSurface,
@@ -345,6 +494,102 @@ impl PresentationCompositor {
         hooks: &dyn PresentationHooks,
     ) -> Result<Option<PresentationEvent>, PresentError> {
         self.render_with_viewport(remote, viewport, true, overlay, hooks)
+    }
+
+    pub fn render_video(
+        &mut self,
+        video: &mut VideoRenderer,
+        overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        hooks: &dyn PresentationHooks,
+    ) -> Result<Option<VideoPresentationReceipt>, PresentError> {
+        self.render_video_with_viewport(video, None, false, overlay, hooks)
+    }
+
+    pub fn render_video_in(
+        &mut self,
+        video: &mut VideoRenderer,
+        viewport: Option<ContentViewport>,
+        overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        hooks: &dyn PresentationHooks,
+    ) -> Result<Option<VideoPresentationReceipt>, PresentError> {
+        self.render_video_with_viewport(video, viewport, true, overlay, hooks)
+    }
+
+    fn render_video_with_viewport(
+        &mut self,
+        video: &mut VideoRenderer,
+        viewport: Option<ContentViewport>,
+        explicit_viewport: bool,
+        overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        hooks: &dyn PresentationHooks,
+    ) -> Result<Option<VideoPresentationReceipt>, PresentError> {
+        require_context_match(
+            self.context.context_id() == video.context_id() && video.uses_context(&self.context),
+        )?;
+        if let Some(fault) = self.context.observed_fault() {
+            return Err(PresentError::GpuFault(fault));
+        }
+        let Some(physical_size) = self.size_state.active() else {
+            return Ok(None);
+        };
+        let target_format = self
+            .configuration
+            .as_ref()
+            .ok_or(PresentError::SurfaceDetached)?
+            .format;
+        let surface = self
+            .presentation
+            .surface()
+            .ok_or(PresentError::SurfaceDetached)?;
+        let acquisition_scope = self.context.begin_fault_scope()?;
+        let (finish, acquired) = complete_scope_before_resuming_unwind(
+            acquisition_scope,
+            || surface.get_current_texture(),
+            |scope| scope.finish(),
+        );
+        let acquisition_token = finish?;
+        self.context.commit_if_unchanged(acquisition_token, || ())?;
+        let acquired = AcquiredFrame::from(acquired);
+        let action = acquired.action();
+        match action {
+            AcquisitionAction::Render | AcquisitionAction::RenderThenReconfigure => {
+                let texture = match acquired {
+                    AcquiredFrame::Success(texture) | AcquiredFrame::Suboptimal(texture) => texture,
+                    _ => unreachable!("视频渲染动作必须包含 SurfaceTexture"),
+                };
+                let scope_backend = GpuContextFrameScopeBackend::new(&self.context);
+                execute_frame_with_fault_scope(&scope_backend, || {
+                    WgpuRecordedVideoFrame::record(
+                        &self.context,
+                        &self.presentation,
+                        &self.configuration,
+                        action,
+                        video,
+                        texture,
+                        viewport,
+                        explicit_viewport,
+                        physical_size,
+                        target_format,
+                        overlay,
+                        hooks,
+                    )
+                })
+            }
+            AcquisitionAction::Reconfigure => {
+                self.reconfigure_existing()?;
+                Ok(None)
+            }
+            AcquisitionAction::RecreateSurface => {
+                self.presentation.recreate(self.context.instance())?;
+                self.configure_surface()?;
+                Ok(None)
+            }
+            AcquisitionAction::Skip => Ok(None),
+            AcquisitionAction::ValidationError => {
+                self.context.observe_fault(GpuFaultClass::Validation);
+                Err(PresentError::GpuFault(GpuFaultClass::Validation))
+            }
+        }
     }
 
     fn render_with_viewport(
@@ -591,7 +836,10 @@ impl Drop for PresentationCompositor {
 mod api_tests {
     use frd_core::PixelSize;
     use frd_protocol_api::PresentationEvent;
-    use frd_render_wgpu::{GpuContext, GpuContextError, RecoveryRequirement, RemoteRenderer};
+    use frd_render_wgpu::{
+        GpuContext, GpuContextError, RecoveryRequirement, RemoteRenderer, VideoPresentationReceipt,
+        VideoRenderer,
+    };
 
     use super::{
         PresentError, PresentationCompositor, PresentationHooks, PresentationSurface,
@@ -611,6 +859,14 @@ mod api_tests {
         hooks: &dyn PresentationHooks,
     ) -> Result<Option<PresentationEvent>, PresentError> {
         compositor.render(remote, |_encoder, _target| {}, hooks)
+    }
+
+    fn render_video_contract(
+        compositor: &mut PresentationCompositor,
+        video: &mut VideoRenderer,
+        hooks: &dyn PresentationHooks,
+    ) -> Result<Option<VideoPresentationReceipt>, PresentError> {
+        compositor.render_video(video, |_encoder, _target| {}, hooks)
     }
 
     async fn request_context_contract(
@@ -647,9 +903,15 @@ mod api_tests {
         let _ = create_surface_contract;
         let _ = request_context_contract;
         let _ = render_contract;
+        let _ = render_video_contract;
         let _ = resize_contract;
         let _ = coordinated_recovery_contract;
         let _ = new_instance_recovery_contract;
+    }
+
+    #[test]
+    fn video_renderer_uses_an_independent_presentation_entry_point() {
+        let _ = render_video_contract;
     }
 
     #[test]

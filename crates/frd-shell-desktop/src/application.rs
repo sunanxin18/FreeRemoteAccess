@@ -29,7 +29,7 @@ use frd_protocol_api::{
 };
 use frd_render_wgpu::{
     BatchApplyFailure, BatchApplyOutcome, BatchApplySuccess, GpuContext, RecoveryRequirement,
-    RemoteRenderer,
+    RemoteRenderer, VideoPresentationReceipt, VideoRenderer, VideoRendererError, VideoStreamEpoch,
 };
 use frd_session::{
     CleanupComplete, CleanupError, CleanupOperations, SessionCleanupHandle, SessionCoordinator,
@@ -1265,6 +1265,24 @@ struct RemoteBinding {
     size: PixelSize,
 }
 
+enum WindowPresentation {
+    Pixel(Option<frd_protocol_api::PresentationEvent>),
+    Video(Option<VideoPresentationReceipt>),
+}
+
+fn take_exact_presented_value<R: PartialEq, T>(
+    pending: &mut Option<(R, T)>,
+    presented: &R,
+) -> Option<T> {
+    if pending
+        .as_ref()
+        .is_some_and(|(receipt, _)| receipt == presented)
+    {
+        return pending.take().map(|(_, value)| value);
+    }
+    None
+}
+
 fn apply_compiled_drain(
     transactions: Vec<FrameTransaction>,
     apply: impl FnOnce(Vec<FrameTransaction>) -> Result<BatchApplySuccess, BatchApplyFailure>,
@@ -1435,6 +1453,7 @@ struct DesktopWindowState {
     window: Arc<Window>,
     gpu: GpuContext,
     renderer: RemoteRenderer,
+    video_renderer: VideoRenderer,
     compositor: PresentationCompositor,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
@@ -1445,6 +1464,8 @@ struct DesktopWindowState {
     cursor_position: Option<(u32, u32)>,
     lifecycle: PresentationLifecycle,
     remote: Option<RemoteBinding>,
+    video: Option<RemoteBinding>,
+    pending_video: Option<(VideoPresentationReceipt, VideoFrameToken)>,
     dpi_transition: DpiTransition,
     pending_texture_writes: PendingTextureWrites,
     focus_session_chrome: bool,
@@ -1741,7 +1762,10 @@ impl FrameBatchFailureTarget for DesktopApplication {
     fn detach_remote_surface(&mut self) {
         if let Some(window) = self.window.as_mut() {
             window.renderer.detach();
+            window.video_renderer.detach();
             window.remote = None;
+            window.video = None;
+            window.pending_video = None;
         }
     }
 
@@ -1921,6 +1945,13 @@ impl DesktopApplication {
                 FatalReason::RendererInitializeFailed,
             )
         })?;
+        let video_renderer = VideoRenderer::new(gpu.clone()).map_err(|_| {
+            FatalReport::internal(
+                FatalComponent::Window,
+                FatalOperation::Initialize,
+                FatalReason::RendererInitializeFailed,
+            )
+        })?;
         let target_format = compositor.target_format().ok_or_else(|| {
             FatalReport::internal(
                 FatalComponent::Window,
@@ -1950,6 +1981,7 @@ impl DesktopApplication {
             window,
             gpu,
             renderer,
+            video_renderer,
             compositor,
             egui_context,
             egui_state,
@@ -1965,6 +1997,8 @@ impl DesktopApplication {
             cursor_position: None,
             lifecycle: PresentationLifecycle::new(physical_size),
             remote: None,
+            video: None,
+            pending_video: None,
             dpi_transition: DpiTransition::default(),
             pending_texture_writes: PendingTextureWrites::default(),
             focus_session_chrome: false,
@@ -2115,11 +2149,107 @@ impl DesktopApplication {
                 .handle_session_event_with_stores(session_id, event, self.stores.as_app_stores());
         }
 
+        let video_events = self.sessions.drain_video_worker_events();
+        outcome.ui_redraw_needed |= !video_events.is_empty();
+        for (session_id, event) in video_events {
+            match event {
+                VideoWorkerEvent::BackendSelected {
+                    identity,
+                    generation,
+                    ..
+                } if identity.session_id == session_id => {
+                    if let Some(window) = self.window.as_mut() {
+                        match window.video_renderer.configure_stream(VideoStreamEpoch {
+                            identity,
+                            generation,
+                        }) {
+                            Ok(()) => {
+                                window.video = None;
+                                window.pending_video = None;
+                            }
+                            Err(VideoRendererError::StaleStreamOrGeneration) => {}
+                            Err(error) => {
+                                return Err(FatalReport::presentation(
+                                    PresentationOperation::Redraw,
+                                    PresentError::from(error),
+                                    None,
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+                }
+                VideoWorkerEvent::FrameDecoded(handoff) => {
+                    let (token, frame) = handoff.into_parts();
+                    let input = frame.as_input();
+                    if token.identity().session_id != session_id
+                        || token.identity() != input.identity
+                        || token.generation() != input.generation
+                        || token.timestamp() != input.timestamp
+                    {
+                        continue;
+                    }
+                    let Some(window) = self.window.as_mut() else {
+                        continue;
+                    };
+                    match window.video_renderer.upload_frame(frame) {
+                        Ok(upload) => {
+                            window.video = Some(RemoteBinding {
+                                session_id,
+                                generation: token.generation(),
+                                size: upload.layout.visible_size(),
+                            });
+                            window.pending_video = Some((upload.receipt, token));
+                            window.pending_texture_writes.record_batch(true);
+                            outcome.frame_redraw_needed = true;
+                        }
+                        Err(VideoRendererError::StaleStreamOrGeneration) => {}
+                        Err(error) => {
+                            return Err(FatalReport::presentation(
+                                PresentationOperation::Redraw,
+                                PresentError::from(error),
+                                None,
+                                None,
+                            ));
+                        }
+                    }
+                }
+                VideoWorkerEvent::DecodeFailed {
+                    identity,
+                    generation,
+                    ..
+                } => {
+                    if let Some(window) = self.window.as_mut() {
+                        let matches_current = window.video.is_some_and(|video| {
+                            video.session_id == identity.session_id
+                                && video.generation == generation
+                        });
+                        if matches_current {
+                            window.video_renderer.detach();
+                            window.video = None;
+                            window.pending_video = None;
+                        }
+                    }
+                }
+                VideoWorkerEvent::Stopped => {
+                    if let Some(window) = self.window.as_mut() {
+                        window.video_renderer.detach();
+                        window.video = None;
+                        window.pending_video = None;
+                    }
+                }
+                VideoWorkerEvent::BackendSelected { .. } => {}
+            }
+        }
+
         if detach_remote {
             self.metrics.detach();
             if let Some(window) = self.window.as_mut() {
                 window.renderer.detach();
+                window.video_renderer.detach();
                 window.remote = None;
+                window.video = None;
+                window.pending_video = None;
                 window.pending_texture_writes.clear();
             }
         }
@@ -2267,7 +2397,7 @@ impl DesktopApplication {
 
     fn content_viewport(&self) -> Option<ContentViewport> {
         let window = self.window.as_ref()?;
-        let remote = window.remote?;
+        let remote = window.video.or(window.remote)?;
         ContentViewport::fit_in(remote.size, window.physical_size, window.remote_area?)
     }
 
@@ -2275,7 +2405,11 @@ impl DesktopApplication {
         let Some((session_id, generation)) = self.input.interactive_epoch() else {
             return;
         };
-        let Some(remote) = self.window.as_ref().and_then(|window| window.remote) else {
+        let Some(remote) = self
+            .window
+            .as_ref()
+            .and_then(|window| window.video.or(window.remote))
+        else {
             return;
         };
         if remote.session_id != session_id || remote.generation != generation {
@@ -2424,6 +2558,9 @@ impl DesktopApplication {
         let remote_viewport = window.remote.and_then(|remote| {
             ContentViewport::fit_in(remote.size, window.physical_size, window.remote_area?)
         });
+        let video_viewport = window.video.and_then(|video| {
+            ContentViewport::fit_in(video.size, window.physical_size, window.remote_area?)
+        });
         for (id, deltas) in &output.textures_delta.set {
             for delta in deltas {
                 window.egui_renderer.update_texture(
@@ -2439,38 +2576,45 @@ impl DesktopApplication {
         // 是互不重叠的字段，不需要为闭包延长所有权而复制整组 wgpu handle。
         let gpu = &window.gpu;
         let egui_renderer = &mut window.egui_renderer;
-        let render_result = window.compositor.render_in(
-            &mut window.renderer,
-            remote_viewport,
-            |encoder, target| {
-                let callbacks = egui_renderer.update_buffers(
-                    gpu.device(),
-                    gpu.queue(),
-                    encoder,
-                    &paint_jobs,
-                    &screen,
-                );
-                debug_assert!(callbacks.is_empty(), "product UI has no egui GPU callbacks");
-                let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("FreeRemoteDesk egui overlay"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                egui_renderer.render(&mut render_pass.forget_lifetime(), &paint_jobs, &screen);
-            },
-            &hook,
-        );
+        let overlay = |encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView| {
+            let callbacks = egui_renderer.update_buffers(
+                gpu.device(),
+                gpu.queue(),
+                encoder,
+                &paint_jobs,
+                &screen,
+            );
+            debug_assert!(callbacks.is_empty(), "product UI has no egui GPU callbacks");
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("FreeRemoteDesk egui overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            egui_renderer.render(&mut render_pass.forget_lifetime(), &paint_jobs, &screen);
+        };
+        let render_result =
+            if video_viewport.is_some() && window.video_renderer.frame_layout().is_some() {
+                window
+                    .compositor
+                    .render_video_in(&mut window.video_renderer, video_viewport, overlay, &hook)
+                    .map(WindowPresentation::Video)
+            } else {
+                window
+                    .compositor
+                    .render_in(&mut window.renderer, remote_viewport, overlay, &hook)
+                    .map(WindowPresentation::Pixel)
+            };
         let render_succeeded = render_result.is_ok();
         let actual_submit = hook.actual_submit();
         for id in &output.textures_delta.free {
@@ -2485,8 +2629,9 @@ impl DesktopApplication {
             let _ = window.gpu.queue().submit(std::iter::empty());
         }
 
+        let mut video_token_to_confirm = None;
         let presentation_error = match render_result {
-            Ok(Some(event)) => {
+            Ok(WindowPresentation::Pixel(Some(event))) => {
                 let (session_id, generation, revision, completeness) = match &event {
                     frd_protocol_api::PresentationEvent::FramePresented {
                         session_id,
@@ -2527,9 +2672,25 @@ impl DesktopApplication {
                 }
                 None
             }
-            Ok(None) => None,
+            Ok(WindowPresentation::Video(Some(receipt))) => {
+                if let Some(token) = take_exact_presented_value(&mut window.pending_video, &receipt)
+                {
+                    video_token_to_confirm = Some(token);
+                    None
+                } else {
+                    Some(PresentError::Renderer(
+                        frd_render_wgpu::RendererError::StalePresentationReceipt,
+                    ))
+                }
+            }
+            Ok(WindowPresentation::Pixel(None) | WindowPresentation::Video(None)) => None,
             Err(error) => Some(error),
         };
+        if let Some(token) = video_token_to_confirm {
+            // worker 可能在 present 前已发布更新的 latest-frame token；此时精确确认
+            // 必须被拒绝，但它是正常背压竞争，不是 surface/GPU 致命错误。
+            let _ = self.sessions.confirm_video_presented(&token);
+        }
         self.publish_metrics_failure();
 
         if let Some(error) = presentation_error {
@@ -3497,6 +3658,11 @@ impl PresentationRecoveryBackend for DesktopWindowRecovery<'_> {
                 .compositor
                 .recover_gpu_with_new_instance(&mut self.window.renderer, dx12_instance()),
         )?;
+        self.window
+            .video_renderer
+            .recover_device(recovered.1.clone())?;
+        self.window.video = None;
+        self.window.pending_video = None;
         self.recovered = Some(recovered);
         Ok(())
     }
@@ -3828,13 +3994,26 @@ mod tests {
     use super::{
         accept_batch_outcome, apply_compiled_drain, dispatch_runtime_drain,
         initialize_metrics_before_session_launch, mark_texture_deltas_applied,
-        terminate_failed_frame_batch, AcceptedLaunchOutcome, ApplicationExitState,
-        AudioOutputFactory, FrameBatchFailureTarget, FrameDrainFailure, PendingLiveSessionPorts,
-        RemoteBinding, RuntimeDrainCallback, RuntimeDrainCallbackTarget, RuntimeDrainOutcome,
-        RuntimeWakeGate, SessionHost, TestLaunchOutcome, UnavailableCredentialStore,
-        UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
+        take_exact_presented_value, terminate_failed_frame_batch, AcceptedLaunchOutcome,
+        ApplicationExitState, AudioOutputFactory, FrameBatchFailureTarget, FrameDrainFailure,
+        PendingLiveSessionPorts, RemoteBinding, RuntimeDrainCallback, RuntimeDrainCallbackTarget,
+        RuntimeDrainOutcome, RuntimeWakeGate, SessionHost, TestLaunchOutcome,
+        UnavailableCredentialStore, UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
+
+    #[test]
+    fn video_confirmation_echoes_only_the_exact_presented_receipt_value() {
+        let mut pending = Some((17_u64, "exact worker token"));
+
+        assert_eq!(take_exact_presented_value(&mut pending, &16), None);
+        assert_eq!(pending, Some((17, "exact worker token")));
+        assert_eq!(
+            take_exact_presented_value(&mut pending, &17),
+            Some("exact worker token")
+        );
+        assert_eq!(pending, None);
+    }
 
     fn assert_metric_startup_fatal_before_launch(error: MetricSinkError) {
         let launches = AtomicUsize::new(0);

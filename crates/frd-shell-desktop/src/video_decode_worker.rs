@@ -3179,6 +3179,8 @@ mod tests {
                 height: 2,
             },
             format: VideoPixelFormat::Yuv444P8,
+            colorimetry: VideoColorimetry::Bt709,
+            range: VideoRange::Limited,
             planes: vec![plane(), plane(), plane()].into_boxed_slice(),
         })
         .unwrap()

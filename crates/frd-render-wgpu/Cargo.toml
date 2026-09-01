@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 frd-core = { path = "../frd-core" }
 frd-frame = { path = "../frd-frame" }
+frd-media-api = { path = "../frd-media-api" }
 wgpu.workspace = true
 
 [dev-dependencies]

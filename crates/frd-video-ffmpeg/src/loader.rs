@@ -483,6 +483,8 @@ fn convert_frame(
         coded_size: input.coded_size,
         visible_rect: input.visible_rect,
         format: VideoPixelFormat::Yuv444P8,
+        colorimetry: input.colorimetry,
+        range: input.range,
         planes,
     })
     .map_err(|_| VideoDecodeError::new(VideoDecodeErrorCode::DecodedFrameLayoutInvalid))
@@ -1088,6 +1090,11 @@ mod tests {
         let outcome = decoder.submit(access_unit).expect("fake frame 应可接收");
 
         assert!(matches!(outcome, DecodeOutcome::Frames(ref frames) if frames.len() == 1));
+        let DecodeOutcome::Frames(frames) = outcome else {
+            unreachable!("上方断言已锁定单帧输出")
+        };
+        assert_eq!(frames[0].as_input().colorimetry, VideoColorimetry::Bt709);
+        assert_eq!(frames[0].as_input().range, VideoRange::Limited);
         assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 3);
         assert_eq!(FRAME_RECLAIM_CALL_COUNT.load(Ordering::SeqCst), 2);
     }
