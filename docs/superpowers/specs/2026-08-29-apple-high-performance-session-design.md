@@ -51,9 +51,11 @@ The wire implementation remains bounded by the repository's ARD 3.10 evidence:
    milestone. In the media-first ordering, only then may the selected startup
    geometry activate generation 1. Every ordering publishes `TransportReady`,
    capabilities, and audio-starting state only at this milestone.
-6. If `ServerState` arrives first, keep the existing strict geometry commit. If
-   it arrives later, treat it as an optional geometry/consistency update; it
-   must never block Message 1 or Message 2.
+6. If `ServerState` arrives before Message 2, keep the existing strict initial
+   geometry commit. After Message 2 activates HP media, strictly parse every
+   late `ServerState` only as optional consistency evidence: it must not enter
+   the Standard/MVS geometry transaction, reset media generation, publish
+   readiness again, or send another framebuffer request.
 
 No new flag, packet, retry message, subtype, or undocumented field is added.
 The implementation must continue to use the literal builder regression in
@@ -114,12 +116,15 @@ Apple adapter performs one transactional media startup commit:
    `TransportReady`, the existing capabilities, and any audio-start state
    exactly once; then service the active UDP transport.
 
-If a strict `ServerState` arrives before Message 2, the existing geometry commit
-and its exact full request remain valid, but they do not publish
-`TransportReady`. Message 2 still completes the media gate. A matching late
-`ServerState` is idempotent; changed late geometry uses the existing
-generation-bound geometry transaction. A public port failure retains the
-terminal, no-rollback API contract and must not publish readiness.
+If a strict `ServerState` arrives before Message 2, the existing initial
+geometry commit and its exact full request remain valid, but they do not publish
+`TransportReady`. Message 2 still completes the media gate. Once Message 2 has
+activated the generation-bound UDP/SRTP transport, both matching and changed
+late `ServerState` messages are observation-only. AVC/HEVC configuration and
+decoded frames own subsequent HP video geometry; the Standard/MVS
+`commit_server_geometry` transaction remains unreachable from this active HP
+branch. A public port failure retains the terminal, no-rollback API contract
+and must not publish readiness.
 
 ### Confirmation-before-frame rule
 
@@ -157,8 +162,9 @@ The selected startup geometry is provisional until the decoded AVC/HEVC frame
 supplies exact geometry. `SurfaceGenerationChanged`, `SurfaceUpdate::Reset`,
 `RemoteBinding`, the decoder surface, the wgpu texture,
 `ContentViewport::fit_in`, and inverse pointer mapping must converge on the same
-current generation and exact decoded size. An optional `ServerState` may supply
-a consistent geometry update, but it is not the media-control prerequisite.
+current generation and exact decoded size. A strict pre-Message-2
+`ServerState` may select the initial scratch geometry, but a post-Message-2
+`ServerState` never drives HP generation or surface geometry.
 
 The renderer uses aspect-preserving contain fit and may letterbox. It must not
 stretch the remote image or substitute the client window size for the confirmed
@@ -168,6 +174,9 @@ virtual-display size.
 
 - Missing or malformed required Message 1/Message 2 media control:
   `apple_high_performance_unavailable`.
+- Message 2 received before Message 1/configuration during HP startup:
+  `apple_high_performance_unavailable`, with the fixed fieldless diagnostic
+  `hp15_media_negotiation_malformed`; no generation or readiness is published.
 - Invalid or over-budget geometry: `apple_high_performance_unavailable`.
 - Peer close before Message 2 transport activation:
   `apple_high_performance_unavailable`; peer close after activation retains the
@@ -207,11 +216,14 @@ Automated verification is intentionally limited to the core protocol contract:
 2. valid Message 2 activates UDP/SRTP, activates generation 1 if it is still
    pending, and publishes `TransportReady`, capabilities, and audio-starting
    state exactly once;
-3. ServerState-first and ServerState-late ordering cannot block or duplicate the
-   media-control milestone;
-4. malformed or missing Message 2 produces
+3. ServerState-first cannot publish readiness before Message 2; after media
+   activation, a changed late ServerState cannot reset media generation,
+   publish a second readiness event, wake the shell, or send another `0x03`;
+4. Message2-before-Message1, malformed, or missing Message 2 produces
    `apple_high_performance_unavailable` without fallback;
-5. a current-generation exact decoded frame presented by the compositor remains
+5. Standard/TCP-MVS retains its existing late ServerState generation
+   transaction independently of the HP observation-only branch;
+6. a current-generation exact decoded frame presented by the compositor remains
    the sole UI Ready and input gate.
 
 The bounded Windows-to-Mac gate must verify separately:

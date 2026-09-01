@@ -707,6 +707,9 @@ fn run_authenticated_session_inner(
                         )
                         .into());
                     }
+                    let startup_stream_answer = !readiness_published
+                        && is_product_high_performance
+                        && matches!(control, Media::StreamAnswer(_));
                     let media_outcome = handle_media_control(
                         control,
                         &mut media,
@@ -715,7 +718,17 @@ fn run_authenticated_session_inner(
                         media_bind_address,
                         &writer,
                         audio_started,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        if startup_stream_answer {
+                            HighPerformanceUnavailable::diagnosed(
+                                HighPerformanceDiagnostic::MediaNegotiationMalformed,
+                            )
+                            .into()
+                        } else {
+                            error
+                        }
+                    })?;
                     if media_outcome == MediaControlOutcome::TransportActivated
                         && is_product_high_performance
                     {
@@ -1429,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn product_high_performance_replies_to_port_announcement_before_optional_server_state() {
+    fn product_high_performance_late_changed_server_state_preserves_active_media_transport() {
         let mut harness = start_production_harness_for(
             frd_core::PixelSize::new(8, 8).unwrap(),
             true,
@@ -1438,7 +1451,7 @@ mod tests {
         );
         harness.read_verified_startup();
 
-        harness.send_message(&port_announcement_message(17_767));
+        harness.send_message(&port_announcement_message(17_769));
         let media_configuration = harness.read_message();
         assert_eq!(&media_configuration[..2], &[0x1c, 0x00]);
         assert_eq!(
@@ -1533,7 +1546,7 @@ mod tests {
             RuntimeTrace::Wake
         ));
 
-        harness.send_message(&server_state_message(8, 8));
+        harness.send_message(&server_state_message(16, 8));
         harness
             .peer
             .set_read_timeout(Some(Duration::from_millis(150)))
@@ -1552,8 +1565,101 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
 
+        harness.send_message(&port_announcement_message(17_770));
+        assert!(matches!(
+            harness.peer.read(&mut extra),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            harness.exit.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
         harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
         let _ = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        harness.worker.join().unwrap();
+    }
+
+    #[test]
+    fn product_high_performance_message_two_before_message_one_fails_unavailable_without_readiness()
+    {
+        let mut harness = start_production_harness_for(
+            frd_core::PixelSize::new(8, 8).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            |trace| Box::new(TracingEvents(trace)),
+        );
+        harness.read_verified_startup();
+
+        harness.send_message(&media_stream_answer_message());
+        let exit = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            exit,
+            frd_protocol_api::ProtocolExit::Failed(ref error)
+                if error.code()
+                    == crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+        ));
+        while let Ok(trace) = harness.trace.try_recv() {
+            assert!(!matches!(
+                trace,
+                RuntimeTrace::Event(SessionEvent::SurfaceGenerationChanged { .. })
+                    | RuntimeTrace::Surface(frd_frame::SurfaceUpdate::Reset { .. })
+                    | RuntimeTrace::Event(SessionEvent::StageChanged(
+                        frd_protocol_api::ConnectionStage::TransportReady
+                    ))
+            ));
+        }
+        harness.worker.join().unwrap();
+    }
+
+    #[test]
+    fn standard_late_changed_server_state_keeps_the_generation_transaction() {
+        let mut harness = start_production_harness(false);
+        harness.read_verified_startup();
+
+        harness.send_message(&server_state_message(8, 8));
+        assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 8, 0, 8]);
+        for _ in 0..7 {
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        harness.send_message(&server_state_message(16, 8));
+        assert_eq!(harness.read_message(), [5, 0, 0, 0, 0, 0]);
+        assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 16, 0, 8]);
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Event(SessionEvent::SurfaceGenerationChanged {
+                generation: 2,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(16, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Surface(frd_frame::SurfaceUpdate::Reset {
+                generation: 2,
+                size,
+                ..
+            }) if size == frd_core::PixelSize::new(16, 8).unwrap()
+        ));
+        assert!(matches!(
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RuntimeTrace::Wake
+        ));
+
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(
+            harness.exit.recv_timeout(Duration::from_secs(2)).unwrap(),
+            frd_protocol_api::ProtocolExit::Closed
+        );
         harness.worker.join().unwrap();
     }
 

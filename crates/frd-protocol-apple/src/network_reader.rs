@@ -2683,6 +2683,20 @@ impl NetworkReaderRuntime {
             Ok(Media::State(encoding::SERVER_STATE)) => {
                 let geometry = hpss::parse_server_state_geometry(&message)
                     .context("活动会话 ServerState 结构非法")?;
+                if self
+                    .media_startup_gate
+                    .as_ref()
+                    .is_some_and(HighPerformanceStartupGate::is_confirmed)
+                {
+                    let current = current_surface_size(&self.surface);
+                    if geometry.width != current.width || geometry.height != current.height {
+                        eprintln!(
+                            "[apple] High Performance 忽略 late ServerState 几何观察: {}x{}（当前 {}x{}）",
+                            geometry.width, geometry.height, current.width, current.height
+                        );
+                    }
+                    return Ok(NetworkFrameOutcome::Consumed);
+                }
                 if let Some((width, height)) = Some((geometry.width, geometry.height)) {
                     if let Some(observed) = DisplaySize::new(width, height) {
                         self.ensure_server_state_generation_coherence(media_state)?;

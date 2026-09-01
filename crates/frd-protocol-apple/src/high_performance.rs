@@ -42,6 +42,7 @@ pub(crate) enum HighPerformanceDiagnostic {
     ConfirmationMalformed,
     ConfirmationCommitWriteClosed,
     PendingControlBudget,
+    MediaNegotiationMalformed,
     NamedSrpSelected,
     SrpStep1Written,
     SrpChallengeAccepted,
@@ -90,6 +91,7 @@ impl HighPerformanceDiagnostic {
             Self::ConfirmationMalformed => "hp07_confirmation_malformed",
             Self::ConfirmationCommitWriteClosed => "hp08_confirmation_commit_write_closed",
             Self::PendingControlBudget => "hp09_pending_control_budget",
+            Self::MediaNegotiationMalformed => "hp15_media_negotiation_malformed",
             Self::NamedSrpSelected => "hp00_named_srp_selected",
             Self::SrpStep1Written => "hp00_srp_step1_written",
             Self::SrpChallengeAccepted => "hp00_srp_challenge_accepted",
@@ -158,6 +160,7 @@ impl fmt::Display for HighPerformanceDiagnostic {
             | Self::ConfirmationMalformed
             | Self::ConfirmationCommitWriteClosed
             | Self::PendingControlBudget
+            | Self::MediaNegotiationMalformed
             | Self::NamedSrpSelected
             | Self::SrpStep1Written
             | Self::SrpChallengeAccepted
@@ -545,6 +548,10 @@ mod tests {
             (
                 HighPerformanceDiagnostic::SrpProofMismatch,
                 "hp14_srp_proof_mismatch",
+            ),
+            (
+                HighPerformanceDiagnostic::MediaNegotiationMalformed,
+                "hp15_media_negotiation_malformed",
             ),
             (
                 HighPerformanceDiagnostic::SrpResponseAccepted,
