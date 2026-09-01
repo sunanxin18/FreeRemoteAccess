@@ -12,6 +12,10 @@ pub const MAX_HEVC_SPS_NAL_BYTES: usize = 64 * 1024;
 /// `max_12bit`、`max_10bit`、`max_8bit` 和 `lower_bit_rate`。
 const MAIN444_8_REXT_CONSTRAINT_MASK: u64 =
     (1u64 << 43) | (1u64 << 42) | (1u64 << 41) | (1u64 << 35);
+const MAX_SHORT_TERM_REF_PIC_SETS: u32 = 64;
+const MAX_REFS_PER_SHORT_TERM_SET: u32 = 64;
+const MAX_LONG_TERM_REFS: u32 = 32;
+const MAX_HRD_CPB_CNT_MINUS1: u32 = 31;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HevcSps {
@@ -57,7 +61,9 @@ impl HevcSps {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HevcSpsError {
-    NalBudgetExceeded { limit: usize },
+    NalBudgetExceeded {
+        limit: usize,
+    },
     Truncated,
     InvalidNalHeader,
     InvalidNalType(u8),
@@ -68,6 +74,14 @@ pub enum HevcSpsError {
     InvalidDimensions,
     InvalidConformanceWindow,
     InvalidBitDepth(u32),
+    InvalidRange {
+        field: &'static str,
+        value: u32,
+        maximum: u32,
+    },
+    UnsupportedSyntax(&'static str),
+    InvalidTrailingBits,
+    ExtraRbspData,
 }
 
 impl fmt::Display for HevcSpsError {
@@ -96,6 +110,19 @@ impl fmt::Display for HevcSpsError {
             Self::InvalidBitDepth(value) => {
                 write!(formatter, "HEVC SPS bit_depth_minus8 非法：{value}")
             }
+            Self::InvalidRange {
+                field,
+                value,
+                maximum,
+            } => write!(
+                formatter,
+                "HEVC SPS {field} 超出范围：{value}，最大允许 {maximum}"
+            ),
+            Self::UnsupportedSyntax(field) => {
+                write!(formatter, "HEVC SPS 暂不支持 {field}")
+            }
+            Self::InvalidTrailingBits => formatter.write_str("HEVC SPS rbsp_trailing_bits 非法"),
+            Self::ExtraRbspData => formatter.write_str("HEVC SPS 尾随位后存在额外数据"),
         }
     }
 }
@@ -104,7 +131,8 @@ impl Error for HevcSpsError {}
 
 /// 解析一个完整的 HEVC SPS NAL（包含 2 字节 NAL header）。
 ///
-/// 只读取解码后端选择所需的 SPS 头字段；其余语法不在此能力门禁中推断。
+/// 只提取解码后端选择所需的能力字段；其余 SPS 语法仅做有界完整验证，
+/// 不在此门禁中推断或解码图像内容。
 pub fn parse_hevc_sps(nal: &[u8]) -> Result<HevcSps, HevcSpsError> {
     if nal.len() > MAX_HEVC_SPS_NAL_BYTES {
         return Err(HevcSpsError::NalBudgetExceeded {
@@ -161,7 +189,8 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Result<HevcSps, HevcSpsError> {
         }
     }
 
-    bits.read_ue()?; // sps_seq_parameter_set_id
+    let sps_id = bits.read_ue()?;
+    validate_max("sps_seq_parameter_set_id", sps_id, 15)?;
     let chroma_format = bits.read_ue()?;
     if chroma_format > 3 {
         return Err(HevcSpsError::InvalidChromaFormat(chroma_format));
@@ -223,6 +252,8 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Result<HevcSps, HevcSpsError> {
         return Err(HevcSpsError::InvalidBitDepth(bit_depth_chroma_minus8));
     }
 
+    parse_sps_suffix(&mut bits, max_sub_layers_minus1)?;
+
     Ok(HevcSps {
         general_profile_space,
         general_tier_flag,
@@ -243,6 +274,377 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Result<HevcSps, HevcSpsError> {
         bit_depth_luma: 8 + bit_depth_luma_minus8 as u8,
         bit_depth_chroma: 8 + bit_depth_chroma_minus8 as u8,
     })
+}
+
+fn parse_sps_suffix(
+    bits: &mut BitReader<'_>,
+    max_sub_layers_minus1: u8,
+) -> Result<(), HevcSpsError> {
+    let log2_max_pic_order_cnt_lsb_minus4 = bits.read_ue()?;
+    validate_max(
+        "log2_max_pic_order_cnt_lsb_minus4",
+        log2_max_pic_order_cnt_lsb_minus4,
+        12,
+    )?;
+
+    let ordering_info_present = bits.read_bit()?;
+    let first_layer = if ordering_info_present {
+        0
+    } else {
+        max_sub_layers_minus1
+    };
+    for _ in first_layer..=max_sub_layers_minus1 {
+        let max_dec_pic_buffering_minus1 = bits.read_ue()?;
+        validate_max(
+            "sps_max_dec_pic_buffering_minus1",
+            max_dec_pic_buffering_minus1,
+            MAX_REFS_PER_SHORT_TERM_SET,
+        )?;
+        let max_num_reorder_pics = bits.read_ue()?;
+        if max_num_reorder_pics > max_dec_pic_buffering_minus1 {
+            return Err(HevcSpsError::InvalidRange {
+                field: "sps_max_num_reorder_pics",
+                value: max_num_reorder_pics,
+                maximum: max_dec_pic_buffering_minus1,
+            });
+        }
+        bits.read_ue()?; // sps_max_latency_increase_plus1
+    }
+
+    let log2_min_luma_coding_block_size_minus3 = bits.read_ue()?;
+    validate_max(
+        "log2_min_luma_coding_block_size_minus3",
+        log2_min_luma_coding_block_size_minus3,
+        3,
+    )?;
+    let log2_diff_max_min_luma_coding_block_size = bits.read_ue()?;
+    validate_sum_max(
+        "log2_diff_max_min_luma_coding_block_size",
+        log2_min_luma_coding_block_size_minus3,
+        log2_diff_max_min_luma_coding_block_size,
+        3,
+    )?;
+    let log2_min_luma_transform_block_size_minus2 = bits.read_ue()?;
+    validate_max(
+        "log2_min_luma_transform_block_size_minus2",
+        log2_min_luma_transform_block_size_minus2,
+        3,
+    )?;
+    let log2_diff_max_min_luma_transform_block_size = bits.read_ue()?;
+    validate_sum_max(
+        "log2_diff_max_min_luma_transform_block_size",
+        log2_min_luma_transform_block_size_minus2,
+        log2_diff_max_min_luma_transform_block_size,
+        3,
+    )?;
+    validate_max("max_transform_hierarchy_depth_inter", bits.read_ue()?, 32)?;
+    validate_max("max_transform_hierarchy_depth_intra", bits.read_ue()?, 32)?;
+
+    if bits.read_bit()? && bits.read_bit()? {
+        skip_scaling_list_data(bits)?;
+    }
+    bits.read_bit()?; // amp_enabled_flag
+    bits.read_bit()?; // sample_adaptive_offset_enabled_flag
+    if bits.read_bit()? {
+        bits.read_bits(4)?; // pcm_sample_bit_depth_luma_minus1
+        bits.read_bits(4)?; // pcm_sample_bit_depth_chroma_minus1
+        let log2_min_pcm_luma_coding_block_size_minus3 = bits.read_ue()?;
+        validate_max(
+            "log2_min_pcm_luma_coding_block_size_minus3",
+            log2_min_pcm_luma_coding_block_size_minus3,
+            2,
+        )?;
+        let log2_diff_max_min_pcm_luma_coding_block_size = bits.read_ue()?;
+        validate_sum_max(
+            "log2_diff_max_min_pcm_luma_coding_block_size",
+            log2_min_pcm_luma_coding_block_size_minus3,
+            log2_diff_max_min_pcm_luma_coding_block_size,
+            2,
+        )?;
+        bits.read_bit()?; // pcm_loop_filter_disabled_flag
+    }
+
+    let num_short_term_ref_pic_sets = bits.read_ue()?;
+    validate_max(
+        "num_short_term_ref_pic_sets",
+        num_short_term_ref_pic_sets,
+        MAX_SHORT_TERM_REF_PIC_SETS,
+    )?;
+    skip_short_term_ref_pic_sets(bits, num_short_term_ref_pic_sets)?;
+
+    if bits.read_bit()? {
+        let num_long_term_ref_pics_sps = bits.read_ue()?;
+        validate_max(
+            "num_long_term_ref_pics_sps",
+            num_long_term_ref_pics_sps,
+            MAX_LONG_TERM_REFS,
+        )?;
+        let poc_width = usize::try_from(log2_max_pic_order_cnt_lsb_minus4 + 4)
+            .map_err(|_| HevcSpsError::ExpGolombOverflow)?;
+        for _ in 0..num_long_term_ref_pics_sps {
+            bits.read_bits(poc_width)?;
+            bits.read_bit()?;
+        }
+    }
+    bits.read_bit()?; // sps_temporal_mvp_enabled_flag
+    bits.read_bit()?; // strong_intra_smoothing_enabled_flag
+    if bits.read_bit()? {
+        skip_vui_parameters(bits, max_sub_layers_minus1)?;
+    }
+
+    if bits.read_bit()? {
+        let range_extension = bits.read_bit()?;
+        let multilayer_extension = bits.read_bit()?;
+        let extension_3d = bits.read_bit()?;
+        let scc_extension = bits.read_bit()?;
+        let extension_4bits = bits.read_bits(4)?;
+        if range_extension {
+            bits.skip_bits(9)?;
+        }
+        if multilayer_extension || extension_3d || scc_extension || extension_4bits != 0 {
+            return Err(HevcSpsError::UnsupportedSyntax("非 Range SPS extension"));
+        }
+    }
+
+    bits.finish_rbsp()
+}
+
+fn skip_scaling_list_data(bits: &mut BitReader<'_>) -> Result<(), HevcSpsError> {
+    for size_id in 0..4usize {
+        let matrix_step = if size_id == 3 { 3 } else { 1 };
+        for matrix_id in (0..6usize).step_by(matrix_step) {
+            if !bits.read_bit()? {
+                let delta = bits.read_ue()?;
+                validate_max("scaling_list_pred_matrix_id_delta", delta, matrix_id as u32)?;
+                continue;
+            }
+            if size_id > 1 {
+                let dc_minus8 = bits.read_se()?;
+                if !(-7..=247).contains(&dc_minus8) {
+                    return Err(HevcSpsError::InvalidRange {
+                        field: "scaling_list_dc_coef_minus8",
+                        value: dc_minus8.unsigned_abs(),
+                        maximum: 247,
+                    });
+                }
+            }
+            let coefficient_count = 64usize.min(1usize << (4 + (size_id << 1)));
+            for _ in 0..coefficient_count {
+                let delta = bits.read_se()?;
+                if !(-128..=127).contains(&delta) {
+                    return Err(HevcSpsError::InvalidRange {
+                        field: "scaling_list_delta_coef",
+                        value: delta.unsigned_abs(),
+                        maximum: 128,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn skip_short_term_ref_pic_sets(bits: &mut BitReader<'_>, count: u32) -> Result<(), HevcSpsError> {
+    let mut delta_poc_counts = [0u32; MAX_SHORT_TERM_REF_PIC_SETS as usize];
+    for index in 0..count as usize {
+        let inter_prediction = index != 0 && bits.read_bit()?;
+        let delta_poc_count = if inter_prediction {
+            bits.read_bit()?; // delta_rps_sign
+            bits.read_ue()?; // abs_delta_rps_minus1
+            let reference_count = delta_poc_counts[index - 1];
+            let mut used_count = 0u32;
+            for _ in 0..=reference_count {
+                let used_by_current = bits.read_bit()?;
+                let use_delta = used_by_current || bits.read_bit()?;
+                if use_delta {
+                    used_count += 1;
+                }
+            }
+            used_count
+        } else {
+            let negative = bits.read_ue()?;
+            let positive = bits.read_ue()?;
+            let total = negative
+                .checked_add(positive)
+                .ok_or(HevcSpsError::ExpGolombOverflow)?;
+            validate_max("NumDeltaPocs", total, MAX_REFS_PER_SHORT_TERM_SET)?;
+            for _ in 0..negative {
+                bits.read_ue()?;
+                bits.read_bit()?;
+            }
+            for _ in 0..positive {
+                bits.read_ue()?;
+                bits.read_bit()?;
+            }
+            total
+        };
+        validate_max("NumDeltaPocs", delta_poc_count, MAX_REFS_PER_SHORT_TERM_SET)?;
+        delta_poc_counts[index] = delta_poc_count;
+    }
+    Ok(())
+}
+
+fn skip_vui_parameters(
+    bits: &mut BitReader<'_>,
+    max_sub_layers_minus1: u8,
+) -> Result<(), HevcSpsError> {
+    if bits.read_bit()? {
+        let aspect_ratio_idc = bits.read_bits(8)? as u32;
+        if aspect_ratio_idc == 255 {
+            let width = bits.read_bits(16)? as u32;
+            let height = bits.read_bits(16)? as u32;
+            if width == 0 || height == 0 {
+                return Err(HevcSpsError::InvalidRange {
+                    field: "sar_width/sar_height",
+                    value: 0,
+                    maximum: u16::MAX.into(),
+                });
+            }
+        } else if aspect_ratio_idc > 16 {
+            return Err(HevcSpsError::InvalidRange {
+                field: "aspect_ratio_idc",
+                value: aspect_ratio_idc,
+                maximum: 16,
+            });
+        }
+    }
+    if bits.read_bit()? {
+        bits.read_bit()?; // overscan_appropriate_flag
+    }
+    if bits.read_bit()? {
+        let video_format = bits.read_bits(3)? as u32;
+        validate_max("video_format", video_format, 5)?;
+        bits.read_bit()?; // video_full_range_flag
+        if bits.read_bit()? {
+            bits.skip_bits(24)?;
+        }
+    }
+    if bits.read_bit()? {
+        validate_max("chroma_sample_loc_type_top_field", bits.read_ue()?, 5)?;
+        validate_max("chroma_sample_loc_type_bottom_field", bits.read_ue()?, 5)?;
+    }
+    bits.read_bit()?; // neutral_chroma_indication_flag
+    bits.read_bit()?; // field_seq_flag
+    bits.read_bit()?; // frame_field_info_present_flag
+    if bits.read_bit()? {
+        for _ in 0..4 {
+            bits.read_ue()?;
+        }
+    }
+    if bits.read_bit()? {
+        let num_units_in_tick = bits.read_bits(32)?;
+        let time_scale = bits.read_bits(32)?;
+        if num_units_in_tick == 0 || time_scale == 0 {
+            return Err(HevcSpsError::InvalidRange {
+                field: "vui timing",
+                value: 0,
+                maximum: u32::MAX,
+            });
+        }
+        if bits.read_bit()? {
+            bits.read_ue()?;
+        }
+        if bits.read_bit()? {
+            skip_hrd_parameters(bits, max_sub_layers_minus1)?;
+        }
+    }
+    if bits.read_bit()? {
+        bits.read_bit()?; // tiles_fixed_structure_flag
+        bits.read_bit()?; // motion_vectors_over_pic_boundaries_flag
+        bits.read_bit()?; // restricted_ref_pic_lists_flag
+        validate_max("min_spatial_segmentation_idc", bits.read_ue()?, 4095)?;
+        validate_max("max_bytes_per_pic_denom", bits.read_ue()?, 16)?;
+        validate_max("max_bits_per_min_cu_denom", bits.read_ue()?, 16)?;
+        validate_max("log2_max_mv_length_horizontal", bits.read_ue()?, 15)?;
+        validate_max("log2_max_mv_length_vertical", bits.read_ue()?, 15)?;
+    }
+    Ok(())
+}
+
+fn skip_hrd_parameters(
+    bits: &mut BitReader<'_>,
+    max_sub_layers_minus1: u8,
+) -> Result<(), HevcSpsError> {
+    let nal_hrd_parameters_present = bits.read_bit()?;
+    let vcl_hrd_parameters_present = bits.read_bit()?;
+    let mut sub_pic_hrd_params_present = false;
+    if nal_hrd_parameters_present || vcl_hrd_parameters_present {
+        sub_pic_hrd_params_present = bits.read_bit()?;
+        if sub_pic_hrd_params_present {
+            bits.read_bits(8)?;
+            bits.read_bits(5)?;
+            bits.read_bit()?;
+            bits.read_bits(5)?;
+        }
+        bits.read_bits(4)?;
+        bits.read_bits(4)?;
+        if sub_pic_hrd_params_present {
+            bits.read_bits(4)?;
+        }
+        bits.read_bits(5)?;
+        bits.read_bits(5)?;
+        bits.read_bits(5)?;
+    }
+
+    for _ in 0..=max_sub_layers_minus1 {
+        let fixed_pic_rate_general = bits.read_bit()?;
+        let fixed_pic_rate_within_cvs = fixed_pic_rate_general || bits.read_bit()?;
+        let low_delay_hrd = if fixed_pic_rate_within_cvs {
+            bits.read_ue()?;
+            false
+        } else {
+            bits.read_bit()?
+        };
+        let cpb_cnt_minus1 = if low_delay_hrd { 0 } else { bits.read_ue()? };
+        validate_max("cpb_cnt_minus1", cpb_cnt_minus1, MAX_HRD_CPB_CNT_MINUS1)?;
+        if nal_hrd_parameters_present {
+            skip_sub_layer_hrd_parameters(bits, cpb_cnt_minus1, sub_pic_hrd_params_present)?;
+        }
+        if vcl_hrd_parameters_present {
+            skip_sub_layer_hrd_parameters(bits, cpb_cnt_minus1, sub_pic_hrd_params_present)?;
+        }
+    }
+    Ok(())
+}
+
+fn skip_sub_layer_hrd_parameters(
+    bits: &mut BitReader<'_>,
+    cpb_cnt_minus1: u32,
+    sub_pic_hrd_params_present: bool,
+) -> Result<(), HevcSpsError> {
+    for _ in 0..=cpb_cnt_minus1 {
+        bits.read_ue()?;
+        bits.read_ue()?;
+        if sub_pic_hrd_params_present {
+            bits.read_ue()?;
+            bits.read_ue()?;
+        }
+        bits.read_bit()?;
+    }
+    Ok(())
+}
+
+fn validate_max(field: &'static str, value: u32, maximum: u32) -> Result<(), HevcSpsError> {
+    if value > maximum {
+        return Err(HevcSpsError::InvalidRange {
+            field,
+            value,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+fn validate_sum_max(
+    field: &'static str,
+    first: u32,
+    second: u32,
+    maximum: u32,
+) -> Result<(), HevcSpsError> {
+    let value = first
+        .checked_add(second)
+        .ok_or(HevcSpsError::ExpGolombOverflow)?;
+    validate_max(field, value, maximum)
 }
 
 fn crop_units(chroma_format_idc: u8, separate_colour_plane_flag: bool) -> (u32, u32) {
@@ -344,6 +746,31 @@ impl<'a> BitReader<'a> {
         let suffix = self.read_bits(leading_zero_bits)? as u32;
         Ok(((1u32 << leading_zero_bits) - 1) + suffix)
     }
+
+    fn read_se(&mut self) -> Result<i32, HevcSpsError> {
+        let code_num = i64::from(self.read_ue()?);
+        let value = if code_num & 1 == 0 {
+            -(code_num / 2)
+        } else {
+            (code_num + 1) / 2
+        };
+        i32::try_from(value).map_err(|_| HevcSpsError::ExpGolombOverflow)
+    }
+
+    fn finish_rbsp(&mut self) -> Result<(), HevcSpsError> {
+        if !self.read_bit()? {
+            return Err(HevcSpsError::InvalidTrailingBits);
+        }
+        while self.bit_offset % 8 != 0 {
+            if self.read_bit()? {
+                return Err(HevcSpsError::InvalidTrailingBits);
+            }
+        }
+        if self.bit_offset != self.bytes.len().saturating_mul(8) {
+            return Err(HevcSpsError::ExtraRbspData);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -361,13 +788,13 @@ mod tests {
 
     const MAIN_420_8BIT_1280X720_SPS: &[u8] = &[
         0x42, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
-        0x00, 0x03, 0x00, 0x78, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x17,
+        0x00, 0x03, 0x00, 0x78, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x17, 0x7f, 0xc2, 0x08,
     ];
 
     const SUB_LAYER_PROFILE_SPS: &[u8] = &[
         0x42, 0x01, 0x03, 0x01, 0x40, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
         0x00, 0x03, 0x00, 0x78, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
-        0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0xa0, 0x88, 0x45, 0xc0,
+        0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0xa0, 0x88, 0x45, 0xdf, 0xf0, 0x82,
     ];
 
     #[test]
@@ -455,11 +882,37 @@ mod tests {
 
     #[test]
     fn truncated_sps_never_publishes_partial_capabilities() {
-        assert_eq!(
-            parse_hevc_sps(&CAPTURED_MAIN444_8BIT_SPS[..17]),
-            Err(HevcSpsError::Truncated)
-        );
+        for length in 2..CAPTURED_MAIN444_8BIT_SPS.len() {
+            assert!(
+                parse_hevc_sps(&CAPTURED_MAIN444_8BIT_SPS[..length]).is_err(),
+                "truncated SPS prefix of {length} bytes must be rejected"
+            );
+        }
         assert_eq!(parse_hevc_sps(&[0x42, 0x01]), Err(HevcSpsError::Truncated));
+    }
+
+    #[test]
+    fn rbsp_trailing_bits_and_extra_nonzero_data_are_rejected() {
+        let mut missing_stop_bit = CAPTURED_MAIN444_8BIT_SPS.to_vec();
+        *missing_stop_bit.last_mut().unwrap() = 0;
+        assert!(parse_hevc_sps(&missing_stop_bit).is_err());
+
+        let mut nonzero_after_stop_bit = CAPTURED_MAIN444_8BIT_SPS.to_vec();
+        *nonzero_after_stop_bit.last_mut().unwrap() = 0x81;
+        assert!(parse_hevc_sps(&nonzero_after_stop_bit).is_err());
+
+        let mut extra_rbsp = CAPTURED_MAIN444_8BIT_SPS.to_vec();
+        extra_rbsp.push(0x80);
+        assert!(parse_hevc_sps(&extra_rbsp).is_err());
+    }
+
+    #[test]
+    fn reserved_vui_video_format_is_rejected() {
+        let mut reserved_video_format = CAPTURED_MAIN444_8BIT_SPS.to_vec();
+        // RBSP bit 579..581 是当前 fixture 的 video_format；101(5) 改为 110(6)。
+        reserved_video_format[76] = 0x3b;
+
+        assert!(parse_hevc_sps(&reserved_video_format).is_err());
     }
 
     #[test]

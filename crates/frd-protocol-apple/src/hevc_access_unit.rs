@@ -160,7 +160,7 @@ impl HevcAccessUnitAssembler {
             nals: Vec::new(),
             access_unit_bytes: 0,
             parameter_sets: [None, None, None],
-            dropping_until_marker: false,
+            dropping_until_marker: true,
         })
     }
 
@@ -176,7 +176,7 @@ impl HevcAccessUnitAssembler {
         self.nals.clear();
         self.access_unit_bytes = 0;
         self.parameter_sets = [None, None, None];
-        self.dropping_until_marker = false;
+        self.dropping_until_marker = true;
     }
 
     /// 接收一个已认证 RTP 包；同一次调用可能排空重排队列并发布多个 AU。
@@ -204,7 +204,11 @@ impl HevcAccessUnitAssembler {
         }
 
         if self.dropping_until_marker {
-            if packet.marker {
+            if packet.marker
+                && self
+                    .expected_sequence
+                    .is_none_or(|cursor| serial_at_or_after(packet.sequence, cursor))
+            {
                 self.dropping_until_marker = false;
                 self.expected_sequence = Some(packet.sequence.wrapping_add(1));
                 self.clear_reorder();
@@ -455,6 +459,10 @@ fn nal_type(nal: &[u8]) -> Option<u8> {
     nal.first().map(|first| (first >> 1) & 0x3f)
 }
 
+fn serial_at_or_after(sequence: u16, cursor: u16) -> bool {
+    sequence.wrapping_sub(cursor) < 0x8000
+}
+
 fn parameter_set_index(nal: &[u8]) -> Option<usize> {
     match nal_type(nal)? {
         32 => Some(0),
@@ -494,9 +502,109 @@ mod tests {
         HevcAccessUnitAssembler::new(GENERATION, HevcAccessUnitLimits::default()).unwrap()
     }
 
+    fn synchronize(assembler: &mut HevcAccessUnitAssembler, first_sequence: u16) {
+        assert!(assembler
+            .push(packet(
+                first_sequence.wrapping_sub(1),
+                0,
+                true,
+                &[0x02, 0x01, 0],
+            ))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn initial_middle_of_access_unit_is_dropped_through_the_first_marker() {
+        let mut assembler = assembler();
+
+        assert!(assembler
+            .push(packet(10, 1000, false, &[0x02, 0x01, 0xaa]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(11, 1000, true, &[0x02, 0x01, 0xbb]))
+            .unwrap()
+            .is_empty());
+
+        let output = assembler
+            .push(packet(12, 2000, true, &[0x02, 0x01, 0xcc]))
+            .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].timestamp, 2000);
+        assert_eq!(output[0].data, [0, 0, 0, 3, 0x02, 0x01, 0xcc]);
+    }
+
+    #[test]
+    fn late_old_marker_during_recovery_cannot_rewind_the_sequence_cursor() {
+        let mut assembler = assembler();
+        assert!(assembler
+            .push(packet(9, 900, true, &[0x02, 0x01, 0]))
+            .unwrap()
+            .is_empty());
+        assembler
+            .push(packet(10, 1000, false, &[0x02, 0x01, 1]))
+            .unwrap();
+        assert_eq!(
+            assembler.push(packet(11, 2000, false, &[0x02, 0x01, 2])),
+            Err(HevcAccessUnitError::TimestampChangedBeforeMarker {
+                previous: 1000,
+                actual: 2000,
+            })
+        );
+
+        assert!(assembler
+            .push(packet(8, 800, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(12, 2000, true, &[0x02, 0x01, 4]))
+            .unwrap()
+            .is_empty());
+        let output = assembler
+            .push(packet(13, 3000, true, &[0x02, 0x01, 5]))
+            .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].timestamp, 3000);
+    }
+
+    #[test]
+    fn forward_recovery_marker_is_accepted_across_sequence_wrap() {
+        let mut assembler = assembler();
+        assert!(assembler
+            .push(packet(u16::MAX - 2, 900, true, &[0x02, 0x01, 0]))
+            .unwrap()
+            .is_empty());
+        assembler
+            .push(packet(u16::MAX - 1, 1000, false, &[0x02, 0x01, 1]))
+            .unwrap();
+        assert_eq!(
+            assembler.push(packet(u16::MAX, 2000, false, &[0x02, 0x01, 2])),
+            Err(HevcAccessUnitError::TimestampChangedBeforeMarker {
+                previous: 1000,
+                actual: 2000,
+            })
+        );
+
+        assert!(assembler
+            .push(packet(u16::MAX - 1, 800, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(0, 2000, true, &[0x02, 0x01, 4]))
+            .unwrap()
+            .is_empty());
+        let output = assembler
+            .push(packet(1, 3000, true, &[0x02, 0x01, 5]))
+            .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].timestamp, 3000);
+    }
+
     #[test]
     fn out_of_order_packets_publish_only_after_the_gap_is_filled() {
         let mut assembler = assembler();
+        synchronize(&mut assembler, 10);
         assert!(assembler
             .push(packet(10, 1000, false, &[0x02, 0x01, 0xaa]))
             .unwrap()
@@ -526,6 +634,7 @@ mod tests {
     #[test]
     fn sequence_wrap_is_ordered_modulo_sixteen_bits() {
         let mut assembler = assembler();
+        synchronize(&mut assembler, u16::MAX);
         assert!(assembler
             .push(packet(u16::MAX, 2000, false, &[0x02, 0x01, 1]))
             .unwrap()
@@ -544,6 +653,7 @@ mod tests {
     #[test]
     fn complete_ap_and_fu_form_one_keyframe_access_unit() {
         let mut assembler = assembler();
+        synchronize(&mut assembler, 20);
         assert!(assembler
             .push(packet(
                 20,
@@ -581,6 +691,7 @@ mod tests {
     #[test]
     fn cached_parameter_sets_are_prepended_to_a_later_keyframe() {
         let mut assembler = assembler();
+        synchronize(&mut assembler, 30);
         let config = [
             0x60, 0x01, 0, 3, 0x40, 0x01, 1, 0, 3, 0x42, 0x01, 2, 0, 3, 0x44, 0x01, 3,
         ];
@@ -618,6 +729,7 @@ mod tests {
             },
         )
         .unwrap();
+        synchronize(&mut assembler, 40);
         assembler
             .push(packet(40, 6000, false, &[0x02, 0x01, 1]))
             .unwrap();
@@ -636,6 +748,7 @@ mod tests {
     #[test]
     fn timestamp_change_before_marker_drops_both_sides_of_the_boundary() {
         let mut assembler = assembler();
+        synchronize(&mut assembler, 50);
         assembler
             .push(packet(50, 9000, false, &[0x02, 0x01, 1]))
             .unwrap();
@@ -662,6 +775,7 @@ mod tests {
     #[test]
     fn ssrc_change_and_generation_reset_discard_stream_state() {
         let mut assembler = assembler();
+        synchronize(&mut assembler, 60);
         assembler
             .push(packet(60, 12000, false, &[0x02, 0x01, 1]))
             .unwrap();
@@ -688,12 +802,21 @@ mod tests {
                 actual: GENERATION,
             })
         );
-        let fresh = HevcRtpPacket {
+        let boundary = HevcRtpPacket {
             generation: GENERATION + 1,
             sequence: 1,
             timestamp: 1,
             marker: true,
             payload: &[0x02, 0x01, 4],
+            ssrc: SSRC,
+        };
+        assert!(assembler.push(boundary).unwrap().is_empty());
+        let fresh = HevcRtpPacket {
+            generation: GENERATION + 1,
+            sequence: 2,
+            timestamp: 2,
+            marker: true,
+            payload: &[0x02, 0x01, 5],
             ssrc: SSRC,
         };
         assert_eq!(assembler.push(fresh).unwrap().len(), 1);
@@ -702,6 +825,7 @@ mod tests {
     #[test]
     fn malformed_fu_and_access_unit_budget_never_publish_partial_frames() {
         let mut assembler = assembler();
+        synchronize(&mut assembler, 70);
         assembler
             .push(packet(70, 15000, false, &[0x62, 0x01, 0x93, 1]))
             .unwrap();
@@ -725,6 +849,7 @@ mod tests {
             },
         )
         .unwrap();
+        synchronize(&mut bounded, 80);
         bounded
             .push(packet(80, 17000, false, &[0x02, 0x01, 1]))
             .unwrap();
@@ -745,6 +870,7 @@ mod tests {
             },
         )
         .unwrap();
+        synchronize(&mut assembler, 90);
         assembler
             .push(packet(90, 18000, false, &[0x02, 0x01, 0]))
             .unwrap();
@@ -768,6 +894,7 @@ mod tests {
             },
         )
         .unwrap();
+        synchronize(&mut assembler, 100);
         let config = [
             0x60, 0x01, 0, 2, 0x40, 0x01, 0, 2, 0x42, 0x01, 0, 2, 0x44, 0x01,
         ];

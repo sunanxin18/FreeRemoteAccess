@@ -55,6 +55,7 @@ pub enum HevcRtpError {
     StaleGeneration { expected: u64, actual: u64 },
     Truncated,
     InvalidNalHeader,
+    UnsupportedNalType(u8),
     ZeroLengthAggregateNal,
     AggregateNalCountExceeded { limit: usize },
     PayloadBudgetExceeded { limit: usize },
@@ -77,6 +78,9 @@ impl fmt::Display for HevcRtpError {
             ),
             Self::Truncated => formatter.write_str("HEVC RTP payload 被截断"),
             Self::InvalidNalHeader => formatter.write_str("HEVC NAL header 非法"),
+            Self::UnsupportedNalType(nal_type) => {
+                write!(formatter, "HEVC RTP 不支持 NAL 类型 {nal_type}")
+            }
             Self::ZeroLengthAggregateNal => formatter.write_str("HEVC AP 包含零长度 NAL"),
             Self::AggregateNalCountExceeded { limit } => {
                 write!(formatter, "HEVC AP 的 NAL 数量超过资源上限 {limit}")
@@ -174,6 +178,10 @@ impl HevcRtpDepacketizer {
         match nal_type {
             HEVC_AP_NAL_TYPE => self.push_aggregation(payload),
             HEVC_FU_NAL_TYPE => self.push_fragment(sequence_number, payload),
+            50..=63 => {
+                self.fu = None;
+                Err(HevcRtpError::UnsupportedNalType(nal_type))
+            }
             _ => self.push_single(payload),
         }
     }
@@ -215,6 +223,10 @@ impl HevcRtpDepacketizer {
             if bytes.len() < 2 || !valid_nal_header(bytes[0], bytes[1]) {
                 return Err(HevcRtpError::InvalidNalHeader);
             }
+            let member_type = nal_type(bytes[0]);
+            if member_type > 47 {
+                return Err(HevcRtpError::UnsupportedNalType(member_type));
+            }
             output.push(HevcNal {
                 bytes: bytes.to_vec(),
             });
@@ -245,7 +257,7 @@ impl HevcRtpDepacketizer {
             self.fu = None;
             return Err(HevcRtpError::FuStartAndEnd);
         }
-        if matches!(fragment_type, HEVC_AP_NAL_TYPE | HEVC_FU_NAL_TYPE) {
+        if fragment_type > 47 {
             self.fu = None;
             return Err(HevcRtpError::ReservedFuType(fragment_type));
         }
@@ -368,6 +380,58 @@ mod tests {
         assert_eq!(output.len(), 2);
         assert_eq!(bytes(&output[0]), &[0x40, 0x01, 0xaa]);
         assert_eq!(bytes(&output[1]), &[0x02, 0x01, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn single_nal_path_rejects_paci_and_reserved_or_unspecified_types() {
+        for nal_type in 50..=63 {
+            let mut decoder = decoder();
+            let payload = [(nal_type << 1), 0x01, 0xaa];
+            assert!(
+                decoder.push(GENERATION, 12, &payload).is_err(),
+                "single-NAL type {nal_type} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregation_rejects_every_packetization_or_reserved_member_transactionally() {
+        for nal_type in 48..=63 {
+            let mut decoder = decoder();
+            let payload = [
+                0x60,
+                0x01,
+                0x00,
+                0x03,
+                0x40,
+                0x01,
+                0xaa,
+                0x00,
+                0x03,
+                nal_type << 1,
+                0x01,
+                0xbb,
+            ];
+            assert!(
+                decoder.push(GENERATION, 13, &payload).is_err(),
+                "AP member type {nal_type} must be rejected"
+            );
+            let output = decoder.push(GENERATION, 14, &[0x02, 0x01, 0xcc]).unwrap();
+            assert_eq!(output.len(), 1);
+            assert_eq!(bytes(&output[0]), &[0x02, 0x01, 0xcc]);
+        }
+    }
+
+    #[test]
+    fn fragmentation_rejects_every_packetization_or_reserved_reconstructed_type() {
+        for nal_type in 48..=63 {
+            let mut decoder = decoder();
+            let payload = [0x62, 0x01, 0x80 | nal_type, 0xaa];
+            assert_eq!(
+                decoder.push(GENERATION, 15, &payload),
+                Err(HevcRtpError::ReservedFuType(nal_type))
+            );
+        }
     }
 
     #[test]
