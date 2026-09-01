@@ -24,6 +24,11 @@ impl fmt::Display for StartupRequestMessage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HighPerformanceDiagnostic {
+    SinkReady,
+    FactoryCreate,
+    TcpConnected,
+    RfbBannerAccepted,
+    SecurityOfferReceived,
     NamedSrpNotOffered,
     EncryptionInvariant,
     SetDisplayWriteClosed,
@@ -54,6 +59,11 @@ pub(crate) enum HighPerformanceDiagnostic {
 impl HighPerformanceDiagnostic {
     pub(crate) const fn stage_code(self) -> &'static str {
         match self {
+            Self::SinkReady => "hp00_sink_ready",
+            Self::FactoryCreate => "hp00_factory_create",
+            Self::TcpConnected => "hp00_tcp_connected",
+            Self::RfbBannerAccepted => "hp00_rfb_banner_accepted",
+            Self::SecurityOfferReceived => "hp00_security_offer_received",
             Self::NamedSrpNotOffered => "hp01_named_srp_not_offered",
             Self::EncryptionInvariant => "hp02_encryption_invariant",
             Self::SetDisplayWriteClosed => "hp03_set_display_write_closed",
@@ -102,7 +112,12 @@ impl fmt::Display for HighPerformanceDiagnostic {
                 formatter,
                 " accepted_width={accepted_width} accepted_height={accepted_height} elapsed_ms={elapsed_ms}"
             ),
-            Self::NamedSrpNotOffered
+            Self::SinkReady
+            | Self::FactoryCreate
+            | Self::TcpConnected
+            | Self::RfbBannerAccepted
+            | Self::SecurityOfferReceived
+            | Self::NamedSrpNotOffered
             | Self::EncryptionInvariant
             | Self::SetDisplayWriteClosed
             | Self::ConfirmationPeerClosed
@@ -397,6 +412,30 @@ mod tests {
 
     #[test]
     fn high_performance_diagnostic_formatter_exposes_only_closed_vocabulary_fields() {
+        for (diagnostic, expected_stage) in [
+            (HighPerformanceDiagnostic::SinkReady, "hp00_sink_ready"),
+            (
+                HighPerformanceDiagnostic::FactoryCreate,
+                "hp00_factory_create",
+            ),
+            (
+                HighPerformanceDiagnostic::TcpConnected,
+                "hp00_tcp_connected",
+            ),
+            (
+                HighPerformanceDiagnostic::RfbBannerAccepted,
+                "hp00_rfb_banner_accepted",
+            ),
+            (
+                HighPerformanceDiagnostic::SecurityOfferReceived,
+                "hp00_security_offer_received",
+            ),
+        ] {
+            assert_eq!(
+                diagnostic.to_string(),
+                format!("[apple-hp-stage] stage={expected_stage}")
+            );
+        }
         assert_eq!(
             HighPerformanceDiagnostic::StartupRequestWriteClosed {
                 message: StartupRequestMessage::DisplayQuery,

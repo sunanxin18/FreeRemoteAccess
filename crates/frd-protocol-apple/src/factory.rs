@@ -29,6 +29,29 @@ const PRODUCT_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
 const HIGH_PERFORMANCE_SESSION_ENCODING_PROFILE: SessionEncodingProfile =
     SessionEncodingProfile::AppleUdpMedia;
 
+struct HighPerformanceStageObserver<'a> {
+    enabled: bool,
+    sink: &'a mut dyn FnMut(HighPerformanceDiagnostic),
+}
+
+impl<'a> HighPerformanceStageObserver<'a> {
+    fn for_protocol(
+        protocol_id: &frd_core::ProtocolId,
+        sink: &'a mut dyn FnMut(HighPerformanceDiagnostic),
+    ) -> Self {
+        Self {
+            enabled: protocol_id == &frd_core::ProtocolId::apple_high_performance(),
+            sink,
+        }
+    }
+
+    fn observe(&mut self, diagnostic: HighPerformanceDiagnostic) {
+        if self.enabled {
+            (self.sink)(diagnostic);
+        }
+    }
+}
+
 fn product_error(protocol_id: frd_core::ProtocolId, code: &'static str) -> ProtocolError {
     ProtocolError::adapter(protocol_id, code)
 }
@@ -149,7 +172,10 @@ impl AppleProtocolFactory {
 
 impl ProtocolFactory for AppleProtocolFactory {
     fn descriptor(&self) -> ProtocolDescriptor {
-        ProtocolDescriptor::from(frd_core::ProtocolId::apple_hpss_mvs())
+        let protocol_id = frd_core::ProtocolId::apple_hpss_mvs();
+        let mut sink = |diagnostic: HighPerformanceDiagnostic| diagnostic.emit();
+        let mut observer = HighPerformanceStageObserver::for_protocol(&protocol_id, &mut sink);
+        descriptor_with_observer(protocol_id, &mut observer)
     }
 
     fn create(
@@ -157,18 +183,25 @@ impl ProtocolFactory for AppleProtocolFactory {
         request: ConnectRequest,
         runtime: ProtocolRuntime,
     ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
-        create_product_session(
-            frd_core::ProtocolId::apple_hpss_mvs(),
+        let protocol_id = frd_core::ProtocolId::apple_hpss_mvs();
+        let mut sink = |diagnostic: HighPerformanceDiagnostic| diagnostic.emit();
+        let mut observer = HighPerformanceStageObserver::for_protocol(&protocol_id, &mut sink);
+        create_product_session_with_observer(
+            protocol_id,
             PRODUCT_SESSION_ENCODING_PROFILE,
             request,
             runtime,
+            &mut observer,
         )
     }
 }
 
 impl ProtocolFactory for AppleHighPerformanceProtocolFactory {
     fn descriptor(&self) -> ProtocolDescriptor {
-        ProtocolDescriptor::from(frd_core::ProtocolId::apple_high_performance())
+        let protocol_id = frd_core::ProtocolId::apple_high_performance();
+        let mut sink = |diagnostic: HighPerformanceDiagnostic| diagnostic.emit();
+        let mut observer = HighPerformanceStageObserver::for_protocol(&protocol_id, &mut sink);
+        descriptor_with_observer(protocol_id, &mut observer)
     }
 
     fn create(
@@ -176,21 +209,35 @@ impl ProtocolFactory for AppleHighPerformanceProtocolFactory {
         request: ConnectRequest,
         runtime: ProtocolRuntime,
     ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
-        create_product_session(
-            frd_core::ProtocolId::apple_high_performance(),
+        let protocol_id = frd_core::ProtocolId::apple_high_performance();
+        let mut sink = |diagnostic: HighPerformanceDiagnostic| diagnostic.emit();
+        let mut observer = HighPerformanceStageObserver::for_protocol(&protocol_id, &mut sink);
+        create_product_session_with_observer(
+            protocol_id,
             HIGH_PERFORMANCE_SESSION_ENCODING_PROFILE,
             request,
             runtime,
+            &mut observer,
         )
     }
 }
 
-fn create_product_session(
+fn descriptor_with_observer(
+    protocol_id: frd_core::ProtocolId,
+    observer: &mut HighPerformanceStageObserver<'_>,
+) -> ProtocolDescriptor {
+    observer.observe(HighPerformanceDiagnostic::SinkReady);
+    ProtocolDescriptor::from(protocol_id)
+}
+
+fn create_product_session_with_observer(
     expected_protocol_id: frd_core::ProtocolId,
     encoding_profile: SessionEncodingProfile,
     request: ConnectRequest,
     runtime: ProtocolRuntime,
+    observer: &mut HighPerformanceStageObserver<'_>,
 ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
+    observer.observe(HighPerformanceDiagnostic::FactoryCreate);
     if request.protocol_id != expected_protocol_id {
         return Err(product_error(expected_protocol_id, APPLE_PROTOCOL_MISMATCH));
     }
@@ -253,16 +300,27 @@ fn connect_authenticated_for_profile(
     request: &ConnectRequest,
     encoding_profile: SessionEncodingProfile,
 ) -> Result<EstablishedAppleSession, ProtocolError> {
+    let mut sink = |diagnostic: HighPerformanceDiagnostic| diagnostic.emit();
+    let mut observer = HighPerformanceStageObserver::for_protocol(&request.protocol_id, &mut sink);
+    connect_authenticated_for_profile_with_observer(request, encoding_profile, &mut observer)
+}
+
+fn connect_authenticated_for_profile_with_observer(
+    request: &ConnectRequest,
+    encoding_profile: SessionEncodingProfile,
+    observer: &mut HighPerformanceStageObserver<'_>,
+) -> Result<EstablishedAppleSession, ProtocolError> {
     let protocol_id = request.protocol_id.clone();
     let stream = match literal_socket_address(request.endpoint.host(), request.endpoint.port()) {
         Some(address) => TcpStream::connect(address),
         None => TcpStream::connect((request.endpoint.host(), request.endpoint.port())),
     }
     .map_err(|_| product_error(protocol_id.clone(), APPLE_CONNECTION_FAILED))?;
+    observer.observe(HighPerformanceDiagnostic::TcpConnected);
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut connection = AppleConnection::new(stream);
-    let (version, offered) = negotiate(&mut connection)
+    let (version, offered) = negotiate(&mut connection, observer)
         .map_err(|_| product_error(protocol_id.clone(), APPLE_NEGOTIATION_FAILED))?;
     let credentials = request
         .credentials
@@ -320,9 +378,37 @@ mod product_profile_tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
-    use frd_protocol_api::ProtocolFactory;
+    use frd_frame::SurfaceUpdate;
+    use frd_protocol_api::{
+        ProtocolError, ProtocolFactory, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
+        SessionEvent, SurfacePublisher,
+    };
 
     use crate::session::SessionEncodingProfile;
+
+    struct AcceptEvents;
+
+    impl RuntimeEventSink for AcceptEvents {
+        fn publish(&self, _: SessionEvent) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct AcceptFrames;
+
+    impl SurfacePublisher for AcceptFrames {
+        fn publish(&self, _: SurfaceUpdate) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    struct AcceptWake;
+
+    impl RuntimeWake for AcceptWake {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
 
     fn credentials() -> frd_protocol_api::Credentials {
         let mut password = frd_core::SecretBuffer::new(b"test-password".to_vec());
@@ -330,6 +416,191 @@ mod product_profile_tests {
             username: "test-user".to_owned(),
             password: password.take(),
         }
+    }
+
+    fn request(
+        address: std::net::SocketAddr,
+        protocol_id: frd_core::ProtocolId,
+    ) -> frd_protocol_api::ConnectRequest {
+        frd_protocol_api::ConnectRequest {
+            session_id: frd_core::SessionId::allocate(),
+            endpoint: frd_core::Endpoint::new(address.ip().to_string(), address.port()).unwrap(),
+            protocol_id,
+            credentials: Some(credentials()),
+            saved_server_pin: None,
+        }
+    }
+
+    fn runtime(session_id: frd_core::SessionId) -> ProtocolRuntime {
+        ProtocolRuntime::with_ports(
+            session_id,
+            Box::new(AcceptEvents),
+            Box::new(AcceptFrames),
+            Box::new(AcceptWake),
+        )
+    }
+
+    fn run_preoffer_route(
+        profile: SessionEncodingProfile,
+        protocol_id: frd_core::ProtocolId,
+        server: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (
+        Vec<crate::high_performance::HighPerformanceDiagnostic>,
+        ProtocolError,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server(stream);
+        });
+        let request = request(address, protocol_id.clone());
+        let mut stages = Vec::new();
+        let mut sink = |stage| stages.push(stage);
+        let mut observer =
+            super::HighPerformanceStageObserver::for_protocol(&protocol_id, &mut sink);
+
+        let error = match super::connect_authenticated_for_profile_with_observer(
+            &request,
+            profile,
+            &mut observer,
+        ) {
+            Ok(_) => panic!("pre-offer fixture must terminate before authentication"),
+            Err(error) => error,
+        };
+        drop(observer);
+        server.join().unwrap();
+        (stages, error)
+    }
+
+    #[test]
+    fn explicit_high_performance_factory_routes_sink_and_create_markers_only_for_hp() {
+        let hp_id = frd_core::ProtocolId::apple_high_performance();
+        let standard_id = frd_core::ProtocolId::apple_hpss_mvs();
+
+        let mut hp_stages = Vec::new();
+        let mut hp_sink = |stage| hp_stages.push(stage);
+        let mut hp_observer =
+            super::HighPerformanceStageObserver::for_protocol(&hp_id, &mut hp_sink);
+        let descriptor = super::descriptor_with_observer(hp_id.clone(), &mut hp_observer);
+        let hp_request = request("127.0.0.1:9".parse().unwrap(), hp_id.clone());
+        let session_id = hp_request.session_id;
+        let _session = super::create_product_session_with_observer(
+            hp_id.clone(),
+            SessionEncodingProfile::AppleUdpMedia,
+            hp_request,
+            runtime(session_id),
+            &mut hp_observer,
+        )
+        .unwrap();
+        drop(hp_observer);
+        assert_eq!(descriptor.id, hp_id);
+        assert_eq!(
+            hp_stages,
+            [
+                crate::high_performance::HighPerformanceDiagnostic::SinkReady,
+                crate::high_performance::HighPerformanceDiagnostic::FactoryCreate,
+            ]
+        );
+
+        let mut standard_stages = Vec::new();
+        let mut standard_sink = |stage| standard_stages.push(stage);
+        let mut standard_observer =
+            super::HighPerformanceStageObserver::for_protocol(&standard_id, &mut standard_sink);
+        let descriptor =
+            super::descriptor_with_observer(standard_id.clone(), &mut standard_observer);
+        let standard_request = request("127.0.0.1:9".parse().unwrap(), standard_id.clone());
+        let session_id = standard_request.session_id;
+        let _session = super::create_product_session_with_observer(
+            standard_id.clone(),
+            SessionEncodingProfile::AppleTcpMvs,
+            standard_request,
+            runtime(session_id),
+            &mut standard_observer,
+        )
+        .unwrap();
+        drop(standard_observer);
+        assert_eq!(descriptor.id, standard_id);
+        assert!(standard_stages.is_empty());
+    }
+
+    #[test]
+    fn explicit_high_performance_preoffer_markers_stop_at_their_exact_boundaries() {
+        let (invalid_banner_stages, error) = run_preoffer_route(
+            SessionEncodingProfile::AppleUdpMedia,
+            frd_core::ProtocolId::apple_high_performance(),
+            |mut stream| stream.write_all(&[0_u8; 12]).unwrap(),
+        );
+        assert_eq!(error.code(), "apple_negotiation_failed");
+        assert_eq!(
+            invalid_banner_stages,
+            [crate::high_performance::HighPerformanceDiagnostic::TcpConnected]
+        );
+
+        let (missing_offer_stages, error) = run_preoffer_route(
+            SessionEncodingProfile::AppleUdpMedia,
+            frd_core::ProtocolId::apple_high_performance(),
+            |mut stream| {
+                stream.write_all(b"RFB 003.008\n").unwrap();
+                let mut echoed_banner = [0_u8; 12];
+                stream.read_exact(&mut echoed_banner).unwrap();
+            },
+        );
+        assert_eq!(error.code(), "apple_negotiation_failed");
+        assert_eq!(
+            missing_offer_stages,
+            [
+                crate::high_performance::HighPerformanceDiagnostic::TcpConnected,
+                crate::high_performance::HighPerformanceDiagnostic::RfbBannerAccepted,
+            ]
+        );
+
+        let (complete_offer_stages, error) = run_preoffer_route(
+            SessionEncodingProfile::AppleUdpMedia,
+            frd_core::ProtocolId::apple_high_performance(),
+            |mut stream| {
+                stream.write_all(b"RFB 003.008\n").unwrap();
+                let mut echoed_banner = [0_u8; 12];
+                stream.read_exact(&mut echoed_banner).unwrap();
+                stream
+                    .write_all(&[1, crate::protocol::security::APPLE_ARD])
+                    .unwrap();
+            },
+        );
+        assert_eq!(
+            error.code(),
+            crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+        );
+        assert_eq!(
+            complete_offer_stages,
+            [
+                crate::high_performance::HighPerformanceDiagnostic::TcpConnected,
+                crate::high_performance::HighPerformanceDiagnostic::RfbBannerAccepted,
+                crate::high_performance::HighPerformanceDiagnostic::SecurityOfferReceived,
+            ]
+        );
+    }
+
+    #[test]
+    fn standard_mvs_handshake_does_not_route_high_performance_preoffer_markers() {
+        let (stages, error) = run_preoffer_route(
+            SessionEncodingProfile::AppleTcpMvs,
+            frd_core::ProtocolId::apple_hpss_mvs(),
+            |mut stream| {
+                stream.write_all(b"RFB 003.008\n").unwrap();
+                let mut echoed_banner = [0_u8; 12];
+                stream.read_exact(&mut echoed_banner).unwrap();
+                stream
+                    .write_all(&[1, crate::protocol::security::APPLE_ARD])
+                    .unwrap();
+            },
+        );
+
+        assert_eq!(
+            error.code(),
+            crate::high_performance::APPLE_HIGH_PERFORMANCE_UNAVAILABLE
+        );
+        assert!(stages.is_empty());
     }
 
     #[test]
@@ -476,9 +747,13 @@ mod product_profile_tests {
     }
 }
 
-fn negotiate(connection: &mut AppleConnection) -> Result<((u8, u8), Vec<u8>)> {
+fn negotiate(
+    connection: &mut AppleConnection,
+    observer: &mut HighPerformanceStageObserver<'_>,
+) -> Result<((u8, u8), Vec<u8>)> {
     let raw_banner = connection.read_vec(frd_wire_rfb::RFB_BANNER_BYTES)?;
     let banner = decode_banner(&raw_banner)?;
+    observer.observe(HighPerformanceDiagnostic::RfbBannerAccepted);
     let parsed = (
         banner.major.min(u16::from(u8::MAX)) as u8,
         banner.minor.min(u16::from(u8::MAX)) as u8,
@@ -526,6 +801,7 @@ fn negotiate(connection: &mut AppleConnection) -> Result<((u8, u8), Vec<u8>)> {
             decode_security_types(8, &bytes)?
         }
     };
+    observer.observe(HighPerformanceDiagnostic::SecurityOfferReceived);
     Ok((version, security_types))
 }
 
