@@ -1265,6 +1265,35 @@ struct RemoteBinding {
     size: PixelSize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VideoBinding {
+    identity: VideoStreamIdentity,
+    generation: u64,
+    size: PixelSize,
+}
+
+impl VideoBinding {
+    fn remote_binding(self) -> RemoteBinding {
+        RemoteBinding {
+            session_id: self.identity.session_id,
+            generation: self.generation,
+            size: self.size,
+        }
+    }
+}
+
+fn detach_video_for_matching_failure(
+    active: &mut Option<VideoBinding>,
+    identity: VideoStreamIdentity,
+    generation: u64,
+) -> bool {
+    if active.is_some_and(|video| video.identity == identity && video.generation == generation) {
+        *active = None;
+        return true;
+    }
+    false
+}
+
 enum WindowPresentation {
     Pixel(Option<frd_protocol_api::PresentationEvent>),
     Video(Option<VideoPresentationReceipt>),
@@ -1464,7 +1493,7 @@ struct DesktopWindowState {
     cursor_position: Option<(u32, u32)>,
     lifecycle: PresentationLifecycle,
     remote: Option<RemoteBinding>,
-    video: Option<RemoteBinding>,
+    video: Option<VideoBinding>,
     pending_video: Option<(VideoPresentationReceipt, VideoFrameToken)>,
     dpi_transition: DpiTransition,
     pending_texture_writes: PendingTextureWrites,
@@ -2194,8 +2223,8 @@ impl DesktopApplication {
                     };
                     match window.video_renderer.upload_frame(frame) {
                         Ok(upload) => {
-                            window.video = Some(RemoteBinding {
-                                session_id,
+                            window.video = Some(VideoBinding {
+                                identity: token.identity(),
                                 generation: token.generation(),
                                 size: upload.layout.visible_size(),
                             });
@@ -2220,13 +2249,13 @@ impl DesktopApplication {
                     ..
                 } => {
                     if let Some(window) = self.window.as_mut() {
-                        let matches_current = window.video.is_some_and(|video| {
-                            video.session_id == identity.session_id
-                                && video.generation == generation
-                        });
+                        let matches_current = detach_video_for_matching_failure(
+                            &mut window.video,
+                            identity,
+                            generation,
+                        );
                         if matches_current {
                             window.video_renderer.detach();
-                            window.video = None;
                             window.pending_video = None;
                         }
                     }
@@ -2397,7 +2426,10 @@ impl DesktopApplication {
 
     fn content_viewport(&self) -> Option<ContentViewport> {
         let window = self.window.as_ref()?;
-        let remote = window.video.or(window.remote)?;
+        let remote = window
+            .video
+            .map(VideoBinding::remote_binding)
+            .or(window.remote)?;
         ContentViewport::fit_in(remote.size, window.physical_size, window.remote_area?)
     }
 
@@ -2405,11 +2437,12 @@ impl DesktopApplication {
         let Some((session_id, generation)) = self.input.interactive_epoch() else {
             return;
         };
-        let Some(remote) = self
-            .window
-            .as_ref()
-            .and_then(|window| window.video.or(window.remote))
-        else {
+        let Some(remote) = self.window.as_ref().and_then(|window| {
+            window
+                .video
+                .map(VideoBinding::remote_binding)
+                .or(window.remote)
+        }) else {
             return;
         };
         if remote.session_id != session_id || remote.generation != generation {
@@ -3963,8 +3996,8 @@ mod tests {
         AppAction, AppController, AppIntent, AppPlatformStores, PresentationEvent, ProductPolicy,
     };
     use frd_core::{
-        Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelRect, ProtocolId,
-        SecretBuffer, SessionId, TargetSystem,
+        Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelRect, PixelSize,
+        ProtocolId, SecretBuffer, SessionId, TargetSystem,
     };
     use frd_frame::{
         EnqueuedSurfaceUpdate, FrameCompleteness, FrameReset, FrameRevision, FrameTransaction,
@@ -3992,13 +4025,14 @@ mod tests {
     use winit::event::Ime;
 
     use super::{
-        accept_batch_outcome, apply_compiled_drain, dispatch_runtime_drain,
-        initialize_metrics_before_session_launch, mark_texture_deltas_applied,
-        take_exact_presented_value, terminate_failed_frame_batch, AcceptedLaunchOutcome,
-        ApplicationExitState, AudioOutputFactory, FrameBatchFailureTarget, FrameDrainFailure,
-        PendingLiveSessionPorts, RemoteBinding, RuntimeDrainCallback, RuntimeDrainCallbackTarget,
-        RuntimeDrainOutcome, RuntimeWakeGate, SessionHost, TestLaunchOutcome,
-        UnavailableCredentialStore, UnavailableProfileStore, WakeSink, WorkerKind, WorkerSpawner,
+        accept_batch_outcome, apply_compiled_drain, detach_video_for_matching_failure,
+        dispatch_runtime_drain, initialize_metrics_before_session_launch,
+        mark_texture_deltas_applied, take_exact_presented_value, terminate_failed_frame_batch,
+        AcceptedLaunchOutcome, ApplicationExitState, AudioOutputFactory, FrameBatchFailureTarget,
+        FrameDrainFailure, PendingLiveSessionPorts, RemoteBinding, RuntimeDrainCallback,
+        RuntimeDrainCallbackTarget, RuntimeDrainOutcome, RuntimeWakeGate, SessionHost,
+        TestLaunchOutcome, UnavailableCredentialStore, UnavailableProfileStore, VideoBinding,
+        WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
 
@@ -4013,6 +4047,44 @@ mod tests {
             Some("exact worker token")
         );
         assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn video_stale_sibling_decode_failure_cannot_detach_active_stream() {
+        let session_id = SessionId::allocate();
+        let active_identity = VideoStreamIdentity {
+            session_id,
+            stream_id: 7,
+        };
+        let sibling_identity = VideoStreamIdentity {
+            session_id,
+            stream_id: 8,
+        };
+        let binding = VideoBinding {
+            identity: active_identity,
+            generation: 11,
+            size: PixelSize::new(1920, 1080).unwrap(),
+        };
+        let mut active = Some(binding);
+
+        assert!(!detach_video_for_matching_failure(
+            &mut active,
+            active_identity,
+            10
+        ));
+        assert_eq!(active, Some(binding));
+        assert!(!detach_video_for_matching_failure(
+            &mut active,
+            sibling_identity,
+            11
+        ));
+        assert_eq!(active, Some(binding));
+        assert!(detach_video_for_matching_failure(
+            &mut active,
+            active_identity,
+            11
+        ));
+        assert_eq!(active, None);
     }
 
     fn assert_metric_startup_fatal_before_launch(error: MetricSinkError) {

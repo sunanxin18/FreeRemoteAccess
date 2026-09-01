@@ -236,12 +236,7 @@ impl VideoPass {
         bind_group_layout: &wgpu::BindGroupLayout,
         target_format: wgpu::TextureFormat,
     ) -> Result<Self, VideoRendererError> {
-        if !target_format.is_srgb()
-            && !matches!(
-                target_format,
-                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
-            )
-        {
+        if !target_format.is_srgb() {
             return Err(VideoRendererError::UnsupportedTargetFormat);
         }
         let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/video_yuv444.wgsl"));
@@ -987,10 +982,9 @@ mod tests {
                     println!("SKIP adapter_unavailable: no headless adapter supports the required render path");
                     return;
                 }
-                Err(crate::GpuContextError::DeviceUnavailable) => {
-                    println!("SKIP device_unavailable: headless adapter cannot create the required device");
-                    return;
-                }
+                Err(crate::GpuContextError::DeviceUnavailable) => panic!(
+                    "device_unavailable: headless adapter was found but device creation failed"
+                ),
             };
             let stream = identity(7);
             let epoch = VideoStreamEpoch {
@@ -1054,7 +1048,7 @@ mod tests {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
@@ -1076,7 +1070,7 @@ mod tests {
                     &mut encoder,
                     &view,
                     PixelSize::new(2, 2).unwrap(),
-                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
                 )
                 .unwrap();
             assert_eq!(receipt, Some(upload.receipt));
