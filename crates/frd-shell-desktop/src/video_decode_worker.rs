@@ -14,6 +14,7 @@ use frd_media_api::{
 
 pub const VIDEO_ACCESS_UNIT_ENTRY_LIMIT: usize = 64;
 pub const VIDEO_ACCESS_UNIT_BYTE_LIMIT: usize = 32 * 1024 * 1024;
+const VIDEO_STREAM_IDENTITY_LIMIT: usize = 4;
 const VIDEO_EVENT_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,21 +293,31 @@ struct StreamPresentationState {
     epoch: StreamEpoch,
     latest_token: Option<VideoFrameToken>,
     latest_frame: Option<DecodedVideoFrame>,
+    latest_sequence: Option<u64>,
     delivered_token: Option<VideoFrameToken>,
     ready: bool,
+    terminal: bool,
+}
+
+struct ControlPublication {
+    sequence: u64,
+    epoch: Option<StreamEpoch>,
+    event: VideoWorkerEvent,
 }
 
 struct VideoEventState {
-    controls: VecDeque<VideoWorkerEvent>,
+    controls: VecDeque<ControlPublication>,
     streams: HashMap<VideoStreamIdentity, StreamPresentationState>,
     next_epoch: u64,
-    next_publication: u64,
+    next_sequence: u64,
 }
 
 #[derive(Clone)]
 pub struct VideoWorkerEvents {
     shared: Arc<(Mutex<VideoEventState>, Condvar)>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    before_control_enqueue: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 impl VideoWorkerEvents {
@@ -317,11 +328,33 @@ impl VideoWorkerEvents {
                     controls: VecDeque::new(),
                     streams: HashMap::new(),
                     next_epoch: 1,
-                    next_publication: 1,
+                    next_sequence: 1,
                 }),
                 Condvar::new(),
             )),
             wake,
+            #[cfg(test)]
+            before_control_enqueue: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_control_enqueue(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .before_control_enqueue
+            .lock()
+            .expect("control publication hook mutex poisoned") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn invoke_before_control_enqueue(&self) {
+        let hook = self
+            .before_control_enqueue
+            .lock()
+            .expect("control publication hook mutex poisoned")
+            .clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -338,14 +371,19 @@ impl VideoWorkerEvents {
             generation,
             serial,
         };
+        state
+            .controls
+            .retain(|control| control.epoch.is_none_or(|old| old.identity != identity));
         state.streams.insert(
             identity,
             StreamPresentationState {
                 epoch,
                 latest_token: None,
                 latest_frame: None,
+                latest_sequence: None,
                 delivered_token: None,
                 ready: false,
+                terminal: false,
             },
         );
         wake.notify_all();
@@ -368,14 +406,15 @@ impl VideoWorkerEvents {
     }
 
     fn publish_selected(&self, epoch: StreamEpoch, diagnostics: VideoDecoderDiagnostics) {
-        if !self.is_current(epoch) {
-            return;
-        }
-        self.publish_control(VideoWorkerEvent::BackendSelected {
-            identity: epoch.identity,
-            generation: epoch.generation,
-            diagnostics,
-        });
+        self.publish_epoch_control(
+            epoch,
+            VideoWorkerEvent::BackendSelected {
+                identity: epoch.identity,
+                generation: epoch.generation,
+                diagnostics,
+            },
+            false,
+        );
     }
 
     fn publish_failure(
@@ -384,24 +423,52 @@ impl VideoWorkerEvents {
         code: VideoDecodeErrorCode,
         after_first_frame: bool,
     ) {
-        if !self.is_current(epoch) {
-            return;
-        }
-        self.publish_control(VideoWorkerEvent::DecodeFailed {
-            identity: epoch.identity,
-            generation: epoch.generation,
-            code,
-            after_first_frame,
-        });
+        self.publish_epoch_control(
+            epoch,
+            VideoWorkerEvent::DecodeFailed {
+                identity: epoch.identity,
+                generation: epoch.generation,
+                code,
+                after_first_frame,
+            },
+            true,
+        );
     }
 
-    fn publish_control(&self, event: VideoWorkerEvent) {
+    fn publish_epoch_control(&self, epoch: StreamEpoch, event: VideoWorkerEvent, terminal: bool) {
+        #[cfg(test)]
+        self.invoke_before_control_enqueue();
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().expect("video event mutex poisoned");
+        if state
+            .streams
+            .get(&epoch.identity)
+            .map(|stream| stream.epoch)
+            != Some(epoch)
+        {
+            return;
+        }
+        let sequence = take_next_sequence(&mut state);
+        if terminal {
+            let stream = state
+                .streams
+                .get_mut(&epoch.identity)
+                .expect("current stream remains present");
+            stream.terminal = true;
+            if stream.ready {
+                stream.latest_token = None;
+                stream.delivered_token = None;
+                stream.ready = false;
+            }
+        }
         while state.controls.len() >= VIDEO_EVENT_LIMIT {
             state.controls.pop_front();
         }
-        state.controls.push_back(event);
+        state.controls.push_back(ControlPublication {
+            sequence,
+            epoch: Some(epoch),
+            event,
+        });
         wake.notify_all();
         drop(state);
         self.notify_wake();
@@ -422,11 +489,7 @@ impl VideoWorkerEvents {
         {
             return;
         }
-        let publication_id = state.next_publication;
-        state.next_publication = state
-            .next_publication
-            .checked_add(1)
-            .expect("video publication id exhausted");
+        let publication_id = take_next_sequence(&mut state);
         let token = VideoFrameToken {
             identity: epoch.identity,
             generation: epoch.generation,
@@ -439,6 +502,7 @@ impl VideoWorkerEvents {
             .expect("current stream remains present");
         stream.latest_token = Some(token);
         stream.latest_frame = Some(frame);
+        stream.latest_sequence = Some(publication_id);
         stream.delivered_token = None;
         wake.notify_all();
         drop(state);
@@ -513,7 +577,13 @@ impl VideoWorkerEvents {
         {
             return Err(VideoDecodeErrorCode::StaleStreamOrGeneration);
         }
-        stream.ready = true;
+        if stream.terminal {
+            stream.latest_token = None;
+            stream.delivered_token = None;
+            stream.ready = false;
+        } else {
+            stream.ready = true;
+        }
         Ok(())
     }
 
@@ -528,7 +598,40 @@ impl VideoWorkerEvents {
     }
 
     fn publish_stopped(&self) {
-        self.publish_control(VideoWorkerEvent::Stopped);
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().expect("video event mutex poisoned");
+        let sequence = take_next_sequence(&mut state);
+        while state.controls.len() >= VIDEO_EVENT_LIMIT {
+            state.controls.pop_front();
+        }
+        state.controls.push_back(ControlPublication {
+            sequence,
+            epoch: None,
+            event: VideoWorkerEvent::Stopped,
+        });
+        wake.notify_all();
+        drop(state);
+        self.notify_wake();
+    }
+
+    fn remove_terminal_if_drained(&self, identity: VideoStreamIdentity) -> bool {
+        let mut state = self.shared.0.lock().expect("video event mutex poisoned");
+        let drained = state.streams.get(&identity).is_some_and(|stream| {
+            stream.terminal
+                && stream.latest_frame.is_none()
+                && stream.latest_token.is_none()
+                && stream.delivered_token.is_none()
+                && !stream.ready
+                && !state.controls.iter().any(|control| {
+                    control
+                        .epoch
+                        .is_some_and(|epoch| epoch.identity == identity)
+                })
+        });
+        if drained {
+            state.streams.remove(&identity);
+        }
+        drained
     }
 
     fn notify_wake(&self) {
@@ -536,6 +639,15 @@ impl VideoWorkerEvents {
             wake();
         }
     }
+}
+
+fn take_next_sequence(state: &mut VideoEventState) -> u64 {
+    let sequence = state.next_sequence;
+    state.next_sequence = state
+        .next_sequence
+        .checked_add(1)
+        .expect("video publication sequence exhausted");
+    sequence
 }
 
 fn event_available(state: &VideoEventState) -> bool {
@@ -547,31 +659,28 @@ fn event_available(state: &VideoEventState) -> bool {
 }
 
 fn pop_event(state: &mut VideoEventState) -> Option<VideoWorkerEvent> {
-    if !matches!(state.controls.front(), Some(VideoWorkerEvent::Stopped)) {
-        if let Some(event) = state.controls.pop_front() {
-            return Some(event);
-        }
-    }
-    let identity = state
+    let frame = state
         .streams
         .iter()
         .filter_map(|(identity, stream)| {
             stream
                 .latest_frame
                 .as_ref()
-                .zip(stream.latest_token)
-                .map(|(_, token)| (*identity, token.publication_id))
+                .zip(stream.latest_sequence)
+                .map(|(_, sequence)| (*identity, sequence))
         })
-        .min_by_key(|(_, publication_id)| *publication_id)
-        .map(|(identity, _)| identity);
-    if let Some(identity) = identity {
-        return take_frame_from_state(state, identity).map(VideoWorkerEvent::FrameDecoded);
+        .min_by_key(|(_, sequence)| *sequence);
+    let control_sequence = state.controls.front().map(|control| control.sequence);
+    if let Some((identity, frame_sequence)) = frame {
+        if control_sequence.is_none_or(|control_sequence| frame_sequence < control_sequence) {
+            return take_frame_from_state(state, identity).map(VideoWorkerEvent::FrameDecoded);
+        }
     }
-    let event = state.controls.pop_front()?;
-    if event == VideoWorkerEvent::Stopped {
+    let control = state.controls.pop_front()?;
+    if control.event == VideoWorkerEvent::Stopped {
         state.streams.clear();
     }
-    Some(event)
+    Some(control.event)
 }
 
 fn take_frame_from_state(
@@ -581,6 +690,7 @@ fn take_frame_from_state(
     let stream = state.streams.get_mut(&identity)?;
     let token = stream.latest_token?;
     let frame = stream.latest_frame.take()?;
+    stream.latest_sequence = None;
     stream.delivered_token = Some(token);
     Some(DecodedVideoFrameHandoff { token, frame })
 }
@@ -588,11 +698,18 @@ fn take_frame_from_state(
 struct StreamRoute {
     input: VideoInputQueue,
     started: bool,
+    terminal: bool,
+    joined: bool,
+    restart_pending: bool,
 }
 
 struct VideoRouterState {
     streams: HashMap<VideoStreamIdentity, StreamRoute>,
     closed: bool,
+    #[cfg(test)]
+    spawn_count: usize,
+    #[cfg(test)]
+    supervisor_revision: u64,
 }
 
 #[derive(Clone)]
@@ -608,6 +725,10 @@ impl VideoRouter {
                 Mutex::new(VideoRouterState {
                     streams: HashMap::new(),
                     closed: false,
+                    #[cfg(test)]
+                    spawn_count: 0,
+                    #[cfg(test)]
+                    supervisor_revision: 0,
                 }),
                 Condvar::new(),
             )),
@@ -624,16 +745,25 @@ impl VideoRouter {
         if state.closed {
             return Err(VideoWorkerSendError::Closed);
         }
+        cleanup_drained_streams(&mut state, &self.events);
+        if !state.streams.contains_key(&identity)
+            && state.streams.len() >= VIDEO_STREAM_IDENTITY_LIMIT
+        {
+            return Err(VideoWorkerSendError::Full);
+        }
         let replace = state
             .streams
             .get(&identity)
-            .is_none_or(|route| route.input.is_closed());
+            .is_none_or(|route| route.terminal || route.input.is_closed());
         if replace {
             state.streams.insert(
                 identity,
                 StreamRoute {
                     input: VideoInputQueue::new(),
                     started: false,
+                    terminal: false,
+                    joined: false,
+                    restart_pending: false,
                 },
             );
         }
@@ -692,8 +822,12 @@ impl VideoRouter {
             .get_mut(&identity)
             .filter(|route| Arc::ptr_eq(&route.input.shared, &input.shared))
         {
-            route.started = false;
-            if !input.has_pending_config() {
+            if input.has_pending_config() {
+                route.restart_pending = true;
+                route.terminal = false;
+            } else {
+                route.restart_pending = false;
+                route.terminal = true;
                 input.close();
             }
         }
@@ -709,9 +843,61 @@ impl VideoRouter {
             .filter(|route| Arc::ptr_eq(&route.input.shared, &input.shared))
         {
             route.started = false;
+            route.terminal = true;
+            route.joined = true;
+            route.restart_pending = false;
             input.close();
         }
+        cleanup_drained_streams(&mut state, &self.events);
         wake.notify_all();
+    }
+
+    fn reap_stream(&self, identity: VideoStreamIdentity, input: &VideoInputQueue) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().expect("video router mutex poisoned");
+        if let Some(route) = state
+            .streams
+            .get_mut(&identity)
+            .filter(|route| Arc::ptr_eq(&route.input.shared, &input.shared))
+        {
+            route.started = false;
+            route.joined = true;
+            if route.restart_pending {
+                route.restart_pending = false;
+                route.terminal = false;
+            }
+        }
+        cleanup_drained_streams(&mut state, &self.events);
+        wake.notify_all();
+    }
+
+    #[cfg(test)]
+    fn record_spawn(&self) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().expect("video router mutex poisoned");
+        state.spawn_count += 1;
+        wake.notify_all();
+    }
+
+    #[cfg(test)]
+    fn record_supervisor_revision(&self) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().expect("video router mutex poisoned");
+        state.supervisor_revision += 1;
+        wake.notify_all();
+    }
+}
+
+fn cleanup_drained_streams(state: &mut VideoRouterState, events: &VideoWorkerEvents) {
+    let candidates = state
+        .streams
+        .iter()
+        .filter_map(|(identity, route)| (route.terminal && route.joined).then_some(*identity))
+        .collect::<Vec<_>>();
+    for identity in candidates {
+        if events.remove_terminal_if_drained(identity) {
+            state.streams.remove(&identity);
+        }
     }
 }
 
@@ -850,27 +1036,41 @@ impl Drop for VideoDecodeWorker {
 }
 
 fn run_supervisor(router: VideoRouter, events: VideoWorkerEvents, loader: StreamRegistryLoader) {
-    let mut workers: HashMap<VideoStreamIdentity, JoinHandle<()>> = HashMap::new();
+    struct RunningWorker {
+        input: VideoInputQueue,
+        thread: JoinHandle<()>,
+    }
+
+    let mut workers: HashMap<VideoStreamIdentity, RunningWorker> = HashMap::new();
     loop {
+        #[cfg(test)]
+        router.record_supervisor_revision();
         let finished = workers
             .iter()
-            .filter_map(|(identity, worker)| worker.is_finished().then_some(*identity))
+            .filter_map(|(identity, worker)| worker.thread.is_finished().then_some(*identity))
             .collect::<Vec<_>>();
         for identity in finished {
             if let Some(worker) = workers.remove(&identity) {
-                let _ = worker.join();
+                let _ = worker.thread.join();
+                router.reap_stream(identity, &worker.input);
             }
         }
 
         let (closed, starts) = {
             let (lock, wake) = &*router.shared;
             let mut state = lock.lock().expect("video router mutex poisoned");
+            cleanup_drained_streams(&mut state, &events);
             let starts = state
                 .streams
                 .iter_mut()
                 .filter_map(|(identity, route)| {
-                    (!route.started && !workers.contains_key(identity)).then(|| {
+                    (!route.started
+                        && !route.terminal
+                        && !route.input.is_closed()
+                        && !workers.contains_key(identity))
+                    .then(|| {
                         route.started = true;
+                        route.joined = false;
                         (*identity, route.input.clone())
                     })
                 })
@@ -885,6 +1085,8 @@ fn run_supervisor(router: VideoRouter, events: VideoWorkerEvents, loader: Stream
         };
 
         for (identity, input) in starts {
+            #[cfg(test)]
+            router.record_spawn();
             let worker_events = events.clone();
             let worker_loader = loader.clone();
             let worker_router = router.clone();
@@ -907,7 +1109,13 @@ fn run_supervisor(router: VideoRouter, events: VideoWorkerEvents, loader: Stream
                     worker_router.finish_stream(identity, &worker_input);
                 }) {
                 Ok(worker) => {
-                    workers.insert(identity, worker);
+                    workers.insert(
+                        identity,
+                        RunningWorker {
+                            input,
+                            thread: worker,
+                        },
+                    );
                 }
                 Err(_) => {
                     if let Some(epoch) = input.latest_epoch() {
@@ -924,7 +1132,7 @@ fn run_supervisor(router: VideoRouter, events: VideoWorkerEvents, loader: Stream
 
         if closed {
             for worker in workers.into_values() {
-                let _ = worker.join();
+                let _ = worker.thread.join();
             }
             return;
         }
@@ -1547,6 +1755,251 @@ mod tests {
         assert!(events.is_ready(stream_b, 7));
     }
 
+    #[test]
+    fn stale_control_publication_is_rechecked_atomically_after_config_ingress() {
+        let identity = test_identity();
+        let events = super::VideoWorkerEvents::new(None);
+        let old_epoch = events.accept_config(identity, 7);
+        let selection = registry(DecoderScript::Echo, Arc::new(AtomicUsize::new(0)))
+            .select(&super::query_for_config(&test_config_for(identity, 7)))
+            .unwrap();
+        let diagnostics = super::VideoDecoderDiagnostics(selection);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        events.set_before_control_enqueue(Arc::new({
+            let release_rx = release_rx.clone();
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let publisher = {
+            let events = events.clone();
+            std::thread::spawn(move || events.publish_selected(old_epoch, diagnostics))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("旧 control publication 应到达 enqueue barrier");
+        events.accept_config(identity, 8);
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+
+        assert!(events.try_recv().is_none(), "旧 epoch control 不得迟到入队");
+    }
+
+    #[test]
+    fn stale_failure_publication_is_rechecked_atomically_after_config_ingress() {
+        let identity = test_identity();
+        let events = super::VideoWorkerEvents::new(None);
+        let old_epoch = events.accept_config(identity, 7);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        events.set_before_control_enqueue(Arc::new({
+            let release_rx = release_rx.clone();
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let publisher = {
+            let events = events.clone();
+            std::thread::spawn(move || {
+                events.publish_failure(
+                    old_epoch,
+                    VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
+                    false,
+                )
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("旧 failure publication 应到达 enqueue barrier");
+        events.accept_config(identity, 8);
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap();
+
+        assert!(events.try_recv().is_none(), "旧 epoch failure 不得迟到入队");
+    }
+
+    #[test]
+    fn fatal_stream_stays_terminal_until_one_new_config_restarts_it_once() {
+        let identity = test_identity();
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let worker = VideoDecodeWorker::spawn_with_stream_registry_loader(Arc::new({
+            let loader_calls = loader_calls.clone();
+            move |_identity| {
+                let call = loader_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(registry(
+                    if call == 0 {
+                        DecoderScript::FailBefore
+                    } else {
+                        DecoderScript::Echo
+                    },
+                    Arc::new(AtomicUsize::new(0)),
+                ))
+            }
+        }))
+        .unwrap();
+        worker
+            .sender()
+            .try_send_config(test_config_for(identity, 7))
+            .unwrap();
+        recv_backend_selected_for(&worker, identity, 7);
+        worker
+            .sender()
+            .try_send_access_unit(test_au_for(identity, 7, 1, true, 1))
+            .unwrap();
+        recv_decode_failed_for(&worker, identity, 7);
+
+        wait_for_supervisor_revisions(&worker, 3);
+        assert_eq!(worker_spawn_count(&worker), 1);
+        assert_eq!(loader_calls.load(Ordering::Acquire), 1);
+
+        worker
+            .sender()
+            .try_send_config(test_config_for(identity, 8))
+            .unwrap();
+        recv_backend_selected_for(&worker, identity, 8);
+        wait_for_supervisor_revisions(&worker, 1);
+        assert_eq!(worker_spawn_count(&worker), 2);
+        assert_eq!(loader_calls.load(Ordering::Acquire), 2);
+        stop(worker);
+    }
+
+    #[test]
+    fn fifth_retained_encoded_stream_identity_is_rejected_without_worker_allocation() {
+        let session_id = SessionId::allocate();
+        let worker = VideoDecodeWorker::spawn_with_stream_registry_loader(Arc::new(|_identity| {
+            Err(VideoDecodeError::new(
+                VideoDecodeErrorCode::BackendUnavailable,
+            ))
+        }))
+        .unwrap();
+        for stream_id in 1..=4 {
+            worker
+                .sender()
+                .try_send_config(test_config_for(identity_for(session_id, stream_id), 7))
+                .unwrap();
+        }
+
+        assert_eq!(
+            worker
+                .sender()
+                .try_send_config(test_config_for(identity_for(session_id, 5), 7,)),
+            Err(super::VideoWorkerSendError::Full)
+        );
+        wait_for_spawn_count(&worker, 4);
+        assert_eq!(worker_spawn_count(&worker), 4);
+        stop(worker);
+    }
+
+    #[test]
+    fn drained_terminal_identities_release_capacity_and_churn_stays_bounded() {
+        let session_id = SessionId::allocate();
+        let worker = VideoDecodeWorker::spawn_with_stream_registry_loader(Arc::new(|_identity| {
+            Err(VideoDecodeError::new(
+                VideoDecodeErrorCode::BackendUnavailable,
+            ))
+        }))
+        .unwrap();
+
+        for stream_id in 1..=12 {
+            let identity = identity_for(session_id, stream_id);
+            worker
+                .sender()
+                .try_send_config(test_config_for(identity, 7))
+                .expect("已 drain 的 terminal identity 应释放容量");
+            recv_decode_failed_for(&worker, identity, 7);
+            wait_for_supervisor_revisions(&worker, 2);
+            let (router_count, event_count) = retained_identity_counts(&worker);
+            assert!(router_count <= 4, "router identity 必须保持有界");
+            assert!(event_count <= 4, "output identity 必须保持有界");
+        }
+
+        assert_eq!(worker_spawn_count(&worker), 12);
+        stop(worker);
+    }
+
+    #[test]
+    fn delivered_terminal_frame_token_retains_capacity_until_confirmed() {
+        let session_id = SessionId::allocate();
+        let worker = VideoDecodeWorker::spawn_with_stream_registry_loader(Arc::new(|_identity| {
+            Ok(registry(
+                DecoderScript::FrameThenFail,
+                Arc::new(AtomicUsize::new(0)),
+            ))
+        }))
+        .unwrap();
+        let mut terminal_frames = Vec::new();
+        for stream_id in 1..=4 {
+            let identity = identity_for(session_id, stream_id);
+            worker
+                .sender()
+                .try_send_config(test_config_for(identity, 7))
+                .unwrap();
+            recv_backend_selected_for(&worker, identity, 7);
+            worker
+                .sender()
+                .try_send_access_unit(test_au_for(identity, 7, 1, true, 1))
+                .unwrap();
+            terminal_frames.push(recv_frame_for(&worker, identity));
+            worker
+                .sender()
+                .try_send_access_unit(test_au_for(identity, 7, 2, false, 1))
+                .unwrap();
+            recv_decode_failed_for(&worker, identity, 7);
+        }
+        wait_for_supervisor_revisions(&worker, 2);
+
+        let fifth = identity_for(session_id, 5);
+        assert_eq!(
+            worker.sender().try_send_config(test_config_for(fifth, 7)),
+            Err(super::VideoWorkerSendError::Full)
+        );
+        worker
+            .events()
+            .confirm_presented(terminal_frames[0].token())
+            .unwrap();
+        wait_for_supervisor_revisions(&worker, 2);
+        worker
+            .sender()
+            .try_send_config(test_config_for(fifth, 7))
+            .expect("terminal handoff token 消费后应释放一个 identity slot");
+        stop(worker);
+    }
+
+    #[test]
+    fn retained_frame_publication_precedes_a_later_fatal_control() {
+        let identity = test_identity();
+        let events = super::VideoWorkerEvents::new(None);
+        let epoch = events.accept_config(identity, 7);
+        events.publish_frame(epoch, test_frame_for(identity, 7, 41));
+        events.publish_failure(
+            epoch,
+            VideoDecodeErrorCode::DecodeFailedAfterFirstFrame,
+            true,
+        );
+
+        assert!(matches!(
+            events.try_recv(),
+            Some(VideoWorkerEvent::FrameDecoded(frame))
+                if frame.frame().as_input().timestamp.ticks == 41
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Some(VideoWorkerEvent::DecodeFailed {
+                identity: actual_identity,
+                generation: 7,
+                after_first_frame: true,
+                ..
+            }) if actual_identity == identity
+        ));
+    }
+
     fn worker_with_script(script: DecoderScript, submits: Arc<AtomicUsize>) -> VideoDecodeWorker {
         VideoDecodeWorker::spawn_with_registry_loader(Box::new(move || {
             Ok(registry(script, submits))
@@ -1646,7 +2099,8 @@ mod tests {
                     VideoDecodeErrorCode::DecodeFailedBeforeFirstFrame,
                 )),
                 DecoderScript::FrameThenFail if call == 0 => Ok(DecodeOutcome::Frames(
-                    vec![test_frame(
+                    vec![test_frame_for(
+                        access_unit.identity(),
                         access_unit.generation(),
                         access_unit.timestamp().ticks,
                     )]
@@ -1760,6 +2214,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn recv_decode_failed_for(
+        worker: &VideoDecodeWorker,
+        identity: VideoStreamIdentity,
+        generation: u64,
+    ) {
+        loop {
+            if matches!(
+                recv_event(worker),
+                VideoWorkerEvent::DecodeFailed {
+                    identity: actual_identity,
+                    generation: actual_generation,
+                    ..
+                } if actual_identity == identity && actual_generation == generation
+            ) {
+                return;
+            }
+        }
+    }
+
+    fn worker_spawn_count(worker: &VideoDecodeWorker) -> usize {
+        worker.sender.router.shared.0.lock().unwrap().spawn_count
+    }
+
+    fn wait_for_spawn_count(worker: &VideoDecodeWorker, expected: usize) {
+        let (lock, wake) = &*worker.sender.router.shared;
+        let mut state = lock.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.spawn_count < expected {
+            let now = Instant::now();
+            assert!(now < deadline, "spawn count 应在 deadline 内成立");
+            let (next, timeout) = wake
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            assert!(!timeout.timed_out() || state.spawn_count >= expected);
+        }
+    }
+
+    fn wait_for_supervisor_revisions(worker: &VideoDecodeWorker, additional: u64) {
+        let (lock, wake) = &*worker.sender.router.shared;
+        let mut state = lock.lock().unwrap();
+        let target = state.supervisor_revision + additional;
+        wake.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.supervisor_revision < target {
+            let now = Instant::now();
+            assert!(now < deadline, "supervisor revision 应在 deadline 内推进");
+            let (next, timeout) = wake
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap();
+            state = next;
+            assert!(!timeout.timed_out() || state.supervisor_revision >= target);
+        }
+    }
+
+    fn retained_identity_counts(worker: &VideoDecodeWorker) -> (usize, usize) {
+        let router_count = worker.sender.router.shared.0.lock().unwrap().streams.len();
+        let event_count = worker.events.shared.0.lock().unwrap().streams.len();
+        (router_count, event_count)
     }
 
     fn assert_no_frame_for_generation(
