@@ -344,7 +344,9 @@ fn drain_media(media: &Receiver<MediaFrame>, playback: &mut Option<AudioPlayback
                     }
                 }
             }
-            Ok(MediaFrame::Pcm { .. } | MediaFrame::EncodedVideo { .. }) => {}
+            Ok(
+                MediaFrame::Pcm { .. } | MediaFrame::VideoConfig(_) | MediaFrame::EncodedVideo(_),
+            ) => {}
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
         }
     }

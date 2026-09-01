@@ -989,7 +989,7 @@ fn run_audio_worker(
                 channels,
                 samples,
             }) => break (sample_rate_hz, channels, samples),
-            Ok(_) => {}
+            Ok(MediaFrame::VideoConfig(_) | MediaFrame::EncodedVideo(_)) => {}
             Err(_) => return AudioWorkerExit::Closed,
         }
     };
@@ -1003,18 +1003,20 @@ fn run_audio_worker(
         return AudioWorkerExit::Failed;
     }
     while let Ok(frame) = media.recv() {
-        if let MediaFrame::Pcm {
-            sample_rate_hz,
-            channels,
-            samples,
-        } = frame
-        {
-            if output
-                .enqueue_pcm(sample_rate_hz, channels, samples)
-                .is_err()
-            {
-                return AudioWorkerExit::Failed;
+        match frame {
+            MediaFrame::Pcm {
+                sample_rate_hz,
+                channels,
+                samples,
+            } => {
+                if output
+                    .enqueue_pcm(sample_rate_hz, channels, samples)
+                    .is_err()
+                {
+                    return AudioWorkerExit::Failed;
+                }
             }
+            MediaFrame::VideoConfig(_) | MediaFrame::EncodedVideo(_) => {}
         }
     }
     AudioWorkerExit::Closed
@@ -3665,6 +3667,7 @@ impl AudioOutputFactory for UnavailableAudioFactory {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread::JoinHandle;
@@ -3681,7 +3684,10 @@ mod tests {
         EnqueuedSurfaceUpdate, FrameCompleteness, FrameReset, FrameRevision, FrameTransaction,
         FrameTransactionError, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
     };
-    use frd_media_api::{AudioOutput, AudioOutputError, MediaFrame};
+    use frd_media_api::{
+        AudioOutput, AudioOutputError, EncodedVideoAccessUnit, MediaFrame, VideoStreamIdentity,
+        VideoTimestamp,
+    };
     use frd_platform_api::{PlatformCapabilities, PlatformError, ServerIdentityStore};
     use frd_protocol_api::{
         ConnectRequest, ConnectionStage, CredentialRequirements, Credentials, ProtocolCatalog,
@@ -5325,10 +5331,7 @@ mod tests {
         let video_only_worker =
             std::thread::spawn(move || super::run_audio_worker(video_only_factory, video_only_rx));
         video_only_tx
-            .send(MediaFrame::EncodedVideo {
-                timestamp_us: 1,
-                bytes: vec![0xaa].into_boxed_slice(),
-            })
+            .send(MediaFrame::EncodedVideo(test_video_access_unit(1, 0xaa)))
             .unwrap();
         drop(video_only_tx);
         assert_eq!(
@@ -5352,10 +5355,7 @@ mod tests {
             super::run_audio_worker(video_then_pcm_factory, video_then_pcm_rx)
         });
         video_then_pcm_tx
-            .send(MediaFrame::EncodedVideo {
-                timestamp_us: 2,
-                bytes: vec![0xbb].into_boxed_slice(),
-            })
+            .send(MediaFrame::EncodedVideo(test_video_access_unit(2, 0xbb)))
             .unwrap();
         std::thread::sleep(Duration::from_millis(25));
         assert_eq!(
@@ -5377,6 +5377,23 @@ mod tests {
         );
         assert_eq!(video_then_pcm_opens.load(Ordering::Acquire), 1);
         assert_eq!(*pcm_frames.lock().unwrap(), vec![vec![7_i16, -8_i16]]);
+    }
+
+    fn test_video_access_unit(ticks: u64, byte: u8) -> EncodedVideoAccessUnit {
+        EncodedVideoAccessUnit::try_new(
+            VideoStreamIdentity {
+                session_id: SessionId::allocate(),
+                stream_id: 1,
+            },
+            1,
+            VideoTimestamp {
+                ticks,
+                timescale: NonZeroU32::new(1_000_000).expect("测试 timebase 非零"),
+            },
+            true,
+            vec![byte].into_boxed_slice(),
+        )
+        .expect("测试访问单元有效")
     }
 
     fn assert_audio_degradation_and_cleanup(audio: Arc<dyn AudioOutputFactory>) {

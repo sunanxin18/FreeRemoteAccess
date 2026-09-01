@@ -871,13 +871,17 @@ impl ProtocolRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
     use std::sync::{mpsc, Arc, Mutex};
 
     use frd_core::{InputEvent, PhysicalViewport, PixelRect, PixelSize, SessionId, SessionInput};
     use frd_frame::{
         FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
     };
-    use frd_media_api::{MediaFrame, MediaPublishError, MediaPublisher};
+    use frd_media_api::{
+        EncodedVideoAccessUnit, MediaFrame, MediaPublishError, MediaPublisher, VideoStreamIdentity,
+        VideoTimestamp,
+    };
 
     use super::{
         evaluate_server_identity, Endpoint, MailboxSurfacePublisher, ProtocolCatalog,
@@ -1441,10 +1445,7 @@ mod tests {
             Err(ProtocolError::Terminal)
         );
         assert_eq!(
-            runtime.publish_media(MediaFrame::EncodedVideo {
-                timestamp_us: 1,
-                bytes: vec![0x11].into_boxed_slice(),
-            }),
+            runtime.publish_media(MediaFrame::EncodedVideo(test_access_unit(session_id, 1))),
             Err(ProtocolError::Terminal)
         );
         assert_eq!(*media.lock().expect("media calls"), 0);
@@ -1470,10 +1471,7 @@ mod tests {
         establish_generation(&mut runtime, session_id, 1);
 
         assert_eq!(
-            runtime.publish_media(MediaFrame::EncodedVideo {
-                timestamp_us: 1,
-                bytes: vec![0x11].into_boxed_slice(),
-            }),
+            runtime.publish_media(MediaFrame::EncodedVideo(test_access_unit(session_id, 1))),
             Err(ProtocolError::MediaPortClosed)
         );
         assert!(runtime.requires_shutdown());
@@ -1500,10 +1498,9 @@ mod tests {
             establish_generation(&mut runtime, session_id, 1);
 
             assert_eq!(
-                runtime.try_publish_optional_media(MediaFrame::EncodedVideo {
-                    timestamp_us: 1,
-                    bytes: vec![0x11].into_boxed_slice(),
-                }),
+                runtime.try_publish_optional_media(MediaFrame::EncodedVideo(test_access_unit(
+                    session_id, 1,
+                ))),
                 Err(ProtocolError::MediaPortClosed)
             );
             assert!(!runtime.requires_shutdown());
@@ -1599,6 +1596,23 @@ mod tests {
                 PixelFormat::Bgrx8UnormSrgb,
             )
             .expect("generation succeeds");
+    }
+
+    fn test_access_unit(session_id: SessionId, generation: u64) -> EncodedVideoAccessUnit {
+        EncodedVideoAccessUnit::try_new(
+            VideoStreamIdentity {
+                session_id,
+                stream_id: 1,
+            },
+            generation,
+            VideoTimestamp {
+                ticks: 1,
+                timescale: NonZeroU32::new(1_000_000).expect("测试 timebase 非零"),
+            },
+            true,
+            vec![0x11].into_boxed_slice(),
+        )
+        .expect("测试访问单元有效")
     }
 
     fn input(session_id: SessionId, generation: u64) -> SessionCommand {
