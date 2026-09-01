@@ -2,6 +2,7 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $packageRoot = Join-Path $repoRoot "target\package-test"
 $codecRoot = Join-Path $packageRoot "codecs\ffmpeg-8.1.2\windows-x86_64"
 $verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
+$correspondingSourceAsset = Join-Path $repoRoot "target\release-assets\FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip"
 
 Describe "Windows package verification security boundaries" {
     BeforeAll {
@@ -22,7 +23,20 @@ Describe "Windows package verification security boundaries" {
         try {
             $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
             $LASTEXITCODE | Should Not Be 0
-            ($output -join "`n") | Should Match "可遮蔽 approved bundle"
+            ($output -join "`n") | Should Match "版本化 codec 目录之外存在未批准 DLL"
+        }
+        finally {
+            Remove-Item -LiteralPath $shadow -Force
+        }
+    }
+
+    It "rejects an unapproved imported runtime DLL in the package root" {
+        $shadow = Join-Path $packageRoot "VCRUNTIME140.dll"
+        Set-Content -LiteralPath $shadow -Value "unapproved runtime shadow" -Encoding UTF8
+        try {
+            $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "版本化 codec 目录之外存在未批准 DLL"
         }
         finally {
             Remove-Item -LiteralPath $shadow -Force
@@ -57,5 +71,11 @@ Describe "Windows package verification security boundaries" {
         finally {
             Copy-Item -LiteralPath $backup -Destination $notice -Force
         }
+    }
+
+    It "publishes the exact corresponding-source ZIP in non-hidden release staging" {
+        (Test-Path -LiteralPath $correspondingSourceAsset -PathType Leaf) | Should Be $true
+        $manifest = Get-Content -Raw -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
+        (Get-FileHash -LiteralPath $correspondingSourceAsset -Algorithm SHA256).Hash | Should Be $manifest.correspondingSource.sha256
     }
 }

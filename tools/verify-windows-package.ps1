@@ -160,18 +160,17 @@ foreach ($requiredNoticeText in @($ExpectedSourceUrl, $ExpectedCorrespondingSour
 $approvedDirectoryFull = [IO.Path]::GetFullPath($codecDirectory).TrimEnd('\')
 $shadowDlls = @(
     Get-ChildItem -LiteralPath $package -Recurse -File -Filter "*.dll" | Where-Object {
-        $_.Name -in $ApprovedDllNames -and
         -not ([IO.Path]::GetFullPath($_.DirectoryName).TrimEnd('\').Equals($approvedDirectoryFull, [StringComparison]::OrdinalIgnoreCase))
     }
 )
 $shadowDllPaths = @($shadowDlls | ForEach-Object { $_.FullName })
-Assert-True ($shadowDlls.Count -eq 0) "package 中存在可遮蔽 approved bundle 的 DLL: $($shadowDllPaths -join ', ')"
+Assert-True ($shadowDlls.Count -eq 0) "package 的版本化 codec 目录之外存在未批准 DLL: $($shadowDllPaths -join ', ')"
 
 $currentDirectoryShadowDlls = @(
-    Get-ChildItem -LiteralPath (Get-Location).Path -File -Filter "*.dll" | Where-Object { $_.Name -in $ApprovedDllNames }
+    Get-ChildItem -LiteralPath (Get-Location).Path -File -Filter "*.dll"
 )
 $currentDirectoryShadowDllPaths = @($currentDirectoryShadowDlls | ForEach-Object { $_.FullName })
-Assert-True ($currentDirectoryShadowDlls.Count -eq 0) "当前目录存在可优先加载的 approved DLL: $($currentDirectoryShadowDllPaths -join ', ')"
+Assert-True ($currentDirectoryShadowDlls.Count -eq 0) "当前目录存在可优先加载的未批准 DLL: $($currentDirectoryShadowDllPaths -join ', ')"
 
 Write-Host "Windows package verification passed: $package"
 Write-Host "Codec directory: $ApprovedCodecDirectory"
