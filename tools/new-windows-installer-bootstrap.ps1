@@ -40,6 +40,7 @@ $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
 
 $stagingRoot = Join-Path $parent (".FreeRemoteDesk.install-bootstrap-" + [Guid]::NewGuid().ToString("N"))
 $payloadPath = Join-Path $stagingRoot "elevation-payload.ps1"
+$resultPath = Join-Path $stagingRoot "elevation-result.json"
 $created = $false
 try {
     [IO.Directory]::CreateDirectory($stagingRoot) | Out-Null
@@ -84,6 +85,18 @@ try {
     finally {
         $stream.Dispose()
     }
+    $resultStream = [IO.FileStream]::new(
+        $resultPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    try {
+        $resultStream.Flush($true)
+    }
+    finally {
+        $resultStream.Dispose()
+    }
 
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
@@ -94,16 +107,18 @@ try {
     }
     $payloadHash = [Convert]::ToBase64String($payloadHashBytes)
     $payloadPathBlob = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadPath))
+    $resultPathBlob = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resultPath))
     $userSidBlob = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userSid.Value))
 
     $launcher = @"
 `$ErrorActionPreference='Stop'
 try {
 `$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$payloadPathBlob'))
+`$r=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$resultPathBlob'))
 `$expected=[Convert]::FromBase64String('$payloadHash')
 `$userSid=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$userSidBlob'))
 `$root=[IO.Path]::GetDirectoryName(`$p)
-if ([IO.Path]::GetFileName(`$p) -cne 'elevation-payload.ps1' -or [IO.Path]::GetFileName(`$root) -cnotmatch '^\.FreeRemoteDesk\.install-bootstrap-[0-9a-f]{32}$') { throw '管理员 elevation payload 路径契约不匹配' }
+if ([IO.Path]::GetFileName(`$p) -cne 'elevation-payload.ps1' -or [IO.Path]::GetDirectoryName(`$r) -cne `$root -or [IO.Path]::GetFileName(`$r) -cne 'elevation-result.json' -or [IO.Path]::GetFileName(`$root) -cnotmatch '^\.FreeRemoteDesk\.install-bootstrap-[0-9a-f]{32}$') { throw '管理员 elevation payload 路径契约不匹配' }
 function Get-Sid([string]`$value) { try { return ([Security.Principal.NTAccount]::new(`$value)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { return ([Security.Principal.SecurityIdentifier]::new(`$value)).Value } }
 function Assert-Object([string]`$path,[bool]`$directory) {
 `$item=Get-Item -Force -LiteralPath `$path -ErrorAction Stop
@@ -122,6 +137,15 @@ if ((`$mask -band `$danger) -ne 0 -and (`$rule.AccessControlType -ne [Security.A
 }
 }
 Assert-Object `$root `$true
+Assert-Object `$r `$false
+`$resultStream=[IO.FileStream]::new(`$r,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+`$stage='payload_validation'; `$status='error'; `$errorType=''; `$message=''; `$exitCode=1
+`$stdout=New-Object 'Collections.Generic.List[string]'; `$stderr=New-Object 'Collections.Generic.List[string]'
+`$sensitive=@(Get-ChildItem Env: | Where-Object { `$_.Name -match '(?i)(password|passwd|secret|token|credential|private.?key|api.?key)' -and `$_.Value.Length -ge 4 } | ForEach-Object { `$_.Value })
+Get-ChildItem Env: | Where-Object { `$_.Name -match '(?i)(password|passwd|secret|token|credential|private.?key|api.?key)' } | Remove-Item -ErrorAction SilentlyContinue
+function Clean-Text([object]`$value) { `$text=[string]`$value; foreach (`$secret in `$sensitive) { `$text=`$text.Replace(`$secret,'[REDACTED]') }; `$text=[regex]::Replace(`$text,'[\x00-\x1F\x7F]+',' '); if (`$text.Length -gt 512) { `$text=`$text.Substring(0,512) }; return `$text }
+function Add-Record(`$target,[object]`$value) { if (`$target.Count -ge 8) { return }; `$used=0; foreach (`$entry in `$target) { `$used += `$entry.Length }; if (`$used -ge 2048) { return }; `$text=Clean-Text `$value; `$remaining=2048-`$used; if (`$text.Length -gt `$remaining) { `$text=`$text.Substring(0,`$remaining) }; [void]`$target.Add(`$text) }
+try {
 Assert-Object `$p `$false
 `$stream=[IO.FileStream]::new(`$p,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
 try { `$memory=New-Object IO.MemoryStream; try { `$stream.CopyTo(`$memory); `$bytes=`$memory.ToArray() } finally { `$memory.Dispose() }; Assert-Object `$root `$true; Assert-Object `$p `$false } finally { `$stream.Dispose() }
@@ -130,10 +154,20 @@ if (`$actual.Length -ne `$expected.Length) { throw '管理员 elevation payload 
 `$difference=0
 for (`$i=0; `$i -lt `$actual.Length; `$i++) { `$difference=`$difference -bor (`$actual[`$i] -bxor `$expected[`$i]) }
 if (`$difference -ne 0) { throw '管理员 elevation payload SHA-256 不匹配' }
-& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString(`$bytes)))
-Write-Output 'FreeRemoteDesk 管理员 payload 已通过校验'
-exit 0
-} catch { Write-Error `$_; exit 1 }
+`$stage='installer_execution'
+& ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString(`$bytes))) *>&1 | ForEach-Object { if (`$_ -is [Management.Automation.ErrorRecord]) { Add-Record `$stderr `$_ } else { Add-Record `$stdout `$_ } }
+`$status='ok'; `$stage='complete'; `$exitCode=0
+} catch { `$errorType=`$_.Exception.GetType().FullName; `$message=Clean-Text `$_.Exception.Message; Add-Record `$stderr `$message }
+finally {
+`$result=[ordered]@{schema='freeremotedesk.windows.install-result.v1';status=`$status;stage=`$stage;errorType=`$errorType;message=`$message;stdout=@(`$stdout);stderr=@(`$stderr)}
+`$json=`$result | ConvertTo-Json -Compress -Depth 3
+`$resultBytes=[Text.Encoding]::UTF8.GetBytes(`$json)
+if (`$resultBytes.Length -gt 8191) { `$resultBytes=[Text.Encoding]::UTF8.GetBytes('{"schema":"freeremotedesk.windows.install-result.v1","status":"error","stage":"bootstrap_result","errorType":"System.InvalidOperationException","message":"管理员结果超过安全长度","stdout":[],"stderr":[]}'); `$exitCode=1 }
+`$resultStream.SetLength(0); `$resultStream.Write(`$resultBytes,0,`$resultBytes.Length); `$resultStream.Flush(`$true); `$resultStream.Dispose()
+}
+if (`$exitCode -eq 0) { Write-Output 'FreeRemoteDesk 管理员 payload 已通过校验' }
+exit `$exitCode
+} catch { exit 1 }
 "@
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launcher))
     if ($encodedCommand.Length -ge 30000) {
@@ -143,12 +177,16 @@ exit 0
     [PSCustomObject]@{
         StagingRoot = $stagingRoot
         PayloadPath = $payloadPath
+        ResultPath = $resultPath
         PayloadSha256 = (($payloadHashBytes | ForEach-Object { $_.ToString("X2") }) -join "")
         EncodedCommand = $encodedCommand
         UserSid = $userSid.Value
     }
 }
 catch {
+    if ($created -and (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+        [IO.File]::Delete($resultPath)
+    }
     if ($created -and (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
         [IO.File]::Delete($payloadPath)
     }

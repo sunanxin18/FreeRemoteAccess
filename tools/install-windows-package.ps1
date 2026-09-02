@@ -22,7 +22,7 @@ if (-not $Elevated) {
     $bootstrapBuilder = Join-Path $repoRoot "tools\new-windows-installer-bootstrap.ps1"
 }
 $expectedVerifierSha256 = "74D50DFA2786AD3712214E927A429CA4AB947DE9EAFD86C67089B265ACA7D968"
-$expectedBootstrapBuilderSha256 = "4CA4924D92A42704DA14BB1F8709B12681CF13264FA4530F4DFB845588AE16D0"
+$expectedBootstrapBuilderSha256 = "2759BE25E45B6C6992A26560130E0CB2E35BE398ECBB7C6CC3C0AAC57D46AEA1"
 $package = [IO.Path]::GetFullPath($PackageRoot)
 $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
 $elevationHost = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
@@ -30,6 +30,47 @@ $icacls = Join-Path $systemDirectory "icacls.exe"
 $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
 $installRoot = [IO.Path]::GetFullPath((Join-Path $programFiles "FreeRemoteDesk"))
 $programFilesRoot = [IO.Path]::GetFullPath($programFiles).TrimEnd('\') + '\'
+
+function Read-AdministratorResult([IO.FileStream]$Handle) {
+    if ($Handle.Length -le 0 -or $Handle.Length -ge 8192) {
+        throw "管理员结构化结果长度无效"
+    }
+    $Handle.Position = 0
+    $bytes = New-Object byte[] ([int]$Handle.Length)
+    $offset = 0
+    while ($offset -lt $bytes.Length) {
+        $read = $Handle.Read($bytes, $offset, $bytes.Length - $offset)
+        if ($read -le 0) {
+            throw "管理员结构化结果读取不完整"
+        }
+        $offset += $read
+    }
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $result = $utf8.GetString($bytes) | ConvertFrom-Json
+    $expectedProperties = @("errorType", "message", "schema", "stage", "status", "stderr", "stdout")
+    $actualProperties = @($result.PSObject.Properties.Name | Sort-Object)
+    if (($actualProperties -join "|") -cne ($expectedProperties -join "|")) {
+        throw "管理员结构化结果字段集合无效"
+    }
+    if ($result.schema -cne "freeremotedesk.windows.install-result.v1" -or
+        @("ok", "error") -cnotcontains [string]$result.status -or
+        @("payload_validation", "installer_execution", "complete", "bootstrap_result") -cnotcontains [string]$result.stage) {
+        throw "管理员结构化结果契约无效"
+    }
+    if (([string]$result.errorType).Length -gt 256 -or
+        ([string]$result.errorType) -notmatch '^[A-Za-z0-9_.+]*$') {
+        throw "管理员结构化结果 errorType 无效"
+    }
+    foreach ($text in @([string]$result.message) + @($result.stdout) + @($result.stderr)) {
+        if ($text.Length -gt 512 -or $text -match '[\x00-\x1F\x7F]') {
+            throw "管理员结构化结果包含超长文本或控制字符"
+        }
+    }
+    if (@($result.stdout).Count -gt 8 -or @($result.stderr).Count -gt 8) {
+        throw "管理员结构化结果输出项过多"
+    }
+    return $result
+}
 
 if (-not $installRoot.StartsWith($programFilesRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw "固定安装目录不在 Program Files 下: $installRoot"
@@ -128,6 +169,7 @@ if (-not $isAdministrator) {
 
     $bootstrapBuilderScript = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($bootstrapBuilderBytes))
     $plan = $null
+    $resultHandle = $null
     try {
         $plan = & $bootstrapBuilderScript `
             -InstallerBytes $installerBytes `
@@ -136,14 +178,47 @@ if (-not $isAdministrator) {
         if ($plan.EncodedCommand.Length -ge 30000) {
             throw "管理员安装 bootstrap 超过 Windows 安全命令行上限"
         }
+        $resultHandle = [IO.FileStream]::new(
+            [string]$plan.ResultPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite
+        )
         $child = Start-Process -FilePath $elevationHost -Verb RunAs -WindowStyle Hidden -ArgumentList @(
             "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $plan.EncodedCommand
         ) -Wait -PassThru
-        if ($child.ExitCode -ne 0) {
-            throw "管理员安装进程失败，退出码 $($child.ExitCode)"
+        try {
+            $administratorResult = Read-AdministratorResult $resultHandle
+        }
+        catch {
+            throw "管理员安装进程退出码 $($child.ExitCode)，结构化结果无效: $($_.Exception.Message)"
+        }
+        if ($child.ExitCode -ne 0 -or $administratorResult.status -cne "ok" -or
+            $administratorResult.stage -cne "complete") {
+            $parts = @()
+            if (-not [string]::IsNullOrWhiteSpace([string]$administratorResult.message)) {
+                $parts += [string]$administratorResult.message
+            }
+            if (@($administratorResult.stderr).Count -ne 0) {
+                $parts += "stderr: $(@($administratorResult.stderr) -join ' | ')"
+            }
+            if (@($administratorResult.stdout).Count -ne 0) {
+                $parts += "stdout: $(@($administratorResult.stdout) -join ' | ')"
+            }
+            if ($parts.Count -eq 0) {
+                $parts += "管理员进程未提供错误详情"
+            }
+            throw "管理员安装失败 [$($administratorResult.stage)/$($administratorResult.errorType)]，退出码 $($child.ExitCode): $($parts -join '; ')"
         }
     }
     finally {
+        if ($null -ne $resultHandle) {
+            $resultHandle.Dispose()
+        }
+        if ($null -ne $plan -and $null -ne $plan.ResultPath -and
+            (Test-Path -LiteralPath $plan.ResultPath -PathType Leaf)) {
+            [IO.File]::Delete($plan.ResultPath)
+        }
         if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
             [IO.File]::Delete($plan.PayloadPath)
         }

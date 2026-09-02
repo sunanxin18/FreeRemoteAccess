@@ -176,6 +176,59 @@ Describe "Windows package verification security boundaries" {
 }
 
 Describe "Windows elevation bootstrap security boundary" {
+    It "returns a bounded structured administrator error without inherited secrets" {
+        $secretSentinel = "FRD_TEST_SECRET_9b17f34b"
+        $oldSecret = $env:FRD_PASSWORD
+        $env:FRD_PASSWORD = $secretSentinel
+        $installerText = @"
+[CmdletBinding()]
+param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
+Write-Output 'diagnostic before failure'
+throw 'bounded administrator failure detail'
+"@
+        $plan = $null
+        try {
+            $plan = & $bootstrapBuilder `
+                -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
+                -VerifierBytes ([Text.Encoding]::UTF8.GetBytes("trusted verifier")) `
+                -PackageRoot $TestDrive `
+                -StagingParent $TestDrive
+            $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+            $systemPowerShell = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
+            $output = & $systemPowerShell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $plan.EncodedCommand 2>&1
+
+            $LASTEXITCODE | Should Not Be 0
+            $resultText = Get-Content -Raw -Encoding UTF8 -LiteralPath $plan.ResultPath
+            $result = $resultText | ConvertFrom-Json
+            $result.schema | Should Be "freeremotedesk.windows.install-result.v1"
+            $result.status | Should Be "error"
+            $result.stage | Should Be "installer_execution"
+            $result.message | Should Match "bounded administrator failure detail"
+            ($result.stdout -join "`n") | Should Match "diagnostic before failure"
+            $resultText | Should Not Match ([regex]::Escape($secretSentinel))
+            $resultText.Length | Should BeLessThan 8192
+            ($output -join "`n") | Should Not Match ([regex]::Escape($secretSentinel))
+        }
+        finally {
+            if ($null -eq $oldSecret) {
+                Remove-Item Env:FRD_PASSWORD -ErrorAction SilentlyContinue
+            }
+            else {
+                $env:FRD_PASSWORD = $oldSecret
+            }
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.PayloadPath -Force
+            }
+            if ($null -ne $plan -and $null -ne $plan.ResultPath -and
+                (Test-Path -LiteralPath $plan.ResultPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.ResultPath -Force
+            }
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
+                Remove-Item -LiteralPath $plan.StagingRoot -Force
+            }
+        }
+    }
+
     It "runs the real elevated installer from hash-checked in-memory bytes without a script path" {
         $installerFileBytes = [IO.File]::ReadAllBytes($installer)
         $installerHasBom = $installerFileBytes.Length -ge 3 -and
@@ -247,6 +300,10 @@ if (`$TrustedVerifierBytes.Length -lt 131072) { throw 'verifier payload was trun
             if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
                 Remove-Item -LiteralPath $plan.PayloadPath -Force
             }
+            if ($null -ne $plan -and $null -ne $plan.ResultPath -and
+                (Test-Path -LiteralPath $plan.ResultPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.ResultPath -Force
+            }
             if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
                 Remove-Item -LiteralPath $plan.StagingRoot -Force
             }
@@ -275,11 +332,19 @@ param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
 
             $LASTEXITCODE | Should Not Be 0
             (Test-Path -LiteralPath $marker) | Should Be $false
-            ($output -join "`n") | Should Match "管理员 elevation payload SHA-256 不匹配"
+            $result = Get-Content -Raw -Encoding UTF8 -LiteralPath $plan.ResultPath | ConvertFrom-Json
+            $result.status | Should Be "error"
+            $result.stage | Should Be "payload_validation"
+            $result.message | Should Match "管理员 elevation payload SHA-256 不匹配"
+            ($output -join "`n") | Should Not Match "管理员 elevation payload SHA-256 不匹配"
         }
         finally {
             if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
                 Remove-Item -LiteralPath $plan.PayloadPath -Force
+            }
+            if ($null -ne $plan -and $null -ne $plan.ResultPath -and
+                (Test-Path -LiteralPath $plan.ResultPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.ResultPath -Force
             }
             if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
                 Remove-Item -LiteralPath $plan.StagingRoot -Force
