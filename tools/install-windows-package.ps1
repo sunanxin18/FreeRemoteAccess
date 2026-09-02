@@ -22,7 +22,7 @@ if (-not $Elevated) {
     $bootstrapBuilder = Join-Path $repoRoot "tools\new-windows-installer-bootstrap.ps1"
 }
 $expectedVerifierSha256 = "74D50DFA2786AD3712214E927A429CA4AB947DE9EAFD86C67089B265ACA7D968"
-$expectedBootstrapBuilderSha256 = "2759BE25E45B6C6992A26560130E0CB2E35BE398ECBB7C6CC3C0AAC57D46AEA1"
+$expectedBootstrapBuilderSha256 = "BAE11BAE8B7AEE58031D5AE1B0DC3ADC4DFF3C772E96595FF7A054FC2CA698C7"
 $package = [IO.Path]::GetFullPath($PackageRoot)
 $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
 $elevationHost = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"

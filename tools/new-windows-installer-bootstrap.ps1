@@ -69,7 +69,9 @@ try {
 `$verifierBytes = [Convert]::FromBase64String('$verifierBlob')
 `$package = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$packageBlob'))
 `$installer = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString(`$installerBytes))
-& `$installer -PackageRoot `$package -Elevated -TrustedVerifierBytes `$verifierBytes
+Push-Location -LiteralPath `$package
+try { & `$installer -PackageRoot `$package -Elevated -TrustedVerifierBytes `$verifierBytes }
+finally { Pop-Location }
 "@
     $bundleBytes = [Text.Encoding]::UTF8.GetBytes($bundle)
     $stream = [IO.FileStream]::new(

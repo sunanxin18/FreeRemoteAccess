@@ -176,6 +176,53 @@ Describe "Windows package verification security boundaries" {
 }
 
 Describe "Windows elevation bootstrap security boundary" {
+    It "binds elevated installer current directory to the hash-bound package root instead of System32" {
+        $cleanPackage = Join-Path $TestDrive "clean package root"
+        New-Item -ItemType Directory -Path $cleanPackage | Out-Null
+        $marker = Join-Path $TestDrive "package-cwd.marker"
+        $installerText = @"
+[CmdletBinding()]
+param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
+if (-not (Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'kernel32.dll') -PathType Leaf)) { throw 'System32 DLL fixture is unavailable' }
+if (-not ([IO.Path]::GetFullPath((Get-Location).Path).TrimEnd('\') -eq [IO.Path]::GetFullPath(`$PackageRoot).TrimEnd('\'))) { throw "elevated cwd was not package root: `$((Get-Location).Path)" }
+if (@(Get-ChildItem -LiteralPath (Get-Location).Path -File -Filter '*.dll').Count -ne 0) { throw 'clean package root unexpectedly contains a DLL' }
+[IO.File]::WriteAllText('$($marker.Replace("'", "''"))', (Get-Location).Path, [Text.Encoding]::UTF8)
+"@
+        $plan = $null
+        try {
+            $plan = & $bootstrapBuilder `
+                -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
+                -VerifierBytes ([Text.Encoding]::UTF8.GetBytes("trusted verifier")) `
+                -PackageRoot $cleanPackage `
+                -StagingParent $TestDrive
+            $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+            $systemPowerShell = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
+            Push-Location $systemDirectory
+            try {
+                $output = & $systemPowerShell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $plan.EncodedCommand 2>&1
+            }
+            finally {
+                Pop-Location
+            }
+
+            $LASTEXITCODE | Should Be 0
+            [IO.Path]::GetFullPath((Get-Content -Raw -LiteralPath $marker)).TrimEnd('\') | Should Be ([IO.Path]::GetFullPath($cleanPackage).TrimEnd('\'))
+            ($output -join "`n") | Should Match "FreeRemoteDesk 管理员 payload 已通过校验"
+        }
+        finally {
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.PayloadPath -Force
+            }
+            if ($null -ne $plan -and $null -ne $plan.ResultPath -and
+                (Test-Path -LiteralPath $plan.ResultPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.ResultPath -Force
+            }
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
+                Remove-Item -LiteralPath $plan.StagingRoot -Force
+            }
+        }
+    }
+
     It "returns a bounded structured administrator error without inherited secrets" {
         $secretSentinel = "FRD_TEST_SECRET_9b17f34b"
         $oldSecret = $env:FRD_PASSWORD
@@ -266,6 +313,7 @@ throw 'bounded administrator failure detail'
     It "keeps a large installer payload below the Windows command-line limit and executes the hash-bound bytes" {
         $marker = Join-Path $TestDrive "large-bootstrap.marker"
         $packageArgument = Join-Path $TestDrive "package argument with spaces"
+        New-Item -ItemType Directory -Path $packageArgument | Out-Null
         $installerText = @"
 [CmdletBinding()]
 param(
