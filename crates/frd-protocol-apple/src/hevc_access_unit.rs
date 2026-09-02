@@ -141,6 +141,15 @@ enum InitialConfigurationState {
     Configured,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HevcAssemblerDiagnostics {
+    pub(crate) complete_configuration_access_units: u64,
+    pub(crate) reorder_window_exceeded: u64,
+    pub(crate) recovery_marker_resyncs: u64,
+    pub(crate) waiting_for_recovery_irap_drops: u64,
+    pub(crate) completed_access_units: u64,
+}
+
 #[derive(Debug)]
 pub struct HevcAccessUnitAssembler {
     generation: u64,
@@ -158,6 +167,7 @@ pub struct HevcAccessUnitAssembler {
     complete_initial_ap_parameter_sets: Option<[Vec<u8>; 3]>,
     dropping_until_marker: bool,
     recovery_sequence: Option<u16>,
+    diagnostics: HevcAssemblerDiagnostics,
 }
 
 impl HevcAccessUnitAssembler {
@@ -184,6 +194,7 @@ impl HevcAccessUnitAssembler {
             complete_initial_ap_parameter_sets: None,
             dropping_until_marker: false,
             recovery_sequence: None,
+            diagnostics: HevcAssemblerDiagnostics::default(),
         })
     }
 
@@ -203,6 +214,12 @@ impl HevcAccessUnitAssembler {
         self.complete_initial_ap_parameter_sets = None;
         self.dropping_until_marker = false;
         self.recovery_sequence = None;
+        self.diagnostics = HevcAssemblerDiagnostics::default();
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    pub(crate) const fn diagnostics(&self) -> HevcAssemblerDiagnostics {
+        self.diagnostics
     }
 
     /// 接收一个已认证 RTP 包；同一次调用可能排空重排队列并发布多个 AU。
@@ -243,6 +260,8 @@ impl HevcAccessUnitAssembler {
                 self.expected_sequence = Some(packet.sequence.wrapping_add(1));
                 self.recovery_sequence = None;
                 self.clear_reorder();
+                self.diagnostics.recovery_marker_resyncs =
+                    self.diagnostics.recovery_marker_resyncs.saturating_add(1);
             }
             return Ok(Vec::new());
         }
@@ -255,6 +274,8 @@ impl HevcAccessUnitAssembler {
         if usize::from(distance) >= self.limits.max_reorder_packets {
             self.preserve_complete_initial_ap_parameter_sets();
             self.drop_at_packet_boundary(packet.sequence, packet.marker);
+            self.diagnostics.reorder_window_exceeded =
+                self.diagnostics.reorder_window_exceeded.saturating_add(1);
             return Err(HevcAccessUnitError::ReorderWindowExceeded {
                 limit: self.limits.max_reorder_packets,
             });
@@ -352,6 +373,10 @@ impl HevcAccessUnitAssembler {
             }
             if let [Some(vps), Some(sps), Some(pps)] = parameter_sets {
                 self.complete_initial_ap_parameter_sets = Some([vps, sps, pps]);
+                self.diagnostics.complete_configuration_access_units = self
+                    .diagnostics
+                    .complete_configuration_access_units
+                    .saturating_add(1);
             }
         }
         if packet.marker && packet_nals.is_empty() {
@@ -392,14 +417,20 @@ impl HevcAccessUnitAssembler {
                 .any(|nal| matches!(nal_type(nal), Some(16..=23)))
         {
             self.discard_access_unit();
+            self.diagnostics.waiting_for_recovery_irap_drops = self
+                .diagnostics
+                .waiting_for_recovery_irap_drops
+                .saturating_add(1);
             return Ok(None);
         }
 
         if !packet.marker {
             return Ok(None);
         }
-        self.finish_access_unit(packet.ssrc, packet.timestamp)
-            .map(Some)
+        let access_unit = self.finish_access_unit(packet.ssrc, packet.timestamp)?;
+        self.diagnostics.completed_access_units =
+            self.diagnostics.completed_access_units.saturating_add(1);
+        Ok(Some(access_unit))
     }
 
     fn finish_access_unit(
@@ -967,6 +998,70 @@ mod tests {
                 0xcc, 0, 0, 0, 4, 0x26, 0x01, 0xdd, 0xee,
             ]
         );
+    }
+
+    #[test]
+    fn diagnostics_count_complete_configuration_au_completed_au_and_generation_reset() {
+        let mut assembler = assembler();
+        let configuration = [
+            0x60, 0x01, 0, 3, 0x40, 0x01, 0xaa, 0, 3, 0x42, 0x01, 0xbb, 0, 3, 0x44, 0x01, 0xcc,
+        ];
+
+        assert_eq!(
+            assembler
+                .push(packet(20, 3_000, true, &configuration))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            assembler.diagnostics().complete_configuration_access_units,
+            1
+        );
+        assert_eq!(assembler.diagnostics().completed_access_units, 1);
+
+        assembler.reset(GENERATION + 1);
+        assert_eq!(
+            assembler.diagnostics(),
+            super::HevcAssemblerDiagnostics::default()
+        );
+    }
+
+    #[test]
+    fn diagnostics_count_reorder_recovery_resync_and_waiting_for_irap_drop() {
+        let mut assembler = assembler();
+        let configuration = [
+            0x60, 0x01, 0, 3, 0x40, 0x01, 1, 0, 3, 0x42, 0x01, 2, 0, 3, 0x44, 0x01, 3,
+        ];
+        assert!(assembler
+            .push(packet(10, 0, false, &configuration))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            assembler.push(packet(267, 0, true, &[0x02, 0x01, 4])),
+            Err(HevcAccessUnitError::ReorderWindowExceeded { .. })
+        ));
+        assert!(assembler
+            .push(packet(268, 3_000, true, &[0x02, 0x01, 5]))
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push(packet(269, 6_000, false, &[0x02, 0x01, 6]))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            assembler.push(packet(270, 9_000, false, &[0x02, 0x01, 7])),
+            Err(HevcAccessUnitError::TimestampChangedBeforeMarker { .. })
+        ));
+        assert!(assembler
+            .push(packet(271, 9_000, true, &[0x02, 0x01, 8]))
+            .unwrap()
+            .is_empty());
+
+        let diagnostics = assembler.diagnostics();
+        assert_eq!(diagnostics.reorder_window_exceeded, 1);
+        assert_eq!(diagnostics.waiting_for_recovery_irap_drops, 1);
+        assert_eq!(diagnostics.recovery_marker_resyncs, 1);
     }
 
     #[test]

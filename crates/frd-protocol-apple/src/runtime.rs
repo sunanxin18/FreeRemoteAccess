@@ -515,6 +515,11 @@ fn publish_transport_readiness(
     Ok(udp_media_enabled)
 }
 
+#[cfg(any(debug_assertions, test))]
+fn should_emit_debug_media_close_summary(protocol_id: &frd_core::ProtocolId) -> bool {
+    protocol_id == &frd_core::ProtocolId::apple_high_performance()
+}
+
 // Keep the verified session wiring explicit; aggregating these arguments would
 // only move the boundary and risk coupling transport/media state construction.
 #[allow(clippy::too_many_arguments)]
@@ -774,6 +779,10 @@ fn run_authenticated_session_inner(
     if audio_started {
         let _ = runtime.publish_event(SessionEvent::AudioState(AudioState::Stopped));
     }
+    #[cfg(debug_assertions)]
+    if should_emit_debug_media_close_summary(protocol_id) {
+        media.emit_debug_close_summary();
+    }
     let _ = media.close(reader.generation());
     #[cfg(test)]
     connection
@@ -806,6 +815,16 @@ mod tests {
         MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
         SessionCommand, SessionEvent, SurfacePublisher,
     };
+
+    #[test]
+    fn debug_media_close_summary_is_limited_to_product_high_performance() {
+        assert!(super::should_emit_debug_media_close_summary(
+            &frd_core::ProtocolId::apple_high_performance()
+        ));
+        assert!(!super::should_emit_debug_media_close_summary(
+            &frd_core::ProtocolId::apple_hpss_mvs()
+        ));
+    }
 
     struct NoopWake;
 

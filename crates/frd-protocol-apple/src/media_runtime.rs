@@ -49,6 +49,7 @@ pub(crate) struct ViewerMediaState {
     pub(crate) non_silent_audio_access_units: u64,
     pub(crate) concealed_audio_access_units: u64,
     pub(crate) authenticated_video_packets: u64,
+    active_service_ticks: u64,
     video_stream_1: VideoReceiveState,
     video_stream_2: VideoReceiveState,
     audio_degraded: bool,
@@ -59,6 +60,7 @@ struct VideoReceiveState {
     assembler: HevcAccessUnitAssembler,
     adapter: AppleHighPerformanceVideoAdapter,
     stage_trace: MediaStageTrace,
+    authenticated_rtp_packets: u64,
 }
 
 impl VideoReceiveState {
@@ -68,6 +70,7 @@ impl VideoReceiveState {
                 .context("创建 Apple HP HEVC AU 组装器失败")?,
             adapter: AppleHighPerformanceVideoAdapter::new(identity, generation),
             stage_trace: MediaStageTrace::default(),
+            authenticated_rtp_packets: 0,
         })
     }
 
@@ -75,9 +78,11 @@ impl VideoReceiveState {
         self.assembler.reset(generation);
         self.adapter.reset(generation);
         self.stage_trace = MediaStageTrace::default();
+        self.authenticated_rtp_packets = 0;
     }
 
     fn observe_authenticated_rtp(&mut self, generation: u64) {
+        self.authenticated_rtp_packets = self.authenticated_rtp_packets.saturating_add(1);
         self.stage_trace
             .observe(MediaStageDiagnostic::AuthenticatedVideoRtp {
                 generation,
@@ -168,6 +173,7 @@ impl ViewerMediaState {
             non_silent_audio_access_units: 0,
             concealed_audio_access_units: 0,
             authenticated_video_packets: 0,
+            active_service_ticks: 0,
             video_stream_1: VideoReceiveState::new(
                 VideoStreamIdentity {
                     session_id,
@@ -192,6 +198,8 @@ impl ViewerMediaState {
         self.audio_receiver = ArdAudioReceiver::new().context("重建 Mac→PC AAC-ELD 接收器失败")?;
         self.video_stream_1.reset(generation);
         self.video_stream_2.reset(generation);
+        self.authenticated_video_packets = 0;
+        self.active_service_ticks = 0;
         self.audio_degraded = false;
         self.control_stage_trace = MediaStageTrace::default();
         Ok(())
@@ -244,6 +252,7 @@ impl ViewerMediaState {
         if self.transport.phase() != MediaTransportPhase::Active {
             return Ok(0);
         }
+        self.active_service_ticks = self.active_service_ticks.saturating_add(1);
         self.transport.service_control_reports_at(generation, now)?;
         let Self {
             transport,
@@ -257,6 +266,7 @@ impl ViewerMediaState {
             video_stream_1,
             video_stream_2,
             audio_degraded,
+            active_service_ticks: _,
             control_stage_trace: _,
         } = self;
         let summary = transport.drain_receive_round(generation, |role, datagram| {
@@ -282,6 +292,46 @@ impl ViewerMediaState {
 
     pub(crate) fn close(&mut self, generation: u64) -> Result<()> {
         self.transport.close(generation)
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    pub(crate) fn debug_close_summary(&self) -> String {
+        let discards = self.transport.discard_counters();
+        let stream_1_assembler = self.video_stream_1.assembler.diagnostics();
+        let stream_2_assembler = self.video_stream_2.assembler.diagnostics();
+        let stream_1_adapter = self.video_stream_1.adapter.diagnostics();
+        let stream_2_adapter = self.video_stream_2.adapter.diagnostics();
+        format!(
+            "[frd-media-summary] active_service_ticks={} authenticated_video_rtp_stream_1={} authenticated_video_rtp_stream_2={} discard_unexpected_source={} discard_empty_datagram={} discard_truncated_header={} discard_malformed_packet={} discard_authentication_failed={} discard_replay_or_too_old={} stream_1_complete_configuration_access_units={} stream_1_reorder_window_exceeded={} stream_1_recovery_marker_resyncs={} stream_1_waiting_for_recovery_irap_drops={} stream_1_completed_access_units={} stream_2_complete_configuration_access_units={} stream_2_reorder_window_exceeded={} stream_2_recovery_marker_resyncs={} stream_2_waiting_for_recovery_irap_drops={} stream_2_completed_access_units={} stream_1_video_config_publications={} stream_1_encoded_video_publications={} stream_2_video_config_publications={} stream_2_encoded_video_publications={}",
+            self.active_service_ticks,
+            self.video_stream_1.authenticated_rtp_packets,
+            self.video_stream_2.authenticated_rtp_packets,
+            discards.unexpected_source,
+            discards.empty_datagram,
+            discards.truncated_header,
+            discards.malformed_packet,
+            discards.authentication_failed,
+            discards.replay_or_too_old,
+            stream_1_assembler.complete_configuration_access_units,
+            stream_1_assembler.reorder_window_exceeded,
+            stream_1_assembler.recovery_marker_resyncs,
+            stream_1_assembler.waiting_for_recovery_irap_drops,
+            stream_1_assembler.completed_access_units,
+            stream_2_assembler.complete_configuration_access_units,
+            stream_2_assembler.reorder_window_exceeded,
+            stream_2_assembler.recovery_marker_resyncs,
+            stream_2_assembler.waiting_for_recovery_irap_drops,
+            stream_2_assembler.completed_access_units,
+            stream_1_adapter.video_config_publications,
+            stream_1_adapter.encoded_video_publications,
+            stream_2_adapter.video_config_publications,
+            stream_2_adapter.encoded_video_publications,
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn emit_debug_close_summary(&self) {
+        eprintln!("{}", self.debug_close_summary());
     }
 }
 
@@ -690,6 +740,16 @@ mod tests {
             matches!(&published[1], MediaFrame::EncodedVideo(access_unit)
             if access_unit.identity().session_id == session_id
                 && access_unit.identity().stream_id == 1)
+        );
+        assert_eq!(
+            state.debug_close_summary(),
+            "[frd-media-summary] active_service_ticks=0 authenticated_video_rtp_stream_1=1 authenticated_video_rtp_stream_2=0 discard_unexpected_source=0 discard_empty_datagram=0 discard_truncated_header=0 discard_malformed_packet=0 discard_authentication_failed=0 discard_replay_or_too_old=0 stream_1_complete_configuration_access_units=1 stream_1_reorder_window_exceeded=0 stream_1_recovery_marker_resyncs=0 stream_1_waiting_for_recovery_irap_drops=0 stream_1_completed_access_units=1 stream_2_complete_configuration_access_units=0 stream_2_reorder_window_exceeded=0 stream_2_recovery_marker_resyncs=0 stream_2_waiting_for_recovery_irap_drops=0 stream_2_completed_access_units=0 stream_1_video_config_publications=1 stream_1_encoded_video_publications=1 stream_2_video_config_publications=0 stream_2_encoded_video_publications=0"
+        );
+
+        state.reset_generation(2).unwrap();
+        assert_eq!(
+            state.debug_close_summary(),
+            "[frd-media-summary] active_service_ticks=0 authenticated_video_rtp_stream_1=0 authenticated_video_rtp_stream_2=0 discard_unexpected_source=0 discard_empty_datagram=0 discard_truncated_header=0 discard_malformed_packet=0 discard_authentication_failed=0 discard_replay_or_too_old=0 stream_1_complete_configuration_access_units=0 stream_1_reorder_window_exceeded=0 stream_1_recovery_marker_resyncs=0 stream_1_waiting_for_recovery_irap_drops=0 stream_1_completed_access_units=0 stream_2_complete_configuration_access_units=0 stream_2_reorder_window_exceeded=0 stream_2_recovery_marker_resyncs=0 stream_2_waiting_for_recovery_irap_drops=0 stream_2_completed_access_units=0 stream_1_video_config_publications=0 stream_1_encoded_video_publications=0 stream_2_video_config_publications=0 stream_2_encoded_video_publications=0"
         );
     }
 
