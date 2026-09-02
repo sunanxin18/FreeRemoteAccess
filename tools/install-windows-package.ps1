@@ -2,15 +2,27 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$PackageRoot,
-    [switch]$Elevated
+    [switch]$Elevated,
+    [Parameter(DontShow = $true)]
+    [byte[]]$TrustedVerifierBytes
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
+$repoRoot = $null
+$verifier = $null
+$bootstrapBuilder = $null
+if (-not $Elevated) {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        throw "非管理员安装必须从固定 installer 文件启动"
+    }
+    $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+    $verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
+    $bootstrapBuilder = Join-Path $repoRoot "tools\new-windows-installer-bootstrap.ps1"
+}
 $expectedVerifierSha256 = "74D50DFA2786AD3712214E927A429CA4AB947DE9EAFD86C67089B265ACA7D968"
+$expectedBootstrapBuilderSha256 = "4CA4924D92A42704DA14BB1F8709B12681CF13264FA4530F4DFB845588AE16D0"
 $package = [IO.Path]::GetFullPath($PackageRoot)
 $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
 $elevationHost = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
@@ -37,7 +49,15 @@ if ($hostSignature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
     throw "系统 PowerShell 主机签名无效"
 }
 
-$verifierFileBytes = [IO.File]::ReadAllBytes($verifier)
+$verifierFileBytes = if ($Elevated) {
+    if ($null -eq $TrustedVerifierBytes -or $TrustedVerifierBytes.Length -eq 0) {
+        throw "管理员安装缺少由父进程 hash 锚定的 package verifier"
+    }
+    $TrustedVerifierBytes
+}
+else {
+    [IO.File]::ReadAllBytes($verifier)
+}
 $hasUtf8Bom = $verifierFileBytes.Length -ge 3 -and
     $verifierFileBytes[0] -eq 0xEF -and $verifierFileBytes[1] -eq 0xBB -and $verifierFileBytes[2] -eq 0xBF
 $verifierBytes = if ($hasUtf8Bom) { $verifierFileBytes[3..($verifierFileBytes.Length - 1)] } else { $verifierFileBytes }
@@ -80,121 +100,56 @@ if (-not $isAdministrator) {
     if ($Elevated) {
         throw "UAC 提权后仍未获得管理员权限"
     }
-    function ConvertTo-GzipBase64([byte[]]$InputBytes) {
-        $output = [IO.MemoryStream]::new()
-        $gzip = [IO.Compression.GZipStream]::new($output, [IO.Compression.CompressionMode]::Compress, $true)
-        try {
-            $gzip.Write($InputBytes, 0, $InputBytes.Length)
-        }
-        finally {
-            $gzip.Dispose()
-        }
-        try {
-            return [Convert]::ToBase64String($output.ToArray())
-        }
-        finally {
-            $output.Dispose()
-        }
+    $installerBytes = [Text.Encoding]::UTF8.GetBytes($MyInvocation.MyCommand.ScriptBlock.ToString())
+    $bootstrapBuilderFileBytes = [IO.File]::ReadAllBytes($bootstrapBuilder)
+    $builderHasUtf8Bom = $bootstrapBuilderFileBytes.Length -ge 3 -and
+        $bootstrapBuilderFileBytes[0] -eq 0xEF -and
+        $bootstrapBuilderFileBytes[1] -eq 0xBB -and
+        $bootstrapBuilderFileBytes[2] -eq 0xBF
+    $bootstrapBuilderBytesWithCheckoutLineEndings = if ($builderHasUtf8Bom) {
+        $bootstrapBuilderFileBytes[3..($bootstrapBuilderFileBytes.Length - 1)]
+    }
+    else {
+        $bootstrapBuilderFileBytes
+    }
+    $bootstrapBuilderText = [Text.Encoding]::UTF8.GetString($bootstrapBuilderBytesWithCheckoutLineEndings).Replace("`r`n", "`n")
+    $bootstrapBuilderBytes = [Text.Encoding]::UTF8.GetBytes($bootstrapBuilderText)
+    $builderSha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actualBootstrapBuilderSha256 = (($builderSha.ComputeHash($bootstrapBuilderBytes) |
+                ForEach-Object { $_.ToString("X2") }) -join "")
+    }
+    finally {
+        $builderSha.Dispose()
+    }
+    if ($actualBootstrapBuilderSha256 -cne $expectedBootstrapBuilderSha256) {
+        throw "elevation bootstrap builder 与 installer 固定版本不匹配"
     }
 
-    $forward = @{ package = $package } | ConvertTo-Json -Compress
-    $data = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($forward))
-    $utf8Bom = [Text.Encoding]::UTF8.GetPreamble()
-    $installerBytes = [Text.Encoding]::UTF8.GetBytes($MyInvocation.MyCommand.ScriptBlock.ToString())
-    $installerFileBytes = [byte[]]@($utf8Bom + $installerBytes)
-    $verifierEmbeddedBytes = [byte[]]@($utf8Bom + $verifierBytes)
-    $installerBlob = ConvertTo-GzipBase64 $installerFileBytes
-    $verifierBlob = ConvertTo-GzipBase64 $verifierEmbeddedBytes
-    $installerSha = [Security.Cryptography.SHA256]::Create()
+    $bootstrapBuilderScript = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($bootstrapBuilderBytes))
+    $plan = $null
     try {
-        $installerHash = (($installerSha.ComputeHash($installerFileBytes) | ForEach-Object { $_.ToString("X2") }) -join "")
+        $plan = & $bootstrapBuilderScript `
+            -InstallerBytes $installerBytes `
+            -VerifierBytes $verifierBytes `
+            -PackageRoot $package
+        if ($plan.EncodedCommand.Length -ge 30000) {
+            throw "管理员安装 bootstrap 超过 Windows 安全命令行上限"
+        }
+        $child = Start-Process -FilePath $elevationHost -Verb RunAs -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $plan.EncodedCommand
+        ) -Wait -PassThru
+        if ($child.ExitCode -ne 0) {
+            throw "管理员安装进程失败，退出码 $($child.ExitCode)"
+        }
     }
     finally {
-        $installerSha.Dispose()
-    }
-    $verifierFileSha = [Security.Cryptography.SHA256]::Create()
-    try {
-        $verifierHash = (($verifierFileSha.ComputeHash($verifierEmbeddedBytes) | ForEach-Object { $_.ToString("X2") }) -join "")
-    }
-    finally {
-        $verifierFileSha.Dispose()
-    }
-    $bootstrap = @"
-`$ErrorActionPreference = 'Stop'
-function Expand-EmbeddedScript([string]`$Value) {
-    `$compressed = [Convert]::FromBase64String(`$Value)
-    `$input = New-Object IO.MemoryStream(,`$compressed)
-    `$gzip = New-Object IO.Compression.GZipStream(`$input, [IO.Compression.CompressionMode]::Decompress)
-    `$output = New-Object IO.MemoryStream
-    try { `$gzip.CopyTo(`$output); return `$output.ToArray() }
-    finally { `$gzip.Dispose(); `$input.Dispose(); `$output.Dispose() }
-}
-`$programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
-`$systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
-`$icacls = Join-Path `$systemDirectory 'icacls.exe'
-`$helperRoot = Join-Path `$programFiles ('.FreeRemoteDesk.installer-' + [Guid]::NewGuid().ToString('N'))
-try {
-    `$argsJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$data')) | ConvertFrom-Json
-    `$tools = Join-Path `$helperRoot 'tools'
-    New-Item -ItemType Directory -Path `$tools -Force | Out-Null
-    & `$icacls `$helperRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' '*S-1-5-32-545:(OI)(CI)(RX)' /Q
-    if (`$LASTEXITCODE -ne 0) { throw '无法保护管理员安装脚本目录' }
-    `$installerPath = Join-Path `$tools 'install-windows-package.ps1'
-    `$verifierPath = Join-Path `$tools 'verify-windows-package.ps1'
-    [IO.File]::WriteAllBytes(`$installerPath, (Expand-EmbeddedScript '$installerBlob'))
-    [IO.File]::WriteAllBytes(`$verifierPath, (Expand-EmbeddedScript '$verifierBlob'))
-    & `$icacls `$helperRoot /setowner '*S-1-5-32-544' /T /C /Q
-    if (`$LASTEXITCODE -ne 0) { throw '无法保护管理员安装脚本 owner' }
-    if ((Get-FileHash -LiteralPath `$installerPath -Algorithm SHA256).Hash -cne '$installerHash' -or
-        (Get-FileHash -LiteralPath `$verifierPath -Algorithm SHA256).Hash -cne '$verifierHash') {
-        throw '管理员安装脚本 payload hash 不匹配'
-    }
-    & `$installerPath -PackageRoot `$argsJson.package -Elevated
-    exit 0
-}
-catch {
-    Write-Error `$_
-    exit 1
-}
-finally {
-    if (Test-Path -LiteralPath `$helperRoot) {
-        Remove-Item -LiteralPath `$helperRoot -Recurse -Force
-    }
-}
-"@
-    $bootstrapBytes = [Text.Encoding]::UTF8.GetBytes($bootstrap)
-    $bootstrapOutput = [IO.MemoryStream]::new()
-    $bootstrapGzip = [IO.Compression.GZipStream]::new($bootstrapOutput, [IO.Compression.CompressionMode]::Compress, $true)
-    try {
-        $bootstrapGzip.Write($bootstrapBytes, 0, $bootstrapBytes.Length)
-    }
-    finally {
-        $bootstrapGzip.Dispose()
-    }
-    try {
-        $bootstrapBlob = [Convert]::ToBase64String($bootstrapOutput.ToArray())
-    }
-    finally {
-        $bootstrapOutput.Dispose()
-    }
-    $launcher = @"
-`$compressed = [Convert]::FromBase64String('$bootstrapBlob')
-`$input = New-Object IO.MemoryStream(,`$compressed)
-`$gzip = New-Object IO.Compression.GZipStream(`$input, [IO.Compression.CompressionMode]::Decompress)
-`$output = New-Object IO.MemoryStream
-try { `$gzip.CopyTo(`$output); `$code = [Text.Encoding]::UTF8.GetString(`$output.ToArray()) }
-finally { `$gzip.Dispose(); `$input.Dispose(); `$output.Dispose() }
-& ([ScriptBlock]::Create(`$code))
-"@
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launcher))
-    if ($encoded.Length -gt 30000) {
-        throw "管理员安装 bootstrap 超过 Windows 安全命令行上限"
-    }
-    $child = Start-Process -FilePath $elevationHost -Verb RunAs -WindowStyle Hidden -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded
-    ) -Wait -PassThru
-    if ($child.ExitCode -ne 0) {
-        throw "管理员安装进程失败，退出码 $($child.ExitCode)"
+        if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
+            [IO.File]::Delete($plan.PayloadPath)
+        }
+        if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
+            [IO.Directory]::Delete($plan.StagingRoot, $false)
+        }
     }
     return
 }

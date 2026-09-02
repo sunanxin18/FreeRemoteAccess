@@ -3,6 +3,7 @@ $packageRoot = Join-Path $repoRoot "target\package-test"
 $codecRoot = Join-Path $packageRoot "codecs\ffmpeg-8.1.2\windows-x86_64"
 $verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
 $installer = Join-Path $repoRoot "tools\install-windows-package.ps1"
+$bootstrapBuilder = Join-Path $repoRoot "tools\new-windows-installer-bootstrap.ps1"
 $correspondingSourceAsset = Join-Path $repoRoot "target\release-assets\FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip"
 
 Describe "Windows package verification security boundaries" {
@@ -171,5 +172,118 @@ Describe "Windows package verification security boundaries" {
         (Test-Path -LiteralPath $correspondingSourceAsset -PathType Leaf) | Should Be $true
         $manifest = Get-Content -Raw -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
         (Get-FileHash -LiteralPath $correspondingSourceAsset -Algorithm SHA256).Hash | Should Be $manifest.correspondingSource.sha256
+    }
+}
+
+Describe "Windows elevation bootstrap security boundary" {
+    It "runs the real elevated installer from hash-checked in-memory bytes without a script path" {
+        $installerFileBytes = [IO.File]::ReadAllBytes($installer)
+        $installerHasBom = $installerFileBytes.Length -ge 3 -and
+            $installerFileBytes[0] -eq 0xEF -and
+            $installerFileBytes[1] -eq 0xBB -and
+            $installerFileBytes[2] -eq 0xBF
+        $installerBytes = if ($installerHasBom) {
+            $installerFileBytes[3..($installerFileBytes.Length - 1)]
+        }
+        else {
+            $installerFileBytes
+        }
+        $verifierFileBytes = [IO.File]::ReadAllBytes($verifier)
+        $verifierHasBom = $verifierFileBytes.Length -ge 3 -and
+            $verifierFileBytes[0] -eq 0xEF -and
+            $verifierFileBytes[1] -eq 0xBB -and
+            $verifierFileBytes[2] -eq 0xBF
+        $verifierBytes = if ($verifierHasBom) {
+            $verifierFileBytes[3..($verifierFileBytes.Length - 1)]
+        }
+        else {
+            $verifierFileBytes
+        }
+        $installerScript = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($installerBytes))
+
+        $output = & $installerScript `
+            -PackageRoot $packageRoot `
+            -Elevated `
+            -TrustedVerifierBytes $verifierBytes `
+            -WhatIf *>&1
+
+        ($output -join "`n") | Should Match "Windows package installation planned"
+    }
+
+    It "keeps a large installer payload below the Windows command-line limit and executes the hash-bound bytes" {
+        $marker = Join-Path $TestDrive "large-bootstrap.marker"
+        $packageArgument = Join-Path $TestDrive "package argument with spaces"
+        $installerText = @"
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = `$true)][string]`$PackageRoot,
+    [switch]`$Elevated,
+    [byte[]]`$TrustedVerifierBytes
+)
+if (-not `$Elevated) { throw 'expected elevated bundle mode' }
+if (`$TrustedVerifierBytes.Length -lt 131072) { throw 'verifier payload was truncated' }
+[IO.File]::WriteAllText('$($marker.Replace("'", "''"))', `$PackageRoot, [Text.Encoding]::UTF8)
+"@
+        $largeVerifier = New-Object byte[] 131072
+        ([Random]::new(8675309)).NextBytes($largeVerifier)
+        $plan = $null
+        try {
+            $plan = & $bootstrapBuilder `
+                -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
+                -VerifierBytes $largeVerifier `
+                -PackageRoot $packageArgument `
+                -StagingParent $TestDrive
+
+            $plan.EncodedCommand.Length | Should BeLessThan 30000
+            $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+            $systemPowerShell = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
+            $output = & $systemPowerShell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $plan.EncodedCommand 2>&1
+
+            $LASTEXITCODE | Should Be 0
+            (Get-Content -Raw -LiteralPath $marker) | Should Be $packageArgument
+            ($output -join "`n") | Should Match "FreeRemoteDesk 管理员 payload 已通过校验"
+        }
+        finally {
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.PayloadPath -Force
+            }
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
+                Remove-Item -LiteralPath $plan.StagingRoot -Force
+            }
+        }
+    }
+
+    It "rejects a staged elevation bundle changed after its hash was anchored" {
+        $marker = Join-Path $TestDrive "tampered-bootstrap.marker"
+        $installerText = @"
+[CmdletBinding()]
+param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
+[IO.File]::WriteAllText('$($marker.Replace("'", "''"))', 'executed')
+"@
+        $plan = $null
+        try {
+            $plan = & $bootstrapBuilder `
+                -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
+                -VerifierBytes ([Text.Encoding]::UTF8.GetBytes("trusted verifier")) `
+                -PackageRoot $TestDrive `
+                -StagingParent $TestDrive
+            [IO.File]::AppendAllText($plan.PayloadPath, "tampered")
+
+            $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+            $systemPowerShell = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
+            $output = & $systemPowerShell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $plan.EncodedCommand 2>&1
+
+            $LASTEXITCODE | Should Not Be 0
+            (Test-Path -LiteralPath $marker) | Should Be $false
+            ($output -join "`n") | Should Match "管理员 elevation payload SHA-256 不匹配"
+        }
+        finally {
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.PayloadPath -Force
+            }
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
+                Remove-Item -LiteralPath $plan.StagingRoot -Force
+            }
+        }
     }
 }
