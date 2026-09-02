@@ -108,6 +108,7 @@ int32_t frd_native_decoder_create(const uint8_t *extradata,
     }
     memcpy(state->codec->extradata, extradata, extradata_len);
     state->codec->extradata_size = (int)extradata_len;
+    state->codec->apply_cropping = 0;
 
     result = avcodec_open2(state->codec, decoder, NULL);
     if (result < 0) {

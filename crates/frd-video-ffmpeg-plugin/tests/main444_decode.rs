@@ -144,6 +144,78 @@ fn fixed_ffmpeg_decodes_synthetic_main444_idr_to_owned_yuv444p8() {
 }
 
 #[test]
+fn fixed_ffmpeg_preserves_coded_planes_for_synthetic_cropped_main444_idr() {
+    const CODED_WIDTH: u32 = 16;
+    const CODED_HEIGHT: u32 = 16;
+    const PLANE_STRIDE_BYTES: u32 = 16;
+
+    let bitstream = include_bytes!("fixtures/synthetic-main444-cropped-16x8.hevc");
+    let nals = annex_b_nals(bitstream);
+    assert_eq!(
+        nals.iter().map(|nal| nal.kind).collect::<Vec<_>>(),
+        vec![32, 33, 34, 20],
+        "裁剪 fixture 必须只含 VPS/SPS/PPS 和单个 IDR_N_LP"
+    );
+
+    let loaded = unsafe { load_direct_api(&development_codec_bundle()) };
+    let api = loaded.api;
+    let config = FrdVideoConfig {
+        codec: FRD_CODEC_HEVC,
+        profile: FRD_PROFILE_HEVC_MAIN_444_8,
+        chroma: FRD_CHROMA_YUV_444,
+        bit_depth: 8,
+        coded_width: CODED_WIDTH,
+        coded_height: CODED_HEIGHT,
+        timebase: 90_000,
+        bitstream_format: FRD_BITSTREAM_ANNEX_B,
+        vps: byte_slice(nals[0].bytes),
+        sps: byte_slice(nals[1].bytes),
+        pps: byte_slice(nals[2].bytes),
+    };
+
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: config and output storage remain valid for the call; the validated table owns the
+    // returned handle until the matching destroy callback below.
+    assert_eq!(unsafe { (api.create)(&config, &mut handle) }, FrdStatus::OK);
+    assert!(!handle.is_null());
+
+    let access_unit = with_start_code(nals[3].bytes);
+    // SAFETY: handle is exclusively owned and serialized; input bytes live through the call.
+    let submit_status = unsafe {
+        (api.submit)(
+            handle,
+            access_unit.as_ptr(),
+            access_unit.len(),
+            90_000,
+            FRD_SUBMIT_RANDOM_ACCESS,
+        )
+    };
+    assert!(
+        submit_status == FrdStatus::OK || submit_status == FrdStatus::NEED_MORE_DATA,
+        "submit 应接受经验证的 Annex-B IDR，实际 {submit_status:?}"
+    );
+
+    let mut decoded = unsafe { receive_one_frame(api, handle) };
+    assert_eq!(decoded.timestamp_ticks, 90_000);
+    assert_eq!(decoded.pixel_format, FRD_PIXEL_FORMAT_YUV_444_P8);
+    assert_eq!(decoded.plane_count, 3);
+    for plane in decoded.planes {
+        assert_eq!(plane.width, CODED_WIDTH);
+        assert_eq!(plane.height, CODED_HEIGHT);
+        assert_eq!(plane.stride_bytes, PLANE_STRIDE_BYTES);
+        assert_eq!(
+            plane.buffer.len,
+            usize::try_from(PLANE_STRIDE_BYTES * CODED_HEIGHT).unwrap()
+        );
+        assert!(!plane.buffer.data.is_null());
+    }
+    // SAFETY: exactly-once reclamation of the successful receive output.
+    unsafe { (api.reclaim)(handle, &mut decoded) };
+    // SAFETY: final release of the exclusive handle.
+    unsafe { (api.destroy)(handle) };
+}
+
+#[test]
 fn native_callbacks_fail_closed_for_out_of_contract_inputs() {
     let metadata = fixture_metadata(include_str!("fixtures/apple-main444-idr.json"));
     let nals = annex_b_nals(include_bytes!("fixtures/apple-main444-idr.hevc"));
