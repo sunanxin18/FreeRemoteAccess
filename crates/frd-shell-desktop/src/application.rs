@@ -110,6 +110,12 @@ fn classify_ime_before_egui<'a>(
     }
 }
 
+fn schedule_egui_repaint(event: &WindowEvent, repaint: bool, request_redraw: impl FnOnce()) {
+    if repaint && !matches!(event, WindowEvent::RedrawRequested) {
+        request_redraw();
+    }
+}
+
 pub trait WakeSink: Send + Sync {
     fn wake(&self) -> Result<(), ProtocolError>;
 }
@@ -1304,6 +1310,14 @@ impl VideoBinding {
             size: self.size,
         }
     }
+}
+
+fn content_viewport_for_surface(
+    remote: PixelSize,
+    drawable: PixelSize,
+    remote_area: PixelRect,
+) -> Option<ContentViewport> {
+    ContentViewport::fit_in(remote, drawable, remote_area)
 }
 
 fn detach_video_for_matching_failure(
@@ -2731,11 +2745,12 @@ impl DesktopApplication {
 
     fn content_viewport(&self) -> Option<ContentViewport> {
         let window = self.window.as_ref()?;
-        let remote = window
-            .video
-            .map(VideoBinding::remote_binding)
-            .or(window.remote)?;
-        ContentViewport::fit_in(remote.size, window.physical_size, window.remote_area?)
+        let remote = if let Some(video) = window.video {
+            video.remote_binding()
+        } else {
+            window.remote?
+        };
+        content_viewport_for_surface(remote.size, window.physical_size, window.remote_area?)
     }
 
     fn send_viewport_changed(&self) {
@@ -2894,10 +2909,10 @@ impl DesktopApplication {
             pixels_per_point: output.pixels_per_point,
         };
         let remote_viewport = window.remote.and_then(|remote| {
-            ContentViewport::fit_in(remote.size, window.physical_size, window.remote_area?)
+            content_viewport_for_surface(remote.size, window.physical_size, window.remote_area?)
         });
         let video_viewport = window.video.and_then(|video| {
-            ContentViewport::fit_in(video.size, window.physical_size, window.remote_area?)
+            content_viewport_for_surface(video.size, window.physical_size, window.remote_area?)
         });
         for (id, deltas) in &output.textures_delta.set {
             for delta in deltas {
@@ -3398,9 +3413,11 @@ impl DesktopApplication {
             return;
         }
         let interactive = self.input.interactive_epoch().is_some();
+        let content_viewport = self.content_viewport();
         let ownership = self.window.as_ref().and_then(|window| {
             effective_pointer_keyboard_ownership(
                 window.chrome_layout?,
+                content_viewport,
                 window.cursor_position?,
                 consumed_by_egui,
                 interactive,
@@ -3796,9 +3813,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             return;
         };
         let response = window.egui_state.on_window_event(&window.window, &event);
-        if response.repaint {
-            window.window.request_redraw();
-        }
+        schedule_egui_repaint(&event, response.repaint, || window.window.request_redraw());
         if let WindowEvent::CursorMoved { position, .. } = &event {
             let position = (position.x >= 0.0 && position.y >= 0.0)
                 .then_some((position.x as u32, position.y as u32));
@@ -4099,6 +4114,7 @@ fn map_mouse_button(button: MouseButton) -> Option<PointerButton> {
 
 fn pointer_keyboard_ownership(
     layout: ChromeLayout,
+    content_viewport: Option<ContentViewport>,
     position: (u32, u32),
 ) -> Option<InputOwnership> {
     match layout.hit_test(position.0, position.1) {
@@ -4107,12 +4123,16 @@ fn pointer_keyboard_ownership(
         | ChromeHit::Clipboard
         | ChromeHit::SessionAction => Some(InputOwnership::Ui),
         ChromeHit::Client => {
-            let rect = layout.content_rect;
+            let rect = content_viewport?.content;
             let in_content = position.0 >= rect.x
                 && position.1 >= rect.y
                 && position.0 < rect.x.saturating_add(rect.width)
                 && position.1 < rect.y.saturating_add(rect.height);
-            in_content.then_some(InputOwnership::Remote)
+            Some(if in_content {
+                InputOwnership::Remote
+            } else {
+                InputOwnership::Ui
+            })
         }
         ChromeHit::Drag | ChromeHit::Minimize | ChromeHit::Maximize | ChromeHit::Close => None,
     }
@@ -4120,11 +4140,12 @@ fn pointer_keyboard_ownership(
 
 fn effective_pointer_keyboard_ownership(
     layout: ChromeLayout,
+    content_viewport: Option<ContentViewport>,
     position: (u32, u32),
     consumed_by_egui: bool,
     interactive: bool,
 ) -> Option<InputOwnership> {
-    match pointer_keyboard_ownership(layout, position) {
+    match pointer_keyboard_ownership(layout, content_viewport, position) {
         Some(InputOwnership::Remote) if consumed_by_egui || !interactive => {
             Some(InputOwnership::Ui)
         }
@@ -4355,8 +4376,8 @@ mod tests {
         AppAction, AppController, AppIntent, AppPlatformStores, PresentationEvent, ProductPolicy,
     };
     use frd_core::{
-        Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelRect, PixelSize,
-        ProtocolId, SecretBuffer, SessionId, TargetSystem,
+        ContentViewport, Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelRect,
+        PixelSize, ProtocolId, SecretBuffer, SessionId, TargetSystem,
     };
     use frd_frame::{
         EnqueuedSurfaceUpdate, FrameCompleteness, FrameReset, FrameRevision, FrameTransaction,
@@ -4385,7 +4406,7 @@ mod tests {
     };
     use frd_session::reserve_session_start;
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
-    use winit::event::Ime;
+    use winit::event::{Ime, WindowEvent};
 
     use super::{
         accept_batch_outcome, apply_compiled_drain, detach_video_for_matching_failure,
@@ -4398,6 +4419,80 @@ mod tests {
         VideoSurfaceDrainTarget, WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
+
+    #[test]
+    fn egui_repaint_schedules_redraw_only_for_non_redraw_requested_events() {
+        let mut redraws = 0;
+        super::schedule_egui_repaint(&WindowEvent::RedrawRequested, true, || redraws += 1);
+        assert_eq!(redraws, 0);
+
+        super::schedule_egui_repaint(&WindowEvent::Focused(true), true, || redraws += 1);
+        assert_eq!(redraws, 1);
+
+        redraws = 0;
+        super::schedule_egui_repaint(&WindowEvent::Focused(true), false, || redraws += 1);
+        assert_eq!(redraws, 0);
+    }
+
+    #[test]
+    fn apple_mvs_pixel_surface_uses_aspect_fit_and_exact_pointer_mapping() {
+        let viewport = super::content_viewport_for_surface(
+            PixelSize::new(1920, 1080).unwrap(),
+            PixelSize::new(2240, 1337).unwrap(),
+            PixelRect {
+                x: 20,
+                y: 50,
+                width: 2200,
+                height: 1237,
+            },
+        )
+        .expect("有效的 Apple Standard/MVS 像素 surface 必须有视口");
+
+        assert_eq!(
+            viewport.content,
+            PixelRect {
+                x: 20,
+                y: 50,
+                width: 2199,
+                height: 1237,
+            }
+        );
+        assert_eq!(
+            viewport.map_pointer(20.0, 50.0),
+            Some(frd_core::PixelPoint { x: 0, y: 0 })
+        );
+        assert_eq!(
+            viewport.map_pointer(2218.0, 1286.0),
+            Some(frd_core::PixelPoint { x: 1919, y: 1079 })
+        );
+    }
+
+    #[test]
+    fn high_performance_video_and_rdp_pixel_surfaces_keep_fit_behavior() {
+        let drawable = PixelSize::new(2240, 1337).unwrap();
+        let remote_area = PixelRect {
+            x: 20,
+            y: 50,
+            width: 2200,
+            height: 1237,
+        };
+        let remote = PixelSize::new(1920, 1080).unwrap();
+
+        let high_performance_video =
+            super::content_viewport_for_surface(remote, drawable, remote_area)
+                .expect("有效的视频 surface 必须有视口");
+        let rdp_pixel = super::content_viewport_for_surface(remote, drawable, remote_area)
+            .expect("有效的 RDP 像素 surface 必须有视口");
+
+        let expected_fit = PixelRect {
+            x: 20,
+            y: 50,
+            width: 2199,
+            height: 1237,
+        };
+        assert_eq!(high_performance_video.content, expected_fit);
+        assert_eq!(rdp_pixel.content, expected_fit);
+    }
 
     #[test]
     fn video_confirmation_echoes_only_the_exact_presented_receipt_value() {
@@ -5492,6 +5587,11 @@ mod tests {
     #[test]
     fn pointer_domain_changes_only_for_session_glyphs_and_remote_content() {
         let layout = crate::ChromeLayout::for_window(1100, 720, 1.0, 0, 144).unwrap();
+        let viewport = ContentViewport {
+            drawable: PixelSize::new(1100, 720).unwrap(),
+            content: layout.content_rect,
+            remote: PixelSize::new(1100, 676).unwrap(),
+        };
         let glyph = layout.session_buttons[0].center();
         let content = (
             layout.content_rect.x + layout.content_rect.width / 2,
@@ -5499,32 +5599,93 @@ mod tests {
         );
 
         assert_eq!(
-            super::pointer_keyboard_ownership(layout, glyph),
+            super::pointer_keyboard_ownership(layout, Some(viewport), glyph),
             Some(crate::InputOwnership::Ui)
         );
         assert_eq!(
-            super::pointer_keyboard_ownership(layout, content),
+            super::pointer_keyboard_ownership(layout, Some(viewport), content),
             Some(crate::InputOwnership::Remote)
         );
         assert_eq!(
-            super::effective_pointer_keyboard_ownership(layout, content, true, true),
+            super::effective_pointer_keyboard_ownership(
+                layout,
+                Some(viewport),
+                content,
+                true,
+                true
+            ),
             Some(crate::InputOwnership::Ui)
         );
         assert_eq!(
-            super::effective_pointer_keyboard_ownership(layout, content, false, false),
+            super::effective_pointer_keyboard_ownership(
+                layout,
+                Some(viewport),
+                content,
+                false,
+                false
+            ),
             Some(crate::InputOwnership::Ui)
         );
         assert_eq!(
-            super::effective_pointer_keyboard_ownership(layout, content, false, true),
+            super::effective_pointer_keyboard_ownership(
+                layout,
+                Some(viewport),
+                content,
+                false,
+                true
+            ),
             Some(crate::InputOwnership::Remote)
         );
-        assert_eq!(super::pointer_keyboard_ownership(layout, (100, 20)), None);
+        assert_eq!(
+            super::pointer_keyboard_ownership(layout, Some(viewport), (100, 20)),
+            None
+        );
         assert_eq!(
             super::pointer_keyboard_ownership(
                 layout,
+                Some(viewport),
                 layout.minimize_button.expect("Windows layout").center(),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn mvs_letterbox_cannot_claim_remote_keyboard_domain() {
+        let layout = crate::ChromeLayout::for_window(2240, 1337, 1.0, 0, 0).unwrap();
+        let viewport = ContentViewport::fit_in(
+            PixelSize::new(1920, 1080).unwrap(),
+            PixelSize::new(2240, 1337).unwrap(),
+            PixelRect {
+                x: 20,
+                y: 50,
+                width: 2200,
+                height: 1237,
+            },
+        )
+        .expect("有效 MVS 内容区域必须生成视口");
+
+        assert_eq!(
+            super::effective_pointer_keyboard_ownership(
+                layout,
+                Some(viewport),
+                (19, 50),
+                false,
+                true,
+            ),
+            Some(crate::InputOwnership::Ui),
+            "左侧黑边不是远端内容，必须切回本地键盘域"
+        );
+        assert_eq!(
+            super::effective_pointer_keyboard_ownership(
+                layout,
+                Some(viewport),
+                (20, 50),
+                false,
+                true,
+            ),
+            Some(crate::InputOwnership::Remote),
+            "缩放后内容左上角仍必须进入远端键盘域"
         );
     }
 
