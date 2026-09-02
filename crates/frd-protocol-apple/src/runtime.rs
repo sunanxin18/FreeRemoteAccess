@@ -32,6 +32,7 @@ use crate::protocol;
 
 const APPLE_RUNTIME_FAILED: &str = "apple_runtime_failed";
 const APPLE_RUNTIME_READ_POLL: Duration = Duration::from_millis(100);
+const APPLE_HIGH_PERFORMANCE_ACTIVE_MEDIA_READ_POLL: Duration = Duration::from_millis(5);
 fn startup_display_size(
     protocol_id: &frd_core::ProtocolId,
     server_init: DisplaySize,
@@ -582,7 +583,8 @@ fn run_authenticated_session_inner(
         },
     )?;
     let initial_full_sent_at = Instant::now();
-    connection.set_read_timeout(Some(APPLE_RUNTIME_READ_POLL))?;
+    let mut application_frame_read_poll = APPLE_RUNTIME_READ_POLL;
+    connection.set_read_timeout(Some(application_frame_read_poll))?;
     let writer = connection.writer_handle()?;
 
     let mut media =
@@ -732,6 +734,15 @@ fn run_authenticated_session_inner(
                     if media_outcome == MediaControlOutcome::TransportActivated
                         && is_product_high_performance
                     {
+                        if application_frame_read_poll
+                            != APPLE_HIGH_PERFORMANCE_ACTIVE_MEDIA_READ_POLL
+                        {
+                            connection.set_read_timeout(Some(
+                                APPLE_HIGH_PERFORMANCE_ACTIVE_MEDIA_READ_POLL,
+                            ))?;
+                            application_frame_read_poll =
+                                APPLE_HIGH_PERFORMANCE_ACTIVE_MEDIA_READ_POLL;
+                        }
                         let size =
                             reader.activate_media_startup_at(&mut runtime, Instant::now())?;
                         eprintln!(
@@ -868,6 +879,8 @@ mod tests {
         peer_crypto: crate::session::SessionCrypto,
         commands: mpsc::Sender<SessionCommand>,
         trace: mpsc::Receiver<RuntimeTrace>,
+        application_frame_read_events:
+            mpsc::Receiver<crate::connection::ApplicationFrameReadTestEvent>,
         exit: mpsc::Receiver<frd_protocol_api::ProtocolExit>,
         worker: thread::JoinHandle<()>,
         session_id: frd_core::SessionId,
@@ -1036,6 +1049,8 @@ mod tests {
         connection
             .set_crypto(crate::session::SessionCrypto::from_key_iv(key, iv))
             .unwrap();
+        let (application_frame_read_events_tx, application_frame_read_events) = mpsc::channel();
+        connection.set_application_frame_read_test_events(application_frame_read_events_tx);
         let session_id = frd_core::SessionId::allocate();
         let (commands, command_rx) = mpsc::channel();
         let (trace_tx, trace) = mpsc::channel();
@@ -1068,6 +1083,7 @@ mod tests {
             peer_crypto: crate::session::SessionCrypto::from_key_iv(key, iv),
             commands,
             trace,
+            application_frame_read_events,
             exit,
             worker,
             session_id,
@@ -1078,6 +1094,22 @@ mod tests {
         start_production_harness_with_events(udp_media_enabled, |trace| {
             Box::new(TracingEvents(trace))
         })
+    }
+
+    fn collect_application_frame_read_events_until(
+        events: &mpsc::Receiver<crate::connection::ApplicationFrameReadTestEvent>,
+        predicate: impl Fn(&[crate::connection::ApplicationFrameReadTestEvent]) -> bool,
+    ) -> Vec<crate::connection::ApplicationFrameReadTestEvent> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = Vec::new();
+        while !predicate(&observed) {
+            observed.push(
+                events
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("会话循环必须在测试期限内达到读边界"),
+            );
+        }
+        observed
     }
 
     fn close_pending_production_harness(harness: ProductionHarness) {
@@ -1171,6 +1203,161 @@ mod tests {
             super::startup_display_size(&protocol_id, portrait),
             portrait
         );
+    }
+
+    #[test]
+    fn product_high_performance_uses_active_media_poll_before_its_next_blocking_read_once() {
+        let mut harness = start_production_harness_for(
+            frd_core::PixelSize::new(8, 8).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            |trace| Box::new(TracingEvents(trace)),
+        );
+        harness.read_verified_startup();
+
+        harness.send_message(&port_announcement_message(17_771));
+        assert_eq!(harness.read_message().first(), Some(&0x1c));
+        let mut observed = collect_application_frame_read_events_until(
+            &harness.application_frame_read_events,
+            |events| {
+                events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            crate::connection::ApplicationFrameReadTestEvent::ApplicationFrameRead(duration)
+                                if *duration == Duration::from_millis(100)
+                        )
+                    })
+                    .count()
+                    >= 2
+            },
+        );
+        assert!(!observed.iter().any(|event| {
+            matches!(
+                event,
+                crate::connection::ApplicationFrameReadTestEvent::ReadPollSet(duration)
+                    if *duration == Duration::from_millis(5)
+            )
+        }));
+        harness.send_message(&media_stream_answer_message());
+
+        observed.extend(collect_application_frame_read_events_until(
+            &harness.application_frame_read_events,
+            |events| {
+                events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        crate::connection::ApplicationFrameReadTestEvent::ApplicationFrameRead(duration)
+                            if *duration == Duration::from_millis(5)
+                    )
+                })
+                .count()
+                >= 2
+            },
+        ));
+        let initial_poll = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::connection::ApplicationFrameReadTestEvent::ReadPollSet(duration)
+                        if *duration == Duration::from_millis(100)
+                )
+            })
+            .expect("HP 产品运行时必须先设置 100ms 应用帧轮询");
+        let active_poll = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::connection::ApplicationFrameReadTestEvent::ReadPollSet(duration)
+                        if *duration == Duration::from_millis(5)
+                )
+            })
+            .expect("Message 2 激活媒体后必须设置 5ms 应用帧轮询");
+        let first_active_read = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    crate::connection::ApplicationFrameReadTestEvent::ApplicationFrameRead(duration)
+                        if *duration == Duration::from_millis(5)
+                )
+            })
+            .expect("媒体激活后的下一次应用帧读取必须使用 5ms 轮询");
+        assert!(initial_poll < active_poll);
+        assert!(active_poll < first_active_read);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        crate::connection::ApplicationFrameReadTestEvent::ReadPollSet(duration)
+                            if *duration == Duration::from_millis(5)
+                    )
+                })
+                .count(),
+            1,
+            "Active 循环不得重复设置相同的 5ms 轮询"
+        );
+
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        harness.worker.join().unwrap();
+    }
+
+    #[test]
+    fn standard_media_activation_retains_the_hundred_millisecond_runtime_poll() {
+        let mut harness = start_production_harness(false);
+        harness.read_verified_startup();
+
+        harness.send_message(&server_state_message(8, 8));
+        assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 8, 0, 8]);
+        for _ in 0..7 {
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        harness.send_message(&port_announcement_message(17_772));
+        assert_eq!(harness.read_message().first(), Some(&0x1c));
+        harness.send_message(&media_stream_answer_message());
+
+        let observed = collect_application_frame_read_events_until(
+            &harness.application_frame_read_events,
+            |events| {
+                events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        crate::connection::ApplicationFrameReadTestEvent::ApplicationFrameRead(duration)
+                            if *duration == Duration::from_millis(100)
+                    )
+                })
+                .count()
+                >= 2
+            },
+        );
+        assert!(observed.iter().any(|event| {
+            matches!(
+                event,
+                crate::connection::ApplicationFrameReadTestEvent::ReadPollSet(duration)
+                    if *duration == Duration::from_millis(100)
+            )
+        }));
+        assert!(!observed.iter().any(|event| {
+            matches!(
+                event,
+                crate::connection::ApplicationFrameReadTestEvent::ReadPollSet(duration)
+                    if *duration == Duration::from_millis(5)
+            )
+        }));
+
+        harness.peer.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = harness.exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        harness.worker.join().unwrap();
     }
 
     #[test]

@@ -95,6 +95,13 @@ pub(crate) enum SessionRuntimeTestEvent {
     WriterShutdown,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationFrameReadTestEvent {
+    ReadPollSet(Duration),
+    ApplicationFrameRead(Duration),
+}
+
 #[derive(Default)]
 struct WriterHooks {
     #[cfg(test)]
@@ -253,6 +260,8 @@ pub struct AppleConnection {
     writer: Option<AppleWriterHandle>,
     #[cfg(test)]
     session_runtime_test_events: Option<Sender<SessionRuntimeTestEvent>>,
+    #[cfg(test)]
+    application_frame_read_test_events: Option<Sender<ApplicationFrameReadTestEvent>>,
 }
 
 impl AppleConnection {
@@ -278,6 +287,8 @@ impl AppleConnection {
             writer: None,
             #[cfg(test)]
             session_runtime_test_events: None,
+            #[cfg(test)]
+            application_frame_read_test_events: None,
         }
     }
 
@@ -308,6 +319,12 @@ impl AppleConnection {
             .set_read_timeout(duration)
             .context("设置读超时失败")?;
         self.read_timeout_cap.set(duration);
+        #[cfg(test)]
+        if let Some(duration) = duration {
+            self.notify_application_frame_read_test_event(
+                ApplicationFrameReadTestEvent::ReadPollSet(duration),
+            );
+        }
         Ok(())
     }
 
@@ -368,8 +385,23 @@ impl AppleConnection {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_application_frame_read_test_events(
+        &mut self,
+        events: Sender<ApplicationFrameReadTestEvent>,
+    ) {
+        self.application_frame_read_test_events = Some(events);
+    }
+
+    #[cfg(test)]
     pub(crate) fn notify_session_runtime_test_event(&self, event: SessionRuntimeTestEvent) {
         if let Some(events) = &self.session_runtime_test_events {
+            let _ = events.send(event);
+        }
+    }
+
+    #[cfg(test)]
+    fn notify_application_frame_read_test_event(&self, event: ApplicationFrameReadTestEvent) {
+        if let Some(events) = &self.application_frame_read_test_events {
             let _ = events.send(event);
         }
     }
@@ -431,6 +463,12 @@ impl AppleConnection {
                 .map(Some);
         }
         let mut temporary = [0; 16384];
+        #[cfg(test)]
+        if let Some(duration) = self.read_timeout_cap.get() {
+            self.notify_application_frame_read_test_event(
+                ApplicationFrameReadTestEvent::ApplicationFrameRead(duration),
+            );
+        }
         self.apply_deadline_timeouts()?;
         let received = self
             .stream
