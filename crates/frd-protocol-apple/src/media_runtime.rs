@@ -323,7 +323,8 @@ impl ViewerMediaState {
     #[cfg(any(debug_assertions, test))]
     fn debug_advance_active_service_tick(&mut self) -> Option<u64> {
         self.active_service_ticks = self.active_service_ticks.saturating_add(1);
-        matches!(self.active_service_ticks, 512 | 2048).then_some(self.active_service_ticks)
+        matches!(self.active_service_ticks, 64 | 128 | 256 | 512 | 2048)
+            .then_some(self.active_service_ticks)
     }
 
     #[cfg(any(debug_assertions, test))]
@@ -621,38 +622,34 @@ mod tests {
             ViewerMediaState::new(AudioMediaFlow::MacToPc, 1, "127.0.0.1".parse().unwrap())
                 .unwrap();
 
-        state.active_service_ticks = 510;
-        assert_eq!(state.debug_advance_active_service_tick(), None);
-        let tick_512 = state
-            .debug_advance_active_service_tick()
-            .expect("tick 512 must emit one checkpoint");
-        let checkpoint_512 = state.debug_service_checkpoint_summary(tick_512);
-        assert!(checkpoint_512.starts_with(
-            "[frd-media-checkpoint] tick=512 active_service_ticks=512 authenticated_video_rtp_stream_1=0 "
-        ));
-        assert_eq!(
-            checkpoint_512.strip_prefix("[frd-media-checkpoint] tick=512"),
-            state
-                .debug_close_summary()
-                .strip_prefix("[frd-media-summary]"),
-            "checkpoint and close summary must expose the same safe fields"
-        );
-        assert_eq!(state.debug_advance_active_service_tick(), None);
-
-        state.active_service_ticks = 2047;
-        let tick_2048 = state
-            .debug_advance_active_service_tick()
-            .expect("tick 2048 must emit one checkpoint");
-        let checkpoint_2048 = state.debug_service_checkpoint_summary(tick_2048);
-        assert!(checkpoint_2048.starts_with(
-            "[frd-media-checkpoint] tick=2048 active_service_ticks=2048 authenticated_video_rtp_stream_1=0 "
-        ));
-        assert_eq!(state.debug_advance_active_service_tick(), None);
+        for (before_boundary, boundary) in
+            [(62, 64), (126, 128), (254, 256), (510, 512), (2046, 2048)]
+        {
+            state.active_service_ticks = before_boundary;
+            assert_eq!(state.debug_advance_active_service_tick(), None);
+            let tick = state
+                .debug_advance_active_service_tick()
+                .unwrap_or_else(|| panic!("tick {boundary} must emit one checkpoint"));
+            assert_eq!(tick, boundary);
+            let checkpoint = state.debug_service_checkpoint_summary(tick);
+            let checkpoint_prefix = format!("[frd-media-checkpoint] tick={boundary}");
+            assert!(checkpoint.starts_with(&format!(
+                "{checkpoint_prefix} active_service_ticks={boundary} authenticated_video_rtp_stream_1=0 "
+            )));
+            assert_eq!(
+                checkpoint.strip_prefix(&checkpoint_prefix),
+                state
+                    .debug_close_summary()
+                    .strip_prefix("[frd-media-summary]"),
+                "checkpoint and close summary must expose the same safe fields"
+            );
+            assert_eq!(state.debug_advance_active_service_tick(), None);
+        }
 
         state.reset_generation(2).unwrap();
         assert_eq!(state.active_service_ticks, 0);
-        state.active_service_ticks = 511;
-        assert_eq!(state.debug_advance_active_service_tick(), Some(512));
+        state.active_service_ticks = 63;
+        assert_eq!(state.debug_advance_active_service_tick(), Some(64));
     }
 
     #[test]
