@@ -26,6 +26,8 @@ use crate::high_performance::{
 };
 use crate::hpss::{self, Media};
 use crate::media_negotiation::AudioMediaFlow;
+#[cfg(all(debug_assertions, not(test)))]
+use crate::media_runtime::DebugMediaStage;
 use crate::media_runtime::ViewerMediaState;
 use crate::network_reader::{NetworkFrameOutcome, NetworkReaderRuntime};
 use crate::protocol;
@@ -646,9 +648,19 @@ fn run_authenticated_session_inner(
             if reader.is_high_performance_confirmed() {
                 media.service_active(&mut runtime, reader.generation(), now)?;
             }
-            reader.service_tick(&writer, &mut runtime, now)?;
+            #[cfg(all(debug_assertions, not(test)))]
+            media.debug_update_stage(DebugMediaStage::ReaderEnter);
+            let reader_result = reader.service_tick(&writer, &mut runtime, now);
+            #[cfg(all(debug_assertions, not(test)))]
+            media.debug_update_stage(DebugMediaStage::ReaderExit);
+            reader_result?;
 
-            let message = match connection.read_app_frame_step() {
+            #[cfg(all(debug_assertions, not(test)))]
+            media.debug_update_stage(DebugMediaStage::TcpReadEnter);
+            let read_result = connection.read_app_frame_step();
+            #[cfg(all(debug_assertions, not(test)))]
+            media.debug_update_stage(DebugMediaStage::TcpReadExit);
+            let message = match read_result {
                 Ok(Some(message)) => message,
                 Ok(None) => continue,
                 Err(error) if is_timeout(&error) => continue,
@@ -665,7 +677,9 @@ fn run_authenticated_session_inner(
             };
             let mut before_generation_commit = || pointer.release_all(&writer);
             let was_pending = !reader.is_high_performance_confirmed();
-            let outcome = preserve_pending_confirmation_result(
+            #[cfg(all(debug_assertions, not(test)))]
+            media.debug_update_stage(DebugMediaStage::FrameHandleEnter);
+            let outcome_result = preserve_pending_confirmation_result(
                 was_pending,
                 reader.handle_frame(
                     message,
@@ -674,7 +688,10 @@ fn run_authenticated_session_inner(
                     &mut runtime,
                     &mut before_generation_commit,
                 ),
-            )?;
+            );
+            #[cfg(all(debug_assertions, not(test)))]
+            media.debug_update_stage(DebugMediaStage::FrameHandleExit);
+            let outcome = outcome_result?;
             match outcome {
                 NetworkFrameOutcome::Consumed => {}
                 NetworkFrameOutcome::HighPerformanceConfirmed { size } => {

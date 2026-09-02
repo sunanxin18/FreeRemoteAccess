@@ -1,4 +1,11 @@
 use std::net::IpAddr;
+#[cfg(all(debug_assertions, not(test)))]
+use std::sync::{
+    atomic::{fence, AtomicBool, AtomicU64, AtomicU8, Ordering},
+    Arc, Weak,
+};
+#[cfg(all(debug_assertions, not(test)))]
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -55,6 +62,205 @@ pub(crate) struct ViewerMediaState {
     video_stream_2: VideoReceiveState,
     audio_degraded: bool,
     control_stage_trace: MediaStageTrace,
+    #[cfg(all(debug_assertions, not(test)))]
+    debug_watchdog: Arc<DebugMediaWatchdog>,
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum DebugMediaStage {
+    ControlEnter = 1,
+    ControlExit,
+    DrainEnter,
+    DrainExit,
+    AudioEnter,
+    AudioExit,
+    Video1Enter,
+    Video1Exit,
+    Video2Enter,
+    Video2Exit,
+    ReaderEnter,
+    ReaderExit,
+    TcpReadEnter,
+    TcpReadExit,
+    FrameHandleEnter,
+    FrameHandleExit,
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+impl DebugMediaStage {
+    fn name_from_u8(value: u8) -> Option<&'static str> {
+        DEBUG_MEDIA_STAGE_NAMES
+            .get(usize::from(value))
+            .copied()
+            .filter(|name| !name.is_empty())
+    }
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+const DEBUG_MEDIA_STAGE_NAMES: [&str; 17] = [
+    "",
+    "control_enter",
+    "control_exit",
+    "drain_enter",
+    "drain_exit",
+    "audio_enter",
+    "audio_exit",
+    "video1_enter",
+    "video1_exit",
+    "video2_enter",
+    "video2_exit",
+    "reader_enter",
+    "reader_exit",
+    "tcp_read_enter",
+    "tcp_read_exit",
+    "frame_handle_enter",
+    "frame_handle_exit",
+];
+
+#[cfg(all(debug_assertions, not(test)))]
+struct DebugMediaWatchdog {
+    tick: AtomicU64,
+    stage: AtomicU8,
+    snapshot_version: AtomicU64,
+    stop: AtomicBool,
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+#[derive(Clone, Copy)]
+struct DebugMediaSnapshot {
+    version: u64,
+    tick: u64,
+    stage: u8,
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+impl DebugMediaWatchdog {
+    fn spawn() -> Arc<Self> {
+        let watchdog = Arc::new(Self {
+            tick: AtomicU64::new(0),
+            stage: AtomicU8::new(0),
+            snapshot_version: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+        });
+        let weak: Weak<Self> = Arc::downgrade(&watchdog);
+        let _ = std::thread::Builder::new()
+            .name("frd-media-watchdog".to_owned())
+            .spawn(move || run_debug_media_watchdog(weak));
+        watchdog
+    }
+
+    fn update(&self, tick: u64, stage: DebugMediaStage) {
+        self.write_snapshot(tick, stage as u8);
+    }
+
+    fn disarm(&self) {
+        self.write_snapshot(0, 0);
+    }
+
+    fn write_snapshot(&self, tick: u64, stage: u8) {
+        let previous = self.snapshot_version.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0, "media watchdog seqlock writer overlapped");
+        self.tick.store(tick, Ordering::Relaxed);
+        self.stage.store(stage, Ordering::Relaxed);
+        let writing = self.snapshot_version.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(writing & 1, 1, "media watchdog seqlock writer lost parity");
+    }
+
+    fn snapshot(&self) -> Option<DebugMediaSnapshot> {
+        let before = self.snapshot_version.load(Ordering::Acquire);
+        if before == 0 || before & 1 != 0 {
+            return None;
+        }
+        let tick = self.tick.load(Ordering::Relaxed);
+        let stage = self.stage.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        let after = self.snapshot_version.load(Ordering::Acquire);
+        (before == after && after & 1 == 0).then_some(DebugMediaSnapshot {
+            version: after,
+            tick,
+            stage,
+        })
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+fn run_debug_media_watchdog(weak: Weak<DebugMediaWatchdog>) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(250);
+    const STALL_INTERVAL: Duration = Duration::from_secs(2);
+
+    let mut last_version = 0;
+    let mut unchanged_since = Instant::now();
+    let mut reported = false;
+    loop {
+        std::thread::sleep(POLL_INTERVAL);
+        let Some(watchdog) = weak.upgrade() else {
+            break;
+        };
+        if watchdog.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let Some(snapshot) = watchdog.snapshot() else {
+            continue;
+        };
+        if snapshot.version != last_version {
+            last_version = snapshot.version;
+            unchanged_since = Instant::now();
+            reported = false;
+            continue;
+        }
+        if !reported && unchanged_since.elapsed() >= STALL_INTERVAL {
+            let Some(confirmed) = watchdog.snapshot() else {
+                continue;
+            };
+            if confirmed.version != snapshot.version {
+                continue;
+            }
+            if !(128..=256).contains(&confirmed.tick) {
+                continue;
+            }
+            if let Some(stage) = DebugMediaStage::name_from_u8(confirmed.stage) {
+                eprintln!("[frd-media-stall] tick={} phase={stage}", confirmed.tick);
+                reported = true;
+            }
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+struct DebugMediaStageExit<'a> {
+    watchdog: &'a DebugMediaWatchdog,
+    tick: u64,
+    stage: DebugMediaStage,
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+impl<'a> DebugMediaStageExit<'a> {
+    fn enter(
+        watchdog: &'a DebugMediaWatchdog,
+        tick: u64,
+        enter: DebugMediaStage,
+        exit: DebugMediaStage,
+    ) -> Self {
+        watchdog.update(tick, enter);
+        Self {
+            watchdog,
+            tick,
+            stage: exit,
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+impl Drop for DebugMediaStageExit<'_> {
+    fn drop(&mut self) {
+        self.watchdog.update(self.tick, self.stage);
+    }
 }
 
 struct VideoReceiveState {
@@ -200,6 +406,8 @@ impl ViewerMediaState {
             )?,
             audio_degraded: false,
             control_stage_trace: MediaStageTrace::default(),
+            #[cfg(all(debug_assertions, not(test)))]
+            debug_watchdog: DebugMediaWatchdog::spawn(),
         })
     }
 
@@ -209,6 +417,8 @@ impl ViewerMediaState {
         let next_audio_receiver =
             ArdAudioReceiver::new().context("重建 Mac→PC AAC-ELD 接收器失败")?;
         self.transport.reset_generation(generation)?;
+        #[cfg(all(debug_assertions, not(test)))]
+        self.debug_watchdog.disarm();
         self.audio_receiver = next_audio_receiver;
         self.video_stream_1.reset(generation);
         self.video_stream_2.reset(generation);
@@ -273,7 +483,16 @@ impl ViewerMediaState {
         if let Some(tick) = self.debug_advance_active_service_tick() {
             eprintln!("{}", self.debug_service_checkpoint_summary(tick));
         }
-        self.transport.service_control_reports_at(generation, now)?;
+        #[cfg(all(debug_assertions, not(test)))]
+        let debug_tick = self.active_service_ticks;
+        #[cfg(all(debug_assertions, not(test)))]
+        self.debug_watchdog
+            .update(debug_tick, DebugMediaStage::ControlEnter);
+        let control_result = self.transport.service_control_reports_at(generation, now);
+        #[cfg(all(debug_assertions, not(test)))]
+        self.debug_watchdog
+            .update(debug_tick, DebugMediaStage::ControlExit);
+        control_result?;
         let Self {
             transport,
             audio_receiver,
@@ -289,8 +508,12 @@ impl ViewerMediaState {
             #[cfg(any(debug_assertions, test))]
                 active_service_ticks: _,
             control_stage_trace: _,
+            #[cfg(all(debug_assertions, not(test)))]
+            debug_watchdog,
         } = self;
-        let summary = transport.drain_receive_round(generation, |role, datagram| {
+        #[cfg(all(debug_assertions, not(test)))]
+        debug_watchdog.update(debug_tick, DebugMediaStage::DrainEnter);
+        let summary_result = transport.drain_receive_round(generation, |role, datagram| {
             accept_datagram(
                 audio_receiver,
                 authenticated_audio_packets,
@@ -306,12 +529,21 @@ impl ViewerMediaState {
                 generation,
                 role,
                 datagram,
+                #[cfg(all(debug_assertions, not(test)))]
+                debug_watchdog.as_ref(),
+                #[cfg(all(debug_assertions, not(test)))]
+                debug_tick,
             )
-        })?;
+        });
+        #[cfg(all(debug_assertions, not(test)))]
+        debug_watchdog.update(debug_tick, DebugMediaStage::DrainExit);
+        let summary = summary_result?;
         Ok(summary.accepted_total)
     }
 
     pub(crate) fn close(&mut self, generation: u64) -> Result<()> {
+        #[cfg(all(debug_assertions, not(test)))]
+        self.debug_watchdog.stop();
         self.transport.close(generation)
     }
 
@@ -330,6 +562,13 @@ impl ViewerMediaState {
     #[cfg(any(debug_assertions, test))]
     fn debug_service_checkpoint_summary(&self, tick: u64) -> String {
         self.debug_summary_with_prefix(&format!("[frd-media-checkpoint] tick={tick}"))
+    }
+
+    #[cfg(all(debug_assertions, not(test)))]
+    pub(crate) fn debug_update_stage(&self, stage: DebugMediaStage) {
+        if self.transport.phase() == MediaTransportPhase::Active {
+            self.debug_watchdog.update(self.active_service_ticks, stage);
+        }
     }
 
     #[cfg(any(debug_assertions, test))]
@@ -390,7 +629,30 @@ fn accept_datagram(
     generation: u64,
     role: MediaRole,
     datagram: MediaDatagram,
+    #[cfg(all(debug_assertions, not(test)))] debug_watchdog: &DebugMediaWatchdog,
+    #[cfg(all(debug_assertions, not(test)))] debug_tick: u64,
 ) -> Result<()> {
+    #[cfg(all(debug_assertions, not(test)))]
+    let _debug_handler_exit = match role {
+        MediaRole::Audio => DebugMediaStageExit::enter(
+            debug_watchdog,
+            debug_tick,
+            DebugMediaStage::AudioEnter,
+            DebugMediaStage::AudioExit,
+        ),
+        MediaRole::VideoStream1 => DebugMediaStageExit::enter(
+            debug_watchdog,
+            debug_tick,
+            DebugMediaStage::Video1Enter,
+            DebugMediaStage::Video1Exit,
+        ),
+        MediaRole::VideoStream2 => DebugMediaStageExit::enter(
+            debug_watchdog,
+            debug_tick,
+            DebugMediaStage::Video2Enter,
+            DebugMediaStage::Video2Exit,
+        ),
+    };
     if role == MediaRole::Audio && *audio_degraded {
         return Ok(());
     }
