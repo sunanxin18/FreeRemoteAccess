@@ -20,9 +20,10 @@ use crate::media_negotiation::{
 };
 use crate::media_protocol::{MediaStreamPortAnnouncement, MediaStreamPortDescriptor};
 use crate::srtp::{
-    build_compound_rtcp_receiver_report_with_block, classify_rtp_mux_packet, derive_session_keys,
-    parse_rtp_header, secure_packet_discard_kind, RtpMuxPacketKind, RtpReceptionReportState,
-    SecurePacketDiscardKind, SrtcpReceiver, SrtcpSender, SrtpPacketKind, SrtpReceiver,
+    build_compound_rtcp_receiver_report_with_block_and_picture_loss, classify_rtp_mux_packet,
+    derive_session_keys, parse_rtp_header, secure_packet_discard_kind, RtpMuxPacketKind,
+    RtpReceptionReportState, SecurePacketDiscardKind, SrtcpReceiver, SrtcpSender, SrtpPacketKind,
+    SrtpReceiver,
 };
 use crate::srtp::{
     parse_rtcp_reception_reports, protect_rtp_packet, RtcpReceptionReport, SrtpSessionKeys,
@@ -74,6 +75,7 @@ struct BoundMediaSocket {
     outbound_rtp: Option<OutboundRtpStream>,
     inbound_crypto: Option<InboundCryptoStream>,
     reception_report: RtpReceptionReportState,
+    pending_picture_loss_media_ssrc: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -581,6 +583,7 @@ impl MediaTransport {
                     outbound_rtp: None,
                     inbound_crypto: None,
                     reception_report: RtpReceptionReportState::new(role.rtp_clock_rate()),
+                    pending_picture_loss_media_ssrc: None,
                 });
             }
             Ok::<_, anyhow::Error>(sockets)
@@ -755,6 +758,27 @@ impl MediaTransport {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn queue_picture_loss(
+        &mut self,
+        generation: u64,
+        role: MediaRole,
+        media_ssrc: u32,
+    ) -> Result<()> {
+        self.validate_generation(generation)?;
+        ensure!(
+            self.phase == MediaTransportPhase::Active,
+            "仅激活的 Apple HP 媒体传输可请求视频恢复"
+        );
+        ensure!(
+            matches!(role, MediaRole::VideoStream1 | MediaRole::VideoStream2),
+            "PLI 只能绑定到 Apple HP 视频 socket"
+        );
+        self.socket_mut(generation, role)?
+            .pending_picture_loss_media_ssrc
+            .get_or_insert(media_ssrc);
+        Ok(())
     }
 
     fn socket(&self, generation: u64, role: MediaRole) -> Result<&BoundMediaSocket> {
@@ -1086,9 +1110,10 @@ fn send_control_report(bound: &mut BoundMediaSocket, now: Instant) -> Result<()>
         .outbound_control
         .as_mut()
         .with_context(|| format!("{0:?} 缺少 SRTCP 发送状态", bound.role))?;
-    let report = build_compound_rtcp_receiver_report_with_block(
+    let report = build_compound_rtcp_receiver_report_with_block_and_picture_loss(
         control.local_ssrc,
         snapshot.map(|snapshot| snapshot.report),
+        bound.pending_picture_loss_media_ssrc,
     );
     let packet = control
         .sender
@@ -1102,6 +1127,7 @@ fn send_control_report(bound: &mut BoundMediaSocket, now: Instant) -> Result<()>
     if let Some(snapshot) = snapshot {
         bound.reception_report.commit_report(snapshot);
     }
+    bound.pending_picture_loss_media_ssrc = None;
     Ok(())
 }
 
@@ -1542,6 +1568,11 @@ mod tests {
             &mut self,
             role: MediaRole,
         ) -> Vec<crate::srtp::RtcpReceptionReport> {
+            let plaintext = self.receive_control_plaintext(role);
+            parse_rtcp_reception_reports(&plaintext).unwrap()
+        }
+
+        fn receive_control_plaintext(&mut self, role: MediaRole) -> Vec<u8> {
             let remote = &self
                 .remotes
                 .iter()
@@ -1559,7 +1590,7 @@ mod tests {
                 .open(&protected[..count])
                 .unwrap()
                 .expect("出站 SRTCP 控制报告不应被重放窗口丢弃");
-            parse_rtcp_reception_reports(&plaintext).unwrap()
+            plaintext
         }
 
         fn send_rtcp(&mut self, role: MediaRole, plaintext: &[u8]) {
@@ -1692,6 +1723,91 @@ mod tests {
     }
 
     #[test]
+    fn pending_picture_loss_is_coalesced_per_video_socket_and_cleared_after_send() {
+        const REMOTE_MEDIA_SSRC: u32 = 0x5566_7788;
+        let mut loopback = ThreeRoleLoopback::new();
+        let local_sender_ssrc = loopback
+            .transport
+            .configuration
+            .as_ref()
+            .unwrap()
+            .video_stream_1
+            .offer
+            .local_ssrc;
+        loopback
+            .transport
+            .queue_picture_loss(
+                ThreeRoleLoopback::GENERATION,
+                MediaRole::VideoStream1,
+                REMOTE_MEDIA_SSRC,
+            )
+            .unwrap();
+        loopback
+            .transport
+            .queue_picture_loss(
+                ThreeRoleLoopback::GENERATION,
+                MediaRole::VideoStream1,
+                REMOTE_MEDIA_SSRC,
+            )
+            .unwrap();
+
+        loopback
+            .transport
+            .service_control_reports_at(
+                ThreeRoleLoopback::GENERATION,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(loopback
+            .receive_control_plaintext(MediaRole::Audio)
+            .windows(2)
+            .all(|header| header != [0x81, 206]));
+        let video = loopback.receive_control_plaintext(MediaRole::VideoStream1);
+        assert_eq!(
+            &video[video.len() - 12..],
+            &[
+                0x81,
+                206,
+                0,
+                2,
+                local_sender_ssrc.to_be_bytes()[0],
+                local_sender_ssrc.to_be_bytes()[1],
+                local_sender_ssrc.to_be_bytes()[2],
+                local_sender_ssrc.to_be_bytes()[3],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[0],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[1],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[2],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[3],
+            ]
+        );
+        assert_eq!(
+            video
+                .windows(2)
+                .filter(|header| *header == [0x81, 206])
+                .count(),
+            1
+        );
+        assert!(loopback
+            .receive_control_plaintext(MediaRole::VideoStream2)
+            .windows(2)
+            .all(|header| header != [0x81, 206]));
+
+        loopback
+            .transport
+            .service_control_reports_at(
+                ThreeRoleLoopback::GENERATION,
+                Instant::now() + Duration::from_secs(4),
+            )
+            .unwrap();
+        let _ = loopback.receive_control_plaintext(MediaRole::Audio);
+        assert!(loopback
+            .receive_control_plaintext(MediaRole::VideoStream1)
+            .windows(2)
+            .all(|header| header != [0x81, 206]));
+        let _ = loopback.receive_control_plaintext(MediaRole::VideoStream2);
+    }
+
+    #[test]
     fn failed_control_send_does_not_commit_interval_but_successful_send_does() {
         const REMOTE_SSRC: u32 = 0x5566_7788;
         let now = Instant::now();
@@ -1710,7 +1826,7 @@ mod tests {
             );
         }
         let mut bound = BoundMediaSocket {
-            role: MediaRole::Audio,
+            role: MediaRole::VideoStream1,
             socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
             receive_buffer_actual_bytes: 0,
             remote: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9),
@@ -1725,6 +1841,7 @@ mod tests {
             outbound_rtp: None,
             inbound_crypto: None,
             reception_report,
+            pending_picture_loss_media_ssrc: Some(REMOTE_SSRC),
         };
 
         assert_eq!(
@@ -1737,6 +1854,11 @@ mod tests {
             85
         );
         assert!(send_control_report(&mut bound, now).is_err());
+        assert_eq!(
+            bound.pending_picture_loss_media_ssrc,
+            Some(REMOTE_SSRC),
+            "失败发送必须保留待发送的 Apple PLI"
+        );
         assert_eq!(
             bound
                 .reception_report
@@ -1751,6 +1873,10 @@ mod tests {
         let receiving = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         bound.remote = receiving.local_addr().unwrap();
         send_control_report(&mut bound, now).unwrap();
+        assert_eq!(
+            bound.pending_picture_loss_media_ssrc, None,
+            "成功发送后必须清除待发送的 Apple PLI"
+        );
         assert_eq!(
             bound
                 .reception_report

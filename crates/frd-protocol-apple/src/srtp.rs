@@ -66,6 +66,9 @@ const RTCP_SOURCE_DESCRIPTION_PACKET_TYPE: u8 = 202;
 const RTCP_SOURCE_DESCRIPTION_SOURCE_COUNT: u8 = 1;
 const RTCP_SOURCE_DESCRIPTION_CNAME_ITEM: u8 = 1;
 const RTCP_SOURCE_DESCRIPTION_END_ITEM: u8 = 0;
+const RTCP_PAYLOAD_SPECIFIC_FEEDBACK_PACKET_TYPE: u8 = 206;
+const RTCP_PICTURE_LOSS_INDICATION_FORMAT: u8 = 1;
+const RTCP_PICTURE_LOSS_INDICATION_WORDS_MINUS_ONE: u16 = 2;
 const RTCP_WORD_LEN: usize = 4;
 const RTCP_COMMON_HEADER_LEN: usize = 4;
 const RTCP_REPORT_COUNT_MASK: u8 = 0x1f;
@@ -1049,6 +1052,14 @@ pub(crate) fn build_compound_rtcp_receiver_report_with_block(
     local_ssrc: u32,
     report: Option<RtcpReceptionReportBlock>,
 ) -> Vec<u8> {
+    build_compound_rtcp_receiver_report_with_block_and_picture_loss(local_ssrc, report, None)
+}
+
+pub(crate) fn build_compound_rtcp_receiver_report_with_block_and_picture_loss(
+    local_ssrc: u32,
+    report: Option<RtcpReceptionReportBlock>,
+    picture_loss_media_ssrc: Option<u32>,
+) -> Vec<u8> {
     let mut compound = Vec::with_capacity(
         SRTCP_UNENCRYPTED_PREFIX_LEN + report.map_or(0, |_| RTCP_RECEPTION_REPORT_LEN) + 40,
     );
@@ -1099,6 +1110,15 @@ pub(crate) fn build_compound_rtcp_receiver_report_with_block(
         u16::try_from(sdes_words_minus_one).expect("固定 SDES packet 长度可放入 u16");
     compound[sdes_start + 2..sdes_start + RTCP_COMMON_HEADER_LEN]
         .copy_from_slice(&sdes_words_minus_one.to_be_bytes());
+    if let Some(media_ssrc) = picture_loss_media_ssrc {
+        compound.extend_from_slice(&[
+            RTCP_VERSION_AND_ZERO_REPORTS | RTCP_PICTURE_LOSS_INDICATION_FORMAT,
+            RTCP_PAYLOAD_SPECIFIC_FEEDBACK_PACKET_TYPE,
+        ]);
+        compound.extend_from_slice(&RTCP_PICTURE_LOSS_INDICATION_WORDS_MINUS_ONE.to_be_bytes());
+        compound.extend_from_slice(&local_ssrc.to_be_bytes());
+        compound.extend_from_slice(&media_ssrc.to_be_bytes());
+    }
     compound
 }
 
@@ -1639,6 +1659,41 @@ mod tests {
             }),
         );
         assert_eq!(&negative[13..16], &[0x80, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn apple_picture_loss_feedback_is_appended_exactly_once_to_the_rr_compound() {
+        const REMOTE_MEDIA_SSRC: u32 = 0x5566_7788;
+        let compound = build_compound_rtcp_receiver_report_with_block_and_picture_loss(
+            TEST_SSRC,
+            None,
+            Some(REMOTE_MEDIA_SSRC),
+        );
+
+        assert_eq!(
+            &compound[compound.len() - 12..],
+            &[
+                0x81,
+                206,
+                0,
+                2,
+                TEST_SSRC.to_be_bytes()[0],
+                TEST_SSRC.to_be_bytes()[1],
+                TEST_SSRC.to_be_bytes()[2],
+                TEST_SSRC.to_be_bytes()[3],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[0],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[1],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[2],
+                REMOTE_MEDIA_SSRC.to_be_bytes()[3],
+            ]
+        );
+        assert_eq!(
+            compound
+                .windows(2)
+                .filter(|header| *header == [0x81, 206])
+                .count(),
+            1
+        );
     }
 
     #[test]

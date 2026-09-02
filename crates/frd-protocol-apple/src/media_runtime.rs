@@ -264,8 +264,14 @@ struct VideoReceiveState {
     assembler: HevcAccessUnitAssembler,
     adapter: AppleHighPerformanceVideoAdapter,
     stage_trace: MediaStageTrace,
+    pending_recovery_request: Option<VideoRecoveryRequest>,
     #[cfg(any(debug_assertions, test))]
     authenticated_rtp_packets: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoRecoveryRequest {
+    PictureLoss { media_ssrc: u32 },
 }
 
 impl VideoReceiveState {
@@ -275,6 +281,7 @@ impl VideoReceiveState {
                 .context("创建 Apple HP HEVC AU 组装器失败")?,
             adapter: AppleHighPerformanceVideoAdapter::new(identity, generation),
             stage_trace: MediaStageTrace::default(),
+            pending_recovery_request: None,
             #[cfg(any(debug_assertions, test))]
             authenticated_rtp_packets: 0,
         })
@@ -284,6 +291,7 @@ impl VideoReceiveState {
         self.assembler.reset(generation);
         self.adapter.reset(generation);
         self.stage_trace = MediaStageTrace::default();
+        self.pending_recovery_request = None;
         #[cfg(any(debug_assertions, test))]
         {
             self.authenticated_rtp_packets = 0;
@@ -318,7 +326,13 @@ impl VideoReceiveState {
             payload: packet.payload,
         }) {
             Ok(access_units) => access_units,
-            Err(HevcAccessUnitError::ReorderWindowExceeded { .. }) => return Ok(()),
+            Err(HevcAccessUnitError::ReorderWindowExceeded { .. }) => {
+                self.pending_recovery_request
+                    .get_or_insert(VideoRecoveryRequest::PictureLoss {
+                        media_ssrc: packet.header.ssrc,
+                    });
+                return Ok(());
+            }
             Err(error) => return Err(error).context("组装 Apple HP HEVC 访问单元失败"),
         };
         for access_unit in access_units {
@@ -327,6 +341,10 @@ impl VideoReceiveState {
                 .context("发布 Apple HP HEVC 访问单元失败")?;
         }
         Ok(())
+    }
+
+    fn take_recovery_request(&mut self) -> Option<VideoRecoveryRequest> {
+        self.pending_recovery_request.take()
     }
 }
 
@@ -535,6 +553,20 @@ impl ViewerMediaState {
         #[cfg(all(debug_assertions, not(test)))]
         debug_watchdog.update(debug_tick, DebugMediaStage::DrainExit);
         let summary = summary_result?;
+        for (role, request) in [
+            (
+                MediaRole::VideoStream1,
+                video_stream_1.take_recovery_request(),
+            ),
+            (
+                MediaRole::VideoStream2,
+                video_stream_2.take_recovery_request(),
+            ),
+        ] {
+            if let Some(VideoRecoveryRequest::PictureLoss { media_ssrc }) = request {
+                transport.queue_picture_loss(generation, role, media_ssrc)?;
+            }
+        }
         Ok(summary.accepted_total)
     }
 
@@ -1170,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_packet_loss_drops_one_au_and_recovers() {
+    fn configured_packet_loss_requests_one_recovery_and_publishes_only_after_irap() {
         let session_id = SessionId::allocate();
         let (_commands, command_rx) = mpsc::channel();
         let published = Arc::new(Mutex::new(Vec::new()));
@@ -1219,14 +1251,33 @@ mod tests {
             MediaRole::VideoStream1,
             MediaDatagram::Rtp(video_rtp(261, 3_000, true, &[0x02, 0x01, 0xee])),
         )
-        .expect("captured reorder-window loss must drop only the damaged AU");
+        .expect("reorder-window loss must drop the damaged AU without failing the session");
+        assert_eq!(
+            state.video_stream_1.take_recovery_request(),
+            Some(super::VideoRecoveryRequest::PictureLoss {
+                media_ssrc: 0x1020_3040,
+            })
+        );
+        assert_eq!(state.video_stream_1.take_recovery_request(), None);
         accept_state_datagram(
             &mut state,
             &mut runtime,
             MediaRole::VideoStream1,
             MediaDatagram::Rtp(video_rtp(262, 6_000, true, &[0x02, 0x01, 0xff])),
         )
-        .expect("the next complete AU must remain publishable in the same stream");
+        .expect("non-IRAP recovery traffic must be ignored without failing the session");
+        assert_eq!(
+            published.lock().unwrap().len(),
+            2,
+            "no frame may be published between reorder loss and the recovery IRAP"
+        );
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(263, 9_000, true, &[0x26, 0x01, 0xab])),
+        )
+        .expect("the first recovery IRAP must restore publication");
 
         assert!(!runtime.requires_shutdown());
         let published = published.lock().unwrap();
@@ -1235,7 +1286,8 @@ mod tests {
             matches!(&published[2], MediaFrame::EncodedVideo(access_unit)
             if access_unit.identity().session_id == session_id
                 && access_unit.generation() == 1
-                && access_unit.timestamp().ticks == 6_000)
+                && access_unit.timestamp().ticks == 9_000
+                && access_unit.random_access())
         );
     }
 

@@ -286,7 +286,7 @@ impl HevcAccessUnitAssembler {
             return Ok(Vec::new());
         }
         if usize::from(distance) >= self.limits.max_reorder_packets {
-            self.preserve_complete_initial_ap_parameter_sets();
+            self.require_recovery_irap();
             self.drop_at_packet_boundary(packet.sequence, packet.marker);
             #[cfg(any(debug_assertions, test))]
             {
@@ -601,6 +601,13 @@ impl HevcAccessUnitAssembler {
         };
         self.parameter_sets = [Some(vps), Some(sps), Some(pps)];
         self.initial_configuration = InitialConfigurationState::AwaitingRecoveryIrap;
+    }
+
+    fn require_recovery_irap(&mut self) {
+        self.preserve_complete_initial_ap_parameter_sets();
+        if self.initial_configuration == InitialConfigurationState::Configured {
+            self.initial_configuration = InitialConfigurationState::AwaitingRecoveryIrap;
+        }
     }
 
     fn fail_access_unit_budget(&mut self) -> HevcAccessUnitError {
@@ -1220,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn gap_beyond_reorder_window_drops_the_access_unit() {
+    fn configured_reorder_loss_waits_for_irap_and_prepends_cached_parameter_sets() {
         let mut assembler = HevcAccessUnitAssembler::new(
             GENERATION,
             HevcAccessUnitLimits {
@@ -1230,19 +1237,42 @@ mod tests {
         )
         .unwrap();
         synchronize(&mut assembler, 40);
+        let configuration = [
+            0x60, 0x01, 0, 3, 0x40, 0x01, 1, 0, 3, 0x42, 0x01, 2, 0, 3, 0x44, 0x01, 3,
+        ];
+        assert_eq!(
+            assembler
+                .push(packet(40, 5_000, true, &configuration))
+                .unwrap()
+                .len(),
+            1
+        );
         assembler
-            .push(packet(40, 6000, false, &[0x02, 0x01, 1]))
+            .push(packet(41, 6_000, false, &[0x02, 0x01, 1]))
             .unwrap();
 
         assert_eq!(
-            assembler.push(packet(43, 6000, true, &[0x02, 0x01, 2])),
+            assembler.push(packet(44, 6_000, true, &[0x02, 0x01, 2])),
             Err(HevcAccessUnitError::ReorderWindowExceeded { limit: 2 })
         );
+        assert!(assembler
+            .push(packet(45, 7_000, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
         let output = assembler
-            .push(packet(44, 7000, true, &[0x02, 0x01, 3]))
+            .push(packet(46, 8_000, true, &[0x26, 0x01, 0xfe]))
             .unwrap();
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0].timestamp, 7000);
+        assert!(output[0].keyframe);
+        assert!(output[0].parameter_sets_prepended);
+        assert_eq!(output[0].timestamp, 8_000);
+        assert_eq!(
+            output[0].data,
+            [
+                0, 0, 0, 3, 0x40, 0x01, 1, 0, 0, 0, 3, 0x42, 0x01, 2, 0, 0, 0, 3, 0x44, 0x01, 3, 0,
+                0, 0, 3, 0x26, 0x01, 0xfe,
+            ]
+        );
     }
 
     #[test]
