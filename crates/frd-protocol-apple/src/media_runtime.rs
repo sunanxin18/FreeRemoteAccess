@@ -270,8 +270,8 @@ impl ViewerMediaState {
             return Ok(0);
         }
         #[cfg(any(debug_assertions, test))]
-        {
-            self.active_service_ticks = self.active_service_ticks.saturating_add(1);
+        if let Some(tick) = self.debug_advance_active_service_tick() {
+            eprintln!("{}", self.debug_service_checkpoint_summary(tick));
         }
         self.transport.service_control_reports_at(generation, now)?;
         let Self {
@@ -317,13 +317,30 @@ impl ViewerMediaState {
 
     #[cfg(any(debug_assertions, test))]
     pub(crate) fn debug_close_summary(&self) -> String {
+        self.debug_summary_with_prefix("[frd-media-summary]")
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn debug_advance_active_service_tick(&mut self) -> Option<u64> {
+        self.active_service_ticks = self.active_service_ticks.saturating_add(1);
+        matches!(self.active_service_ticks, 512 | 2048).then_some(self.active_service_ticks)
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn debug_service_checkpoint_summary(&self, tick: u64) -> String {
+        self.debug_summary_with_prefix(&format!("[frd-media-checkpoint] tick={tick}"))
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn debug_summary_with_prefix(&self, prefix: &str) -> String {
         let discards = self.transport.discard_counters();
         let stream_1_assembler = self.video_stream_1.assembler.diagnostics();
         let stream_2_assembler = self.video_stream_2.assembler.diagnostics();
         let stream_1_adapter = self.video_stream_1.adapter.diagnostics();
         let stream_2_adapter = self.video_stream_2.adapter.diagnostics();
         format!(
-            "[frd-media-summary] active_service_ticks={} authenticated_video_rtp_stream_1={} authenticated_video_rtp_stream_2={} discard_unexpected_source={} discard_empty_datagram={} discard_truncated_header={} discard_malformed_packet={} discard_authentication_failed={} discard_replay_or_too_old={} stream_1_complete_configuration_access_units={} stream_1_reorder_window_exceeded={} stream_1_recovery_marker_resyncs={} stream_1_waiting_for_recovery_irap_drops={} stream_1_completed_access_units={} stream_2_complete_configuration_access_units={} stream_2_reorder_window_exceeded={} stream_2_recovery_marker_resyncs={} stream_2_waiting_for_recovery_irap_drops={} stream_2_completed_access_units={} stream_1_video_config_publications={} stream_1_encoded_video_publications={} stream_2_video_config_publications={} stream_2_encoded_video_publications={}",
+            "{} active_service_ticks={} authenticated_video_rtp_stream_1={} authenticated_video_rtp_stream_2={} discard_unexpected_source={} discard_empty_datagram={} discard_truncated_header={} discard_malformed_packet={} discard_authentication_failed={} discard_replay_or_too_old={} stream_1_complete_configuration_access_units={} stream_1_reorder_window_exceeded={} stream_1_recovery_marker_resyncs={} stream_1_waiting_for_recovery_irap_drops={} stream_1_completed_access_units={} stream_2_complete_configuration_access_units={} stream_2_reorder_window_exceeded={} stream_2_recovery_marker_resyncs={} stream_2_waiting_for_recovery_irap_drops={} stream_2_completed_access_units={} stream_1_video_config_publications={} stream_1_encoded_video_publications={} stream_2_video_config_publications={} stream_2_encoded_video_publications={}",
+            prefix,
             self.active_service_ticks,
             self.video_stream_1.authenticated_rtp_packets,
             self.video_stream_2.authenticated_rtp_packets,
@@ -596,6 +613,76 @@ mod tests {
             *self.attempts.lock().unwrap() += 1;
             Err(self.failure.clone())
         }
+    }
+
+    #[test]
+    fn debug_media_checkpoint_fires_once_at_each_boundary_and_rearms_after_reset() {
+        let mut state =
+            ViewerMediaState::new(AudioMediaFlow::MacToPc, 1, "127.0.0.1".parse().unwrap())
+                .unwrap();
+
+        state.active_service_ticks = 510;
+        assert_eq!(state.debug_advance_active_service_tick(), None);
+        let tick_512 = state
+            .debug_advance_active_service_tick()
+            .expect("tick 512 must emit one checkpoint");
+        let checkpoint_512 = state.debug_service_checkpoint_summary(tick_512);
+        assert!(checkpoint_512.starts_with(
+            "[frd-media-checkpoint] tick=512 active_service_ticks=512 authenticated_video_rtp_stream_1=0 "
+        ));
+        assert_eq!(
+            checkpoint_512.strip_prefix("[frd-media-checkpoint] tick=512"),
+            state
+                .debug_close_summary()
+                .strip_prefix("[frd-media-summary]"),
+            "checkpoint and close summary must expose the same safe fields"
+        );
+        assert_eq!(state.debug_advance_active_service_tick(), None);
+
+        state.active_service_ticks = 2047;
+        let tick_2048 = state
+            .debug_advance_active_service_tick()
+            .expect("tick 2048 must emit one checkpoint");
+        let checkpoint_2048 = state.debug_service_checkpoint_summary(tick_2048);
+        assert!(checkpoint_2048.starts_with(
+            "[frd-media-checkpoint] tick=2048 active_service_ticks=2048 authenticated_video_rtp_stream_1=0 "
+        ));
+        assert_eq!(state.debug_advance_active_service_tick(), None);
+
+        state.reset_generation(2).unwrap();
+        assert_eq!(state.active_service_ticks, 0);
+        state.active_service_ticks = 511;
+        assert_eq!(state.debug_advance_active_service_tick(), Some(512));
+    }
+
+    #[test]
+    fn inactive_media_service_does_not_advance_or_emit_debug_checkpoint() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(Arc::new(Mutex::new(Vec::new()))))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state
+                .service_active(&mut runtime, 1, std::time::Instant::now())
+                .unwrap(),
+            0
+        );
+        assert_eq!(state.active_service_ticks, 0);
     }
 
     #[test]
