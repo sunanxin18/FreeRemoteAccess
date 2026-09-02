@@ -221,7 +221,7 @@ fn run_debug_media_watchdog(weak: Weak<DebugMediaWatchdog>) {
             if confirmed.version != snapshot.version {
                 continue;
             }
-            if !(128..=256).contains(&confirmed.tick) {
+            if confirmed.tick < 128 {
                 continue;
             }
             if let Some(stage) = DebugMediaStage::name_from_u8(confirmed.stage) {
