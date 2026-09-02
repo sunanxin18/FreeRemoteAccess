@@ -1,0 +1,10 @@
+{
+  "fixture_sha256": "565808411cfe52260eed3174aabfb9c1af2f8d651d77cfe973a6da64ca801751",
+  "bit_depth": 8,
+  "coded_width": 16,
+  "coded_height": 16,
+  "visible_width": 16,
+  "visible_height": 8,
+  "crop_bottom": 8,
+  "plane_stride_bytes": 16
+}

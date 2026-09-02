@@ -35,6 +35,18 @@ struct PlaneChecksums {
     v: String,
 }
 
+#[derive(Debug)]
+struct CroppedFixtureMetadata {
+    fixture_sha256: String,
+    bit_depth: u32,
+    coded_width: u32,
+    coded_height: u32,
+    visible_width: u32,
+    visible_height: u32,
+    crop_bottom: u32,
+    plane_stride_bytes: u32,
+}
+
 #[derive(Clone, Copy)]
 struct Api {
     create: FrdCreateDecoderFn,
@@ -145,11 +157,12 @@ fn fixed_ffmpeg_decodes_synthetic_main444_idr_to_owned_yuv444p8() {
 
 #[test]
 fn fixed_ffmpeg_preserves_coded_planes_for_synthetic_cropped_main444_idr() {
-    const CODED_WIDTH: u32 = 16;
-    const CODED_HEIGHT: u32 = 16;
-    const PLANE_STRIDE_BYTES: u32 = 16;
+    let metadata =
+        cropped_fixture_metadata(include_str!("fixtures/synthetic-main444-cropped-16x8.json"));
+    assert_cropped_fixture_metadata(&metadata);
 
     let bitstream = include_bytes!("fixtures/synthetic-main444-cropped-16x8.hevc");
+    assert_eq!(hex_sha256(bitstream), metadata.fixture_sha256);
     let nals = annex_b_nals(bitstream);
     assert_eq!(
         nals.iter().map(|nal| nal.kind).collect::<Vec<_>>(),
@@ -163,9 +176,9 @@ fn fixed_ffmpeg_preserves_coded_planes_for_synthetic_cropped_main444_idr() {
         codec: FRD_CODEC_HEVC,
         profile: FRD_PROFILE_HEVC_MAIN_444_8,
         chroma: FRD_CHROMA_YUV_444,
-        bit_depth: 8,
-        coded_width: CODED_WIDTH,
-        coded_height: CODED_HEIGHT,
+        bit_depth: metadata.bit_depth,
+        coded_width: metadata.coded_width,
+        coded_height: metadata.coded_height,
         timebase: 90_000,
         bitstream_format: FRD_BITSTREAM_ANNEX_B,
         vps: byte_slice(nals[0].bytes),
@@ -200,12 +213,12 @@ fn fixed_ffmpeg_preserves_coded_planes_for_synthetic_cropped_main444_idr() {
     assert_eq!(decoded.pixel_format, FRD_PIXEL_FORMAT_YUV_444_P8);
     assert_eq!(decoded.plane_count, 3);
     for plane in decoded.planes {
-        assert_eq!(plane.width, CODED_WIDTH);
-        assert_eq!(plane.height, CODED_HEIGHT);
-        assert_eq!(plane.stride_bytes, PLANE_STRIDE_BYTES);
+        assert_eq!(plane.width, metadata.coded_width);
+        assert_eq!(plane.height, metadata.coded_height);
+        assert_eq!(plane.stride_bytes, metadata.plane_stride_bytes);
         assert_eq!(
             plane.buffer.len,
-            usize::try_from(PLANE_STRIDE_BYTES * CODED_HEIGHT).unwrap()
+            usize::try_from(metadata.plane_stride_bytes * metadata.coded_height).unwrap()
         );
         assert!(!plane.buffer.data.is_null());
     }
@@ -457,6 +470,35 @@ fn fixture_metadata(json: &str) -> FixtureMetadata {
             v: json_string(json, "v"),
         },
     }
+}
+
+fn cropped_fixture_metadata(json: &str) -> CroppedFixtureMetadata {
+    CroppedFixtureMetadata {
+        fixture_sha256: json_string(json, "fixture_sha256"),
+        bit_depth: json_u32(json, "bit_depth"),
+        coded_width: json_u32(json, "coded_width"),
+        coded_height: json_u32(json, "coded_height"),
+        visible_width: json_u32(json, "visible_width"),
+        visible_height: json_u32(json, "visible_height"),
+        crop_bottom: json_u32(json, "crop_bottom"),
+        plane_stride_bytes: json_u32(json, "plane_stride_bytes"),
+    }
+}
+
+fn assert_cropped_fixture_metadata(metadata: &CroppedFixtureMetadata) {
+    assert_eq!(metadata.bit_depth, 8);
+    assert_eq!((metadata.coded_width, metadata.coded_height), (16, 16));
+    assert_eq!((metadata.visible_width, metadata.visible_height), (16, 8));
+    assert_ne!(
+        (metadata.coded_width, metadata.coded_height),
+        (metadata.visible_width, metadata.visible_height)
+    );
+    assert_eq!(
+        metadata.coded_height - metadata.visible_height,
+        metadata.crop_bottom
+    );
+    assert_eq!(metadata.crop_bottom, 8);
+    assert_eq!(metadata.plane_stride_bytes, 16);
 }
 
 fn json_value_tail<'a>(json: &'a str, key: &str) -> &'a str {
