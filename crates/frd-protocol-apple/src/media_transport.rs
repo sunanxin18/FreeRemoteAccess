@@ -20,9 +20,9 @@ use crate::media_negotiation::{
 };
 use crate::media_protocol::{MediaStreamPortAnnouncement, MediaStreamPortDescriptor};
 use crate::srtp::{
-    build_compound_rtcp_receiver_report, classify_rtp_mux_packet, derive_session_keys,
-    secure_packet_discard_kind, RtpMuxPacketKind, SecurePacketDiscardKind, SrtcpReceiver,
-    SrtcpSender, SrtpPacketKind, SrtpReceiver,
+    build_compound_rtcp_receiver_report_with_block, classify_rtp_mux_packet, derive_session_keys,
+    parse_rtp_header, secure_packet_discard_kind, RtpMuxPacketKind, RtpReceptionReportState,
+    SecurePacketDiscardKind, SrtcpReceiver, SrtcpSender, SrtpPacketKind, SrtpReceiver,
 };
 use crate::srtp::{
     parse_rtcp_reception_reports, protect_rtp_packet, RtcpReceptionReport, SrtpSessionKeys,
@@ -42,6 +42,15 @@ pub enum MediaRole {
     Audio,
     VideoStream1,
     VideoStream2,
+}
+
+impl MediaRole {
+    const fn rtp_clock_rate(self) -> u32 {
+        match self {
+            Self::Audio => 48_000,
+            Self::VideoStream1 | Self::VideoStream2 => 90_000,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +73,7 @@ struct BoundMediaSocket {
     outbound_control: Option<OutboundControlStream>,
     outbound_rtp: Option<OutboundRtpStream>,
     inbound_crypto: Option<InboundCryptoStream>,
+    reception_report: RtpReceptionReportState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -570,6 +580,7 @@ impl MediaTransport {
                     outbound_control: None,
                     outbound_rtp: None,
                     inbound_crypto: None,
+                    reception_report: RtpReceptionReportState::new(role.rtp_clock_rate()),
                 });
             }
             Ok::<_, anyhow::Error>(sockets)
@@ -673,6 +684,7 @@ impl MediaTransport {
             .configuration
             .as_ref()
             .context("激活媒体数据面前缺少客户端配置")?;
+        let activation_now = Instant::now();
         let activation = self.sockets.iter_mut().try_for_each(|bound| {
             let entry = configuration_entry(configuration, bound.role)?;
             let rtcp_keys = derive_session_keys(&entry.viewer_to_server, SrtpPacketKind::Rtcp);
@@ -696,14 +708,14 @@ impl MediaTransport {
                     SrtpPacketKind::Rtcp,
                 )),
             });
-            send_control_report(bound)?;
+            send_control_report(bound, activation_now)?;
             Ok::<_, anyhow::Error>(())
         });
         match activation {
             Ok(()) => {
                 self.phase = MediaTransportPhase::Active;
                 self.next_control_report_at =
-                    Some(Instant::now() + MEDIA_CONTROL_REPORT_STARTUP_RETRY_INTERVAL);
+                    Some(activation_now + MEDIA_CONTROL_REPORT_STARTUP_RETRY_INTERVAL);
                 Ok(())
             }
             Err(error) => {
@@ -727,7 +739,10 @@ impl MediaTransport {
             return Ok(0);
         }
 
-        let result = self.sockets.iter_mut().try_for_each(send_control_report);
+        let result = self
+            .sockets
+            .iter_mut()
+            .try_for_each(|bound| send_control_report(bound, now));
         match result {
             Ok(()) => {
                 self.next_control_report_at =
@@ -915,15 +930,16 @@ impl MediaTransport {
             .position(|entry| entry.role == role)
             .with_context(|| format!("媒体角色 {role:?} 没有已绑定 socket"))?;
         let mut packet = vec![0u8; MAX_MEDIA_DATAGRAM_BYTES];
-        let (received, source) = match self.sockets[socket_index].socket.recv_from(&mut packet) {
-            Ok(received) => received,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(MediaReceiveOutcome::Empty);
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("接收 {role:?} UDP 数据报失败"));
-            }
-        };
+        let (received, source, received_at) =
+            match self.sockets[socket_index].socket.recv_from(&mut packet) {
+                Ok((received, source)) => (received, source, Instant::now()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(MediaReceiveOutcome::Empty);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("接收 {role:?} UDP 数据报失败"));
+                }
+            };
         if source != self.sockets[socket_index].remote {
             return Ok(self.record_discard(role, MediaDiscardReason::UnexpectedSource, None));
         }
@@ -957,6 +973,32 @@ impl MediaTransport {
         };
         match crypto_result {
             Ok(Some(plaintext)) => {
+                if packet_kind == RtpMuxPacketKind::Rtcp {
+                    if let Err(error) = self.sockets[socket_index]
+                        .reception_report
+                        .observe_sender_reports(&plaintext, received_at)
+                    {
+                        return Ok(self.record_discard(
+                            role,
+                            MediaDiscardReason::MalformedPacket,
+                            Some(&error),
+                        ));
+                    }
+                } else {
+                    let header = match parse_rtp_header(&plaintext) {
+                        Ok(header) => header,
+                        Err(error) => {
+                            return Ok(self.record_discard(
+                                role,
+                                MediaDiscardReason::MalformedPacket,
+                                Some(&error),
+                            ));
+                        }
+                    };
+                    self.sockets[socket_index]
+                        .reception_report
+                        .observe_rtp(header, received_at);
+                }
                 if role == MediaRole::Audio && packet_kind == RtpMuxPacketKind::Rtcp {
                     let reports = match parse_rtcp_reception_reports(&plaintext) {
                         Ok(reports) => reports,
@@ -1038,12 +1080,16 @@ impl MediaTransport {
     }
 }
 
-fn send_control_report(bound: &mut BoundMediaSocket) -> Result<()> {
+fn send_control_report(bound: &mut BoundMediaSocket, now: Instant) -> Result<()> {
+    let snapshot = bound.reception_report.report_snapshot(now);
     let control = bound
         .outbound_control
         .as_mut()
         .with_context(|| format!("{0:?} 缺少 SRTCP 发送状态", bound.role))?;
-    let report = build_compound_rtcp_receiver_report(control.local_ssrc);
+    let report = build_compound_rtcp_receiver_report_with_block(
+        control.local_ssrc,
+        snapshot.map(|snapshot| snapshot.report),
+    );
     let packet = control
         .sender
         .protect(&report)
@@ -1053,6 +1099,9 @@ fn send_control_report(bound: &mut BoundMediaSocket) -> Result<()> {
         .send_to(&packet, bound.remote)
         .with_context(|| format!("发送 {0:?} SRTCP Receiver Report 失败", bound.role))?;
     ensure!(written == packet.len(), "SRTCP 数据报未完整发送");
+    if let Some(snapshot) = snapshot {
+        bound.reception_report.commit_report(snapshot);
+    }
     Ok(())
 }
 
@@ -1073,17 +1122,19 @@ fn configuration_entry(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioReceptionEvidence, MediaDatagram, MediaDiscardCounters, MediaDiscardReason,
-        MediaReceiveOutcome, MediaRole, MediaTransport, MediaTransportPhase, OutboundRtpStream,
+        send_control_report, AudioReceptionEvidence, BoundMediaSocket, MediaDatagram,
+        MediaDiscardCounters, MediaDiscardReason, MediaReceiveOutcome, MediaRole, MediaTransport,
+        MediaTransportPhase, OutboundControlStream, OutboundRtpStream,
     };
     use crate::audio_codec::{ARD_AUDIO_RTP_PAYLOAD_TYPE, ARD_AUDIO_SAMPLES_PER_ACCESS_UNIT};
     use crate::media_negotiation::{AudioMediaFlow, CompressedProtobufAnswer, MediaStreamAnswer};
     use crate::media_protocol::parse_media_stream_port_announcement;
     use crate::srtp::{
-        build_compound_rtcp_receiver_report, derive_session_keys, parse_rtp_packet,
-        protect_rtp_packet, SrtcpSender, SrtpPacketKind, SrtpReceiver, SrtpSessionKeys,
+        build_compound_rtcp_receiver_report, derive_session_keys, parse_rtcp_reception_reports,
+        parse_rtp_packet, protect_rtp_packet, RtpHeader, RtpReceptionReportState, SrtcpReceiver,
+        SrtcpSender, SrtpPacketKind, SrtpReceiver, SrtpSessionKeys, RTP_FIXED_HEADER_LEN,
     };
-    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
     use std::time::{Duration, Instant};
 
     fn announcement_fixture(audio_port: u16, audio_flags: u32) -> [u8; 54] {
@@ -1274,6 +1325,8 @@ mod tests {
         transport: MediaTransport,
         remotes: [(MediaRole, UdpSocket); 3],
         incoming_keys: [(MediaRole, SrtpSessionKeys); 3],
+        incoming_control_senders: [(MediaRole, SrtcpSender); 3],
+        control_receivers: [(MediaRole, SrtcpReceiver); 3],
     }
 
     impl ThreeRoleLoopback {
@@ -1351,6 +1404,60 @@ mod tests {
                     ),
                 ),
             ];
+            let control_receivers = [
+                (
+                    MediaRole::Audio,
+                    SrtcpReceiver::new(derive_session_keys(
+                        &configuration.audio.viewer_to_server,
+                        SrtpPacketKind::Rtcp,
+                    )),
+                ),
+                (
+                    MediaRole::VideoStream1,
+                    SrtcpReceiver::new(derive_session_keys(
+                        &configuration.video_stream_1.viewer_to_server,
+                        SrtpPacketKind::Rtcp,
+                    )),
+                ),
+                (
+                    MediaRole::VideoStream2,
+                    SrtcpReceiver::new(derive_session_keys(
+                        &configuration
+                            .video_stream_2
+                            .as_ref()
+                            .unwrap()
+                            .viewer_to_server,
+                        SrtpPacketKind::Rtcp,
+                    )),
+                ),
+            ];
+            let incoming_control_senders = [
+                (
+                    MediaRole::Audio,
+                    SrtcpSender::new(derive_session_keys(
+                        &configuration.audio.server_to_viewer,
+                        SrtpPacketKind::Rtcp,
+                    )),
+                ),
+                (
+                    MediaRole::VideoStream1,
+                    SrtcpSender::new(derive_session_keys(
+                        &configuration.video_stream_1.server_to_viewer,
+                        SrtpPacketKind::Rtcp,
+                    )),
+                ),
+                (
+                    MediaRole::VideoStream2,
+                    SrtcpSender::new(derive_session_keys(
+                        &configuration
+                            .video_stream_2
+                            .as_ref()
+                            .unwrap()
+                            .server_to_viewer,
+                        SrtpPacketKind::Rtcp,
+                    )),
+                ),
+            ];
             transport.mark_configuration_sent(Self::GENERATION).unwrap();
             let mut answer = answer_fixture();
             answer.video_stream_2 = Some(answer.video_stream_1.clone());
@@ -1364,6 +1471,8 @@ mod tests {
                 transport,
                 remotes,
                 incoming_keys,
+                incoming_control_senders,
+                control_receivers,
             }
         }
 
@@ -1392,6 +1501,32 @@ mod tests {
             remote.send_to(&protected, local).unwrap();
         }
 
+        fn send_tampered_rtp(&self, role: MediaRole, sequence: u16) {
+            const TEST_TIMESTAMP: u32 = 960;
+            const TEST_SSRC: u32 = 0x5566_7788;
+            let mut plaintext = vec![2 << 6, ARD_AUDIO_RTP_PAYLOAD_TYPE];
+            plaintext.extend_from_slice(&sequence.to_be_bytes());
+            plaintext.extend_from_slice(&TEST_TIMESTAMP.to_be_bytes());
+            plaintext.extend_from_slice(&TEST_SSRC.to_be_bytes());
+            plaintext.extend_from_slice(b"tampered");
+            let keys = &self
+                .incoming_keys
+                .iter()
+                .find(|(candidate, _)| *candidate == role)
+                .unwrap()
+                .1;
+            let mut protected = protect_rtp_packet(&plaintext, keys, 0).unwrap();
+            *protected.last_mut().unwrap() ^= 0x01;
+            let remote = &self
+                .remotes
+                .iter()
+                .find(|(candidate, _)| *candidate == role)
+                .unwrap()
+                .1;
+            let local = self.transport.local_addr(Self::GENERATION, role).unwrap();
+            remote.send_to(&protected, local).unwrap();
+        }
+
         fn send_empty_datagram(&self, role: MediaRole) {
             let remote = &self
                 .remotes
@@ -1402,6 +1537,230 @@ mod tests {
             let local = self.transport.local_addr(Self::GENERATION, role).unwrap();
             remote.send_to(&[], local).unwrap();
         }
+
+        fn receive_control_reports(
+            &mut self,
+            role: MediaRole,
+        ) -> Vec<crate::srtp::RtcpReceptionReport> {
+            let remote = &self
+                .remotes
+                .iter()
+                .find(|(candidate, _)| *candidate == role)
+                .unwrap()
+                .1;
+            let mut protected = [0u8; 256];
+            let (count, _) = remote.recv_from(&mut protected).unwrap();
+            let plaintext = self
+                .control_receivers
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == role)
+                .unwrap()
+                .1
+                .open(&protected[..count])
+                .unwrap()
+                .expect("出站 SRTCP 控制报告不应被重放窗口丢弃");
+            parse_rtcp_reception_reports(&plaintext).unwrap()
+        }
+
+        fn send_rtcp(&mut self, role: MediaRole, plaintext: &[u8]) {
+            let protected = self
+                .incoming_control_senders
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == role)
+                .unwrap()
+                .1
+                .protect(plaintext)
+                .unwrap();
+            let remote = &self
+                .remotes
+                .iter()
+                .find(|(candidate, _)| *candidate == role)
+                .unwrap()
+                .1;
+            let local = self.transport.local_addr(Self::GENERATION, role).unwrap();
+            remote.send_to(&protected, local).unwrap();
+        }
+    }
+
+    #[test]
+    fn periodic_control_report_describes_only_authenticated_unique_inbound_rtp() {
+        const REMOTE_SSRC: u32 = 0x5566_7788;
+        let mut loopback = ThreeRoleLoopback::new();
+        let local_audio_ssrc = loopback
+            .transport
+            .configuration
+            .as_ref()
+            .unwrap()
+            .audio
+            .offer
+            .local_ssrc;
+        loopback.send_rtp(MediaRole::Audio, 1, b"first");
+        assert!(matches!(
+            loopback
+                .transport
+                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+                .unwrap(),
+            MediaReceiveOutcome::Accepted(MediaDatagram::Rtp(_))
+        ));
+        loopback.send_rtp(MediaRole::Audio, 1, b"first");
+        assert_eq!(
+            loopback
+                .transport
+                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+                .unwrap(),
+            MediaReceiveOutcome::Discarded(MediaDiscardReason::ReplayOrTooOld)
+        );
+        loopback.send_tampered_rtp(MediaRole::Audio, 2);
+        assert_eq!(
+            loopback
+                .transport
+                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+                .unwrap(),
+            MediaReceiveOutcome::Discarded(MediaDiscardReason::AuthenticationFailed)
+        );
+        loopback.send_rtp(MediaRole::Audio, 3, b"third");
+        assert!(matches!(
+            loopback
+                .transport
+                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+                .unwrap(),
+            MediaReceiveOutcome::Accepted(MediaDatagram::Rtp(_))
+        ));
+
+        assert_eq!(
+            loopback
+                .transport
+                .service_control_reports_at(
+                    ThreeRoleLoopback::GENERATION,
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .unwrap(),
+            3
+        );
+        let reports = loopback.receive_control_reports(MediaRole::Audio);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].reporter_ssrc, local_audio_ssrc);
+        assert_eq!(reports[0].source_ssrc, REMOTE_SSRC);
+        assert_eq!(reports[0].extended_highest_sequence, 3);
+        assert_eq!(reports[0].cumulative_packets_lost, 1);
+        assert_eq!(reports[0].fraction_lost, 85);
+        assert!(loopback
+            .receive_control_reports(MediaRole::VideoStream1)
+            .is_empty());
+    }
+
+    #[test]
+    fn authenticated_sender_report_populates_lsr_and_dlsr_in_next_control_report() {
+        const REMOTE_SSRC: u32 = 0x5566_7788;
+        let mut loopback = ThreeRoleLoopback::new();
+        loopback.send_rtp(MediaRole::VideoStream1, 1, b"video");
+        assert!(matches!(
+            loopback
+                .transport
+                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream1)
+                .unwrap(),
+            MediaReceiveOutcome::Accepted(MediaDatagram::Rtp(_))
+        ));
+
+        let mut sender_report = vec![0x80, 200, 0, 6];
+        sender_report.extend_from_slice(&REMOTE_SSRC.to_be_bytes());
+        sender_report.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+        sender_report.extend_from_slice(&0x5566_7788u32.to_be_bytes());
+        sender_report.extend_from_slice(&0u32.to_be_bytes());
+        sender_report.extend_from_slice(&0u32.to_be_bytes());
+        sender_report.extend_from_slice(&0u32.to_be_bytes());
+        loopback.send_rtcp(MediaRole::VideoStream1, &sender_report);
+        assert_eq!(
+            loopback
+                .transport
+                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream1)
+                .unwrap(),
+            MediaReceiveOutcome::Accepted(MediaDatagram::Rtcp(sender_report))
+        );
+
+        loopback
+            .transport
+            .service_control_reports_at(
+                ThreeRoleLoopback::GENERATION,
+                Instant::now() + Duration::from_millis(1_500),
+            )
+            .unwrap();
+        let reports = loopback.receive_control_reports(MediaRole::VideoStream1);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].last_sender_report, 0x3344_5566);
+        assert!(reports[0].delay_since_last_sender_report >= 0x0001_0000);
+    }
+
+    #[test]
+    fn failed_control_send_does_not_commit_interval_but_successful_send_does() {
+        const REMOTE_SSRC: u32 = 0x5566_7788;
+        let now = Instant::now();
+        let mut reception_report = RtpReceptionReportState::new(48_000);
+        for sequence in [1, 3] {
+            reception_report.observe_rtp(
+                RtpHeader {
+                    marker: false,
+                    payload_type: ARD_AUDIO_RTP_PAYLOAD_TYPE,
+                    sequence,
+                    timestamp: u32::from(sequence) * 960,
+                    ssrc: REMOTE_SSRC,
+                    payload_offset: RTP_FIXED_HEADER_LEN,
+                },
+                now,
+            );
+        }
+        let mut bound = BoundMediaSocket {
+            role: MediaRole::Audio,
+            socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            receive_buffer_actual_bytes: 0,
+            remote: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9),
+            outbound_control: Some(OutboundControlStream {
+                local_ssrc: 0x1020_3040,
+                sender: SrtcpSender::new(SrtpSessionKeys {
+                    encryption_key: [0; 32],
+                    salt: [0; 14],
+                    authentication_key: [0; 20],
+                }),
+            }),
+            outbound_rtp: None,
+            inbound_crypto: None,
+            reception_report,
+        };
+
+        assert_eq!(
+            bound
+                .reception_report
+                .report_snapshot(now)
+                .unwrap()
+                .report
+                .fraction_lost,
+            85
+        );
+        assert!(send_control_report(&mut bound, now).is_err());
+        assert_eq!(
+            bound
+                .reception_report
+                .report_snapshot(now)
+                .unwrap()
+                .report
+                .fraction_lost,
+            85,
+            "失败发送不得提交 interval prior"
+        );
+
+        let receiving = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        bound.remote = receiving.local_addr().unwrap();
+        send_control_report(&mut bound, now).unwrap();
+        assert_eq!(
+            bound
+                .reception_report
+                .report_snapshot(now)
+                .unwrap()
+                .report
+                .fraction_lost,
+            0,
+            "成功发送后必须提交 interval prior"
+        );
     }
 
     #[test]

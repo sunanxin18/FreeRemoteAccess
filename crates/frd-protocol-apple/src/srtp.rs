@@ -11,6 +11,7 @@ use aes::Aes256;
 use anyhow::{ensure, Context, Result};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use std::time::{Duration, Instant};
 
 use crate::media_negotiation::SrtpMasterMaterial;
 
@@ -81,7 +82,15 @@ const RTCP_CUMULATIVE_LOSS_SIGN_BIT: u32 = 1 << 23;
 const RTCP_CUMULATIVE_LOSS_SIGN_EXTENSION_MASK: u32 = 0xff00_0000;
 const RTCP_REPORT_EXTENDED_HIGHEST_SEQUENCE_OFFSET: usize = 8;
 const RTCP_REPORT_INTERARRIVAL_JITTER_OFFSET: usize = 12;
+const RTCP_REPORT_LAST_SENDER_REPORT_OFFSET: usize = 16;
+const RTCP_REPORT_DELAY_SINCE_LAST_SENDER_REPORT_OFFSET: usize = 20;
 const RTCP_SENDER_REPORT_PACKET_TYPE: u8 = 200;
+const RTCP_SENDER_REPORT_NTP_MIDDLE_OFFSET: usize = 10;
+const RTCP_SENDER_REPORT_NTP_MIDDLE_LEN: usize = 4;
+const RTCP_SIGNED_24_MIN: i32 = -8_388_608;
+const RTCP_SIGNED_24_MAX: i32 = 8_388_607;
+const NANOSECONDS_PER_SECOND: u128 = 1_000_000_000;
+const RTCP_DELAY_UNITS_PER_SECOND: u128 = 1 << 16;
 const SCREEN_SHARING_CNAME_PREFIX: &str = "freeremotedesk-";
 
 #[derive(Clone, Copy)]
@@ -137,6 +146,254 @@ pub struct RtcpReceptionReport {
     pub cumulative_packets_lost: i32,
     pub extended_highest_sequence: u32,
     pub interarrival_jitter: u32,
+    pub last_sender_report: u32,
+    pub delay_since_last_sender_report: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RtcpReceptionReportBlock {
+    pub source_ssrc: u32,
+    pub fraction_lost: u8,
+    pub cumulative_packets_lost: i32,
+    pub extended_highest_sequence: u32,
+    pub interarrival_jitter: u32,
+    pub last_sender_report: u32,
+    pub delay_since_last_sender_report: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RtpReceptionReportSnapshot {
+    pub report: RtcpReceptionReportBlock,
+    expected_packets: u64,
+    received_packets: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SenderReportTiming {
+    source_ssrc: u32,
+    ntp_middle_32: u32,
+    received_at: Instant,
+}
+
+#[derive(Debug)]
+pub(crate) struct RtpReceptionReportState {
+    clock_rate: u32,
+    source_ssrc: Option<u32>,
+    base_extended_sequence: i64,
+    highest_extended_sequence: i64,
+    received_packets: u64,
+    expected_prior: u64,
+    received_prior: u64,
+    previous_arrival: Option<Instant>,
+    previous_rtp_timestamp: u32,
+    jitter_q4: i128,
+    last_sender_report: Option<SenderReportTiming>,
+}
+
+impl RtpReceptionReportState {
+    pub(crate) fn new(clock_rate: u32) -> Self {
+        debug_assert!(clock_rate != 0);
+        Self {
+            clock_rate,
+            source_ssrc: None,
+            base_extended_sequence: 0,
+            highest_extended_sequence: 0,
+            received_packets: 0,
+            expected_prior: 0,
+            received_prior: 0,
+            previous_arrival: None,
+            previous_rtp_timestamp: 0,
+            jitter_q4: 0,
+            last_sender_report: None,
+        }
+    }
+
+    pub(crate) fn observe_rtp(&mut self, header: RtpHeader, received_at: Instant) {
+        if self.source_ssrc != Some(header.ssrc) {
+            let retained_sender_report = self
+                .last_sender_report
+                .filter(|report| report.source_ssrc == header.ssrc);
+            *self = Self::new(self.clock_rate);
+            self.source_ssrc = Some(header.ssrc);
+            self.base_extended_sequence = i64::from(header.sequence);
+            self.highest_extended_sequence = i64::from(header.sequence);
+            self.last_sender_report = retained_sender_report;
+        } else {
+            let highest_sequence = self.highest_extended_sequence as u16;
+            let cycle = self.highest_extended_sequence & !i64::from(u16::MAX);
+            let candidate = if header.sequence < highest_sequence
+                && highest_sequence - header.sequence > RTP_SEQUENCE_HALF_SPACE
+            {
+                cycle + i64::from(RTP_SEQUENCE_SPACE) + i64::from(header.sequence)
+            } else if header.sequence > highest_sequence
+                && header.sequence - highest_sequence > RTP_SEQUENCE_HALF_SPACE
+            {
+                cycle - i64::from(RTP_SEQUENCE_SPACE) + i64::from(header.sequence)
+            } else {
+                cycle + i64::from(header.sequence)
+            };
+            self.highest_extended_sequence = self.highest_extended_sequence.max(candidate);
+        }
+
+        if let Some(previous_arrival) = self.previous_arrival {
+            let arrival_delta = received_at
+                .checked_duration_since(previous_arrival)
+                .unwrap_or(Duration::ZERO);
+            let arrival_ticks = duration_to_clock_ticks(arrival_delta, self.clock_rate);
+            let rtp_timestamp_delta =
+                i128::from(header.timestamp.wrapping_sub(self.previous_rtp_timestamp) as i32);
+            let variation = (arrival_ticks - rtp_timestamp_delta).abs();
+            let previous_jitter = self.jitter_q4;
+            self.jitter_q4 = (previous_jitter + variation - ((previous_jitter + 8) >> 4)).max(0);
+        }
+        self.previous_arrival = Some(received_at);
+        self.previous_rtp_timestamp = header.timestamp;
+        self.received_packets = self.received_packets.saturating_add(1);
+    }
+
+    pub(crate) fn observe_sender_reports(
+        &mut self,
+        compound: &[u8],
+        received_at: Instant,
+    ) -> Result<()> {
+        let mut packet_offset = 0usize;
+        let mut observed_sender_report = None;
+        while packet_offset < compound.len() {
+            let remaining = &compound[packet_offset..];
+            ensure!(
+                remaining.len() >= RTCP_COMMON_HEADER_LEN,
+                "RTCP compound packet 的公共头截断"
+            );
+            ensure!(
+                rtp_version(remaining[0]) == RTP_VERSION,
+                "RTCP version 不是 2"
+            );
+            let words_minus_one = u16::from_be_bytes(
+                remaining[RTCP_LENGTH_OFFSET..RTCP_LENGTH_OFFSET + 2]
+                    .try_into()
+                    .expect("已验证 RTCP 公共头长度"),
+            );
+            let packet_len = (usize::from(words_minus_one) + 1)
+                .checked_mul(RTCP_WORD_LEN)
+                .context("RTCP packet 长度溢出")?;
+            ensure!(
+                packet_len >= RTCP_COMMON_HEADER_LEN && packet_len <= remaining.len(),
+                "RTCP packet 声明长度越界"
+            );
+            let packet = &remaining[..packet_len];
+            if packet[RTCP_PACKET_TYPE_OFFSET] == RTCP_SENDER_REPORT_PACKET_TYPE {
+                ensure!(
+                    packet.len() >= RTCP_SENDER_REPORT_PREFIX_LEN,
+                    "RTCP Sender Report 固定字段截断"
+                );
+                let report_blocks_len = usize::from(packet[0] & RTCP_REPORT_COUNT_MASK)
+                    .checked_mul(RTCP_RECEPTION_REPORT_LEN)
+                    .context("RTCP Sender Report block 长度溢出")?;
+                ensure!(
+                    RTCP_SENDER_REPORT_PREFIX_LEN + report_blocks_len <= packet.len(),
+                    "RTCP Sender Report block 截断"
+                );
+                let source_ssrc = read_ssrc(packet, RTCP_SSRC_OFFSET);
+                if self.source_ssrc.is_none() || self.source_ssrc == Some(source_ssrc) {
+                    let ntp_middle_32 = u32::from_be_bytes(
+                        packet[RTCP_SENDER_REPORT_NTP_MIDDLE_OFFSET
+                            ..RTCP_SENDER_REPORT_NTP_MIDDLE_OFFSET
+                                + RTCP_SENDER_REPORT_NTP_MIDDLE_LEN]
+                            .try_into()
+                            .expect("已验证 RTCP Sender Report 固定字段长度"),
+                    );
+                    observed_sender_report = Some(SenderReportTiming {
+                        source_ssrc,
+                        ntp_middle_32,
+                        received_at,
+                    });
+                }
+            }
+            packet_offset += packet_len;
+        }
+        ensure!(
+            packet_offset == compound.len(),
+            "RTCP compound packet 边界不一致"
+        );
+        if let Some(observed_sender_report) = observed_sender_report {
+            self.last_sender_report = Some(observed_sender_report);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn report_snapshot(&self, now: Instant) -> Option<RtpReceptionReportSnapshot> {
+        let source_ssrc = self.source_ssrc?;
+        let expected_packets = self
+            .highest_extended_sequence
+            .saturating_sub(self.base_extended_sequence)
+            .saturating_add(1)
+            .max(0) as u64;
+        let cumulative_packets_lost =
+            i128::from(expected_packets).saturating_sub(i128::from(self.received_packets));
+        let expected_interval = expected_packets.saturating_sub(self.expected_prior);
+        let received_interval = self.received_packets.saturating_sub(self.received_prior);
+        let lost_interval = i128::from(expected_interval) - i128::from(received_interval);
+        let fraction_lost = if expected_interval == 0 || lost_interval <= 0 {
+            0
+        } else {
+            u8::try_from(((lost_interval << 8) / i128::from(expected_interval)).clamp(0, 255))
+                .expect("fraction lost 已限制在 u8 范围")
+        };
+        let (last_sender_report, delay_since_last_sender_report) = self
+            .last_sender_report
+            .filter(|report| report.source_ssrc == source_ssrc)
+            .map(|report| {
+                (
+                    report.ntp_middle_32,
+                    duration_to_rtcp_delay(
+                        now.checked_duration_since(report.received_at)
+                            .unwrap_or(Duration::ZERO),
+                    ),
+                )
+            })
+            .unwrap_or((0, 0));
+        Some(RtpReceptionReportSnapshot {
+            report: RtcpReceptionReportBlock {
+                source_ssrc,
+                fraction_lost,
+                cumulative_packets_lost: clamp_signed_24(cumulative_packets_lost),
+                extended_highest_sequence: self
+                    .highest_extended_sequence
+                    .clamp(0, i64::from(u32::MAX))
+                    as u32,
+                interarrival_jitter: (self.jitter_q4 >> 4).clamp(0, i128::from(u32::MAX)) as u32,
+                last_sender_report,
+                delay_since_last_sender_report,
+            },
+            expected_packets,
+            received_packets: self.received_packets,
+        })
+    }
+
+    pub(crate) fn commit_report(&mut self, snapshot: RtpReceptionReportSnapshot) {
+        self.expected_prior = snapshot.expected_packets;
+        self.received_prior = snapshot.received_packets;
+    }
+}
+
+fn duration_to_clock_ticks(duration: Duration, clock_rate: u32) -> i128 {
+    let ticks = duration.as_nanos().saturating_mul(u128::from(clock_rate)) / NANOSECONDS_PER_SECOND;
+    i128::try_from(ticks).unwrap_or(i128::MAX)
+}
+
+fn duration_to_rtcp_delay(duration: Duration) -> u32 {
+    let units = duration
+        .as_nanos()
+        .saturating_mul(RTCP_DELAY_UNITS_PER_SECOND)
+        / NANOSECONDS_PER_SECOND;
+    u32::try_from(units).unwrap_or(u32::MAX)
+}
+
+fn clamp_signed_24(value: i128) -> i32 {
+    value.clamp(
+        i128::from(RTCP_SIGNED_24_MIN),
+        i128::from(RTCP_SIGNED_24_MAX),
+    ) as i32
 }
 
 /// 按 RFC 5761 的不冲突 payload-type 区间区分 RTP 与 RTCP。
@@ -270,6 +527,18 @@ pub fn parse_rtcp_reception_reports(compound: &[u8]) -> Result<Vec<RtcpReception
                     interarrival_jitter: u32::from_be_bytes(
                         block[RTCP_REPORT_INTERARRIVAL_JITTER_OFFSET
                             ..RTCP_REPORT_INTERARRIVAL_JITTER_OFFSET + 4]
+                            .try_into()
+                            .expect("RTCP report block 长度固定"),
+                    ),
+                    last_sender_report: u32::from_be_bytes(
+                        block[RTCP_REPORT_LAST_SENDER_REPORT_OFFSET
+                            ..RTCP_REPORT_LAST_SENDER_REPORT_OFFSET + 4]
+                            .try_into()
+                            .expect("RTCP report block 长度固定"),
+                    ),
+                    delay_since_last_sender_report: u32::from_be_bytes(
+                        block[RTCP_REPORT_DELAY_SINCE_LAST_SENDER_REPORT_OFFSET
+                            ..RTCP_REPORT_DELAY_SINCE_LAST_SENDER_REPORT_OFFSET + 4]
                             .try_into()
                             .expect("RTCP report block 长度固定"),
                     ),
@@ -771,14 +1040,42 @@ fn verify_authentication_tag_with_suffix(
     Ok(())
 }
 
-/// 构造 Apple `_RTPSendRTCP` 同构的 RR + SDES/CNAME compound packet。
+/// 构造已确认由 Apple `_RTPSendRTCP` 发送的 RR + SDES/CNAME compound packet。
 pub fn build_compound_rtcp_receiver_report(local_ssrc: u32) -> Vec<u8> {
-    let mut compound = vec![0u8; SRTCP_UNENCRYPTED_PREFIX_LEN];
-    compound[0] = RTCP_VERSION_AND_ZERO_REPORTS;
+    build_compound_rtcp_receiver_report_with_block(local_ssrc, None)
+}
+
+pub(crate) fn build_compound_rtcp_receiver_report_with_block(
+    local_ssrc: u32,
+    report: Option<RtcpReceptionReportBlock>,
+) -> Vec<u8> {
+    let mut compound = Vec::with_capacity(
+        SRTCP_UNENCRYPTED_PREFIX_LEN + report.map_or(0, |_| RTCP_RECEPTION_REPORT_LEN) + 40,
+    );
+    compound.resize(SRTCP_UNENCRYPTED_PREFIX_LEN, 0);
+    compound[0] = RTCP_VERSION_AND_ZERO_REPORTS | u8::from(report.is_some());
     compound[1] = RTCP_RECEIVER_REPORT_PACKET_TYPE;
-    compound[2..4].copy_from_slice(&RTCP_RECEIVER_REPORT_WORDS_MINUS_ONE.to_be_bytes());
+    let receiver_report_words_minus_one = if report.is_some() {
+        RTCP_RECEIVER_REPORT_WORDS_MINUS_ONE
+            + u16::try_from(RTCP_RECEPTION_REPORT_LEN / RTCP_WORD_LEN)
+                .expect("固定 reception report block 长度可放入 u16")
+    } else {
+        RTCP_RECEIVER_REPORT_WORDS_MINUS_ONE
+    };
+    compound[2..4].copy_from_slice(&receiver_report_words_minus_one.to_be_bytes());
     compound[RTCP_SSRC_OFFSET..RTCP_SSRC_OFFSET + SSRC_LEN]
         .copy_from_slice(&local_ssrc.to_be_bytes());
+    if let Some(report) = report {
+        compound.extend_from_slice(&report.source_ssrc.to_be_bytes());
+        compound.push(report.fraction_lost);
+        compound.extend_from_slice(
+            &clamp_signed_24(i128::from(report.cumulative_packets_lost)).to_be_bytes()[1..],
+        );
+        compound.extend_from_slice(&report.extended_highest_sequence.to_be_bytes());
+        compound.extend_from_slice(&report.interarrival_jitter.to_be_bytes());
+        compound.extend_from_slice(&report.last_sender_report.to_be_bytes());
+        compound.extend_from_slice(&report.delay_since_last_sender_report.to_be_bytes());
+    }
 
     let cname = format!("{SCREEN_SHARING_CNAME_PREFIX}{local_ssrc:08x}");
     let cname_len = u8::try_from(cname.len()).expect("固定前缀加十六进制 SSRC 可放入 SDES 长度");
@@ -978,6 +1275,7 @@ fn read_ssrc(packet: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     const TEST_SSRC: u32 = 0x1122_3344;
 
@@ -1305,6 +1603,185 @@ mod tests {
         assert!(compound
             .windows(SCREEN_SHARING_CNAME_PREFIX.len())
             .any(|window| window == SCREEN_SHARING_CNAME_PREFIX.as_bytes()));
+    }
+
+    #[test]
+    fn receiver_report_builder_serializes_one_rfc3550_report_block_and_clamps_signed_loss() {
+        const REMOTE_SSRC: u32 = 0x5566_7788;
+        let report = RtcpReceptionReportBlock {
+            source_ssrc: REMOTE_SSRC,
+            fraction_lost: 85,
+            cumulative_packets_lost: i32::MAX,
+            extended_highest_sequence: 0x0001_0003,
+            interarrival_jitter: 56,
+            last_sender_report: 0x3344_5566,
+            delay_since_last_sender_report: 0x0001_8000,
+        };
+
+        let compound = build_compound_rtcp_receiver_report_with_block(TEST_SSRC, Some(report));
+
+        assert_eq!(&compound[..4], &[0x81, 201, 0, 7]);
+        assert_eq!(&compound[4..8], &TEST_SSRC.to_be_bytes());
+        assert_eq!(&compound[8..12], &REMOTE_SSRC.to_be_bytes());
+        assert_eq!(compound[12], 85);
+        assert_eq!(&compound[13..16], &[0x7f, 0xff, 0xff]);
+        assert_eq!(&compound[16..20], &0x0001_0003u32.to_be_bytes());
+        assert_eq!(&compound[20..24], &56u32.to_be_bytes());
+        assert_eq!(&compound[24..28], &0x3344_5566u32.to_be_bytes());
+        assert_eq!(&compound[28..32], &0x0001_8000u32.to_be_bytes());
+        assert_eq!(&compound[32..34], &[0x81, 202]);
+
+        let negative = build_compound_rtcp_receiver_report_with_block(
+            TEST_SSRC,
+            Some(RtcpReceptionReportBlock {
+                cumulative_packets_lost: i32::MIN,
+                ..report
+            }),
+        );
+        assert_eq!(&negative[13..16], &[0x80, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn reception_report_tracks_wrap_loss_and_interval_fraction_without_snapshot_side_effects() {
+        const REMOTE_SSRC: u32 = 0x5566_7788;
+        let start = Instant::now();
+        let mut state = RtpReceptionReportState::new(90_000);
+        state.observe_rtp(
+            RtpHeader {
+                marker: false,
+                payload_type: 96,
+                sequence: 65_534,
+                timestamp: 0,
+                ssrc: REMOTE_SSRC,
+                payload_offset: RTP_FIXED_HEADER_LEN,
+            },
+            start,
+        );
+        state.observe_rtp(
+            RtpHeader {
+                sequence: 0,
+                timestamp: 9_000,
+                ..RtpHeader {
+                    marker: false,
+                    payload_type: 96,
+                    sequence: 65_534,
+                    timestamp: 0,
+                    ssrc: REMOTE_SSRC,
+                    payload_offset: RTP_FIXED_HEADER_LEN,
+                }
+            },
+            start + Duration::from_millis(100),
+        );
+
+        let first = state
+            .report_snapshot(start + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(first.report.extended_highest_sequence, 65_536);
+        assert_eq!(first.report.cumulative_packets_lost, 1);
+        assert_eq!(first.report.fraction_lost, 85);
+        assert_eq!(
+            state
+                .report_snapshot(start + Duration::from_secs(1))
+                .unwrap()
+                .report
+                .fraction_lost,
+            85,
+            "构造发送快照不得提前提交 interval prior"
+        );
+        state.commit_report(first);
+
+        for (sequence, timestamp, millis) in [(1, 18_000, 200), (3, 27_000, 300)] {
+            state.observe_rtp(
+                RtpHeader {
+                    marker: false,
+                    payload_type: 96,
+                    sequence,
+                    timestamp,
+                    ssrc: REMOTE_SSRC,
+                    payload_offset: RTP_FIXED_HEADER_LEN,
+                },
+                start + Duration::from_millis(millis),
+            );
+        }
+        let second = state
+            .report_snapshot(start + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(second.report.extended_highest_sequence, 65_539);
+        assert_eq!(second.report.cumulative_packets_lost, 2);
+        assert_eq!(second.report.fraction_lost, 85);
+    }
+
+    #[test]
+    fn reception_report_uses_role_clock_rate_for_rfc3550_jitter() {
+        const REMOTE_SSRC: u32 = 0x5566_7788;
+        let start = Instant::now();
+        for (clock_rate, timestamp_step) in [(48_000, 4_800), (90_000, 9_000)] {
+            let mut state = RtpReceptionReportState::new(clock_rate);
+            for (sequence, timestamp, millis) in [
+                (1, 0, 0),
+                (2, timestamp_step, 100),
+                (3, timestamp_step * 2, 210),
+            ] {
+                state.observe_rtp(
+                    RtpHeader {
+                        marker: false,
+                        payload_type: 96,
+                        sequence,
+                        timestamp,
+                        ssrc: REMOTE_SSRC,
+                        payload_offset: RTP_FIXED_HEADER_LEN,
+                    },
+                    start + Duration::from_millis(millis),
+                );
+            }
+            let report = state
+                .report_snapshot(start + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(report.report.interarrival_jitter, clock_rate / 1_600);
+        }
+    }
+
+    #[test]
+    fn reception_report_uses_authenticated_sender_report_for_lsr_and_dlsr() {
+        const REMOTE_SSRC: u32 = 0x5566_7788;
+        let start = Instant::now();
+        let mut state = RtpReceptionReportState::new(90_000);
+        state.observe_rtp(
+            RtpHeader {
+                marker: false,
+                payload_type: 96,
+                sequence: 1,
+                timestamp: 0,
+                ssrc: REMOTE_SSRC,
+                payload_offset: RTP_FIXED_HEADER_LEN,
+            },
+            start,
+        );
+        assert_eq!(
+            state
+                .report_snapshot(start + Duration::from_millis(500))
+                .unwrap()
+                .report
+                .last_sender_report,
+            0
+        );
+
+        let mut sender_report = vec![0x80, 200, 0, 6];
+        sender_report.extend_from_slice(&REMOTE_SSRC.to_be_bytes());
+        sender_report.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+        sender_report.extend_from_slice(&0x5566_7788u32.to_be_bytes());
+        sender_report.extend_from_slice(&0u32.to_be_bytes());
+        sender_report.extend_from_slice(&0u32.to_be_bytes());
+        sender_report.extend_from_slice(&0u32.to_be_bytes());
+        state
+            .observe_sender_reports(&sender_report, start + Duration::from_secs(1))
+            .unwrap();
+
+        let report = state
+            .report_snapshot(start + Duration::from_millis(2_500))
+            .unwrap();
+        assert_eq!(report.report.last_sender_report, 0x3344_5566);
+        assert_eq!(report.report.delay_since_last_sender_report, 0x0001_8000);
     }
 
     #[test]
