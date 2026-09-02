@@ -221,9 +221,6 @@ fn run_debug_media_watchdog(weak: Weak<DebugMediaWatchdog>) {
             if confirmed.version != snapshot.version {
                 continue;
             }
-            if confirmed.tick < 128 {
-                continue;
-            }
             if let Some(stage) = DebugMediaStage::name_from_u8(confirmed.stage) {
                 eprintln!("[frd-media-stall] tick={} phase={stage}", confirmed.tick);
                 reported = true;
