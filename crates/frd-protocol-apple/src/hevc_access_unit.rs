@@ -141,6 +141,7 @@ enum InitialConfigurationState {
     Configured,
 }
 
+#[cfg(any(debug_assertions, test))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct HevcAssemblerDiagnostics {
     pub(crate) complete_configuration_access_units: u64,
@@ -167,7 +168,10 @@ pub struct HevcAccessUnitAssembler {
     complete_initial_ap_parameter_sets: Option<[Vec<u8>; 3]>,
     dropping_until_marker: bool,
     recovery_sequence: Option<u16>,
+    #[cfg(any(debug_assertions, test))]
     diagnostics: HevcAssemblerDiagnostics,
+    #[cfg(any(debug_assertions, test))]
+    access_unit_has_complete_configuration: bool,
 }
 
 impl HevcAccessUnitAssembler {
@@ -194,7 +198,10 @@ impl HevcAccessUnitAssembler {
             complete_initial_ap_parameter_sets: None,
             dropping_until_marker: false,
             recovery_sequence: None,
+            #[cfg(any(debug_assertions, test))]
             diagnostics: HevcAssemblerDiagnostics::default(),
+            #[cfg(any(debug_assertions, test))]
+            access_unit_has_complete_configuration: false,
         })
     }
 
@@ -214,7 +221,11 @@ impl HevcAccessUnitAssembler {
         self.complete_initial_ap_parameter_sets = None;
         self.dropping_until_marker = false;
         self.recovery_sequence = None;
-        self.diagnostics = HevcAssemblerDiagnostics::default();
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.diagnostics = HevcAssemblerDiagnostics::default();
+            self.access_unit_has_complete_configuration = false;
+        }
     }
 
     #[cfg(any(debug_assertions, test))]
@@ -260,8 +271,11 @@ impl HevcAccessUnitAssembler {
                 self.expected_sequence = Some(packet.sequence.wrapping_add(1));
                 self.recovery_sequence = None;
                 self.clear_reorder();
-                self.diagnostics.recovery_marker_resyncs =
-                    self.diagnostics.recovery_marker_resyncs.saturating_add(1);
+                #[cfg(any(debug_assertions, test))]
+                {
+                    self.diagnostics.recovery_marker_resyncs =
+                        self.diagnostics.recovery_marker_resyncs.saturating_add(1);
+                }
             }
             return Ok(Vec::new());
         }
@@ -274,8 +288,15 @@ impl HevcAccessUnitAssembler {
         if usize::from(distance) >= self.limits.max_reorder_packets {
             self.preserve_complete_initial_ap_parameter_sets();
             self.drop_at_packet_boundary(packet.sequence, packet.marker);
-            self.diagnostics.reorder_window_exceeded =
-                self.diagnostics.reorder_window_exceeded.saturating_add(1);
+            #[cfg(any(debug_assertions, test))]
+            {
+                if packet.marker {
+                    self.diagnostics.recovery_marker_resyncs =
+                        self.diagnostics.recovery_marker_resyncs.saturating_add(1);
+                }
+                self.diagnostics.reorder_window_exceeded =
+                    self.diagnostics.reorder_window_exceeded.saturating_add(1);
+            }
             return Err(HevcAccessUnitError::ReorderWindowExceeded {
                 limit: self.limits.max_reorder_packets,
             });
@@ -362,9 +383,13 @@ impl HevcAccessUnitAssembler {
                     return Err(HevcAccessUnitError::Depacketize(error));
                 }
             };
-        if self.initial_configuration == InitialConfigurationState::AwaitingConfigurationAu
-            && nal_type(&packet.payload) == Some(48)
-        {
+        #[cfg(any(debug_assertions, test))]
+        let observe_complete_configuration = nal_type(&packet.payload) == Some(48);
+        #[cfg(not(any(debug_assertions, test)))]
+        let observe_complete_configuration = self.initial_configuration
+            == InitialConfigurationState::AwaitingConfigurationAu
+            && nal_type(&packet.payload) == Some(48);
+        if observe_complete_configuration {
             let mut parameter_sets: [Option<Vec<u8>>; 3] = [None, None, None];
             for nal in &packet_nals {
                 if let Some(index) = parameter_set_index(nal.as_bytes()) {
@@ -372,11 +397,14 @@ impl HevcAccessUnitAssembler {
                 }
             }
             if let [Some(vps), Some(sps), Some(pps)] = parameter_sets {
-                self.complete_initial_ap_parameter_sets = Some([vps, sps, pps]);
-                self.diagnostics.complete_configuration_access_units = self
-                    .diagnostics
-                    .complete_configuration_access_units
-                    .saturating_add(1);
+                #[cfg(any(debug_assertions, test))]
+                {
+                    self.access_unit_has_complete_configuration = true;
+                }
+                if self.initial_configuration == InitialConfigurationState::AwaitingConfigurationAu
+                {
+                    self.complete_initial_ap_parameter_sets = Some([vps, sps, pps]);
+                }
             }
         }
         if packet.marker && packet_nals.is_empty() {
@@ -417,10 +445,13 @@ impl HevcAccessUnitAssembler {
                 .any(|nal| matches!(nal_type(nal), Some(16..=23)))
         {
             self.discard_access_unit();
-            self.diagnostics.waiting_for_recovery_irap_drops = self
-                .diagnostics
-                .waiting_for_recovery_irap_drops
-                .saturating_add(1);
+            #[cfg(any(debug_assertions, test))]
+            {
+                self.diagnostics.waiting_for_recovery_irap_drops = self
+                    .diagnostics
+                    .waiting_for_recovery_irap_drops
+                    .saturating_add(1);
+            }
             return Ok(None);
         }
 
@@ -428,8 +459,18 @@ impl HevcAccessUnitAssembler {
             return Ok(None);
         }
         let access_unit = self.finish_access_unit(packet.ssrc, packet.timestamp)?;
-        self.diagnostics.completed_access_units =
-            self.diagnostics.completed_access_units.saturating_add(1);
+        #[cfg(any(debug_assertions, test))]
+        {
+            if self.access_unit_has_complete_configuration {
+                self.diagnostics.complete_configuration_access_units = self
+                    .diagnostics
+                    .complete_configuration_access_units
+                    .saturating_add(1);
+            }
+            self.access_unit_has_complete_configuration = false;
+            self.diagnostics.completed_access_units =
+                self.diagnostics.completed_access_units.saturating_add(1);
+        }
         Ok(Some(access_unit))
     }
 
@@ -545,6 +586,10 @@ impl HevcAccessUnitAssembler {
         self.access_unit_bytes = 0;
         self.depacketizer.reset(self.generation);
         self.complete_initial_ap_parameter_sets = None;
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.access_unit_has_complete_configuration = false;
+        }
     }
 
     fn preserve_complete_initial_ap_parameter_sets(&mut self) {
@@ -1061,7 +1106,86 @@ mod tests {
         let diagnostics = assembler.diagnostics();
         assert_eq!(diagnostics.reorder_window_exceeded, 1);
         assert_eq!(diagnostics.waiting_for_recovery_irap_drops, 1);
+        assert_eq!(diagnostics.recovery_marker_resyncs, 2);
+    }
+
+    #[test]
+    fn configuration_diagnostic_counts_only_one_successful_complete_configuration_au() {
+        let configuration = [
+            0x60, 0x01, 0, 3, 0x40, 0x01, 1, 0, 3, 0x42, 0x01, 2, 0, 3, 0x44, 0x01, 3,
+        ];
+        let mut completed = assembler();
+        assert!(completed
+            .push(packet(1, 0, false, &configuration))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            completed.diagnostics().complete_configuration_access_units,
+            0,
+            "a marker-less configuration AP is not a completed AU"
+        );
+        assert_eq!(
+            completed
+                .push(packet(2, 0, true, &configuration))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            completed.diagnostics().complete_configuration_access_units,
+            1,
+            "multiple complete APs in one completed AU count once"
+        );
+
+        let mut discarded = assembler();
+        assert!(discarded
+            .push(packet(1, 0, false, &configuration))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            discarded.push(packet(2, 1, false, &[0x02, 0x01, 4])),
+            Err(HevcAccessUnitError::TimestampChangedBeforeMarker { .. })
+        ));
+        assert_eq!(
+            discarded.diagnostics().complete_configuration_access_units,
+            0,
+            "a discarded configuration AU is not counted"
+        );
+    }
+
+    #[test]
+    fn reorder_window_with_its_own_marker_counts_one_immediate_recovery_resync() {
+        let mut assembler = assembler();
+        assert!(assembler
+            .push(packet(10, 0, false, &[0x02, 0x01, 1]))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            assembler.push(packet(267, 0, true, &[0x02, 0x01, 2])),
+            Err(HevcAccessUnitError::ReorderWindowExceeded { .. })
+        ));
+        let diagnostics = assembler.diagnostics();
+        assert_eq!(diagnostics.reorder_window_exceeded, 1);
         assert_eq!(diagnostics.recovery_marker_resyncs, 1);
+    }
+
+    #[test]
+    fn reorder_window_waits_for_one_later_marker_before_counting_recovery_resync() {
+        let mut assembler = assembler();
+        assert!(assembler
+            .push(packet(10, 0, false, &[0x02, 0x01, 1]))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            assembler.push(packet(267, 0, false, &[0x02, 0x01, 2])),
+            Err(HevcAccessUnitError::ReorderWindowExceeded { .. })
+        ));
+        assert_eq!(assembler.diagnostics().recovery_marker_resyncs, 0);
+        assert!(assembler
+            .push(packet(268, 0, true, &[0x02, 0x01, 3]))
+            .unwrap()
+            .is_empty());
+        assert_eq!(assembler.diagnostics().recovery_marker_resyncs, 1);
     }
 
     #[test]

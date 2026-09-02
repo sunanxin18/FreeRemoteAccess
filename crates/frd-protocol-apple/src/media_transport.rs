@@ -1875,6 +1875,31 @@ mod tests {
     }
 
     #[test]
+    fn generation_reset_clears_nonzero_discard_counters() {
+        let mut transport = MediaTransport::new(1, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            transport.record_discard(
+                MediaRole::Audio,
+                MediaDiscardReason::AuthenticationFailed,
+                None,
+            ),
+            MediaReceiveOutcome::Discarded(MediaDiscardReason::AuthenticationFailed)
+        );
+        assert_ne!(
+            transport.discard_counters(),
+            MediaDiscardCounters::default()
+        );
+
+        transport.reset_generation(2).unwrap();
+
+        assert_eq!(transport.generation(), 2);
+        assert_eq!(
+            transport.discard_counters(),
+            MediaDiscardCounters::default()
+        );
+    }
+
+    #[test]
     fn announced_roles_cannot_share_a_remote_port() {
         let mut announcement =
             parse_media_stream_port_announcement(&announcement_fixture(9_999, 1)).unwrap();

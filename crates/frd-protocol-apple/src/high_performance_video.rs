@@ -43,6 +43,7 @@ impl fmt::Display for AppleHighPerformanceVideoError {
 
 impl Error for AppleHighPerformanceVideoError {}
 
+#[cfg(any(debug_assertions, test))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AppleHighPerformanceVideoDiagnostics {
     pub(crate) video_config_publications: u64,
@@ -56,6 +57,7 @@ pub(crate) struct AppleHighPerformanceVideoAdapter {
     parameter_sets: [Option<Vec<u8>>; 3],
     configured_parameter_sets: Option<[Option<Vec<u8>>; 3]>,
     stage_trace: MediaStageTrace,
+    #[cfg(any(debug_assertions, test))]
     diagnostics: AppleHighPerformanceVideoDiagnostics,
 }
 
@@ -67,6 +69,7 @@ impl AppleHighPerformanceVideoAdapter {
             parameter_sets: [None, None, None],
             configured_parameter_sets: None,
             stage_trace: MediaStageTrace::default(),
+            #[cfg(any(debug_assertions, test))]
             diagnostics: AppleHighPerformanceVideoDiagnostics::default(),
         }
     }
@@ -76,7 +79,10 @@ impl AppleHighPerformanceVideoAdapter {
         self.parameter_sets = [None, None, None];
         self.configured_parameter_sets = None;
         self.stage_trace = MediaStageTrace::default();
-        self.diagnostics = AppleHighPerformanceVideoDiagnostics::default();
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.diagnostics = AppleHighPerformanceVideoDiagnostics::default();
+        }
     }
 
     #[cfg(any(debug_assertions, test))]
@@ -149,8 +155,11 @@ impl AppleHighPerformanceVideoAdapter {
             runtime
                 .publish_media(MediaFrame::VideoConfig(config))
                 .map_err(|_| AppleHighPerformanceVideoError::MediaPublicationFailed)?;
-            self.diagnostics.video_config_publications =
-                self.diagnostics.video_config_publications.saturating_add(1);
+            #[cfg(any(debug_assertions, test))]
+            {
+                self.diagnostics.video_config_publications =
+                    self.diagnostics.video_config_publications.saturating_add(1);
+            }
             self.configured_parameter_sets = Some(next_parameter_sets.clone());
         }
 
@@ -172,10 +181,13 @@ impl AppleHighPerformanceVideoAdapter {
         runtime
             .publish_media(MediaFrame::EncodedVideo(access_unit))
             .map_err(|_| AppleHighPerformanceVideoError::MediaPublicationFailed)?;
-        self.diagnostics.encoded_video_publications = self
-            .diagnostics
-            .encoded_video_publications
-            .saturating_add(1);
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.diagnostics.encoded_video_publications = self
+                .diagnostics
+                .encoded_video_publications
+                .saturating_add(1);
+        }
         if let Some(size) = published_config_size {
             self.stage_trace
                 .observe(MediaStageDiagnostic::HevcAccessUnitPublished {

@@ -49,6 +49,7 @@ pub(crate) struct ViewerMediaState {
     pub(crate) non_silent_audio_access_units: u64,
     pub(crate) concealed_audio_access_units: u64,
     pub(crate) authenticated_video_packets: u64,
+    #[cfg(any(debug_assertions, test))]
     active_service_ticks: u64,
     video_stream_1: VideoReceiveState,
     video_stream_2: VideoReceiveState,
@@ -60,6 +61,7 @@ struct VideoReceiveState {
     assembler: HevcAccessUnitAssembler,
     adapter: AppleHighPerformanceVideoAdapter,
     stage_trace: MediaStageTrace,
+    #[cfg(any(debug_assertions, test))]
     authenticated_rtp_packets: u64,
 }
 
@@ -70,6 +72,7 @@ impl VideoReceiveState {
                 .context("创建 Apple HP HEVC AU 组装器失败")?,
             adapter: AppleHighPerformanceVideoAdapter::new(identity, generation),
             stage_trace: MediaStageTrace::default(),
+            #[cfg(any(debug_assertions, test))]
             authenticated_rtp_packets: 0,
         })
     }
@@ -78,11 +81,17 @@ impl VideoReceiveState {
         self.assembler.reset(generation);
         self.adapter.reset(generation);
         self.stage_trace = MediaStageTrace::default();
-        self.authenticated_rtp_packets = 0;
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.authenticated_rtp_packets = 0;
+        }
     }
 
     fn observe_authenticated_rtp(&mut self, generation: u64) {
-        self.authenticated_rtp_packets = self.authenticated_rtp_packets.saturating_add(1);
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.authenticated_rtp_packets = self.authenticated_rtp_packets.saturating_add(1);
+        }
         self.stage_trace
             .observe(MediaStageDiagnostic::AuthenticatedVideoRtp {
                 generation,
@@ -173,6 +182,7 @@ impl ViewerMediaState {
             non_silent_audio_access_units: 0,
             concealed_audio_access_units: 0,
             authenticated_video_packets: 0,
+            #[cfg(any(debug_assertions, test))]
             active_service_ticks: 0,
             video_stream_1: VideoReceiveState::new(
                 VideoStreamIdentity {
@@ -194,12 +204,19 @@ impl ViewerMediaState {
     }
 
     pub(crate) fn reset_generation(&mut self, generation: u64) -> Result<()> {
+        // 先完成可能失败的接收器准备，随后才提交 transport generation；其后的本地
+        // 状态替换和诊断归零均不再失败，避免摘要跨 generation 混合。
+        let next_audio_receiver =
+            ArdAudioReceiver::new().context("重建 Mac→PC AAC-ELD 接收器失败")?;
         self.transport.reset_generation(generation)?;
-        self.audio_receiver = ArdAudioReceiver::new().context("重建 Mac→PC AAC-ELD 接收器失败")?;
+        self.audio_receiver = next_audio_receiver;
         self.video_stream_1.reset(generation);
         self.video_stream_2.reset(generation);
         self.authenticated_video_packets = 0;
-        self.active_service_ticks = 0;
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.active_service_ticks = 0;
+        }
         self.audio_degraded = false;
         self.control_stage_trace = MediaStageTrace::default();
         Ok(())
@@ -252,7 +269,10 @@ impl ViewerMediaState {
         if self.transport.phase() != MediaTransportPhase::Active {
             return Ok(0);
         }
-        self.active_service_ticks = self.active_service_ticks.saturating_add(1);
+        #[cfg(any(debug_assertions, test))]
+        {
+            self.active_service_ticks = self.active_service_ticks.saturating_add(1);
+        }
         self.transport.service_control_reports_at(generation, now)?;
         let Self {
             transport,
@@ -266,7 +286,8 @@ impl ViewerMediaState {
             video_stream_1,
             video_stream_2,
             audio_degraded,
-            active_service_ticks: _,
+            #[cfg(any(debug_assertions, test))]
+                active_service_ticks: _,
             control_stage_trace: _,
         } = self;
         let summary = transport.drain_receive_round(generation, |role, datagram| {
