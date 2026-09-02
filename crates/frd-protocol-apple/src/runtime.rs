@@ -119,14 +119,33 @@ pub(crate) fn preserve_pending_confirmation_result<T>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AppleKeyboardWireMode {
+    #[default]
+    StandardRfb,
+    HighPerformanceEncrypted,
+}
+
 #[derive(Default)]
 pub(crate) struct PointerWireState {
     point: Option<PixelPoint>,
     buttons: u8,
     pressed_keys: BTreeMap<PhysicalKeyCode, u32>,
+    keyboard_mode: AppleKeyboardWireMode,
 }
 
 impl PointerWireState {
+    fn for_protocol(protocol_id: &frd_core::ProtocolId) -> Self {
+        Self {
+            keyboard_mode: if protocol_id == &frd_core::ProtocolId::apple_high_performance() {
+                AppleKeyboardWireMode::HighPerformanceEncrypted
+            } else {
+                AppleKeyboardWireMode::StandardRfb
+            },
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn handle(&mut self, event: InputEvent, writer: &AppleWriterHandle) -> Result<()> {
         match event {
             InputEvent::PointerSample(sample) => self.handle_sample(sample, writer)?,
@@ -189,7 +208,7 @@ impl PointerWireState {
 
     pub(crate) fn release_all(&mut self, writer: &AppleWriterHandle) -> Result<()> {
         for keysym in std::mem::take(&mut self.pressed_keys).into_values() {
-            writer.send_private_message(&protocol::msg_key_event(false, keysym))?;
+            self.send_key_event(false, keysym, writer)?;
         }
         let point = self.point.unwrap_or(PixelPoint { x: 0, y: 0 });
         writer.send_private_message(&protocol::msg_pointer_event(
@@ -220,13 +239,24 @@ impl PointerWireState {
                     return Ok(());
                 };
                 self.pressed_keys.insert(code, keysym);
-                writer.send_private_message(&protocol::msg_key_event(true, keysym))
+                self.send_key_event(true, keysym, writer)
             }
             KeyState::Released => {
                 let Some(keysym) = self.pressed_keys.remove(&code) else {
                     return Ok(());
                 };
-                writer.send_private_message(&protocol::msg_key_event(false, keysym))
+                self.send_key_event(false, keysym, writer)
+            }
+        }
+    }
+
+    fn send_key_event(&self, down: bool, keysym: u32, writer: &AppleWriterHandle) -> Result<()> {
+        match self.keyboard_mode {
+            AppleKeyboardWireMode::StandardRfb => {
+                writer.send_private_message(&protocol::msg_key_event(down, keysym))
+            }
+            AppleKeyboardWireMode::HighPerformanceEncrypted => {
+                writer.send_encrypted_key_event(down, keysym)
             }
         }
     }
@@ -606,7 +636,7 @@ fn run_authenticated_session_inner(
         protocol_id,
     )
     .map_err(|error| anyhow::anyhow!(error.code()))?;
-    let mut pointer = PointerWireState::default();
+    let mut pointer = PointerWireState::for_protocol(protocol_id);
     let mut disconnect_requested = false;
     let mut readiness_published = false;
     let mut audio_started = false;
@@ -832,6 +862,81 @@ mod tests {
         MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
         SessionCommand, SessionEvent, SurfacePublisher,
     };
+
+    #[test]
+    fn keyboard_wire_mode_is_scoped_to_apple_protocol_identity() {
+        assert_eq!(
+            super::PointerWireState::for_protocol(&frd_core::ProtocolId::apple_high_performance())
+                .keyboard_mode,
+            super::AppleKeyboardWireMode::HighPerformanceEncrypted
+        );
+        assert_eq!(
+            super::PointerWireState::for_protocol(&frd_core::ProtocolId::apple_hpss_mvs())
+                .keyboard_mode,
+            super::AppleKeyboardWireMode::StandardRfb
+        );
+    }
+
+    #[test]
+    fn standard_apple_keyboard_path_keeps_the_rfb_type_4_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut connection = crate::AppleConnection::new(stream);
+        let writer = connection.writer_handle().unwrap();
+        let mut pointer =
+            super::PointerWireState::for_protocol(&frd_core::ProtocolId::apple_hpss_mvs());
+
+        pointer
+            .handle(
+                frd_core::InputEvent::PhysicalKey {
+                    code: frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04),
+                    state: frd_core::KeyState::Pressed,
+                    modifiers: frd_core::Modifiers::default(),
+                },
+                &writer,
+            )
+            .unwrap();
+
+        let mut message = [0u8; frd_wire_rfb::KEY_EVENT_MESSAGE_BYTES];
+        peer.read_exact(&mut message).unwrap();
+        assert_eq!(message, frd_wire_rfb::encode_key_event(true, 0x61));
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn high_performance_release_all_keeps_the_encrypted_key_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let initial_key = [0x21; 16];
+        let outer_key = [0x31; 16];
+        let outer_iv = [0x42; 16];
+        let mut connection = crate::AppleConnection::new(stream);
+        connection
+            .set_crypto(crate::session::SessionCrypto::from_key_iv_with_initial_key(
+                outer_key,
+                outer_iv,
+                initial_key,
+            ))
+            .unwrap();
+        let writer = connection.writer_handle().unwrap();
+        let mut pointer =
+            super::PointerWireState::for_protocol(&frd_core::ProtocolId::apple_high_performance());
+        pointer
+            .pressed_keys
+            .insert(frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04), 0x61);
+
+        pointer.release_all(&writer).unwrap();
+
+        let mut peer_crypto = crate::session::SessionCrypto::from_key_iv(outer_key, outer_iv);
+        let key_release = read_encrypted_test_message(&mut peer, &mut peer_crypto);
+        assert_eq!(key_release.len(), 18);
+        assert_eq!(&key_release[..2], &[0x10, 0x00]);
+        let pointer_release = read_encrypted_test_message(&mut peer, &mut peer_crypto);
+        assert_eq!(pointer_release[0], 0x05);
+        writer.shutdown().unwrap();
+    }
 
     #[test]
     fn debug_media_close_summary_is_limited_to_product_high_performance() {
