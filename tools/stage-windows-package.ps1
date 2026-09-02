@@ -4,7 +4,9 @@ param(
     [string]$Application = "target/release/freeremotedesk-windows.exe",
     [string]$CodecSource = ".codex-target/ffmpeg-8.1.2/windows-x86_64/Release/codec",
     [string]$BuildProvenance = ".codex-target/ffmpeg-8.1.2/windows-x86_64/Release/build-provenance.txt",
-    [string]$CorrespondingSourceAsset = ".codex-target/ffmpeg-8.1.2/release-assets/FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip"
+    [string]$CorrespondingSourceAsset = ".codex-target/ffmpeg-8.1.2/release-assets/FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip",
+    [string]$GitCommit,
+    [string]$BuildId
 )
 
 Set-StrictMode -Version Latest
@@ -52,6 +54,20 @@ function Assert-ExactFileSet([string]$Directory, [string[]]$Expected) {
     $expectedKey = (($Expected | Sort-Object) -join "|")
     if ($actualKey -cne $expectedKey) {
         throw "目录文件集合不匹配；实际 [$($children.Name -join ', ')]，要求 [$($Expected -join ', ')]"
+    }
+}
+
+function Get-PayloadSha256($Entries) {
+    $records = @($Entries | Sort-Object { [string]$_.path } | ForEach-Object {
+        "$([string]$_.path)`0$([string]$_.sha256)`n"
+    }) -join ""
+    $bytes = [Text.Encoding]::UTF8.GetBytes($records)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("X2") }) -join "")
+    }
+    finally {
+        $sha.Dispose()
     }
 }
 
@@ -115,6 +131,18 @@ try {
     Copy-Item -LiteralPath (Join-Path $licensesSource "FFmpeg-NOTICE.txt") -Destination $licenseDestination
 
     $manifest = Get-Content -Raw -LiteralPath $templatePath | ConvertFrom-Json
+    if (-not [string]::IsNullOrWhiteSpace($GitCommit)) {
+        if ($GitCommit -cnotmatch '^[0-9a-fA-F]{40}$') {
+            throw "GitCommit 必须为完整 40 位十六进制 commit ID"
+        }
+        $manifest.build.gitCommit = $GitCommit.ToLowerInvariant()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BuildId)) {
+        if ($BuildId.Length -gt 128 -or $BuildId -cnotmatch '^[A-Za-z0-9._-]+$') {
+            throw "BuildId 只能包含字母、数字、点、下划线和连字符，且不得超过 128 字符"
+        }
+        $manifest.build.buildId = $BuildId
+    }
     $manifest.buildProvenanceSha256 = (Get-FileHash -LiteralPath $provenancePath -Algorithm SHA256).Hash
     $correspondingSourceHash = (Get-FileHash -LiteralPath $sourceAssetPath -Algorithm SHA256).Hash
     $manifest.correspondingSource.sha256 = $correspondingSourceHash
@@ -125,10 +153,13 @@ try {
         }
         $entry.sha256 = (Get-FileHash -LiteralPath $stagedFile -Algorithm SHA256).Hash
     }
+    $manifest.payloadSha256 = Get-PayloadSha256 $manifest.files
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $attempt "ffmpeg-manifest.json") -Encoding UTF8
 
-    & pwsh -NoProfile -File $verifier -PackageRoot $attempt
-    if ($LASTEXITCODE -ne 0) {
+    try {
+        & $verifier -PackageRoot $attempt
+    }
+    catch {
         throw "临时 Windows package 验证失败"
     }
     Copy-Item -LiteralPath $sourceAssetPath -Destination $releaseAssetAttempt
@@ -155,8 +186,10 @@ try {
         $packagePublished = $true
         Move-Item -LiteralPath $releaseAssetAttempt -Destination $releaseAsset
         $releaseAssetPublished = $true
-        & pwsh -NoProfile -File $verifier -PackageRoot $package
-        if ($LASTEXITCODE -ne 0) {
+        try {
+            & $verifier -PackageRoot $package
+        }
+        catch {
             throw "已发布 Windows package 验证失败"
         }
         if ((Get-FileHash -LiteralPath $releaseAsset -Algorithm SHA256).Hash -cne $correspondingSourceHash) {

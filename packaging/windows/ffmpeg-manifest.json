@@ -2,6 +2,12 @@
   "schema": "freeremotedesk.windows.ffmpeg-package.v1",
   "ffmpegVersion": "8.1.2",
   "platform": "windows-x86_64",
+  "build": {
+    "gitCommit": null,
+    "buildId": null
+  },
+  "payloadHashAlgorithm": "sha256-path-nul-sha256-lf-v1",
+  "payloadSha256": null,
   "codecDirectory": "codecs/ffmpeg-8.1.2/windows-x86_64",
   "libavcodecMajor": 62,
   "source": {
@@ -40,6 +46,11 @@
   },
   "buildProvenanceSha256": null,
   "files": [
+    {
+      "path": "freeremotedesk-windows.exe",
+      "role": "application",
+      "sha256": null
+    },
     {
       "path": "codecs/ffmpeg-8.1.2/windows-x86_64/avcodec-62.dll",
       "role": "ffmpeg-libavcodec",

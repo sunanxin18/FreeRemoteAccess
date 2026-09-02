@@ -2,6 +2,7 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $packageRoot = Join-Path $repoRoot "target\package-test"
 $codecRoot = Join-Path $packageRoot "codecs\ffmpeg-8.1.2\windows-x86_64"
 $verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
+$installer = Join-Path $repoRoot "tools\install-windows-package.ps1"
 $correspondingSourceAsset = Join-Path $repoRoot "target\release-assets\FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip"
 
 Describe "Windows package verification security boundaries" {
@@ -15,6 +16,99 @@ Describe "Windows package verification security boundaries" {
         $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
         $LASTEXITCODE | Should Be 0
         ($output -join "`n") | Should Match "Windows package verification passed"
+    }
+
+    It "binds the Windows GUI executable bytes into the complete payload manifest" {
+        $manifest = Get-Content -Raw -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
+        $applicationEntries = @($manifest.files | Where-Object { $_.path -ceq "freeremotedesk-windows.exe" -and $_.role -ceq "application" })
+
+        $applicationEntries.Count | Should Be 1
+        $applicationEntries[0].sha256 | Should Be (Get-FileHash -LiteralPath (Join-Path $packageRoot "freeremotedesk-windows.exe") -Algorithm SHA256).Hash
+        $manifest.payloadSha256 | Should Match '^[0-9A-F]{64}$'
+    }
+
+    It "rejects an old GUI executable mixed with the staged codec payload" {
+        $application = Join-Path $packageRoot "freeremotedesk-windows.exe"
+        $backup = Join-Path $TestDrive "freeremotedesk-windows.original.exe"
+        Copy-Item -LiteralPath $application -Destination $backup
+        try {
+            Set-Content -LiteralPath $application -Value "old executable bytes" -Encoding UTF8
+            $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "payload.*不匹配|实际 staged bytes 不匹配"
+        }
+        finally {
+            Copy-Item -LiteralPath $backup -Destination $application -Force
+        }
+    }
+
+    It "rejects a staging root when trusted installation is required" {
+        $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot -RequireTrustedInstall 2>&1
+        $LASTEXITCODE | Should Not Be 0
+        ($output -join "`n") | Should Match "受信安装路径检查失败"
+    }
+
+    It "plans installation only for the fixed Program Files product directory" {
+        $output = & pwsh -NoProfile -File $installer -PackageRoot $packageRoot -WhatIf 2>&1
+        $LASTEXITCODE | Should Be 0
+        $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+        ($output -join "`n") | Should Match ([regex]::Escape((Join-Path $programFiles "FreeRemoteDesk")))
+        $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+        $elevationHost = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
+        ($output -join "`n") | Should Match ([regex]::Escape($elevationHost))
+    }
+
+    It "rejects a tampered package before installation or elevation" {
+        $application = Join-Path $packageRoot "freeremotedesk-windows.exe"
+        $backup = Join-Path $TestDrive "freeremotedesk-windows.preinstall.exe"
+        Copy-Item -LiteralPath $application -Destination $backup
+        try {
+            Add-Content -LiteralPath $application -Value "tampered before install" -Encoding UTF8
+            $output = & pwsh -NoProfile -File $installer -PackageRoot $packageRoot -WhatIf 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "安装前 package 验证失败"
+        }
+        finally {
+            Copy-Item -LiteralPath $backup -Destination $application -Force
+        }
+    }
+
+    It "does not execute a PATH-shadowed PowerShell host during package preflight" {
+        $fakeBin = Join-Path $TestDrive "fake-pwsh-bin"
+        New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
+        Copy-Item -LiteralPath (Join-Path $env:SystemRoot "System32\cmd.exe") -Destination (Join-Path $fakeBin "pwsh.exe")
+        $oldPath = $env:Path
+        try {
+            $env:Path = "$fakeBin;$oldPath"
+            $hostPath = (Get-Process -Id $PID).Path
+            $output = & $hostPath -NoProfile -File $installer -PackageRoot $packageRoot -WhatIf 2>&1
+            $LASTEXITCODE | Should Be 0
+            ($output -join "`n") | Should Match "Windows package verification passed"
+        }
+        finally {
+            $env:Path = $oldPath
+        }
+    }
+
+    It "parses the protected UTF-8 scripts with the fixed Windows PowerShell host" {
+        $protectedRoot = Join-Path $TestDrive "protected-installer"
+        $protectedTools = Join-Path $protectedRoot "tools"
+        New-Item -ItemType Directory -Force -Path $protectedTools | Out-Null
+        $bom = [Text.Encoding]::UTF8.GetPreamble()
+        foreach ($name in @("install-windows-package.ps1", "verify-windows-package.ps1")) {
+            $source = Join-Path $repoRoot "tools\$name"
+            $destination = Join-Path $protectedTools $name
+            [IO.File]::WriteAllBytes($destination, [byte[]]@($bom + [IO.File]::ReadAllBytes($source)))
+        }
+        $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+        $systemPowerShell = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
+
+        $output = & $systemPowerShell -NoProfile -ExecutionPolicy Bypass -File `
+            (Join-Path $protectedTools "install-windows-package.ps1") `
+            -PackageRoot $packageRoot -WhatIf 2>&1
+
+        ($output -join "`n") | Should Match "Windows package installation planned"
+        $LASTEXITCODE | Should Be 0
     }
 
     It "rejects an approved DLL shadow copy in the package root" {
