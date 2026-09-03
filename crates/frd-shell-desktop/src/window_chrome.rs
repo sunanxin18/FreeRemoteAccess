@@ -2,9 +2,10 @@ use frd_core::PixelRect;
 use frd_ui_egui::session_chrome_metrics;
 
 pub const TITLE_BAR_HEIGHT_POINTS: f64 = 44.0;
-// 280 pt session chrome + twice the 138 pt maximum Windows side inset + 4 pt DPI rounding headroom.
-pub(crate) const MINIMUM_WINDOW_WIDTH_POINTS: f64 =
+// A provisional creation-time hint; runtime native insets provide the binding minimum.
+pub(crate) const INITIAL_MINIMUM_WINDOW_WIDTH_POINTS: f64 =
     session_chrome_metrics().total_width as f64 + 2.0 * 138.0 + 4.0;
+pub(crate) const MINIMUM_WINDOW_HEIGHT_POINTS: f64 = 360.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeChromeInsets {
@@ -75,13 +76,16 @@ impl ChromeLayout {
         }
         let metrics = session_chrome_metrics();
         let slot = scaled(f64::from(metrics.slot_size), scale_factor)?;
-        let session_boundaries = scaled_session_boundaries(metrics, scale_factor)?;
-        let cluster_width = *session_boundaries.last()?;
-        if cluster_width > width_px {
+        let cluster_width_points = f64::from(metrics.total_width);
+        let cluster_width_px = cluster_width_points * scale_factor;
+        if !cluster_width_px.is_finite() || cluster_width_px > f64::from(width_px) {
             return None;
         }
-        let cluster_x = (width_px - cluster_width) / 2;
-        let cluster_right = cluster_x.checked_add(cluster_width)?;
+        let cluster_left = (f64::from(width_px) - cluster_width_px) / 2.0;
+        let session_boundaries = scaled_session_boundaries(metrics, scale_factor, cluster_left)?;
+        let cluster_x = session_boundaries[0];
+        let cluster_right = *session_boundaries.last()?;
+        let cluster_width = cluster_right.checked_sub(cluster_x)?;
         let native_right = width_px.checked_sub(native_trailing_px.min(width_px))?;
         if cluster_x < native_leading_px.min(width_px) || cluster_right > native_right {
             return None;
@@ -97,7 +101,7 @@ impl ChromeLayout {
             let start = session_boundaries[index * 2];
             let end = session_boundaries[index * 2 + 1];
             let rect = ChromeRect {
-                x: cluster_x + start,
+                x: start,
                 y: cluster_y,
                 width: end - start,
                 height: slot,
@@ -133,6 +137,22 @@ impl ChromeLayout {
 
     pub fn session_center_x(self) -> u32 {
         self.session_cluster.center().0
+    }
+
+    pub(crate) fn minimum_width_px(
+        scale_factor: f64,
+        native_leading_px: u32,
+        native_trailing_px: u32,
+    ) -> Option<u32> {
+        if !scale_factor.is_finite() || scale_factor <= 0.0 {
+            return None;
+        }
+        let cluster_width = scaled(
+            f64::from(session_chrome_metrics().total_width),
+            scale_factor,
+        )?;
+        let side_inset = native_leading_px.max(native_trailing_px);
+        cluster_width.checked_add(side_inset.checked_mul(2)?)
     }
 
     pub fn hit_test(self, x: u32, y: u32) -> ChromeHit {
@@ -182,6 +202,7 @@ fn scaled(points: f64, factor: f64) -> Option<u32> {
 fn scaled_session_boundaries(
     metrics: frd_ui_egui::SessionChromeMetrics,
     factor: f64,
+    left_px: f64,
 ) -> Option<[u32; 10]> {
     let slot = f64::from(metrics.slot_size);
     let frame_response = f64::from(metrics.frame_response_width);
@@ -199,21 +220,26 @@ fn scaled_session_boundaries(
         f64::from(metrics.total_width),
     ];
     Some([
-        scaled_boundary(boundaries[0], factor)?,
-        scaled_boundary(boundaries[1], factor)?,
-        scaled_boundary(boundaries[2], factor)?,
-        scaled_boundary(boundaries[3], factor)?,
-        scaled_boundary(boundaries[4], factor)?,
-        scaled_boundary(boundaries[5], factor)?,
-        scaled_boundary(boundaries[6], factor)?,
-        scaled_boundary(boundaries[7], factor)?,
-        scaled_boundary(boundaries[8], factor)?,
-        scaled_boundary(boundaries[9], factor)?,
+        floor_boundary(left_px + boundaries[0] * factor)?,
+        ceil_boundary(left_px + boundaries[1] * factor)?,
+        floor_boundary(left_px + boundaries[2] * factor)?,
+        ceil_boundary(left_px + boundaries[3] * factor)?,
+        floor_boundary(left_px + boundaries[4] * factor)?,
+        ceil_boundary(left_px + boundaries[5] * factor)?,
+        floor_boundary(left_px + boundaries[6] * factor)?,
+        ceil_boundary(left_px + boundaries[7] * factor)?,
+        floor_boundary(left_px + boundaries[8] * factor)?,
+        ceil_boundary(left_px + boundaries[9] * factor)?,
     ])
 }
 
-fn scaled_boundary(points: f64, factor: f64) -> Option<u32> {
-    let value = (points * factor).ceil();
+fn floor_boundary(value: f64) -> Option<u32> {
+    let value = value.floor();
+    (value.is_finite() && value >= 0.0 && value <= u32::MAX as f64).then_some(value as u32)
+}
+
+fn ceil_boundary(value: f64) -> Option<u32> {
+    let value = value.ceil();
     (value.is_finite() && value >= 0.0 && value <= u32::MAX as f64).then_some(value as u32)
 }
 
@@ -391,18 +417,18 @@ mod tests {
         assert_eq!(
             layout.session_buttons[1],
             ChromeRect {
-                x: 504,
+                x: 503,
                 y: 0,
-                width: 97,
+                width: 98,
                 height: 49,
             }
         );
         assert_eq!(
             layout.session_buttons[4],
             ChromeRect {
-                x: 711,
+                x: 710,
                 y: 0,
-                width: 48,
+                width: 49,
                 height: 49,
             }
         );
@@ -429,5 +455,38 @@ mod tests {
                     <= layout.title_bar.width - layout.native.trailing_px
             );
         }
+    }
+
+    #[test]
+    fn half_pixel_centered_cluster_keeps_the_visible_action_edge_in_the_client_area() {
+        let layout = ChromeLayout::for_window(1215, 800, 106.0 / 96.0, 0, 0).unwrap();
+
+        assert_eq!(layout.session_cluster.x, 452);
+        assert_eq!(layout.session_cluster.width, 311);
+        assert_eq!(
+            layout.session_buttons[4],
+            ChromeRect {
+                x: 713,
+                y: 0,
+                width: 50,
+                height: 49,
+            }
+        );
+        assert_eq!(layout.hit_test(762, 22), ChromeHit::SessionAction);
+    }
+
+    #[test]
+    fn actual_windows_trailing_inset_requires_a_wider_minimum_than_the_initial_hint() {
+        assert!(ChromeLayout::for_window(560, 720, 1.0, 0, 141).is_none());
+        assert_eq!(ChromeLayout::minimum_width_px(1.0, 0, 141), Some(562));
+        assert!(ChromeLayout::for_window(562, 720, 1.0, 0, 141).is_some());
+
+        let scale_factor = 106.0 / 96.0;
+        assert_eq!(
+            ChromeLayout::minimum_width_px(scale_factor, 0, 156),
+            Some(622)
+        );
+        assert!(ChromeLayout::for_window(621, 720, scale_factor, 0, 156).is_none());
+        assert!(ChromeLayout::for_window(622, 720, scale_factor, 0, 156).is_some());
     }
 }
