@@ -491,7 +491,14 @@ fn show_hidden_shell_diagnostic(ctx: &egui::Context, diagnostic: &str) {
     egui::Area::new(Id::new("freeremotedesk-control-island-shell-diagnostic"))
         .order(Order::Foreground)
         .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 8.0))
+        .movable(false)
+        .interactable(false)
+        .fade_in(false)
         .show(ctx, |ui| {
+            ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+                node.set_role(egui::accesskit::Role::Label);
+                node.set_label(diagnostic);
+            });
             egui::Frame::new()
                 .fill(contrast_plate_fill(ui))
                 .stroke(egui::Stroke::new(1.0, ui.visuals().error_fg_color))
@@ -906,6 +913,66 @@ mod tests {
             .any(|(_, node)| node.label().or_else(|| node.value()) == Some(diagnostic));
         output.textures_delta.clear();
         assert!(accessible);
+
+        let mut settled = context.run_ui(Default::default(), |context| {
+            let _ = super::show_control_island(
+                context,
+                super::ControlIslandRenderInput {
+                    model: &model,
+                    window_capabilities: frd_ui_model::IslandWindowCapabilities::NONE,
+                    visible: false,
+                    maximized: false,
+                    island_rect: egui::Rect::NOTHING,
+                    reveal_line_rect: egui::Rect::from_min_size(
+                        egui::pos2(100.0, 0.0),
+                        egui::vec2(160.0, 2.0),
+                    ),
+                    focus_first: false,
+                    opaque_material: false,
+                    shell_diagnostic: Some(diagnostic),
+                },
+            );
+        });
+        settled.textures_delta.clear();
+        let area_id = egui::Id::new("freeremotedesk-control-island-shell-diagnostic");
+        let area_state = egui::containers::AreaState::load(&context, area_id)
+            .expect("hidden diagnostic area state is retained");
+        assert!(!area_state.interactable);
+
+        let pointer = area_state.rect().center();
+        let raw_input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut pressed = context.run_ui(raw_input, |context| {
+            let _ = super::show_control_island(
+                context,
+                super::ControlIslandRenderInput {
+                    model: &model,
+                    window_capabilities: frd_ui_model::IslandWindowCapabilities::NONE,
+                    visible: false,
+                    maximized: false,
+                    island_rect: egui::Rect::NOTHING,
+                    reveal_line_rect: egui::Rect::from_min_size(
+                        egui::pos2(100.0, 0.0),
+                        egui::vec2(160.0, 2.0),
+                    ),
+                    focus_first: false,
+                    opaque_material: false,
+                    shell_diagnostic: Some(diagnostic),
+                },
+            );
+        });
+        pressed.textures_delta.clear();
+        assert!(!context.egui_is_using_pointer());
     }
 
     #[test]
