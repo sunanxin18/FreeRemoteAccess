@@ -180,6 +180,7 @@ impl AppleHighPerformanceVideoAdapter {
         let annex_b = access_unit
             .annex_b_bytes()
             .map_err(|_| AppleHighPerformanceVideoError::MalformedAccessUnit)?;
+        let local_ingress_at = access_unit.local_ingress_at;
         let access_unit = EncodedVideoAccessUnit::try_new(
             self.identity,
             self.generation,
@@ -190,7 +191,8 @@ impl AppleHighPerformanceVideoAdapter {
             access_unit.keyframe,
             annex_b.into_boxed_slice(),
         )
-        .map_err(|_| AppleHighPerformanceVideoError::MalformedAccessUnit)?;
+        .map_err(|_| AppleHighPerformanceVideoError::MalformedAccessUnit)?
+        .with_local_ingress_at(local_ingress_at);
         match runtime
             .publish_media_with_recoverable_backpressure(MediaFrame::EncodedVideo(access_unit))
         {
@@ -362,6 +364,7 @@ mod tests {
             timestamp: 90_000,
             keyframe: true,
             parameter_sets_prepended: false,
+            local_ingress_at: std::time::Instant::now(),
             data,
         }
     }

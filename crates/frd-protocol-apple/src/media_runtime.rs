@@ -34,7 +34,9 @@ use crate::hp_media_diagnostics::{
 };
 use crate::media_negotiation::{AudioMediaFlow, MediaStreamAnswer};
 use crate::media_protocol::MediaStreamPortAnnouncement;
-use crate::media_transport::{MediaDatagram, MediaRole, MediaTransport, MediaTransportPhase};
+use crate::media_transport::{
+    MediaDatagram, MediaRole, MediaTransport, MediaTransportPhase, ReceivedMediaDatagram,
+};
 use crate::srtp::{parse_rtp_packet, RtpPacket};
 
 const MAX_PCM_PUBLICATION_SAMPLES: usize =
@@ -348,6 +350,7 @@ impl VideoReceiveState {
         runtime: &mut ProtocolRuntime,
         generation: u64,
         datagram: &[u8],
+        local_ingress_at: Instant,
     ) -> Result<()> {
         let packet = parse_video_rtp_for_media(datagram)?;
         match self.active_ssrc {
@@ -372,14 +375,17 @@ impl VideoReceiveState {
             None => self.active_ssrc = Some(packet.header.ssrc),
             Some(_) => {}
         }
-        let access_units = match self.assembler.push(HevcRtpPacket {
-            generation,
-            ssrc: packet.header.ssrc,
-            sequence: packet.header.sequence,
-            timestamp: packet.header.timestamp,
-            marker: packet.header.marker,
-            payload: packet.payload,
-        }) {
+        let access_units = match self.assembler.push_received_at(
+            HevcRtpPacket {
+                generation,
+                ssrc: packet.header.ssrc,
+                sequence: packet.header.sequence,
+                timestamp: packet.header.timestamp,
+                marker: packet.header.marker,
+                payload: packet.payload,
+            },
+            local_ingress_at,
+        ) {
             Ok(access_units) => access_units,
             Err(HevcAccessUnitError::ReorderWindowExceeded { .. }) => {
                 self.pending_recovery_request
@@ -623,28 +629,29 @@ impl ViewerMediaState {
         } = self;
         #[cfg(all(debug_assertions, not(test)))]
         debug_watchdog.update(debug_tick, DebugMediaStage::DrainEnter);
-        let summary_result = transport.drain_receive_round(generation, |role, datagram| {
-            accept_datagram(
-                audio_receiver,
-                authenticated_audio_packets,
-                late_audio_packets,
-                audio_resynchronizations,
-                non_silent_audio_access_units,
-                concealed_audio_access_units,
-                authenticated_video_packets,
-                video_stream_1,
-                video_stream_2,
-                audio_degraded,
-                runtime,
-                generation,
-                role,
-                datagram,
-                #[cfg(all(debug_assertions, not(test)))]
-                debug_watchdog.as_ref(),
-                #[cfg(all(debug_assertions, not(test)))]
-                debug_tick,
-            )
-        });
+        let summary_result =
+            transport.drain_receive_round_received(generation, |role, received| {
+                accept_received_datagram(
+                    audio_receiver,
+                    authenticated_audio_packets,
+                    late_audio_packets,
+                    audio_resynchronizations,
+                    non_silent_audio_access_units,
+                    concealed_audio_access_units,
+                    authenticated_video_packets,
+                    video_stream_1,
+                    video_stream_2,
+                    audio_degraded,
+                    runtime,
+                    generation,
+                    role,
+                    received,
+                    #[cfg(all(debug_assertions, not(test)))]
+                    debug_watchdog.as_ref(),
+                    #[cfg(all(debug_assertions, not(test)))]
+                    debug_tick,
+                )
+            });
         #[cfg(all(debug_assertions, not(test)))]
         debug_watchdog.update(debug_tick, DebugMediaStage::DrainExit);
         let summary = summary_result?;
@@ -737,6 +744,7 @@ impl ViewerMediaState {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn accept_datagram(
     audio_receiver: &mut ArdAudioReceiver,
@@ -753,6 +761,85 @@ fn accept_datagram(
     generation: u64,
     role: MediaRole,
     datagram: MediaDatagram,
+) -> Result<()> {
+    accept_datagram_received_at(
+        audio_receiver,
+        authenticated_audio_packets,
+        late_audio_packets,
+        audio_resynchronizations,
+        non_silent_audio_access_units,
+        concealed_audio_access_units,
+        authenticated_video_packets,
+        video_stream_1,
+        video_stream_2,
+        audio_degraded,
+        runtime,
+        generation,
+        role,
+        datagram,
+        Instant::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_received_datagram(
+    audio_receiver: &mut ArdAudioReceiver,
+    authenticated_audio_packets: &mut u64,
+    late_audio_packets: &mut u64,
+    audio_resynchronizations: &mut u64,
+    non_silent_audio_access_units: &mut u64,
+    concealed_audio_access_units: &mut u64,
+    authenticated_video_packets: &mut u64,
+    video_stream_1: &mut VideoReceiveState,
+    video_stream_2: &mut VideoReceiveState,
+    audio_degraded: &mut bool,
+    runtime: &mut ProtocolRuntime,
+    generation: u64,
+    role: MediaRole,
+    received: ReceivedMediaDatagram,
+    #[cfg(all(debug_assertions, not(test)))] debug_watchdog: &DebugMediaWatchdog,
+    #[cfg(all(debug_assertions, not(test)))] debug_tick: u64,
+) -> Result<()> {
+    accept_datagram_received_at(
+        audio_receiver,
+        authenticated_audio_packets,
+        late_audio_packets,
+        audio_resynchronizations,
+        non_silent_audio_access_units,
+        concealed_audio_access_units,
+        authenticated_video_packets,
+        video_stream_1,
+        video_stream_2,
+        audio_degraded,
+        runtime,
+        generation,
+        role,
+        received.datagram,
+        received.received_at,
+        #[cfg(all(debug_assertions, not(test)))]
+        debug_watchdog,
+        #[cfg(all(debug_assertions, not(test)))]
+        debug_tick,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_datagram_received_at(
+    audio_receiver: &mut ArdAudioReceiver,
+    authenticated_audio_packets: &mut u64,
+    late_audio_packets: &mut u64,
+    audio_resynchronizations: &mut u64,
+    non_silent_audio_access_units: &mut u64,
+    concealed_audio_access_units: &mut u64,
+    authenticated_video_packets: &mut u64,
+    video_stream_1: &mut VideoReceiveState,
+    video_stream_2: &mut VideoReceiveState,
+    audio_degraded: &mut bool,
+    runtime: &mut ProtocolRuntime,
+    generation: u64,
+    role: MediaRole,
+    datagram: MediaDatagram,
+    local_ingress_at: Instant,
     #[cfg(all(debug_assertions, not(test)))] debug_watchdog: &DebugMediaWatchdog,
     #[cfg(all(debug_assertions, not(test)))] debug_tick: u64,
 ) -> Result<()> {
@@ -803,12 +890,12 @@ fn accept_datagram(
         (MediaRole::Audio, MediaDatagram::Rtcp(_)) => {}
         (MediaRole::VideoStream1, MediaDatagram::Rtp(packet)) => {
             video_stream_1.observe_authenticated_rtp(generation);
-            video_stream_1.accept_rtp(runtime, generation, &packet)?;
+            video_stream_1.accept_rtp(runtime, generation, &packet, local_ingress_at)?;
             *authenticated_video_packets = authenticated_video_packets.saturating_add(1);
         }
         (MediaRole::VideoStream2, MediaDatagram::Rtp(packet)) => {
             video_stream_2.observe_authenticated_rtp(generation);
-            video_stream_2.accept_rtp(runtime, generation, &packet)?;
+            video_stream_2.accept_rtp(runtime, generation, &packet, local_ingress_at)?;
             *authenticated_video_packets = authenticated_video_packets.saturating_add(1);
         }
         (MediaRole::VideoStream1 | MediaRole::VideoStream2, MediaDatagram::Rtcp(_)) => {}
@@ -890,8 +977,9 @@ mod tests {
     use crate::media_negotiation::AudioMediaFlow;
 
     use super::{
-        accept_audio_outcome, accept_datagram, parse_video_rtp_for_media, publish_decoded_audio,
-        AudioReceiveOutcome, MediaDatagram, MediaRole, ViewerMediaState,
+        accept_audio_outcome, accept_datagram, accept_datagram_received_at,
+        parse_video_rtp_for_media, publish_decoded_audio, AudioReceiveOutcome, MediaDatagram,
+        MediaRole, ViewerMediaState,
     };
 
     fn accept_state_datagram(
@@ -915,6 +1003,32 @@ mod tests {
             state.transport.generation(),
             role,
             datagram,
+        )
+    }
+
+    fn accept_state_datagram_at(
+        state: &mut ViewerMediaState,
+        runtime: &mut ProtocolRuntime,
+        role: MediaRole,
+        datagram: MediaDatagram,
+        received_at: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        accept_datagram_received_at(
+            &mut state.audio_receiver,
+            &mut state.authenticated_audio_packets,
+            &mut state.late_audio_packets,
+            &mut state.audio_resynchronizations,
+            &mut state.non_silent_audio_access_units,
+            &mut state.concealed_audio_access_units,
+            &mut state.authenticated_video_packets,
+            &mut state.video_stream_1,
+            &mut state.video_stream_2,
+            &mut state.audio_degraded,
+            runtime,
+            state.transport.generation(),
+            role,
+            datagram,
+            received_at,
         )
     }
 
@@ -1234,11 +1348,13 @@ mod tests {
             aggregation.extend_from_slice(&(nal.len() as u16).to_be_bytes());
             aggregation.extend_from_slice(nal);
         }
-        accept_state_datagram(
+        let received_at = std::time::Instant::now();
+        accept_state_datagram_at(
             &mut state,
             &mut runtime,
             MediaRole::VideoStream1,
             MediaDatagram::Rtp(video_rtp(1, 90_000, true, &aggregation)),
+            received_at,
         )
         .unwrap();
 
@@ -1249,7 +1365,8 @@ mod tests {
         assert!(
             matches!(&published[1], MediaFrame::EncodedVideo(access_unit)
             if access_unit.identity().session_id == session_id
-                && access_unit.identity().stream_id == 1)
+                && access_unit.identity().stream_id == 1
+                && access_unit.local_ingress_at() == Some(received_at))
         );
         assert_eq!(
             state.debug_close_summary(),

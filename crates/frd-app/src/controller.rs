@@ -16,7 +16,7 @@ use frd_session::{
 use frd_ui_model::{
     CapabilityGlyphState, ConnectionDraft, ConnectionForm, ConnectionGlyph, ConnectionSubmission,
     LaunchOptions, Page, ProfilePersistenceWarning, ProtocolChoice, SessionChromeAction,
-    SessionChromeModel,
+    SessionChromeModel, SessionTiming, SessionTimingSource,
 };
 
 use crate::AppIntent;
@@ -187,7 +187,7 @@ pub struct AppController {
     challenge: Option<ServerIdentityChallenge>,
     inbound_clipboard: Option<ClipboardPayload>,
     audio_state: AudioState,
-    frame_response_ms: Option<u32>,
+    presentation_timing: Option<SessionTiming>,
     pending_profile: Option<PendingProfileTransaction>,
     profile_persistence_warning: Option<ProfilePersistenceWarning>,
 }
@@ -205,7 +205,7 @@ impl AppController {
             challenge: None,
             inbound_clipboard: None,
             audio_state: AudioState::Unavailable,
-            frame_response_ms: None,
+            presentation_timing: None,
             pending_profile: None,
             profile_persistence_warning: None,
         }
@@ -261,7 +261,7 @@ impl AppController {
                 challenge: None,
                 inbound_clipboard: None,
                 audio_state: AudioState::Unavailable,
-                frame_response_ms: None,
+                presentation_timing: None,
                 pending_profile: None,
                 profile_persistence_warning: None,
             },
@@ -281,7 +281,7 @@ impl AppController {
             Page::Connecting { diagnostics, .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Connecting,
                 diagnostics: diagnostics.clone(),
-                frame_response_ms: None,
+                presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
                 action: Some(SessionChromeAction::Cancel),
@@ -289,7 +289,7 @@ impl AppController {
             Page::AwaitingFirstFrame { diagnostics, .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::WaitingForFrame,
                 diagnostics: diagnostics.clone(),
-                frame_response_ms: None,
+                presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
                 action: Some(SessionChromeAction::Cancel),
@@ -297,7 +297,7 @@ impl AppController {
             Page::Disconnecting { .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Disconnecting,
                 diagnostics: None,
-                frame_response_ms: None,
+                presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
                 action: None,
@@ -305,7 +305,7 @@ impl AppController {
             Page::Failed { code, .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Failed,
                 diagnostics: Some(code.clone()),
-                frame_response_ms: None,
+                presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
                 action: None,
@@ -317,7 +317,7 @@ impl AppController {
             } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Connected,
                 diagnostics: diagnostics.clone(),
-                frame_response_ms: self.frame_response_ms,
+                presentation_timing: self.presentation_timing,
                 audio: if capabilities.remote_audio {
                     CapabilityGlyphState::Available
                 } else {
@@ -712,7 +712,7 @@ impl AppController {
         self.protocol_capabilities = SessionCapabilities::default();
         self.inbound_clipboard = None;
         self.audio_state = AudioState::Unavailable;
-        self.frame_response_ms = None;
+        self.presentation_timing = None;
         self.profile_persistence_warning = None;
     }
 
@@ -819,7 +819,10 @@ impl AppController {
                 self.refresh_presented_capabilities();
             }
             SessionEvent::FrameResponseTiming(timing) if timing.generation == self.generation => {
-                self.frame_response_ms = Some(timing.smoothed_ms);
+                self.presentation_timing = Some(SessionTiming {
+                    source: SessionTimingSource::FramebufferResponse,
+                    milliseconds: timing.smoothed_ms,
+                });
             }
             SessionEvent::Clipboard(payload) => {
                 self.inbound_clipboard = Some(payload);
@@ -837,7 +840,7 @@ impl AppController {
                 ..
             } if Some(session_id) == self.session_id && generation > self.generation => {
                 self.generation = generation;
-                self.frame_response_ms = None;
+                self.presentation_timing = None;
                 self.page = Page::AwaitingFirstFrame {
                     draft: self.page.retained_draft(),
                     stage: ConnectionStage::TransportReady,
@@ -1016,25 +1019,42 @@ impl AppController {
     }
 
     pub fn handle_presentation(&mut self, event: PresentationEvent) {
-        if !matches!(self.page, Page::AwaitingFirstFrame { .. }) {
-            return;
+        match event {
+            PresentationEvent::Timing(timing)
+                if Some(timing.session_id) == self.session_id
+                    && timing.generation == self.generation =>
+            {
+                self.presentation_timing = Some(SessionTiming {
+                    source: match timing.source {
+                        frd_protocol_api::PresentationTimingSource::MediaIngressToPresent => {
+                            SessionTimingSource::MediaIngressToPresent
+                        }
+                    },
+                    milliseconds: timing.smoothed_ms,
+                });
+            }
+            PresentationEvent::FramePresented {
+                session_id,
+                generation,
+                completeness,
+                ..
+            } if matches!(self.page, Page::AwaitingFirstFrame { .. })
+                && Some(session_id) == self.session_id
+                && generation == self.generation
+                && completeness == FrameCompleteness::FullBaseline =>
+            {
+                self.page = Page::RemoteSession {
+                    draft: self.page.retained_draft(),
+                    capabilities: self.effective_capabilities(),
+                    diagnostics: self.profile_persistence_diagnostics(),
+                };
+            }
+            _ => {}
         }
-        let PresentationEvent::FramePresented {
-            session_id,
-            generation,
-            completeness,
-            ..
-        } = event;
-        if Some(session_id) == self.session_id
-            && generation == self.generation
-            && completeness == FrameCompleteness::FullBaseline
-        {
-            self.page = Page::RemoteSession {
-                draft: self.page.retained_draft(),
-                capabilities: self.effective_capabilities(),
-                diagnostics: self.profile_persistence_diagnostics(),
-            };
-        }
+    }
+
+    pub fn clear_presentation_timing(&mut self) {
+        self.presentation_timing = None;
     }
 
     /// AppIntent 不承载热路径输入；仅当前已呈现会话可路由 protocol-neutral 输入。

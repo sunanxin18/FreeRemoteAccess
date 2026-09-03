@@ -469,6 +469,23 @@ pub struct FrameResponseTiming {
     pub smoothed_ms: u32,
 }
 
+/// 协议中立的本地呈现计时来源。每个来源必须保留其自身边界语义。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationTimingSource {
+    /// 已认证媒体访问单元的首个本机入站包，到其精确画面呈现确认。
+    MediaIngressToPresent,
+}
+
+/// 本地呈现管线计时；不表示 ping、RTT 或服务端到客户端端到端延迟。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PresentationTiming {
+    pub session_id: SessionId,
+    pub generation: u64,
+    pub source: PresentationTimingSource,
+    pub sample_ms: u32,
+    pub smoothed_ms: u32,
+}
+
 pub enum SessionCommand {
     Input(SessionInput),
     ViewportChanged {
@@ -510,6 +527,7 @@ pub enum PresentationEvent {
         revision: u64,
         completeness: FrameCompleteness,
     },
+    Timing(PresentationTiming),
 }
 
 pub trait RuntimeEventSink: Send {

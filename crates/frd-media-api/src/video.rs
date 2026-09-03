@@ -1,5 +1,6 @@
 use frd_core::{PixelRect, PixelSize, SessionId};
 use std::num::NonZeroU32;
+use std::time::Instant;
 use std::{hash::Hash, hash::Hasher};
 
 /// 单个编码参数集允许的最大字节数。
@@ -208,6 +209,7 @@ pub struct EncodedVideoAccessUnit {
     generation: u64,
     timestamp: VideoTimestamp,
     random_access: bool,
+    local_ingress_at: Option<Instant>,
     bytes: Box<[u8]>,
 }
 
@@ -230,6 +232,7 @@ impl EncodedVideoAccessUnit {
             generation,
             timestamp,
             random_access,
+            local_ingress_at: None,
             bytes,
         })
     }
@@ -250,8 +253,53 @@ impl EncodedVideoAccessUnit {
         self.random_access
     }
 
+    /// 附加协议已完成认证后的本机入站时刻。该元数据不属于媒体 wire timestamp。
+    pub fn with_local_ingress_at(mut self, received_at: Instant) -> Self {
+        self.local_ingress_at = Some(received_at);
+        self
+    }
+
+    pub const fn local_ingress_at(&self) -> Option<Instant> {
+        self.local_ingress_at
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+#[cfg(test)]
+mod access_unit_timing_tests {
+    use std::num::NonZeroU32;
+    use std::time::Instant;
+
+    use frd_core::SessionId;
+
+    use super::{EncodedVideoAccessUnit, VideoStreamIdentity, VideoTimestamp};
+
+    #[test]
+    fn local_ingress_metadata_is_optional_and_can_be_attached_without_changing_wire_timestamp() {
+        let identity = VideoStreamIdentity {
+            session_id: SessionId::allocate(),
+            stream_id: 1,
+        };
+        let timestamp = VideoTimestamp {
+            ticks: 90_000,
+            timescale: NonZeroU32::new(90_000).unwrap(),
+        };
+        let ingress = Instant::now();
+        let access_unit = EncodedVideoAccessUnit::try_new(
+            identity,
+            7,
+            timestamp,
+            true,
+            vec![1].into_boxed_slice(),
+        )
+        .unwrap()
+        .with_local_ingress_at(ingress);
+
+        assert_eq!(access_unit.timestamp(), timestamp);
+        assert_eq!(access_unit.local_ingress_at(), Some(ingress));
     }
 }
 

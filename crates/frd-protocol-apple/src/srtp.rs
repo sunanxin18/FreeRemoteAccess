@@ -213,6 +213,11 @@ impl RtpReceptionReportState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn previous_arrival(&self) -> Option<Instant> {
+        self.previous_arrival
+    }
+
     pub(crate) fn observe_rtp(&mut self, header: RtpHeader, received_at: Instant) {
         if self.source_ssrc != Some(header.ssrc) {
             let retained_sender_report = self

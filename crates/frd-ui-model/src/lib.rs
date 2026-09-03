@@ -2,7 +2,10 @@
 
 mod chrome;
 
-pub use chrome::{CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel};
+pub use chrome::{
+    CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel, SessionTiming,
+    SessionTimingSource,
+};
 
 use frd_core::{CredentialProviderId, SecretBuffer, TargetSystem};
 use frd_platform_api::{ConnectionProfileKey, SavedConnectionProfile};

@@ -63,6 +63,7 @@ use crate::lifecycle::{
     PresentationRecoveryBackend, PresentationRecoveryContext, PresentationRecoveryFailure,
 };
 use crate::platform::PlatformWindowChrome;
+use crate::presentation_timing::{PresentationTimingKey, PresentationTimingTracker};
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::ui_fonts::system_font_definitions;
 use crate::video_decode_worker::{
@@ -84,7 +85,7 @@ const APPLE_HIGH_PERFORMANCE_PROTOCOL_ID: &str = "apple-high-performance";
 const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     connection: ConnectionGlyph::Connected,
     diagnostics: None,
-    frame_response_ms: None,
+    presentation_timing: None,
     audio: CapabilityGlyphState::Unavailable,
     clipboard: CapabilityGlyphState::Unavailable,
     action: Some(SessionChromeAction::Disconnect),
@@ -2090,6 +2091,7 @@ pub struct DesktopApplication {
     input: InputRouter,
     hp_input_diagnostics: HighPerformanceInputShellDiagnostics,
     metrics: FramePipelineMetrics,
+    presentation_timing: PresentationTimingTracker,
     proxy: EventLoopProxy<DesktopUserEvent>,
     runtime_wake_gate: Arc<RuntimeWakeGate>,
     window: Option<DesktopWindowState>,
@@ -2326,6 +2328,7 @@ impl DesktopApplication {
             input: InputRouter::default(),
             hp_input_diagnostics: HighPerformanceInputShellDiagnostics::from_environment(),
             metrics,
+            presentation_timing: PresentationTimingTracker::default(),
             proxy,
             runtime_wake_gate,
             window: None,
@@ -2366,6 +2369,7 @@ impl DesktopApplication {
             input: InputRouter::default(),
             hp_input_diagnostics: HighPerformanceInputShellDiagnostics::from_environment(),
             metrics: FramePipelineMetrics::disabled(),
+            presentation_timing: PresentationTimingTracker::default(),
             proxy,
             runtime_wake_gate,
             window: None,
@@ -2620,13 +2624,19 @@ impl DesktopApplication {
                     session_id,
                     generation,
                     ..
-                } => self.metrics.observe_generation(*session_id, *generation),
+                } => {
+                    self.metrics.observe_generation(*session_id, *generation);
+                    self.presentation_timing.reset();
+                }
                 SessionEvent::FrameResponseTiming(timing) => {
                     self.metrics.observe_frame_response_timing(*timing)
                 }
                 SessionEvent::StageChanged(frd_protocol_api::ConnectionStage::Disconnecting)
                 | SessionEvent::Error(_)
-                | SessionEvent::Closed(_) => self.metrics.clear_input_probe(),
+                | SessionEvent::Closed(_) => {
+                    self.metrics.clear_input_probe();
+                    self.presentation_timing.reset();
+                }
                 _ => {}
             }
             if matches!(
@@ -2662,6 +2672,10 @@ impl DesktopApplication {
         }
 
         let video_admissions = self.sessions.drain_video_admissions();
+        if !video_admissions.is_empty() {
+            self.presentation_timing.reset();
+            self.launch.controller_mut().clear_presentation_timing();
+        }
         let video_events = self.sessions.drain_video_worker_events();
         let active_protocol_id = self.sessions.active_protocol_id();
         let video_drain = if let Some(window) = self.window.as_mut() {
@@ -3108,6 +3122,9 @@ impl DesktopApplication {
                         completeness,
                         ..
                     } => (*session_id, *generation, *revision, *completeness),
+                    frd_protocol_api::PresentationEvent::Timing(_) => {
+                        unreachable!("pixel renderer only publishes frame-presented events")
+                    }
                 };
                 let identity = MetricIdentity {
                     session_id,
@@ -3154,6 +3171,7 @@ impl DesktopApplication {
             Ok(WindowPresentation::Pixel(None) | WindowPresentation::Video(None)) => None,
             Err(error) => Some(error),
         };
+        let mut video_timing = None;
         let video_presentation = video_ready_event_after_confirmation(
             video_token_to_confirm,
             |token| {
@@ -3165,7 +3183,19 @@ impl DesktopApplication {
                 self.sessions
                     .video_is_ready(token.identity(), token.generation())
                     .then_some(())
-                    .ok_or(())
+                    .ok_or(())?;
+                if let Some(local_ingress_at) = token.local_ingress_at() {
+                    video_timing = self.presentation_timing.observe(
+                        PresentationTimingKey {
+                            identity: token.identity(),
+                            generation: token.generation(),
+                            worker_epoch_serial: token.worker_epoch_serial(),
+                        },
+                        local_ingress_at,
+                        std::time::Instant::now(),
+                    );
+                }
+                Ok::<(), ()>(())
             },
             |token| frd_protocol_api::PresentationEvent::FramePresented {
                 session_id: token.identity().session_id,
@@ -3180,7 +3210,10 @@ impl DesktopApplication {
                 generation,
                 revision,
                 completeness,
-            } = event.clone();
+            } = event.clone()
+            else {
+                unreachable!("video readiness only creates frame-presented events")
+            };
             debug_assert_eq!(completeness, FrameCompleteness::FullBaseline);
             self.metrics.observe_full_baseline_presented(
                 MetricIdentity {
@@ -3205,6 +3238,12 @@ impl DesktopApplication {
                 self.send_viewport_changed();
                 self.request_redraw();
             }
+        }
+        if let Some(timing) = video_timing {
+            self.launch
+                .controller_mut()
+                .handle_presentation(frd_protocol_api::PresentationEvent::Timing(timing));
+            self.request_redraw();
         }
         self.publish_metrics_failure();
 

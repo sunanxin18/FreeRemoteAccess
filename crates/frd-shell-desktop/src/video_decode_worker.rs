@@ -86,6 +86,8 @@ pub struct VideoFrameToken {
     identity: VideoStreamIdentity,
     generation: u64,
     timestamp: VideoTimestamp,
+    worker_epoch_serial: u64,
+    local_ingress_at: Option<Instant>,
     publication_id: u64,
 }
 
@@ -104,6 +106,14 @@ impl VideoFrameToken {
 
     pub const fn publication_id(&self) -> u64 {
         self.publication_id
+    }
+
+    pub const fn worker_epoch_serial(&self) -> u64 {
+        self.worker_epoch_serial
+    }
+
+    pub const fn local_ingress_at(&self) -> Option<Instant> {
+        self.local_ingress_at
     }
 }
 
@@ -372,6 +382,40 @@ struct StreamPresentationState {
     terminal: bool,
 }
 
+#[derive(Default)]
+struct AccessUnitIngressMap {
+    entries: VecDeque<(VideoTimestamp, Instant)>,
+}
+
+impl AccessUnitIngressMap {
+    fn record(&mut self, timestamp: VideoTimestamp, local_ingress_at: Option<Instant>) {
+        let Some(local_ingress_at) = local_ingress_at else {
+            return;
+        };
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(pending, _)| *pending == timestamp)
+        {
+            self.entries.remove(index);
+        }
+        while self.entries.len() >= VIDEO_ACCESS_UNIT_ENTRY_LIMIT {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((timestamp, local_ingress_at));
+    }
+
+    fn take(&mut self, timestamp: VideoTimestamp) -> Option<Instant> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(pending, _)| *pending == timestamp)?;
+        self.entries
+            .remove(index)
+            .map(|(_, received_at)| received_at)
+    }
+}
+
 struct ControlPublication {
     sequence: u64,
     epoch: Option<StreamEpoch>,
@@ -542,7 +586,12 @@ impl VideoWorkerEvents {
         self.notify_wake();
     }
 
-    fn publish_frame(&self, epoch: StreamEpoch, frame: DecodedVideoFrame) {
+    fn publish_frame(
+        &self,
+        epoch: StreamEpoch,
+        frame: DecodedVideoFrame,
+        local_ingress_at: Option<Instant>,
+    ) {
         let input = frame.as_input();
         if input.identity != epoch.identity || input.generation != epoch.generation {
             return;
@@ -564,6 +613,8 @@ impl VideoWorkerEvents {
             identity: epoch.identity,
             generation: epoch.generation,
             timestamp,
+            worker_epoch_serial: epoch.serial,
+            local_ingress_at,
             publication_id,
         };
         let stream = state
@@ -1493,6 +1544,7 @@ struct ActiveDecoder {
     epoch: StreamEpoch,
     decoder: Box<dyn VideoDecoder>,
     after_first_frame: bool,
+    ingress_by_timestamp: AccessUnitIngressMap,
 }
 
 fn run_stream_worker(
@@ -1542,6 +1594,7 @@ fn run_stream_worker(
                             epoch,
                             decoder,
                             after_first_frame: false,
+                            ingress_by_timestamp: AccessUnitIngressMap::default(),
                         });
                     }
                     Err(error) => {
@@ -1557,6 +1610,10 @@ fn run_stream_worker(
                 if decoder.epoch != epoch || !events.is_current(epoch) {
                     continue;
                 }
+                let timestamp = access_unit.timestamp();
+                decoder
+                    .ingress_by_timestamp
+                    .record(timestamp, access_unit.local_ingress_at());
                 match call_decoder_boundary(|| decoder.decoder.submit(access_unit)) {
                     Ok(DecodeOutcome::NeedMoreData) => {}
                     Ok(DecodeOutcome::Frames(frames)) => {
@@ -1611,7 +1668,8 @@ fn publish_current_frames(
         let input = frame.as_input();
         if input.identity == active.epoch.identity && input.generation == active.epoch.generation {
             active.after_first_frame = true;
-            events.publish_frame(active.epoch, frame);
+            let local_ingress_at = active.ingress_by_timestamp.take(input.timestamp);
+            events.publish_frame(active.epoch, frame, local_ingress_at);
         }
     }
 }
@@ -2072,7 +2130,7 @@ mod tests {
         let identity = test_identity();
         let events = super::VideoWorkerEvents::new(None);
         let epoch = events.accept_config(identity, 7);
-        events.publish_frame(epoch, test_frame_for(identity, 7, 41));
+        events.publish_frame(epoch, test_frame_for(identity, 7, 41), None);
         for _ in 0..(super::VIDEO_EVENT_LIMIT + 8) {
             events.publish_failure(
                 epoch,
@@ -2097,9 +2155,9 @@ mod tests {
         let stream_b = identity_for(session_id, 22);
         let events = super::VideoWorkerEvents::new(None);
         let epoch_a = events.accept_config(stream_a, 7);
-        events.publish_frame(epoch_a, test_frame_for(stream_a, 7, 1));
+        events.publish_frame(epoch_a, test_frame_for(stream_a, 7, 1), None);
         let first_a = events.take_latest_frame(stream_a).unwrap();
-        events.publish_frame(epoch_a, test_frame_for(stream_a, 7, 2));
+        events.publish_frame(epoch_a, test_frame_for(stream_a, 7, 2), None);
         let second_a = events.take_latest_frame(stream_a).unwrap();
 
         assert_eq!(
@@ -2110,7 +2168,7 @@ mod tests {
         assert!(events.is_ready(stream_a, 7));
 
         let epoch_b = events.accept_config(stream_b, 7);
-        events.publish_frame(epoch_b, test_frame_for(stream_b, 7, 1));
+        events.publish_frame(epoch_b, test_frame_for(stream_b, 7, 1), None);
         let first_b = events.take_latest_frame(stream_b).unwrap();
         let wrong_stream = super::VideoFrameToken {
             identity: stream_b,
@@ -2123,6 +2181,50 @@ mod tests {
         assert!(!events.is_ready(stream_b, 7));
         events.confirm_presented(first_b.token()).unwrap();
         assert!(events.is_ready(stream_b, 7));
+    }
+
+    #[test]
+    fn decoded_frame_ingress_is_matched_by_timestamp_and_bound_to_worker_epoch() {
+        let mut pending = super::AccessUnitIngressMap::default();
+        let base = std::time::Instant::now();
+        let first = VideoTimestamp {
+            ticks: 1,
+            timescale: NonZeroU32::new(90_000).unwrap(),
+        };
+        let second = VideoTimestamp {
+            ticks: 2,
+            timescale: NonZeroU32::new(90_000).unwrap(),
+        };
+        pending.record(second, Some(base + Duration::from_millis(20)));
+        pending.record(first, Some(base + Duration::from_millis(10)));
+
+        assert_eq!(pending.take(first), Some(base + Duration::from_millis(10)));
+        assert_eq!(pending.take(second), Some(base + Duration::from_millis(20)));
+        assert_eq!(
+            pending.take(first),
+            None,
+            "a decoded timestamp is consumed once"
+        );
+    }
+
+    #[test]
+    fn exact_present_token_retains_ingress_but_stale_token_cannot_confirm() {
+        let identity = test_identity();
+        let events = super::VideoWorkerEvents::new(None);
+        let epoch = events.accept_config(identity, 7);
+        let ingress = std::time::Instant::now();
+        events.publish_frame(epoch, test_frame_for(identity, 7, 1), Some(ingress));
+        let delivered = events.take_latest_frame(identity).unwrap();
+
+        assert_eq!(delivered.token().local_ingress_at(), Some(ingress));
+        assert_eq!(delivered.token().worker_epoch_serial(), epoch.serial);
+        let mut stale = *delivered.token();
+        stale.publication_id += 1;
+        assert_eq!(
+            events.confirm_presented(&stale),
+            Err(VideoDecodeErrorCode::StaleStreamOrGeneration)
+        );
+        events.confirm_presented(delivered.token()).unwrap();
     }
 
     #[test]
@@ -2345,7 +2447,7 @@ mod tests {
         let identity = test_identity();
         let events = super::VideoWorkerEvents::new(None);
         let epoch = events.accept_config(identity, 7);
-        events.publish_frame(epoch, test_frame_for(identity, 7, 41));
+        events.publish_frame(epoch, test_frame_for(identity, 7, 41), None);
         events.publish_failure(
             epoch,
             VideoDecodeErrorCode::DecodeFailedAfterFirstFrame,

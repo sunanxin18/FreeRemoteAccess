@@ -6,6 +6,7 @@ mod frame_metrics_sink;
 mod input;
 mod lifecycle;
 mod platform;
+mod presentation_timing;
 mod repaint;
 mod ui_fonts;
 mod video_decode_worker;

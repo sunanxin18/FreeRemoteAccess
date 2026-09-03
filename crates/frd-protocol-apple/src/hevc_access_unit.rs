@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::time::Instant;
 
 use crate::hevc_rtp::{HevcRtpDepacketizer, HevcRtpError, HevcRtpLimits};
 
@@ -18,6 +19,7 @@ pub struct HevcAccessUnit {
     pub timestamp: u32,
     pub keyframe: bool,
     pub parameter_sets_prepended: bool,
+    pub local_ingress_at: Instant,
     pub data: Vec<u8>,
 }
 
@@ -131,6 +133,7 @@ struct BufferedPacket {
     sequence: u16,
     timestamp: u32,
     marker: bool,
+    local_ingress_at: Instant,
     payload: Vec<u8>,
 }
 
@@ -161,6 +164,7 @@ pub struct HevcAccessUnitAssembler {
     buffered: HashMap<u16, BufferedPacket>,
     buffered_bytes: usize,
     timestamp: Option<u32>,
+    local_ingress_at: Option<Instant>,
     nals: Vec<Vec<u8>>,
     access_unit_bytes: usize,
     parameter_sets: [Option<Vec<u8>>; 3],
@@ -191,6 +195,7 @@ impl HevcAccessUnitAssembler {
             buffered: HashMap::new(),
             buffered_bytes: 0,
             timestamp: None,
+            local_ingress_at: None,
             nals: Vec::new(),
             access_unit_bytes: 0,
             parameter_sets: [None, None, None],
@@ -214,6 +219,7 @@ impl HevcAccessUnitAssembler {
         self.buffered.clear();
         self.buffered_bytes = 0;
         self.timestamp = None;
+        self.local_ingress_at = None;
         self.nals.clear();
         self.access_unit_bytes = 0;
         self.parameter_sets = [None, None, None];
@@ -237,6 +243,15 @@ impl HevcAccessUnitAssembler {
     pub fn push(
         &mut self,
         packet: HevcRtpPacket<'_>,
+    ) -> Result<Vec<HevcAccessUnit>, HevcAccessUnitError> {
+        self.push_received_at(packet, Instant::now())
+    }
+
+    /// 接收一个带本机认证完成时刻的 RTP 包；用于保留 AU 的最早入站边界。
+    pub fn push_received_at(
+        &mut self,
+        packet: HevcRtpPacket<'_>,
+        local_ingress_at: Instant,
     ) -> Result<Vec<HevcAccessUnit>, HevcAccessUnitError> {
         if packet.generation != self.generation {
             return Err(HevcAccessUnitError::StaleGeneration {
@@ -328,6 +343,7 @@ impl HevcAccessUnitAssembler {
                 sequence: packet.sequence,
                 timestamp: packet.timestamp,
                 marker: packet.marker,
+                local_ingress_at,
                 payload: packet.payload.to_vec(),
             },
         );
@@ -369,6 +385,12 @@ impl HevcAccessUnitAssembler {
         } else {
             self.timestamp = Some(packet.timestamp);
         }
+        self.local_ingress_at = Some(
+            self.local_ingress_at
+                .map_or(packet.local_ingress_at, |earliest| {
+                    earliest.min(packet.local_ingress_at)
+                }),
+        );
 
         let packet_nals =
             match self
@@ -547,6 +569,10 @@ impl HevcAccessUnitAssembler {
         self.initial_configuration = InitialConfigurationState::Configured;
         self.complete_initial_ap_parameter_sets = None;
         self.timestamp = None;
+        let local_ingress_at = self
+            .local_ingress_at
+            .take()
+            .expect("完成的 HEVC AU 至少包含一个已认证 RTP 包");
         self.nals.clear();
         self.access_unit_bytes = 0;
         self.depacketizer.reset(self.generation);
@@ -556,6 +582,7 @@ impl HevcAccessUnitAssembler {
             timestamp,
             keyframe,
             parameter_sets_prepended,
+            local_ingress_at,
             data,
         })
     }
@@ -582,6 +609,7 @@ impl HevcAccessUnitAssembler {
 
     fn discard_access_unit(&mut self) {
         self.timestamp = None;
+        self.local_ingress_at = None;
         self.nals.clear();
         self.access_unit_bytes = 0;
         self.depacketizer.reset(self.generation);
@@ -707,6 +735,8 @@ fn append_length_prefixed(output: &mut Vec<u8>, nal: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
         HevcAccessUnitAssembler, HevcAccessUnitError, HevcAccessUnitLimits, HevcRtpPacket,
         InitialConfigurationState,
@@ -992,6 +1022,40 @@ mod tests {
                 0, 0, 0, 3, 0x02, 0x01, 0xaa, 0, 0, 0, 3, 0x02, 0x01, 0xbb, 0, 0, 0, 3, 0x02, 0x01,
                 0xcc,
             ]
+        );
+    }
+
+    #[test]
+    fn access_unit_keeps_the_earliest_authenticated_ingress_across_reordering() {
+        let mut assembler = assembler();
+        assume_configured(&mut assembler, 10);
+        let base = Instant::now();
+
+        assert!(assembler
+            .push_received_at(
+                packet(10, 1_000, false, &[0x02, 0x01, 0xaa]),
+                base + Duration::from_millis(20),
+            )
+            .unwrap()
+            .is_empty());
+        assert!(assembler
+            .push_received_at(
+                packet(12, 1_000, true, &[0x02, 0x01, 0xcc]),
+                base + Duration::from_millis(5),
+            )
+            .unwrap()
+            .is_empty());
+        let access_units = assembler
+            .push_received_at(
+                packet(11, 1_000, false, &[0x02, 0x01, 0xbb]),
+                base + Duration::from_millis(30),
+            )
+            .unwrap();
+
+        assert_eq!(access_units.len(), 1);
+        assert_eq!(
+            access_units[0].local_ingress_at,
+            base + Duration::from_millis(5)
         );
     }
 

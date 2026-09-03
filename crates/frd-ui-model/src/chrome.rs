@@ -24,12 +24,24 @@ pub enum SessionChromeAction {
     Disconnect,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionTimingSource {
+    FramebufferResponse,
+    MediaIngressToPresent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionTiming {
+    pub source: SessionTimingSource,
+    pub milliseconds: u32,
+}
+
 /// 连接开始后标题栏所需的全部协议无关状态。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionChromeModel {
     pub connection: ConnectionGlyph,
     pub diagnostics: Option<String>,
-    pub frame_response_ms: Option<u32>,
+    pub presentation_timing: Option<SessionTiming>,
     pub audio: CapabilityGlyphState,
     pub clipboard: CapabilityGlyphState,
     pub action: Option<SessionChromeAction>,

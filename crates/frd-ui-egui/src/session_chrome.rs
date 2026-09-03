@@ -3,7 +3,8 @@ use egui::{
     WidgetInfo, WidgetType,
 };
 use frd_ui_model::{
-    CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel,
+    CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel, SessionTiming,
+    SessionTimingSource,
 };
 
 const SLOT_SIZE: f32 = 44.0;
@@ -12,6 +13,8 @@ const SLOT_COUNT: usize = 4;
 const FRAME_RESPONSE_WIDTH: f32 = 88.0;
 const FRAME_RESPONSE_TOOLTIP: &str =
     "画面响应时间（从画面更新请求成功发送到完整更新处理完成，不含本地呈现）";
+const MEDIA_INGRESS_TO_PRESENT_TOOLTIP: &str =
+    "视频接收至呈现（从首个已认证视频包到本地画面呈现，不含服务端采集编码及此前网络时间）";
 
 pub const MATERIAL_SYMBOLS_FONT_FAMILY: &str = "frd-material-symbols-rounded";
 const MATERIAL_SYMBOLS_FONT_BYTES: &[u8] = include_bytes!(concat!(
@@ -62,16 +65,20 @@ struct FrameResponseSemantic {
     tooltip: &'static str,
 }
 
-fn frame_response_semantic(frame_response_ms: Option<u32>) -> FrameResponseSemantic {
-    let text = match frame_response_ms {
+fn presentation_timing_semantic(timing: Option<SessionTiming>) -> FrameResponseSemantic {
+    let text = match timing.map(|timing| timing.milliseconds) {
         None => "-- ms".to_owned(),
         Some(ms) if ms < 10_000 => format!("{ms} ms"),
         Some(_) => "9999+ ms".to_owned(),
     };
+    let tooltip = match timing.map(|timing| timing.source) {
+        Some(SessionTimingSource::MediaIngressToPresent) => MEDIA_INGRESS_TO_PRESENT_TOOLTIP,
+        Some(SessionTimingSource::FramebufferResponse) | None => FRAME_RESPONSE_TOOLTIP,
+    };
     FrameResponseSemantic {
-        accessible_name: format!("{FRAME_RESPONSE_TOOLTIP}；当前值：{text}"),
+        accessible_name: format!("{tooltip}；当前值：{text}"),
         text,
-        tooltip: FRAME_RESPONSE_TOOLTIP,
+        tooltip,
     }
 }
 
@@ -230,7 +237,7 @@ pub fn show_session_chrome_with_focus(
             connection_response.request_focus();
         }
         connection_id = Some(connection_response.id);
-        frame_response_id = Some(show_frame_response(ui, model.frame_response_ms).id);
+        frame_response_id = Some(show_presentation_timing(ui, model.presentation_timing).id);
         show_glyph(ui, audio_glyph(model.audio), None, None, false);
         show_glyph(ui, clipboard_glyph(model.clipboard), None, None, false);
 
@@ -248,8 +255,8 @@ pub fn show_session_chrome_with_focus(
     }
 }
 
-fn show_frame_response(ui: &mut Ui, frame_response_ms: Option<u32>) -> Response {
-    let semantic = frame_response_semantic(frame_response_ms);
+fn show_presentation_timing(ui: &mut Ui, timing: Option<SessionTiming>) -> Response {
+    let semantic = presentation_timing_semantic(timing);
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(FRAME_RESPONSE_WIDTH, SLOT_SIZE),
         Sense::focusable_noninteractive(),
@@ -376,18 +383,19 @@ mod tests {
     use egui::{FontDefinitions, FontFamily};
     use frd_ui_model::{
         CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel,
+        SessionTiming, SessionTimingSource,
     };
 
     use super::{
         accessible_label, action_glyph, audio_glyph, clipboard_glyph, connection_glyph,
-        frame_response_semantic, glyph_fill_state, install_session_chrome_font,
-        material_symbol_font_id, session_chrome_metrics, GlyphFillState,
+        glyph_fill_state, install_session_chrome_font, material_symbol_font_id,
+        presentation_timing_semantic, session_chrome_metrics, GlyphFillState,
         MATERIAL_SYMBOLS_FONT_FAMILY,
     };
 
     #[test]
     fn frame_response_box_formats_text_accessibility_tooltip_and_metrics() {
-        let unknown = frame_response_semantic(None);
+        let unknown = presentation_timing_semantic(None);
         assert_eq!(unknown.text, "-- ms");
         assert_eq!(
             unknown.accessible_name,
@@ -398,8 +406,31 @@ mod tests {
             "画面响应时间（从画面更新请求成功发送到完整更新处理完成，不含本地呈现）"
         );
 
-        assert_eq!(frame_response_semantic(Some(37)).text, "37 ms");
-        assert_eq!(frame_response_semantic(Some(u32::MAX)).text, "9999+ ms");
+        assert_eq!(
+            presentation_timing_semantic(Some(SessionTiming {
+                source: SessionTimingSource::FramebufferResponse,
+                milliseconds: 37,
+            }))
+            .text,
+            "37 ms"
+        );
+        assert_eq!(
+            presentation_timing_semantic(Some(SessionTiming {
+                source: SessionTimingSource::FramebufferResponse,
+                milliseconds: u32::MAX,
+            }))
+            .text,
+            "9999+ ms"
+        );
+        let media = presentation_timing_semantic(Some(SessionTiming {
+            source: SessionTimingSource::MediaIngressToPresent,
+            milliseconds: 24,
+        }));
+        assert_eq!(media.text, "24 ms");
+        assert_eq!(
+            media.tooltip,
+            "视频接收至呈现（从首个已认证视频包到本地画面呈现，不含服务端采集编码及此前网络时间）"
+        );
 
         let metrics = session_chrome_metrics();
         assert_eq!(metrics.frame_response_width, 88.0);
@@ -424,7 +455,7 @@ mod tests {
                     &SessionChromeModel {
                         connection: ConnectionGlyph::Connected,
                         diagnostics: None,
-                        frame_response_ms: None,
+                        presentation_timing: None,
                         audio: CapabilityGlyphState::Unavailable,
                         clipboard: CapabilityGlyphState::Unavailable,
                         action: Some(SessionChromeAction::Disconnect),
@@ -624,7 +655,7 @@ mod tests {
         let connected = SessionChromeModel {
             connection: ConnectionGlyph::Connected,
             diagnostics: None,
-            frame_response_ms: None,
+            presentation_timing: None,
             audio: CapabilityGlyphState::Available,
             clipboard: CapabilityGlyphState::Available,
             action: Some(SessionChromeAction::Disconnect),
@@ -632,7 +663,7 @@ mod tests {
         let waiting = SessionChromeModel {
             connection: ConnectionGlyph::WaitingForFrame,
             diagnostics: None,
-            frame_response_ms: None,
+            presentation_timing: None,
             audio: CapabilityGlyphState::Unavailable,
             clipboard: CapabilityGlyphState::Unavailable,
             action: Some(SessionChromeAction::Cancel),
