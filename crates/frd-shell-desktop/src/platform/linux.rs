@@ -1,7 +1,8 @@
 use frd_ui_model::IslandWindowCapabilities;
 
 use crate::{
-    ChromeHitMap, NativeChromeInsets, WindowChromeAdapter, WindowChromeCommand, WindowChromeError,
+    AppearancePolicy, ChromeHitMap, NativeChromeInsets, WindowChromeAdapter, WindowChromeCommand,
+    WindowChromeError,
 };
 
 pub(crate) struct PlatformWindowChrome;
@@ -33,6 +34,14 @@ impl WindowChromeAdapter for PlatformWindowChrome {
 
     fn capabilities(&self) -> IslandWindowCapabilities {
         crate::window_chrome::unverified_desktop_capabilities()
+    }
+
+    fn appearance_policy(&self) -> AppearancePolicy {
+        AppearancePolicy::conservative()
+    }
+
+    fn refresh_appearance_policy(&mut self) -> bool {
+        false
     }
 
     fn native_interaction_active(&self) -> bool {

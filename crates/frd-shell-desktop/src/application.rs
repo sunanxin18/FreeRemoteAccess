@@ -2027,20 +2027,24 @@ impl DesktopWindowState {
 
     fn reset_connection_chrome(&mut self, now: std::time::Instant) {
         self.floating_chrome = FloatingChromeController::connected_default(now);
+        self.floating_chrome
+            .set_animations_enabled(self.chrome.appearance_policy().animate);
         self.floating_chrome.force_reveal_after_release(now);
         self.island_reposition_drag_delta = egui::Vec2::ZERO;
         self.island_ui_interaction_active = false;
         self.window_move_hovered = false;
     }
 
-    fn refresh_control_island_pin(&mut self, now: std::time::Instant) {
+    fn refresh_control_island_pin(&mut self, now: std::time::Instant) -> bool {
         let active = control_island_interaction_active(
             self.island_ui_interaction_active,
             self.window_move_hovered,
             self.chrome.native_interaction_active(),
         );
+        let previous = self.floating_chrome.state();
         self.floating_chrome
             .observe_island_union(active, active, now);
+        self.floating_chrome.state() != previous
     }
 }
 
@@ -2529,6 +2533,9 @@ impl DesktopApplication {
             target_format,
             egui_wgpu::RendererOptions::default(),
         );
+        let mut floating_chrome =
+            FloatingChromeController::connected_default(std::time::Instant::now());
+        floating_chrome.set_animations_enabled(chrome.appearance_policy().animate);
         let mut state = DesktopWindowState {
             chrome,
             window,
@@ -2557,7 +2564,7 @@ impl DesktopApplication {
             video_stage_trace: OwnedVideoStageTrace::default(),
             dpi_transition: DpiTransition::default(),
             pending_texture_writes: PendingTextureWrites::default(),
-            floating_chrome: FloatingChromeController::connected_default(std::time::Instant::now()),
+            floating_chrome,
             island_reposition_drag_delta: egui::Vec2::ZERO,
             island_ui_interaction_active: false,
             window_move_hovered: false,
@@ -3052,6 +3059,9 @@ impl DesktopApplication {
         let now = std::time::Instant::now();
         if product_chrome.is_none() {
             window.floating_chrome = FloatingChromeController::connected_default(now);
+            window
+                .floating_chrome
+                .set_animations_enabled(window.chrome.appearance_policy().animate);
         } else if !auto_hide_enabled && forced_reveal_diagnostic.is_none() {
             window.floating_chrome.force_reveal_after_release(now);
         }
@@ -3102,7 +3112,7 @@ impl DesktopApplication {
                         island_rect,
                         reveal_line_rect,
                         focus_first: focus_session_chrome,
-                        opaque_material: false,
+                        opaque_material: window.chrome.appearance_policy().opaque_material,
                         shell_diagnostic: forced_reveal_diagnostic.as_deref(),
                     },
                 );
@@ -3177,7 +3187,9 @@ impl DesktopApplication {
                     .window_move_region
                     .is_some_and(|rect| rect.contains(x, y))
             });
-            window.refresh_control_island_pin(now);
+            if window.refresh_control_island_pin(now) {
+                window.window.request_redraw();
+            }
         }
         if island_pressed {
             let delta = island_reposition_delta - window.island_reposition_drag_delta;
@@ -4210,12 +4222,19 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                         .as_ref()
                         .is_some_and(|layouts| layouts.overlay.top_sensor_rect.contains(x, y))
                 });
+                let mut revealed_immediately = false;
                 if hover_reveal_enabled {
+                    let was_visible = window.floating_chrome.is_visible();
+                    let previous = window.floating_chrome.state();
                     window.floating_chrome.observe_top_sensor(
                         inside_top_sensor,
                         remote_input_held,
                         std::time::Instant::now(),
                     );
+                    revealed_immediately = !was_visible && window.floating_chrome.is_visible();
+                    if window.floating_chrome.state() != previous {
+                        window.window.request_redraw();
+                    }
                 }
                 window.window_move_hovered = position.is_some_and(|(x, y)| {
                     window
@@ -4224,8 +4243,10 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                         .and_then(|layouts| layouts.overlay.window_move_region)
                         .is_some_and(|rect| rect.contains(x, y))
                 });
-                if auto_hide_enabled {
-                    window.refresh_control_island_pin(std::time::Instant::now());
+                if auto_hide_enabled && !revealed_immediately {
+                    if window.refresh_control_island_pin(std::time::Instant::now()) {
+                        window.window.request_redraw();
+                    }
                 }
             }
         }
@@ -4368,17 +4389,27 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             ),
             DesktopMode::TestTexture { stage, .. } => *stage == TestTextureStage::RemoteSession,
         };
-        if auto_hide_enabled {
-            if let Some(window) = self.window.as_mut() {
-                window.refresh_control_island_pin(now);
+        let pin_changed = auto_hide_enabled
+            && self
+                .window
+                .as_mut()
+                .is_some_and(|window| window.refresh_control_island_pin(now));
+        let appearance_changed = self.window.as_mut().is_some_and(|window| {
+            if !window.chrome.refresh_appearance_policy() {
+                return false;
             }
-        }
+            let policy = window.chrome.appearance_policy();
+            window
+                .floating_chrome
+                .set_animations_enabled(policy.animate);
+            true
+        });
         let chrome_changed = auto_hide_enabled
             && self
                 .window
                 .as_mut()
                 .is_some_and(|window| window.floating_chrome.advance(now));
-        if chrome_changed {
+        if appearance_changed || pin_changed || chrome_changed {
             self.request_redraw();
         }
         if self

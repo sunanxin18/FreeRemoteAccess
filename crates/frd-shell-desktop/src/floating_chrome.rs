@@ -44,6 +44,7 @@ pub struct FloatingChromeController {
     state: ControlIslandState,
     deadline: Option<Instant>,
     placement: ControlIslandPlacement,
+    animations_enabled: bool,
 }
 
 impl FloatingChromeController {
@@ -52,6 +53,7 @@ impl FloatingChromeController {
             state: ControlIslandState::Hidden,
             deadline: None,
             placement: ControlIslandPlacement::default(),
+            animations_enabled: true,
         }
     }
 
@@ -68,11 +70,35 @@ impl FloatingChromeController {
         )
     }
 
+    pub fn set_animations_enabled(&mut self, enabled: bool) -> bool {
+        if self.animations_enabled == enabled {
+            return false;
+        }
+        self.animations_enabled = enabled;
+        if enabled {
+            return false;
+        }
+
+        let previous_state = self.state;
+        let had_deadline = self.deadline.take().is_some();
+        self.state = match self.state {
+            ControlIslandState::RevealPending => ControlIslandState::Visible,
+            ControlIslandState::HidePending => ControlIslandState::Hidden,
+            state => state,
+        };
+        had_deadline || self.state != previous_state
+    }
+
     pub fn observe_top_sensor(&mut self, inside: bool, remote_input_held: bool, now: Instant) {
         match self.state {
             ControlIslandState::Hidden if inside && !remote_input_held => {
-                self.state = ControlIslandState::RevealPending;
-                self.deadline = now.checked_add(REVEAL_DELAY);
+                if self.animations_enabled {
+                    self.state = ControlIslandState::RevealPending;
+                    self.deadline = now.checked_add(REVEAL_DELAY);
+                } else {
+                    self.state = ControlIslandState::Visible;
+                    self.deadline = None;
+                }
             }
             ControlIslandState::RevealPending if !inside || remote_input_held => {
                 self.state = ControlIslandState::Hidden;
@@ -100,8 +126,13 @@ impl FloatingChromeController {
             self.state,
             ControlIslandState::Visible | ControlIslandState::Pinned
         ) {
-            self.state = ControlIslandState::HidePending;
-            self.deadline = now.checked_add(HIDE_DELAY);
+            if self.animations_enabled {
+                self.state = ControlIslandState::HidePending;
+                self.deadline = now.checked_add(HIDE_DELAY);
+            } else {
+                self.state = ControlIslandState::Hidden;
+                self.deadline = None;
+            }
         }
     }
 
@@ -601,6 +632,32 @@ mod tests {
         chrome.observe_top_sensor(true, false, start + Duration::from_millis(20));
         assert_eq!(chrome.state(), ControlIslandState::RevealPending);
         chrome.observe_top_sensor(false, false, start + Duration::from_millis(30));
+        assert_eq!(chrome.state(), ControlIslandState::Hidden);
+        assert_eq!(chrome.next_deadline(), None);
+    }
+
+    #[test]
+    fn floating_chrome_reduced_motion_converges_pending_states_without_deadlines() {
+        let start = Instant::now();
+        let mut chrome = FloatingChromeController::connected_default(start);
+
+        chrome.observe_top_sensor(true, false, start);
+        assert_eq!(chrome.state(), ControlIslandState::RevealPending);
+        assert!(chrome.set_animations_enabled(false));
+        assert_eq!(chrome.state(), ControlIslandState::Visible);
+        assert_eq!(chrome.next_deadline(), None);
+
+        chrome.set_animations_enabled(true);
+        chrome.observe_island_union(false, false, start);
+        assert_eq!(chrome.state(), ControlIslandState::HidePending);
+        assert!(chrome.set_animations_enabled(false));
+        assert_eq!(chrome.state(), ControlIslandState::Hidden);
+        assert_eq!(chrome.next_deadline(), None);
+
+        chrome.observe_top_sensor(true, false, start);
+        assert_eq!(chrome.state(), ControlIslandState::Visible);
+        assert_eq!(chrome.next_deadline(), None);
+        chrome.observe_island_union(false, false, start);
         assert_eq!(chrome.state(), ControlIslandState::Hidden);
         assert_eq!(chrome.next_deadline(), None);
     }

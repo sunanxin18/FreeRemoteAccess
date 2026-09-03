@@ -7,20 +7,23 @@ use frd_ui_model::{IslandAction, IslandWindowCapabilities};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DwmDefWindowProc, DwmExtendFrameIntoClientArea};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, IsZoomed, SetWindowPos, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-    HTCLIENT, HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS,
-    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
+    GetClientRect, IsZoomed, SetWindowPos, SystemParametersInfoW, HTBOTTOM, HTBOTTOMLEFT,
+    HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
+    SPI_GETCLIENTAREAANIMATION, SPI_GETHIGHCONTRAST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, WM_CLOSE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_SETTINGCHANGE, WM_THEMECHANGED,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::{
-    ChromeHitMap, ChromeHitTarget, NativeChromeInsets, WindowChromeAdapter, WindowChromeCommand,
-    WindowChromeError, TITLE_BAR_HEIGHT_POINTS,
+    AppearancePolicy, ChromeHitMap, ChromeHitTarget, NativeChromeInsets, WindowChromeAdapter,
+    WindowChromeCommand, WindowChromeError, TITLE_BAR_HEIGHT_POINTS,
 };
 
 const SUBCLASS_ID: usize = 0x4652_4443;
@@ -29,11 +32,13 @@ struct SubclassState {
     hit_map: Mutex<Option<ChromeHitMap>>,
     resize_metrics: Mutex<(i32, i32)>,
     native_interaction: AtomicBool,
+    appearance_dirty: AtomicBool,
 }
 
 pub(crate) struct PlatformWindowChrome {
     hwnd: Option<HWND>,
     state: Box<SubclassState>,
+    appearance_policy: AppearancePolicy,
 }
 
 impl PlatformWindowChrome {
@@ -44,7 +49,9 @@ impl PlatformWindowChrome {
                 hit_map: Mutex::new(None),
                 resize_metrics: Mutex::new((8, 8)),
                 native_interaction: AtomicBool::new(false),
+                appearance_dirty: AtomicBool::new(false),
             }),
+            appearance_policy: AppearancePolicy::conservative(),
         }
     }
 
@@ -92,6 +99,7 @@ impl PlatformWindowChrome {
 impl WindowChromeAdapter for PlatformWindowChrome {
     fn configure(&mut self, window: &winit::window::Window) -> Result<(), WindowChromeError> {
         let hwnd = Self::hwnd(window)?;
+        self.appearance_policy = AppearancePolicy::from_probe(query_appearance_preferences());
         self.refresh_native_metrics(hwnd)?;
         let state_ptr = (&mut *self.state) as *mut SubclassState as usize;
         if unsafe { SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, state_ptr) } == 0 {
@@ -129,6 +137,22 @@ impl WindowChromeAdapter for PlatformWindowChrome {
 
     fn capabilities(&self) -> IslandWindowCapabilities {
         IslandWindowCapabilities::WINDOWS
+    }
+
+    fn appearance_policy(&self) -> AppearancePolicy {
+        self.appearance_policy
+    }
+
+    fn refresh_appearance_policy(&mut self) -> bool {
+        if !self.state.appearance_dirty.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        let next = AppearancePolicy::from_probe(query_appearance_preferences());
+        if next == self.appearance_policy {
+            return false;
+        }
+        self.appearance_policy = next;
+        true
     }
 
     fn native_interaction_active(&self) -> bool {
@@ -194,6 +218,7 @@ unsafe extern "system" fn subclass_proc(
 ) -> LRESULT {
     let state = &*(reference_data as *const SubclassState);
     observe_native_interaction_message(&state.native_interaction, message);
+    observe_appearance_message(&state.appearance_dirty, message);
     if message == WM_NCCALCSIZE && wparam != 0 {
         let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
         let original_top = params.rgrc[0].top;
@@ -259,6 +284,49 @@ fn observe_native_interaction_message(active: &AtomicBool, message: u32) {
         WM_EXITSIZEMOVE => active.store(false, Ordering::Release),
         _ => {}
     }
+}
+
+fn observe_appearance_message(dirty: &AtomicBool, message: u32) {
+    if matches!(message, WM_SETTINGCHANGE | WM_THEMECHANGED) {
+        dirty.store(true, Ordering::Release);
+    }
+}
+
+fn query_appearance_preferences() -> Option<(bool, bool)> {
+    let mut high_contrast = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        dwFlags: 0,
+        lpszDefaultScheme: std::ptr::null_mut(),
+    };
+    if unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            high_contrast.cbSize,
+            (&mut high_contrast as *mut HIGHCONTRASTW).cast(),
+            0,
+        )
+    } == 0
+    {
+        return None;
+    }
+
+    let mut client_area_animation = 0_i32;
+    if unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut client_area_animation as *mut i32).cast(),
+            0,
+        )
+    } == 0
+    {
+        return None;
+    }
+
+    Some((
+        high_contrast.dwFlags & HCF_HIGHCONTRASTON != 0,
+        client_area_animation != 0,
+    ))
 }
 
 fn accepted_dwm_resize_hit(result: LRESULT) -> Option<LRESULT> {
@@ -341,12 +409,12 @@ mod tests {
     use frd_ui_model::IslandAction;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HTBOTTOMRIGHT, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOPLEFT, WM_ENTERSIZEMOVE,
-        WM_EXITSIZEMOVE, WM_NULL,
+        WM_EXITSIZEMOVE, WM_NULL, WM_SETTINGCHANGE, WM_THEMECHANGED,
     };
 
     use super::{
-        accepted_dwm_resize_hit, observe_native_interaction_message, resize_hit,
-        resize_hit_for_window, windows_island_native_insets, windows_native_hit,
+        accepted_dwm_resize_hit, observe_appearance_message, observe_native_interaction_message,
+        resize_hit, resize_hit_for_window, windows_island_native_insets, windows_native_hit,
     };
     use crate::{ChromeHitMap, ChromeHitTarget, ChromeRect};
 
@@ -360,6 +428,19 @@ mod tests {
         assert!(active.load(Ordering::Acquire));
         observe_native_interaction_message(&active, WM_EXITSIZEMOVE);
         assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn windows_setting_and_theme_messages_mark_appearance_preferences_dirty() {
+        for message in [WM_SETTINGCHANGE, WM_THEMECHANGED] {
+            let dirty = AtomicBool::new(false);
+            observe_appearance_message(&dirty, message);
+            assert!(dirty.load(Ordering::Acquire));
+        }
+
+        let dirty = AtomicBool::new(false);
+        observe_appearance_message(&dirty, WM_NULL);
+        assert!(!dirty.load(Ordering::Acquire));
     }
 
     #[test]
