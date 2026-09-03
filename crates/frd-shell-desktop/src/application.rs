@@ -176,9 +176,11 @@ fn reveal_offline_test_texture_island(
     input: &InputRouter,
     chrome: &mut FloatingChromeController,
     exact_shortcut: bool,
+    is_synthetic: bool,
     now: std::time::Instant,
 ) -> bool {
     if !exact_shortcut
+        || is_synthetic
         || input.interactive_epoch().is_some()
         || input.has_remote_held_input()
         || !matches!(
@@ -3769,6 +3771,7 @@ impl DesktopApplication {
                 &self.input,
                 &mut window.floating_chrome,
                 local_shortcut,
+                *is_synthetic,
                 std::time::Instant::now(),
             ) {
                 window
@@ -6370,6 +6373,7 @@ mod tests {
             &input,
             &mut chrome,
             true,
+            false,
             now,
         ));
         assert_eq!(chrome.state(), crate::ControlIslandState::Pinned);
@@ -6381,6 +6385,7 @@ mod tests {
                 &input,
                 &mut chrome,
                 true,
+                false,
                 now,
             ));
             assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
@@ -6392,6 +6397,18 @@ mod tests {
             &input,
             &mut chrome,
             false,
+            false,
+            now,
+        ));
+        assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
+
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        assert!(!super::reveal_offline_test_texture_island(
+            &remote,
+            &input,
+            &mut chrome,
+            true,
+            true,
             now,
         ));
         assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
