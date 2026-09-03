@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::IpAddr;
 #[cfg(all(debug_assertions, not(test)))]
 use std::sync::{
@@ -21,6 +22,7 @@ use crate::connection::AppleWriterHandle;
 use crate::hevc_access_unit::{
     HevcAccessUnitAssembler, HevcAccessUnitError, HevcAccessUnitLimits, HevcRtpPacket,
 };
+use crate::hevc_rtp::HevcRtpError;
 use crate::high_performance_video::AppleHighPerformanceVideoAdapter;
 use crate::media_negotiation::{AudioMediaFlow, MediaStreamAnswer};
 use crate::media_protocol::MediaStreamPortAnnouncement;
@@ -29,6 +31,7 @@ use crate::srtp::parse_rtp_packet;
 
 const MAX_PCM_PUBLICATION_SAMPLES: usize =
     ARD_AUDIO_SAMPLE_RATE_HZ as usize * ARD_AUDIO_CHANNEL_COUNT * 2;
+const MAX_RETIRED_VIDEO_SSRCS: usize = 8;
 
 pub(crate) fn publish_decoded_audio(
     runtime: &mut ProtocolRuntime,
@@ -265,7 +268,8 @@ struct VideoReceiveState {
     adapter: AppleHighPerformanceVideoAdapter,
     stage_trace: MediaStageTrace,
     pending_recovery_request: Option<VideoRecoveryRequest>,
-    authenticated_ssrc: Option<u32>,
+    active_ssrc: Option<u32>,
+    retired_ssrcs: VecDeque<u32>,
     awaiting_replacement_irap: bool,
     #[cfg(any(debug_assertions, test))]
     authenticated_rtp_packets: u64,
@@ -284,7 +288,8 @@ impl VideoReceiveState {
             adapter: AppleHighPerformanceVideoAdapter::new(identity, generation),
             stage_trace: MediaStageTrace::default(),
             pending_recovery_request: None,
-            authenticated_ssrc: None,
+            active_ssrc: None,
+            retired_ssrcs: VecDeque::new(),
             awaiting_replacement_irap: false,
             #[cfg(any(debug_assertions, test))]
             authenticated_rtp_packets: 0,
@@ -296,7 +301,8 @@ impl VideoReceiveState {
         self.adapter.reset(generation);
         self.stage_trace = MediaStageTrace::default();
         self.pending_recovery_request = None;
-        self.authenticated_ssrc = None;
+        self.active_ssrc = None;
+        self.retired_ssrcs.clear();
         self.awaiting_replacement_irap = false;
         #[cfg(any(debug_assertions, test))]
         {
@@ -323,15 +329,25 @@ impl VideoReceiveState {
         datagram: &[u8],
     ) -> Result<()> {
         let packet = parse_rtp_packet(datagram).context("解析 Apple HP 视频 RTP 数据报失败")?;
-        match self.authenticated_ssrc {
+        match self.active_ssrc {
             Some(previous) if previous != packet.header.ssrc => {
+                if self.retired_ssrcs.contains(&packet.header.ssrc) {
+                    return Ok(());
+                }
+                // Apple HP 每个媒体 role 同时只发布一个活动视频 SSRC。同一 display
+                // generation 内不允许退回旧 SSRC；达到有界历史上限后忽略新的未知
+                // SSRC，等待下一次 generation reset，而不是放宽成多活动流。
+                if self.retired_ssrcs.len() == MAX_RETIRED_VIDEO_SSRCS {
+                    return Ok(());
+                }
+                self.retired_ssrcs.push_back(previous);
                 self.assembler.reset(generation);
                 self.adapter.reset(generation);
                 self.pending_recovery_request = None;
-                self.authenticated_ssrc = Some(packet.header.ssrc);
+                self.active_ssrc = Some(packet.header.ssrc);
                 self.awaiting_replacement_irap = true;
             }
-            None => self.authenticated_ssrc = Some(packet.header.ssrc),
+            None => self.active_ssrc = Some(packet.header.ssrc),
             Some(_) => {}
         }
         let access_units = match self.assembler.push(HevcRtpPacket {
@@ -351,6 +367,12 @@ impl VideoReceiveState {
                 return Ok(());
             }
             Err(HevcAccessUnitError::MissingInitialParameterSets)
+                if self.awaiting_replacement_irap =>
+            {
+                self.assembler.reset(generation);
+                return Ok(());
+            }
+            Err(HevcAccessUnitError::Depacketize(HevcRtpError::FuContinuationWithoutStart))
                 if self.awaiting_replacement_irap =>
             {
                 self.assembler.reset(generation);
@@ -1399,6 +1421,249 @@ mod tests {
             matches!(&published[3], MediaFrame::EncodedVideo(access_unit)
             if access_unit.random_access() && access_unit.timestamp().ticks == 6_000)
         );
+    }
+
+    #[test]
+    fn authenticated_video_ssrc_switch_ignores_late_retired_source_without_flapping() {
+        const FIRST_SSRC: u32 = 0x1020_3040;
+        const SECOND_SSRC: u32 = 0x5060_7080;
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let mut first_configuration = startup_parameter_set_ap();
+        first_configuration.extend_from_slice(&[0, 4, 0x26, 0x01, 0xaa, 0xbb]);
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                FIRST_SSRC,
+                1,
+                0,
+                true,
+                &first_configuration,
+            )),
+        )
+        .unwrap();
+
+        let mut replacement_configuration = startup_parameter_set_ap();
+        replacement_configuration.extend_from_slice(&[0, 4, 0x26, 0x01, 0xcc, 0xdd]);
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                1,
+                3_000,
+                true,
+                &replacement_configuration,
+            )),
+        )
+        .unwrap();
+        assert_eq!(published.lock().unwrap().len(), 4);
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                FIRST_SSRC,
+                2,
+                6_000,
+                true,
+                &[0x02, 0x01, 0xee],
+            )),
+        )
+        .expect("late authenticated packets from the retired SSRC must be ignored");
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                2,
+                9_000,
+                true,
+                &[0x02, 0x01, 0xff],
+            )),
+        )
+        .expect("the active replacement SSRC must continue without another reset");
+
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 5);
+        assert!(
+            matches!(&published[4], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.timestamp().ticks == 9_000)
+        );
+    }
+
+    #[test]
+    fn authenticated_video_ssrc_switch_caches_configuration_au_until_later_irap() {
+        const FIRST_SSRC: u32 = 0x1020_3040;
+        const SECOND_SSRC: u32 = 0x5060_7080;
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let mut first_configuration = startup_parameter_set_ap();
+        first_configuration.extend_from_slice(&[0, 4, 0x26, 0x01, 0xaa, 0xbb]);
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                FIRST_SSRC,
+                1,
+                0,
+                true,
+                &first_configuration,
+            )),
+        )
+        .unwrap();
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                1,
+                3_000,
+                true,
+                &startup_parameter_set_ap(),
+            )),
+        )
+        .expect("replacement configuration AU must be cached without publication");
+        assert_eq!(published.lock().unwrap().len(), 2);
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                2,
+                6_000,
+                true,
+                &[0x26, 0x01, 0xcc],
+            )),
+        )
+        .expect("a later replacement IRAP must publish cached configuration first");
+
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 4);
+        assert!(matches!(&published[2], MediaFrame::VideoConfig(_)));
+        assert!(
+            matches!(&published[3], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.random_access() && access_unit.timestamp().ticks == 6_000)
+        );
+    }
+
+    #[test]
+    fn authenticated_video_ssrc_switch_drops_initial_fu_continuation_without_fatal() {
+        const FIRST_SSRC: u32 = 0x1020_3040;
+        const SECOND_SSRC: u32 = 0x5060_7080;
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let mut first_configuration = startup_parameter_set_ap();
+        first_configuration.extend_from_slice(&[0, 4, 0x26, 0x01, 0xaa, 0xbb]);
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                FIRST_SSRC,
+                1,
+                0,
+                true,
+                &first_configuration,
+            )),
+        )
+        .unwrap();
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                1,
+                3_000,
+                false,
+                &[0x62, 0x01, 0x20, 0xee],
+            )),
+        )
+        .expect("a replacement stream observed mid-FU must wait instead of failing the session");
+        assert_eq!(published.lock().unwrap().len(), 2);
+
+        let mut replacement_configuration = startup_parameter_set_ap();
+        replacement_configuration.extend_from_slice(&[0, 4, 0x26, 0x01, 0xcc, 0xdd]);
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                2,
+                6_000,
+                true,
+                &replacement_configuration,
+            )),
+        )
+        .expect("replacement stream must recover after a complete configuration IRAP");
+        assert_eq!(published.lock().unwrap().len(), 4);
     }
 
     #[test]
