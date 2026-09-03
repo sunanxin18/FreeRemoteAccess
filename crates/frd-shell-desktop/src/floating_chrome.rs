@@ -205,6 +205,10 @@ impl ChromeHitMap {
                 .iter()
                 .any(|rect| !valid_rect(*rect) || !rect_within(remote_content, *rect))
             || overlaps(island_reposition_handle, window_move_region)
+            || island_actions.iter().any(|(rect, _)| {
+                overlaps(Some(*rect), island_reposition_handle)
+                    || overlaps(Some(*rect), window_move_region)
+            })
         {
             return None;
         }
@@ -350,8 +354,14 @@ impl ChromeGeometrySnapshot {
             scaled_points(REVEAL_LINE_WIDTH_POINTS, self.scale_factor)?.min(safe_width);
         let line_height = scaled_points(REVEAL_LINE_HEIGHT_POINTS, self.scale_factor)?
             .min(self.window_size.height);
+        let clamped_island_center = f64::from(island_rect.center().0);
         let reveal_line_rect = ChromeRect {
-            x: clamp_origin_around_center(desired_center, line_width, safe_left, safe_right)?,
+            x: clamp_origin_around_center(
+                clamped_island_center,
+                line_width,
+                safe_left,
+                safe_right,
+            )?,
             y: 0,
             width: line_width,
             height: line_height,
@@ -359,9 +369,9 @@ impl ChromeGeometrySnapshot {
         let sensor_height = scaled_points(f64::from(TOP_SENSOR_POINTS), self.scale_factor)?
             .min(self.window_size.height);
         let top_sensor_rect = ChromeRect {
-            x: reveal_line_rect.x,
+            x: safe_left,
             y: 0,
-            width: reveal_line_rect.width,
+            width: safe_width,
             height: sensor_height,
         };
 
@@ -617,6 +627,77 @@ mod tests {
             Some(ChromeHitTarget::RemoteContent),
             "the visual-only green line must not enter the hit map"
         );
+    }
+
+    #[test]
+    fn floating_chrome_line_follows_the_clamped_island_center() {
+        let layouts = ChromeGeometrySnapshot::new(800, 600, 1.0, NativeChromeInsets::default())
+            .unwrap()
+            .layouts(
+                ControlIslandPlacement {
+                    normalized_center_x: 0.0,
+                    top_points: 0.0,
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            layouts.overlay.reveal_line_rect.center().0,
+            layouts.overlay.island_rect.unwrap().center().0
+        );
+    }
+
+    #[test]
+    fn floating_chrome_top_sensor_spans_the_effective_safe_width() {
+        let layouts = ChromeGeometrySnapshot::new(
+            1200,
+            800,
+            1.0,
+            NativeChromeInsets {
+                leading_px: 72,
+                trailing_px: 144,
+            },
+        )
+        .unwrap()
+        .layouts(ControlIslandPlacement::default(), false)
+        .unwrap();
+
+        assert_eq!(layouts.overlay.top_sensor_rect.x, 72);
+        assert_eq!(layouts.overlay.top_sensor_rect.width, 984);
+        assert!(
+            layouts.overlay.reveal_line_rect.width < layouts.overlay.top_sensor_rect.width,
+            "the visual line stays bounded while the move-only sensor covers the safe top edge"
+        );
+    }
+
+    #[test]
+    fn floating_chrome_rejects_actions_overlapping_either_move_handle() {
+        let remote = PixelRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let shared = ChromeRect {
+            x: 100,
+            y: 10,
+            width: 44,
+            height: 44,
+        };
+
+        for (reposition, window_move) in [(Some(shared), None), (None, Some(shared))] {
+            assert_eq!(
+                ChromeHitMap::candidate(
+                    remote,
+                    vec![(shared, IslandAction::Disconnect)],
+                    reposition,
+                    window_move,
+                    Vec::new(),
+                ),
+                None
+            );
+        }
     }
 
     #[test]
