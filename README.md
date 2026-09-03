@@ -26,7 +26,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
 |---|---|---|---|---|---|
-| Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成，Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
+| Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成，Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；Windows 浮动控制岛 shell 已完成 **受限验证**，不代表任一远程协议互操作，证据见 [`windows-floating-control-island.md`](docs/validation/windows-floating-control-island.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
 | macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；必须保留 macOS 原生标题栏、字体和 Keychain 适配 |
 | Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；需实现窗口管理器适配与 Secret Service |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
