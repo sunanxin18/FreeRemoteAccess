@@ -860,6 +860,7 @@ mod tests {
     };
 
     use crate::audio_codec::DecodedAudioPacket;
+    use crate::hp_media_diagnostics::with_test_diagnostic_observer;
     use crate::media_negotiation::AudioMediaFlow;
 
     use super::{
@@ -1801,8 +1802,21 @@ mod tests {
     }
 
     #[test]
-    fn malformed_authenticated_video_rtp_reaches_the_classified_fatal_boundary() {
-        assert!(parse_video_rtp_for_media(&[0x80]).is_err());
+    fn malformed_authenticated_video_rtp_emits_one_closed_fatal_category_when_enabled() {
+        let (result, lines) =
+            with_test_diagnostic_observer(true, || parse_video_rtp_for_media(&[0x80]));
+
+        assert!(result.is_err());
+        assert_eq!(lines, ["[apple-hp-media-fatal] category=video_rtp_parse"]);
+    }
+
+    #[test]
+    fn malformed_authenticated_video_rtp_emits_nothing_when_diagnostics_are_disabled() {
+        let (result, lines) =
+            with_test_diagnostic_observer(false, || parse_video_rtp_for_media(&[0x80]));
+
+        assert!(result.is_err());
+        assert!(lines.is_empty());
     }
 
     fn video_rtp(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
