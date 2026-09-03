@@ -12,12 +12,13 @@ use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, IsZoomed, SetWindowPos, SystemParametersInfoW, HTBOTTOM, HTBOTTOMLEFT,
-    HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-    NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
+    GetClientRect, IsZoomed, SetWindowPos, ShowWindow, SystemParametersInfoW, HTBOTTOM,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP,
+    HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
     SPI_GETCLIENTAREAANIMATION, SPI_GETHIGHCONTRAST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, WM_CLOSE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
-    WM_SETTINGCHANGE, WM_THEMECHANGED,
+    SWP_NOZORDER, SW_MAXIMIZE, SW_RESTORE, WM_CLOSE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_SETTINGCHANGE,
+    WM_THEMECHANGED,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -33,6 +34,7 @@ struct SubclassState {
     resize_metrics: Mutex<(i32, i32)>,
     native_interaction: AtomicBool,
     appearance_dirty: AtomicBool,
+    maximize_press_armed: AtomicBool,
 }
 
 pub(crate) struct PlatformWindowChrome {
@@ -50,6 +52,7 @@ impl PlatformWindowChrome {
                 resize_metrics: Mutex::new((8, 8)),
                 native_interaction: AtomicBool::new(false),
                 appearance_dirty: AtomicBool::new(false),
+                maximize_press_armed: AtomicBool::new(false),
             }),
             appearance_policy: AppearancePolicy::conservative(),
         }
@@ -219,6 +222,34 @@ unsafe extern "system" fn subclass_proc(
     let state = &*(reference_data as *const SubclassState);
     observe_native_interaction_message(&state.native_interaction, message);
     observe_appearance_message(&state.appearance_dirty, message);
+    if matches!(message, WM_NCLBUTTONDOWN | WM_NCLBUTTONUP) {
+        let was_armed = if message == WM_NCLBUTTONUP {
+            state.maximize_press_armed.swap(false, Ordering::AcqRel)
+        } else {
+            state.maximize_press_armed.store(false, Ordering::Release);
+            false
+        };
+        let hit = chrome_hit_target_at_screen_point(hwnd, state, lparam);
+        match native_maximize_click_decision(message, wparam, hit, was_armed) {
+            NativeMaximizeClickDecision::Pass => {}
+            NativeMaximizeClickDecision::Arm => {
+                state.maximize_press_armed.store(true, Ordering::Release);
+                return 0;
+            }
+            NativeMaximizeClickDecision::Toggle => {
+                ShowWindow(
+                    hwnd,
+                    if IsZoomed(hwnd) != 0 {
+                        SW_RESTORE
+                    } else {
+                        SW_MAXIMIZE
+                    },
+                );
+                return 0;
+            }
+            NativeMaximizeClickDecision::Consume => return 0,
+        }
+    }
     if message == WM_NCCALCSIZE && wparam != 0 {
         let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
         let original_top = params.rgrc[0].top;
@@ -276,6 +307,57 @@ unsafe extern "system" fn subclass_proc(
         return windows_native_hit(&hit_map, (point.x as u32, point.y as u32)) as LRESULT;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeMaximizeClickDecision {
+    Pass,
+    Arm,
+    Toggle,
+    Consume,
+}
+
+fn native_maximize_click_decision(
+    message: u32,
+    wparam: WPARAM,
+    hit: Option<ChromeHitTarget>,
+    was_armed: bool,
+) -> NativeMaximizeClickDecision {
+    let reported_maximize = wparam == HTMAXBUTTON as WPARAM;
+    let exact_maximize = matches!(
+        hit,
+        Some(ChromeHitTarget::IslandAction(
+            IslandAction::ToggleMaximizeWindow
+        ))
+    );
+    match message {
+        WM_NCLBUTTONDOWN if reported_maximize && exact_maximize => NativeMaximizeClickDecision::Arm,
+        WM_NCLBUTTONDOWN if reported_maximize => NativeMaximizeClickDecision::Consume,
+        WM_NCLBUTTONUP if was_armed && reported_maximize && exact_maximize => {
+            NativeMaximizeClickDecision::Toggle
+        }
+        WM_NCLBUTTONUP if was_armed || reported_maximize => NativeMaximizeClickDecision::Consume,
+        _ => NativeMaximizeClickDecision::Pass,
+    }
+}
+
+unsafe fn chrome_hit_target_at_screen_point(
+    hwnd: HWND,
+    state: &SubclassState,
+    lparam: LPARAM,
+) -> Option<ChromeHitTarget> {
+    let mut point = POINT {
+        x: low_word_signed(lparam),
+        y: high_word_signed(lparam),
+    };
+    if ScreenToClient(hwnd, &mut point) == 0 || point.x < 0 || point.y < 0 {
+        return None;
+    }
+    state
+        .hit_map
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref()?.hit_test((point.x as u32, point.y as u32)))
 }
 
 fn observe_native_interaction_message(active: &AtomicBool, message: u32) {
@@ -409,12 +491,14 @@ mod tests {
     use frd_ui_model::IslandAction;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HTBOTTOMRIGHT, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOPLEFT, WM_ENTERSIZEMOVE,
-        WM_EXITSIZEMOVE, WM_NULL, WM_SETTINGCHANGE, WM_THEMECHANGED,
+        WM_EXITSIZEMOVE, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NULL, WM_SETTINGCHANGE,
+        WM_THEMECHANGED,
     };
 
     use super::{
-        accepted_dwm_resize_hit, observe_appearance_message, observe_native_interaction_message,
-        resize_hit, resize_hit_for_window, windows_island_native_insets, windows_native_hit,
+        accepted_dwm_resize_hit, native_maximize_click_decision, observe_appearance_message,
+        observe_native_interaction_message, resize_hit, resize_hit_for_window,
+        windows_island_native_insets, windows_native_hit, NativeMaximizeClickDecision,
     };
     use crate::{ChromeHitMap, ChromeHitTarget, ChromeRect};
 
@@ -428,6 +512,38 @@ mod tests {
         assert!(active.load(Ordering::Acquire));
         observe_native_interaction_message(&active, WM_EXITSIZEMOVE);
         assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn native_maximize_click_requires_an_armed_exact_button_up() {
+        let maximize = Some(ChromeHitTarget::IslandAction(
+            IslandAction::ToggleMaximizeWindow,
+        ));
+        assert_eq!(
+            native_maximize_click_decision(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, maximize, false,),
+            NativeMaximizeClickDecision::Arm
+        );
+        assert_eq!(
+            native_maximize_click_decision(WM_NCLBUTTONUP, HTMAXBUTTON as usize, maximize, true,),
+            NativeMaximizeClickDecision::Toggle
+        );
+        assert_eq!(
+            native_maximize_click_decision(WM_NCLBUTTONUP, HTMAXBUTTON as usize, maximize, false,),
+            NativeMaximizeClickDecision::Consume
+        );
+        assert_eq!(
+            native_maximize_click_decision(WM_NCLBUTTONUP, HTCLIENT as usize, maximize, true,),
+            NativeMaximizeClickDecision::Consume
+        );
+        assert_eq!(
+            native_maximize_click_decision(
+                WM_NCLBUTTONUP,
+                HTMAXBUTTON as usize,
+                Some(ChromeHitTarget::RemoteContent),
+                true,
+            ),
+            NativeMaximizeClickDecision::Consume
+        );
     }
 
     #[test]
