@@ -171,6 +171,30 @@ fn completes_first_remote_frame(
     !was_remote_session && is_remote_session && is_full_baseline
 }
 
+fn reveal_offline_test_texture_island(
+    mode: &DesktopMode,
+    input: &InputRouter,
+    chrome: &mut FloatingChromeController,
+    exact_shortcut: bool,
+    now: std::time::Instant,
+) -> bool {
+    if !exact_shortcut
+        || input.interactive_epoch().is_some()
+        || input.has_remote_held_input()
+        || !matches!(
+            mode,
+            DesktopMode::TestTexture {
+                stage: TestTextureStage::RemoteSession,
+                ..
+            }
+        )
+    {
+        return false;
+    }
+    chrome.force_reveal_after_release(now);
+    true
+}
+
 fn control_island_interaction_active(
     ui_or_tooltip_active: bool,
     window_move_hovered: bool,
@@ -3739,6 +3763,22 @@ impl DesktopApplication {
         let local_shortcut = code.is_some_and(|code| {
             local_chrome_shortcut(code, event.state, event.repeat, self.input.modifiers())
         });
+        if let Some(window) = self.window.as_mut() {
+            if reveal_offline_test_texture_island(
+                &self.mode,
+                &self.input,
+                &mut window.floating_chrome,
+                local_shortcut,
+                std::time::Instant::now(),
+            ) {
+                window
+                    .egui_context
+                    .memory_mut(|memory| memory.stop_text_input());
+                window.focus_session_chrome = true;
+                window.window.request_redraw();
+                return true;
+            }
+        }
         let remote_allowed = self.launch.controller().effective_capabilities().text_input;
         match self.input.dispatch_key_event(
             physical,
@@ -4693,6 +4733,8 @@ fn local_chrome_shortcut(
         && !repeat
         && modifiers.control
         && modifiers.alt
+        && !modifiers.shift
+        && !modifiers.meta
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6301,10 +6343,112 @@ mod tests {
     }
 
     #[test]
+    fn offline_remote_texture_exact_shortcut_reveals_without_a_fake_session() {
+        let session_id = SessionId::allocate();
+        let remote = super::DesktopMode::TestTexture {
+            stage: super::TestTextureStage::RemoteSession,
+            session_id,
+            exit_after: None,
+            resize_after: None,
+            driver_started: false,
+        };
+        let connection = super::DesktopMode::TestTexture {
+            stage: super::TestTextureStage::Connection,
+            session_id,
+            exit_after: None,
+            resize_after: None,
+            driver_started: false,
+        };
+        let input = crate::InputRouter::default();
+        assert_eq!(input.interactive_epoch(), None);
+        assert!(!input.has_remote_held_input());
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+
+        assert!(super::reveal_offline_test_texture_island(
+            &remote,
+            &input,
+            &mut chrome,
+            true,
+            now,
+        ));
+        assert_eq!(chrome.state(), crate::ControlIslandState::Pinned);
+
+        for mode in [&connection, &super::DesktopMode::Product] {
+            let mut chrome = crate::FloatingChromeController::connected_default(now);
+            assert!(!super::reveal_offline_test_texture_island(
+                mode,
+                &input,
+                &mut chrome,
+                true,
+                now,
+            ));
+            assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
+        }
+
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        assert!(!super::reveal_offline_test_texture_island(
+            &remote,
+            &input,
+            &mut chrome,
+            false,
+            now,
+        ));
+        assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
+
+        #[cfg(target_os = "windows")]
+        {
+            let exact = Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::default()
+            };
+            assert!(super::local_chrome_shortcut(
+                winit::keyboard::KeyCode::Home,
+                winit::event::ElementState::Pressed,
+                false,
+                exact,
+            ));
+            assert!(!super::local_chrome_shortcut(
+                winit::keyboard::KeyCode::Home,
+                winit::event::ElementState::Pressed,
+                false,
+                Modifiers {
+                    shift: true,
+                    ..exact
+                },
+            ));
+        }
+    }
+
+    #[test]
     fn accesskit_root_custom_action_is_the_only_root_reveal_request() {
         let context = egui::Context::default();
         context.enable_accesskit();
-        let mut output = context.run_ui(Default::default(), |_| {});
+        context.set_fonts(super::system_font_definitions());
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        chrome.force_reveal_after_release(now);
+        assert_eq!(chrome.state(), crate::ControlIslandState::Pinned);
+        let mut output = context.run_ui(Default::default(), |context| {
+            frd_ui_egui::show_control_island(
+                context,
+                frd_ui_egui::ControlIslandRenderInput {
+                    model: &super::TEST_SESSION_CHROME,
+                    window_capabilities: frd_ui_model::IslandWindowCapabilities::NONE,
+                    visible: chrome.is_visible(),
+                    maximized: false,
+                    island_rect: egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(480.0, 52.0),
+                    ),
+                    reveal_line_rect: egui::Rect::NOTHING,
+                    focus_first: true,
+                    opaque_material: true,
+                    shell_diagnostic: None,
+                },
+            );
+        });
         super::install_accesskit_root_reveal_action(&mut output.platform_output, true);
         let root_id = egui::accesskit_root_id().accesskit_id();
         let update = output
@@ -6322,6 +6466,34 @@ mod tests {
             action.id == super::ACCESSKIT_REVEAL_ACTION_ID
                 && action.description.as_ref() == "显示远程桌面控制栏"
         }));
+
+        let mut reachable = Vec::from(root.children());
+        let mut labels = Vec::new();
+        let mut visited = Vec::new();
+        while let Some(id) = reachable.pop() {
+            if visited.contains(&id) {
+                continue;
+            }
+            visited.push(id);
+            let Some(node) = update
+                .nodes
+                .iter()
+                .find_map(|(node_id, node)| (*node_id == id).then_some(node))
+            else {
+                continue;
+            };
+            if let Some(label) = node.label().or_else(|| node.value()) {
+                labels.push(label.to_owned());
+            }
+            reachable.extend_from_slice(node.children());
+        }
+        for expected in ["已连接", "远程音频不可用", "剪贴板不可用", "断开连接"]
+        {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "visible pinned island glyph must be reachable from the AccessKit root: {expected}"
+            );
+        }
 
         let request = egui::accesskit::ActionRequest {
             action: egui::accesskit::Action::CustomAction,
