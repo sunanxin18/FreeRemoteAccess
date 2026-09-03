@@ -1,19 +1,104 @@
 mod connection;
+mod control_island;
 mod login_icons;
 mod session;
-mod session_chrome;
+
+#[cfg(test)]
+mod control_island_contract_tests {
+    use egui::{pos2, vec2, Context, Rect};
+    use frd_ui_model::{
+        CapabilityGlyphState, ConnectionGlyph, IslandAction, IslandWindowCapabilities,
+        SessionChromeModel,
+    };
+
+    use crate::{show_control_island, window_action_semantics, ControlIslandRenderInput};
+
+    fn model() -> SessionChromeModel {
+        SessionChromeModel {
+            connection: ConnectionGlyph::Connected,
+            diagnostics: None,
+            presentation_timing: None,
+            audio: CapabilityGlyphState::Unavailable,
+            clipboard: CapabilityGlyphState::Unavailable,
+            action: Some(IslandAction::Disconnect),
+        }
+    }
+
+    #[test]
+    fn windows_actions_have_material_glyphs_and_44_point_targets() {
+        let semantics = window_action_semantics(IslandWindowCapabilities::WINDOWS, false);
+
+        assert_eq!(
+            semantics.iter().map(|item| item.action).collect::<Vec<_>>(),
+            vec![
+                IslandAction::MinimizeWindow,
+                IslandAction::ToggleMaximizeWindow,
+                IslandAction::CloseWindow,
+            ]
+        );
+        assert!(semantics.iter().all(|item| item.target_size == 44.0));
+        assert!(semantics.iter().all(|item| !item.tooltip.is_empty()));
+        assert_eq!(
+            semantics
+                .iter()
+                .map(|item| (item.symbol_name, item.codepoint))
+                .collect::<Vec<_>>(),
+            vec![
+                ("remove", '\u{e15b}'),
+                ("fullscreen", '\u{e5d0}'),
+                ("close", '\u{e5cd}'),
+            ]
+        );
+
+        let maximized = window_action_semantics(IslandWindowCapabilities::WINDOWS, true);
+        assert_eq!(maximized[1].symbol_name, "fullscreen_exit");
+        assert_eq!(maximized[1].codepoint, '\u{e5d1}');
+        assert_eq!(maximized[1].accessible_name, "还原窗口");
+    }
+
+    #[test]
+    fn hidden_renderer_has_only_a_visual_reveal_line() {
+        let context = Context::default();
+        let model = model();
+        let island_rect = Rect::from_min_size(pos2(350.0, 0.0), vec2(500.0, 52.0));
+        let reveal_line_rect = Rect::from_min_size(pos2(500.0, 0.0), vec2(200.0, 2.0));
+        let mut result = None;
+        let mut output = context.run_ui(Default::default(), |context| {
+            result = Some(show_control_island(
+                context,
+                ControlIslandRenderInput {
+                    model: &model,
+                    window_capabilities: IslandWindowCapabilities::WINDOWS,
+                    visible: false,
+                    maximized: false,
+                    island_rect,
+                    reveal_line_rect,
+                    focus_first: false,
+                    opaque_material: false,
+                },
+            ));
+        });
+        output.textures_delta.clear();
+        let result = result.expect("renderer returns a result in hidden state");
+
+        assert!(result.action.is_none());
+        assert!(result.hit_rects.is_empty());
+        assert_eq!(result.reveal_line_alpha, 0.5);
+    }
+}
 
 pub use connection::{show_connection_form, show_connection_form_with_state, show_page};
+pub use control_island::{
+    control_island_metrics, install_control_island_font, session_chrome_metrics,
+    show_control_island, window_action_semantics, ControlIslandRenderInput,
+    ControlIslandRenderResult, IslandActionSemantic, SessionChromeMetrics,
+    MATERIAL_SYMBOLS_FONT_FAMILY,
+};
 pub use login_icons::{
     install_login_icons_font, LoginIcon, LoginIconSemantic, LOGIN_ICON_BUTTON_SIZE,
     LOGIN_MATERIAL_SYMBOLS_FONT_FAMILY,
 };
 pub use session::show_session_page;
-pub use session_chrome::{
-    install_session_chrome_font, session_chrome_metrics, show_session_chrome,
-    show_session_chrome_with_focus, SessionChromeMetrics, SessionChromeRenderResult,
-    MATERIAL_SYMBOLS_FONT_FAMILY,
-};
 
 #[cfg(test)]
 #[test]

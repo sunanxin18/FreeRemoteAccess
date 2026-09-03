@@ -37,8 +37,8 @@ use frd_session::{
     SessionStartFailure, SessionStartOutcome, SessionStartPermit,
 };
 use frd_ui_model::{
-    CapabilityGlyphState, ConnectionGlyph, LaunchOptions, Page, SessionChromeAction,
-    SessionChromeModel,
+    CapabilityGlyphState, ConnectionGlyph, IslandAction, IslandWindowCapabilities, LaunchOptions,
+    Page, SessionChromeModel,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -88,7 +88,7 @@ const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     presentation_timing: None,
     audio: CapabilityGlyphState::Unavailable,
     clipboard: CapabilityGlyphState::Unavailable,
-    action: Some(SessionChromeAction::Disconnect),
+    action: Some(IslandAction::Disconnect),
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2959,28 +2959,51 @@ impl DesktopApplication {
                         } => None,
                     };
                     if let Some(chrome) = chrome {
-                        let metrics = frd_ui_egui::session_chrome_metrics();
-                        ui.horizontal(|ui| {
-                            ui.add_space(
-                                ((ui.available_width() - metrics.total_width) / 2.0).max(0.0),
-                            );
-                            if let Some(action) = frd_ui_egui::show_session_chrome_with_focus(
-                                ui,
-                                chrome,
-                                focus_session_chrome,
-                            )
-                            .action
-                            {
-                                intent = Some(match action {
-                                    frd_ui_model::SessionChromeAction::Cancel => {
-                                        AppIntent::CancelConnect
-                                    }
-                                    frd_ui_model::SessionChromeAction::Disconnect => {
-                                        AppIntent::Disconnect
-                                    }
-                                });
+                        let window_capabilities = if cfg!(target_os = "windows") {
+                            IslandWindowCapabilities::WINDOWS
+                        } else {
+                            IslandWindowCapabilities::NONE
+                        };
+                        let metrics = frd_ui_egui::control_island_metrics(window_capabilities);
+                        let island_rect = egui::Rect::from_center_size(
+                            egui::pos2(ui.max_rect().center().x, ui.max_rect().center().y),
+                            egui::vec2(metrics.total_width + 8.0, metrics.height + 8.0),
+                        );
+                        let reveal_line_rect = egui::Rect::from_center_size(
+                            egui::pos2(ui.max_rect().center().x, ui.max_rect().top() + 1.0),
+                            egui::vec2(160.0, 2.0),
+                        );
+                        let result = frd_ui_egui::show_control_island(
+                            ui.ctx(),
+                            frd_ui_egui::ControlIslandRenderInput {
+                                model: chrome,
+                                window_capabilities,
+                                visible: true,
+                                maximized: window_maximized,
+                                island_rect,
+                                reveal_line_rect,
+                                focus_first: focus_session_chrome,
+                                opaque_material: false,
+                            },
+                        );
+                        match result.action {
+                            Some(IslandAction::CancelConnect) => {
+                                intent = Some(AppIntent::CancelConnect);
                             }
-                        });
+                            Some(IslandAction::Disconnect) => {
+                                intent = Some(AppIntent::Disconnect);
+                            }
+                            Some(
+                                IslandAction::ShowConnectionDetails
+                                | IslandAction::ToggleRemoteAudio
+                                | IslandAction::OpenClipboard
+                                | IslandAction::MinimizeWindow
+                                | IslandAction::ToggleMaximizeWindow
+                                | IslandAction::CloseWindow
+                                | IslandAction::ShowSystemMenu,
+                            )
+                            | None => {}
+                        }
                     }
                     paint_platform_window_controls(
                         ui,

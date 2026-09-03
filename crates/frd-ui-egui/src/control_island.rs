@@ -1,10 +1,10 @@
 use egui::{
-    Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Response, Sense, Ui, Vec2,
-    WidgetInfo, WidgetType,
+    Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Id, LayerId, Order, Response,
+    Sense, Ui, Vec2, WidgetInfo, WidgetType,
 };
 use frd_ui_model::{
-    CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel, SessionTiming,
-    SessionTimingSource,
+    CapabilityGlyphState, ConnectionGlyph, IslandAction, IslandWindowCapabilities,
+    SessionChromeModel, SessionTiming, SessionTimingSource,
 };
 
 const SLOT_SIZE: f32 = 44.0;
@@ -22,7 +22,7 @@ const MATERIAL_SYMBOLS_FONT_BYTES: &[u8] = include_bytes!(concat!(
     "/../../assets/ui-icons/material-symbols-rounded-24-400.ttf"
 ));
 
-pub fn install_session_chrome_font(definitions: &mut FontDefinitions) {
+pub fn install_control_island_font(definitions: &mut FontDefinitions) {
     definitions.font_data.insert(
         MATERIAL_SYMBOLS_FONT_FAMILY.to_owned(),
         FontData::from_static(MATERIAL_SYMBOLS_FONT_BYTES).into(),
@@ -171,21 +171,38 @@ fn clipboard_glyph(state: CapabilityGlyphState) -> GlyphSemantic {
     }
 }
 
-fn action_glyph(action: Option<SessionChromeAction>) -> GlyphSemantic {
+fn drag_glyph() -> GlyphSemantic {
+    GlyphSemantic {
+        symbol_name: "drag_indicator",
+        codepoint: '\u{e945}',
+        accessible_name: "移动控制岛",
+        tooltip: "拖动以移动控制岛",
+        available: true,
+    }
+}
+
+fn action_glyph(action: Option<IslandAction>) -> GlyphSemantic {
     match action {
-        Some(SessionChromeAction::Cancel) => GlyphSemantic {
+        Some(IslandAction::CancelConnect) => GlyphSemantic {
             symbol_name: "close",
             codepoint: '\u{e5cd}',
             accessible_name: "取消连接",
             tooltip: "取消连接",
             available: true,
         },
-        Some(SessionChromeAction::Disconnect) => GlyphSemantic {
+        Some(IslandAction::Disconnect) => GlyphSemantic {
             symbol_name: "link_off",
             codepoint: '\u{e16f}',
             accessible_name: "断开连接",
             tooltip: "断开连接",
             available: true,
+        },
+        Some(_) => GlyphSemantic {
+            symbol_name: "more_horiz",
+            codepoint: '\u{e5d3}',
+            accessible_name: "操作不可用",
+            tooltip: "操作不可用",
+            available: false,
         },
         None => GlyphSemantic {
             symbol_name: "more_horiz",
@@ -197,37 +214,204 @@ fn action_glyph(action: Option<SessionChromeAction>) -> GlyphSemantic {
     }
 }
 
-pub fn show_session_chrome(ui: &mut Ui, model: &SessionChromeModel) -> Option<SessionChromeAction> {
-    show_session_chrome_with_focus(ui, model, false).action
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IslandActionSemantic {
+    pub action: IslandAction,
+    pub symbol_name: &'static str,
+    pub codepoint: char,
+    pub accessible_name: &'static str,
+    pub tooltip: &'static str,
+    pub target_size: f32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SessionChromeRenderResult {
-    pub action: Option<SessionChromeAction>,
-    pub connection_id: egui::Id,
-    pub frame_response_id: egui::Id,
+impl IslandActionSemantic {
+    fn glyph(self) -> GlyphSemantic {
+        GlyphSemantic {
+            symbol_name: self.symbol_name,
+            codepoint: self.codepoint,
+            accessible_name: self.accessible_name,
+            tooltip: self.tooltip,
+            available: true,
+        }
+    }
 }
 
-pub fn show_session_chrome_with_focus(
+pub fn window_action_semantics(
+    capabilities: IslandWindowCapabilities,
+    maximized: bool,
+) -> Vec<IslandActionSemantic> {
+    let mut semantics = Vec::with_capacity(3);
+    if capabilities.minimize {
+        semantics.push(IslandActionSemantic {
+            action: IslandAction::MinimizeWindow,
+            symbol_name: "remove",
+            codepoint: '\u{e15b}',
+            accessible_name: "最小化窗口",
+            tooltip: "最小化窗口",
+            target_size: SLOT_SIZE,
+        });
+    }
+    if capabilities.maximize {
+        semantics.push(IslandActionSemantic {
+            action: IslandAction::ToggleMaximizeWindow,
+            symbol_name: if maximized {
+                "fullscreen_exit"
+            } else {
+                "fullscreen"
+            },
+            codepoint: if maximized { '\u{e5d1}' } else { '\u{e5d0}' },
+            accessible_name: if maximized {
+                "还原窗口"
+            } else {
+                "最大化窗口"
+            },
+            tooltip: if maximized {
+                "还原窗口"
+            } else {
+                "最大化窗口"
+            },
+            target_size: SLOT_SIZE,
+        });
+    }
+    if capabilities.close {
+        semantics.push(IslandActionSemantic {
+            action: IslandAction::CloseWindow,
+            symbol_name: "close",
+            codepoint: '\u{e5cd}',
+            accessible_name: "关闭窗口",
+            tooltip: "关闭窗口",
+            target_size: SLOT_SIZE,
+        });
+    }
+    semantics
+}
+
+pub fn control_island_metrics(
+    window_capabilities: IslandWindowCapabilities,
+) -> SessionChromeMetrics {
+    let session = session_chrome_metrics();
+    let additional_slots = 1 + window_action_semantics(window_capabilities, false).len();
+    SessionChromeMetrics {
+        total_width: session.total_width + (SLOT_SIZE + SLOT_SPACING) * additional_slots as f32,
+        ..session
+    }
+}
+
+pub struct ControlIslandRenderInput<'a> {
+    pub model: &'a SessionChromeModel,
+    pub window_capabilities: IslandWindowCapabilities,
+    pub visible: bool,
+    pub maximized: bool,
+    pub island_rect: egui::Rect,
+    pub reveal_line_rect: egui::Rect,
+    pub focus_first: bool,
+    pub opaque_material: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlIslandRenderResult {
+    pub action: Option<IslandAction>,
+    pub hovered_union: bool,
+    pub focused_union: bool,
+    pub pressed: bool,
+    pub reposition_delta: egui::Vec2,
+    pub window_move_requested: bool,
+    pub hit_rects: Vec<(egui::Rect, IslandAction)>,
+    pub reveal_line_alpha: f32,
+}
+
+impl Default for ControlIslandRenderResult {
+    fn default() -> Self {
+        Self {
+            action: None,
+            hovered_union: false,
+            focused_union: false,
+            pressed: false,
+            reposition_delta: egui::Vec2::ZERO,
+            window_move_requested: false,
+            hit_rects: Vec::new(),
+            reveal_line_alpha: 0.0,
+        }
+    }
+}
+
+pub fn show_control_island(
+    ctx: &egui::Context,
+    input: ControlIslandRenderInput<'_>,
+) -> ControlIslandRenderResult {
+    if !input.visible {
+        let alpha = 0.5;
+        ctx.layer_painter(LayerId::new(
+            Order::Foreground,
+            Id::new("freeremotedesk-control-island-reveal-line"),
+        ))
+        .rect_filled(
+            input.reveal_line_rect,
+            input.reveal_line_rect.height() / 2.0,
+            Color32::from_rgba_unmultiplied(43, 181, 99, (alpha * 255.0) as u8),
+        );
+        return ControlIslandRenderResult {
+            reveal_line_alpha: alpha,
+            ..ControlIslandRenderResult::default()
+        };
+    }
+
+    let mut result = ControlIslandRenderResult::default();
+    let response = egui::Area::new(Id::new("freeremotedesk-control-island"))
+        .order(Order::Foreground)
+        .fixed_pos(input.island_rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(input.island_rect.size());
+            ui.set_max_size(input.island_rect.size());
+            let frame_fill = if input.opaque_material {
+                ui.visuals().panel_fill
+            } else if ui.visuals().dark_mode {
+                Color32::from_rgba_unmultiplied(28, 28, 30, 58)
+            } else {
+                Color32::from_rgba_unmultiplied(245, 245, 247, 58)
+            };
+            let border = if ui.visuals().dark_mode {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 72)
+            } else {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 64)
+            };
+            egui::Frame::new()
+                .fill(frame_fill)
+                .stroke(egui::Stroke::new(1.0, border))
+                .corner_radius(16)
+                .inner_margin(egui::Margin::symmetric(4, 4))
+                .show(ui, |ui| render_visible_island(ui, &input, &mut result));
+        })
+        .response;
+    result.hovered_union |= response.hovered();
+    result.pressed |= response.is_pointer_button_down_on();
+    result
+}
+
+fn render_visible_island(
     ui: &mut Ui,
-    model: &SessionChromeModel,
-    focus_first: bool,
-) -> SessionChromeRenderResult {
-    let mut selected = None;
-    let mut connection_id = None;
-    let mut frame_response_id = None;
+    input: &ControlIslandRenderInput<'_>,
+    result: &mut ControlIslandRenderResult,
+) {
+    let full_width = control_island_metrics(input.window_capabilities).total_width;
+    let collapse_capabilities = input.island_rect.width() < full_width;
     let prior_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.x = SLOT_SPACING;
     ui.horizontal(|ui| {
-        let mut connection = connection_glyph(model.connection);
+        let drag = show_glyph_with_sense(ui, drag_glyph(), None, None, Sense::drag());
+        observe_response(result, &drag);
+        result.reposition_delta = drag.drag_delta();
+
+        let mut connection = connection_glyph(input.model.connection);
         let diagnostic_tooltip;
-        if let Some(diagnostics) = model.diagnostics.as_deref() {
+        if let Some(diagnostics) = input.model.diagnostics.as_deref() {
             diagnostic_tooltip = format!("{}\n诊断：{diagnostics}", connection.tooltip);
             connection.tooltip = "";
         } else {
             diagnostic_tooltip = connection.tooltip.to_owned();
         }
-        let connection_accessible = accessible_label(connection, model.diagnostics.as_deref());
+        let connection_accessible =
+            accessible_label(connection, input.model.diagnostics.as_deref());
         let connection_response = show_glyph(
             ui,
             connection,
@@ -235,26 +419,69 @@ pub fn show_session_chrome_with_focus(
             Some(&connection_accessible),
             false,
         );
-        if focus_first {
+        if input.focus_first {
             connection_response.request_focus();
         }
-        connection_id = Some(connection_response.id);
-        frame_response_id = Some(show_presentation_timing(ui, model.presentation_timing).id);
-        show_glyph(ui, audio_glyph(model.audio), None, None, false);
-        show_glyph(ui, clipboard_glyph(model.clipboard), None, None, false);
+        observe_response(result, &connection_response);
 
-        let action = action_glyph(model.action);
-        if show_glyph(ui, action, None, None, action.available).clicked() {
-            selected = model.action;
+        let timing = show_presentation_timing(ui, input.model.presentation_timing);
+        observe_response(result, &timing);
+        if collapse_capabilities {
+            let capabilities = GlyphSemantic {
+                symbol_name: "more_horiz",
+                codepoint: '\u{e5d3}',
+                accessible_name: "远程音频与剪贴板状态",
+                tooltip: "远程音频与剪贴板状态",
+                available: false,
+            };
+            let tooltip = format!(
+                "{}；{}",
+                audio_glyph(input.model.audio).tooltip,
+                clipboard_glyph(input.model.clipboard).tooltip
+            );
+            let collapsed = show_glyph(ui, capabilities, Some(&tooltip), Some(&tooltip), false);
+            observe_response(result, &collapsed);
+        } else {
+            let audio = show_glyph(ui, audio_glyph(input.model.audio), None, None, false);
+            observe_response(result, &audio);
+            let clipboard = show_glyph(
+                ui,
+                clipboard_glyph(input.model.clipboard),
+                None,
+                None,
+                false,
+            );
+            observe_response(result, &clipboard);
+        }
+
+        let action = action_glyph(input.model.action);
+        let action_response = show_glyph(ui, action, None, None, action.available);
+        observe_response(result, &action_response);
+        if action.available {
+            if let Some(action) = input.model.action {
+                result.hit_rects.push((action_response.rect, action));
+                if action_response.clicked() {
+                    result.action = Some(action);
+                }
+            }
+        }
+
+        for semantic in window_action_semantics(input.window_capabilities, input.maximized) {
+            let response = show_glyph(ui, semantic.glyph(), None, None, true);
+            observe_response(result, &response);
+            result.hit_rects.push((response.rect, semantic.action));
+            if response.clicked() {
+                result.action = Some(semantic.action);
+            }
         }
     });
     ui.spacing_mut().item_spacing = prior_spacing;
-    SessionChromeRenderResult {
-        action: selected,
-        connection_id: connection_id.expect("session chrome always renders its connection glyph"),
-        frame_response_id: frame_response_id
-            .expect("session chrome always renders its frame response timing"),
-    }
+}
+
+fn observe_response(result: &mut ControlIslandRenderResult, response: &Response) {
+    result.hovered_union |= response.hovered();
+    result.focused_union |= response.has_focus();
+    result.pressed |= response.is_pointer_button_down_on();
 }
 
 fn show_presentation_timing(ui: &mut Ui, timing: Option<SessionTiming>) -> Response {
@@ -267,7 +494,7 @@ fn show_presentation_timing(ui: &mut Ui, timing: Option<SessionTiming>) -> Respo
         WidgetInfo::labeled(WidgetType::Label, true, semantic.accessible_name.clone())
     });
     let fill = match glyph_fill_state(response.hovered(), response.has_focus(), false) {
-        GlyphFillState::None => ui.visuals().widgets.inactive.bg_fill,
+        GlyphFillState::None => contrast_plate_fill(ui),
         GlyphFillState::Hover => ui.visuals().widgets.hovered.bg_fill,
         GlyphFillState::Pressed => unreachable!("frame response timing is not actionable"),
     };
@@ -311,7 +538,18 @@ fn show_glyph(
     } else {
         Sense::focusable_noninteractive()
     };
+    show_glyph_with_sense(ui, semantic, tooltip_override, accessible_override, sense)
+}
+
+fn show_glyph_with_sense(
+    ui: &mut Ui,
+    semantic: GlyphSemantic,
+    tooltip_override: Option<&str>,
+    accessible_override: Option<&str>,
+    sense: Sense,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(SLOT_SIZE), sense);
+    let actionable = sense.interactive();
     response.widget_info(|| {
         WidgetInfo::labeled(
             if actionable {
@@ -329,7 +567,7 @@ fn show_glyph(
         response.has_focus(),
         actionable && response.is_pointer_button_down_on(),
     ) {
-        GlyphFillState::None => Color32::TRANSPARENT,
+        GlyphFillState::None => contrast_plate_fill(ui),
         GlyphFillState::Hover => ui.visuals().widgets.hovered.bg_fill,
         GlyphFillState::Pressed => ui.visuals().widgets.active.bg_fill,
     };
@@ -361,6 +599,14 @@ fn show_glyph(
     )
 }
 
+fn contrast_plate_fill(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgba_unmultiplied(24, 24, 27, 220)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 230)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GlyphFillState {
     None,
@@ -384,13 +630,13 @@ mod tests {
 
     use egui::{FontDefinitions, FontFamily};
     use frd_ui_model::{
-        CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel,
-        SessionTiming, SessionTimingSource,
+        CapabilityGlyphState, ConnectionGlyph, IslandAction, SessionChromeModel, SessionTiming,
+        SessionTimingSource,
     };
 
     use super::{
-        accessible_label, action_glyph, audio_glyph, clipboard_glyph, connection_glyph,
-        glyph_fill_state, install_session_chrome_font, material_symbol_font_id,
+        accessible_label, action_glyph, audio_glyph, clipboard_glyph, connection_glyph, drag_glyph,
+        glyph_fill_state, install_control_island_font, material_symbol_font_id,
         presentation_timing_semantic, session_chrome_metrics, GlyphFillState,
         MATERIAL_SYMBOLS_FONT_FAMILY,
     };
@@ -454,44 +700,46 @@ mod tests {
 
     #[test]
     fn programmatic_local_chrome_entry_focuses_the_first_accessible_glyph() {
-        use std::cell::Cell;
-
         let context = egui::Context::default();
         context.enable_accesskit();
         let mut fonts = FontDefinitions::default();
-        install_session_chrome_font(&mut fonts);
+        install_control_island_font(&mut fonts);
         context.set_fonts(fonts);
-        let connection_id = Cell::new(None);
+        let model = SessionChromeModel {
+            connection: ConnectionGlyph::Connected,
+            diagnostics: None,
+            presentation_timing: None,
+            audio: CapabilityGlyphState::Unavailable,
+            clipboard: CapabilityGlyphState::Unavailable,
+            action: Some(IslandAction::Disconnect),
+        };
         let mut output = context.run_ui(Default::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
-                let result = super::show_session_chrome_with_focus(
-                    ui,
-                    &SessionChromeModel {
-                        connection: ConnectionGlyph::Connected,
-                        diagnostics: None,
-                        presentation_timing: None,
-                        audio: CapabilityGlyphState::Unavailable,
-                        clipboard: CapabilityGlyphState::Unavailable,
-                        action: Some(SessionChromeAction::Disconnect),
-                    },
-                    true,
-                );
-                connection_id.set(Some(result.connection_id));
-            });
+            super::show_control_island(
+                context,
+                super::ControlIslandRenderInput {
+                    model: &model,
+                    window_capabilities: frd_ui_model::IslandWindowCapabilities::NONE,
+                    visible: true,
+                    maximized: false,
+                    island_rect: egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(304.0, 52.0),
+                    ),
+                    reveal_line_rect: egui::Rect::NOTHING,
+                    focus_first: true,
+                    opaque_material: false,
+                },
+            );
         });
 
-        assert_eq!(
-            context.memory(|memory| memory.focused()),
-            connection_id.get()
-        );
+        let connection_id = context
+            .memory(|memory| memory.focused())
+            .expect("connection glyph receives programmatic focus");
         assert_eq!(
             connection_glyph(ConnectionGlyph::Connected).accessible_name,
             "已连接"
         );
-        let connection_node_id = connection_id
-            .get()
-            .expect("connection glyph id was captured")
-            .accesskit_id();
+        let connection_node_id = connection_id.accesskit_id();
         let connection_node = output
             .platform_output
             .accesskit_update
@@ -512,7 +760,7 @@ mod tests {
     fn material_symbols_font_is_registered_as_an_isolated_named_family() {
         let mut definitions = FontDefinitions::default();
 
-        install_session_chrome_font(&mut definitions);
+        install_control_island_font(&mut definitions);
 
         assert!(definitions
             .font_data
@@ -640,14 +888,20 @@ mod tests {
                 '\u{e4f8}',
             ),
             (
-                action_glyph(Some(SessionChromeAction::Cancel)).symbol_name,
-                action_glyph(Some(SessionChromeAction::Cancel)).codepoint,
+                drag_glyph().symbol_name,
+                drag_glyph().codepoint,
+                "drag_indicator",
+                '\u{e945}',
+            ),
+            (
+                action_glyph(Some(IslandAction::CancelConnect)).symbol_name,
+                action_glyph(Some(IslandAction::CancelConnect)).codepoint,
                 "close",
                 '\u{e5cd}',
             ),
             (
-                action_glyph(Some(SessionChromeAction::Disconnect)).symbol_name,
-                action_glyph(Some(SessionChromeAction::Disconnect)).codepoint,
+                action_glyph(Some(IslandAction::Disconnect)).symbol_name,
+                action_glyph(Some(IslandAction::Disconnect)).codepoint,
                 "link_off",
                 '\u{e16f}',
             ),
@@ -672,7 +926,7 @@ mod tests {
             presentation_timing: None,
             audio: CapabilityGlyphState::Available,
             clipboard: CapabilityGlyphState::Available,
-            action: Some(SessionChromeAction::Disconnect),
+            action: Some(IslandAction::Disconnect),
         };
         let waiting = SessionChromeModel {
             connection: ConnectionGlyph::WaitingForFrame,
@@ -680,7 +934,7 @@ mod tests {
             presentation_timing: None,
             audio: CapabilityGlyphState::Unavailable,
             clipboard: CapabilityGlyphState::Unavailable,
-            action: Some(SessionChromeAction::Cancel),
+            action: Some(IslandAction::CancelConnect),
         };
         assert_eq!(session_chrome_metrics(), session_chrome_metrics());
         assert_ne!(connected.action, waiting.action);

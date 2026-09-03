@@ -10,13 +10,16 @@ $outputPath = Join-Path $assetDirectory 'material-symbols-rounded-24-400.ttf'
 $temporaryRoot = Join-Path $repositoryRoot '.codex-target\material-symbols-rounded'
 $fontToolsTarget = Join-Path $temporaryRoot 'fonttools-4.63.0'
 $upstreamPath = Join-Path $temporaryRoot 'material-symbols-rounded-upstream.ttf'
+$codepointsPath = Join-Path $temporaryRoot 'material-symbols-rounded-upstream.codepoints'
 $pythonScriptPath = Join-Path $temporaryRoot 'subset-material-symbols-rounded.py'
 $glyphJsonPath = Join-Path $temporaryRoot 'material-symbols-rounded-glyphs.json'
 
 $upstreamCommit = '84ccef280841abfac506afc4ad4a2782f6d0a1d0'
 $upstreamSha256 = 'C4416E02739ED6865E3218C19DCD62C5A88FB97B8BCC445F24AE8017D11CC2D0'
+$codepointsSha256 = '2CEABD8B6EBA5EF81FF6F2FA8A801397F550841BF9CC42B03B5CC2E2D7AEC9F1'
 $fontToolsVersion = '4.63.0'
 $upstreamUrl = "https://raw.githubusercontent.com/google/material-design-icons/$upstreamCommit/variablefont/MaterialSymbolsRounded%5BFILL,GRAD,opsz,wght%5D.ttf"
+$codepointsUrl = "https://raw.githubusercontent.com/google/material-design-icons/$upstreamCommit/variablefont/MaterialSymbolsRounded%5BFILL%2CGRAD%2Copsz%2Cwght%5D.codepoints"
 
 $glyphs = [ordered]@{
     'check_circle' = 0xF0BE
@@ -26,8 +29,11 @@ $glyphs = [ordered]@{
     'delete' = 0xE92E
     'desktop_windows' = 0xE30C
     'dns' = 0xE875
+    'drag_indicator' = 0xE945
     'error' = 0xF8B6
     'expand_more' = 0xE5CF
+    'fullscreen' = 0xE5D0
+    'fullscreen_exit' = 0xE5D1
     'hourglass_top' = 0xEA5B
     'link_off' = 0xE16F
     'lock' = 0xE899
@@ -36,6 +42,7 @@ $glyphs = [ordered]@{
     'pending' = 0xEF64
     'person' = 0xF0D3
     'progress_activity' = 0xE9D0
+    'remove' = 0xE15B
     'shield_lock' = 0xF686
     'visibility' = 0xE8F4
     'visibility_off' = 0xE8F5
@@ -82,6 +89,31 @@ if (-not (Test-Path -LiteralPath $upstreamPath)) {
 $actualUpstreamSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $upstreamPath).Hash
 if ($actualUpstreamSha256 -ne $upstreamSha256) {
     throw "Pinned upstream SHA-256 mismatch: expected $upstreamSha256, got $actualUpstreamSha256."
+}
+
+if (-not (Test-Path -LiteralPath $codepointsPath)) {
+    Write-Host "Downloading pinned Material Symbols Rounded codepoint source"
+    Invoke-WebRequest -UseBasicParsing -Uri $codepointsUrl -OutFile $codepointsPath
+}
+
+$actualCodepointsSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $codepointsPath).Hash
+if ($actualCodepointsSha256 -ne $codepointsSha256) {
+    throw "Pinned codepoint source SHA-256 mismatch: expected $codepointsSha256, got $actualCodepointsSha256."
+}
+
+$officialCodepoints = @{}
+foreach ($line in Get-Content -LiteralPath $codepointsPath) {
+    if ($line -match '^(?<name>\S+) (?<codepoint>[0-9a-fA-F]+)$') {
+        $officialCodepoints[$Matches.name] = [Convert]::ToInt32($Matches.codepoint, 16)
+    }
+}
+foreach ($glyph in $glyphs.GetEnumerator()) {
+    if (-not $officialCodepoints.ContainsKey($glyph.Key)) {
+        throw "Pinned official codepoint source does not contain glyph '$($glyph.Key)'."
+    }
+    if ($officialCodepoints[$glyph.Key] -ne $glyph.Value) {
+        throw "Configured codepoint for '$($glyph.Key)' does not match pinned official source."
+    }
 }
 
 $glyphs | ConvertTo-Json -Compress | Set-Content -LiteralPath $glyphJsonPath -Encoding utf8
