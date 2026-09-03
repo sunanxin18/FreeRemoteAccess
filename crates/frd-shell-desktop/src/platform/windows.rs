@@ -9,9 +9,9 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, IsZoomed, SetWindowPos, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-    HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-    NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CXSIZE, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
-    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_NCCALCSIZE, WM_NCHITTEST,
+    HTCLIENT, HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS,
+    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, WM_CLOSE, WM_NCCALCSIZE, WM_NCHITTEST,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -118,16 +118,8 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         self.refresh_native_metrics(Self::hwnd(window)?)
     }
 
-    fn native_insets(&self, window: &winit::window::Window) -> NativeChromeInsets {
-        let Ok(hwnd) = Self::hwnd(window) else {
-            return NativeChromeInsets::default();
-        };
-        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-        let button_width = unsafe { GetSystemMetricsForDpi(SM_CXSIZE, dpi) }.max(0) as u32;
-        NativeChromeInsets {
-            leading_px: 0,
-            trailing_px: button_width.saturating_mul(3),
-        }
+    fn native_insets(&self, _window: &winit::window::Window) -> NativeChromeInsets {
+        windows_island_native_insets()
     }
 
     fn capabilities(&self) -> IslandWindowCapabilities {
@@ -201,25 +193,21 @@ unsafe extern "system" fn subclass_proc(
     }
     if message == WM_NCHITTEST {
         let mut dwm_result = 0;
-        if DwmDefWindowProc(hwnd, message, wparam, lparam, &mut dwm_result) != 0
-            && matches!(dwm_result as u32, HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
-        {
-            return dwm_result;
-        }
+        let dwm_resize_hit = (DwmDefWindowProc(hwnd, message, wparam, lparam, &mut dwm_result)
+            != 0)
+            .then(|| accepted_dwm_resize_hit(dwm_result))
+            .flatten();
 
         let mut point = POINT {
             x: low_word_signed(lparam),
             y: high_word_signed(lparam),
         };
         if ScreenToClient(hwnd, &mut point) == 0 {
-            return DefSubclassProc(hwnd, message, wparam, lparam);
-        }
-        let Some(hit_map) = state.hit_map.lock().ok().and_then(|slot| slot.clone()) else {
-            return DefSubclassProc(hwnd, message, wparam, lparam);
+            return dwm_resize_hit.unwrap_or(HTCLIENT as LRESULT);
         };
         let Some((resize_x, resize_y)) = state.resize_metrics.lock().ok().map(|metrics| *metrics)
         else {
-            return DefSubclassProc(hwnd, message, wparam, lparam);
+            return dwm_resize_hit.unwrap_or(HTCLIENT as LRESULT);
         };
         let mut client_rect = RECT {
             left: 0,
@@ -228,7 +216,7 @@ unsafe extern "system" fn subclass_proc(
             bottom: 0,
         };
         if GetClientRect(hwnd, &mut client_rect) == 0 {
-            return DefSubclassProc(hwnd, message, wparam, lparam);
+            return dwm_resize_hit.unwrap_or(HTCLIENT as LRESULT);
         }
         if let Some(resize) = resize_hit_for_window(
             IsZoomed(hwnd) != 0,
@@ -241,12 +229,30 @@ unsafe extern "system" fn subclass_proc(
         ) {
             return resize as LRESULT;
         }
-        if point.x < 0 || point.y < 0 {
-            return DefSubclassProc(hwnd, message, wparam, lparam);
+        if let Some(resize) = dwm_resize_hit {
+            return resize;
         }
+        if point.x < 0 || point.y < 0 {
+            return HTCLIENT as LRESULT;
+        }
+        let Some(hit_map) = state.hit_map.lock().ok().and_then(|slot| slot.clone()) else {
+            return HTCLIENT as LRESULT;
+        };
         return windows_native_hit(&hit_map, (point.x as u32, point.y as u32)) as LRESULT;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+fn accepted_dwm_resize_hit(result: LRESULT) -> Option<LRESULT> {
+    matches!(
+        result as u32,
+        HTLEFT | HTRIGHT | HTTOP | HTTOPLEFT | HTTOPRIGHT | HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT
+    )
+    .then_some(result)
+}
+
+fn windows_island_native_insets() -> NativeChromeInsets {
+    NativeChromeInsets::default()
 }
 
 fn windows_native_hit(hit_map: &ChromeHitMap, point: (u32, u32)) -> u32 {
@@ -313,10 +319,13 @@ mod tests {
     use frd_core::PixelRect;
     use frd_ui_model::IslandAction;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HTBOTTOMRIGHT, HTCLIENT, HTMAXBUTTON, HTTOPLEFT,
+        HTBOTTOMRIGHT, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOPLEFT,
     };
 
-    use super::{resize_hit, resize_hit_for_window, windows_native_hit};
+    use super::{
+        accepted_dwm_resize_hit, resize_hit, resize_hit_for_window, windows_island_native_insets,
+        windows_native_hit,
+    };
     use crate::{ChromeHitMap, ChromeHitTarget, ChromeRect};
 
     #[test]
@@ -350,6 +359,25 @@ mod tests {
         assert_eq!(
             windows_native_hit(&map, maximize_rect.center()),
             HTMAXBUTTON
+        );
+    }
+
+    #[test]
+    fn legacy_dwm_caption_hits_are_rejected_without_discarding_resize_hits() {
+        for legacy_caption in [HTMINBUTTON, HTMAXBUTTON, HTCLOSE] {
+            assert_eq!(accepted_dwm_resize_hit(legacy_caption as isize), None);
+        }
+        assert_eq!(
+            accepted_dwm_resize_hit(HTTOPLEFT as isize),
+            Some(HTTOPLEFT as isize)
+        );
+    }
+
+    #[test]
+    fn windows_island_native_insets_do_not_reserve_legacy_caption_buttons() {
+        assert_eq!(
+            windows_island_native_insets(),
+            crate::NativeChromeInsets::default()
         );
     }
 

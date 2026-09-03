@@ -1913,6 +1913,8 @@ struct DesktopWindowState {
 impl DesktopWindowState {
     fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayouts> {
         let insets = self.chrome.native_insets(&self.window);
+        let remote_area =
+            persistent_session_panel_content_rect(self.physical_size, self.window.scale_factor())?;
         let layouts = ChromeGeometrySnapshot::new(
             self.physical_size.width,
             self.physical_size.height,
@@ -1921,10 +1923,33 @@ impl DesktopWindowState {
         )?
         .with_window_capabilities(self.chrome.capabilities())
         .layouts(ControlIslandPlacement::default(), true)?;
-        self.remote_area = Some(layouts.remote.content_rect);
+        self.remote_area = Some(remote_area);
         self.chrome_layouts = Some(layouts.clone());
         Some(layouts)
     }
+}
+
+fn persistent_session_panel_content_rect(
+    physical_size: PixelSize,
+    scale_factor: f64,
+) -> Option<PixelRect> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    let panel_height = (TITLE_BAR_HEIGHT_POINTS * scale_factor).ceil();
+    if !panel_height.is_finite()
+        || panel_height <= 0.0
+        || panel_height >= f64::from(physical_size.height)
+    {
+        return None;
+    }
+    let panel_height = panel_height as u32;
+    Some(PixelRect {
+        x: 0,
+        y: panel_height,
+        width: physical_size.width,
+        height: physical_size.height - panel_height,
+    })
 }
 
 impl VideoSurfaceDrainTarget for DesktopWindowState {
@@ -5998,28 +6023,15 @@ mod tests {
     }
 
     #[test]
-    fn floating_chrome_keeps_remote_area_at_the_full_window_size() {
-        let layouts = crate::ChromeGeometrySnapshot::new(
-            1100,
-            720,
-            1.5,
-            crate::NativeChromeInsets {
-                leading_px: 0,
-                trailing_px: 144,
-            },
-        )
-        .unwrap()
-        .with_window_capabilities(frd_ui_model::IslandWindowCapabilities::WINDOWS)
-        .layouts(crate::ControlIslandPlacement::default(), true)
-        .unwrap();
+    fn persistent_panel_keeps_remote_surface_below_reserved_row_until_overlay_cutover() {
         assert_eq!(
-            layouts.remote.content_rect,
-            PixelRect {
+            super::persistent_session_panel_content_rect(PixelSize::new(1100, 720).unwrap(), 1.5),
+            Some(PixelRect {
                 x: 0,
-                y: 0,
+                y: 66,
                 width: 1100,
-                height: 720,
-            }
+                height: 654,
+            })
         );
     }
 
