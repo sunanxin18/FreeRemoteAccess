@@ -278,9 +278,7 @@ fn resize_hit_for_window(
 mod tests {
     use windows_sys::Win32::UI::WindowsAndMessaging::{HTBOTTOMRIGHT, HTCLIENT, HTTOPLEFT};
 
-    use crate::{ChromeHitRegions, ChromeLayout, WindowChromeAdapter};
-
-    use super::{resize_hit, resize_hit_for_window, PlatformWindowChrome};
+    use super::{resize_hit, resize_hit_for_window};
 
     #[test]
     fn resize_edges_win_only_at_the_physical_frame_boundary() {
@@ -297,18 +295,5 @@ mod tests {
             resize_hit_for_window(false, 1, 1, 1200, 800, 8, 8),
             Some(HTTOPLEFT)
         );
-    }
-
-    #[test]
-    fn clearing_published_hit_regions_removes_the_previous_layout() {
-        let layout = ChromeLayout::for_window(1000, 700, 1.0, 0, 138).unwrap();
-        let regions = ChromeHitRegions { layout };
-        let mut chrome = PlatformWindowChrome::new();
-
-        chrome.publish_hit_regions(Some(regions));
-        assert_eq!(*chrome.state.regions.lock().unwrap(), Some(regions));
-
-        chrome.publish_hit_regions(None);
-        assert_eq!(*chrome.state.regions.lock().unwrap(), None);
     }
 }

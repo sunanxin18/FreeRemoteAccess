@@ -41,7 +41,7 @@ use frd_ui_model::{
     SessionChromeModel,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
@@ -69,7 +69,7 @@ use crate::video_decode_worker::{
     VideoDecodeSender, VideoDecodeWorker, VideoFrameToken, VideoStreamAdmission, VideoWorkerEvent,
     VideoWorkerEvents,
 };
-use crate::window_chrome::{INITIAL_MINIMUM_WINDOW_WIDTH_POINTS, MINIMUM_WINDOW_HEIGHT_POINTS};
+use crate::window_chrome::MINIMUM_WINDOW_WIDTH_POINTS;
 use crate::{
     ChromeHit, ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter,
     WindowChromeAdapter, TITLE_BAR_HEIGHT_POINTS,
@@ -1813,27 +1813,10 @@ impl DesktopWindowState {
     fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayout> {
         self.chrome_layout = None;
         let insets = self.chrome.native_insets(&self.window);
-        let scale_factor = self.window.scale_factor();
-        let Some(minimum_width) =
-            ChromeLayout::minimum_width_px(scale_factor, insets.leading_px, insets.trailing_px)
-        else {
-            self.remote_area = None;
-            self.chrome.publish_hit_regions(None);
-            return None;
-        };
-        let minimum_height = (MINIMUM_WINDOW_HEIGHT_POINTS * scale_factor).ceil() as u32;
-        self.window
-            .set_min_inner_size(Some(PhysicalSize::new(minimum_width, minimum_height)));
-        if self.physical_size.width < minimum_width {
-            let _ = self.window.request_inner_size(PhysicalSize::new(
-                minimum_width,
-                self.physical_size.height.max(minimum_height),
-            ));
-        }
         let Some(layout) = ChromeLayout::for_window(
             self.physical_size.width,
             self.physical_size.height,
-            scale_factor,
+            self.window.scale_factor(),
             insets.leading_px,
             insets.trailing_px,
         ) else {
@@ -2316,10 +2299,7 @@ impl DesktopApplication {
                         .with_window_icon(self.window_configuration.icon.clone())
                         .with_visible(false)
                         .with_inner_size(LogicalSize::new(1100.0, 720.0))
-                        .with_min_inner_size(LogicalSize::new(
-                            INITIAL_MINIMUM_WINDOW_WIDTH_POINTS,
-                            MINIMUM_WINDOW_HEIGHT_POINTS,
-                        ))
+                        .with_min_inner_size(LogicalSize::new(MINIMUM_WINDOW_WIDTH_POINTS, 360.0))
                         .with_resizable(true),
                 )
                 .map_err(|_| {
