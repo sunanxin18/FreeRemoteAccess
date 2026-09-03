@@ -259,7 +259,7 @@ impl PointerWireState {
                 writer.send_private_message(&protocol::msg_key_event(down, keysym))
             }
             AppleKeyboardWireMode::HighPerformanceEncrypted => {
-                writer.send_encrypted_key_event(down, keysym)
+                writer.send_high_performance_key_event(down, keysym)
             }
         }
     }
@@ -953,19 +953,16 @@ mod tests {
     }
 
     #[test]
-    fn high_performance_release_all_keeps_the_encrypted_key_path() {
+    fn high_performance_release_all_uses_standard_rfb_inside_session_crypto() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut peer, _) = listener.accept().unwrap();
-        let initial_key = [0x21; 16];
         let outer_key = [0x31; 16];
         let outer_iv = [0x42; 16];
         let mut connection = crate::AppleConnection::new(stream);
         connection
-            .set_crypto(crate::session::SessionCrypto::from_key_iv_with_initial_key(
-                outer_key,
-                outer_iv,
-                initial_key,
+            .set_crypto(crate::session::SessionCrypto::from_key_iv(
+                outer_key, outer_iv,
             ))
             .unwrap();
         let writer = connection.writer_handle().unwrap();
@@ -979,8 +976,7 @@ mod tests {
 
         let mut peer_crypto = crate::session::SessionCrypto::from_key_iv(outer_key, outer_iv);
         let key_release = read_encrypted_test_message(&mut peer, &mut peer_crypto);
-        assert_eq!(key_release.len(), 18);
-        assert_eq!(&key_release[..2], &[0x10, 0x00]);
+        assert_eq!(key_release, frd_wire_rfb::encode_key_event(false, 0x61));
         let pointer_release = read_encrypted_test_message(&mut peer, &mut peer_crypto);
         assert_eq!(pointer_release[0], 0x05);
         writer.shutdown().unwrap();

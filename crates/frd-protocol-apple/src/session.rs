@@ -72,9 +72,6 @@ pub(crate) fn take_wire_ciphertext_frame(pending: &mut Vec<u8>) -> Result<Option
 /// 会话加密器：持有一对方向的密钥状态，负责 EncryptOneMessage 帧的编码与解码
 pub struct SessionCrypto {
     key: [u8; 16],
-    /// SRP 派生的初始 AES 钥。Apple High Performance 的 0x10 按键内层继续使用
-    /// 此钥；服务器下发的新钥只用于外层 EncryptOneMessage CBC。
-    initial_key: Option<[u8; 16]>,
     send_iv: [u8; 16],
     recv_iv: [u8; 16],
     send_ctr: u32,
@@ -89,7 +86,6 @@ impl SessionCrypto {
     pub(crate) fn split(self) -> (InboundSessionCrypto, OutboundSessionCrypto) {
         let inbound = SessionCrypto {
             key: self.key,
-            initial_key: None,
             send_iv: self.send_iv,
             recv_iv: self.recv_iv,
             send_ctr: self.send_ctr,
@@ -97,7 +93,6 @@ impl SessionCrypto {
         };
         let outbound = SessionCrypto {
             key: self.key,
-            initial_key: self.initial_key,
             send_iv: self.send_iv,
             recv_iv: self.recv_iv,
             send_ctr: self.send_ctr,
@@ -127,10 +122,7 @@ impl SessionCrypto {
         }
         let counter = u32::from_be_bytes(msg[16..20].try_into().unwrap());
         let (new_key, new_iv) = Self::unwrap_slots(initial_key, &msg[20..52])?;
-        Ok((
-            counter,
-            Self::from_key_iv_with_initial_key(new_key, new_iv, *initial_key),
-        ))
+        Ok((counter, Self::from_key_iv(new_key, new_iv)))
     }
 
     /// 解密 32B 槽区 [ECB(key, new_key)][ECB(key, new_iv)]
@@ -153,22 +145,11 @@ impl SessionCrypto {
     pub fn from_key_iv(key: [u8; 16], iv: [u8; 16]) -> Self {
         Self {
             key,
-            initial_key: None,
             send_iv: iv,
             recv_iv: iv,
             send_ctr: 0,
             recv_ctr: 0,
         }
-    }
-
-    pub(crate) fn from_key_iv_with_initial_key(
-        key: [u8; 16],
-        iv: [u8; 16],
-        initial_key: [u8; 16],
-    ) -> Self {
-        let mut crypto = Self::from_key_iv(key, iv);
-        crypto.initial_key = Some(initial_key);
-        crypto
     }
 
     /// 把一条明文消息打包成加密帧（wire = [BE16 len][CBC 密文]）
@@ -277,44 +258,6 @@ impl OutboundSessionCrypto {
     pub(crate) fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         self.0.seal(plaintext)
     }
-
-    pub(crate) fn seal_high_performance_key_event(
-        &mut self,
-        down: bool,
-        keysym: u32,
-        delta_microseconds: u32,
-    ) -> Result<Vec<u8>> {
-        let initial_key = self
-            .0
-            .initial_key
-            .context("Apple High Performance 按键初始密钥不可用")?;
-        let inner =
-            encrypt_high_performance_key_event(&initial_key, down, keysym, delta_microseconds);
-        self.0.seal(&inner)
-    }
-}
-
-/// ARD 3.10 / ScreenSharing.framework 的 RFBPostX11KeyEvent(source=0) 线缆格式。
-/// 头两个字节保持明文，后续 16 字节用 SRP 初始钥做 AES-128-ECB。
-fn encrypt_high_performance_key_event(
-    initial_key: &[u8; 16],
-    down: bool,
-    keysym: u32,
-    delta_microseconds: u32,
-) -> [u8; 18] {
-    use aes::cipher::{BlockEncryptMut, KeyInit};
-
-    let mut message = [0u8; 18];
-    message[0] = 0x10;
-    message[1] = 0;
-    message[2] = 0xff;
-    message[3] = u8::from(down);
-    message[4..8].copy_from_slice(&keysym.to_be_bytes());
-    message[8..12].copy_from_slice(&delta_microseconds.to_be_bytes());
-    let mut encryptor = <ecb::Encryptor<aes::Aes128>>::new_from_slice(initial_key)
-        .expect("AES-128 初始钥长度固定为 16 字节");
-    encryptor.encrypt_block_mut((&mut message[2..]).into());
-    message
 }
 
 // ---------- Apple 会话层握手与帧读写 ----------
@@ -614,23 +557,6 @@ mod tests {
     }
 
     #[test]
-    fn high_performance_key_event_matches_fixed_ecb_fixture() {
-        const INITIAL_KEY: [u8; 16] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f,
-        ];
-        const EXPECTED: [u8; 18] = [
-            0x10, 0x00, 0xaa, 0xc7, 0xb8, 0xb7, 0x60, 0xb5, 0x90, 0x7c, 0xf1, 0xf1, 0x07, 0xaa,
-            0xef, 0xa9, 0x05, 0x93,
-        ];
-
-        assert_eq!(
-            encrypt_high_performance_key_event(&INITIAL_KEY, true, 0x0000_0061, 0x0102_0304),
-            EXPECTED
-        );
-    }
-
-    #[test]
     fn encryption_session_routes_success_markers_and_disabled_observer_is_neutral() {
         fn run(
             protocol_id: frd_core::ProtocolId,
@@ -797,11 +723,10 @@ mod tests {
         let data = b"hello encrypted session";
         let wire = outbound.seal(data).unwrap();
         assert_eq!(&peer.open(&wire[2..]).unwrap(), data);
-        let key_wire = outbound
-            .seal_high_performance_key_event(true, 0x61, 7)
-            .unwrap();
+        let key_message = crate::protocol::msg_key_event(true, 0x61);
+        let key_wire = outbound.seal(&key_message).unwrap();
         let key_inner = peer.open(&key_wire[2..]).unwrap();
-        assert_eq!(&key_inner[..2], &[0x10, 0x00]);
+        assert_eq!(key_inner, key_message);
     }
 
     #[test]

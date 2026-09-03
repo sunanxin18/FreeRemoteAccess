@@ -321,7 +321,7 @@ enum WriterCommand {
         plaintext: Vec<u8>,
         result: SyncSender<Result<()>>,
     },
-    EncryptedKeyEvent {
+    HighPerformanceKeyEvent {
         down: bool,
         keysym: u32,
         result: SyncSender<Result<()>>,
@@ -424,12 +424,12 @@ impl AppleWriterHandle {
         Ok(result_rx)
     }
 
-    pub(crate) fn send_encrypted_key_event(&self, down: bool, keysym: u32) -> Result<()> {
+    pub(crate) fn send_high_performance_key_event(&self, down: bool, keysym: u32) -> Result<()> {
         (|| {
             let (result_tx, result_rx) = mpsc::sync_channel(1);
             self.control
                 .commands
-                .send(WriterCommand::EncryptedKeyEvent {
+                .send(WriterCommand::HighPerformanceKeyEvent {
                     down,
                     keysym,
                     result: result_tx,
@@ -472,7 +472,6 @@ fn spawn_writer_with_hooks(
     hooks: WriterHooks,
 ) -> AppleWriterHandle {
     let (commands_tx, commands_rx) = mpsc::channel();
-    let key_clock_origin = Instant::now();
     let worker = thread::spawn(move || {
         writer_loop(
             &mut stream,
@@ -480,7 +479,6 @@ fn spawn_writer_with_hooks(
             &mut crypto,
             commands_rx,
             hooks,
-            key_clock_origin,
         )
     });
     AppleWriterHandle {
@@ -498,11 +496,10 @@ fn writer_loop(
     crypto: &mut Option<OutboundSessionCrypto>,
     commands: Receiver<WriterCommand>,
     hooks: WriterHooks,
-    mut previous_key_event_at: Instant,
 ) {
     while let Ok(command) = commands.recv() {
         let diagnostic_key_event = hooks.input_diagnostics.is_some()
-            && matches!(&command, WriterCommand::EncryptedKeyEvent { .. });
+            && matches!(&command, WriterCommand::HighPerformanceKeyEvent { .. });
         let (wire_result, result) = match command {
             WriterCommand::Message { plaintext, result } => {
                 let wire_result = match crypto {
@@ -511,22 +508,15 @@ fn writer_loop(
                 };
                 (wire_result, result)
             }
-            WriterCommand::EncryptedKeyEvent {
+            WriterCommand::HighPerformanceKeyEvent {
                 down,
                 keysym,
                 result,
             } => {
-                let now = Instant::now();
-                let delta_microseconds = now
-                    .saturating_duration_since(previous_key_event_at)
-                    .as_micros() as u32;
-                previous_key_event_at = now;
                 let wire_result = crypto
                     .as_mut()
                     .context("Apple High Performance 加密按键要求已建立的 Apple 加密会话")
-                    .and_then(|crypto| {
-                        crypto.seal_high_performance_key_event(down, keysym, delta_microseconds)
-                    });
+                    .and_then(|crypto| crypto.seal(&crate::protocol::msg_key_event(down, keysym)));
                 (wire_result, result)
             }
             WriterCommand::Shutdown => {
@@ -1021,7 +1011,6 @@ mod tests {
 
     #[test]
     fn writer_delivers_key_result_before_queueing_diagnostics() {
-        let initial_key = [0x41; 16];
         let outer_key = [0x51; 16];
         let outer_iv = [0x61; 16];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1036,11 +1025,7 @@ mod tests {
         let stream = TcpStream::connect(address).unwrap();
         let mut connection = AppleConnection::new(stream);
         connection
-            .set_crypto(SessionCrypto::from_key_iv_with_initial_key(
-                outer_key,
-                outer_iv,
-                initial_key,
-            ))
+            .set_crypto(SessionCrypto::from_key_iv(outer_key, outer_iv))
             .unwrap();
         let (diagnostics, _stage_lines, _terminal_lines) =
             HighPerformanceInputDiagnostics::enabled_for_test(Instant::now(), 4);
@@ -1048,7 +1033,7 @@ mod tests {
         let (events_tx, events_rx) = mpsc::channel();
         let writer = connection.writer_handle_with_io_events(events_tx).unwrap();
 
-        writer.send_encrypted_key_event(true, 0x61).unwrap();
+        writer.send_high_performance_key_event(true, 0x61).unwrap();
 
         assert!(matches!(
             events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -1070,19 +1055,8 @@ mod tests {
         peer.join().unwrap();
     }
 
-    fn decrypt_high_performance_key_event(initial_key: &[u8; 16], message: &[u8]) -> [u8; 18] {
-        use aes::cipher::{BlockDecryptMut, KeyInit};
-
-        assert_eq!(&message[..2], &[0x10, 0x00]);
-        let mut plaintext: [u8; 18] = message.try_into().unwrap();
-        let mut decryptor = <ecb::Decryptor<aes::Aes128>>::new_from_slice(initial_key).unwrap();
-        decryptor.decrypt_block_mut((&mut plaintext[2..]).into());
-        plaintext
-    }
-
     #[test]
-    fn encrypted_key_commands_are_queued_then_wrapped_by_outer_session_crypto() {
-        let initial_key = [0x21; 16];
+    fn high_performance_key_commands_are_standard_rfb_inside_outer_session_crypto() {
         let outer_key = [0x31; 16];
         let outer_iv = [0x42; 16];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1104,32 +1078,20 @@ mod tests {
         let stream = TcpStream::connect(address).unwrap();
         let mut connection = AppleConnection::new(stream);
         connection
-            .set_crypto(SessionCrypto::from_key_iv_with_initial_key(
-                outer_key,
-                outer_iv,
-                initial_key,
-            ))
+            .set_crypto(SessionCrypto::from_key_iv(outer_key, outer_iv))
             .unwrap();
         let writer = connection.writer_handle().unwrap();
-        writer.send_encrypted_key_event(true, 0x61).unwrap();
-        writer.send_encrypted_key_event(false, 0x61).unwrap();
+        writer.send_high_performance_key_event(true, 0x61).unwrap();
+        writer.send_high_performance_key_event(false, 0x61).unwrap();
         writer.shutdown().unwrap();
 
         let messages = server.join().unwrap();
-        let pressed = decrypt_high_performance_key_event(&initial_key, &messages[0]);
-        let released = decrypt_high_performance_key_event(&initial_key, &messages[1]);
-        assert_eq!(pressed[2], 0xff);
-        assert_eq!(pressed[3], 1);
-        assert_eq!(&pressed[4..8], &0x61u32.to_be_bytes());
-        assert_eq!(&pressed[12..], &[0; 6]);
-        assert_eq!(released[2], 0xff);
-        assert_eq!(released[3], 0);
-        assert_eq!(&released[4..8], &0x61u32.to_be_bytes());
-        assert_eq!(&released[12..], &[0; 6]);
+        assert_eq!(messages[0], crate::protocol::msg_key_event(true, 0x61));
+        assert_eq!(messages[1], crate::protocol::msg_key_event(false, 0x61));
     }
 
     #[test]
-    fn encrypted_key_send_failure_has_safe_operation_context() {
+    fn high_performance_key_without_session_crypto_has_safe_operation_context() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let peer = thread::spawn(move || {
@@ -1138,19 +1100,18 @@ mod tests {
         });
         let stream = TcpStream::connect(address).unwrap();
         let mut connection = AppleConnection::new(stream);
-        connection
-            .set_crypto(SessionCrypto::from_key_iv([0x31; 16], [0x42; 16]))
-            .unwrap();
         let writer = connection.writer_handle().unwrap();
 
-        let error = writer.send_encrypted_key_event(true, 0x61).unwrap_err();
+        let error = writer
+            .send_high_performance_key_event(true, 0x61)
+            .unwrap_err();
 
         assert_eq!(
             error.to_string(),
             "发送 Apple High Performance 加密按键失败"
         );
         let chain = format!("{error:#}");
-        assert!(chain.contains("Apple High Performance 按键初始密钥不可用"));
+        assert!(chain.contains("要求已建立的 Apple 加密会话"));
         assert!(!chain.contains("0x61"));
         writer.shutdown().unwrap();
         peer.join().unwrap();
