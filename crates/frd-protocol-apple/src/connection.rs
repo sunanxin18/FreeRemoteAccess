@@ -5,6 +5,7 @@ use std::error;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,22 +19,29 @@ use crate::session::{
 
 const PRODUCTION_WRITER_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const HP_INPUT_DIAGNOSTICS_ENV: &str = "FRD_APPLE_HP_INPUT_DIAGNOSTICS";
+const HP_INPUT_DIAGNOSTICS_QUEUE_LIMIT: usize = 32;
+const HP_INPUT_DIAGNOSTICS_REPORT_POLL: Duration = Duration::from_millis(25);
+const NO_WRITER_COMPLETION: u64 = u64::MAX;
 
 #[derive(Clone)]
 pub(crate) struct HighPerformanceInputDiagnostics {
-    inner: Option<Arc<Mutex<HighPerformanceInputDiagnosticState>>>,
+    inner: Option<Arc<HighPerformanceInputDiagnosticState>>,
 }
 
 struct HighPerformanceInputDiagnosticState {
     started_at: Instant,
-    runtime_consumed: u64,
-    writer_completed: u64,
-    last_writer_completed_at: Option<Instant>,
-    terminal_emitted: bool,
+    runtime_consumed: AtomicU64,
+    writer_completed: AtomicU64,
+    last_writer_completed_ms: AtomicU64,
+    terminal_emitted: AtomicBool,
+    stage_lines: SyncSender<HighPerformanceInputLine>,
+    terminal_lines: SyncSender<HighPerformanceInputLine>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HighPerformanceInputTerminal {
+    LocalDisconnect,
+    CleanClose,
     PeerClosed,
     AdapterError,
 }
@@ -41,101 +49,225 @@ pub(crate) enum HighPerformanceInputTerminal {
 impl HighPerformanceInputTerminal {
     const fn code(self) -> &'static str {
         match self {
+            Self::LocalDisconnect => "local_disconnect",
+            Self::CleanClose => "clean_close",
             Self::PeerClosed => "peer_close",
             Self::AdapterError => "adapter_error",
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HighPerformanceInputLine {
+    Stage {
+        stage: &'static str,
+        count: u64,
+        elapsed_ms: u64,
+    },
+    Terminal {
+        kind: &'static str,
+        runtime_consumed: u64,
+        writer_completed: u64,
+        since_last_writer_ms: Option<u64>,
+        elapsed_ms: u64,
+    },
+}
+
+impl fmt::Display for HighPerformanceInputLine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stage {
+                stage,
+                count,
+                elapsed_ms,
+            } => write!(
+                formatter,
+                "[apple-hp-input] stage={stage} count={count} elapsed_ms={elapsed_ms}"
+            ),
+            Self::Terminal {
+                kind,
+                runtime_consumed,
+                writer_completed,
+                since_last_writer_ms,
+                elapsed_ms,
+            } => write!(
+                formatter,
+                "[apple-hp-input] stage=terminal kind={kind} runtime_consumed={runtime_consumed} writer_completed={writer_completed} since_last_writer_ms={} elapsed_ms={elapsed_ms}",
+                since_last_writer_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            ),
+        }
+    }
+}
+
 impl HighPerformanceInputDiagnostics {
     pub(crate) fn for_protocol(protocol_id: &frd_core::ProtocolId) -> Self {
-        let enabled = protocol_id == &frd_core::ProtocolId::apple_high_performance()
-            && std::env::var_os(HP_INPUT_DIAGNOSTICS_ENV).is_some_and(|value| value == "1");
-        Self::new(enabled, Instant::now())
+        if protocol_id.as_str() != "apple-high-performance"
+            || !std::env::var_os(HP_INPUT_DIAGNOSTICS_ENV).is_some_and(|value| value == "1")
+        {
+            return Self { inner: None };
+        }
+        let (stage_lines, stage_receiver) = mpsc::sync_channel(HP_INPUT_DIAGNOSTICS_QUEUE_LIMIT);
+        let (terminal_lines, terminal_receiver) = mpsc::sync_channel(1);
+        let reporter = thread::Builder::new()
+            .name("frd-hp-input-protocol-diagnostic".to_owned())
+            .spawn(move || report_hp_input_lines(stage_receiver, terminal_receiver));
+        if reporter.is_err() {
+            return Self { inner: None };
+        }
+        Self::with_senders(Instant::now(), stage_lines, terminal_lines)
     }
 
-    fn new(enabled: bool, started_at: Instant) -> Self {
+    fn with_senders(
+        started_at: Instant,
+        stage_lines: SyncSender<HighPerformanceInputLine>,
+        terminal_lines: SyncSender<HighPerformanceInputLine>,
+    ) -> Self {
         Self {
-            inner: enabled.then(|| {
-                Arc::new(Mutex::new(HighPerformanceInputDiagnosticState {
-                    started_at,
-                    runtime_consumed: 0,
-                    writer_completed: 0,
-                    last_writer_completed_at: None,
-                    terminal_emitted: false,
-                }))
-            }),
+            inner: Some(Arc::new(HighPerformanceInputDiagnosticState {
+                started_at,
+                runtime_consumed: AtomicU64::new(0),
+                writer_completed: AtomicU64::new(0),
+                last_writer_completed_ms: AtomicU64::new(NO_WRITER_COMPLETION),
+                terminal_emitted: AtomicBool::new(false),
+                stage_lines,
+                terminal_lines,
+            })),
         }
     }
 
     #[cfg(test)]
-    fn enabled_for_test(started_at: Instant) -> Self {
-        Self::new(true, started_at)
+    fn enabled_for_test(
+        started_at: Instant,
+        capacity: usize,
+    ) -> (
+        Self,
+        Receiver<HighPerformanceInputLine>,
+        Receiver<HighPerformanceInputLine>,
+    ) {
+        let (stage_lines, stage_receiver) = mpsc::sync_channel(capacity);
+        let (terminal_lines, terminal_receiver) = mpsc::sync_channel(1);
+        (
+            Self::with_senders(started_at, stage_lines, terminal_lines),
+            stage_receiver,
+            terminal_receiver,
+        )
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
         self.inner.is_some()
     }
 
-    pub(crate) fn observe_runtime_consumed(&self, now: Instant) -> Option<String> {
-        let mut state = self.inner.as_ref()?.lock().ok()?;
-        state.runtime_consumed = state.runtime_consumed.saturating_add(1);
-        format_hp_input_stage(
-            "runtime_consumed",
-            state.runtime_consumed,
-            now.saturating_duration_since(state.started_at),
-        )
+    pub(crate) fn observe_runtime_consumed(&self, now: Instant) {
+        let Some(state) = &self.inner else {
+            return;
+        };
+        let count = state
+            .runtime_consumed
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        enqueue_hp_input_stage(state, "runtime_consumed", count, now);
     }
 
-    fn observe_writer_completed(&self, now: Instant) -> Option<String> {
-        let mut state = self.inner.as_ref()?.lock().ok()?;
-        state.writer_completed = state.writer_completed.saturating_add(1);
-        state.last_writer_completed_at = Some(now);
-        format_hp_input_stage(
-            "writer_completed",
-            state.writer_completed,
-            now.saturating_duration_since(state.started_at),
-        )
+    fn observe_writer_completed(&self, now: Instant) {
+        let Some(state) = &self.inner else {
+            return;
+        };
+        state
+            .last_writer_completed_ms
+            .store(elapsed_millis(state.started_at, now), Ordering::Release);
+        let count = state
+            .writer_completed
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        enqueue_hp_input_stage(state, "writer_completed", count, now);
     }
 
-    pub(crate) fn terminal_line(
+    pub(crate) fn observe_terminal(
         &self,
         terminal: HighPerformanceInputTerminal,
         now: Instant,
-    ) -> Option<String> {
-        let mut state = self.inner.as_ref()?.lock().ok()?;
-        if state.terminal_emitted {
-            return None;
+    ) -> bool {
+        let Some(state) = &self.inner else {
+            return false;
+        };
+        if state
+            .terminal_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
         }
-        state.terminal_emitted = true;
-        let since_last_writer = state
-            .last_writer_completed_at
-            .map(|last| now.saturating_duration_since(last).as_millis().to_string())
-            .unwrap_or_else(|| "none".to_owned());
-        Some(format!(
-            "[apple-hp-input] stage=terminal kind={} runtime_consumed={} writer_completed={} since_last_writer_ms={} elapsed_ms={}",
-            terminal.code(),
-            state.runtime_consumed,
-            state.writer_completed,
-            since_last_writer,
-            now.saturating_duration_since(state.started_at).as_millis()
-        ))
-    }
-
-    pub(crate) fn emit(&self, line: Option<String>) {
-        if let Some(line) = line {
-            eprintln!("{line}");
-        }
+        let elapsed_ms = elapsed_millis(state.started_at, now);
+        let last_writer_completed_ms = state.last_writer_completed_ms.load(Ordering::Acquire);
+        let line = HighPerformanceInputLine::Terminal {
+            kind: terminal.code(),
+            runtime_consumed: state.runtime_consumed.load(Ordering::Relaxed),
+            writer_completed: state.writer_completed.load(Ordering::Relaxed),
+            since_last_writer_ms: (last_writer_completed_ms != NO_WRITER_COMPLETION)
+                .then(|| elapsed_ms.saturating_sub(last_writer_completed_ms)),
+            elapsed_ms,
+        };
+        let _ = state.terminal_lines.try_send(line);
+        true
     }
 }
 
-fn format_hp_input_stage(stage: &'static str, count: u64, elapsed: Duration) -> Option<String> {
-    count.is_power_of_two().then(|| {
-        format!(
-            "[apple-hp-input] stage={stage} count={count} elapsed_ms={}",
-            elapsed.as_millis()
-        )
-    })
+fn elapsed_millis(started_at: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(started_at)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX - 1)
+}
+
+fn enqueue_hp_input_stage(
+    state: &HighPerformanceInputDiagnosticState,
+    stage: &'static str,
+    count: u64,
+    now: Instant,
+) {
+    if count.is_power_of_two() {
+        let _ = state.stage_lines.try_send(HighPerformanceInputLine::Stage {
+            stage,
+            count,
+            elapsed_ms: elapsed_millis(state.started_at, now),
+        });
+    }
+}
+
+fn report_hp_input_lines(
+    stage_lines: Receiver<HighPerformanceInputLine>,
+    terminal_lines: Receiver<HighPerformanceInputLine>,
+) {
+    loop {
+        match terminal_lines.try_recv() {
+            Ok(terminal) => {
+                for line in stage_lines.try_iter() {
+                    eprintln!("{line}");
+                }
+                eprintln!("{terminal}");
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                for line in stage_lines.try_iter() {
+                    eprintln!("{line}");
+                }
+                return;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        match stage_lines.recv_timeout(HP_INPUT_DIAGNOSTICS_REPORT_POLL) {
+            Ok(line) => eprintln!("{line}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Ok(terminal) = terminal_lines.recv() {
+                    eprintln!("{terminal}");
+                }
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -208,6 +340,8 @@ struct WriterControl {
 pub(crate) enum WriterIoTestEvent {
     Started { wire_bytes: usize },
     Finished { succeeded: bool },
+    ResultDelivered,
+    InputDiagnosticQueued,
 }
 
 #[cfg(test)]
@@ -250,6 +384,20 @@ impl WriterHooks {
             let _ = io_events.send(WriterIoTestEvent::Finished {
                 succeeded: _succeeded,
             });
+        }
+    }
+
+    fn notify_result_delivered(&self) {
+        #[cfg(test)]
+        if let Some(io_events) = &self.io_events {
+            let _ = io_events.send(WriterIoTestEvent::ResultDelivered);
+        }
+    }
+
+    fn notify_input_diagnostic_queued(&self) {
+        #[cfg(test)]
+        if let Some(io_events) = &self.io_events {
+            let _ = io_events.send(WriterIoTestEvent::InputDiagnosticQueued);
         }
     }
 }
@@ -353,7 +501,8 @@ fn writer_loop(
     mut previous_key_event_at: Instant,
 ) {
     while let Ok(command) = commands.recv() {
-        let encrypted_key_event = matches!(&command, WriterCommand::EncryptedKeyEvent { .. });
+        let diagnostic_key_event = hooks.input_diagnostics.is_some()
+            && matches!(&command, WriterCommand::EncryptedKeyEvent { .. });
         let (wire_result, result) = match command {
             WriterCommand::Message { plaintext, result } => {
                 let wire_result = match crypto {
@@ -405,13 +554,14 @@ fn writer_loop(
             write_result
         })();
         let failed = send_result.is_err();
-        if encrypted_key_event && !failed {
+        let _ = result.send(send_result);
+        hooks.notify_result_delivered();
+        if diagnostic_key_event && !failed {
             if let Some(diagnostics) = &hooks.input_diagnostics {
-                let line = diagnostics.observe_writer_completed(Instant::now());
-                diagnostics.emit(line);
+                diagnostics.observe_writer_completed(Instant::now());
+                hooks.notify_input_diagnostic_queued();
             }
         }
-        let _ = result.send(send_result);
         if failed {
             let _ = stream.shutdown(Shutdown::Both);
             break;
@@ -430,6 +580,7 @@ pub struct AppleConnection {
     outbound_crypto: Option<OutboundSessionCrypto>,
     wire_pending: Vec<u8>,
     writer: Option<AppleWriterHandle>,
+    writer_input_diagnostics: Option<HighPerformanceInputDiagnostics>,
     #[cfg(test)]
     session_runtime_test_events: Option<Sender<SessionRuntimeTestEvent>>,
     #[cfg(test)]
@@ -457,6 +608,7 @@ impl AppleConnection {
             outbound_crypto: None,
             wire_pending: Vec::new(),
             writer: None,
+            writer_input_diagnostics: None,
             #[cfg(test)]
             session_runtime_test_events: None,
             #[cfg(test)]
@@ -538,14 +690,13 @@ impl AppleConnection {
         self.writer_handle_with_hooks(WriterHooks::default())
     }
 
-    pub(crate) fn writer_handle_with_input_diagnostics(
+    pub(crate) fn install_input_diagnostics(
         &mut self,
         diagnostics: HighPerformanceInputDiagnostics,
-    ) -> Result<AppleWriterHandle> {
-        self.writer_handle_with_hooks(WriterHooks {
-            input_diagnostics: diagnostics.is_enabled().then_some(diagnostics),
-            ..WriterHooks::default()
-        })
+    ) {
+        if self.writer.is_none() && diagnostics.is_enabled() {
+            self.writer_input_diagnostics = Some(diagnostics);
+        }
     }
 
     #[cfg(test)]
@@ -589,9 +740,12 @@ impl AppleConnection {
         }
     }
 
-    fn writer_handle_with_hooks(&mut self, hooks: WriterHooks) -> Result<AppleWriterHandle> {
+    fn writer_handle_with_hooks(&mut self, mut hooks: WriterHooks) -> Result<AppleWriterHandle> {
         if let Some(writer) = &self.writer {
             return Ok(writer.clone());
+        }
+        if hooks.input_diagnostics.is_none() {
+            hooks.input_diagnostics = self.writer_input_diagnostics.take();
         }
         let stream = self
             .stream
@@ -791,43 +945,129 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
-    fn hp_keyboard_protocol_diagnostics_report_only_counts_and_relative_terminal_timing() {
+    fn hp_keyboard_protocol_diagnostics_queue_counts_and_each_terminal_exactly_once() {
         let started_at = Instant::now();
-        let diagnostics = HighPerformanceInputDiagnostics::enabled_for_test(started_at);
-
-        assert_eq!(
-            diagnostics
-                .observe_runtime_consumed(started_at + Duration::from_millis(5))
-                .as_deref(),
-            Some("[apple-hp-input] stage=runtime_consumed count=1 elapsed_ms=5")
-        );
-        assert_eq!(
-            diagnostics
-                .observe_writer_completed(started_at + Duration::from_millis(8))
-                .as_deref(),
-            Some("[apple-hp-input] stage=writer_completed count=1 elapsed_ms=8")
-        );
-        let terminal = diagnostics
-            .terminal_line(
-                HighPerformanceInputTerminal::PeerClosed,
-                started_at + Duration::from_millis(21),
-            )
-            .expect("enabled diagnostics emit terminal summary");
-        assert_eq!(
-            terminal,
-            "[apple-hp-input] stage=terminal kind=peer_close runtime_consumed=1 writer_completed=1 since_last_writer_ms=13 elapsed_ms=21"
-        );
-        assert_eq!(
-            diagnostics.terminal_line(
-                HighPerformanceInputTerminal::AdapterError,
-                started_at + Duration::from_millis(34),
+        for (terminal, expected_code) in [
+            (
+                HighPerformanceInputTerminal::LocalDisconnect,
+                "local_disconnect",
             ),
-            None,
-            "one session must emit only one terminal summary"
-        );
-        for forbidden in ["keysym", "text", "username", "password", "address"] {
-            assert!(!terminal.contains(forbidden));
+            (HighPerformanceInputTerminal::CleanClose, "clean_close"),
+            (HighPerformanceInputTerminal::PeerClosed, "peer_close"),
+            (HighPerformanceInputTerminal::AdapterError, "adapter_error"),
+        ] {
+            let (diagnostics, stage_lines, terminal_lines) =
+                HighPerformanceInputDiagnostics::enabled_for_test(started_at, 8);
+            diagnostics.observe_runtime_consumed(started_at + Duration::from_millis(5));
+            diagnostics.observe_writer_completed(started_at + Duration::from_millis(8));
+            assert!(diagnostics.observe_terminal(terminal, started_at + Duration::from_millis(21)));
+            assert!(!diagnostics.observe_terminal(
+                HighPerformanceInputTerminal::AdapterError,
+                started_at + Duration::from_millis(34)
+            ));
+
+            let mut lines = stage_lines.try_iter().collect::<Vec<_>>();
+            lines.extend(terminal_lines.try_iter());
+            assert_eq!(lines.len(), 3);
+            assert_eq!(
+                lines[0],
+                HighPerformanceInputLine::Stage {
+                    stage: "runtime_consumed",
+                    count: 1,
+                    elapsed_ms: 5,
+                }
+            );
+            assert_eq!(
+                lines[1],
+                HighPerformanceInputLine::Stage {
+                    stage: "writer_completed",
+                    count: 1,
+                    elapsed_ms: 8,
+                }
+            );
+            assert_eq!(
+                lines[2],
+                HighPerformanceInputLine::Terminal {
+                    kind: expected_code,
+                    runtime_consumed: 1,
+                    writer_completed: 1,
+                    since_last_writer_ms: Some(13),
+                    elapsed_ms: 21,
+                }
+            );
+            let rendered = lines[2].to_string();
+            for forbidden in ["keysym", "text", "username", "password", "address"] {
+                assert!(!rendered.contains(forbidden));
+            }
         }
+    }
+
+    #[test]
+    fn installing_hp_input_diagnostics_does_not_create_the_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || listener.accept().unwrap().0);
+        let stream = TcpStream::connect(address).unwrap();
+        let mut connection = AppleConnection::new(stream);
+        let (diagnostics, _stage_lines, _terminal_lines) =
+            HighPerformanceInputDiagnostics::enabled_for_test(Instant::now(), 1);
+
+        connection.install_input_diagnostics(diagnostics);
+
+        assert!(connection.writer.is_none());
+        drop(connection);
+        drop(peer.join().unwrap());
+    }
+
+    #[test]
+    fn writer_delivers_key_result_before_queueing_diagnostics() {
+        let initial_key = [0x41; 16];
+        let outer_key = [0x51; 16];
+        let outer_iv = [0x61; 16];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut prefix = [0u8; 2];
+            peer.read_exact(&mut prefix).unwrap();
+            let mut ciphertext = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+            peer.read_exact(&mut ciphertext).unwrap();
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        let mut connection = AppleConnection::new(stream);
+        connection
+            .set_crypto(SessionCrypto::from_key_iv_with_initial_key(
+                outer_key,
+                outer_iv,
+                initial_key,
+            ))
+            .unwrap();
+        let (diagnostics, _stage_lines, _terminal_lines) =
+            HighPerformanceInputDiagnostics::enabled_for_test(Instant::now(), 4);
+        connection.install_input_diagnostics(diagnostics);
+        let (events_tx, events_rx) = mpsc::channel();
+        let writer = connection.writer_handle_with_io_events(events_tx).unwrap();
+
+        writer.send_encrypted_key_event(true, 0x61).unwrap();
+
+        assert!(matches!(
+            events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WriterIoTestEvent::Started { .. }
+        ));
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WriterIoTestEvent::Finished { succeeded: true }
+        );
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WriterIoTestEvent::ResultDelivered
+        );
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WriterIoTestEvent::InputDiagnosticQueued
+        );
+        writer.shutdown().unwrap();
+        peer.join().unwrap();
     }
 
     fn decrypt_high_performance_key_event(initial_key: &[u8; 16], message: &[u8]) -> [u8; 18] {

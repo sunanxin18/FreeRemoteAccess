@@ -490,8 +490,7 @@ fn run_authenticated_session_with_media(
         } else {
             HighPerformanceInputTerminal::AdapterError
         };
-        let line = input_diagnostics.terminal_line(terminal, Instant::now());
-        input_diagnostics.emit(line);
+        input_diagnostics.observe_terminal(terminal, Instant::now());
     }
     match result {
         Ok(()) => ProtocolExit::Closed,
@@ -562,6 +561,14 @@ fn publish_transport_readiness(
     Ok(udp_media_enabled)
 }
 
+fn successful_hp_input_terminal(disconnect_requested: bool) -> HighPerformanceInputTerminal {
+    if disconnect_requested {
+        HighPerformanceInputTerminal::LocalDisconnect
+    } else {
+        HighPerformanceInputTerminal::CleanClose
+    }
+}
+
 #[cfg(any(debug_assertions, test))]
 fn should_emit_debug_media_close_summary(protocol_id: &frd_core::ProtocolId) -> bool {
     protocol_id == &frd_core::ProtocolId::apple_high_performance()
@@ -596,9 +603,9 @@ fn run_authenticated_session_inner(
         )
         .into());
     }
-    // Install the HP-only diagnostic hook before the first encrypted startup
-    // write, because `AppleConnection::write_all` lazily creates the sole writer.
-    let writer = connection.writer_handle_with_input_diagnostics(input_diagnostics.clone())?;
+    // Configure the optional hook without creating the writer. The first
+    // encrypted startup write remains the sole lazy-creation and key-clock origin.
+    connection.install_input_diagnostics(input_diagnostics.clone());
     let initial_admission =
         NetworkReaderRuntime::admit_initial_generation(&mut runtime, session_id, initial_size)
             .map_err(|error| anyhow::anyhow!(error.code()))?;
@@ -641,6 +648,7 @@ fn run_authenticated_session_inner(
     let initial_full_sent_at = Instant::now();
     let mut application_frame_read_poll = APPLE_RUNTIME_READ_POLL;
     connection.set_read_timeout(Some(application_frame_read_poll))?;
+    let writer = connection.writer_handle()?;
 
     let mut media =
         ViewerMediaState::new_for_session(session_id, audio_flow, 1, media_server_address)?;
@@ -682,9 +690,7 @@ fn run_authenticated_session_inner(
                     SessionCommand::Input(input) => {
                         if reader.is_high_performance_confirmed() {
                             if matches!(input.event, InputEvent::PhysicalKey { .. }) {
-                                let line =
-                                    input_diagnostics.observe_runtime_consumed(Instant::now());
-                                input_diagnostics.emit(line);
+                                input_diagnostics.observe_runtime_consumed(Instant::now());
                             }
                             pointer.handle(input.event, &writer)?;
                         }
@@ -845,15 +851,12 @@ fn run_authenticated_session_inner(
         Ok(())
     })();
 
-    if let Err(error) = &loop_result {
-        let terminal = if is_peer_closed(error) {
-            HighPerformanceInputTerminal::PeerClosed
-        } else {
-            HighPerformanceInputTerminal::AdapterError
-        };
-        let line = input_diagnostics.terminal_line(terminal, Instant::now());
-        input_diagnostics.emit(line);
-    }
+    let terminal = match &loop_result {
+        Ok(()) => successful_hp_input_terminal(disconnect_requested),
+        Err(error) if is_peer_closed(error) => HighPerformanceInputTerminal::PeerClosed,
+        Err(_) => HighPerformanceInputTerminal::AdapterError,
+    };
+    input_diagnostics.observe_terminal(terminal, Instant::now());
 
     let _ = runtime.publish_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
     if audio_started {
@@ -895,6 +898,18 @@ mod tests {
         MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
         SessionCommand, SessionEvent, SurfacePublisher,
     };
+
+    #[test]
+    fn successful_hp_input_terminal_distinguishes_local_disconnect_from_clean_close() {
+        assert_eq!(
+            super::successful_hp_input_terminal(true),
+            crate::connection::HighPerformanceInputTerminal::LocalDisconnect
+        );
+        assert_eq!(
+            super::successful_hp_input_terminal(false),
+            crate::connection::HighPerformanceInputTerminal::CleanClose
+        );
+    }
 
     #[test]
     fn keyboard_wire_mode_is_scoped_to_apple_protocol_identity() {
@@ -2471,7 +2486,9 @@ mod tests {
                     }
                 }
                 crate::connection::WriterIoTestEvent::Started { .. }
-                | crate::connection::WriterIoTestEvent::Finished { .. } => {}
+                | crate::connection::WriterIoTestEvent::Finished { .. }
+                | crate::connection::WriterIoTestEvent::ResultDelivered
+                | crate::connection::WriterIoTestEvent::InputDiagnosticQueued => {}
             }
         }
 
