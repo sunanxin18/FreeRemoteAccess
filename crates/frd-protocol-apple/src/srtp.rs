@@ -11,6 +11,7 @@ use aes::Aes256;
 use anyhow::{ensure, Context, Result};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::media_negotiation::SrtpMasterMaterial;
@@ -45,6 +46,7 @@ const RTP_MUX_CLASSIFICATION_BYTES: usize = RTP_MUX_PACKET_TYPE_OFFSET + size_of
 const SRTP_PACKET_INDEX_LEN: usize = 6;
 const SRTP_REPLAY_WINDOW_WORDS: usize = 4;
 const SRTP_REPLAY_WINDOW_BITS: u64 = (SRTP_REPLAY_WINDOW_WORDS * u64::BITS as usize) as u64;
+const MAX_SRTP_RECEIVE_SSRC_CONTEXTS: usize = 8;
 const SRTCP_REPLAY_WINDOW_BITS: u32 = u64::BITS;
 const RTP_SEQUENCE_SPACE: u32 = 1 << u16::BITS;
 const RTP_SEQUENCE_HALF_SPACE: u16 = (RTP_SEQUENCE_SPACE / 2) as u16;
@@ -623,6 +625,12 @@ pub fn protect_rtp_packet(
 pub struct SrtpReceiver {
     keys: SrtpSessionKeys,
     initial_rollover_counter: u32,
+    streams: HashMap<u32, SrtpReceiveStreamState>,
+    stream_recency: VecDeque<u32>,
+}
+
+#[derive(Default)]
+struct SrtpReceiveStreamState {
     highest_packet_index: Option<u64>,
     replay_window: SrtpReplayWindow,
 }
@@ -716,8 +724,8 @@ impl SrtpReceiver {
         Self {
             keys,
             initial_rollover_counter: rollover_counter,
-            highest_packet_index: None,
-            replay_window: SrtpReplayWindow::default(),
+            streams: HashMap::new(),
+            stream_recency: VecDeque::new(),
         }
     }
 
@@ -744,7 +752,8 @@ impl SrtpReceiver {
                 .try_into()
                 .expect("已验证 RTP 固定头长度"),
         );
-        let rollover_counter = self.estimate_rollover_counter(sequence)?;
+        let ssrc = read_ssrc(packet, RTP_SSRC_OFFSET);
+        let rollover_counter = self.estimate_rollover_counter(ssrc, sequence)?;
         if let Err(error) = verify_authentication_tag_with_suffix(
             packet,
             authenticated_len,
@@ -757,7 +766,7 @@ impl SrtpReceiver {
             ));
         }
         let packet_index = (u64::from(rollover_counter) << u16::BITS) | u64::from(sequence);
-        if self.is_replay_or_too_old(packet_index) {
+        if self.is_replay_or_too_old(ssrc, packet_index) {
             return Ok(None);
         }
 
@@ -769,12 +778,24 @@ impl SrtpReceiver {
                 error,
             ));
         }
-        self.accept_packet_index(packet_index);
+        if !self.streams.contains_key(&ssrc) && self.streams.len() == MAX_SRTP_RECEIVE_SSRC_CONTEXTS
+        {
+            let oldest = self
+                .stream_recency
+                .pop_front()
+                .expect("非空 SRTP SSRC 上下文必须有 LRU 条目");
+            self.streams.remove(&oldest);
+        }
+        self.accept_packet_index(ssrc, packet_index);
         Ok(Some(plaintext))
     }
 
-    fn estimate_rollover_counter(&self, sequence: u16) -> Result<u32> {
-        let Some(highest_packet_index) = self.highest_packet_index else {
+    fn estimate_rollover_counter(&self, ssrc: u32, sequence: u16) -> Result<u32> {
+        let Some(highest_packet_index) = self
+            .streams
+            .get(&ssrc)
+            .and_then(|stream| stream.highest_packet_index)
+        else {
             return Ok(self.initial_rollover_counter);
         };
         let highest_sequence = highest_packet_index as u16;
@@ -795,33 +816,45 @@ impl SrtpReceiver {
         Ok(highest_rollover_counter)
     }
 
-    fn is_replay_or_too_old(&self, packet_index: u64) -> bool {
-        let Some(highest_packet_index) = self.highest_packet_index else {
+    fn is_replay_or_too_old(&self, ssrc: u32, packet_index: u64) -> bool {
+        let Some(stream) = self.streams.get(&ssrc) else {
+            return false;
+        };
+        let Some(highest_packet_index) = stream.highest_packet_index else {
             return false;
         };
         if packet_index > highest_packet_index {
             return false;
         }
         let age = highest_packet_index - packet_index;
-        age >= SRTP_REPLAY_WINDOW_BITS || self.replay_window.contains(age)
+        age >= SRTP_REPLAY_WINDOW_BITS || stream.replay_window.contains(age)
     }
 
-    fn accept_packet_index(&mut self, packet_index: u64) {
-        match self.highest_packet_index {
+    fn accept_packet_index(&mut self, ssrc: u32, packet_index: u64) {
+        let stream = self.streams.entry(ssrc).or_default();
+        match stream.highest_packet_index {
             None => {
-                self.highest_packet_index = Some(packet_index);
-                self.replay_window.mark(0);
+                stream.highest_packet_index = Some(packet_index);
+                stream.replay_window.mark(0);
             }
             Some(highest_packet_index) if packet_index > highest_packet_index => {
                 let advance = packet_index - highest_packet_index;
-                self.replay_window.advance_and_mark_newest(advance);
-                self.highest_packet_index = Some(packet_index);
+                stream.replay_window.advance_and_mark_newest(advance);
+                stream.highest_packet_index = Some(packet_index);
             }
             Some(highest_packet_index) => {
                 let age = highest_packet_index - packet_index;
-                self.replay_window.mark(age);
+                stream.replay_window.mark(age);
             }
         }
+        if let Some(position) = self
+            .stream_recency
+            .iter()
+            .position(|candidate| *candidate == ssrc)
+        {
+            self.stream_recency.remove(position);
+        }
+        self.stream_recency.push_back(ssrc);
     }
 }
 
@@ -1319,10 +1352,19 @@ mod tests {
         sequence: u16,
         rollover_counter: u32,
     ) -> (Vec<u8>, Vec<u8>) {
+        protected_test_rtp_for_ssrc(keys, TEST_SSRC, sequence, rollover_counter)
+    }
+
+    fn protected_test_rtp_for_ssrc(
+        keys: &SrtpSessionKeys,
+        ssrc: u32,
+        sequence: u16,
+        rollover_counter: u32,
+    ) -> (Vec<u8>, Vec<u8>) {
         let mut plaintext = vec![RTP_VERSION << RTP_VERSION_SHIFT, 101];
         plaintext.extend_from_slice(&sequence.to_be_bytes());
         plaintext.extend_from_slice(&u32::from(sequence).wrapping_mul(960).to_be_bytes());
-        plaintext.extend_from_slice(&TEST_SSRC.to_be_bytes());
+        plaintext.extend_from_slice(&ssrc.to_be_bytes());
         plaintext.extend_from_slice(b"replay-window");
         let protected = protect_rtp_packet(&plaintext, keys, rollover_counter).unwrap();
         (plaintext, protected)
@@ -1514,6 +1556,81 @@ mod tests {
         assert!(receiver.open(&unauthenticated_highest).is_err());
         assert_eq!(receiver.open(&older).unwrap(), Some(older_plaintext));
         assert_eq!(receiver.open(&older).unwrap(), None);
+    }
+
+    #[test]
+    fn srtp_receiver_tracks_replay_and_roc_per_authenticated_ssrc() {
+        const SECOND_SSRC: u32 = 0x5566_7788;
+        let keys = derive_session_keys(&test_material(), SrtpPacketKind::Rtp);
+        let (first_plaintext, first) = protected_test_rtp_for_ssrc(&keys, TEST_SSRC, 1_000, 0);
+        let (second_plaintext, second) = protected_test_rtp_for_ssrc(&keys, SECOND_SSRC, 1, 0);
+        let mut receiver = SrtpReceiver::new(keys.clone());
+
+        assert_eq!(receiver.open(&first).unwrap(), Some(first_plaintext));
+        assert_eq!(receiver.open(&second).unwrap(), Some(second_plaintext));
+        assert_eq!(receiver.open(&first).unwrap(), None);
+        assert_eq!(receiver.open(&second).unwrap(), None);
+    }
+
+    #[test]
+    fn srtp_receiver_evicts_least_recent_context_after_authenticated_ssrc_bound() {
+        const RECEIVE_SSRC_CONTEXT_LIMIT: usize = 8;
+        let keys = derive_session_keys(&test_material(), SrtpPacketKind::Rtp);
+        let mut receiver = SrtpReceiver::new(keys.clone());
+
+        for offset in 0..RECEIVE_SSRC_CONTEXT_LIMIT {
+            let ssrc = 0x7000_0000u32.wrapping_add(offset as u32);
+            let (plaintext, packet) = protected_test_rtp_for_ssrc(&keys, ssrc, 2, 0);
+            assert_eq!(receiver.open(&packet).unwrap(), Some(plaintext));
+        }
+
+        let (active_plaintext, active) = protected_test_rtp_for_ssrc(&keys, 0x7000_0000, 3, 0);
+        assert_eq!(receiver.open(&active).unwrap(), Some(active_plaintext));
+
+        let (new_plaintext, new_source) = protected_test_rtp_for_ssrc(&keys, 0x7000_0008, 2, 0);
+        assert_eq!(receiver.open(&new_source).unwrap(), Some(new_plaintext));
+
+        assert_eq!(receiver.open(&active).unwrap(), None);
+        let (evicted_plaintext, evicted_source) =
+            protected_test_rtp_for_ssrc(&keys, 0x7000_0001, 2, 0);
+        assert_eq!(
+            receiver.open(&evicted_source).unwrap(),
+            Some(evicted_plaintext)
+        );
+    }
+
+    #[test]
+    fn unauthenticated_new_ssrc_does_not_create_or_advance_a_receive_context() {
+        const SECOND_SSRC: u32 = 0x5566_7788;
+        let keys = derive_session_keys(&test_material(), SrtpPacketKind::Rtp);
+        let (_, mut tampered) = protected_test_rtp_for_ssrc(&keys, SECOND_SSRC, 9_000, 0);
+        *tampered.last_mut().unwrap() ^= 1;
+        let (valid_plaintext, valid) = protected_test_rtp_for_ssrc(&keys, SECOND_SSRC, 1, 0);
+        let mut receiver = SrtpReceiver::new(keys);
+
+        assert!(receiver.open(&tampered).is_err());
+        assert_eq!(receiver.open(&valid).unwrap(), Some(valid_plaintext));
+    }
+
+    #[test]
+    fn unauthenticated_new_ssrc_cannot_evict_a_full_receive_context() {
+        const RECEIVE_SSRC_CONTEXT_LIMIT: usize = 8;
+        let keys = derive_session_keys(&test_material(), SrtpPacketKind::Rtp);
+        let mut receiver = SrtpReceiver::new(keys.clone());
+        let mut first_packet = None;
+        for offset in 0..RECEIVE_SSRC_CONTEXT_LIMIT {
+            let ssrc = 0x7100_0000u32.wrapping_add(offset as u32);
+            let (plaintext, packet) = protected_test_rtp_for_ssrc(&keys, ssrc, 2, 0);
+            assert_eq!(receiver.open(&packet).unwrap(), Some(plaintext));
+            if offset == 0 {
+                first_packet = Some(packet);
+            }
+        }
+
+        let (_, mut unauthenticated) = protected_test_rtp_for_ssrc(&keys, 0x7200_0000, 1_000, 0);
+        *unauthenticated.last_mut().unwrap() ^= 1;
+        assert!(receiver.open(&unauthenticated).is_err());
+        assert_eq!(receiver.open(&first_packet.unwrap()).unwrap(), None);
     }
 
     #[test]

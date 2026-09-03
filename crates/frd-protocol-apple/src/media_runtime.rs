@@ -265,6 +265,8 @@ struct VideoReceiveState {
     adapter: AppleHighPerformanceVideoAdapter,
     stage_trace: MediaStageTrace,
     pending_recovery_request: Option<VideoRecoveryRequest>,
+    authenticated_ssrc: Option<u32>,
+    awaiting_replacement_irap: bool,
     #[cfg(any(debug_assertions, test))]
     authenticated_rtp_packets: u64,
 }
@@ -282,6 +284,8 @@ impl VideoReceiveState {
             adapter: AppleHighPerformanceVideoAdapter::new(identity, generation),
             stage_trace: MediaStageTrace::default(),
             pending_recovery_request: None,
+            authenticated_ssrc: None,
+            awaiting_replacement_irap: false,
             #[cfg(any(debug_assertions, test))]
             authenticated_rtp_packets: 0,
         })
@@ -292,6 +296,8 @@ impl VideoReceiveState {
         self.adapter.reset(generation);
         self.stage_trace = MediaStageTrace::default();
         self.pending_recovery_request = None;
+        self.authenticated_ssrc = None;
+        self.awaiting_replacement_irap = false;
         #[cfg(any(debug_assertions, test))]
         {
             self.authenticated_rtp_packets = 0;
@@ -317,6 +323,17 @@ impl VideoReceiveState {
         datagram: &[u8],
     ) -> Result<()> {
         let packet = parse_rtp_packet(datagram).context("解析 Apple HP 视频 RTP 数据报失败")?;
+        match self.authenticated_ssrc {
+            Some(previous) if previous != packet.header.ssrc => {
+                self.assembler.reset(generation);
+                self.adapter.reset(generation);
+                self.pending_recovery_request = None;
+                self.authenticated_ssrc = Some(packet.header.ssrc);
+                self.awaiting_replacement_irap = true;
+            }
+            None => self.authenticated_ssrc = Some(packet.header.ssrc),
+            Some(_) => {}
+        }
         let access_units = match self.assembler.push(HevcRtpPacket {
             generation,
             ssrc: packet.header.ssrc,
@@ -333,9 +350,21 @@ impl VideoReceiveState {
                     });
                 return Ok(());
             }
+            Err(HevcAccessUnitError::MissingInitialParameterSets)
+                if self.awaiting_replacement_irap =>
+            {
+                self.assembler.reset(generation);
+                return Ok(());
+            }
             Err(error) => return Err(error).context("组装 Apple HP HEVC 访问单元失败"),
         };
         for access_unit in access_units {
+            if self.awaiting_replacement_irap {
+                if !access_unit.keyframe {
+                    continue;
+                }
+                self.awaiting_replacement_irap = false;
+            }
             self.adapter
                 .publish_access_unit(runtime, access_unit)
                 .context("发布 Apple HP HEVC 访问单元失败")?;
@@ -1292,6 +1321,87 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_video_ssrc_switch_waits_for_new_configuration_irap_without_fatal() {
+        const FIRST_SSRC: u32 = 0x1020_3040;
+        const SECOND_SSRC: u32 = 0x5060_7080;
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RecordingMedia(published.clone()))),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let first_configuration = startup_parameter_set_ap();
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                FIRST_SSRC,
+                1,
+                0,
+                true,
+                &first_configuration,
+            )),
+        )
+        .unwrap();
+        assert_eq!(published.lock().unwrap().len(), 2);
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                1,
+                3_000,
+                true,
+                &[0x02, 0x01, 0xaa],
+            )),
+        )
+        .expect("authenticated SSRC replacement traffic must not fail the session");
+        assert_eq!(published.lock().unwrap().len(), 2);
+        assert!(!runtime.requires_shutdown());
+
+        let mut replacement_configuration = startup_parameter_set_ap();
+        replacement_configuration.extend_from_slice(&[0, 4, 0x26, 0x01, 0xbb, 0xcc]);
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp_for_ssrc(
+                SECOND_SSRC,
+                2,
+                6_000,
+                true,
+                &replacement_configuration,
+            )),
+        )
+        .expect("new SSRC configuration plus IRAP must restore publication");
+
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 4);
+        assert!(matches!(&published[2], MediaFrame::VideoConfig(_)));
+        assert!(
+            matches!(&published[3], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.random_access() && access_unit.timestamp().ticks == 6_000)
+        );
+    }
+
+    #[test]
     fn startup_loss_waits_for_irap_before_publishing_cached_configuration() {
         let session_id = SessionId::allocate();
         let (_commands, command_rx) = mpsc::channel();
@@ -1408,10 +1518,20 @@ mod tests {
     }
 
     fn video_rtp(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+        video_rtp_for_ssrc(0x1020_3040, sequence, timestamp, marker, payload)
+    }
+
+    fn video_rtp_for_ssrc(
+        ssrc: u32,
+        sequence: u16,
+        timestamp: u32,
+        marker: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut packet = vec![0x80, 96 | if marker { 0x80 } else { 0 }];
         packet.extend_from_slice(&sequence.to_be_bytes());
         packet.extend_from_slice(&timestamp.to_be_bytes());
-        packet.extend_from_slice(&0x1020_3040_u32.to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
         packet.extend_from_slice(payload);
         packet
     }
