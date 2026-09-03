@@ -262,6 +262,7 @@ fn windows_native_hit(hit_map: &ChromeHitMap, point: (u32, u32)) -> u32 {
         Some(
             ChromeHitTarget::IslandAction(_)
             | ChromeHitTarget::IslandRepositionHandle
+            | ChromeHitTarget::IslandSurface
             | ChromeHitTarget::NativeChrome
             | ChromeHitTarget::RemoteContent,
         )

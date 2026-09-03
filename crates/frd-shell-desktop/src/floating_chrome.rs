@@ -59,6 +59,15 @@ impl FloatingChromeController {
         self.state
     }
 
+    pub fn is_visible(&self) -> bool {
+        matches!(
+            self.state,
+            ControlIslandState::Visible
+                | ControlIslandState::HidePending
+                | ControlIslandState::Pinned
+        )
+    }
+
     pub fn observe_top_sensor(&mut self, inside: bool, remote_input_held: bool, now: Instant) {
         match self.state {
             ControlIslandState::Hidden if inside && !remote_input_held => {
@@ -98,6 +107,11 @@ impl FloatingChromeController {
 
     pub fn force_reveal_after_release(&mut self, _now: Instant) {
         self.state = ControlIslandState::Pinned;
+        self.deadline = None;
+    }
+
+    pub fn hide_after_failed_release(&mut self) {
+        self.state = ControlIslandState::Hidden;
         self.deadline = None;
     }
 
@@ -169,6 +183,7 @@ pub struct ChromeOverlayLayout {
 pub enum ChromeHitTarget {
     IslandAction(IslandAction),
     IslandRepositionHandle,
+    IslandSurface,
     WindowMoveRegion,
     NativeChrome,
     RemoteContent,
@@ -178,6 +193,7 @@ pub enum ChromeHitTarget {
 pub struct ChromeHitMap {
     island_actions: Vec<(ChromeRect, IslandAction)>,
     island_reposition_handle: Option<ChromeRect>,
+    island_surface: Option<ChromeRect>,
     window_move_region: Option<ChromeRect>,
     native_chrome: Vec<ChromeRect>,
     remote_content: PixelRect,
@@ -218,11 +234,28 @@ impl ChromeHitMap {
         Some(Self {
             island_actions,
             island_reposition_handle,
+            island_surface: None,
             window_move_region,
             native_chrome,
             remote_content,
             maximize_rect,
         })
+    }
+
+    pub fn with_island_surface(mut self, island_surface: Option<ChromeRect>) -> Option<Self> {
+        if island_surface.is_some_and(|rect| {
+            !valid_rect(rect)
+                || !rect_within(self.remote_content, rect)
+                || overlaps(Some(rect), self.window_move_region)
+                || self
+                    .native_chrome
+                    .iter()
+                    .any(|native| overlaps(Some(rect), Some(*native)))
+        }) {
+            return None;
+        }
+        self.island_surface = island_surface;
+        Some(self)
     }
 
     pub fn hit_test(&self, point: (u32, u32)) -> Option<ChromeHitTarget> {
@@ -239,6 +272,9 @@ impl ChromeHitMap {
             .is_some_and(|rect| rect.contains(x, y))
         {
             return Some(ChromeHitTarget::IslandRepositionHandle);
+        }
+        if self.island_surface.is_some_and(|rect| rect.contains(x, y)) {
+            return Some(ChromeHitTarget::IslandSurface);
         }
         if self
             .window_move_region
@@ -413,7 +449,8 @@ impl ChromeGeometrySnapshot {
             overlay.island_reposition_handle,
             overlay.window_move_region,
             Vec::new(),
-        )?;
+        )?
+        .with_island_surface(overlay.island_rect)?;
         Some(ChromeLayouts {
             remote,
             overlay,
@@ -626,6 +663,13 @@ mod tests {
                 .hit_test(hidden.overlay.reveal_line_rect.center()),
             Some(ChromeHitTarget::RemoteContent),
             "the visual-only green line must not enter the hit map"
+        );
+        assert_eq!(
+            visible
+                .hit_map
+                .hit_test(visible.overlay.island_rect.unwrap().center()),
+            Some(ChromeHitTarget::IslandSurface),
+            "the complete visible-island candidate must keep transparent material local"
         );
     }
 

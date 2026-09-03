@@ -71,8 +71,8 @@ use crate::video_decode_worker::{
 };
 use crate::{
     ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeLayouts, ChromeRect,
-    ControlIslandPlacement, InputGate, InputOwnership, InputRouter, WindowChromeAdapter,
-    WindowChromeCommand, TITLE_BAR_HEIGHT_POINTS,
+    ControlIslandPlacement, FloatingChromeController, InputGate, InputOwnership, InputRouter,
+    WindowChromeAdapter, WindowChromeCommand,
 };
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -82,6 +82,7 @@ const PENDING_LAUNCH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration
 const HP_INPUT_DIAGNOSTICS_ENV: &str = "FRD_APPLE_HP_INPUT_DIAGNOSTICS";
 const HP_INPUT_DIAGNOSTICS_QUEUE_LIMIT: usize = 32;
 const APPLE_HIGH_PERFORMANCE_PROTOCOL_ID: &str = "apple-high-performance";
+const ACCESSKIT_REVEAL_ACTION_ID: i32 = 0x4652_4401;
 const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     connection: ConnectionGlyph::Connected,
     diagnostics: None,
@@ -90,6 +91,67 @@ const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     clipboard: CapabilityGlyphState::Unavailable,
     action: Some(IslandAction::Disconnect),
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForcedRevealError {
+    ReleaseRejected(SessionHostError),
+}
+
+fn complete_checked_forced_reveal(
+    input: &mut InputRouter,
+    chrome: &mut FloatingChromeController,
+    release: Option<frd_core::InputEvent>,
+    now: std::time::Instant,
+    enqueue: impl FnOnce(frd_core::InputEvent) -> Result<(), SessionHostError>,
+) -> Result<(), ForcedRevealError> {
+    if let Some(release) = release {
+        if let Err(error) = enqueue(release) {
+            let _ = input.set_gate(InputGate::Blocked);
+            chrome.hide_after_failed_release();
+            return Err(ForcedRevealError::ReleaseRejected(error));
+        }
+    }
+    chrome.force_reveal_after_release(now);
+    Ok(())
+}
+
+fn install_accesskit_root_reveal_action(output: &mut egui::PlatformOutput, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let root_id = egui::accesskit_root_id().accesskit_id();
+    let Some(root) = output.accesskit_update.as_mut().and_then(|update| {
+        update
+            .nodes
+            .iter_mut()
+            .find_map(|(id, node)| (*id == root_id).then_some(node))
+    }) else {
+        return;
+    };
+    root.add_action(egui::accesskit::Action::CustomAction);
+    root.push_custom_action(egui::accesskit::CustomAction {
+        id: ACCESSKIT_REVEAL_ACTION_ID,
+        description: "显示远程桌面控制栏".into(),
+    });
+}
+
+fn is_accesskit_root_reveal_request(request: &egui::accesskit::ActionRequest) -> bool {
+    request.action == egui::accesskit::Action::CustomAction
+        && request.target_tree == egui::accesskit::TreeId::ROOT
+        && request.target_node == egui::accesskit_root_id().accesskit_id()
+        && request.data
+            == Some(egui::accesskit::ActionData::CustomAction(
+                ACCESSKIT_REVEAL_ACTION_ID,
+            ))
+}
+
+fn completes_first_remote_frame(
+    was_remote_session: bool,
+    is_remote_session: bool,
+    is_full_baseline: bool,
+) -> bool {
+    !was_remote_session && is_remote_session && is_full_baseline
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HighPerformanceInputShellLine {
@@ -1907,14 +1969,15 @@ struct DesktopWindowState {
     video_stage_trace: OwnedVideoStageTrace,
     dpi_transition: DpiTransition,
     pending_texture_writes: PendingTextureWrites,
+    floating_chrome: FloatingChromeController,
+    island_reposition_drag_delta: egui::Vec2,
     focus_session_chrome: bool,
 }
 
 impl DesktopWindowState {
     fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayouts> {
         let insets = self.chrome.native_insets(&self.window);
-        let remote_area =
-            persistent_session_panel_content_rect(self.physical_size, self.window.scale_factor())?;
+        let (normalized_center_x, top_points) = self.floating_chrome.normalized_position();
         let layouts = ChromeGeometrySnapshot::new(
             self.physical_size.width,
             self.physical_size.height,
@@ -1922,34 +1985,23 @@ impl DesktopWindowState {
             insets,
         )?
         .with_window_capabilities(self.chrome.capabilities())
-        .layouts(ControlIslandPlacement::default(), true)?;
-        self.remote_area = Some(remote_area);
+        .layouts(
+            ControlIslandPlacement {
+                normalized_center_x,
+                top_points,
+            },
+            self.floating_chrome.is_visible(),
+        )?;
+        self.remote_area = Some(layouts.remote.content_rect);
         self.chrome_layouts = Some(layouts.clone());
         Some(layouts)
     }
-}
 
-fn persistent_session_panel_content_rect(
-    physical_size: PixelSize,
-    scale_factor: f64,
-) -> Option<PixelRect> {
-    if !scale_factor.is_finite() || scale_factor <= 0.0 {
-        return None;
+    fn reset_connection_chrome(&mut self, now: std::time::Instant) {
+        self.floating_chrome = FloatingChromeController::connected_default(now);
+        self.floating_chrome.force_reveal_after_release(now);
+        self.island_reposition_drag_delta = egui::Vec2::ZERO;
     }
-    let panel_height = (TITLE_BAR_HEIGHT_POINTS * scale_factor).ceil();
-    if !panel_height.is_finite()
-        || panel_height <= 0.0
-        || panel_height >= f64::from(physical_size.height)
-    {
-        return None;
-    }
-    let panel_height = panel_height as u32;
-    Some(PixelRect {
-        x: 0,
-        y: panel_height,
-        width: physical_size.width,
-        height: physical_size.height - panel_height,
-    })
 }
 
 impl VideoSurfaceDrainTarget for DesktopWindowState {
@@ -2462,6 +2514,8 @@ impl DesktopApplication {
             video_stage_trace: OwnedVideoStageTrace::default(),
             dpi_transition: DpiTransition::default(),
             pending_texture_writes: PendingTextureWrites::default(),
+            floating_chrome: FloatingChromeController::connected_default(std::time::Instant::now()),
+            island_reposition_drag_delta: egui::Vec2::ZERO,
             focus_session_chrome: false,
         };
         state.refresh_chrome_geometry().ok_or_else(|| {
@@ -2525,6 +2579,9 @@ impl DesktopApplication {
                 }
             }
             Some(AppAction::StartSession(request, permit)) => {
+                if let Some(window) = self.window.as_mut() {
+                    window.reset_connection_chrome(std::time::Instant::now());
+                }
                 let target = self
                     .launch
                     .controller()
@@ -2742,6 +2799,58 @@ impl DesktopApplication {
         self.send_input_with_hp_diagnostics(event, None);
     }
 
+    fn force_reveal_island(&mut self, now: std::time::Instant) -> Result<(), ForcedRevealError> {
+        let release = self.input.enter_local_chrome();
+        self.finish_forced_reveal(release, now)
+    }
+
+    fn finish_forced_reveal(
+        &mut self,
+        release: Option<frd_core::InputEvent>,
+        now: std::time::Instant,
+    ) -> Result<(), ForcedRevealError> {
+        let Self {
+            input,
+            sessions,
+            launch,
+            window,
+            ..
+        } = self;
+        let Some(window) = window.as_mut() else {
+            let _ = input.set_gate(InputGate::Blocked);
+            return Err(ForcedRevealError::ReleaseRejected(
+                SessionHostError::NoActiveSession,
+            ));
+        };
+        let reveal = complete_checked_forced_reveal(
+            input,
+            &mut window.floating_chrome,
+            release,
+            now,
+            |event| {
+                let command = launch
+                    .controller()
+                    .route_input(event)
+                    .ok_or(SessionHostError::NoActiveSession)?;
+                sessions.send_command(command)
+            },
+        );
+        if let Err(error) = reveal {
+            window.window.request_redraw();
+            return Err(error);
+        }
+        window
+            .egui_context
+            .memory_mut(|memory| memory.stop_text_input());
+        window.focus_session_chrome = true;
+        window.window.request_redraw();
+        Ok(())
+    }
+
+    fn report_forced_reveal_error(error: ForcedRevealError) {
+        eprintln!("控制栏显示失败（FRD-WIN-SHELL-003: forced_reveal_release_rejected）：{error:?}");
+    }
+
     fn send_input_with_hp_diagnostics(
         &mut self,
         event: frd_core::InputEvent,
@@ -2857,6 +2966,23 @@ impl DesktopApplication {
     }
 
     fn render(&mut self) {
+        let (product_chrome, auto_hide_enabled) = match &self.mode {
+            DesktopMode::Product => (
+                self.launch.controller().session_chrome(),
+                matches!(
+                    self.launch.controller().page(),
+                    AppPage::RemoteSession { .. }
+                ),
+            ),
+            DesktopMode::TestTexture {
+                stage: TestTextureStage::RemoteSession,
+                ..
+            } => (Some(TEST_SESSION_CHROME.clone()), true),
+            DesktopMode::TestTexture {
+                stage: TestTextureStage::Connection,
+                ..
+            } => (None, false),
+        };
         let Some(window) = self.window.as_mut() else {
             return;
         };
@@ -2868,6 +2994,12 @@ impl DesktopApplication {
                 let _ = window.gpu.queue().submit(std::iter::empty());
             }
             return;
+        }
+        let now = std::time::Instant::now();
+        if product_chrome.is_none() {
+            window.floating_chrome = FloatingChromeController::connected_default(now);
+        } else if !auto_hide_enabled {
+            window.floating_chrome.force_reveal_after_release(now);
         }
         let Some(chrome_layouts) = window.refresh_chrome_geometry() else {
             return;
@@ -2883,73 +3015,62 @@ impl DesktopApplication {
         let mut intent = None;
         let mut window_command = None;
         let mut rendered_hit_rects = Vec::new();
-        let product_chrome = controller.session_chrome();
+        let mut island_hovered = false;
+        let mut island_focused = false;
+        let mut island_pressed = false;
+        let mut island_reposition_delta = egui::Vec2::ZERO;
+        let mut first_remote_frame_presented = false;
+        let chrome_available = product_chrome.is_some();
         let mut output = egui_context.run_ui(raw_input, |root_ui| {
-            egui::Panel::top("window-session-chrome")
-                .exact_size(TITLE_BAR_HEIGHT_POINTS as f32)
-                .frame(
-                    egui::Frame::new()
-                        .fill(root_ui.style().visuals.panel_fill)
-                        .inner_margin(egui::Margin::symmetric(0, 4)),
-                )
-                .show(root_ui, |ui| {
-                    let chrome = match mode {
-                        DesktopMode::Product => product_chrome.as_ref(),
-                        DesktopMode::TestTexture {
-                            stage: TestTextureStage::RemoteSession,
-                            ..
-                        } => Some(&TEST_SESSION_CHROME),
-                        DesktopMode::TestTexture {
-                            stage: TestTextureStage::Connection,
-                            ..
-                        } => None,
-                    };
-                    if let Some(chrome) = chrome {
-                        let window_capabilities = window.chrome.capabilities();
-                        let scale = window.window.scale_factor() as f32;
-                        let to_logical = |rect: ChromeRect| {
-                            egui::Rect::from_min_size(
-                                egui::pos2(rect.x as f32 / scale, rect.y as f32 / scale),
-                                egui::vec2(rect.width as f32 / scale, rect.height as f32 / scale),
-                            )
-                        };
-                        let island_rect = chrome_layouts
-                            .overlay
-                            .island_rect
-                            .map(to_logical)
-                            .expect("visible floating chrome geometry includes the island");
-                        let reveal_line_rect = to_logical(chrome_layouts.overlay.reveal_line_rect);
-                        let result = frd_ui_egui::show_control_island(
-                            ui.ctx(),
-                            frd_ui_egui::ControlIslandRenderInput {
-                                model: chrome,
-                                window_capabilities,
-                                visible: true,
-                                maximized: window_maximized,
-                                island_rect,
-                                reveal_line_rect,
-                                focus_first: focus_session_chrome,
-                                opaque_material: false,
-                            },
-                        );
-                        rendered_hit_rects = result.hit_rects;
-                        if result.window_move_requested {
-                            window_command = Some(WindowChromeCommand::BeginMove);
-                        }
-                        match result.action {
-                            Some(IslandAction::CancelConnect) => {
-                                intent = Some(AppIntent::CancelConnect);
-                            }
-                            Some(IslandAction::Disconnect) => {
-                                intent = Some(AppIntent::Disconnect);
-                            }
-                            Some(action) => {
-                                window_command = window_command_for_island_action(action);
-                            }
-                            None => {}
-                        }
+            if let Some(chrome) = product_chrome.as_ref() {
+                let window_capabilities = window.chrome.capabilities();
+                let scale = window.window.scale_factor() as f32;
+                let to_logical = |rect: ChromeRect| {
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.x as f32 / scale, rect.y as f32 / scale),
+                        egui::vec2(rect.width as f32 / scale, rect.height as f32 / scale),
+                    )
+                };
+                let reveal_line_rect = to_logical(chrome_layouts.overlay.reveal_line_rect);
+                let island_rect = chrome_layouts
+                    .overlay
+                    .island_rect
+                    .map(to_logical)
+                    .unwrap_or(reveal_line_rect);
+                let result = frd_ui_egui::show_control_island(
+                    root_ui.ctx(),
+                    frd_ui_egui::ControlIslandRenderInput {
+                        model: chrome,
+                        window_capabilities,
+                        visible: window.floating_chrome.is_visible(),
+                        maximized: window_maximized,
+                        island_rect,
+                        reveal_line_rect,
+                        focus_first: focus_session_chrome,
+                        opaque_material: false,
+                    },
+                );
+                island_hovered = result.hovered_union;
+                island_focused = result.focused_union;
+                island_pressed = result.pressed;
+                island_reposition_delta = result.reposition_delta;
+                rendered_hit_rects = result.hit_rects;
+                if result.window_move_requested {
+                    window_command = Some(WindowChromeCommand::BeginMove);
+                }
+                match result.action {
+                    Some(IslandAction::CancelConnect) => {
+                        intent = Some(AppIntent::CancelConnect);
                     }
-                });
+                    Some(IslandAction::Disconnect) => {
+                        intent = Some(AppIntent::Disconnect);
+                    }
+                    Some(action) => {
+                        window_command = window_command_for_island_action(action);
+                    }
+                    None => {}
+                }
+            }
 
             match mode {
                 DesktopMode::Product => {
@@ -2989,6 +3110,31 @@ impl DesktopApplication {
                 } => {}
             }
         });
+        install_accesskit_root_reveal_action(&mut output.platform_output, chrome_available);
+        if auto_hide_enabled && chrome_available {
+            window.floating_chrome.observe_island_union(
+                island_hovered,
+                island_focused || island_pressed,
+                now,
+            );
+        }
+        if island_pressed {
+            let delta = island_reposition_delta - window.island_reposition_drag_delta;
+            window.island_reposition_drag_delta = island_reposition_delta;
+            if delta != egui::Vec2::ZERO {
+                if let Some(bounds) = island_reposition_bounds(
+                    &chrome_layouts,
+                    window.physical_size,
+                    window.window.scale_factor(),
+                    window.chrome.native_insets(&window.window),
+                ) {
+                    window.floating_chrome.reposition(delta, bounds);
+                    window.window.request_redraw();
+                }
+            }
+        } else {
+            window.island_reposition_drag_delta = egui::Vec2::ZERO;
+        }
         let scale_factor = window.window.scale_factor();
         let island_actions = rendered_hit_rects
             .into_iter()
@@ -3004,6 +3150,7 @@ impl DesktopApplication {
                 chrome_layouts.overlay.window_move_region,
                 Vec::new(),
             )
+            .and_then(|map| map.with_island_surface(chrome_layouts.overlay.island_rect))
         }) {
             window.chrome.publish_hit_map(hit_map.clone());
             window.chrome_hit_map = Some(hit_map);
@@ -3125,13 +3272,19 @@ impl DesktopApplication {
                     self.metrics
                         .observe_presented(identity, revision, presented_at);
                 }
-                self.launch.controller_mut().handle_presentation(event);
-                if matches!(
+                let was_remote_session = matches!(
                     self.launch.controller().page(),
                     AppPage::RemoteSession { .. }
-                ) && completeness == FrameCompleteness::FullBaseline
-                {
+                );
+                self.launch.controller_mut().handle_presentation(event);
+                let is_remote_session = matches!(
+                    self.launch.controller().page(),
+                    AppPage::RemoteSession { .. }
+                );
+                if is_remote_session && completeness == FrameCompleteness::FullBaseline {
                     let egui_context = window.egui_context.clone();
+                    first_remote_frame_presented =
+                        completes_first_remote_frame(was_remote_session, is_remote_session, true);
                     if let Some(release) = self.input.set_gate(InputGate::Interactive {
                         session_id,
                         generation,
@@ -3210,11 +3363,18 @@ impl DesktopApplication {
                 revision,
                 std::time::Instant::now(),
             );
-            self.launch.controller_mut().handle_presentation(event);
-            if matches!(
+            let was_remote_session = matches!(
                 self.launch.controller().page(),
                 AppPage::RemoteSession { .. }
-            ) {
+            );
+            self.launch.controller_mut().handle_presentation(event);
+            let is_remote_session = matches!(
+                self.launch.controller().page(),
+                AppPage::RemoteSession { .. }
+            );
+            if is_remote_session {
+                first_remote_frame_presented =
+                    completes_first_remote_frame(was_remote_session, is_remote_session, true);
                 if let Some(release) = self.input.set_gate(InputGate::Interactive {
                     session_id,
                     generation,
@@ -3270,6 +3430,15 @@ impl DesktopApplication {
                 }
                 *stage = TestTextureStage::RemoteSession;
                 self.request_redraw();
+            }
+        }
+        if first_remote_frame_presented {
+            if let Some(window) = self.window.as_mut() {
+                window.floating_chrome.observe_island_union(
+                    false,
+                    false,
+                    std::time::Instant::now(),
+                );
             }
         }
     }
@@ -3520,15 +3689,8 @@ impl DesktopApplication {
                 true
             }
             KeyboardPreDispatch::EnterLocalChrome(release) => {
-                if let Some(release) = release {
-                    self.send_input(release);
-                }
-                if let Some(window) = self.window.as_mut() {
-                    window.egui_context.memory_mut(|memory| {
-                        memory.stop_text_input();
-                    });
-                    window.focus_session_chrome = true;
-                    window.window.request_redraw();
+                if let Err(error) = self.finish_forced_reveal(release, std::time::Instant::now()) {
+                    Self::report_forced_reveal_error(error);
                 }
                 true
             }
@@ -3818,19 +3980,17 @@ impl DesktopApplication {
         }
     }
 
-    fn synchronize_repaint_deadline(&mut self, event_loop: &ActiveEventLoop) {
+    fn synchronize_repaint_deadline(&mut self) {
         self.armed_repaint = self.repaint_scheduler.take_plan();
         let now = std::time::Instant::now();
-        match self.armed_repaint {
-            Some(plan) if plan.deadline <= now => {
-                if self.repaint_scheduler.fire(plan, now) {
-                    self.request_redraw();
-                }
-                self.armed_repaint = None;
-                event_loop.set_control_flow(ControlFlow::Wait);
+        if let Some(plan) = self.armed_repaint {
+            if plan.deadline > now {
+                return;
             }
-            Some(plan) => event_loop.set_control_flow(ControlFlow::WaitUntil(plan.deadline)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+            if self.repaint_scheduler.fire(plan, now) {
+                self.request_redraw();
+            }
+            self.armed_repaint = None;
         }
     }
 }
@@ -3884,7 +4044,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 drop(callbacks);
                 self.maybe_finish_exit(event_loop);
             }
-            DesktopUserEvent::Repaint => self.synchronize_repaint_deadline(event_loop),
+            DesktopUserEvent::Repaint => self.synchronize_repaint_deadline(),
             DesktopUserEvent::LaunchFinished(outcome) => {
                 self.handle_launch_finished(event_loop, outcome)
             }
@@ -3908,28 +4068,36 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             }
             DesktopUserEvent::ExitTestTexture => event_loop.exit(),
             DesktopUserEvent::AccessKit(event) => {
-                if matches!(
-                    &event.window_event,
-                    egui_winit::accesskit_winit::WindowEvent::ActionRequested(_)
-                ) {
-                    if let Some(release) = self.input.enter_local_chrome() {
-                        self.send_input(release);
-                    }
-                }
-                let Some(window) = self
+                let Some(window_id) = self
                     .window
-                    .as_mut()
+                    .as_ref()
                     .filter(|window| window.window.id() == event.window_id)
+                    .map(|window| window.window.id())
                 else {
                     return;
                 };
                 match event.window_event {
                     egui_winit::accesskit_winit::WindowEvent::InitialTreeRequested => {
-                        window.window.request_redraw();
+                        if let Some(window) = self.window.as_ref() {
+                            window.window.request_redraw();
+                        }
+                    }
+                    egui_winit::accesskit_winit::WindowEvent::ActionRequested(request)
+                        if is_accesskit_root_reveal_request(&request) =>
+                    {
+                        if let Err(error) = self.force_reveal_island(std::time::Instant::now()) {
+                            Self::report_forced_reveal_error(error);
+                        }
                     }
                     egui_winit::accesskit_winit::WindowEvent::ActionRequested(request) => {
-                        window.egui_state.on_accesskit_action_request(request);
-                        window.window.request_redraw();
+                        if let Some(window) = self
+                            .window
+                            .as_mut()
+                            .filter(|window| window.window.id() == window_id)
+                        {
+                            window.egui_state.on_accesskit_action_request(request);
+                            window.window.request_redraw();
+                        }
                     }
                     egui_winit::accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
                 }
@@ -3964,8 +4132,20 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         if let WindowEvent::CursorMoved { position, .. } = &event {
             let position = (position.x >= 0.0 && position.y >= 0.0)
                 .then_some((position.x as u32, position.y as u32));
+            let remote_input_held = self.input.has_remote_held_input();
             if let Some(window) = self.window.as_mut() {
                 window.cursor_position = position;
+                let inside_top_sensor = position.is_some_and(|(x, y)| {
+                    window
+                        .chrome_layouts
+                        .as_ref()
+                        .is_some_and(|layouts| layouts.overlay.top_sensor_rect.contains(x, y))
+                });
+                window.floating_chrome.observe_top_sensor(
+                    inside_top_sensor,
+                    remote_input_held,
+                    std::time::Instant::now(),
+                );
             }
         }
         match &event {
@@ -4100,6 +4280,13 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         let now = std::time::Instant::now();
         self.metrics.advance_phase(now);
         self.publish_metrics_failure();
+        let chrome_changed = self
+            .window
+            .as_mut()
+            .is_some_and(|window| window.floating_chrome.advance(now));
+        if chrome_changed {
+            self.request_redraw();
+        }
         if self
             .exit_state
             .pending_launch_deadline()
@@ -4149,6 +4336,11 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             .into_iter()
             .chain(self.exit_state.pending_launch_deadline())
             .chain(self.metrics.next_deadline(now))
+            .chain(
+                self.window
+                    .as_ref()
+                    .and_then(|window| window.floating_chrome.next_deadline()),
+            )
             .min();
         event_loop.set_control_flow(
             next_deadline
@@ -4285,6 +4477,27 @@ fn logical_rect_to_physical(rect: egui::Rect, scale_factor: f64) -> Option<Chrom
     })
 }
 
+fn island_reposition_bounds(
+    layouts: &ChromeLayouts,
+    physical_size: PixelSize,
+    scale_factor: f64,
+    native: crate::NativeChromeInsets,
+) -> Option<egui::Rect> {
+    let island = layouts.overlay.island_rect?;
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    let scale = scale_factor as f32;
+    let half_width = island.width as f32 / scale / 2.0;
+    let island_height = island.height as f32 / scale;
+    let left = native.leading_px as f32 / scale + half_width;
+    let right =
+        (physical_size.width.saturating_sub(native.trailing_px)) as f32 / scale - half_width;
+    let bottom = physical_size.height as f32 / scale - island_height;
+    (left.is_finite() && right.is_finite() && bottom.is_finite() && right > left && bottom >= 0.0)
+        .then(|| egui::Rect::from_min_max(egui::pos2(left, 0.0), egui::pos2(right, bottom)))
+}
+
 fn window_command_for_island_action(action: IslandAction) -> Option<WindowChromeCommand> {
     match action {
         IslandAction::MinimizeWindow => Some(WindowChromeCommand::Minimize),
@@ -4305,7 +4518,13 @@ fn pointer_keyboard_ownership(
     position: (u32, u32),
 ) -> Option<InputOwnership> {
     match hit_map.hit_test(position) {
-        Some(ChromeHitTarget::IslandAction(_)) => Some(InputOwnership::Ui),
+        Some(
+            ChromeHitTarget::IslandAction(_)
+            | ChromeHitTarget::IslandRepositionHandle
+            | ChromeHitTarget::IslandSurface
+            | ChromeHitTarget::WindowMoveRegion
+            | ChromeHitTarget::NativeChrome,
+        ) => Some(InputOwnership::Ui),
         Some(ChromeHitTarget::RemoteContent) => {
             let rect = content_viewport?.content;
             let in_content = position.0 >= rect.x
@@ -4318,12 +4537,7 @@ fn pointer_keyboard_ownership(
                 InputOwnership::Ui
             })
         }
-        Some(
-            ChromeHitTarget::IslandRepositionHandle
-            | ChromeHitTarget::WindowMoveRegion
-            | ChromeHitTarget::NativeChrome,
-        )
-        | None => None,
+        None => None,
     }
 }
 
@@ -5833,13 +6047,26 @@ mod tests {
             width: 44,
             height: 44,
         };
+        let window_move = crate::ChromeRect {
+            x: 600,
+            y: 8,
+            width: 44,
+            height: 44,
+        };
+        let island_surface = crate::ChromeRect {
+            x: 700,
+            y: 8,
+            width: 44,
+            height: 44,
+        };
         let hit_map = crate::ChromeHitMap::candidate(
             remote_content,
             vec![(glyph, frd_ui_model::IslandAction::Disconnect)],
             Some(reposition),
-            None,
+            Some(window_move),
             Vec::new(),
         )
+        .and_then(|map| map.with_island_surface(Some(island_surface)))
         .unwrap();
         let viewport = ContentViewport {
             drawable: PixelSize::new(1100, 720).unwrap(),
@@ -5888,8 +6115,101 @@ mod tests {
         );
         assert_eq!(
             super::pointer_keyboard_ownership(&hit_map, Some(viewport), reposition.center()),
-            None
+            Some(crate::InputOwnership::Ui)
         );
+        assert_eq!(
+            super::pointer_keyboard_ownership(&hit_map, Some(viewport), window_move.center()),
+            Some(crate::InputOwnership::Ui)
+        );
+        assert_eq!(
+            hit_map.hit_test(island_surface.center()),
+            Some(crate::ChromeHitTarget::IslandSurface)
+        );
+        assert_eq!(
+            super::pointer_keyboard_ownership(&hit_map, Some(viewport), island_surface.center()),
+            Some(crate::InputOwnership::Ui)
+        );
+    }
+
+    #[test]
+    fn forced_reveal_blocks_when_release_all_cannot_be_enqueued() {
+        let mut input = crate::InputRouter::default();
+        input.focus_gained();
+        input.set_gate(crate::InputGate::Interactive {
+            session_id: SessionId::allocate(),
+            generation: 7,
+        });
+        let held_key = PhysicalKeyCode::from_usb_hid_usage(0xe0);
+        assert!(input
+            .key(held_key, KeyState::Pressed, crate::InputOwnership::Remote)
+            .is_some());
+        let release = input.enter_local_chrome();
+        let start = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(start);
+        chrome.observe_top_sensor(true, false, start);
+        assert_eq!(chrome.state(), crate::ControlIslandState::RevealPending);
+
+        assert_eq!(
+            super::complete_checked_forced_reveal(
+                &mut input,
+                &mut chrome,
+                release,
+                start,
+                |_| Err(super::SessionHostError::CommandClosed),
+            ),
+            Err(super::ForcedRevealError::ReleaseRejected(
+                super::SessionHostError::CommandClosed
+            ))
+        );
+        assert_eq!(input.interactive_epoch(), None);
+        assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
+    }
+
+    #[test]
+    fn accesskit_root_custom_action_is_the_only_root_reveal_request() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut output = context.run_ui(Default::default(), |_| {});
+        super::install_accesskit_root_reveal_action(&mut output.platform_output, true);
+        let root_id = egui::accesskit_root_id().accesskit_id();
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("enabled AccessKit emits a tree update");
+        let root = update
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (*id == root_id).then_some(node))
+            .expect("egui AccessKit tree includes its root node");
+        assert!(root.supports_action(egui::accesskit::Action::CustomAction));
+        assert!(root.custom_actions().iter().any(|action| {
+            action.id == super::ACCESSKIT_REVEAL_ACTION_ID
+                && action.description.as_ref() == "显示远程桌面控制栏"
+        }));
+
+        let request = egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::CustomAction,
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node: root_id,
+            data: Some(egui::accesskit::ActionData::CustomAction(
+                super::ACCESSKIT_REVEAL_ACTION_ID,
+            )),
+        };
+        assert!(super::is_accesskit_root_reveal_request(&request));
+
+        let mut wrong_action = request;
+        wrong_action.data = Some(egui::accesskit::ActionData::CustomAction(-1));
+        assert!(!super::is_accesskit_root_reveal_request(&wrong_action));
+        super::mark_texture_deltas_applied(&mut output.textures_delta);
+    }
+
+    #[test]
+    fn only_the_transition_to_remote_session_starts_the_initial_hide_deadline() {
+        assert!(super::completes_first_remote_frame(false, true, true));
+        assert!(!super::completes_first_remote_frame(true, true, true));
+        assert!(!super::completes_first_remote_frame(false, true, false));
+        assert!(!super::completes_first_remote_frame(false, false, true));
     }
 
     #[test]
@@ -6020,19 +6340,6 @@ mod tests {
 
         assert!(deltas.set.is_empty());
         assert!(deltas.free.is_empty());
-    }
-
-    #[test]
-    fn persistent_panel_keeps_remote_surface_below_reserved_row_until_overlay_cutover() {
-        assert_eq!(
-            super::persistent_session_panel_content_rect(PixelSize::new(1100, 720).unwrap(), 1.5),
-            Some(PixelRect {
-                x: 0,
-                y: 66,
-                width: 1100,
-                height: 654,
-            })
-        );
     }
 
     struct CountingWake(AtomicUsize);

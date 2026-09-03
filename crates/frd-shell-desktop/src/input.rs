@@ -126,6 +126,13 @@ impl InputRouter {
         self.modifiers
     }
 
+    pub fn has_remote_held_input(&self) -> bool {
+        self.remote_buttons.any_pressed()
+            || self.remote_back_pressed
+            || self.remote_forward_pressed
+            || !self.remote_keys.is_empty()
+    }
+
     pub fn enter_local_chrome(&mut self) -> Option<InputEvent> {
         self.keyboard_domain = KeyboardDomain::LocalChrome;
         self.disarm_remote_ownership()
@@ -367,10 +374,7 @@ impl InputRouter {
     }
 
     fn release_remote_state(&mut self) -> Option<InputEvent> {
-        let held = self.remote_buttons.any_pressed()
-            || self.remote_back_pressed
-            || self.remote_forward_pressed
-            || !self.remote_keys.is_empty();
+        let held = self.has_remote_held_input();
         self.remote_buttons = PointerButtons::default();
         self.remote_back_pressed = false;
         self.remote_forward_pressed = false;
@@ -813,6 +817,20 @@ mod tests {
             input.pre_dispatch_key(home, KeyState::Pressed, false),
             KeyboardPreDispatch::LocalChrome
         );
+    }
+
+    #[test]
+    fn held_remote_input_is_reported_until_the_ownership_handoff_releases_it() {
+        let mut input = interactive_input();
+        let control = frd_core::PhysicalKeyCode::from_usb_hid_usage(0xe0);
+        assert!(matches!(
+            input.pre_dispatch_key(control, KeyState::Pressed, false),
+            KeyboardPreDispatch::Remote(Some(_))
+        ));
+        assert!(input.has_remote_held_input());
+
+        assert_eq!(input.enter_local_chrome(), Some(InputEvent::ReleaseAll));
+        assert!(!input.has_remote_held_input());
     }
 
     #[test]
