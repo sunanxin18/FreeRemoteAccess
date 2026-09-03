@@ -9,7 +9,7 @@ use frd_media_api::{
     VideoParameterSets, VideoProfile, VideoRange, VideoStreamConfig, VideoStreamConfigInput,
     VideoStreamIdentity, VideoTimeBase, VideoTimestamp,
 };
-use frd_protocol_api::ProtocolRuntime;
+use frd_protocol_api::{ProtocolRuntime, RecoverableMediaPublishOutcome};
 
 use crate::hevc_access_unit::HevcAccessUnit;
 use crate::hevc_sps::{parse_hevc_sps, HevcSps};
@@ -153,9 +153,21 @@ impl AppleHighPerformanceVideoAdapter {
             let config =
                 build_video_config(self.identity, self.generation, sps, Some(parameter_sets))?;
             published_config_size = Some(config.as_input().coded_size);
-            runtime
-                .publish_required_media_detailed(MediaFrame::VideoConfig(config))
-                .map_err(AppleHighPerformanceVideoError::MediaPublicationFailed)?;
+            match runtime
+                .publish_media_with_recoverable_backpressure(MediaFrame::VideoConfig(config))
+            {
+                Ok(RecoverableMediaPublishOutcome::Published) => {}
+                Ok(RecoverableMediaPublishOutcome::Backpressured) => {
+                    return Err(AppleHighPerformanceVideoError::MediaPublicationFailed(
+                        MediaPublishError::Full,
+                    ));
+                }
+                Err(error) => {
+                    return Err(AppleHighPerformanceVideoError::MediaPublicationFailed(
+                        error,
+                    ));
+                }
+            }
             #[cfg(any(debug_assertions, test))]
             {
                 self.diagnostics.video_config_publications =
@@ -179,9 +191,21 @@ impl AppleHighPerformanceVideoAdapter {
             annex_b.into_boxed_slice(),
         )
         .map_err(|_| AppleHighPerformanceVideoError::MalformedAccessUnit)?;
-        runtime
-            .publish_required_media_detailed(MediaFrame::EncodedVideo(access_unit))
-            .map_err(AppleHighPerformanceVideoError::MediaPublicationFailed)?;
+        match runtime
+            .publish_media_with_recoverable_backpressure(MediaFrame::EncodedVideo(access_unit))
+        {
+            Ok(RecoverableMediaPublishOutcome::Published) => {}
+            Ok(RecoverableMediaPublishOutcome::Backpressured) => {
+                return Err(AppleHighPerformanceVideoError::MediaPublicationFailed(
+                    MediaPublishError::Full,
+                ));
+            }
+            Err(error) => {
+                return Err(AppleHighPerformanceVideoError::MediaPublicationFailed(
+                    error,
+                ));
+            }
+        }
         #[cfg(any(debug_assertions, test))]
         {
             self.diagnostics.encoded_video_publications = self

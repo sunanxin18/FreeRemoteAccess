@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use frd_core::SessionId;
-use frd_media_api::{MediaFrame, MediaStageDiagnostic, MediaStageTrace, VideoStreamIdentity};
+use frd_media_api::{
+    MediaFrame, MediaPublishError, MediaStageDiagnostic, MediaStageTrace, VideoStreamIdentity,
+};
 use frd_protocol_api::{AudioState, ProtocolError, ProtocolRuntime, SessionEvent};
 
 use crate::audio_codec::{
@@ -23,7 +25,9 @@ use crate::hevc_access_unit::{
     HevcAccessUnitAssembler, HevcAccessUnitError, HevcAccessUnitLimits, HevcRtpPacket,
 };
 use crate::hevc_rtp::HevcRtpError;
-use crate::high_performance_video::AppleHighPerformanceVideoAdapter;
+use crate::high_performance_video::{
+    AppleHighPerformanceVideoAdapter, AppleHighPerformanceVideoError,
+};
 use crate::hp_media_diagnostics::{
     adapter_fatal_category, emit_hp_media_fatal, hevc_fatal_category,
     VIDEO_RTP_PARSE_FATAL_CATEGORY,
@@ -285,6 +289,7 @@ struct VideoReceiveState {
     active_ssrc: Option<u32>,
     retired_ssrcs: VecDeque<u32>,
     awaiting_replacement_irap: bool,
+    awaiting_backpressure_irap: bool,
     #[cfg(any(debug_assertions, test))]
     authenticated_rtp_packets: u64,
 }
@@ -305,6 +310,7 @@ impl VideoReceiveState {
             active_ssrc: None,
             retired_ssrcs: VecDeque::new(),
             awaiting_replacement_irap: false,
+            awaiting_backpressure_irap: false,
             #[cfg(any(debug_assertions, test))]
             authenticated_rtp_packets: 0,
         })
@@ -318,6 +324,7 @@ impl VideoReceiveState {
         self.active_ssrc = None;
         self.retired_ssrcs.clear();
         self.awaiting_replacement_irap = false;
+        self.awaiting_backpressure_irap = false;
         #[cfg(any(debug_assertions, test))]
         {
             self.authenticated_rtp_packets = 0;
@@ -360,6 +367,7 @@ impl VideoReceiveState {
                 self.pending_recovery_request = None;
                 self.active_ssrc = Some(packet.header.ssrc);
                 self.awaiting_replacement_irap = true;
+                self.awaiting_backpressure_irap = false;
             }
             None => self.active_ssrc = Some(packet.header.ssrc),
             Some(_) => {}
@@ -381,13 +389,13 @@ impl VideoReceiveState {
                 return Ok(());
             }
             Err(HevcAccessUnitError::MissingInitialParameterSets)
-                if self.awaiting_replacement_irap =>
+                if self.awaiting_replacement_irap || self.awaiting_backpressure_irap =>
             {
                 self.assembler.reset(generation);
                 return Ok(());
             }
             Err(HevcAccessUnitError::Depacketize(HevcRtpError::FuContinuationWithoutStart))
-                if self.awaiting_replacement_irap =>
+                if self.awaiting_replacement_irap || self.awaiting_backpressure_irap =>
             {
                 self.assembler.reset(generation);
                 return Ok(());
@@ -404,9 +412,27 @@ impl VideoReceiveState {
                 }
                 self.awaiting_replacement_irap = false;
             }
-            if let Err(error) = self.adapter.publish_access_unit(runtime, access_unit) {
-                emit_hp_media_fatal(adapter_fatal_category(&error));
-                return Err(error).context("发布 Apple HP HEVC 访问单元失败");
+            if self.awaiting_backpressure_irap && !access_unit.keyframe {
+                continue;
+            }
+            match self.adapter.publish_access_unit(runtime, access_unit) {
+                Ok(()) => self.awaiting_backpressure_irap = false,
+                Err(AppleHighPerformanceVideoError::MediaPublicationFailed(
+                    MediaPublishError::Full,
+                )) => {
+                    self.pending_recovery_request.get_or_insert(
+                        VideoRecoveryRequest::PictureLoss {
+                            media_ssrc: packet.header.ssrc,
+                        },
+                    );
+                    self.assembler.reset(generation);
+                    self.awaiting_backpressure_irap = true;
+                    return Ok(());
+                }
+                Err(error) => {
+                    emit_hp_media_fatal(adapter_fatal_category(&error));
+                    return Err(error).context("发布 Apple HP HEVC 访问单元失败");
+                }
             }
         }
         Ok(())
@@ -970,6 +996,24 @@ mod tests {
         attempts: Arc<Mutex<usize>>,
     }
 
+    struct BackpressureOnceMedia {
+        attempts: Arc<Mutex<usize>>,
+        published: Arc<Mutex<Vec<MediaFrame>>>,
+        reject_attempt: usize,
+    }
+
+    impl MediaPublisher for BackpressureOnceMedia {
+        fn publish(&self, frame: MediaFrame) -> Result<(), MediaPublishError> {
+            let mut attempts = self.attempts.lock().unwrap();
+            *attempts += 1;
+            if *attempts == self.reject_attempt {
+                return Err(MediaPublishError::Full);
+            }
+            self.published.lock().unwrap().push(frame);
+            Ok(())
+        }
+    }
+
     impl MediaPublisher for RejectingMedia {
         fn publish(&self, _frame: MediaFrame) -> Result<(), MediaPublishError> {
             *self.attempts.lock().unwrap() += 1;
@@ -1359,6 +1403,156 @@ mod tests {
                 && access_unit.timestamp().ticks == 9_000
                 && access_unit.random_access())
         );
+    }
+
+    #[test]
+    fn video_queue_backpressure_requests_one_recovery_and_resumes_on_irap() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let attempts = Arc::new(Mutex::new(0usize));
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(BackpressureOnceMedia {
+                attempts: attempts.clone(),
+                published: published.clone(),
+                reject_attempt: 3,
+            })),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let aggregation = startup_parameter_set_ap();
+        for (sequence, marker, payload) in [
+            (1, false, aggregation.as_slice()),
+            (2, true, &[0x26, 0x01, 0xaa][..]),
+        ] {
+            accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(video_rtp(sequence, 0, marker, payload)),
+            )
+            .unwrap();
+        }
+        assert_eq!(published.lock().unwrap().len(), 2);
+
+        let (result, lines) = with_test_diagnostic_observer(true, || {
+            accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(video_rtp(3, 3_000, true, &[0x02, 0x01, 0xbb])),
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "queue Full must not fail the desktop session"
+        );
+        assert!(
+            lines.is_empty(),
+            "queue Full must not emit a fatal diagnostic"
+        );
+        assert!(!runtime.requires_shutdown());
+        assert_eq!(
+            state.video_stream_1.take_recovery_request(),
+            Some(super::VideoRecoveryRequest::PictureLoss {
+                media_ssrc: 0x1020_3040,
+            })
+        );
+        assert_eq!(state.video_stream_1.take_recovery_request(), None);
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(4, 6_000, true, &[0x02, 0x01, 0xcc])),
+        )
+        .expect("non-IRAP must be discarded while recovering from queue backpressure");
+        assert_eq!(published.lock().unwrap().len(), 2);
+
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(5, 9_000, false, &startup_parameter_set_ap())),
+        )
+        .unwrap();
+        accept_state_datagram(
+            &mut state,
+            &mut runtime,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(video_rtp(6, 9_000, true, &[0x26, 0x01, 0xdd])),
+        )
+        .expect("the first recovery IRAP must resume publication");
+
+        assert!(!runtime.requires_shutdown());
+        assert_eq!(*attempts.lock().unwrap(), 4);
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 3);
+        assert!(
+            matches!(&published[2], MediaFrame::EncodedVideo(access_unit)
+            if access_unit.random_access() && access_unit.timestamp().ticks == 9_000)
+        );
+    }
+
+    #[test]
+    fn closed_video_worker_remains_fatal_and_poisoning() {
+        let session_id = SessionId::allocate();
+        let (_commands, command_rx) = mpsc::channel();
+        let attempts = Arc::new(Mutex::new(0usize));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(NoopFrames),
+            Some(Box::new(RejectingMedia {
+                failure: MediaPublishError::Closed,
+                attempts: attempts.clone(),
+            })),
+            Box::new(NoopWake),
+        );
+        establish_desktop_generation(&mut runtime, session_id);
+        let mut state = ViewerMediaState::new_for_session(
+            session_id,
+            AudioMediaFlow::MacToPc,
+            1,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap();
+
+        let (result, lines) = with_test_diagnostic_observer(true, || {
+            accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(video_rtp(1, 0, false, &startup_parameter_set_ap())),
+            )?;
+            accept_state_datagram(
+                &mut state,
+                &mut runtime,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(video_rtp(2, 0, true, &[0x26, 0x01, 0xaa])),
+            )
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            lines,
+            ["[apple-hp-media-fatal] category=video_worker_closed"]
+        );
+        assert!(runtime.requires_shutdown());
+        assert_eq!(*attempts.lock().unwrap(), 1);
     }
 
     #[test]

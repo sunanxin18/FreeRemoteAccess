@@ -32,6 +32,12 @@ pub enum ProtocolError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoverableMediaPublishOutcome {
+    Published,
+    Backpressured,
+}
+
 impl ProtocolError {
     pub fn adapter(protocol_id: ProtocolId, code: &'static str) -> Self {
         Self::Adapter { protocol_id, code }
@@ -874,6 +880,31 @@ impl ProtocolRuntime {
         result
     }
 
+    /// 发布会话必需的媒体帧，并允许调用方从有界队列背压中恢复。
+    ///
+    /// `Full` 作为 `Backpressured` 返回且不 poison runtime；消费者关闭、未配置
+    /// 媒体端口或已进入终态仍以 `Closed` 失败，并保持会话必需媒体的 fatal 语义。
+    pub fn publish_media_with_recoverable_backpressure(
+        &mut self,
+        frame: MediaFrame,
+    ) -> Result<RecoverableMediaPublishOutcome, MediaPublishError> {
+        if self.terminal {
+            return Err(MediaPublishError::Closed);
+        }
+        let Some(media) = &self.media else {
+            self.poison();
+            return Err(MediaPublishError::Closed);
+        };
+        match media.publish(frame) {
+            Ok(()) => Ok(RecoverableMediaPublishOutcome::Published),
+            Err(MediaPublishError::Full) => Ok(RecoverableMediaPublishOutcome::Backpressured),
+            Err(MediaPublishError::Closed) => {
+                self.poison();
+                Err(MediaPublishError::Closed)
+            }
+        }
+    }
+
     /// 尝试发布可独立降级的媒体帧。媒体端口背压或关闭不会把桌面会话
     /// 标记为终态；调用方必须显式停止该媒体流，不能在循环中隐藏重试。
     pub fn try_publish_optional_media(&mut self, frame: MediaFrame) -> Result<(), ProtocolError> {
@@ -909,8 +940,9 @@ mod tests {
 
     use super::{
         evaluate_server_identity, Endpoint, MailboxSurfacePublisher, ProtocolCatalog,
-        ProtocolError, ProtocolId, ProtocolRuntime, ProtocolSelection, RuntimeEventSink,
-        RuntimeWake, SessionCommand, SessionEvent, SurfacePublisher, TargetSystem,
+        ProtocolError, ProtocolId, ProtocolRuntime, ProtocolSelection,
+        RecoverableMediaPublishOutcome, RuntimeEventSink, RuntimeWake, SessionCommand,
+        SessionEvent, SurfacePublisher, TargetSystem,
     };
 
     #[test]
@@ -1595,6 +1627,85 @@ mod tests {
             Err(MediaPublishError::Closed)
         );
         assert!(!runtime.requires_shutdown());
+    }
+
+    #[test]
+    fn recoverable_media_backpressure_preserves_runtime_but_closed_is_terminal() {
+        for (failure, expected, terminal) in [
+            (
+                MediaPublishError::Full,
+                Ok(RecoverableMediaPublishOutcome::Backpressured),
+                false,
+            ),
+            (
+                MediaPublishError::Closed,
+                Err(MediaPublishError::Closed),
+                true,
+            ),
+        ] {
+            let session_id = SessionId::allocate();
+            let (_, receiver) = mpsc::channel();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let attempts = Arc::new(Mutex::new(0usize));
+            let mut runtime = ProtocolRuntime::new(
+                session_id,
+                receiver,
+                Box::new(RecordingEvents(log.clone())),
+                Box::new(RecordingFrames(log.clone())),
+                Some(Box::new(OptionalFailingMedia {
+                    failure,
+                    attempts: attempts.clone(),
+                })),
+                Box::new(RecordingWake(log)),
+            );
+            establish_generation(&mut runtime, session_id, 1);
+
+            assert_eq!(
+                runtime.publish_media_with_recoverable_backpressure(MediaFrame::EncodedVideo(
+                    test_access_unit(session_id, 1),
+                )),
+                expected
+            );
+            assert_eq!(runtime.requires_shutdown(), terminal);
+            assert_eq!(*attempts.lock().expect("media attempts"), 1);
+            if terminal {
+                assert_eq!(
+                    runtime.publish_media_with_recoverable_backpressure(MediaFrame::EncodedVideo(
+                        test_access_unit(session_id, 1)
+                    ),),
+                    Err(MediaPublishError::Closed)
+                );
+                assert_eq!(
+                    *attempts.lock().expect("terminal media attempts"),
+                    1,
+                    "terminal runtime must not call the media publisher again"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recoverable_media_without_a_port_is_closed_and_terminal() {
+        let session_id = SessionId::allocate();
+        let (_, receiver) = mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            receiver,
+            Box::new(RecordingEvents(log.clone())),
+            Box::new(RecordingFrames(log.clone())),
+            None,
+            Box::new(RecordingWake(log)),
+        );
+        establish_generation(&mut runtime, session_id, 1);
+
+        assert_eq!(
+            runtime.publish_media_with_recoverable_backpressure(MediaFrame::EncodedVideo(
+                test_access_unit(session_id, 1),
+            )),
+            Err(MediaPublishError::Closed)
+        );
+        assert!(runtime.requires_shutdown());
     }
 
     #[test]
