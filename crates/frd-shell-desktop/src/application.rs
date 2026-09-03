@@ -72,7 +72,7 @@ use crate::video_decode_worker::{
 use crate::window_chrome::{INITIAL_MINIMUM_WINDOW_WIDTH_POINTS, MINIMUM_WINDOW_HEIGHT_POINTS};
 use crate::{
     ChromeHit, ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter,
-    WindowChromeAdapter, TITLE_BAR_HEIGHT_POINTS,
+    NativeChromeInsets, WindowChromeAdapter, WindowChromeError, TITLE_BAR_HEIGHT_POINTS,
 };
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -1814,22 +1814,6 @@ impl DesktopWindowState {
         self.chrome_layout = None;
         let insets = self.chrome.native_insets(&self.window);
         let scale_factor = self.window.scale_factor();
-        let Some(minimum_width) =
-            ChromeLayout::minimum_width_px(scale_factor, insets.leading_px, insets.trailing_px)
-        else {
-            self.remote_area = None;
-            self.chrome.publish_hit_regions(None);
-            return None;
-        };
-        let minimum_height = (MINIMUM_WINDOW_HEIGHT_POINTS * scale_factor).ceil() as u32;
-        self.window
-            .set_min_inner_size(Some(PhysicalSize::new(minimum_width, minimum_height)));
-        if self.physical_size.width < minimum_width {
-            let _ = self.window.request_inner_size(PhysicalSize::new(
-                minimum_width,
-                self.physical_size.height.max(minimum_height),
-            ));
-        }
         let Some(layout) = ChromeLayout::for_window(
             self.physical_size.width,
             self.physical_size.height,
@@ -1847,6 +1831,45 @@ impl DesktopWindowState {
             .publish_hit_regions(Some(ChromeHitRegions { layout }));
         Some(layout)
     }
+
+    fn update_chrome_minimum_size(&self) -> Option<PhysicalSize<u32>> {
+        let insets = self.chrome.native_insets(&self.window);
+        apply_chrome_minimum_size(
+            &self.window,
+            self.window.scale_factor(),
+            insets,
+            self.physical_size,
+        )
+    }
+}
+
+fn chrome_minimum_size(scale_factor: f64, insets: NativeChromeInsets) -> Option<PhysicalSize<u32>> {
+    let width =
+        ChromeLayout::minimum_width_px(scale_factor, insets.leading_px, insets.trailing_px)?;
+    let height = (MINIMUM_WINDOW_HEIGHT_POINTS * scale_factor).ceil();
+    (height.is_finite() && height > 0.0 && height <= u32::MAX as f64)
+        .then_some(PhysicalSize::new(width, height as u32))
+}
+
+fn apply_chrome_minimum_size(
+    window: &Window,
+    scale_factor: f64,
+    insets: NativeChromeInsets,
+    current_size: PixelSize,
+) -> Option<PhysicalSize<u32>> {
+    let minimum_size = chrome_minimum_size(scale_factor, insets)?;
+    window.set_min_inner_size(Some(minimum_size));
+    if current_size.width < minimum_size.width || current_size.height < minimum_size.height {
+        let _ = window.request_inner_size(PhysicalSize::new(
+            minimum_size.width,
+            current_size.height.max(minimum_size.height),
+        ));
+    }
+    Some(minimum_size)
+}
+
+fn resize_requires_compositor_reconfigure(current: PixelSize, requested: PixelSize) -> bool {
+    current != requested
 }
 
 impl VideoSurfaceDrainTarget for DesktopWindowState {
@@ -2338,6 +2361,24 @@ impl DesktopApplication {
                 FatalReason::WindowChromeFailed,
             )
         })?;
+        let initial_physical = window.inner_size();
+        let initial_size = PixelSize::new(initial_physical.width, initial_physical.height)
+            .ok_or_else(|| {
+                FatalReport::internal(
+                    FatalComponent::Window,
+                    FatalOperation::Initialize,
+                    FatalReason::WindowSizeInvalid,
+                )
+            })?;
+        let initial_insets = chrome.native_insets(&window);
+        apply_chrome_minimum_size(&window, window.scale_factor(), initial_insets, initial_size)
+            .ok_or_else(|| {
+                FatalReport::internal(
+                    FatalComponent::Window,
+                    FatalOperation::Initialize,
+                    FatalReason::WindowChromeFailed,
+                )
+            })?;
         let physical = window.inner_size();
         let physical_size = PixelSize::new(physical.width, physical.height).ok_or_else(|| {
             FatalReport::internal(
@@ -2747,15 +2788,20 @@ impl DesktopApplication {
         let mut committed = false;
         let mut presentation_error = None;
         if let Some(window) = self.window.as_mut() {
-            let result = window.compositor.resize(size);
-            match window.lifecycle.finish_resize(size, result) {
-                Ok(()) => {
-                    window.physical_size = size;
-                    window.dpi_transition.finish_resize();
-                    let _ = window.refresh_chrome_geometry();
-                    committed = true;
+            if resize_requires_compositor_reconfigure(window.physical_size, size) {
+                let result = window.compositor.resize(size);
+                match window.lifecycle.finish_resize(size, result) {
+                    Ok(()) => {
+                        window.physical_size = size;
+                        window.dpi_transition.finish_resize();
+                        let _ = window.refresh_chrome_geometry();
+                        committed = true;
+                    }
+                    Err(error) => presentation_error = Some(error),
                 }
-                Err(error) => presentation_error = Some(error),
+            } else {
+                let _ = window.refresh_chrome_geometry();
+                committed = true;
             }
         }
         if committed {
@@ -3892,7 +3938,15 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             WindowEvent::ScaleFactorChanged { .. } => {
                 let refresh_result = self.window.as_mut().map(|window| {
                     window.dpi_transition.begin();
-                    window.chrome.refresh_for_dpi(&window.window)
+                    window
+                        .chrome
+                        .refresh_for_dpi(&window.window)
+                        .and_then(|()| {
+                            window
+                                .update_chrome_minimum_size()
+                                .map(|_| ())
+                                .ok_or(WindowChromeError::InvalidGeometry)
+                        })
                 });
                 if refresh_result.is_some_and(|result| result.is_err()) {
                     eprintln!(
@@ -4432,6 +4486,7 @@ mod tests {
     };
     use frd_session::reserve_session_start;
     use frd_ui_model::{ConnectionDraft, ConnectionForm, ProtocolChoice};
+    use winit::dpi::PhysicalSize;
     use winit::event::{Ime, WindowEvent};
 
     use super::{
@@ -4458,6 +4513,43 @@ mod tests {
         redraws = 0;
         super::schedule_egui_repaint(&WindowEvent::Focused(true), false, || redraws += 1);
         assert_eq!(redraws, 0);
+    }
+
+    #[test]
+    fn same_size_resize_refreshes_geometry_without_reconfiguring_the_compositor() {
+        let current = PixelSize::new(1100, 720).unwrap();
+
+        assert!(!super::resize_requires_compositor_reconfigure(
+            current, current
+        ));
+        assert!(super::resize_requires_compositor_reconfigure(
+            current,
+            PixelSize::new(1101, 720).unwrap()
+        ));
+    }
+
+    #[test]
+    fn chrome_minimum_size_uses_the_current_native_insets() {
+        assert_eq!(
+            super::chrome_minimum_size(
+                1.0,
+                crate::NativeChromeInsets {
+                    leading_px: 0,
+                    trailing_px: 141,
+                }
+            ),
+            Some(PhysicalSize::new(562, 360))
+        );
+        assert_eq!(
+            super::chrome_minimum_size(
+                106.0 / 96.0,
+                crate::NativeChromeInsets {
+                    leading_px: 0,
+                    trailing_px: 156,
+                }
+            ),
+            Some(PhysicalSize::new(622, 398))
+        );
     }
 
     #[test]
