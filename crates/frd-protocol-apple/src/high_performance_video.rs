@@ -4,10 +4,10 @@ use std::num::NonZeroU32;
 
 use frd_core::{PixelRect, PixelSize};
 use frd_media_api::{
-    ChromaFormat, ChromaLocation, EncodedVideoAccessUnit, MediaFrame, MediaStageDiagnostic,
-    MediaStageTrace, VideoBitstreamFormat, VideoCodec, VideoColorimetry, VideoParameterSets,
-    VideoProfile, VideoRange, VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity,
-    VideoTimeBase, VideoTimestamp,
+    ChromaFormat, ChromaLocation, EncodedVideoAccessUnit, MediaFrame, MediaPublishError,
+    MediaStageDiagnostic, MediaStageTrace, VideoBitstreamFormat, VideoCodec, VideoColorimetry,
+    VideoParameterSets, VideoProfile, VideoRange, VideoStreamConfig, VideoStreamConfigInput,
+    VideoStreamIdentity, VideoTimeBase, VideoTimestamp,
 };
 use frd_protocol_api::ProtocolRuntime;
 
@@ -16,14 +16,14 @@ use crate::hevc_sps::{parse_hevc_sps, HevcSps};
 
 pub(crate) const APPLE_HEVC_RTP_CLOCK_HZ: u32 = 90_000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AppleHighPerformanceVideoError {
     StaleGeneration,
     MalformedAccessUnit,
     UnsupportedStreamConfig,
     InvalidStreamConfig,
     StreamConfigChangedWithinGeneration,
-    MediaPublicationFailed,
+    MediaPublicationFailed(MediaPublishError),
 }
 
 impl fmt::Display for AppleHighPerformanceVideoError {
@@ -36,7 +36,8 @@ impl fmt::Display for AppleHighPerformanceVideoError {
             Self::StreamConfigChangedWithinGeneration => {
                 "Apple HP 视频参数集在同一 generation 内变化"
             }
-            Self::MediaPublicationFailed => "Apple HP 视频发布失败",
+            Self::MediaPublicationFailed(MediaPublishError::Full) => "Apple HP 视频发布队列已满",
+            Self::MediaPublicationFailed(MediaPublishError::Closed) => "Apple HP 视频发布端已关闭",
         })
     }
 }
@@ -153,8 +154,8 @@ impl AppleHighPerformanceVideoAdapter {
                 build_video_config(self.identity, self.generation, sps, Some(parameter_sets))?;
             published_config_size = Some(config.as_input().coded_size);
             runtime
-                .publish_media(MediaFrame::VideoConfig(config))
-                .map_err(|_| AppleHighPerformanceVideoError::MediaPublicationFailed)?;
+                .publish_required_media_detailed(MediaFrame::VideoConfig(config))
+                .map_err(AppleHighPerformanceVideoError::MediaPublicationFailed)?;
             #[cfg(any(debug_assertions, test))]
             {
                 self.diagnostics.video_config_publications =
@@ -179,8 +180,8 @@ impl AppleHighPerformanceVideoAdapter {
         )
         .map_err(|_| AppleHighPerformanceVideoError::MalformedAccessUnit)?;
         runtime
-            .publish_media(MediaFrame::EncodedVideo(access_unit))
-            .map_err(|_| AppleHighPerformanceVideoError::MediaPublicationFailed)?;
+            .publish_required_media_detailed(MediaFrame::EncodedVideo(access_unit))
+            .map_err(AppleHighPerformanceVideoError::MediaPublicationFailed)?;
         #[cfg(any(debug_assertions, test))]
         {
             self.diagnostics.encoded_video_publications = self

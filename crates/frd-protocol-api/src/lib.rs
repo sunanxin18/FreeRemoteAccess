@@ -848,12 +848,26 @@ impl ProtocolRuntime {
         if self.terminal {
             return Err(ProtocolError::Terminal);
         }
+        self.publish_required_media_detailed(frame)
+            .map_err(|_| ProtocolError::MediaPortClosed)
+    }
+
+    /// 发布会话必需的媒体帧，同时保留媒体端口拒绝原因。
+    ///
+    /// 与 `publish_media` 相同，媒体发布器拒绝帧时会把 runtime 标记为终态；
+    /// 未配置媒体端口仍保持原有的非 poison 行为。该入口只供必须区分有界背压
+    /// 与消费者关闭的协议适配器使用，不提供降级或重试语义。
+    pub fn publish_required_media_detailed(
+        &mut self,
+        frame: MediaFrame,
+    ) -> Result<(), MediaPublishError> {
+        if self.terminal {
+            return Err(MediaPublishError::Closed);
+        }
         let Some(media) = &self.media else {
-            return Err(ProtocolError::MediaPortClosed);
+            return Err(MediaPublishError::Closed);
         };
-        let result = media.publish(frame).map_err(|error| match error {
-            MediaPublishError::Closed | MediaPublishError::Full => ProtocolError::MediaPortClosed,
-        });
+        let result = media.publish(frame);
         if result.is_err() {
             self.poison();
         }
@@ -1519,6 +1533,68 @@ mod tests {
             Err(ProtocolError::MediaPortClosed)
         );
         assert!(runtime.requires_shutdown());
+    }
+
+    #[test]
+    fn detailed_required_media_failure_preserves_full_and_closed_while_poisoning() {
+        for failure in [MediaPublishError::Full, MediaPublishError::Closed] {
+            let session_id = SessionId::allocate();
+            let (_, receiver) = mpsc::channel();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let attempts = Arc::new(Mutex::new(0usize));
+            let mut runtime = ProtocolRuntime::new(
+                session_id,
+                receiver,
+                Box::new(RecordingEvents(log.clone())),
+                Box::new(RecordingFrames(log.clone())),
+                Some(Box::new(OptionalFailingMedia {
+                    failure: failure.clone(),
+                    attempts: attempts.clone(),
+                })),
+                Box::new(RecordingWake(log)),
+            );
+            establish_generation(&mut runtime, session_id, 1);
+
+            assert_eq!(
+                runtime.publish_required_media_detailed(MediaFrame::EncodedVideo(
+                    test_access_unit(session_id, 1),
+                )),
+                Err(failure)
+            );
+            assert!(runtime.requires_shutdown());
+            assert_eq!(*attempts.lock().expect("required media attempts"), 1);
+            assert_eq!(
+                runtime.publish_required_media_detailed(MediaFrame::EncodedVideo(
+                    test_access_unit(session_id, 1),
+                )),
+                Err(MediaPublishError::Closed)
+            );
+            assert_eq!(*attempts.lock().expect("required media attempts"), 1);
+        }
+    }
+
+    #[test]
+    fn missing_required_media_port_preserves_non_poisoning_behavior() {
+        let session_id = SessionId::allocate();
+        let (_, receiver) = mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            receiver,
+            Box::new(RecordingEvents(log.clone())),
+            Box::new(RecordingFrames(log.clone())),
+            None,
+            Box::new(RecordingWake(log)),
+        );
+        establish_generation(&mut runtime, session_id, 1);
+
+        assert_eq!(
+            runtime.publish_required_media_detailed(MediaFrame::EncodedVideo(test_access_unit(
+                session_id, 1
+            ),)),
+            Err(MediaPublishError::Closed)
+        );
+        assert!(!runtime.requires_shutdown());
     }
 
     #[test]

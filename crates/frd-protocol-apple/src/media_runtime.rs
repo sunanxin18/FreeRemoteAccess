@@ -24,6 +24,9 @@ use crate::hevc_access_unit::{
 };
 use crate::hevc_rtp::HevcRtpError;
 use crate::high_performance_video::AppleHighPerformanceVideoAdapter;
+use crate::hp_media_diagnostics::{
+    adapter_fatal_category, emit_hp_media_fatal, hevc_fatal_category,
+};
 use crate::media_negotiation::{AudioMediaFlow, MediaStreamAnswer};
 use crate::media_protocol::MediaStreamPortAnnouncement;
 use crate::media_transport::{MediaDatagram, MediaRole, MediaTransport, MediaTransportPhase};
@@ -378,7 +381,10 @@ impl VideoReceiveState {
                 self.assembler.reset(generation);
                 return Ok(());
             }
-            Err(error) => return Err(error).context("组装 Apple HP HEVC 访问单元失败"),
+            Err(error) => {
+                emit_hp_media_fatal(hevc_fatal_category(&error));
+                return Err(error).context("组装 Apple HP HEVC 访问单元失败");
+            }
         };
         for access_unit in access_units {
             if self.awaiting_replacement_irap {
@@ -387,9 +393,10 @@ impl VideoReceiveState {
                 }
                 self.awaiting_replacement_irap = false;
             }
-            self.adapter
-                .publish_access_unit(runtime, access_unit)
-                .context("发布 Apple HP HEVC 访问单元失败")?;
+            if let Err(error) = self.adapter.publish_access_unit(runtime, access_unit) {
+                emit_hp_media_fatal(adapter_fatal_category(&error));
+                return Err(error).context("发布 Apple HP HEVC 访问单元失败");
+            }
         }
         Ok(())
     }
