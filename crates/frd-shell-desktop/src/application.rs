@@ -78,6 +78,7 @@ const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
 const FRAME_MAILBOX_PIXEL_LIMIT: usize = 64 * 1024 * 1024;
 const MEDIA_MAILBOX_ENTRY_LIMIT: usize = 16;
 const PENDING_LAUNCH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const HP_INPUT_DIAGNOSTICS_ENV: &str = "FRD_APPLE_HP_INPUT_DIAGNOSTICS";
 const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     connection: ConnectionGlyph::Connected,
     diagnostics: None,
@@ -86,6 +87,59 @@ const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     clipboard: CapabilityGlyphState::Unavailable,
     action: Some(SessionChromeAction::Disconnect),
 };
+
+#[derive(Default)]
+struct HighPerformanceInputShellDiagnostics {
+    enabled: bool,
+    shell_physical_accepted: u64,
+    command_enqueued: u64,
+}
+
+impl HighPerformanceInputShellDiagnostics {
+    fn from_environment() -> Self {
+        Self {
+            enabled: std::env::var_os(HP_INPUT_DIAGNOSTICS_ENV).is_some_and(|value| value == "1"),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    const fn enabled_for_test() -> Self {
+        Self {
+            enabled: true,
+            shell_physical_accepted: 0,
+            command_enqueued: 0,
+        }
+    }
+
+    fn observe_accepted(&mut self, protocol_id: &ProtocolId) -> Option<String> {
+        if !self.enabled || protocol_id != &ProtocolId::apple_high_performance() {
+            return None;
+        }
+        self.shell_physical_accepted = self.shell_physical_accepted.saturating_add(1);
+        format_hp_input_count("shell_physical_accepted", self.shell_physical_accepted)
+    }
+
+    fn observe_enqueued(&mut self, protocol_id: &ProtocolId) -> Option<String> {
+        if !self.enabled || protocol_id != &ProtocolId::apple_high_performance() {
+            return None;
+        }
+        self.command_enqueued = self.command_enqueued.saturating_add(1);
+        format_hp_input_count("command_enqueued", self.command_enqueued)
+    }
+}
+
+fn format_hp_input_count(stage: &'static str, count: u64) -> Option<String> {
+    count
+        .is_power_of_two()
+        .then(|| format!("[apple-hp-input] stage={stage} count={count}"))
+}
+
+fn emit_hp_input_diagnostic(line: Option<String>) {
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ImePreDispatch<'a> {
@@ -1988,6 +2042,7 @@ pub struct DesktopApplication {
     stores: DesktopPlatformStores,
     sessions: SessionHost,
     input: InputRouter,
+    hp_input_diagnostics: HighPerformanceInputShellDiagnostics,
     metrics: FramePipelineMetrics,
     proxy: EventLoopProxy<DesktopUserEvent>,
     runtime_wake_gate: Arc<RuntimeWakeGate>,
@@ -2223,6 +2278,7 @@ impl DesktopApplication {
             stores,
             sessions: SessionHost::new(factories, wake, audio_factory),
             input: InputRouter::default(),
+            hp_input_diagnostics: HighPerformanceInputShellDiagnostics::from_environment(),
             metrics,
             proxy,
             runtime_wake_gate,
@@ -2262,6 +2318,7 @@ impl DesktopApplication {
                 Arc::new(UnavailableAudioFactory),
             ),
             input: InputRouter::default(),
+            hp_input_diagnostics: HighPerformanceInputShellDiagnostics::from_environment(),
             metrics: FramePipelineMetrics::disabled(),
             proxy,
             runtime_wake_gate,
@@ -2677,6 +2734,9 @@ impl DesktopApplication {
     }
 
     fn send_input(&mut self, event: frd_core::InputEvent) {
+        let physical_key_protocol = matches!(event, frd_core::InputEvent::PhysicalKey { .. })
+            .then(|| self.sessions.active_protocol_id())
+            .flatten();
         if let Some(command) = self.launch.controller().route_input(event) {
             let probe = match &command {
                 SessionCommand::Input(input)
@@ -2692,6 +2752,11 @@ impl DesktopApplication {
             let accepted_at = std::time::Instant::now();
             match self.sessions.send_command(command) {
                 Ok(()) => {
+                    if let Some(protocol_id) = physical_key_protocol.as_ref() {
+                        emit_hp_input_diagnostic(
+                            self.hp_input_diagnostics.observe_enqueued(protocol_id),
+                        );
+                    }
                     if let Some(identity) = probe {
                         self.metrics.observe_input_sent(identity, accepted_at);
                     }
@@ -3368,6 +3433,13 @@ impl DesktopApplication {
             KeyboardPreDispatch::Consume => true,
             KeyboardPreDispatch::Remote(input) => {
                 if let Some(input) = input {
+                    if matches!(input, frd_core::InputEvent::PhysicalKey { .. }) {
+                        if let Some(protocol_id) = self.sessions.active_protocol_id() {
+                            emit_hp_input_diagnostic(
+                                self.hp_input_diagnostics.observe_accepted(&protocol_id),
+                            );
+                        }
+                    }
                     self.send_input(input);
                 }
                 true
@@ -4419,6 +4491,28 @@ mod tests {
         VideoSurfaceDrainTarget, WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
+
+    #[test]
+    fn hp_keyboard_shell_diagnostics_are_protocol_scoped_and_rate_limited() {
+        let hp = ProtocolId::apple_high_performance();
+        let standard = ProtocolId::apple_hpss_mvs();
+        let mut diagnostics = super::HighPerformanceInputShellDiagnostics::enabled_for_test();
+
+        assert_eq!(diagnostics.observe_accepted(&standard), None);
+        assert_eq!(
+            diagnostics.observe_accepted(&hp).as_deref(),
+            Some("[apple-hp-input] stage=shell_physical_accepted count=1")
+        );
+        assert_eq!(
+            diagnostics.observe_enqueued(&hp).as_deref(),
+            Some("[apple-hp-input] stage=command_enqueued count=1")
+        );
+        assert_eq!(
+            diagnostics.observe_accepted(&hp).as_deref(),
+            Some("[apple-hp-input] stage=shell_physical_accepted count=2")
+        );
+        assert_eq!(diagnostics.observe_accepted(&hp), None);
+    }
 
     #[test]
     fn egui_repaint_schedules_redraw_only_for_non_redraw_requested_events() {

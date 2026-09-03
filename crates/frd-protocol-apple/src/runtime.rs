@@ -17,7 +17,10 @@ use frd_protocol_api::{
     SessionCommand, SessionEvent,
 };
 
-use crate::connection::{is_peer_closed, is_timeout, AppleWriterHandle};
+use crate::connection::{
+    is_peer_closed, is_timeout, AppleWriterHandle, HighPerformanceInputDiagnostics,
+    HighPerformanceInputTerminal,
+};
 use crate::dynamic_resolution::DisplaySize;
 use crate::factory::EstablishedAppleSession;
 use crate::high_performance::{
@@ -468,7 +471,8 @@ fn run_authenticated_session_with_media(
     udp_media_enabled: bool,
     protocol_id: frd_core::ProtocolId,
 ) -> ProtocolExit {
-    match run_authenticated_session_inner(
+    let input_diagnostics = HighPerformanceInputDiagnostics::for_protocol(&protocol_id);
+    let result = run_authenticated_session_inner(
         connection,
         display_name,
         initial_pixel_size,
@@ -478,7 +482,18 @@ fn run_authenticated_session_with_media(
         audio_flow,
         udp_media_enabled,
         &protocol_id,
-    ) {
+        input_diagnostics.clone(),
+    );
+    if let Err(error) = &result {
+        let terminal = if is_peer_closed(error) {
+            HighPerformanceInputTerminal::PeerClosed
+        } else {
+            HighPerformanceInputTerminal::AdapterError
+        };
+        let line = input_diagnostics.terminal_line(terminal, Instant::now());
+        input_diagnostics.emit(line);
+    }
+    match result {
         Ok(()) => ProtocolExit::Closed,
         Err(error) => protocol_exit_for_runtime_error(protocol_id, error),
     }
@@ -565,6 +580,7 @@ fn run_authenticated_session_inner(
     audio_flow: AudioMediaFlow,
     udp_media_enabled: bool,
     protocol_id: &frd_core::ProtocolId,
+    input_diagnostics: HighPerformanceInputDiagnostics,
 ) -> Result<()> {
     let server_init_size = DisplaySize::new(
         u16::try_from(initial_pixel_size.width).context("Apple 初始宽度超出 u16")?,
@@ -580,6 +596,9 @@ fn run_authenticated_session_inner(
         )
         .into());
     }
+    // Install the HP-only diagnostic hook before the first encrypted startup
+    // write, because `AppleConnection::write_all` lazily creates the sole writer.
+    let writer = connection.writer_handle_with_input_diagnostics(input_diagnostics.clone())?;
     let initial_admission =
         NetworkReaderRuntime::admit_initial_generation(&mut runtime, session_id, initial_size)
             .map_err(|error| anyhow::anyhow!(error.code()))?;
@@ -622,7 +641,6 @@ fn run_authenticated_session_inner(
     let initial_full_sent_at = Instant::now();
     let mut application_frame_read_poll = APPLE_RUNTIME_READ_POLL;
     connection.set_read_timeout(Some(application_frame_read_poll))?;
-    let writer = connection.writer_handle()?;
 
     let mut media =
         ViewerMediaState::new_for_session(session_id, audio_flow, 1, media_server_address)?;
@@ -663,6 +681,11 @@ fn run_authenticated_session_inner(
                     }
                     SessionCommand::Input(input) => {
                         if reader.is_high_performance_confirmed() {
+                            if matches!(input.event, InputEvent::PhysicalKey { .. }) {
+                                let line =
+                                    input_diagnostics.observe_runtime_consumed(Instant::now());
+                                input_diagnostics.emit(line);
+                            }
                             pointer.handle(input.event, &writer)?;
                         }
                     }
@@ -821,6 +844,16 @@ fn run_authenticated_session_inner(
         }
         Ok(())
     })();
+
+    if let Err(error) = &loop_result {
+        let terminal = if is_peer_closed(error) {
+            HighPerformanceInputTerminal::PeerClosed
+        } else {
+            HighPerformanceInputTerminal::AdapterError
+        };
+        let line = input_diagnostics.terminal_line(terminal, Instant::now());
+        input_diagnostics.emit(line);
+    }
 
     let _ = runtime.publish_event(SessionEvent::StageChanged(ConnectionStage::Disconnecting));
     if audio_started {

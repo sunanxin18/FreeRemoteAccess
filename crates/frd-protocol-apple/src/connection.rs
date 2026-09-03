@@ -17,6 +17,126 @@ use crate::session::{
 };
 
 const PRODUCTION_WRITER_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const HP_INPUT_DIAGNOSTICS_ENV: &str = "FRD_APPLE_HP_INPUT_DIAGNOSTICS";
+
+#[derive(Clone)]
+pub(crate) struct HighPerformanceInputDiagnostics {
+    inner: Option<Arc<Mutex<HighPerformanceInputDiagnosticState>>>,
+}
+
+struct HighPerformanceInputDiagnosticState {
+    started_at: Instant,
+    runtime_consumed: u64,
+    writer_completed: u64,
+    last_writer_completed_at: Option<Instant>,
+    terminal_emitted: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum HighPerformanceInputTerminal {
+    PeerClosed,
+    AdapterError,
+}
+
+impl HighPerformanceInputTerminal {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::PeerClosed => "peer_close",
+            Self::AdapterError => "adapter_error",
+        }
+    }
+}
+
+impl HighPerformanceInputDiagnostics {
+    pub(crate) fn for_protocol(protocol_id: &frd_core::ProtocolId) -> Self {
+        let enabled = protocol_id == &frd_core::ProtocolId::apple_high_performance()
+            && std::env::var_os(HP_INPUT_DIAGNOSTICS_ENV).is_some_and(|value| value == "1");
+        Self::new(enabled, Instant::now())
+    }
+
+    fn new(enabled: bool, started_at: Instant) -> Self {
+        Self {
+            inner: enabled.then(|| {
+                Arc::new(Mutex::new(HighPerformanceInputDiagnosticState {
+                    started_at,
+                    runtime_consumed: 0,
+                    writer_completed: 0,
+                    last_writer_completed_at: None,
+                    terminal_emitted: false,
+                }))
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn enabled_for_test(started_at: Instant) -> Self {
+        Self::new(true, started_at)
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    pub(crate) fn observe_runtime_consumed(&self, now: Instant) -> Option<String> {
+        let mut state = self.inner.as_ref()?.lock().ok()?;
+        state.runtime_consumed = state.runtime_consumed.saturating_add(1);
+        format_hp_input_stage(
+            "runtime_consumed",
+            state.runtime_consumed,
+            now.saturating_duration_since(state.started_at),
+        )
+    }
+
+    fn observe_writer_completed(&self, now: Instant) -> Option<String> {
+        let mut state = self.inner.as_ref()?.lock().ok()?;
+        state.writer_completed = state.writer_completed.saturating_add(1);
+        state.last_writer_completed_at = Some(now);
+        format_hp_input_stage(
+            "writer_completed",
+            state.writer_completed,
+            now.saturating_duration_since(state.started_at),
+        )
+    }
+
+    pub(crate) fn terminal_line(
+        &self,
+        terminal: HighPerformanceInputTerminal,
+        now: Instant,
+    ) -> Option<String> {
+        let mut state = self.inner.as_ref()?.lock().ok()?;
+        if state.terminal_emitted {
+            return None;
+        }
+        state.terminal_emitted = true;
+        let since_last_writer = state
+            .last_writer_completed_at
+            .map(|last| now.saturating_duration_since(last).as_millis().to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        Some(format!(
+            "[apple-hp-input] stage=terminal kind={} runtime_consumed={} writer_completed={} since_last_writer_ms={} elapsed_ms={}",
+            terminal.code(),
+            state.runtime_consumed,
+            state.writer_completed,
+            since_last_writer,
+            now.saturating_duration_since(state.started_at).as_millis()
+        ))
+    }
+
+    pub(crate) fn emit(&self, line: Option<String>) {
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
+    }
+}
+
+fn format_hp_input_stage(stage: &'static str, count: u64, elapsed: Duration) -> Option<String> {
+    count.is_power_of_two().then(|| {
+        format!(
+            "[apple-hp-input] stage={stage} count={count} elapsed_ms={}",
+            elapsed.as_millis()
+        )
+    })
+}
 
 #[derive(Debug)]
 struct PeerClosed;
@@ -111,6 +231,7 @@ pub(crate) enum ApplicationFrameReadTestEvent {
 struct WriterHooks {
     #[cfg(test)]
     io_events: Option<Sender<WriterIoTestEvent>>,
+    input_diagnostics: Option<HighPerformanceInputDiagnostics>,
 }
 
 impl WriterHooks {
@@ -232,6 +353,7 @@ fn writer_loop(
     mut previous_key_event_at: Instant,
 ) {
     while let Ok(command) = commands.recv() {
+        let encrypted_key_event = matches!(&command, WriterCommand::EncryptedKeyEvent { .. });
         let (wire_result, result) = match command {
             WriterCommand::Message { plaintext, result } => {
                 let wire_result = match crypto {
@@ -283,6 +405,12 @@ fn writer_loop(
             write_result
         })();
         let failed = send_result.is_err();
+        if encrypted_key_event && !failed {
+            if let Some(diagnostics) = &hooks.input_diagnostics {
+                let line = diagnostics.observe_writer_completed(Instant::now());
+                diagnostics.emit(line);
+            }
+        }
         let _ = result.send(send_result);
         if failed {
             let _ = stream.shutdown(Shutdown::Both);
@@ -410,6 +538,16 @@ impl AppleConnection {
         self.writer_handle_with_hooks(WriterHooks::default())
     }
 
+    pub(crate) fn writer_handle_with_input_diagnostics(
+        &mut self,
+        diagnostics: HighPerformanceInputDiagnostics,
+    ) -> Result<AppleWriterHandle> {
+        self.writer_handle_with_hooks(WriterHooks {
+            input_diagnostics: diagnostics.is_enabled().then_some(diagnostics),
+            ..WriterHooks::default()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn writer_handle_with_io_events(
         &mut self,
@@ -417,6 +555,7 @@ impl AppleConnection {
     ) -> Result<AppleWriterHandle> {
         self.writer_handle_with_hooks(WriterHooks {
             io_events: Some(io_events),
+            ..WriterHooks::default()
         })
     }
 
@@ -650,6 +789,46 @@ impl Drop for AppleConnection {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn hp_keyboard_protocol_diagnostics_report_only_counts_and_relative_terminal_timing() {
+        let started_at = Instant::now();
+        let diagnostics = HighPerformanceInputDiagnostics::enabled_for_test(started_at);
+
+        assert_eq!(
+            diagnostics
+                .observe_runtime_consumed(started_at + Duration::from_millis(5))
+                .as_deref(),
+            Some("[apple-hp-input] stage=runtime_consumed count=1 elapsed_ms=5")
+        );
+        assert_eq!(
+            diagnostics
+                .observe_writer_completed(started_at + Duration::from_millis(8))
+                .as_deref(),
+            Some("[apple-hp-input] stage=writer_completed count=1 elapsed_ms=8")
+        );
+        let terminal = diagnostics
+            .terminal_line(
+                HighPerformanceInputTerminal::PeerClosed,
+                started_at + Duration::from_millis(21),
+            )
+            .expect("enabled diagnostics emit terminal summary");
+        assert_eq!(
+            terminal,
+            "[apple-hp-input] stage=terminal kind=peer_close runtime_consumed=1 writer_completed=1 since_last_writer_ms=13 elapsed_ms=21"
+        );
+        assert_eq!(
+            diagnostics.terminal_line(
+                HighPerformanceInputTerminal::AdapterError,
+                started_at + Duration::from_millis(34),
+            ),
+            None,
+            "one session must emit only one terminal summary"
+        );
+        for forbidden in ["keysym", "text", "username", "password", "address"] {
+            assert!(!terminal.contains(forbidden));
+        }
+    }
 
     fn decrypt_high_performance_key_event(initial_key: &[u8; 16], message: &[u8]) -> [u8; 18] {
         use aes::cipher::{BlockDecryptMut, KeyInit};
