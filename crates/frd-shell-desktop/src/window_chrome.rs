@@ -227,6 +227,15 @@ pub enum WindowChromeAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowChromeCommand {
+    BeginMove,
+    Minimize,
+    ToggleMaximize,
+    Close,
+    ShowSystemMenu,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowChromeError {
     UnsupportedWindow,
     PlatformCallFailed,
