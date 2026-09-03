@@ -69,7 +69,6 @@ use crate::video_decode_worker::{
     VideoDecodeSender, VideoDecodeWorker, VideoFrameToken, VideoStreamAdmission, VideoWorkerEvent,
     VideoWorkerEvents,
 };
-use crate::window_chrome::MINIMUM_WINDOW_WIDTH_POINTS;
 use crate::{
     ChromeHit, ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter,
     WindowChromeAdapter, TITLE_BAR_HEIGHT_POINTS,
@@ -1813,21 +1812,16 @@ impl DesktopWindowState {
     fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayout> {
         self.chrome_layout = None;
         let insets = self.chrome.native_insets(&self.window);
-        let Some(layout) = ChromeLayout::for_window(
+        let layout = ChromeLayout::for_window(
             self.physical_size.width,
             self.physical_size.height,
             self.window.scale_factor(),
             insets.leading_px,
             insets.trailing_px,
-        ) else {
-            self.remote_area = None;
-            self.chrome.publish_hit_regions(None);
-            return None;
-        };
+        )?;
         self.remote_area = Some(layout.content_rect);
         self.chrome_layout = Some(layout);
-        self.chrome
-            .publish_hit_regions(Some(ChromeHitRegions { layout }));
+        self.chrome.publish_hit_regions(ChromeHitRegions { layout });
         Some(layout)
     }
 }
@@ -2299,7 +2293,7 @@ impl DesktopApplication {
                         .with_window_icon(self.window_configuration.icon.clone())
                         .with_visible(false)
                         .with_inner_size(LogicalSize::new(1100.0, 720.0))
-                        .with_min_inner_size(LogicalSize::new(MINIMUM_WINDOW_WIDTH_POINTS, 360.0))
+                        .with_min_inner_size(LogicalSize::new(520.0, 360.0))
                         .with_resizable(true),
                 )
                 .map_err(|_| {
