@@ -30,7 +30,7 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         }
     }
 
-    fn publish_hit_regions(&mut self, _regions: ChromeHitRegions) {}
+    fn publish_hit_regions(&mut self, _regions: Option<ChromeHitRegions>) {}
 
     fn execute(&mut self, window: &winit::window::Window, action: WindowChromeAction) {
         match action {

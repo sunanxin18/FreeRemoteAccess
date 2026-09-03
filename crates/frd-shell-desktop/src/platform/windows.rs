@@ -129,9 +129,9 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         }
     }
 
-    fn publish_hit_regions(&mut self, regions: ChromeHitRegions) {
+    fn publish_hit_regions(&mut self, regions: Option<ChromeHitRegions>) {
         if let Ok(mut slot) = self.state.regions.lock() {
-            *slot = Some(regions);
+            *slot = regions;
         }
     }
 
