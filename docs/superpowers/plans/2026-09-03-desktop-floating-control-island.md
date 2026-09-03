@@ -108,9 +108,9 @@ Delete `SessionChromeAction`; do not add an alias. The controller emits only con
 
 - [ ] **Step 4: Run focused model/app tests and check the old symbol is gone**
 
-Run: `cargo test -p frd-ui-model && cargo test -p frd-app && rg -n "SessionChromeAction" crates apps`
+Run: `cargo test -p frd-ui-model && cargo test -p frd-app && rg -n "SessionChromeAction" crates/frd-ui-model crates/frd-app`
 
-Expected: both test suites pass; `rg` returns no production or test references.
+Expected: both test suites pass; `rg` returns no model/controller references. Task 2 migrates the downstream renderer and shell consumers before requiring a workspace-wide zero-result search.
 
 - [ ] **Step 5: Commit**
 
@@ -121,7 +121,108 @@ git commit -m "refactor(ui): define protocol-neutral island actions"
 
 ---
 
-### Task 2: Floating state machine and invariant geometry
+### Task 2: Accessible control-island renderer and deterministic Material glyphs
+
+This task executes immediately after Task 1 so every downstream consumer moves to
+`IslandAction` and the workspace returns to a green compile before shell geometry
+changes begin.
+
+**Files:**
+- Rename: `crates/frd-ui-egui/src/session_chrome.rs` to `crates/frd-ui-egui/src/control_island.rs`
+- Modify: `crates/frd-ui-egui/src/lib.rs`
+- Modify: `crates/frd-shell-desktop/src/application.rs` (mechanical action/import migration only)
+- Modify: `tools/update-material-symbols-rounded.ps1`
+- Modify: `assets/ui-icons/material-symbols-rounded-24-400.ttf`
+- Modify: `assets/ui-icons/README.md`
+
+**Interfaces:**
+- Consumes: `SessionChromeModel`, `IslandAction`, `IslandWindowCapabilities`, visibility, placement, maximized state, and accessibility focus request.
+- Produces: `ControlIslandRenderResult { action, hovered_union, focused_union, pressed, reposition_delta, window_move_requested }` and the exact logical rectangles later used to build `ChromeOverlayLayout`.
+
+- [ ] **Step 1: Write failing renderer tests**
+
+```rust
+#[test]
+fn windows_actions_have_material_glyphs_and_44_point_targets() {
+    let semantics = window_action_semantics(IslandWindowCapabilities::WINDOWS, false);
+    assert_eq!(semantics.iter().map(|item| item.action).collect::<Vec<_>>(), vec![
+        IslandAction::MinimizeWindow,
+        IslandAction::ToggleMaximizeWindow,
+        IslandAction::CloseWindow,
+    ]);
+    assert!(semantics.iter().all(|item| item.target_size == 44.0));
+    assert!(semantics.iter().all(|item| !item.tooltip.is_empty()));
+}
+
+#[test]
+fn hidden_renderer_has_only_a_visual_reveal_line() {
+    let result = render_island_fixture(false, 1200.0);
+    assert!(result.action.is_none());
+    assert!(result.hit_rects.is_empty());
+    assert_eq!(result.reveal_line_alpha, 0.5);
+}
+```
+
+- [ ] **Step 2: Run the UI tests and verify RED**
+
+Run: `cargo test -p frd-ui-egui control_island -- --nocapture`
+
+Expected: compilation fails because the renderer API and window glyph semantics do not exist.
+
+- [ ] **Step 3: Extend and regenerate the pinned Material subset**
+
+Add the official names/codepoints `remove`, `fullscreen`, `fullscreen_exit`, and `drag_indicator` to `tools/update-material-symbols-rounded.ps1`, run `powershell -ExecutionPolicy Bypass -File tools/update-material-symbols-rounded.ps1`, and record the resulting deterministic subset hash and names in `assets/ui-icons/README.md`. Do not hand-draw these glyphs.
+
+- [ ] **Step 4: Render the line and island in the existing egui pass**
+
+```rust
+pub struct ControlIslandRenderInput<'a> {
+    pub model: &'a SessionChromeModel,
+    pub window_capabilities: IslandWindowCapabilities,
+    pub visible: bool,
+    pub maximized: bool,
+    pub island_rect: egui::Rect,
+    pub reveal_line_rect: egui::Rect,
+    pub focus_first: bool,
+    pub opaque_material: bool,
+}
+
+pub struct ControlIslandRenderResult {
+    pub action: Option<IslandAction>,
+    pub hovered_union: bool,
+    pub focused_union: bool,
+    pub pressed: bool,
+    pub reposition_delta: egui::Vec2,
+    pub window_move_requested: bool,
+    pub hit_rects: Vec<(egui::Rect, IslandAction)>,
+    pub reveal_line_alpha: f32,
+}
+
+pub fn show_control_island(ctx: &egui::Context, input: ControlIslandRenderInput<'_>) -> ControlIslandRenderResult;
+```
+
+Use a fixed `egui::Area`, a rounded 18--25 percent neutral outer material, compact contrast plates, no blur, and no new render pass. Keep the approved 64-point timing slot and its source-aware tooltip. Collapse unsupported/low-priority capability details before controls overlap. During this task only, the shell may keep its current persistent placement while calling the renamed renderer; Task 5 removes that placement and `Panel::top`.
+
+- [ ] **Step 5: Migrate every action consumer and restore a green workspace**
+
+Update the current shell match to `IslandAction::{CancelConnect, Disconnect}`. Window variants remain undispatched until Task 4 supplies `WindowChromeCommand`; audio/clipboard variants remain disabled. Run `rg -n "SessionChromeAction" crates apps` and require zero results.
+
+- [ ] **Step 6: Run UI, shell, and deterministic asset tests**
+
+Run: `cargo test -p frd-ui-egui && cargo check -p frd-shell-desktop && powershell -ExecutionPolicy Bypass -File tools/update-material-symbols-rounded.ps1 && git diff --exit-code -- assets/ui-icons/material-symbols-rounded-24-400.ttf`
+
+Expected: UI tests and shell check pass, the old action symbol is absent, and the second asset generation produces no binary diff.
+
+- [ ] **Step 7: Commit**
+
+```powershell
+git add crates/frd-ui-egui/src/control_island.rs crates/frd-ui-egui/src/lib.rs crates/frd-shell-desktop/src/application.rs tools/update-material-symbols-rounded.ps1 assets/ui-icons/material-symbols-rounded-24-400.ttf assets/ui-icons/README.md
+git commit -m "feat(ui): render accessible floating control island"
+```
+
+---
+
+### Task 3: Floating state machine and invariant geometry
 
 **Files:**
 - Create: `crates/frd-shell-desktop/src/floating_chrome.rs`
@@ -243,98 +344,6 @@ Expected: all state and invariant geometry tests pass.
 ```powershell
 git add crates/frd-shell-desktop/src/floating_chrome.rs crates/frd-shell-desktop/src/window_chrome.rs crates/frd-shell-desktop/src/lib.rs
 git commit -m "feat(shell): add floating chrome state and geometry"
-```
-
----
-
-### Task 3: Accessible control-island renderer and deterministic Material glyphs
-
-**Files:**
-- Rename: `crates/frd-ui-egui/src/session_chrome.rs` to `crates/frd-ui-egui/src/control_island.rs`
-- Modify: `crates/frd-ui-egui/src/lib.rs`
-- Modify: `tools/update-material-symbols-rounded.ps1`
-- Modify: `assets/ui-icons/material-symbols-rounded-24-400.ttf`
-- Modify: `assets/ui-icons/README.md`
-
-**Interfaces:**
-- Consumes: `SessionChromeModel`, `IslandAction`, `IslandWindowCapabilities`, visibility, placement, maximized state, and accessibility focus request.
-- Produces: `ControlIslandRenderResult { action, hovered_union, focused_union, pressed, reposition_delta, window_move_requested }` and the exact logical rectangles used to build `ChromeOverlayLayout`.
-
-- [ ] **Step 1: Write failing renderer tests**
-
-```rust
-#[test]
-fn windows_actions_have_material_glyphs_and_44_point_targets() {
-    let semantics = window_action_semantics(IslandWindowCapabilities::WINDOWS, false);
-    assert_eq!(semantics.iter().map(|item| item.action).collect::<Vec<_>>(), vec![
-        IslandAction::MinimizeWindow,
-        IslandAction::ToggleMaximizeWindow,
-        IslandAction::CloseWindow,
-    ]);
-    assert!(semantics.iter().all(|item| item.target_size == 44.0));
-    assert!(semantics.iter().all(|item| !item.tooltip.is_empty()));
-}
-
-#[test]
-fn hidden_renderer_has_only_a_visual_reveal_line() {
-    let result = render_island_fixture(IslandVisibility::Hidden, 1200.0);
-    assert!(result.action.is_none());
-    assert!(result.hit_rects.is_empty());
-    assert_eq!(result.reveal_line_alpha, 0.5);
-}
-```
-
-- [ ] **Step 2: Run the UI tests and verify RED**
-
-Run: `cargo test -p frd-ui-egui control_island -- --nocapture`
-
-Expected: compilation fails because the renderer API and window glyph semantics do not exist.
-
-- [ ] **Step 3: Extend and regenerate the pinned Material subset**
-
-Add the official names/codepoints `remove`, `fullscreen`, `fullscreen_exit`, and `drag_indicator` to `tools/update-material-symbols-rounded.ps1`, run `powershell -ExecutionPolicy Bypass -File tools/update-material-symbols-rounded.ps1`, and record the resulting deterministic subset hash and names in `assets/ui-icons/README.md`. Do not hand-draw these glyphs.
-
-- [ ] **Step 4: Render the line and island in the existing egui pass**
-
-```rust
-pub struct ControlIslandRenderInput<'a> {
-    pub model: &'a SessionChromeModel,
-    pub window_capabilities: IslandWindowCapabilities,
-    pub visible: bool,
-    pub maximized: bool,
-    pub island_rect: egui::Rect,
-    pub reveal_line_rect: egui::Rect,
-    pub focus_first: bool,
-    pub opaque_material: bool,
-}
-
-pub struct ControlIslandRenderResult {
-    pub action: Option<IslandAction>,
-    pub hovered_union: bool,
-    pub focused_union: bool,
-    pub pressed: bool,
-    pub reposition_delta: egui::Vec2,
-    pub window_move_requested: bool,
-    pub hit_rects: Vec<(egui::Rect, IslandAction)>,
-    pub reveal_line_alpha: f32,
-}
-
-pub fn show_control_island(ctx: &egui::Context, input: ControlIslandRenderInput<'_>) -> ControlIslandRenderResult;
-```
-
-Use a fixed `egui::Area`, a rounded 18--25 percent neutral outer material, compact contrast plates, no blur, and no `Panel::top`. Keep the approved 64-point timing slot and its source-aware tooltip. Collapse unsupported/low-priority capability details before controls overlap.
-
-- [ ] **Step 5: Run UI and deterministic asset tests**
-
-Run: `cargo test -p frd-ui-egui && powershell -ExecutionPolicy Bypass -File tools/update-material-symbols-rounded.ps1 && git diff --exit-code -- assets/ui-icons/material-symbols-rounded-24-400.ttf`
-
-Expected: UI tests pass and the second asset generation produces no binary diff.
-
-- [ ] **Step 6: Commit**
-
-```powershell
-git add crates/frd-ui-egui/src/control_island.rs crates/frd-ui-egui/src/lib.rs tools/update-material-symbols-rounded.ps1 assets/ui-icons/material-symbols-rounded-24-400.ttf assets/ui-icons/README.md
-git commit -m "feat(ui): render accessible floating control island"
 ```
 
 ---
