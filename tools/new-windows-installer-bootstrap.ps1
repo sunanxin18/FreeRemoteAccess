@@ -70,7 +70,7 @@ try {
 `$package = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$packageBlob'))
 `$installer = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString(`$installerBytes))
 Push-Location -LiteralPath `$package
-try { & `$installer -PackageRoot `$package -Elevated -TrustedVerifierBytes `$verifierBytes }
+try { & `$installer -PackageRoot `$package -Elevated -TrustedVerifierBytes `$verifierBytes -Confirm:`$false }
 finally { Pop-Location }
 "@
     $bundleBytes = [Text.Encoding]::UTF8.GetBytes($bundle)

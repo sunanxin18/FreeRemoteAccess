@@ -217,12 +217,54 @@ Describe "Windows package verification security boundaries" {
 }
 
 Describe "Windows elevation bootstrap security boundary" {
+    It "executes a SupportsShouldProcess elevated installer without an interactive confirmation" {
+        $marker = Join-Path $TestDrive "should-process-bootstrap.marker"
+        $installerText = @"
+[CmdletBinding(SupportsShouldProcess = `$true, ConfirmImpact = 'Medium')]
+param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
+if (-not `$Elevated) { throw 'expected elevated bundle mode' }
+if (-not `$PSBoundParameters.ContainsKey('Confirm') -or `$PSBoundParameters['Confirm']) {
+    throw 'bootstrap must explicitly pass -Confirm:`$false'
+}
+if (-not `$PSCmdlet.ShouldProcess(`$PackageRoot, 'write execution marker')) { return }
+[IO.File]::WriteAllText('$($marker.Replace("'", "''"))', 'executed', [Text.Encoding]::UTF8)
+"@
+        $plan = $null
+        try {
+            $plan = & $bootstrapBuilder `
+                -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
+                -VerifierBytes ([Text.Encoding]::UTF8.GetBytes("trusted verifier")) `
+                -PackageRoot $TestDrive `
+                -StagingParent $TestDrive
+            $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+            $systemPowerShell = Join-Path $systemDirectory "WindowsPowerShell\\v1.0\\powershell.exe"
+            $output = & $systemPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $plan.EncodedCommand 2>&1
+
+            $LASTEXITCODE | Should Be 0
+            (Test-Path -LiteralPath $marker -PathType Leaf) | Should Be $true
+            (Get-Content -Raw -LiteralPath $marker) | Should Be "executed"
+            ($output -join "`n") | Should Match "FreeRemoteDesk 管理员 payload 已通过校验"
+        }
+        finally {
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.PayloadPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.PayloadPath -Force
+            }
+            if ($null -ne $plan -and $null -ne $plan.ResultPath -and
+                (Test-Path -LiteralPath $plan.ResultPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $plan.ResultPath -Force
+            }
+            if ($null -ne $plan -and (Test-Path -LiteralPath $plan.StagingRoot -PathType Container)) {
+                Remove-Item -LiteralPath $plan.StagingRoot -Force
+            }
+        }
+    }
+
     It "binds elevated installer current directory to the hash-bound package root instead of System32" {
         $cleanPackage = Join-Path $TestDrive "clean package root"
         New-Item -ItemType Directory -Path $cleanPackage | Out-Null
         $marker = Join-Path $TestDrive "package-cwd.marker"
         $installerText = @"
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = `$true)]
 param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
 if (-not (Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'kernel32.dll') -PathType Leaf)) { throw 'System32 DLL fixture is unavailable' }
 if (-not ([IO.Path]::GetFullPath((Get-Location).Path).TrimEnd('\') -eq [IO.Path]::GetFullPath(`$PackageRoot).TrimEnd('\'))) { throw "elevated cwd was not package root: `$((Get-Location).Path)" }
@@ -269,7 +311,7 @@ if (@(Get-ChildItem -LiteralPath (Get-Location).Path -File -Filter '*.dll').Coun
         $oldSecret = $env:FRD_PASSWORD
         $env:FRD_PASSWORD = $secretSentinel
         $installerText = @"
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = `$true)]
 param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
 Write-Output 'diagnostic before failure'
 throw 'bounded administrator failure detail'
@@ -356,7 +398,7 @@ throw 'bounded administrator failure detail'
         $packageArgument = Join-Path $TestDrive "package argument with spaces"
         New-Item -ItemType Directory -Path $packageArgument | Out-Null
         $installerText = @"
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = `$true)]
 param(
     [Parameter(Mandatory = `$true)][string]`$PackageRoot,
     [switch]`$Elevated,
