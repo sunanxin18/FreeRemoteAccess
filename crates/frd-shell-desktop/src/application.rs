@@ -37,8 +37,7 @@ use frd_session::{
     SessionStartFailure, SessionStartOutcome, SessionStartPermit,
 };
 use frd_ui_model::{
-    CapabilityGlyphState, ConnectionGlyph, IslandAction, IslandWindowCapabilities, LaunchOptions,
-    Page, SessionChromeModel,
+    CapabilityGlyphState, ConnectionGlyph, IslandAction, LaunchOptions, Page, SessionChromeModel,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -71,8 +70,9 @@ use crate::video_decode_worker::{
     VideoWorkerEvents,
 };
 use crate::{
-    ChromeHit, ChromeHitRegions, ChromeLayout, InputGate, InputOwnership, InputRouter,
-    WindowChromeAdapter, TITLE_BAR_HEIGHT_POINTS,
+    ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeLayouts, ChromeRect,
+    ControlIslandPlacement, InputGate, InputOwnership, InputRouter, WindowChromeAdapter,
+    WindowChromeCommand, TITLE_BAR_HEIGHT_POINTS,
 };
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -1896,7 +1896,8 @@ struct DesktopWindowState {
     egui_renderer: egui_wgpu::Renderer,
     physical_size: PixelSize,
     remote_area: Option<PixelRect>,
-    chrome_layout: Option<ChromeLayout>,
+    chrome_layouts: Option<ChromeLayouts>,
+    chrome_hit_map: Option<ChromeHitMap>,
     cursor_position: Option<(u32, u32)>,
     lifecycle: PresentationLifecycle,
     remote: Option<RemoteBinding>,
@@ -1910,20 +1911,19 @@ struct DesktopWindowState {
 }
 
 impl DesktopWindowState {
-    fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayout> {
-        self.chrome_layout = None;
+    fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayouts> {
         let insets = self.chrome.native_insets(&self.window);
-        let layout = ChromeLayout::for_window(
+        let layouts = ChromeGeometrySnapshot::new(
             self.physical_size.width,
             self.physical_size.height,
             self.window.scale_factor(),
-            insets.leading_px,
-            insets.trailing_px,
-        )?;
-        self.remote_area = Some(layout.content_rect);
-        self.chrome_layout = Some(layout);
-        self.chrome.publish_hit_regions(ChromeHitRegions { layout });
-        Some(layout)
+            insets,
+        )?
+        .with_window_capabilities(self.chrome.capabilities())
+        .layouts(ControlIslandPlacement::default(), true)?;
+        self.remote_area = Some(layouts.remote.content_rect);
+        self.chrome_layouts = Some(layouts.clone());
+        Some(layouts)
     }
 }
 
@@ -2182,87 +2182,6 @@ mod dpi_transition_tests {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn paint_platform_window_controls(
-    ui: &egui::Ui,
-    layout: ChromeLayout,
-    scale_factor: f64,
-    maximized: bool,
-) {
-    // WM_NCCALCSIZE gives WGPU the full frame, so Windows no longer paints the
-    // caption glyph pixels. These are visual mirrors only: DwmDefWindowProc
-    // still owns native caption hit testing, hover tooltips and Snap Layout.
-    let color = ui.visuals().text_color();
-    let stroke = egui::Stroke::new(1.2, color);
-    let to_points = |rect: crate::ChromeRect| {
-        let scale = scale_factor as f32;
-        egui::Rect::from_min_size(
-            egui::pos2(rect.x as f32 / scale, rect.y as f32 / scale),
-            egui::vec2(rect.width as f32 / scale, rect.height as f32 / scale),
-        )
-    };
-    if let Some(rect) = layout.minimize_button.map(to_points) {
-        let center = rect.center();
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-5.0, 3.0),
-                center + egui::vec2(5.0, 3.0),
-            ],
-            stroke,
-        );
-    }
-    if let Some(rect) = layout.maximize_button.map(to_points) {
-        let center = rect.center();
-        if maximized {
-            ui.painter().rect_stroke(
-                egui::Rect::from_center_size(center + egui::vec2(-1.5, 1.5), egui::vec2(8.0, 8.0)),
-                0.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().rect_stroke(
-                egui::Rect::from_center_size(center + egui::vec2(1.5, -1.5), egui::vec2(8.0, 8.0)),
-                0.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-        } else {
-            ui.painter().rect_stroke(
-                egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)),
-                0.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-    }
-    if let Some(rect) = layout.close_button.map(to_points) {
-        let center = rect.center();
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(-5.0, -5.0),
-                center + egui::vec2(5.0, 5.0),
-            ],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [
-                center + egui::vec2(5.0, -5.0),
-                center + egui::vec2(-5.0, 5.0),
-            ],
-            stroke,
-        );
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn paint_platform_window_controls(
-    _ui: &egui::Ui,
-    _layout: ChromeLayout,
-    _scale_factor: f64,
-    _maximized: bool,
-) {
-}
-
 impl FrameBatchFailureTarget for DesktopApplication {
     fn block_remote_input(&mut self) {
         self.block_and_release_input_for_fatal();
@@ -2507,7 +2426,8 @@ impl DesktopApplication {
                 width: physical_size.width,
                 height: physical_size.height,
             }),
-            chrome_layout: None,
+            chrome_layouts: None,
+            chrome_hit_map: None,
             cursor_position: None,
             lifecycle: PresentationLifecycle::new(physical_size),
             remote: None,
@@ -2924,8 +2844,7 @@ impl DesktopApplication {
             }
             return;
         }
-        let Some(chrome_layout) = window.refresh_chrome_geometry() else {
-            window.remote_area = None;
+        let Some(chrome_layouts) = window.refresh_chrome_geometry() else {
             return;
         };
         let window_maximized = window.window.is_maximized();
@@ -2937,6 +2856,8 @@ impl DesktopApplication {
         let controller = self.launch.controller_mut();
         let catalog = &self.catalog;
         let mut intent = None;
+        let mut window_command = None;
+        let mut rendered_hit_rects = Vec::new();
         let product_chrome = controller.session_chrome();
         let mut output = egui_context.run_ui(raw_input, |root_ui| {
             egui::Panel::top("window-session-chrome")
@@ -2959,20 +2880,20 @@ impl DesktopApplication {
                         } => None,
                     };
                     if let Some(chrome) = chrome {
-                        let window_capabilities = if cfg!(target_os = "windows") {
-                            IslandWindowCapabilities::WINDOWS
-                        } else {
-                            IslandWindowCapabilities::NONE
+                        let window_capabilities = window.chrome.capabilities();
+                        let scale = window.window.scale_factor() as f32;
+                        let to_logical = |rect: ChromeRect| {
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.x as f32 / scale, rect.y as f32 / scale),
+                                egui::vec2(rect.width as f32 / scale, rect.height as f32 / scale),
+                            )
                         };
-                        let metrics = frd_ui_egui::control_island_metrics(window_capabilities);
-                        let island_rect = egui::Rect::from_center_size(
-                            egui::pos2(ui.max_rect().center().x, ui.max_rect().center().y),
-                            egui::vec2(metrics.total_width + 8.0, metrics.height + 8.0),
-                        );
-                        let reveal_line_rect = egui::Rect::from_center_size(
-                            egui::pos2(ui.max_rect().center().x, ui.max_rect().top() + 1.0),
-                            egui::vec2(160.0, 2.0),
-                        );
+                        let island_rect = chrome_layouts
+                            .overlay
+                            .island_rect
+                            .map(to_logical)
+                            .expect("visible floating chrome geometry includes the island");
+                        let reveal_line_rect = to_logical(chrome_layouts.overlay.reveal_line_rect);
                         let result = frd_ui_egui::show_control_island(
                             ui.ctx(),
                             frd_ui_egui::ControlIslandRenderInput {
@@ -2986,6 +2907,10 @@ impl DesktopApplication {
                                 opaque_material: false,
                             },
                         );
+                        rendered_hit_rects = result.hit_rects;
+                        if result.window_move_requested {
+                            window_command = Some(WindowChromeCommand::BeginMove);
+                        }
                         match result.action {
                             Some(IslandAction::CancelConnect) => {
                                 intent = Some(AppIntent::CancelConnect);
@@ -2993,24 +2918,12 @@ impl DesktopApplication {
                             Some(IslandAction::Disconnect) => {
                                 intent = Some(AppIntent::Disconnect);
                             }
-                            Some(
-                                IslandAction::ShowConnectionDetails
-                                | IslandAction::ToggleRemoteAudio
-                                | IslandAction::OpenClipboard
-                                | IslandAction::MinimizeWindow
-                                | IslandAction::ToggleMaximizeWindow
-                                | IslandAction::CloseWindow
-                                | IslandAction::ShowSystemMenu,
-                            )
-                            | None => {}
+                            Some(action) => {
+                                window_command = window_command_for_island_action(action);
+                            }
+                            None => {}
                         }
                     }
-                    paint_platform_window_controls(
-                        ui,
-                        chrome_layout,
-                        window.window.scale_factor(),
-                        window_maximized,
-                    );
                 });
 
             match mode {
@@ -3051,6 +2964,32 @@ impl DesktopApplication {
                 } => {}
             }
         });
+        let scale_factor = window.window.scale_factor();
+        let island_actions = rendered_hit_rects
+            .into_iter()
+            .map(|(rect, action)| {
+                logical_rect_to_physical(rect, scale_factor).map(|rect| (rect, action))
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(hit_map) = island_actions.and_then(|island_actions| {
+            ChromeHitMap::candidate(
+                chrome_layouts.remote.content_rect,
+                island_actions,
+                chrome_layouts.overlay.island_reposition_handle,
+                chrome_layouts.overlay.window_move_region,
+                Vec::new(),
+            )
+        }) {
+            window.chrome.publish_hit_map(hit_map.clone());
+            window.chrome_hit_map = Some(hit_map);
+        }
+        if let Some(command) = window_command {
+            if let Err(error) = window.chrome.execute(&window.window, command) {
+                eprintln!(
+                    "窗口操作失败（FRD-WIN-SHELL-002: window_chrome_command_failed）：{error:?}"
+                );
+            }
+        }
         window
             .egui_state
             .handle_platform_output(&window.window, output.platform_output);
@@ -3599,7 +3538,7 @@ impl DesktopApplication {
         let content_viewport = self.content_viewport();
         let ownership = self.window.as_ref().and_then(|window| {
             effective_pointer_keyboard_ownership(
-                window.chrome_layout?,
+                window.chrome_hit_map.as_ref()?,
                 content_viewport,
                 window.cursor_position?,
                 consumed_by_egui,
@@ -4295,17 +4234,54 @@ fn map_mouse_button(button: MouseButton) -> Option<PointerButton> {
     }
 }
 
+fn logical_rect_to_physical(rect: egui::Rect, scale_factor: f64) -> Option<ChromeRect> {
+    if !rect.is_finite() || !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    let scale = scale_factor as f32;
+    let min_x = (rect.min.x * scale).floor();
+    let min_y = (rect.min.y * scale).floor();
+    let max_x = (rect.max.x * scale).ceil();
+    let max_y = (rect.max.y * scale).ceil();
+    if min_x < 0.0
+        || min_y < 0.0
+        || max_x <= min_x
+        || max_y <= min_y
+        || max_x > u32::MAX as f32
+        || max_y > u32::MAX as f32
+    {
+        return None;
+    }
+    Some(ChromeRect {
+        x: min_x as u32,
+        y: min_y as u32,
+        width: (max_x - min_x) as u32,
+        height: (max_y - min_y) as u32,
+    })
+}
+
+fn window_command_for_island_action(action: IslandAction) -> Option<WindowChromeCommand> {
+    match action {
+        IslandAction::MinimizeWindow => Some(WindowChromeCommand::Minimize),
+        IslandAction::ToggleMaximizeWindow => Some(WindowChromeCommand::ToggleMaximize),
+        IslandAction::CloseWindow => Some(WindowChromeCommand::Close),
+        IslandAction::ShowSystemMenu => Some(WindowChromeCommand::ShowSystemMenu),
+        IslandAction::ShowConnectionDetails
+        | IslandAction::CancelConnect
+        | IslandAction::Disconnect
+        | IslandAction::ToggleRemoteAudio
+        | IslandAction::OpenClipboard => None,
+    }
+}
+
 fn pointer_keyboard_ownership(
-    layout: ChromeLayout,
+    hit_map: &ChromeHitMap,
     content_viewport: Option<ContentViewport>,
     position: (u32, u32),
 ) -> Option<InputOwnership> {
-    match layout.hit_test(position.0, position.1) {
-        ChromeHit::Connection
-        | ChromeHit::Audio
-        | ChromeHit::Clipboard
-        | ChromeHit::SessionAction => Some(InputOwnership::Ui),
-        ChromeHit::Client => {
+    match hit_map.hit_test(position) {
+        Some(ChromeHitTarget::IslandAction(_)) => Some(InputOwnership::Ui),
+        Some(ChromeHitTarget::RemoteContent) => {
             let rect = content_viewport?.content;
             let in_content = position.0 >= rect.x
                 && position.1 >= rect.y
@@ -4317,18 +4293,23 @@ fn pointer_keyboard_ownership(
                 InputOwnership::Ui
             })
         }
-        ChromeHit::Drag | ChromeHit::Minimize | ChromeHit::Maximize | ChromeHit::Close => None,
+        Some(
+            ChromeHitTarget::IslandRepositionHandle
+            | ChromeHitTarget::WindowMoveRegion
+            | ChromeHitTarget::NativeChrome,
+        )
+        | None => None,
     }
 }
 
 fn effective_pointer_keyboard_ownership(
-    layout: ChromeLayout,
+    hit_map: &ChromeHitMap,
     content_viewport: Option<ContentViewport>,
     position: (u32, u32),
     consumed_by_egui: bool,
     interactive: bool,
 ) -> Option<InputOwnership> {
-    match pointer_keyboard_ownership(layout, content_viewport, position) {
+    match pointer_keyboard_ownership(hit_map, content_viewport, position) {
         Some(InputOwnership::Remote) if consumed_by_egui || !interactive => {
             Some(InputOwnership::Ui)
         }
@@ -5809,29 +5790,50 @@ mod tests {
 
     #[test]
     fn pointer_domain_changes_only_for_session_glyphs_and_remote_content() {
-        let layout = crate::ChromeLayout::for_window(1100, 720, 1.0, 0, 144).unwrap();
+        let remote_content = PixelRect {
+            x: 0,
+            y: 0,
+            width: 1100,
+            height: 720,
+        };
+        let glyph = crate::ChromeRect {
+            x: 500,
+            y: 8,
+            width: 44,
+            height: 44,
+        };
+        let reposition = crate::ChromeRect {
+            x: 448,
+            y: 8,
+            width: 44,
+            height: 44,
+        };
+        let hit_map = crate::ChromeHitMap::candidate(
+            remote_content,
+            vec![(glyph, frd_ui_model::IslandAction::Disconnect)],
+            Some(reposition),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let viewport = ContentViewport {
             drawable: PixelSize::new(1100, 720).unwrap(),
-            content: layout.content_rect,
-            remote: PixelSize::new(1100, 676).unwrap(),
+            content: remote_content,
+            remote: PixelSize::new(1100, 720).unwrap(),
         };
-        let glyph = layout.session_buttons[0].center();
-        let content = (
-            layout.content_rect.x + layout.content_rect.width / 2,
-            layout.content_rect.y + layout.content_rect.height / 2,
-        );
+        let content = (remote_content.width / 2, remote_content.height / 2);
 
         assert_eq!(
-            super::pointer_keyboard_ownership(layout, Some(viewport), glyph),
+            super::pointer_keyboard_ownership(&hit_map, Some(viewport), glyph.center()),
             Some(crate::InputOwnership::Ui)
         );
         assert_eq!(
-            super::pointer_keyboard_ownership(layout, Some(viewport), content),
+            super::pointer_keyboard_ownership(&hit_map, Some(viewport), content),
             Some(crate::InputOwnership::Remote)
         );
         assert_eq!(
             super::effective_pointer_keyboard_ownership(
-                layout,
+                &hit_map,
                 Some(viewport),
                 content,
                 true,
@@ -5841,7 +5843,7 @@ mod tests {
         );
         assert_eq!(
             super::effective_pointer_keyboard_ownership(
-                layout,
+                &hit_map,
                 Some(viewport),
                 content,
                 false,
@@ -5851,7 +5853,7 @@ mod tests {
         );
         assert_eq!(
             super::effective_pointer_keyboard_ownership(
-                layout,
+                &hit_map,
                 Some(viewport),
                 content,
                 false,
@@ -5860,22 +5862,52 @@ mod tests {
             Some(crate::InputOwnership::Remote)
         );
         assert_eq!(
-            super::pointer_keyboard_ownership(layout, Some(viewport), (100, 20)),
+            super::pointer_keyboard_ownership(&hit_map, Some(viewport), reposition.center()),
             None
         );
+    }
+
+    #[test]
+    fn island_window_actions_map_to_exact_platform_commands() {
+        use frd_ui_model::IslandAction;
+
         assert_eq!(
-            super::pointer_keyboard_ownership(
-                layout,
-                Some(viewport),
-                layout.minimize_button.expect("Windows layout").center(),
-            ),
+            super::window_command_for_island_action(IslandAction::MinimizeWindow),
+            Some(crate::WindowChromeCommand::Minimize)
+        );
+        assert_eq!(
+            super::window_command_for_island_action(IslandAction::ToggleMaximizeWindow),
+            Some(crate::WindowChromeCommand::ToggleMaximize)
+        );
+        assert_eq!(
+            super::window_command_for_island_action(IslandAction::CloseWindow),
+            Some(crate::WindowChromeCommand::Close)
+        );
+        assert_eq!(
+            super::window_command_for_island_action(IslandAction::ShowSystemMenu),
+            Some(crate::WindowChromeCommand::ShowSystemMenu)
+        );
+        assert_eq!(
+            super::window_command_for_island_action(IslandAction::Disconnect),
             None
         );
     }
 
     #[test]
     fn mvs_letterbox_cannot_claim_remote_keyboard_domain() {
-        let layout = crate::ChromeLayout::for_window(2240, 1337, 1.0, 0, 0).unwrap();
+        let hit_map = crate::ChromeHitMap::candidate(
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 2240,
+                height: 1337,
+            },
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         let viewport = ContentViewport::fit_in(
             PixelSize::new(1920, 1080).unwrap(),
             PixelSize::new(2240, 1337).unwrap(),
@@ -5890,7 +5922,7 @@ mod tests {
 
         assert_eq!(
             super::effective_pointer_keyboard_ownership(
-                layout,
+                &hit_map,
                 Some(viewport),
                 (19, 50),
                 false,
@@ -5901,7 +5933,7 @@ mod tests {
         );
         assert_eq!(
             super::effective_pointer_keyboard_ownership(
-                layout,
+                &hit_map,
                 Some(viewport),
                 (20, 50),
                 false,
@@ -5966,15 +5998,27 @@ mod tests {
     }
 
     #[test]
-    fn remote_area_starts_below_the_dpi_scaled_titlebar() {
-        let layout = crate::ChromeLayout::for_window(1100, 720, 1.5, 0, 144).unwrap();
+    fn floating_chrome_keeps_remote_area_at_the_full_window_size() {
+        let layouts = crate::ChromeGeometrySnapshot::new(
+            1100,
+            720,
+            1.5,
+            crate::NativeChromeInsets {
+                leading_px: 0,
+                trailing_px: 144,
+            },
+        )
+        .unwrap()
+        .with_window_capabilities(frd_ui_model::IslandWindowCapabilities::WINDOWS)
+        .layouts(crate::ControlIslandPlacement::default(), true)
+        .unwrap();
         assert_eq!(
-            layout.content_rect,
+            layouts.remote.content_rect,
             PixelRect {
                 x: 0,
-                y: 66,
+                y: 0,
                 width: 1100,
-                height: 654,
+                height: 720,
             }
         );
     }

@@ -32,6 +32,6 @@ pub use video_decode_worker::{
     VideoStreamAdmission, VideoWorkerEvent, VideoWorkerEvents, VideoWorkerSendError,
 };
 pub use window_chrome::{
-    ChromeHit, ChromeHitRegions, ChromeLayout, ChromeRect, NativeChromeInsets, WindowChromeAction,
-    WindowChromeAdapter, WindowChromeCommand, WindowChromeError, TITLE_BAR_HEIGHT_POINTS,
+    ChromeRect, NativeChromeInsets, WindowChromeAdapter, WindowChromeCommand, WindowChromeError,
+    TITLE_BAR_HEIGHT_POINTS,
 };

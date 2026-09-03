@@ -1,6 +1,7 @@
+use frd_ui_model::IslandWindowCapabilities;
+
 use crate::{
-    ChromeHitRegions, NativeChromeInsets, WindowChromeAction, WindowChromeAdapter,
-    WindowChromeError,
+    ChromeHitMap, NativeChromeInsets, WindowChromeAdapter, WindowChromeCommand, WindowChromeError,
 };
 
 pub(crate) struct PlatformWindowChrome;
@@ -30,13 +31,17 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         }
     }
 
-    fn publish_hit_regions(&mut self, _regions: ChromeHitRegions) {}
+    fn capabilities(&self) -> IslandWindowCapabilities {
+        crate::window_chrome::unverified_desktop_capabilities()
+    }
 
-    fn execute(&mut self, window: &winit::window::Window, action: WindowChromeAction) {
-        match action {
-            WindowChromeAction::Minimize => window.set_minimized(true),
-            WindowChromeAction::ToggleMaximize => window.set_maximized(!window.is_maximized()),
-            WindowChromeAction::Close => window.set_visible(false),
-        }
+    fn publish_hit_map(&mut self, _hit_map: ChromeHitMap) {}
+
+    fn execute(
+        &mut self,
+        _window: &winit::window::Window,
+        _command: WindowChromeCommand,
+    ) -> Result<(), WindowChromeError> {
+        Err(WindowChromeError::UnsupportedWindow)
     }
 }

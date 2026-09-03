@@ -1,28 +1,29 @@
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use frd_ui_model::{IslandAction, IslandWindowCapabilities};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DwmDefWindowProc, DwmExtendFrameIntoClientArea};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::UI::Controls::MARGINS;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    IsZoomed, SetWindowPos, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE,
-    HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS,
-    SM_CXPADDEDBORDER, SM_CXSIZE, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_NCCALCSIZE, WM_NCHITTEST,
+    GetClientRect, IsZoomed, SetWindowPos, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
+    HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CXSIZE, SM_CXSIZEFRAME, SM_CYSIZEFRAME,
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_NCCALCSIZE, WM_NCHITTEST,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::{
-    ChromeHit, ChromeHitRegions, NativeChromeInsets, WindowChromeAction, WindowChromeAdapter,
+    ChromeHitMap, ChromeHitTarget, NativeChromeInsets, WindowChromeAdapter, WindowChromeCommand,
     WindowChromeError, TITLE_BAR_HEIGHT_POINTS,
 };
 
 const SUBCLASS_ID: usize = 0x4652_4443;
 
 struct SubclassState {
-    regions: Mutex<Option<ChromeHitRegions>>,
+    hit_map: Mutex<Option<ChromeHitMap>>,
     resize_metrics: Mutex<(i32, i32)>,
 }
 
@@ -36,7 +37,7 @@ impl PlatformWindowChrome {
         Self {
             hwnd: None,
             state: Box::new(SubclassState {
-                regions: Mutex::new(None),
+                hit_map: Mutex::new(None),
                 resize_metrics: Mutex::new((8, 8)),
             }),
         }
@@ -129,24 +130,44 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         }
     }
 
-    fn publish_hit_regions(&mut self, regions: ChromeHitRegions) {
-        if let Ok(mut slot) = self.state.regions.lock() {
-            *slot = Some(regions);
+    fn capabilities(&self) -> IslandWindowCapabilities {
+        IslandWindowCapabilities::WINDOWS
+    }
+
+    fn publish_hit_map(&mut self, hit_map: ChromeHitMap) {
+        if let Ok(mut slot) = self.state.hit_map.lock() {
+            *slot = Some(hit_map);
         }
     }
 
-    fn execute(&mut self, window: &winit::window::Window, action: WindowChromeAction) {
-        match action {
-            WindowChromeAction::Minimize => window.set_minimized(true),
-            WindowChromeAction::ToggleMaximize => window.set_maximized(!window.is_maximized()),
-            WindowChromeAction::Close => {
-                if let Ok(hwnd) = Self::hwnd(window) {
-                    unsafe {
-                        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                            hwnd, WM_CLOSE, 0, 0,
-                        );
-                    }
-                }
+    fn execute(
+        &mut self,
+        window: &winit::window::Window,
+        command: WindowChromeCommand,
+    ) -> Result<(), WindowChromeError> {
+        match command {
+            WindowChromeCommand::BeginMove => window
+                .drag_window()
+                .map_err(|_| WindowChromeError::PlatformCallFailed),
+            WindowChromeCommand::Minimize => {
+                window.set_minimized(true);
+                Ok(())
+            }
+            WindowChromeCommand::ToggleMaximize => {
+                window.set_maximized(!window.is_maximized());
+                Ok(())
+            }
+            WindowChromeCommand::Close => {
+                let hwnd = Self::hwnd(window)?;
+                (unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                } != 0)
+                    .then_some(())
+                    .ok_or(WindowChromeError::PlatformCallFailed)
+            }
+            WindowChromeCommand::ShowSystemMenu => {
+                window.show_window_menu(winit::dpi::PhysicalPosition::new(0_i32, 0_i32));
+                Ok(())
             }
         }
     }
@@ -193,19 +214,28 @@ unsafe extern "system" fn subclass_proc(
         if ScreenToClient(hwnd, &mut point) == 0 {
             return DefSubclassProc(hwnd, message, wparam, lparam);
         }
-        let Some(regions) = state.regions.lock().ok().and_then(|slot| *slot) else {
+        let Some(hit_map) = state.hit_map.lock().ok().and_then(|slot| slot.clone()) else {
             return DefSubclassProc(hwnd, message, wparam, lparam);
         };
         let Some((resize_x, resize_y)) = state.resize_metrics.lock().ok().map(|metrics| *metrics)
         else {
             return DefSubclassProc(hwnd, message, wparam, lparam);
         };
+        let mut client_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if GetClientRect(hwnd, &mut client_rect) == 0 {
+            return DefSubclassProc(hwnd, message, wparam, lparam);
+        }
         if let Some(resize) = resize_hit_for_window(
             IsZoomed(hwnd) != 0,
             point.x,
             point.y,
-            regions.layout.title_bar.width as i32,
-            regions.layout.content_rect.y as i32 + regions.layout.content_rect.height as i32,
+            client_rect.right.saturating_sub(client_rect.left),
+            client_rect.bottom.saturating_sub(client_rect.top),
             resize_x,
             resize_y,
         ) {
@@ -214,19 +244,23 @@ unsafe extern "system" fn subclass_proc(
         if point.x < 0 || point.y < 0 {
             return DefSubclassProc(hwnd, message, wparam, lparam);
         }
-        return match regions.layout.hit_test(point.x as u32, point.y as u32) {
-            ChromeHit::Drag => HTCAPTION as LRESULT,
-            ChromeHit::Minimize => HTMINBUTTON as LRESULT,
-            ChromeHit::Maximize => HTMAXBUTTON as LRESULT,
-            ChromeHit::Close => HTCLOSE as LRESULT,
-            ChromeHit::Connection
-            | ChromeHit::Audio
-            | ChromeHit::Clipboard
-            | ChromeHit::SessionAction
-            | ChromeHit::Client => HTCLIENT as LRESULT,
-        };
+        return windows_native_hit(&hit_map, (point.x as u32, point.y as u32)) as LRESULT;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+fn windows_native_hit(hit_map: &ChromeHitMap, point: (u32, u32)) -> u32 {
+    match hit_map.hit_test(point) {
+        Some(ChromeHitTarget::IslandAction(IslandAction::ToggleMaximizeWindow)) => HTMAXBUTTON,
+        Some(ChromeHitTarget::WindowMoveRegion) => HTCAPTION,
+        Some(
+            ChromeHitTarget::IslandAction(_)
+            | ChromeHitTarget::IslandRepositionHandle
+            | ChromeHitTarget::NativeChrome
+            | ChromeHitTarget::RemoteContent,
+        )
+        | None => HTCLIENT,
+    }
 }
 
 fn low_word_signed(value: LPARAM) -> i32 {
@@ -276,9 +310,48 @@ fn resize_hit_for_window(
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{HTBOTTOMRIGHT, HTCLIENT, HTTOPLEFT};
+    use frd_core::PixelRect;
+    use frd_ui_model::IslandAction;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOMRIGHT, HTCLIENT, HTMAXBUTTON, HTTOPLEFT,
+    };
 
-    use super::{resize_hit, resize_hit_for_window};
+    use super::{resize_hit, resize_hit_for_window, windows_native_hit};
+    use crate::{ChromeHitMap, ChromeHitTarget, ChromeRect};
+
+    #[test]
+    fn windows_maximize_rect_preserves_native_snap_hit() {
+        let maximize_rect = ChromeRect {
+            x: 500,
+            y: 8,
+            width: 44,
+            height: 44,
+        };
+        let map = ChromeHitMap::candidate(
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 1200,
+                height: 800,
+            },
+            vec![(maximize_rect, IslandAction::ToggleMaximizeWindow)],
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            map.hit_test(maximize_rect.center()),
+            Some(ChromeHitTarget::IslandAction(
+                IslandAction::ToggleMaximizeWindow
+            ))
+        );
+        assert_eq!(
+            windows_native_hit(&map, maximize_rect.center()),
+            HTMAXBUTTON
+        );
+    }
 
     #[test]
     fn resize_edges_win_only_at_the_physical_frame_boundary() {
