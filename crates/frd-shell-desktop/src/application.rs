@@ -72,7 +72,7 @@ use crate::video_decode_worker::{
 use crate::{
     ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeLayouts, ChromeRect,
     ControlIslandPlacement, FloatingChromeController, InputGate, InputOwnership, InputRouter,
-    WindowChromeAdapter, WindowChromeCommand,
+    WindowChromeAdapter, WindowChromeCommand, WindowChromeError,
 };
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -113,6 +113,51 @@ impl ForcedRevealDiagnostic {
             self.error
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowCommandDiagnostic {
+    command: WindowChromeCommand,
+    error: WindowChromeError,
+}
+
+impl WindowCommandDiagnostic {
+    fn new(command: WindowChromeCommand, error: WindowChromeError) -> Self {
+        Self { command, error }
+    }
+
+    fn message(self) -> String {
+        let command = match self.command {
+            WindowChromeCommand::BeginMove => "begin_move",
+            WindowChromeCommand::Minimize => "minimize",
+            WindowChromeCommand::ToggleMaximize => "toggle_maximize",
+            WindowChromeCommand::Close => "close",
+            WindowChromeCommand::ShowSystemMenu => "show_system_menu",
+        };
+        let reason = match self.error {
+            WindowChromeError::UnsupportedWindow => "unsupported_window",
+            WindowChromeError::PlatformCallFailed => "platform_call_failed",
+            WindowChromeError::InvalidGeometry => "invalid_geometry",
+        };
+        format!(
+            "窗口操作失败（FRD-WIN-SHELL-002: window_chrome_command_failed）：command={command}; reason={reason}"
+        )
+    }
+}
+
+fn update_window_command_diagnostic(
+    slot: &mut Option<WindowCommandDiagnostic>,
+    command: WindowChromeCommand,
+    result: Result<(), WindowChromeError>,
+) -> bool {
+    let next = result
+        .err()
+        .map(|error| WindowCommandDiagnostic::new(command, error));
+    if *slot == next {
+        return false;
+    }
+    *slot = next;
+    true
 }
 
 fn complete_checked_forced_reveal(
@@ -2249,6 +2294,7 @@ pub struct DesktopApplication {
     armed_repaint: Option<RepaintPlan>,
     window_configuration: DesktopWindowConfiguration,
     forced_reveal_diagnostic: Option<ForcedRevealDiagnostic>,
+    window_command_diagnostic: Option<WindowCommandDiagnostic>,
 }
 
 struct ApplicationDrainCallbacks<'a> {
@@ -2406,6 +2452,7 @@ impl DesktopApplication {
             armed_repaint: None,
             window_configuration: DesktopWindowConfiguration::default(),
             forced_reveal_diagnostic: None,
+            window_command_diagnostic: None,
         }
     }
 
@@ -2454,6 +2501,7 @@ impl DesktopApplication {
             armed_repaint: None,
             window_configuration: DesktopWindowConfiguration::default(),
             forced_reveal_diagnostic: None,
+            window_command_diagnostic: None,
         }
     }
 
@@ -2658,6 +2706,7 @@ impl DesktopApplication {
             }
             Some(AppAction::StartSession(request, permit)) => {
                 self.forced_reveal_diagnostic = None;
+                self.window_command_diagnostic = None;
                 if let Some(window) = self.window.as_mut() {
                     window.reset_connection_chrome(std::time::Instant::now());
                 }
@@ -3053,6 +3102,18 @@ impl DesktopApplication {
         let forced_reveal_diagnostic = self
             .forced_reveal_diagnostic
             .map(ForcedRevealDiagnostic::message);
+        let window_command_diagnostic = self
+            .window_command_diagnostic
+            .map(WindowCommandDiagnostic::message);
+        let shell_diagnostic = match (
+            forced_reveal_diagnostic.as_deref(),
+            window_command_diagnostic.as_deref(),
+        ) {
+            (Some(forced), Some(window)) => Some(format!("{forced}\n{window}")),
+            (Some(forced), None) => Some(forced.to_owned()),
+            (None, Some(window)) => Some(window.to_owned()),
+            (None, None) => None,
+        };
         let (product_chrome, auto_hide_enabled) = match &self.mode {
             DesktopMode::Product => (
                 self.launch.controller().session_chrome(),
@@ -3139,7 +3200,7 @@ impl DesktopApplication {
                         reveal_line_rect,
                         focus_first: focus_session_chrome,
                         opaque_material: window.chrome.appearance_policy().opaque_material,
-                        shell_diagnostic: forced_reveal_diagnostic.as_deref(),
+                        shell_diagnostic: shell_diagnostic.as_deref(),
                     },
                 );
                 island_hovered = result.hovered_union;
@@ -3255,10 +3316,17 @@ impl DesktopApplication {
             window.chrome_hit_map = Some(hit_map);
         }
         if let Some(command) = window_command {
-            if let Err(error) = window.chrome.execute(&window.window, command) {
-                eprintln!(
-                    "窗口操作失败（FRD-WIN-SHELL-002: window_chrome_command_failed）：{error:?}"
-                );
+            let result = window.chrome.execute(&window.window, command);
+            let diagnostic_changed = update_window_command_diagnostic(
+                &mut self.window_command_diagnostic,
+                command,
+                result,
+            );
+            if let Err(error) = result {
+                eprintln!("{}", WindowCommandDiagnostic::new(command, error).message());
+            }
+            if diagnostic_changed {
+                window.window.request_redraw();
             }
         }
         window
@@ -6343,6 +6411,30 @@ mod tests {
             diagnostic.message(),
             "控制栏显示失败（FRD-WIN-SHELL-003: forced_reveal_release_rejected）：CommandClosed"
         );
+    }
+
+    #[test]
+    fn window_command_failure_is_visible_and_a_later_success_clears_it() {
+        let mut diagnostic = None;
+        assert!(super::update_window_command_diagnostic(
+            &mut diagnostic,
+            crate::WindowChromeCommand::ToggleMaximize,
+            Err(crate::WindowChromeError::PlatformCallFailed),
+        ));
+        assert_eq!(
+            diagnostic.map(super::WindowCommandDiagnostic::message),
+            Some(
+                "窗口操作失败（FRD-WIN-SHELL-002: window_chrome_command_failed）：command=toggle_maximize; reason=platform_call_failed"
+                    .to_owned()
+            )
+        );
+
+        assert!(super::update_window_command_diagnostic(
+            &mut diagnostic,
+            crate::WindowChromeCommand::ToggleMaximize,
+            Ok(()),
+        ));
+        assert_eq!(diagnostic, None);
     }
 
     #[test]
