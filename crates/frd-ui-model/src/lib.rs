@@ -509,7 +509,10 @@ mod tests {
             username: "test-user".to_owned(),
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = ProtocolCatalog::new([
+            ProtocolId::apple_high_performance(),
+            ProtocolId::apple_hpss_mvs(),
+        ]);
 
         let submission = form
             .take_submission(&catalog)
@@ -529,13 +532,20 @@ mod tests {
             username: "test-user".to_owned(),
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs(), ProtocolId::rdp()]);
+        let catalog = ProtocolCatalog::new([
+            ProtocolId::apple_high_performance(),
+            ProtocolId::apple_hpss_mvs(),
+            ProtocolId::rdp(),
+        ]);
 
         let submission = form
             .take_submission(&catalog)
             .expect("registered Mac automatic protocol is accepted");
 
-        assert_eq!(submission.resolved_protocol, ProtocolId::apple_hpss_mvs());
+        assert_eq!(
+            submission.resolved_protocol,
+            ProtocolId::apple_high_performance()
+        );
     }
 
     #[test]
@@ -548,12 +558,29 @@ mod tests {
             username: "test-user".to_owned(),
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs(), ProtocolId::rdp()]);
+        let catalog = ProtocolCatalog::new([
+            ProtocolId::apple_high_performance(),
+            ProtocolId::apple_hpss_mvs(),
+            ProtocolId::rdp(),
+        ]);
 
         let submission = form
             .take_submission(&catalog)
             .expect("registered Windows automatic protocol is accepted");
 
         assert_eq!(submission.resolved_protocol, ProtocolId::rdp());
+    }
+
+    #[test]
+    fn saved_standard_profile_remains_an_explicit_standard_selection() {
+        let profile = saved_profile();
+        let mut form = ConnectionForm::new(ConnectionDraft::default());
+
+        form.select_profile_metadata(&profile);
+
+        assert_eq!(
+            form.draft.protocol,
+            super::ProtocolChoice::Explicit(ProtocolId::apple_hpss_mvs())
+        );
     }
 }

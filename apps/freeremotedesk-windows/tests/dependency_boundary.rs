@@ -163,6 +163,12 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
         1,
         "the product registers exactly the approved RDP factory"
     );
+    assert!(
+        main_source.contains(
+            "let factories = [apple_high_performance_factory, apple_factory, rdp_factory];"
+        ),
+        "the protocol picker lists Apple High Performance before Apple Standard"
+    );
 }
 
 #[test]

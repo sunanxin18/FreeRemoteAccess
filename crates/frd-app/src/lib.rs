@@ -67,6 +67,13 @@ mod tests {
         AppPage, AppPlatformStores, PresentationEvent, ProductPolicy,
     };
 
+    fn apple_catalog() -> ProtocolCatalog {
+        ProtocolCatalog::new([
+            ProtocolId::apple_high_performance(),
+            ProtocolId::apple_hpss_mvs(),
+        ])
+    }
+
     #[test]
     fn frame_response_timing_updates_remote_chrome_and_clears_on_generation_and_failure() {
         let session_id = SessionId::allocate();
@@ -241,7 +248,7 @@ mod tests {
         controller
             .handle_intent(
                 AppIntent::Disconnect,
-                &ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]),
+                &apple_catalog(),
                 &RecordingStore::default(),
             )
             .expect("disconnect starts cleanup");
@@ -260,7 +267,7 @@ mod tests {
 
     #[test]
     fn session_chrome_maps_connecting_state_to_cancel_without_capability_actions() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let intent = controller
@@ -331,7 +338,7 @@ mod tests {
 
     #[test]
     fn controller_transitions_connection_through_remote_session_and_failed() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let intent = controller
@@ -392,7 +399,7 @@ mod tests {
 
     #[test]
     fn connect_resolves_auto_and_loads_the_saved_pin_before_starting_a_worker() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::with_saved_pin([0x33; 32]);
         let mut controller = AppController::connection_form(complete_form());
         let submission = controller
@@ -409,7 +416,7 @@ mod tests {
             panic!("connect starts through the session request path");
         };
 
-        assert_eq!(request.protocol_id, ProtocolId::apple_hpss_mvs());
+        assert_eq!(request.protocol_id, ProtocolId::apple_high_performance());
         assert_eq!(request.saved_server_pin, Some([0x33; 32]));
     }
 
@@ -607,7 +614,7 @@ mod tests {
 
     #[test]
     fn controller_rejects_a_second_active_connection() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let first = complete_form()
@@ -629,7 +636,7 @@ mod tests {
 
     #[test]
     fn malformed_direct_submission_stays_editable_and_starts_no_worker() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller =
             AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
@@ -641,7 +648,7 @@ mod tests {
                 protocol: ProtocolChoice::Automatic,
                 username: String::new(),
             },
-            resolved_protocol: ProtocolId::apple_hpss_mvs(),
+            resolved_protocol: ProtocolId::apple_high_performance(),
             password: SecretBuffer::new(b"retained-password".to_vec()),
             remember_on_this_device: false,
             selected_profile: None,
@@ -668,7 +675,7 @@ mod tests {
 
     #[test]
     fn direct_submission_without_protocol_required_password_starts_no_worker() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller =
             AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
@@ -680,7 +687,7 @@ mod tests {
                 protocol: ProtocolChoice::Automatic,
                 username: "test-user".to_owned(),
             },
-            resolved_protocol: ProtocolId::apple_hpss_mvs(),
+            resolved_protocol: ProtocolId::apple_high_performance(),
             password: SecretBuffer::new(Vec::new()),
             remember_on_this_device: false,
             selected_profile: None,
@@ -734,7 +741,7 @@ mod tests {
 
     #[test]
     fn unregistered_resolved_protocol_stays_editable_without_starting() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller =
             AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
@@ -770,7 +777,7 @@ mod tests {
 
     #[test]
     fn controller_allows_reconnect_only_after_coordinator_cleanup_completes() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let first = complete_form()
@@ -818,7 +825,7 @@ mod tests {
 
     #[test]
     fn spontaneous_error_requires_matching_cleanup_before_reconnect() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let AppAction::StartSession(request, permit) = controller
@@ -915,7 +922,7 @@ mod tests {
 
     #[test]
     fn spontaneous_closed_requires_matching_cleanup_before_reconnect() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let AppAction::StartSession(request, permit) = controller
@@ -963,7 +970,7 @@ mod tests {
     #[test]
     fn error_then_closed_is_idempotent_and_preserves_first_terminal_code() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let (mut controller, permit) =
             AppController::awaiting_first_frame_with_start(session_id, 1);
@@ -1036,8 +1043,7 @@ mod tests {
             request: ConnectRequest,
             cleanup: RecordingCleanup,
         ) -> Self {
-            let mut coordinator =
-                SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+            let mut coordinator = SessionCoordinator::new(apple_catalog());
             let handle = match coordinator.start(permit, TargetSystem::MacOs, request, move |_| {
                 Ok(Box::new(cleanup) as Box<dyn CleanupOperations>)
             }) {
@@ -1059,7 +1065,7 @@ mod tests {
 
     #[test]
     fn empty_launch_options_leave_the_connection_form_without_an_intent() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let provider = TestCredentialProvider::success();
         let mut launch = AppLaunch::new(LaunchOptions::default(), &provider, &catalog);
 
@@ -1072,7 +1078,7 @@ mod tests {
 
     #[test]
     fn partial_connect_launch_stays_on_the_editable_form() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let provider = TestCredentialProvider::success();
         let mut launch = AppLaunch::new(
             LaunchOptions {
@@ -1096,7 +1102,7 @@ mod tests {
 
     #[test]
     fn complete_launch_without_connect_only_prefills_the_form() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let provider = TestCredentialProvider::success();
         let mut options = complete_launch_options();
         options.connect_when_complete = false;
@@ -1112,7 +1118,7 @@ mod tests {
 
     #[test]
     fn complete_connect_launch_emits_exactly_one_connect_intent() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let provider = TestCredentialProvider::success();
         let mut launch = AppLaunch::new(complete_launch_options(), &provider, &catalog);
 
@@ -1126,7 +1132,7 @@ mod tests {
 
     #[test]
     fn failed_credential_provider_leaves_the_form_and_starts_no_worker() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let provider = TestCredentialProvider::failure();
         let mut launch = AppLaunch::new(complete_launch_options(), &provider, &catalog);
 
@@ -1147,7 +1153,7 @@ mod tests {
 
     #[test]
     fn failed_provider_is_visible_even_when_launch_does_not_auto_connect() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let provider = TestCredentialProvider::failure();
         let mut options = complete_launch_options();
         options.connect_when_complete = false;
@@ -1553,8 +1559,7 @@ mod tests {
             panic!("remembered submission starts a session");
         };
         let session = request.session_id;
-        let mut coordinator =
-            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let mut coordinator = SessionCoordinator::new(apple_catalog());
         let failure = match coordinator.start(permit, TargetSystem::MacOs, request, |_| {
             Err(ProtocolError::Terminal)
         }) {
@@ -1659,7 +1664,7 @@ mod tests {
                 stores,
             );
             Self {
-                catalog: ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]),
+                catalog: apple_catalog(),
                 controller: Mutex::new(controller),
                 identities,
                 profiles,
@@ -2177,7 +2182,7 @@ mod tests {
 
     #[test]
     fn controller_consumes_original_launch_rollback_and_accepts_a_fresh_connect() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let AppAction::StartSession(request, permit) = controller
@@ -2195,8 +2200,7 @@ mod tests {
         };
         let session_id = request.session_id;
         assert!(request.credentials.is_some());
-        let mut coordinator =
-            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let mut coordinator = SessionCoordinator::new(apple_catalog());
         let rollback = match coordinator.start(permit, TargetSystem::MacOs, request, |_| {
             Err(ProtocolError::Terminal)
         }) {
@@ -2231,7 +2235,7 @@ mod tests {
 
     #[test]
     fn mismatched_duplicate_and_stale_launch_rollbacks_leave_the_current_slot_untouched() {
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::connection_form(complete_form());
         let AppAction::StartSession(request, permit) = controller
@@ -2250,8 +2254,7 @@ mod tests {
         let session_id = request.session_id;
 
         let foreign_permit = frd_session::reserve_session_start(session_id).1;
-        let mut foreign_coordinator =
-            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let mut foreign_coordinator = SessionCoordinator::new(apple_catalog());
         let foreign_rollback = match foreign_coordinator.start(
             foreign_permit,
             TargetSystem::MacOs,
@@ -2265,8 +2268,7 @@ mod tests {
             .consume_launch_rollback(&foreign_rollback)
             .is_err());
 
-        let mut coordinator =
-            SessionCoordinator::new(ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]));
+        let mut coordinator = SessionCoordinator::new(apple_catalog());
         let original_rollback =
             match coordinator.start(permit, TargetSystem::MacOs, request, |_| {
                 Err(ProtocolError::Terminal)
@@ -2369,7 +2371,7 @@ mod tests {
     #[test]
     fn presented_apple_disconnecting_stage_closes_input_once_and_waits_for_bound_cleanup() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let (mut controller, permit) =
             AppController::awaiting_first_frame_with_start(session_id, 3);
@@ -2461,7 +2463,7 @@ mod tests {
     #[test]
     fn repeated_cancel_is_a_successful_noop_after_one_disconnect_command() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
 
@@ -2480,7 +2482,7 @@ mod tests {
     #[test]
     fn repeated_disconnect_is_a_successful_noop_after_one_disconnect_command() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
         controller.handle_presentation(PresentationEvent::FramePresented {
@@ -2505,7 +2507,7 @@ mod tests {
     #[test]
     fn cancel_then_disconnect_emits_only_the_first_disconnect_command() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
 
@@ -2561,7 +2563,7 @@ mod tests {
     #[test]
     fn cancel_then_late_full_baseline_does_not_enter_remote() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(session_id, 3);
 
@@ -2583,7 +2585,7 @@ mod tests {
     #[test]
     fn disconnect_then_route_input_returns_none() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(session_id, 3);
         controller.handle_presentation(PresentationEvent::FramePresented {
@@ -2608,7 +2610,7 @@ mod tests {
     #[test]
     fn disconnecting_then_late_transport_ready_and_generation_do_not_resurrect() {
         let session_id = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let mut controller = AppController::awaiting_first_frame(session_id, 3);
 
@@ -2678,7 +2680,7 @@ mod tests {
     #[test]
     fn cleanup_and_reconnect_do_not_expose_prior_session_state() {
         let first = SessionId::allocate();
-        let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
+        let catalog = apple_catalog();
         let store = RecordingStore::default();
         let (mut controller, permit) = AppController::awaiting_first_frame_with_start(first, 1);
         let mut lifecycle =

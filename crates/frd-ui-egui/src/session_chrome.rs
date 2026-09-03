@@ -10,7 +10,7 @@ use frd_ui_model::{
 const SLOT_SIZE: f32 = 44.0;
 const SLOT_SPACING: f32 = 4.0;
 const SLOT_COUNT: usize = 4;
-const FRAME_RESPONSE_WIDTH: f32 = 88.0;
+const FRAME_RESPONSE_WIDTH: f32 = 64.0;
 const FRAME_RESPONSE_TOOLTIP: &str =
     "画面响应时间（从画面更新请求成功发送到完整更新处理完成，不含本地呈现）";
 const MEDIA_INGRESS_TO_PRESENT_TOOLTIP: &str =
@@ -68,8 +68,10 @@ struct FrameResponseSemantic {
 fn presentation_timing_semantic(timing: Option<SessionTiming>) -> FrameResponseSemantic {
     let text = match timing.map(|timing| timing.milliseconds) {
         None => "-- ms".to_owned(),
-        Some(ms) if ms < 10_000 => format!("{ms} ms"),
-        Some(_) => "9999+ ms".to_owned(),
+        Some(ms) if ms < 1_000 => format!("{ms} ms"),
+        Some(ms) if ms < 100_000 => format!("{}.{:01} s", ms / 1_000, ms % 1_000 / 100),
+        Some(ms) if ms < 1_000_000 => format!("{} s", ms / 1_000),
+        Some(_) => "999+ s".to_owned(),
     };
     let tooltip = match timing.map(|timing| timing.source) {
         Some(SessionTimingSource::MediaIngressToPresent) => MEDIA_INGRESS_TO_PRESENT_TOOLTIP,
@@ -414,14 +416,26 @@ mod tests {
             .text,
             "37 ms"
         );
-        assert_eq!(
-            presentation_timing_semantic(Some(SessionTiming {
-                source: SessionTimingSource::FramebufferResponse,
-                milliseconds: u32::MAX,
-            }))
-            .text,
-            "9999+ ms"
-        );
+        for (milliseconds, expected) in [
+            (0, "0 ms"),
+            (999, "999 ms"),
+            (1_000, "1.0 s"),
+            (12_399, "12.3 s"),
+            (99_999, "99.9 s"),
+            (100_000, "100 s"),
+            (999_999, "999 s"),
+            (1_000_000, "999+ s"),
+            (u32::MAX, "999+ s"),
+        ] {
+            assert_eq!(
+                presentation_timing_semantic(Some(SessionTiming {
+                    source: SessionTimingSource::FramebufferResponse,
+                    milliseconds,
+                }))
+                .text,
+                expected
+            );
+        }
         let media = presentation_timing_semantic(Some(SessionTiming {
             source: SessionTimingSource::MediaIngressToPresent,
             milliseconds: 24,
@@ -433,9 +447,9 @@ mod tests {
         );
 
         let metrics = session_chrome_metrics();
-        assert_eq!(metrics.frame_response_width, 88.0);
+        assert_eq!(metrics.frame_response_width, 64.0);
         assert_eq!(metrics.height, 44.0);
-        assert_eq!(metrics.total_width, 280.0);
+        assert_eq!(metrics.total_width, 256.0);
     }
 
     #[test]

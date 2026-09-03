@@ -185,7 +185,7 @@ impl ProtocolCatalog {
 
 fn default_protocol_for(target: TargetSystem) -> Option<ProtocolId> {
     match target {
-        TargetSystem::MacOs => Some(ProtocolId::apple_hpss_mvs()),
+        TargetSystem::MacOs => Some(ProtocolId::apple_high_performance()),
         TargetSystem::Windows => Some(ProtocolId::rdp()),
         TargetSystem::Linux => Some(ProtocolId::rfb()),
         TargetSystem::Custom => None,
@@ -964,17 +964,17 @@ mod tests {
     };
 
     #[test]
-    fn automatic_mac_selection_resolves_to_the_only_apple_protocol() {
+    fn automatic_mac_selection_does_not_fallback_when_high_performance_is_unregistered() {
         let catalog = ProtocolCatalog::new([ProtocolId::apple_hpss_mvs()]);
 
         assert_eq!(
             catalog.select(TargetSystem::MacOs, ProtocolSelection::Automatic),
-            Ok(ProtocolId::apple_hpss_mvs())
+            Err(ProtocolError::UnregisteredProtocol)
         );
     }
 
     #[test]
-    fn apple_modes_are_independent_while_automatic_remains_standard_mvs() {
+    fn automatic_mac_selection_prefers_high_performance_while_standard_remains_explicit() {
         let catalog = ProtocolCatalog::new([
             ProtocolId::apple_hpss_mvs(),
             ProtocolId::apple_high_performance(),
@@ -982,14 +982,14 @@ mod tests {
 
         assert_eq!(
             catalog.select(TargetSystem::MacOs, ProtocolSelection::Automatic),
-            Ok(ProtocolId::apple_hpss_mvs())
+            Ok(ProtocolId::apple_high_performance())
         );
         assert_eq!(
             catalog.select(
                 TargetSystem::MacOs,
-                ProtocolSelection::Explicit(ProtocolId::apple_high_performance()),
+                ProtocolSelection::Explicit(ProtocolId::apple_hpss_mvs()),
             ),
-            Ok(ProtocolId::apple_high_performance())
+            Ok(ProtocolId::apple_hpss_mvs())
         );
         assert_eq!(
             catalog
