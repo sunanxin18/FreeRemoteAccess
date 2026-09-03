@@ -1,8 +1,7 @@
 use frd_core::PixelRect;
+use frd_ui_egui::session_chrome_metrics;
 
 pub const TITLE_BAR_HEIGHT_POINTS: f64 = 44.0;
-const SESSION_SLOT_POINTS: f64 = 44.0;
-const SESSION_SPACING_POINTS: f64 = 4.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeChromeInsets {
@@ -49,7 +48,7 @@ pub struct ChromeLayout {
     pub title_bar: ChromeRect,
     pub content_rect: PixelRect,
     pub session_cluster: ChromeRect,
-    pub session_buttons: [ChromeRect; 4],
+    pub session_buttons: [ChromeRect; 5],
     pub minimize_button: Option<ChromeRect>,
     pub maximize_button: Option<ChromeRect>,
     pub close_button: Option<ChromeRect>,
@@ -71,9 +70,15 @@ impl ChromeLayout {
         if title_height == height_px {
             return None;
         }
-        let slot = scaled(SESSION_SLOT_POINTS, scale_factor)?;
-        let spacing = scaled(SESSION_SPACING_POINTS, scale_factor)?;
-        let cluster_width = slot.checked_mul(4)?.checked_add(spacing.checked_mul(3)?)?;
+        let metrics = session_chrome_metrics();
+        let slot = scaled(f64::from(metrics.slot_size), scale_factor)?;
+        let frame_response = scaled(f64::from(metrics.frame_response_width), scale_factor)?;
+        let spacing = scaled(f64::from(metrics.spacing), scale_factor)?;
+        let session_widths = [slot, frame_response, slot, slot, slot];
+        let cluster_width = session_widths
+            .into_iter()
+            .try_fold(0_u32, |total, width| total.checked_add(width))?
+            .checked_add(spacing.checked_mul((session_widths.len() - 1) as u32)?)?;
         if cluster_width > width_px {
             return None;
         }
@@ -90,11 +95,18 @@ impl ChromeLayout {
             width: cluster_width,
             height: slot,
         };
-        let session_buttons = std::array::from_fn(|index| ChromeRect {
-            x: cluster_x + index as u32 * (slot + spacing),
-            y: cluster_y,
-            width: slot,
-            height: slot,
+        let mut session_x = cluster_x;
+        let session_buttons = std::array::from_fn(|index| {
+            let rect = ChromeRect {
+                x: session_x,
+                y: cluster_y,
+                width: session_widths[index],
+                height: slot,
+            };
+            session_x = session_x
+                .saturating_add(session_widths[index])
+                .saturating_add(spacing);
+            rect
         });
         let (minimize_button, maximize_button, close_button) =
             native_button_rects(width_px, title_height, native_trailing_px);
@@ -130,6 +142,7 @@ impl ChromeLayout {
     pub fn hit_test(self, x: u32, y: u32) -> ChromeHit {
         let custom = [
             ChromeHit::Connection,
+            ChromeHit::Client,
             ChromeHit::Audio,
             ChromeHit::Clipboard,
             ChromeHit::SessionAction,
@@ -306,10 +319,20 @@ mod tests {
             layout.hit_test(100, layout.content_rect.y),
             ChromeHit::Client
         );
-        let action = layout.session_buttons[3];
+        let action = layout.session_buttons[4];
         assert_eq!(
             layout.hit_test(action.center().0, action.center().1),
             ChromeHit::SessionAction
         );
+    }
+
+    #[test]
+    fn disconnect_action_at_the_fifth_ui_region_is_a_session_action() {
+        let layout = ChromeLayout::for_window(1000, 700, 1.0, 0, 138).unwrap();
+
+        // The rendered session chrome is 44 + 4 + 88 + 4 + 44 + 4 + 44 + 4 + 44
+        // logical points wide, centered in this 1000 px window. Its final
+        // Disconnect action is therefore centered at (618, 22).
+        assert_eq!(layout.hit_test(618, 22), ChromeHit::SessionAction);
     }
 }
