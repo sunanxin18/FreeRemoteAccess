@@ -58,8 +58,8 @@ mod tests {
     };
 
     use frd_ui_model::{
-        CapabilityGlyphState, ConnectionDraft, ConnectionForm, ConnectionGlyph, LaunchOptions,
-        ProtocolChoice, SessionChromeAction, SessionChromeModel, SessionTimingSource,
+        CapabilityGlyphState, ConnectionDraft, ConnectionForm, ConnectionGlyph, IslandAction,
+        LaunchOptions, ProtocolChoice, SessionChromeModel, SessionTimingSource,
     };
 
     use super::{
@@ -211,6 +211,29 @@ mod tests {
     }
 
     #[test]
+    fn island_remote_session_exposes_disconnect_and_keeps_timing_semantics() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 7);
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 7,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        controller.handle_presentation(PresentationEvent::Timing(PresentationTiming {
+            session_id,
+            generation: 7,
+            source: PresentationTimingSource::MediaIngressToPresent,
+            sample_ms: 19,
+            smoothed_ms: 24,
+        }));
+
+        let chrome = controller.session_chrome().expect("remote chrome exists");
+        assert_eq!(chrome.action, Some(IslandAction::Disconnect));
+        assert_eq!(chrome.presentation_timing.unwrap().milliseconds, 24);
+    }
+
+    #[test]
     fn session_chrome_maps_waiting_connected_and_disconnecting_states_literally() {
         let session_id = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
@@ -223,7 +246,7 @@ mod tests {
                 presentation_timing: None,
                 audio: CapabilityGlyphState::Unavailable,
                 clipboard: CapabilityGlyphState::Unavailable,
-                action: Some(SessionChromeAction::Cancel),
+                action: Some(IslandAction::CancelConnect),
             })
         );
 
@@ -241,7 +264,7 @@ mod tests {
                 presentation_timing: None,
                 audio: CapabilityGlyphState::Unavailable,
                 clipboard: CapabilityGlyphState::Unavailable,
-                action: Some(SessionChromeAction::Disconnect),
+                action: Some(IslandAction::Disconnect),
             })
         );
 
@@ -285,7 +308,7 @@ mod tests {
                 presentation_timing: None,
                 audio: CapabilityGlyphState::Unavailable,
                 clipboard: CapabilityGlyphState::Unavailable,
-                action: Some(SessionChromeAction::Cancel),
+                action: Some(IslandAction::CancelConnect),
             })
         );
     }
@@ -331,7 +354,7 @@ mod tests {
                 presentation_timing: None,
                 audio: CapabilityGlyphState::Available,
                 clipboard: CapabilityGlyphState::Available,
-                action: Some(SessionChromeAction::Disconnect),
+                action: Some(IslandAction::Disconnect),
             })
         );
     }

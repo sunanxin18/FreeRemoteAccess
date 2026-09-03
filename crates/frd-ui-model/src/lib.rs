@@ -3,8 +3,8 @@
 mod chrome;
 
 pub use chrome::{
-    CapabilityGlyphState, ConnectionGlyph, SessionChromeAction, SessionChromeModel, SessionTiming,
-    SessionTimingSource,
+    CapabilityGlyphState, ConnectionGlyph, IslandAction, IslandWindowCapabilities,
+    SessionChromeModel, SessionTiming, SessionTimingSource,
 };
 
 use frd_core::{CredentialProviderId, SecretBuffer, TargetSystem};

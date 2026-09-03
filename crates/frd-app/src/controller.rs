@@ -15,7 +15,7 @@ use frd_session::{
 };
 use frd_ui_model::{
     CapabilityGlyphState, ConnectionDraft, ConnectionForm, ConnectionGlyph, ConnectionSubmission,
-    LaunchOptions, Page, ProfilePersistenceWarning, ProtocolChoice, SessionChromeAction,
+    IslandAction, LaunchOptions, Page, ProfilePersistenceWarning, ProtocolChoice,
     SessionChromeModel, SessionTiming, SessionTimingSource,
 };
 
@@ -284,7 +284,7 @@ impl AppController {
                 presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
-                action: Some(SessionChromeAction::Cancel),
+                action: Some(IslandAction::CancelConnect),
             }),
             Page::AwaitingFirstFrame { diagnostics, .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::WaitingForFrame,
@@ -292,7 +292,7 @@ impl AppController {
                 presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
-                action: Some(SessionChromeAction::Cancel),
+                action: Some(IslandAction::CancelConnect),
             }),
             Page::Disconnecting { .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Disconnecting,
@@ -328,7 +328,7 @@ impl AppController {
                 } else {
                     unavailable
                 },
-                action: Some(SessionChromeAction::Disconnect),
+                action: Some(IslandAction::Disconnect),
             }),
         }
     }
