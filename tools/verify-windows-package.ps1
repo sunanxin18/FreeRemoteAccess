@@ -174,7 +174,7 @@ function Assert-TrustedObject([string]$Path, [ValidateSet("Ancestor", "Search", 
 }
 
 function Assert-TrustedInstall([string]$Root, [string[]]$PayloadFiles, [string]$CodecDirectory) {
-    if ($env:OS -cne "Windows_NT") {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         throw "受信安装路径检查失败: 仅支持 Windows"
     }
     if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) {

@@ -49,6 +49,47 @@ Describe "Windows package verification security boundaries" {
         ($output -join "`n") | Should Match "受信安装路径检查失败"
     }
 
+    It "detects Windows without relying on the optional OS environment variable" {
+        $bomVerifier = Join-Path $TestDrive "verify-windows-package.bom.ps1"
+        $bom = [Text.Encoding]::UTF8.GetPreamble()
+        $verifierBytes = [IO.File]::ReadAllBytes($verifier)
+        $hasBom = $verifierBytes.Length -ge 3 -and
+            $verifierBytes[0] -eq 0xEF -and $verifierBytes[1] -eq 0xBB -and $verifierBytes[2] -eq 0xBF
+        $windowsPowerShellBytes = if ($hasBom) { $verifierBytes } else { [byte[]]@($bom + $verifierBytes) }
+        [IO.File]::WriteAllBytes($bomVerifier, $windowsPowerShellBytes)
+
+        $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+        $systemPowerShell = Join-Path $systemDirectory "WindowsPowerShell\v1.0\powershell.exe"
+        $pwsh = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop).Source
+        $hosts = @(
+            @{ Name = "pwsh 7"; Path = $pwsh; Verifier = $verifier },
+            @{ Name = "Windows PowerShell 5.1"; Path = $systemPowerShell; Verifier = $bomVerifier }
+        )
+        $hadOs = Test-Path Env:OS
+        $oldOs = $env:OS
+        Remove-Item Env:OS -ErrorAction SilentlyContinue
+        try {
+            foreach ($hostUnderTest in $hosts) {
+                $output = & $hostUnderTest.Path -NoProfile -ExecutionPolicy Bypass -File `
+                    $hostUnderTest.Verifier -PackageRoot $packageRoot -RequireTrustedInstall 2>&1
+                $exitCode = $LASTEXITCODE
+                $message = $output -join "`n"
+
+                $exitCode | Should Not Be 0
+                $message | Should Match "安装目录必须为"
+                $message | Should Not Match "仅支持 Windows"
+            }
+        }
+        finally {
+            if ($hadOs) {
+                $env:OS = $oldOs
+            }
+            else {
+                Remove-Item Env:OS -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     It "plans installation only for the fixed Program Files product directory" {
         $output = & pwsh -NoProfile -File $installer -PackageRoot $packageRoot -WhatIf 2>&1
         $LASTEXITCODE | Should Be 0
