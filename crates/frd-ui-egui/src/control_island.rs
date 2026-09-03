@@ -516,7 +516,7 @@ fn show_presentation_timing(ui: &mut Ui, timing: Option<SessionTiming>) -> Respo
         FontId::proportional(13.0),
         ui.visuals().text_color(),
     );
-    response.on_hover_text(semantic.tooltip)
+    show_response_tooltip(response, semantic.tooltip)
 }
 
 fn accessible_label(semantic: GlyphSemantic, diagnostics: Option<&str>) -> String {
@@ -592,11 +592,23 @@ fn show_glyph_with_sense(
         material_symbol_font_id(),
         color,
     );
-    response.on_hover_text(
+    show_response_tooltip(
+        response,
         tooltip_override
             .filter(|text| !text.is_empty())
             .unwrap_or(semantic.tooltip),
     )
+}
+
+fn show_response_tooltip(response: Response, text: &str) -> Response {
+    let open = response.has_focus() || egui::Tooltip::should_show_tooltip(&response, true);
+    let mut tooltip = egui::Tooltip::for_widget(&response);
+    tooltip.popup = tooltip.popup.open(open);
+    tooltip.show(|ui| {
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.label(text);
+    });
+    response
 }
 
 fn contrast_plate_fill(ui: &Ui) -> Color32 {
@@ -754,6 +766,52 @@ mod tests {
             connection_node.label().or_else(|| connection_node.value()),
             Some("已连接")
         );
+    }
+
+    #[test]
+    fn focused_glyph_opens_its_tooltip_without_a_pointer() {
+        let context = egui::Context::default();
+        let mut fonts = FontDefinitions::default();
+        install_control_island_font(&mut fonts);
+        context.set_fonts(fonts);
+        let model = SessionChromeModel {
+            connection: ConnectionGlyph::Connected,
+            diagnostics: None,
+            presentation_timing: None,
+            audio: CapabilityGlyphState::Unavailable,
+            clipboard: CapabilityGlyphState::Unavailable,
+            action: Some(IslandAction::Disconnect),
+        };
+        let render = |context: &egui::Context, focus_first| {
+            super::show_control_island(
+                context,
+                super::ControlIslandRenderInput {
+                    model: &model,
+                    window_capabilities: frd_ui_model::IslandWindowCapabilities::NONE,
+                    visible: true,
+                    maximized: false,
+                    island_rect: egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(304.0, 52.0),
+                    ),
+                    reveal_line_rect: egui::Rect::NOTHING,
+                    focus_first,
+                    opaque_material: false,
+                },
+            );
+        };
+
+        let mut first = context.run_ui(Default::default(), |context| render(context, true));
+        first.textures_delta.clear();
+        let focused = context
+            .memory(|memory| memory.focused())
+            .expect("connection glyph receives programmatic focus");
+        let mut second = context.run_ui(Default::default(), |context| render(context, false));
+        second.textures_delta.clear();
+
+        assert!(egui::Tooltip::was_tooltip_open_last_frame(
+            &context, focused
+        ));
     }
 
     #[test]
