@@ -57,6 +57,7 @@ pub trait WindowChromeAdapter {
     fn refresh_for_dpi(&mut self, window: &winit::window::Window) -> Result<(), WindowChromeError>;
     fn native_insets(&self, window: &winit::window::Window) -> NativeChromeInsets;
     fn capabilities(&self) -> IslandWindowCapabilities;
+    fn native_interaction_active(&self) -> bool;
     fn publish_hit_map(&mut self, hit_map: ChromeHitMap);
     fn execute(
         &mut self,

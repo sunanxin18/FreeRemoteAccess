@@ -1,4 +1,7 @@
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 
 use frd_ui_model::{IslandAction, IslandWindowCapabilities};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -11,7 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, IsZoomed, SetWindowPos, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
     HTCLIENT, HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS,
     SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, WM_CLOSE, WM_NCCALCSIZE, WM_NCHITTEST,
+    SWP_NOZORDER, WM_CLOSE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -25,6 +28,7 @@ const SUBCLASS_ID: usize = 0x4652_4443;
 struct SubclassState {
     hit_map: Mutex<Option<ChromeHitMap>>,
     resize_metrics: Mutex<(i32, i32)>,
+    native_interaction: AtomicBool,
 }
 
 pub(crate) struct PlatformWindowChrome {
@@ -39,6 +43,7 @@ impl PlatformWindowChrome {
             state: Box::new(SubclassState {
                 hit_map: Mutex::new(None),
                 resize_metrics: Mutex::new((8, 8)),
+                native_interaction: AtomicBool::new(false),
             }),
         }
     }
@@ -126,6 +131,10 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         IslandWindowCapabilities::WINDOWS
     }
 
+    fn native_interaction_active(&self) -> bool {
+        self.state.native_interaction.load(Ordering::Acquire)
+    }
+
     fn publish_hit_map(&mut self, hit_map: ChromeHitMap) {
         if let Ok(mut slot) = self.state.hit_map.lock() {
             *slot = Some(hit_map);
@@ -184,6 +193,7 @@ unsafe extern "system" fn subclass_proc(
     reference_data: usize,
 ) -> LRESULT {
     let state = &*(reference_data as *const SubclassState);
+    observe_native_interaction_message(&state.native_interaction, message);
     if message == WM_NCCALCSIZE && wparam != 0 {
         let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
         let original_top = params.rgrc[0].top;
@@ -241,6 +251,14 @@ unsafe extern "system" fn subclass_proc(
         return windows_native_hit(&hit_map, (point.x as u32, point.y as u32)) as LRESULT;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+fn observe_native_interaction_message(active: &AtomicBool, message: u32) {
+    match message {
+        WM_ENTERSIZEMOVE => active.store(true, Ordering::Release),
+        WM_EXITSIZEMOVE => active.store(false, Ordering::Release),
+        _ => {}
+    }
 }
 
 fn accepted_dwm_resize_hit(result: LRESULT) -> Option<LRESULT> {
@@ -317,17 +335,32 @@ fn resize_hit_for_window(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use frd_core::PixelRect;
     use frd_ui_model::IslandAction;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HTBOTTOMRIGHT, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOPLEFT,
+        HTBOTTOMRIGHT, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOPLEFT, WM_ENTERSIZEMOVE,
+        WM_EXITSIZEMOVE, WM_NULL,
     };
 
     use super::{
-        accepted_dwm_resize_hit, resize_hit, resize_hit_for_window, windows_island_native_insets,
-        windows_native_hit,
+        accepted_dwm_resize_hit, observe_native_interaction_message, resize_hit,
+        resize_hit_for_window, windows_island_native_insets, windows_native_hit,
     };
     use crate::{ChromeHitMap, ChromeHitTarget, ChromeRect};
+
+    #[test]
+    fn windows_native_move_messages_pin_until_the_modal_interaction_exits() {
+        let active = AtomicBool::new(false);
+
+        observe_native_interaction_message(&active, WM_ENTERSIZEMOVE);
+        assert!(active.load(Ordering::Acquire));
+        observe_native_interaction_message(&active, WM_NULL);
+        assert!(active.load(Ordering::Acquire));
+        observe_native_interaction_message(&active, WM_EXITSIZEMOVE);
+        assert!(!active.load(Ordering::Acquire));
+    }
 
     #[test]
     fn windows_maximize_rect_preserves_native_snap_hit() {

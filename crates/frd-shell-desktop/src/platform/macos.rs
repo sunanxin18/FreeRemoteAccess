@@ -35,6 +35,10 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         crate::window_chrome::unverified_desktop_capabilities()
     }
 
+    fn native_interaction_active(&self) -> bool {
+        false
+    }
+
     fn publish_hit_map(&mut self, _hit_map: ChromeHitMap) {}
 
     fn execute(

@@ -306,6 +306,7 @@ pub struct ControlIslandRenderInput<'a> {
     pub reveal_line_rect: egui::Rect,
     pub focus_first: bool,
     pub opaque_material: bool,
+    pub shell_diagnostic: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -313,6 +314,7 @@ pub struct ControlIslandRenderResult {
     pub action: Option<IslandAction>,
     pub hovered_union: bool,
     pub focused_union: bool,
+    pub tooltip_active: bool,
     pub pressed: bool,
     pub reposition_delta: egui::Vec2,
     pub window_move_requested: bool,
@@ -326,6 +328,7 @@ impl Default for ControlIslandRenderResult {
             action: None,
             hovered_union: false,
             focused_union: false,
+            tooltip_active: false,
             pressed: false,
             reposition_delta: egui::Vec2::ZERO,
             window_move_requested: false,
@@ -350,6 +353,9 @@ pub fn show_control_island(
             input.reveal_line_rect.height() / 2.0,
             Color32::from_rgba_unmultiplied(43, 181, 99, (alpha * 255.0) as u8),
         );
+        if let Some(diagnostic) = input.shell_diagnostic {
+            show_hidden_shell_diagnostic(ctx, diagnostic);
+        }
         return ControlIslandRenderResult {
             reveal_line_alpha: alpha,
             ..ControlIslandRenderResult::default()
@@ -403,15 +409,18 @@ fn render_visible_island(
         result.reposition_delta = drag.drag_delta();
 
         let mut connection = connection_glyph(input.model.connection);
-        let diagnostic_tooltip;
-        if let Some(diagnostics) = input.model.diagnostics.as_deref() {
-            diagnostic_tooltip = format!("{}\n诊断：{diagnostics}", connection.tooltip);
-            connection.tooltip = "";
-        } else {
-            diagnostic_tooltip = connection.tooltip.to_owned();
-        }
-        let connection_accessible =
-            accessible_label(connection, input.model.diagnostics.as_deref());
+        let diagnostics = match (input.model.diagnostics.as_deref(), input.shell_diagnostic) {
+            (Some(session), Some(shell)) => Some(format!("{session}\n{shell}")),
+            (Some(session), None) => Some(session.to_owned()),
+            (None, Some(shell)) => Some(shell.to_owned()),
+            (None, None) => None,
+        };
+        let diagnostic_tooltip = diagnostics.as_deref().map_or_else(
+            || connection.tooltip.to_owned(),
+            |diagnostics| format!("{}\n诊断：{diagnostics}", connection.tooltip),
+        );
+        connection.tooltip = "";
+        let connection_accessible = accessible_label(connection, diagnostics.as_deref());
         let connection_response = show_glyph(
             ui,
             connection,
@@ -478,9 +487,27 @@ fn render_visible_island(
     ui.spacing_mut().item_spacing = prior_spacing;
 }
 
+fn show_hidden_shell_diagnostic(ctx: &egui::Context, diagnostic: &str) {
+    egui::Area::new(Id::new("freeremotedesk-control-island-shell-diagnostic"))
+        .order(Order::Foreground)
+        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 8.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(contrast_plate_fill(ui))
+                .stroke(egui::Stroke::new(1.0, ui.visuals().error_fg_color))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_max_width(560.0);
+                    ui.label(egui::RichText::new(diagnostic).color(ui.visuals().error_fg_color));
+                });
+        });
+}
+
 fn observe_response(result: &mut ControlIslandRenderResult, response: &Response) {
     result.hovered_union |= response.hovered();
     result.focused_union |= response.has_focus();
+    result.tooltip_active |= response.is_tooltip_open();
     result.pressed |= response.is_pointer_button_down_on();
 }
 
@@ -740,6 +767,7 @@ mod tests {
                     reveal_line_rect: egui::Rect::NOTHING,
                     focus_first: true,
                     opaque_material: false,
+                    shell_diagnostic: None,
                 },
             );
         });
@@ -797,21 +825,87 @@ mod tests {
                     reveal_line_rect: egui::Rect::NOTHING,
                     focus_first,
                     opaque_material: false,
+                    shell_diagnostic: None,
                 },
-            );
+            )
         };
 
-        let mut first = context.run_ui(Default::default(), |context| render(context, true));
+        let mut first = context.run_ui(Default::default(), |context| {
+            let _ = render(context, true);
+        });
         first.textures_delta.clear();
         let focused = context
             .memory(|memory| memory.focused())
             .expect("connection glyph receives programmatic focus");
-        let mut second = context.run_ui(Default::default(), |context| render(context, false));
+        let mut second = context.run_ui(Default::default(), |context| {
+            let _ = render(context, false);
+        });
         second.textures_delta.clear();
 
         assert!(egui::Tooltip::was_tooltip_open_last_frame(
             &context, focused
         ));
+        let mut third_render = None;
+        let mut third = context.run_ui(Default::default(), |context| {
+            third_render = Some(render(context, false));
+        });
+        third.textures_delta.clear();
+        assert!(
+            third_render
+                .expect("next frame returns the prior tooltip interaction state")
+                .tooltip_active
+        );
+    }
+
+    #[test]
+    fn hidden_shell_failure_is_accessible_without_publishing_island_hits() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut fonts = FontDefinitions::default();
+        install_control_island_font(&mut fonts);
+        context.set_fonts(fonts);
+        let model = SessionChromeModel {
+            connection: ConnectionGlyph::Connected,
+            diagnostics: None,
+            presentation_timing: None,
+            audio: CapabilityGlyphState::Unavailable,
+            clipboard: CapabilityGlyphState::Unavailable,
+            action: Some(IslandAction::Disconnect),
+        };
+        let diagnostic =
+            "控制栏显示失败（FRD-WIN-SHELL-003: forced_reveal_release_rejected）：CommandClosed";
+        let mut render = None;
+        let mut output = context.run_ui(Default::default(), |context| {
+            render = Some(super::show_control_island(
+                context,
+                super::ControlIslandRenderInput {
+                    model: &model,
+                    window_capabilities: frd_ui_model::IslandWindowCapabilities::NONE,
+                    visible: false,
+                    maximized: false,
+                    island_rect: egui::Rect::NOTHING,
+                    reveal_line_rect: egui::Rect::from_min_size(
+                        egui::pos2(100.0, 0.0),
+                        egui::vec2(160.0, 2.0),
+                    ),
+                    focus_first: false,
+                    opaque_material: false,
+                    shell_diagnostic: Some(diagnostic),
+                },
+            ));
+        });
+        let render = render.expect("hidden renderer returns its non-interactive state");
+        assert!(render.hit_rects.is_empty());
+        let accessible = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("hidden diagnostic is present in the accessibility tree")
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label().or_else(|| node.value()) == Some(diagnostic));
+        output.textures_delta.clear();
+        assert!(accessible);
     }
 
     #[test]

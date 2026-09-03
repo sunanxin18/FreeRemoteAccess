@@ -97,6 +97,24 @@ enum ForcedRevealError {
     ReleaseRejected(SessionHostError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForcedRevealDiagnostic {
+    error: SessionHostError,
+}
+
+impl ForcedRevealDiagnostic {
+    fn new(error: SessionHostError) -> Self {
+        Self { error }
+    }
+
+    fn message(self) -> String {
+        format!(
+            "控制栏显示失败（FRD-WIN-SHELL-003: forced_reveal_release_rejected）：{:?}",
+            self.error
+        )
+    }
+}
+
 fn complete_checked_forced_reveal(
     input: &mut InputRouter,
     chrome: &mut FloatingChromeController,
@@ -151,6 +169,14 @@ fn completes_first_remote_frame(
     is_full_baseline: bool,
 ) -> bool {
     !was_remote_session && is_remote_session && is_full_baseline
+}
+
+fn control_island_interaction_active(
+    ui_or_tooltip_active: bool,
+    window_move_hovered: bool,
+    native_interaction_active: bool,
+) -> bool {
+    ui_or_tooltip_active || window_move_hovered || native_interaction_active
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1971,6 +1997,8 @@ struct DesktopWindowState {
     pending_texture_writes: PendingTextureWrites,
     floating_chrome: FloatingChromeController,
     island_reposition_drag_delta: egui::Vec2,
+    island_ui_interaction_active: bool,
+    window_move_hovered: bool,
     focus_session_chrome: bool,
 }
 
@@ -2001,6 +2029,18 @@ impl DesktopWindowState {
         self.floating_chrome = FloatingChromeController::connected_default(now);
         self.floating_chrome.force_reveal_after_release(now);
         self.island_reposition_drag_delta = egui::Vec2::ZERO;
+        self.island_ui_interaction_active = false;
+        self.window_move_hovered = false;
+    }
+
+    fn refresh_control_island_pin(&mut self, now: std::time::Instant) {
+        let active = control_island_interaction_active(
+            self.island_ui_interaction_active,
+            self.window_move_hovered,
+            self.chrome.native_interaction_active(),
+        );
+        self.floating_chrome
+            .observe_island_union(active, active, now);
     }
 }
 
@@ -2178,6 +2218,7 @@ pub struct DesktopApplication {
     repaint_scheduler: RepaintScheduler,
     armed_repaint: Option<RepaintPlan>,
     window_configuration: DesktopWindowConfiguration,
+    forced_reveal_diagnostic: Option<ForcedRevealDiagnostic>,
 }
 
 struct ApplicationDrainCallbacks<'a> {
@@ -2334,6 +2375,7 @@ impl DesktopApplication {
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
             window_configuration: DesktopWindowConfiguration::default(),
+            forced_reveal_diagnostic: None,
         }
     }
 
@@ -2381,6 +2423,7 @@ impl DesktopApplication {
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
             window_configuration: DesktopWindowConfiguration::default(),
+            forced_reveal_diagnostic: None,
         }
     }
 
@@ -2516,6 +2559,8 @@ impl DesktopApplication {
             pending_texture_writes: PendingTextureWrites::default(),
             floating_chrome: FloatingChromeController::connected_default(std::time::Instant::now()),
             island_reposition_drag_delta: egui::Vec2::ZERO,
+            island_ui_interaction_active: false,
+            window_move_hovered: false,
             focus_session_chrome: false,
         };
         state.refresh_chrome_geometry().ok_or_else(|| {
@@ -2579,6 +2624,7 @@ impl DesktopApplication {
                 }
             }
             Some(AppAction::StartSession(request, permit)) => {
+                self.forced_reveal_diagnostic = None;
                 if let Some(window) = self.window.as_mut() {
                     window.reset_connection_chrome(std::time::Instant::now());
                 }
@@ -2814,6 +2860,7 @@ impl DesktopApplication {
             sessions,
             launch,
             window,
+            forced_reveal_diagnostic,
             ..
         } = self;
         let Some(window) = window.as_mut() else {
@@ -2836,9 +2883,12 @@ impl DesktopApplication {
             },
         );
         if let Err(error) = reveal {
+            let ForcedRevealError::ReleaseRejected(source) = error;
+            *forced_reveal_diagnostic = Some(ForcedRevealDiagnostic::new(source));
             window.window.request_redraw();
             return Err(error);
         }
+        *forced_reveal_diagnostic = None;
         window
             .egui_context
             .memory_mut(|memory| memory.stop_text_input());
@@ -2848,7 +2898,8 @@ impl DesktopApplication {
     }
 
     fn report_forced_reveal_error(error: ForcedRevealError) {
-        eprintln!("控制栏显示失败（FRD-WIN-SHELL-003: forced_reveal_release_rejected）：{error:?}");
+        let ForcedRevealError::ReleaseRejected(source) = error;
+        eprintln!("{}", ForcedRevealDiagnostic::new(source).message());
     }
 
     fn send_input_with_hp_diagnostics(
@@ -2966,6 +3017,9 @@ impl DesktopApplication {
     }
 
     fn render(&mut self) {
+        let forced_reveal_diagnostic = self
+            .forced_reveal_diagnostic
+            .map(ForcedRevealDiagnostic::message);
         let (product_chrome, auto_hide_enabled) = match &self.mode {
             DesktopMode::Product => (
                 self.launch.controller().session_chrome(),
@@ -2998,7 +3052,7 @@ impl DesktopApplication {
         let now = std::time::Instant::now();
         if product_chrome.is_none() {
             window.floating_chrome = FloatingChromeController::connected_default(now);
-        } else if !auto_hide_enabled {
+        } else if !auto_hide_enabled && forced_reveal_diagnostic.is_none() {
             window.floating_chrome.force_reveal_after_release(now);
         }
         let Some(chrome_layouts) = window.refresh_chrome_geometry() else {
@@ -3017,6 +3071,7 @@ impl DesktopApplication {
         let mut rendered_hit_rects = Vec::new();
         let mut island_hovered = false;
         let mut island_focused = false;
+        let mut tooltip_active = false;
         let mut island_pressed = false;
         let mut island_reposition_delta = egui::Vec2::ZERO;
         let mut first_remote_frame_presented = false;
@@ -3048,10 +3103,12 @@ impl DesktopApplication {
                         reveal_line_rect,
                         focus_first: focus_session_chrome,
                         opaque_material: false,
+                        shell_diagnostic: forced_reveal_diagnostic.as_deref(),
                     },
                 );
                 island_hovered = result.hovered_union;
                 island_focused = result.focused_union;
+                tooltip_active = result.tooltip_active;
                 island_pressed = result.pressed;
                 island_reposition_delta = result.reposition_delta;
                 rendered_hit_rects = result.hit_rects;
@@ -3112,11 +3169,15 @@ impl DesktopApplication {
         });
         install_accesskit_root_reveal_action(&mut output.platform_output, chrome_available);
         if auto_hide_enabled && chrome_available {
-            window.floating_chrome.observe_island_union(
-                island_hovered,
-                island_focused || island_pressed,
-                now,
-            );
+            window.island_ui_interaction_active =
+                island_hovered || island_focused || island_pressed || tooltip_active;
+            window.window_move_hovered = window.cursor_position.is_some_and(|(x, y)| {
+                chrome_layouts
+                    .overlay
+                    .window_move_region
+                    .is_some_and(|rect| rect.contains(x, y))
+            });
+            window.refresh_control_island_pin(now);
         }
         if island_pressed {
             let delta = island_reposition_delta - window.island_reposition_drag_delta;
@@ -4133,6 +4194,14 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             let position = (position.x >= 0.0 && position.y >= 0.0)
                 .then_some((position.x as u32, position.y as u32));
             let remote_input_held = self.input.has_remote_held_input();
+            let hover_reveal_enabled = self.forced_reveal_diagnostic.is_none();
+            let auto_hide_enabled = match &self.mode {
+                DesktopMode::Product => matches!(
+                    self.launch.controller().page(),
+                    AppPage::RemoteSession { .. }
+                ),
+                DesktopMode::TestTexture { stage, .. } => *stage == TestTextureStage::RemoteSession,
+            };
             if let Some(window) = self.window.as_mut() {
                 window.cursor_position = position;
                 let inside_top_sensor = position.is_some_and(|(x, y)| {
@@ -4141,11 +4210,23 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                         .as_ref()
                         .is_some_and(|layouts| layouts.overlay.top_sensor_rect.contains(x, y))
                 });
-                window.floating_chrome.observe_top_sensor(
-                    inside_top_sensor,
-                    remote_input_held,
-                    std::time::Instant::now(),
-                );
+                if hover_reveal_enabled {
+                    window.floating_chrome.observe_top_sensor(
+                        inside_top_sensor,
+                        remote_input_held,
+                        std::time::Instant::now(),
+                    );
+                }
+                window.window_move_hovered = position.is_some_and(|(x, y)| {
+                    window
+                        .chrome_layouts
+                        .as_ref()
+                        .and_then(|layouts| layouts.overlay.window_move_region)
+                        .is_some_and(|rect| rect.contains(x, y))
+                });
+                if auto_hide_enabled {
+                    window.refresh_control_island_pin(std::time::Instant::now());
+                }
             }
         }
         match &event {
@@ -4280,10 +4361,23 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
         let now = std::time::Instant::now();
         self.metrics.advance_phase(now);
         self.publish_metrics_failure();
-        let chrome_changed = self
-            .window
-            .as_mut()
-            .is_some_and(|window| window.floating_chrome.advance(now));
+        let auto_hide_enabled = match &self.mode {
+            DesktopMode::Product => matches!(
+                self.launch.controller().page(),
+                AppPage::RemoteSession { .. }
+            ),
+            DesktopMode::TestTexture { stage, .. } => *stage == TestTextureStage::RemoteSession,
+        };
+        if auto_hide_enabled {
+            if let Some(window) = self.window.as_mut() {
+                window.refresh_control_island_pin(now);
+            }
+        }
+        let chrome_changed = auto_hide_enabled
+            && self
+                .window
+                .as_mut()
+                .is_some_and(|window| window.floating_chrome.advance(now));
         if chrome_changed {
             self.request_redraw();
         }
@@ -6028,7 +6122,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_domain_changes_only_for_session_glyphs_and_remote_content() {
+    fn island_input_ownership_covers_the_overlay_and_remote_content() {
         let remote_content = PixelRect {
             x: 0,
             y: 0,
@@ -6166,6 +6260,16 @@ mod tests {
     }
 
     #[test]
+    fn forced_reveal_failure_has_a_stable_gui_diagnostic_with_the_concrete_error() {
+        let diagnostic = super::ForcedRevealDiagnostic::new(super::SessionHostError::CommandClosed);
+
+        assert_eq!(
+            diagnostic.message(),
+            "控制栏显示失败（FRD-WIN-SHELL-003: forced_reveal_release_rejected）：CommandClosed"
+        );
+    }
+
+    #[test]
     fn accesskit_root_custom_action_is_the_only_root_reveal_request() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -6210,6 +6314,19 @@ mod tests {
         assert!(!super::completes_first_remote_frame(true, true, true));
         assert!(!super::completes_first_remote_frame(false, true, false));
         assert!(!super::completes_first_remote_frame(false, false, true));
+    }
+
+    #[test]
+    fn tooltip_window_move_and_native_move_each_keep_the_island_pinned() {
+        for active_source in 0..3 {
+            let sources = [active_source == 0, active_source == 1, active_source == 2];
+            assert!(super::control_island_interaction_active(
+                sources[0], sources[1], sources[2]
+            ));
+        }
+        assert!(!super::control_island_interaction_active(
+            false, false, false
+        ));
     }
 
     #[test]

@@ -75,6 +75,7 @@ mod control_island_contract_tests {
                     reveal_line_rect,
                     focus_first: false,
                     opaque_material: false,
+                    shell_diagnostic: None,
                 },
             ));
         });
