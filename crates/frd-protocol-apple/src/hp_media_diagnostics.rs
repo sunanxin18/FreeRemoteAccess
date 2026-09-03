@@ -5,6 +5,7 @@ use crate::hevc_access_unit::HevcAccessUnitError;
 use crate::high_performance_video::AppleHighPerformanceVideoError;
 
 const HP_MEDIA_DIAGNOSTICS_ENV: &str = "FRD_APPLE_HP_MEDIA_DIAGNOSTICS";
+pub(crate) const VIDEO_RTP_PARSE_FATAL_CATEGORY: &str = "video_rtp_parse";
 
 pub(crate) fn diagnostics_enabled_from(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
@@ -98,7 +99,7 @@ mod tests {
 
     use super::{
         adapter_fatal_category, diagnostics_enabled_from, hevc_fatal_category,
-        HpMediaFatalDiagnostic,
+        HpMediaFatalDiagnostic, VIDEO_RTP_PARSE_FATAL_CATEGORY,
     };
 
     #[test]
@@ -227,5 +228,14 @@ mod tests {
                 format!("[apple-hp-media-fatal] category={expected}")
             );
         }
+    }
+
+    #[test]
+    fn video_rtp_parse_category_is_static_and_closed() {
+        assert_eq!(VIDEO_RTP_PARSE_FATAL_CATEGORY, "video_rtp_parse");
+        assert_eq!(
+            HpMediaFatalDiagnostic::new(VIDEO_RTP_PARSE_FATAL_CATEGORY).to_string(),
+            "[apple-hp-media-fatal] category=video_rtp_parse"
+        );
     }
 }

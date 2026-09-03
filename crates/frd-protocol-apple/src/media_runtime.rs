@@ -26,15 +26,26 @@ use crate::hevc_rtp::HevcRtpError;
 use crate::high_performance_video::AppleHighPerformanceVideoAdapter;
 use crate::hp_media_diagnostics::{
     adapter_fatal_category, emit_hp_media_fatal, hevc_fatal_category,
+    VIDEO_RTP_PARSE_FATAL_CATEGORY,
 };
 use crate::media_negotiation::{AudioMediaFlow, MediaStreamAnswer};
 use crate::media_protocol::MediaStreamPortAnnouncement;
 use crate::media_transport::{MediaDatagram, MediaRole, MediaTransport, MediaTransportPhase};
-use crate::srtp::parse_rtp_packet;
+use crate::srtp::{parse_rtp_packet, RtpPacket};
 
 const MAX_PCM_PUBLICATION_SAMPLES: usize =
     ARD_AUDIO_SAMPLE_RATE_HZ as usize * ARD_AUDIO_CHANNEL_COUNT * 2;
 const MAX_RETIRED_VIDEO_SSRCS: usize = 8;
+
+fn parse_video_rtp_for_media(datagram: &[u8]) -> Result<RtpPacket<'_>> {
+    match parse_rtp_packet(datagram) {
+        Ok(packet) => Ok(packet),
+        Err(error) => {
+            emit_hp_media_fatal(VIDEO_RTP_PARSE_FATAL_CATEGORY);
+            Err(error).context("解析 Apple HP 视频 RTP 数据报失败")
+        }
+    }
+}
 
 pub(crate) fn publish_decoded_audio(
     runtime: &mut ProtocolRuntime,
@@ -331,7 +342,7 @@ impl VideoReceiveState {
         generation: u64,
         datagram: &[u8],
     ) -> Result<()> {
-        let packet = parse_rtp_packet(datagram).context("解析 Apple HP 视频 RTP 数据报失败")?;
+        let packet = parse_video_rtp_for_media(datagram)?;
         match self.active_ssrc {
             Some(previous) if previous != packet.header.ssrc => {
                 if self.retired_ssrcs.contains(&packet.header.ssrc) {
@@ -852,8 +863,8 @@ mod tests {
     use crate::media_negotiation::AudioMediaFlow;
 
     use super::{
-        accept_audio_outcome, accept_datagram, publish_decoded_audio, AudioReceiveOutcome,
-        MediaDatagram, MediaRole, ViewerMediaState,
+        accept_audio_outcome, accept_datagram, parse_video_rtp_for_media, publish_decoded_audio,
+        AudioReceiveOutcome, MediaDatagram, MediaRole, ViewerMediaState,
     };
 
     fn accept_state_datagram(
@@ -1787,6 +1798,11 @@ mod tests {
 
         assert_eq!(state.video_stream_1.stage_trace.observed_stage_count(), 1);
         assert_eq!(state.video_stream_2.stage_trace.observed_stage_count(), 0);
+    }
+
+    #[test]
+    fn malformed_authenticated_video_rtp_reaches_the_classified_fatal_boundary() {
+        assert!(parse_video_rtp_for_media(&[0x80]).is_err());
     }
 
     fn video_rtp(sequence: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
