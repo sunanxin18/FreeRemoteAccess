@@ -494,7 +494,11 @@ mod tests {
     };
 
     fn test_directory(label: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let temporary_root = std::env::temp_dir();
+        #[cfg(not(windows))]
+        let temporary_root = fs::canonicalize(temporary_root).unwrap();
+        assert!(temporary_root.is_absolute());
+        let path = temporary_root.join(format!(
             "frd-frame-metrics-{label}-{}-{}",
             std::process::id(),
             Instant::now().elapsed().as_nanos()
