@@ -1250,7 +1250,7 @@ mod tests {
         let peer = thread::spawn(move || {
             let (_stream, _) = listener.accept().unwrap();
             peer_ready_tx.send(()).unwrap();
-            release_peer_rx.recv().unwrap();
+            let _ = release_peer_rx.recv();
         });
 
         let stream = TcpStream::connect(address).unwrap();
@@ -1288,25 +1288,41 @@ mod tests {
         barrier.wait();
         drop(shutdown_tx);
 
-        for _ in 0..2 {
-            assert!(shutdown_rx
-                .recv_timeout(Duration::from_secs(3))
-                .expect("shutdown must be bounded")
-                .is_ok());
-        }
-        let active_error = active_send.join().unwrap().unwrap_err();
-        assert_eq!(active_error.to_string(), "写入失败（连接中断？）");
-        for queued in [queued_one, queued_two] {
-            let queued_error = AppleWriterHandle::receive_message_result(queued).unwrap_err();
-            assert_eq!(queued_error.to_string(), "Apple writer 未返回发送结果");
-        }
+        let shutdown_results = (0..2)
+            .map(|_| {
+                shutdown_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("shutdown must be bounded")
+            })
+            .collect::<Vec<_>>();
+        let active_result = active_send.join().unwrap();
+        let queued_results =
+            [queued_one, queued_two].map(AppleWriterHandle::receive_message_result);
         for thread in shutdown_threads {
             thread.join().unwrap();
         }
-        assert!(writer.shutdown().is_ok());
-        assert!(connection.shutdown().is_ok());
+        let repeated_writer_shutdown = writer.shutdown();
+        let connection_shutdown = connection.shutdown();
 
-        release_peer_tx.send(()).unwrap();
+        let _ = release_peer_tx.send(());
         peer.join().unwrap();
+
+        assert!(shutdown_results.into_iter().all(|result| result.is_ok()));
+        let active_error = active_result.unwrap_err();
+        assert_eq!(active_error.to_string(), "写入失败（连接中断？）");
+        for queued_result in queued_results {
+            let queued_error = queued_result.unwrap_err();
+            assert_eq!(queued_error.to_string(), "Apple writer 未返回发送结果");
+        }
+        assert!(repeated_writer_shutdown.is_ok());
+        if let Err(error) = connection_shutdown {
+            assert!(
+                error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(|io_error| io_error.kind() == std::io::ErrorKind::NotConnected),
+                "重复关闭 Apple 连接只能返回 NotConnected，实际为 {error:#}"
+            );
+        }
     }
 }

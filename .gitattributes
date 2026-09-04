@@ -12,6 +12,9 @@
 *.sh text eol=lf
 *.ps1 text eol=crlf
 
+packaging/windows/licenses/FFmpeg-LGPL-2.1-or-later.txt text eol=lf
+packaging/windows/licenses/FFmpeg-NOTICE.txt text eol=lf
+
 *.ico binary
 *.png binary
 *.jpg binary

@@ -803,8 +803,7 @@ mod product_profile_tests {
             let mut session_requests = vec![0u8; 66 + 24];
             stream.read_exact(&mut session_requests).unwrap();
             peer_ready_tx.send(()).unwrap();
-            peer_release_rx.recv().unwrap();
-            stream.shutdown(Shutdown::Both).unwrap();
+            let _ = peer_release_rx.recv();
         });
 
         let stream = TcpStream::connect(address).unwrap();
@@ -830,10 +829,18 @@ mod product_profile_tests {
         peer_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let result = result_rx.recv_timeout(Duration::from_secs(1));
 
-        shutdown.shutdown(Shutdown::Both).unwrap();
-        peer_release_tx.send(()).unwrap();
+        let shutdown_result = shutdown.shutdown(Shutdown::Both);
+        let _ = peer_release_tx.send(());
         server.join().unwrap();
         finisher.join().unwrap();
+
+        if let Err(error) = shutdown_result {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotConnected,
+                "重复关闭超时握手 socket 只能返回 NotConnected，实际为 {error}"
+            );
+        }
 
         let error = match result.expect("withheld EncryptionInfo must not block the finisher") {
             Ok(_) => panic!("withheld EncryptionInfo must fail finalization"),

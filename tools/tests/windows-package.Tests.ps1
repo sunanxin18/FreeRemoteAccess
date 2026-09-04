@@ -11,6 +11,10 @@ $manifestTemplate = Join-Path $repoRoot "packaging\windows\ffmpeg-manifest.json"
 $configureRecord = Join-Path $repoRoot "third_party\ffmpeg\8.1.2\configure-windows.txt"
 $expectedX86AsmProvenance = "nasm=NASM version 2.16.01"
 $expectedHaveX86Asm = "have_x86asm=1"
+$expectedLicenseHashes = @{
+    "FFmpeg-LGPL-2.1-or-later.txt" = "246041B6ECF9BC32D718A62C57877C78B5EB397B6467E74ED7AE2626AB189C30"
+    "FFmpeg-NOTICE.txt" = "2319907322DA7327C9D6F84B1185C0F71626107F4C81EBC035644DF30ABADB9F"
+}
 
 function Copy-Utf8ScriptForWindowsPowerShell([string]$Source, [string]$Destination) {
     $bom = [Text.Encoding]::UTF8.GetPreamble()
@@ -39,6 +43,37 @@ Describe "Windows package verification security boundaries" {
         $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
         $LASTEXITCODE | Should Be 0
         ($output -join "`n") | Should Match "Windows package verification passed"
+    }
+
+    It "pins the packaged license and notice to their exact LF bytes" {
+        foreach ($name in @($expectedLicenseHashes.Keys)) {
+            $relativePath = "packaging/windows/licenses/$name"
+            $attributes = & git -C $repoRoot check-attr text eol -- $relativePath 2>&1
+            $LASTEXITCODE | Should Be 0
+            ($attributes -join "`n") | Should Match ([regex]::Escape("$relativePath`: text: set"))
+            ($attributes -join "`n") | Should Match ([regex]::Escape("$relativePath`: eol: lf"))
+            (Get-FileHash -LiteralPath (Join-Path $repoRoot $relativePath) -Algorithm SHA256).Hash |
+                Should Be $expectedLicenseHashes[$name]
+        }
+    }
+
+    It "reports a bounded verifier reason without exposing its absolute path" {
+        $shadowRoot = Join-Path $TestDrive "verifier shadow sentinel"
+        $shadow = Join-Path $shadowRoot "sensitive-shadow.dll"
+        $stageRoot = "target/package-test-verifier-message-$PID"
+        New-Item -ItemType Directory -Path $shadowRoot | Out-Null
+        Set-Content -LiteralPath $shadow -Value "not a DLL" -Encoding UTF8
+        Push-Location $shadowRoot
+        try {
+            $output = & pwsh -NoProfile -File $stager -PackageRoot $stageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            $message = $output -join "`n"
+            $message | Should Match "临时 Windows package 验证失败: current_directory_dll_shadow"
+            $message | Should Not Match ([regex]::Escape($shadowRoot))
+        }
+        finally {
+            Pop-Location
+        }
     }
 
     It "stages only x86asm-enabled FFmpeg provenance and records positive evidence" {

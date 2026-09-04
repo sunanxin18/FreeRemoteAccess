@@ -26,9 +26,9 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
 |---|---|---|---|---|---|
-| Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成；`.github/workflows/build-windows.yml` 已重建为 Rust 1.96、WSL/NASM/x86asm、Main444、Pester、staging/verifier 和 LGPL 对应源码 artifact 的完整门禁，首次 GitHub-hosted run 仍待本分支推送确认。Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
-| macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 macOS 15 编译和安全测试门禁，首次 hosted-runner 结果待本分支推送；尚无原生平台 shell、Keychain、安装包或真机运行验证，不得把 CI 编译冒充客户端支持。 |
-| Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 Ubuntu 24.04 GUI 依赖、workspace 编译和安全测试门禁，首次 hosted-runner 结果待本分支推送；尚无窗口管理器、Secret Service、安装包或真机运行验证。 |
+| Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成；`.github/workflows/build-windows.yml` 已重建为 Rust 1.96、WSL/NASM/x86asm、Main444、Pester、staging/verifier 和 LGPL 对应源码 artifact 的完整托管门禁。Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
+| macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 macOS 15 workspace 编译和安全测试托管门禁；尚无原生平台 shell、Keychain、安装包或真机运行验证，不得把 CI 编译冒充客户端支持。 |
+| Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 Ubuntu 24.04 GUI 依赖、workspace 编译和安全测试托管门禁；尚无窗口管理器、Secret Service、安装包或真机运行验证。 |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
 | HarmonyOS NEXT 手机/PC | ArkUI/HUKS 边界设计 | 触控/键鼠计划中 | 计划中 | 尚无 | **计划中**；不是 Android 兼容层，须单独完成 ArkUI、HUKS 和构建 POC |
 

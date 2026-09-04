@@ -1213,12 +1213,8 @@ mod tests {
     }
 
     impl ReceiveOneUdpRoundLoopback {
-        const LOCAL_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-        const REMOTE_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
-        const ATTACKER_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
-
         fn new() -> Self {
-            let remote = UdpSocket::bind((Self::REMOTE_MEDIA_ADDRESS, 0)).unwrap();
+            let remote = crate::bind_test_udp_loopback();
             remote
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
@@ -1226,10 +1222,10 @@ mod tests {
             let announcement =
                 parse_media_stream_port_announcement(&audio_port_announcement_fixture(remote_port))
                     .unwrap();
-            let mut transport = MediaTransport::new(0, IpAddr::V4(Self::REMOTE_MEDIA_ADDRESS));
+            let mut transport = MediaTransport::new(0, IpAddr::V4(Ipv4Addr::LOCALHOST));
             transport.accept_port_announcement(0, announcement).unwrap();
             transport
-                .bind_local_sockets(0, IpAddr::V4(Self::LOCAL_MEDIA_ADDRESS))
+                .bind_test_loopback_sockets(0, &[(MediaRole::Audio, &remote)])
                 .unwrap();
             let configuration = transport.prepare_configuration(0).unwrap();
             let incoming_material =
@@ -1251,7 +1247,7 @@ mod tests {
         }
 
         fn send_discarded_traffic(&self) {
-            let attacker = UdpSocket::bind((Self::ATTACKER_MEDIA_ADDRESS, 0)).unwrap();
+            let attacker = crate::bind_test_udp_loopback();
             attacker.send_to(b"unexpected-source", self.local).unwrap();
             self.remote.send_to(&[], self.local).unwrap();
         }

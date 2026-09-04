@@ -101,6 +101,11 @@ mod tests {
     use crate::server_identity::{fingerprint_sha256, AcceptedServerIdentity};
     use crate::tls::establish_verified_tls;
 
+    #[cfg(target_os = "windows")]
+    const WINDOWS_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+    #[cfg(target_os = "windows")]
+    const WINDOWS_STALLED_PEER_WATCHDOG: Duration = Duration::from_secs(2);
+
     #[test]
     fn writer_preserves_exact_frame_order() {
         let framed = Framed::new(RecordingIo::default());
@@ -145,8 +150,68 @@ mod tests {
     }
 
     #[test]
-    fn writer_stalled_tls_peer_times_out_disarms_and_disconnects() {
-        let (address, certificate_der, release, server) = spawn_stalled_tls_peer();
+    fn writer_stalled_tls_backpressure_would_block_disarms_and_disconnects() {
+        let (address, certificate_der, stalled, release, server) = spawn_stalled_tls_peer();
+        let endpoint = Endpoint::new("localhost", address.port()).expect("valid endpoint");
+        let tcp = TcpStream::connect(address).expect("connect stalled TLS peer");
+        let transport = establish_verified_tls(
+            tcp,
+            &endpoint,
+            &AcceptedServerIdentity::ExactPin {
+                fingerprint: fingerprint_sha256(&certificate_der),
+            },
+        )
+        .expect("exact pin establishes TLS");
+        stalled
+            .recv()
+            .expect("server completed TLS handshake and stopped reading");
+        let (framed, _) = transport.into_parts();
+        let mut writer = OrderedRdpWriter::new(framed);
+        let write_timeout = Duration::from_millis(100);
+        writer
+            .set_write_timeout(write_timeout)
+            .expect("configure finite write timeout");
+        let configured_timeout = writer
+            .framed
+            .get_inner()
+            .0
+            .sock
+            .write_timeout()
+            .expect("read configured write timeout");
+        writer
+            .framed
+            .get_inner()
+            .0
+            .sock
+            .set_nonblocking(true)
+            .expect("make stalled TLS outcome deterministic");
+
+        let payload = vec![0_u8; 32 * 1024 * 1024];
+        let started = Instant::now();
+        let result = writer.write_frame(&payload);
+        let elapsed = started.elapsed();
+        let writable_after_write = writer.is_writable();
+
+        writer.shutdown();
+        let release_result = release.send(());
+        let server_result = server.join();
+
+        assert_eq!(configured_timeout, Some(write_timeout));
+        let error = result.expect_err("a non-reading peer must surface TLS backpressure");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "nonblocking write took {elapsed:?}"
+        );
+        assert!(!writable_after_write);
+        release_result.expect("release stalled peer");
+        server_result.expect("stalled TLS peer exits");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn writer_windows_blocking_socket_write_timeout_surfaces_and_disarms() {
+        let (address, certificate_der, stalled, release, server) = spawn_windows_timeout_tls_peer();
         let endpoint = Endpoint::new("localhost", address.port()).expect("valid endpoint");
         let transport = establish_verified_tls(
             TcpStream::connect(address).expect("connect stalled TLS peer"),
@@ -156,33 +221,54 @@ mod tests {
             },
         )
         .expect("exact pin establishes TLS");
+        stalled
+            .recv()
+            .expect("server completed TLS handshake and stopped reading");
         let (framed, _) = transport.into_parts();
         let mut writer = OrderedRdpWriter::new(framed);
         writer
-            .set_write_timeout(Duration::from_millis(100))
-            .expect("configure finite write timeout");
+            .set_write_timeout(WINDOWS_SOCKET_WRITE_TIMEOUT)
+            .expect("configure finite Windows socket write timeout");
+        let configured_timeout = writer
+            .framed
+            .get_inner()
+            .0
+            .sock
+            .write_timeout()
+            .expect("read configured Windows write timeout");
 
         let payload = vec![0_u8; 32 * 1024 * 1024];
         let started = Instant::now();
-        let error = writer
-            .write_frame(&payload)
-            .expect_err("a non-reading peer must not block the ordered writer forever");
+        let result = writer.write_frame(&payload);
         let elapsed = started.elapsed();
+        let writable_after_write = writer.is_writable();
 
+        writer.shutdown();
+        let release_result = release.send(());
+        let watchdog_elapsed = server.join().expect("Windows stalled TLS peer exits");
+
+        assert_eq!(configured_timeout, Some(WINDOWS_SOCKET_WRITE_TIMEOUT));
+        assert!(
+            !watchdog_elapsed,
+            "Windows socket write timeout did not surface before the {WINDOWS_STALLED_PEER_WATCHDOG:?} peer watchdog"
+        );
+        release_result.expect("release Windows stalled TLS peer");
+        let error = result.expect_err("Windows blocking socket write timeout must surface");
         assert!(matches!(
             error.kind(),
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
         ));
-        assert!(elapsed < Duration::from_secs(2), "write took {elapsed:?}");
-        assert!(!writer.is_writable());
-        writer.shutdown();
-        release.send(()).expect("release stalled peer");
-        server.join().expect("stalled TLS peer exits");
+        assert!(
+            elapsed < WINDOWS_STALLED_PEER_WATCHDOG,
+            "Windows blocking socket write returned after {elapsed:?}"
+        );
+        assert!(!writable_after_write);
     }
 
     fn spawn_stalled_tls_peer() -> (
         std::net::SocketAddr,
         Vec<u8>,
+        mpsc::Receiver<()>,
         mpsc::Sender<()>,
         thread::JoinHandle<()>,
     ) {
@@ -199,6 +285,7 @@ mod tests {
             .expect("valid server TLS config");
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TLS test server");
         let address = listener.local_addr().expect("TLS test server address");
+        let (stalled, wait_until_stalled) = mpsc::sync_channel(0);
         let (release, released) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut tcp, _) = listener.accept().expect("accept TLS test client");
@@ -207,12 +294,71 @@ mod tests {
             connection
                 .complete_io(&mut tcp)
                 .expect("complete server TLS handshake");
+            stalled
+                .send(())
+                .expect("client waits until TLS peer stops reading");
             released
-                .recv_timeout(Duration::from_secs(3))
-                .expect("client disconnects stalled peer within the test bound");
+                .recv()
+                .expect("client releases stalled peer after disconnect");
         });
 
-        (address, certificate_der, release, server)
+        (
+            address,
+            certificate_der,
+            wait_until_stalled,
+            release,
+            server,
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_windows_timeout_tls_peer() -> (
+        std::net::SocketAddr,
+        Vec<u8>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        thread::JoinHandle<bool>,
+    ) {
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_owned()])
+                .expect("generate runtime-only Windows test certificate");
+        let certificate_der = cert.der().to_vec();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(certificate_der.clone())],
+                PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+            )
+            .expect("valid Windows server TLS config");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind Windows TLS test server");
+        let address = listener
+            .local_addr()
+            .expect("Windows TLS test server address");
+        let (stalled, wait_until_stalled) = mpsc::sync_channel(0);
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().expect("accept Windows TLS test client");
+            let mut connection =
+                rustls::ServerConnection::new(Arc::new(config)).expect("server connection");
+            connection
+                .complete_io(&mut tcp)
+                .expect("complete Windows server TLS handshake");
+            stalled
+                .send(())
+                .expect("client waits until Windows TLS peer stops reading");
+            match released.recv_timeout(WINDOWS_STALLED_PEER_WATCHDOG) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => false,
+                Err(mpsc::RecvTimeoutError::Timeout) => true,
+            }
+        });
+
+        (
+            address,
+            certificate_der,
+            wait_until_stalled,
+            release,
+            server,
+        )
     }
 
     #[derive(Default)]

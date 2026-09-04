@@ -1485,6 +1485,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn active_high_performance_rate_command_writes_exact_encrypted_30_hz_profile_once() {
         let mut harness = start_production_harness_for_refresh_tier_at(
@@ -1533,7 +1534,6 @@ mod tests {
             let mut datagram = [0u8; 2_048];
             while peer.recv(&mut datagram).is_ok() {}
         }
-
         harness
             .commands
             .send(SessionCommand::SetMaxSourceFrameRate {

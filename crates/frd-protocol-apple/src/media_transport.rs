@@ -612,6 +612,88 @@ impl MediaTransport {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn bind_test_loopback_sockets(
+        &mut self,
+        generation: u64,
+        peers: &[(MediaRole, &UdpSocket)],
+    ) -> Result<()> {
+        self.validate_generation(generation)?;
+        ensure!(
+            self.phase == MediaTransportPhase::PortsAnnounced,
+            "测试媒体 socket 只能在 PortsAnnounced 状态绑定"
+        );
+        let announcement = self
+            .announcement
+            .as_ref()
+            .context("PortsAnnounced 缺少端口公告")?;
+
+        let binding = (|| {
+            let mut sockets = Vec::new();
+            for (role, descriptor) in Self::descriptors(announcement) {
+                if !descriptor.is_announced() {
+                    continue;
+                }
+                let peer = peers
+                    .iter()
+                    .find_map(|(peer_role, socket)| (*peer_role == role).then_some(*socket))
+                    .with_context(|| format!("测试媒体角色 {role:?} 缺少已绑定 loopback peer"))?;
+                let remote = peer
+                    .local_addr()
+                    .with_context(|| format!("读取测试媒体角色 {role:?} peer 地址失败"))?;
+                ensure!(
+                    remote.ip() == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    "测试媒体角色 {role:?} 必须绑定到 127.0.0.1"
+                );
+                ensure!(
+                    remote.port() == descriptor.port,
+                    "测试媒体角色 {role:?} peer 端口与公告不一致"
+                );
+                let socket = crate::bind_test_udp_loopback();
+                let socket_ref = socket2::SockRef::from(&socket);
+                socket_ref
+                    .set_recv_buffer_size(MEDIA_SOCKET_RECEIVE_BUFFER_REQUEST_BYTES)
+                    .with_context(|| format!("设置测试媒体角色 {role:?} 接收缓冲区失败"))?;
+                let receive_buffer_actual_bytes = socket_ref
+                    .recv_buffer_size()
+                    .with_context(|| format!("读取测试媒体角色 {role:?} 实际接收缓冲区容量失败"))?;
+                socket
+                    .set_nonblocking(true)
+                    .with_context(|| format!("设置测试媒体角色 {role:?} 非阻塞模式失败"))?;
+                sockets.push(BoundMediaSocket {
+                    role,
+                    socket,
+                    receive_buffer_actual_bytes,
+                    remote,
+                    outbound_control: None,
+                    outbound_rtp: None,
+                    inbound_crypto: None,
+                    reception_report: RtpReceptionReportState::new(role.rtp_clock_rate()),
+                    pending_picture_loss_media_ssrc: None,
+                });
+            }
+            ensure!(
+                sockets.len() == peers.len(),
+                "测试媒体 peer 包含未公告的角色"
+            );
+            Ok::<_, anyhow::Error>(sockets)
+        })();
+
+        match binding {
+            Ok(sockets) => {
+                self.sockets = sockets;
+                self.phase = MediaTransportPhase::LocalSocketsReady;
+                Ok(())
+            }
+            Err(error) => {
+                self.sockets.clear();
+                self.phase = MediaTransportPhase::Failed;
+                self.reset_outbound_audio_evidence();
+                Err(error)
+            }
+        }
+    }
+
     pub fn receive_buffer_capacities(
         &self,
         generation: u64,
@@ -1269,11 +1351,9 @@ mod tests {
 
     impl PcToMacAudioLoopback {
         const GENERATION: u64 = 9;
-        const LOCAL_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-        const REMOTE_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
         fn new() -> Self {
-            let remote = UdpSocket::bind((Self::REMOTE_MEDIA_ADDRESS, 0)).unwrap();
+            let remote = crate::bind_test_udp_loopback();
             remote
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
@@ -1283,13 +1363,13 @@ mod tests {
             ))
             .unwrap();
             let mut transport =
-                MediaTransport::new(Self::GENERATION, IpAddr::V4(Self::REMOTE_MEDIA_ADDRESS));
+                MediaTransport::new(Self::GENERATION, IpAddr::V4(Ipv4Addr::LOCALHOST));
             transport.set_audio_flow(AudioMediaFlow::PcToMac).unwrap();
             transport
                 .accept_port_announcement(Self::GENERATION, announcement)
                 .unwrap();
             transport
-                .bind_local_sockets(Self::GENERATION, IpAddr::V4(Self::LOCAL_MEDIA_ADDRESS))
+                .bind_test_loopback_sockets(Self::GENERATION, &[(MediaRole::Audio, &remote)])
                 .unwrap();
             transport.prepare_configuration(Self::GENERATION).unwrap();
             let rtcp_sender = SrtcpSender::new(derive_session_keys(
@@ -1418,23 +1498,12 @@ mod tests {
 
     impl ThreeRoleLoopback {
         const GENERATION: u64 = 7;
-        const LOCAL_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-        const REMOTE_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
         fn new() -> Self {
             let remotes = [
-                (
-                    MediaRole::Audio,
-                    UdpSocket::bind((Self::REMOTE_MEDIA_ADDRESS, 0)).unwrap(),
-                ),
-                (
-                    MediaRole::VideoStream1,
-                    UdpSocket::bind((Self::REMOTE_MEDIA_ADDRESS, 0)).unwrap(),
-                ),
-                (
-                    MediaRole::VideoStream2,
-                    UdpSocket::bind((Self::REMOTE_MEDIA_ADDRESS, 0)).unwrap(),
-                ),
+                (MediaRole::Audio, crate::bind_test_udp_loopback()),
+                (MediaRole::VideoStream1, crate::bind_test_udp_loopback()),
+                (MediaRole::VideoStream2, crate::bind_test_udp_loopback()),
             ];
             for (_, remote) in &remotes {
                 remote
@@ -1450,12 +1519,14 @@ mod tests {
                 parse_media_stream_port_announcement(&three_role_announcement_fixture(ports))
                     .unwrap();
             let mut transport =
-                MediaTransport::new(Self::GENERATION, IpAddr::V4(Self::REMOTE_MEDIA_ADDRESS));
+                MediaTransport::new(Self::GENERATION, IpAddr::V4(Ipv4Addr::LOCALHOST));
             transport
                 .accept_port_announcement(Self::GENERATION, announcement)
                 .unwrap();
+            let peer_refs =
+                std::array::from_fn::<_, 3, _>(|index| (remotes[index].0, &remotes[index].1));
             transport
-                .bind_local_sockets(Self::GENERATION, IpAddr::V4(Self::LOCAL_MEDIA_ADDRESS))
+                .bind_test_loopback_sockets(Self::GENERATION, &peer_refs)
                 .unwrap();
             transport.prepare_configuration(Self::GENERATION).unwrap();
             let second_video_configuration = transport
@@ -2102,10 +2173,8 @@ mod tests {
     }
 
     #[test]
-    fn udp_transport_binds_before_activation_and_preserves_role_and_generation() {
-        const LOCAL_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-        const REMOTE_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
-        let remote = UdpSocket::bind((REMOTE_MEDIA_ADDRESS, 0)).unwrap();
+    fn udp_transport_prebound_loopback_preserves_role_and_generation() {
+        let remote = crate::bind_test_udp_loopback();
         remote
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -2113,15 +2182,15 @@ mod tests {
         let announcement =
             parse_media_stream_port_announcement(&announcement_fixture(remote_port, 1)).unwrap();
 
-        let mut transport = MediaTransport::new(7, IpAddr::V4(REMOTE_MEDIA_ADDRESS));
+        let mut transport = MediaTransport::new(7, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(transport.phase(), MediaTransportPhase::Idle);
         transport.set_audio_flow(AudioMediaFlow::PcToMac).unwrap();
         transport.accept_port_announcement(7, announcement).unwrap();
         transport
-            .bind_local_sockets(7, IpAddr::V4(LOCAL_MEDIA_ADDRESS))
+            .bind_test_loopback_sockets(7, &[(MediaRole::Audio, &remote)])
             .unwrap();
         let local = transport.local_addr(7, MediaRole::Audio).unwrap();
-        assert_eq!(local.port(), remote_port);
+        assert_ne!(local.port(), remote_port);
         let configuration = transport.prepare_configuration(7).unwrap();
         assert_eq!(configuration[0], 0x1c);
         let incoming_audio_material = transport
@@ -2268,25 +2337,21 @@ mod tests {
 
     #[test]
     fn udp_transport_requests_high_rate_receive_capacity_and_reports_effective_value() {
-        const LOCAL_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-        const REMOTE_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
         const FOUR_MEBIBYTES: usize = 4 * 1024 * 1024;
 
-        let comparison = UdpSocket::bind((LOCAL_MEDIA_ADDRESS, 0)).unwrap();
+        let comparison = crate::bind_test_udp_loopback();
         let default_capacity = socket2::SockRef::from(&comparison)
             .recv_buffer_size()
             .unwrap();
-        let remote = UdpSocket::bind((REMOTE_MEDIA_ADDRESS, 0)).unwrap();
-        let announcement = parse_media_stream_port_announcement(&announcement_fixture(
-            remote.local_addr().unwrap().port(),
-            1,
-        ))
-        .unwrap();
-        let mut transport = MediaTransport::new(7, IpAddr::V4(REMOTE_MEDIA_ADDRESS));
+        let remote = crate::bind_test_udp_loopback();
+        let remote_port = remote.local_addr().unwrap().port();
+        let announcement =
+            parse_media_stream_port_announcement(&announcement_fixture(remote_port, 1)).unwrap();
+        let mut transport = MediaTransport::new(7, IpAddr::V4(Ipv4Addr::LOCALHOST));
         transport.accept_port_announcement(7, announcement).unwrap();
 
         transport
-            .bind_local_sockets(7, IpAddr::V4(LOCAL_MEDIA_ADDRESS))
+            .bind_test_loopback_sockets(7, &[(MediaRole::Audio, &remote)])
             .unwrap();
 
         let capacities = transport.receive_buffer_capacities(7).unwrap();
@@ -2312,25 +2377,22 @@ mod tests {
 
     #[test]
     fn udp_transport_discards_untrusted_datagrams_and_accepts_the_next_valid_packet() {
-        const LOCAL_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-        const REMOTE_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
-        const ATTACKER_MEDIA_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
         const BAD_TAG_SEQUENCE: u16 = 10;
         const ACCEPTED_SEQUENCE: u16 = 11;
         const REMOTE_TIMESTAMP: u32 = 960;
         const REMOTE_SSRC: u32 = 0x5566_7788;
 
-        let remote = UdpSocket::bind((REMOTE_MEDIA_ADDRESS, 0)).unwrap();
+        let remote = crate::bind_test_udp_loopback();
         remote
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let remote_port = remote.local_addr().unwrap().port();
         let announcement =
             parse_media_stream_port_announcement(&announcement_fixture(remote_port, 1)).unwrap();
-        let mut transport = MediaTransport::new(7, IpAddr::V4(REMOTE_MEDIA_ADDRESS));
+        let mut transport = MediaTransport::new(7, IpAddr::V4(Ipv4Addr::LOCALHOST));
         transport.accept_port_announcement(7, announcement).unwrap();
         transport
-            .bind_local_sockets(7, IpAddr::V4(LOCAL_MEDIA_ADDRESS))
+            .bind_test_loopback_sockets(7, &[(MediaRole::Audio, &remote)])
             .unwrap();
         let local = transport.local_addr(7, MediaRole::Audio).unwrap();
         transport.prepare_configuration(7).unwrap();
@@ -2348,7 +2410,7 @@ mod tests {
         let mut initial_report = [0u8; 128];
         remote.recv_from(&mut initial_report).unwrap();
 
-        let attacker = UdpSocket::bind((ATTACKER_MEDIA_ADDRESS, 0)).unwrap();
+        let attacker = crate::bind_test_udp_loopback();
         attacker.send_to(b"wrong-source", local).unwrap();
         assert_eq!(
             transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),

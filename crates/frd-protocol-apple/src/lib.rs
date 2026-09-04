@@ -47,6 +47,12 @@ pub use runtime::run_established_hpss_session;
 pub use session::{SessionCrypto, SessionEncodingProfile};
 
 #[cfg(test)]
+pub(crate) fn bind_test_udp_loopback() -> std::net::UdpSocket {
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("绑定 127.0.0.1 临时 UDP 测试 socket 失败")
+}
+
+#[cfg(test)]
 pub(crate) fn read_private_fixture_text(relative_path: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

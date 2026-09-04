@@ -73,6 +73,25 @@ function Get-PayloadSha256($Entries) {
     }
 }
 
+function Get-SafeVerifierFailureReason([Management.Automation.ErrorRecord]$Failure) {
+    $message = [string]$Failure.Exception.Message
+    $closedReasons = @(
+        @{ Pattern = '^staged 许可/notice 与固定发布版本不同:'; Reason = 'license_notice_hash_mismatch' },
+        @{ Pattern = '^当前目录存在可优先加载的未批准 DLL:'; Reason = 'current_directory_dll_shadow' },
+        @{ Pattern = '^package 的版本化 codec 目录之外存在未批准 DLL:'; Reason = 'package_dll_shadow' },
+        @{ Pattern = '^manifest SHA-256 与实际 staged bytes 不匹配:'; Reason = 'staged_file_hash_mismatch' },
+        @{ Pattern = '^staged manifest '; Reason = 'manifest_contract_rejected' },
+        @{ Pattern = '^package 完整文件集合'; Reason = 'package_file_set_mismatch' },
+        @{ Pattern = '^package 完整目录集合'; Reason = 'package_directory_set_mismatch' }
+    )
+    foreach ($closedReason in $closedReasons) {
+        if ($message -cmatch $closedReason.Pattern) {
+            return $closedReason.Reason
+        }
+    }
+    return 'verifier_contract_rejected'
+}
+
 $package = Resolve-RepoPath $PackageRoot
 $applicationPath = Resolve-RepoPath $Application
 $codecSourcePath = Resolve-RepoPath $CodecSource
@@ -175,7 +194,8 @@ try {
         & $verifier -PackageRoot $attempt
     }
     catch {
-        throw "临时 Windows package 验证失败"
+        $reason = Get-SafeVerifierFailureReason $_
+        throw "临时 Windows package 验证失败: $reason"
     }
     Copy-Item -LiteralPath $sourceAssetPath -Destination $releaseAssetAttempt
     if ((Get-FileHash -LiteralPath $releaseAssetAttempt -Algorithm SHA256).Hash -cne $correspondingSourceHash) {
@@ -205,7 +225,8 @@ try {
             & $verifier -PackageRoot $package
         }
         catch {
-            throw "已发布 Windows package 验证失败"
+            $reason = Get-SafeVerifierFailureReason $_
+            throw "已发布 Windows package 验证失败: $reason"
         }
         if ((Get-FileHash -LiteralPath $releaseAsset -Algorithm SHA256).Hash -cne $correspondingSourceHash) {
             throw "已发布对应源码 ZIP hash 不匹配"
