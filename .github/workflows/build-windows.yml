@@ -4,78 +4,123 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "apps/freeremotedesk-windows/**"
-      - "crates/frd-video-ffmpeg/**"
-      - "crates/frd-video-ffmpeg-plugin/**"
+      - "assets/**"
+      - "crates/**"
       - "packaging/windows/**"
       - "third_party/ffmpeg/8.1.2/**"
-      - "tools/build-ffmpeg-windows.ps1"
-      - "tools/ffmpeg-build-common.psm1"
-      - "tools/stage-windows-package.ps1"
-      - "tools/verify-windows-package.ps1"
-      - "tools/tests/ffmpeg-build-common.Tests.ps1"
-      - "tools/tests/windows-package.Tests.ps1"
+      - "tools/**"
       - ".github/workflows/build-windows.yml"
   push:
-    branches: [main]
+    branches:
+      - "main"
+      - "codex/**"
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - "apps/freeremotedesk-windows/**"
-      - "crates/frd-video-ffmpeg/**"
-      - "crates/frd-video-ffmpeg-plugin/**"
+      - "assets/**"
+      - "crates/**"
       - "packaging/windows/**"
       - "third_party/ffmpeg/8.1.2/**"
-      - "tools/build-ffmpeg-windows.ps1"
-      - "tools/ffmpeg-build-common.psm1"
-      - "tools/stage-windows-package.ps1"
-      - "tools/verify-windows-package.ps1"
-      - "tools/tests/ffmpeg-build-common.Tests.ps1"
-      - "tools/tests/windows-package.Tests.ps1"
+      - "tools/**"
       - ".github/workflows/build-windows.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-package-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   package:
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Enable Ubuntu 24.04 build environment
+      - name: Verify pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          $rustcVersion = (rustc --version).Split(' ')[1]
+          if ($rustcVersion -cne '1.96.0') {
+            throw "rust-toolchain.toml requires rustc 1.96.0; found $rustcVersion"
+          }
+
+      - name: Enable Ubuntu 24.04 FFmpeg build environment
         shell: pwsh
         run: |
           wsl.exe --install --distribution Ubuntu-24.04 --no-launch
-          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential mingw-w64 pkg-config xz-utils"
+          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y build-essential mingw-w64 nasm pkg-config xz-utils"
 
-      - name: Build signed-source FFmpeg bundle and fixture tests
+      - name: Build pinned FFmpeg bundle and run native tests
         shell: pwsh
         run: pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -WslDistribution Ubuntu-24.04 -RunNativeTests
 
-      - name: Build Windows GUI without implicit codec copying
+      - name: Run safe Rust tests
+        shell: pwsh
+        run: >-
+          cargo test --locked
+          -p frd-core
+          -p frd-wire-rfb
+          -p frd-frame
+          -p frd-media-api
+          -p frd-protocol-api
+          -p frd-session
+          -p frd-ui-model
+          -p frd-app
+          -p frd-protocol-apple
+          -p frd-protocol-rdp
+          -p frd-ui-egui
+          -p frd-shell-desktop
+          -p frd-video-ffmpeg
+          -p frd-video-ffmpeg-plugin
+          -p frd-platform-windows
+          -p freeremotedesk-windows
+
+      - name: Build Windows GUI release without implicit codec copying
         shell: pwsh
         run: cargo build --locked --release -p freeremotedesk-windows
 
-      - name: Stage and verify Windows binary package
+      - name: Stage Windows package
         shell: pwsh
+        run: pwsh -NoProfile -File tools/stage-windows-package.ps1 -PackageRoot target/package-test
+
+      - name: Verify Windows package
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/verify-windows-package.ps1 -PackageRoot target/package-test
+
+      - name: Run Windows package Pester tests
+        shell: powershell
         run: |
-          pwsh -NoProfile -File tools/stage-windows-package.ps1 -PackageRoot target/package-test
-          pwsh -NoProfile -File tools/verify-windows-package.ps1 -PackageRoot target/package-test
-          Import-Module Pester -Force
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "Windows package tests require Windows PowerShell 5.1"
+          }
+          Import-Module Pester -RequiredVersion 3.4.0 -Force
+          if ((Get-Module Pester).Version -ne [Version]'3.4.0') {
+            throw "Windows package tests require Pester 3.4.0"
+          }
           Invoke-Pester -Script tools/tests/windows-package.Tests.ps1 -EnableExit
 
-      - name: Upload Windows binary package
-        uses: actions/upload-artifact@v4
+      - name: Upload exact Windows package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: freeremotedesk-windows-package
           path: target/package-test
           if-no-files-found: error
 
-      - name: Upload corresponding FFmpeg source sibling asset
-        uses: actions/upload-artifact@v4
+      - name: Upload exact corresponding FFmpeg source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          # This Actions artifact is only a transport wrapper. Release publishing
-          # must upload the exact inner ZIP name below as the binary package's sibling.
-          name: freeremotedesk-corresponding-source-transport-wrapper
+          # The Actions artifact is a transport wrapper. No release is published here.
+          name: freeremotedesk-ffmpeg-8.1.2-corresponding-source
           path: target/release-assets/FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip
           if-no-files-found: error

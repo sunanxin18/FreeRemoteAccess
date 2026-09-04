@@ -181,6 +181,16 @@ fn drag_glyph() -> GlyphSemantic {
     }
 }
 
+fn window_move_glyph() -> GlyphSemantic {
+    GlyphSemantic {
+        symbol_name: "open_with",
+        codepoint: '\u{e89f}',
+        accessible_name: "移动窗口",
+        tooltip: "移动窗口",
+        available: true,
+    }
+}
+
 fn action_glyph(action: Option<IslandAction>) -> GlyphSemantic {
     match action {
         Some(IslandAction::CancelConnect) => GlyphSemantic {
@@ -290,7 +300,9 @@ pub fn control_island_metrics(
     window_capabilities: IslandWindowCapabilities,
 ) -> SessionChromeMetrics {
     let session = session_chrome_metrics();
-    let additional_slots = 1 + window_action_semantics(window_capabilities, false).len();
+    let additional_slots = 1
+        + window_action_semantics(window_capabilities, false).len()
+        + usize::from(window_capabilities.begin_move);
     SessionChromeMetrics {
         total_width: session.total_width + (SLOT_SIZE + SLOT_SPACING) * additional_slots as f32,
         ..session
@@ -318,6 +330,7 @@ pub struct ControlIslandRenderResult {
     pub pressed: bool,
     pub reposition_delta: egui::Vec2,
     pub window_move_requested: bool,
+    pub window_move_rect: Option<egui::Rect>,
     pub hit_rects: Vec<(egui::Rect, IslandAction)>,
     pub reveal_line_alpha: f32,
 }
@@ -332,6 +345,7 @@ impl Default for ControlIslandRenderResult {
             pressed: false,
             reposition_delta: egui::Vec2::ZERO,
             window_move_requested: false,
+            window_move_rect: None,
             hit_rects: Vec::new(),
             reveal_line_alpha: 0.0,
         }
@@ -482,6 +496,14 @@ fn render_visible_island(
             if response.clicked() {
                 result.action = Some(semantic.action);
             }
+        }
+
+        if input.window_capabilities.begin_move {
+            let response = show_glyph(ui, window_move_glyph(), None, None, true);
+            observe_response(result, &response);
+            result.window_move_rect = Some(response.rect);
+            result.window_move_requested |= response.is_pointer_button_down_on()
+                && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
         }
     });
     ui.spacing_mut().item_spacing = prior_spacing;
@@ -683,7 +705,7 @@ mod tests {
     use super::{
         accessible_label, action_glyph, audio_glyph, clipboard_glyph, connection_glyph, drag_glyph,
         glyph_fill_state, install_control_island_font, material_symbol_font_id,
-        presentation_timing_semantic, session_chrome_metrics, GlyphFillState,
+        presentation_timing_semantic, session_chrome_metrics, window_move_glyph, GlyphFillState,
         MATERIAL_SYMBOLS_FONT_FAMILY,
     };
 
@@ -976,6 +998,134 @@ mod tests {
     }
 
     #[test]
+    fn visible_windows_island_requests_local_window_move_only_on_primary_press_edge() {
+        let context = egui::Context::default();
+        let mut fonts = FontDefinitions::default();
+        install_control_island_font(&mut fonts);
+        context.set_fonts(fonts);
+        let model = SessionChromeModel {
+            connection: ConnectionGlyph::Connected,
+            diagnostics: None,
+            presentation_timing: None,
+            audio: CapabilityGlyphState::Unavailable,
+            clipboard: CapabilityGlyphState::Unavailable,
+            action: Some(IslandAction::Disconnect),
+        };
+        let island_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(
+                super::control_island_metrics(frd_ui_model::IslandWindowCapabilities::WINDOWS)
+                    .total_width
+                    + 8.0,
+                52.0,
+            ),
+        );
+        let render = |context: &egui::Context| {
+            super::show_control_island(
+                context,
+                super::ControlIslandRenderInput {
+                    model: &model,
+                    window_capabilities: frd_ui_model::IslandWindowCapabilities::WINDOWS,
+                    visible: true,
+                    maximized: false,
+                    island_rect,
+                    reveal_line_rect: egui::Rect::NOTHING,
+                    focus_first: false,
+                    opaque_material: false,
+                    shell_diagnostic: None,
+                },
+            )
+        };
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 200.0));
+        let mut initial_result = None;
+        let mut initial = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |context| {
+                initial_result = Some(render(context));
+            },
+        );
+        initial.textures_delta.clear();
+        let initial_result = initial_result.expect("visible island publishes the move control");
+        let window_move_point = initial_result
+            .window_move_rect
+            .expect("Windows adapter enables the move control")
+            .center();
+        let mut hovered = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerMoved(window_move_point)],
+                ..Default::default()
+            },
+            |context| {
+                let _ = render(context);
+            },
+        );
+        hovered.textures_delta.clear();
+        let mut pressed_result = None;
+        let mut pressed = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: window_move_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |context| {
+                pressed_result = Some(render(context));
+            },
+        );
+        pressed.textures_delta.clear();
+        let pressed_result = pressed_result.expect("primary press renders the move control");
+        assert!(pressed_result.window_move_requested);
+        assert_eq!(pressed_result.reposition_delta, egui::Vec2::ZERO);
+        assert_eq!(pressed_result.action, None);
+
+        let mut held_result = None;
+        let mut held = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |context| {
+                held_result = Some(render(context));
+            },
+        );
+        held.textures_delta.clear();
+        let held_result = held_result.expect("held primary pointer re-renders the move control");
+        assert!(!held_result.window_move_requested);
+        assert_eq!(held_result.reposition_delta, egui::Vec2::ZERO);
+        assert_eq!(held_result.action, None);
+
+        let mut released_result = None;
+        let mut released = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: window_move_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |context| {
+                released_result = Some(render(context));
+            },
+        );
+        released.textures_delta.clear();
+        let released_result = released_result.expect("pointer release re-renders the move control");
+        assert!(!released_result.window_move_requested);
+        assert_eq!(released_result.reposition_delta, egui::Vec2::ZERO);
+        assert_eq!(released_result.action, None);
+    }
+
+    #[test]
     fn material_symbols_font_is_registered_as_an_isolated_named_family() {
         let mut definitions = FontDefinitions::default();
 
@@ -1111,6 +1261,12 @@ mod tests {
                 drag_glyph().codepoint,
                 "drag_indicator",
                 '\u{e945}',
+            ),
+            (
+                window_move_glyph().symbol_name,
+                window_move_glyph().codepoint,
+                "open_with",
+                '\u{e89f}',
             ),
             (
                 action_glyph(Some(IslandAction::CancelConnect)).symbol_name,

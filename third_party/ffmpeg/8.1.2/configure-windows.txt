@@ -16,6 +16,5 @@
   --disable-version3 \
   --disable-autodetect \
   --disable-network \
-  --disable-x86asm \
   --disable-debug \
   --enable-stripping

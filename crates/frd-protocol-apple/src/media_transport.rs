@@ -15,8 +15,9 @@ use sha2::{Digest as _, Sha256};
 use crate::audio_codec::{ARD_AUDIO_RTP_PAYLOAD_TYPE, ARD_AUDIO_SAMPLES_PER_ACCESS_UNIT};
 use crate::media_negotiation::MediaNegotiatorMode;
 use crate::media_negotiation::{
-    encode_client_media_stream_configuration, AudioMediaFlow, ClientMediaStreamConfiguration,
-    MediaStreamAnswer, MediaStreamConfigurationEntry,
+    encode_client_media_stream_configuration_with_capabilities, AudioMediaFlow,
+    ClientMediaStreamCapabilities, ClientMediaStreamConfiguration, MediaStreamAnswer,
+    MediaStreamConfigurationEntry,
 };
 use crate::media_protocol::{MediaStreamPortAnnouncement, MediaStreamPortDescriptor};
 use crate::srtp::{
@@ -645,6 +646,17 @@ impl MediaTransport {
     }
 
     pub fn prepare_configuration(&mut self, generation: u64) -> Result<Vec<u8>> {
+        self.prepare_configuration_with_capabilities(
+            generation,
+            ClientMediaStreamCapabilities::default(),
+        )
+    }
+
+    pub fn prepare_configuration_with_capabilities(
+        &mut self,
+        generation: u64,
+        capabilities: ClientMediaStreamCapabilities,
+    ) -> Result<Vec<u8>> {
         self.validate_generation(generation)?;
         ensure!(
             self.phase == MediaTransportPhase::LocalSocketsReady,
@@ -654,8 +666,11 @@ impl MediaTransport {
         let configuration =
             ClientMediaStreamConfiguration::generate_one_video_with_audio_flow(self.audio_flow)
                 .context("生成客户端媒体流配置失败")?;
-        let wire = encode_client_media_stream_configuration(&configuration)
-            .context("序列化客户端媒体流配置失败")?;
+        let wire = encode_client_media_stream_configuration_with_capabilities(
+            &configuration,
+            capabilities,
+        )
+        .context("序列化客户端媒体流配置失败")?;
         self.configuration = Some(configuration);
         Ok(wire)
     }
@@ -773,6 +788,16 @@ impl MediaTransport {
         role: MediaRole,
         media_ssrc: u32,
     ) -> Result<()> {
+        self.queue_picture_loss_at(generation, role, media_ssrc, Instant::now())
+    }
+
+    fn queue_picture_loss_at(
+        &mut self,
+        generation: u64,
+        role: MediaRole,
+        media_ssrc: u32,
+        now: Instant,
+    ) -> Result<()> {
         self.validate_generation(generation)?;
         ensure!(
             self.phase == MediaTransportPhase::Active,
@@ -782,9 +807,22 @@ impl MediaTransport {
             matches!(role, MediaRole::VideoStream1 | MediaRole::VideoStream2),
             "PLI 只能绑定到 Apple HP 视频 socket"
         );
-        self.socket_mut(generation, role)?
-            .pending_picture_loss_media_ssrc
-            .get_or_insert(media_ssrc);
+        let newly_queued = {
+            let pending = &mut self
+                .socket_mut(generation, role)?
+                .pending_picture_loss_media_ssrc;
+            if pending.is_some() {
+                false
+            } else {
+                *pending = Some(media_ssrc);
+                true
+            }
+        };
+        if newly_queued {
+            if let Some(due_at) = self.next_control_report_at.as_mut() {
+                *due_at = (*due_at).min(now);
+            }
+        }
         Ok(())
     }
 
@@ -1769,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_picture_loss_is_coalesced_per_video_socket_and_cleared_after_send() {
+    fn queued_picture_loss_expedites_control_report_and_coalesces_per_video_socket() {
         const REMOTE_MEDIA_SSRC: u32 = 0x5566_7788;
         let mut loopback = ThreeRoleLoopback::new();
         let local_sender_ssrc = loopback
@@ -1797,13 +1835,15 @@ mod tests {
             )
             .unwrap();
 
-        loopback
-            .transport
-            .service_control_reports_at(
-                ThreeRoleLoopback::GENERATION,
-                Instant::now() + Duration::from_secs(2),
-            )
-            .unwrap();
+        let service_now = Instant::now();
+        assert_eq!(
+            loopback
+                .transport
+                .service_control_reports_at(ThreeRoleLoopback::GENERATION, service_now)
+                .unwrap(),
+            3,
+            "首个 PLI 入队必须提前全局控制报告截止时间"
+        );
         assert!(loopback
             .receive_control_plaintext(MediaRole::Audio)
             .windows(2)
@@ -1838,19 +1878,22 @@ mod tests {
             .windows(2)
             .all(|header| header != [0x81, 206]));
 
-        loopback
-            .transport
-            .service_control_reports_at(
-                ThreeRoleLoopback::GENERATION,
-                Instant::now() + Duration::from_secs(4),
-            )
-            .unwrap();
-        let _ = loopback.receive_control_plaintext(MediaRole::Audio);
-        assert!(loopback
-            .receive_control_plaintext(MediaRole::VideoStream1)
-            .windows(2)
-            .all(|header| header != [0x81, 206]));
-        let _ = loopback.receive_control_plaintext(MediaRole::VideoStream2);
+        assert_eq!(
+            loopback
+                .transport
+                .service_control_reports_at(ThreeRoleLoopback::GENERATION, service_now)
+                .unwrap(),
+            0,
+            "成功发送后必须清除 PLI，并恢复普通报告周期"
+        );
+        assert_eq!(
+            loopback
+                .transport
+                .socket(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream1)
+                .unwrap()
+                .pending_picture_loss_media_ssrc,
+            None
+        );
     }
 
     #[test]

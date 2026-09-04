@@ -129,6 +129,12 @@ pub struct VideoStreamAdmission {
     pub generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoDecodeLoadSnapshot {
+    pub queued_access_units: usize,
+    pub oldest_local_ingress_at: Option<Instant>,
+}
+
 impl DecodedVideoFrameHandoff {
     pub const fn token(&self) -> &VideoFrameToken {
         &self.token
@@ -204,6 +210,7 @@ struct VideoInputState {
     pending_config: Option<(StreamEpoch, VideoStreamConfig)>,
     access_units: VecDeque<(StreamEpoch, EncodedVideoAccessUnit)>,
     access_unit_bytes: usize,
+    in_flight: Option<(StreamEpoch, Option<Instant>)>,
     worker_epoch: Option<StreamEpoch>,
     closed: bool,
 }
@@ -221,6 +228,7 @@ impl VideoInputQueue {
                     pending_config: None,
                     access_units: VecDeque::new(),
                     access_unit_bytes: 0,
+                    in_flight: None,
                     worker_epoch: None,
                     closed: false,
                 }),
@@ -298,6 +306,7 @@ impl VideoInputQueue {
             }
             if let Some((epoch, access_unit)) = state.access_units.pop_front() {
                 state.access_unit_bytes -= access_unit.bytes().len();
+                state.in_flight = Some((epoch, access_unit.local_ingress_at()));
                 return Some(VideoWorkerCommand::AccessUnit { epoch, access_unit });
             }
             if state.closed {
@@ -319,8 +328,23 @@ impl VideoInputQueue {
         }
         state.access_units.pop_front().map(|(epoch, access_unit)| {
             state.access_unit_bytes -= access_unit.bytes().len();
+            state.in_flight = Some((epoch, access_unit.local_ingress_at()));
             VideoWorkerCommand::AccessUnit { epoch, access_unit }
         })
+    }
+
+    fn finish_access_unit(&self, epoch: StreamEpoch) {
+        let mut state = self
+            .shared
+            .0
+            .lock()
+            .expect("video input queue mutex poisoned");
+        if state
+            .in_flight
+            .is_some_and(|(in_flight_epoch, _)| in_flight_epoch == epoch)
+        {
+            state.in_flight = None;
+        }
     }
 
     fn close(&self) {
@@ -330,6 +354,7 @@ impl VideoInputQueue {
         state.pending_config = None;
         state.access_units.clear();
         state.access_unit_bytes = 0;
+        state.in_flight = None;
         wake.notify_all();
     }
 
@@ -369,6 +394,42 @@ impl VideoInputQueue {
             .lock()
             .expect("video input queue mutex poisoned")
             .worker_epoch
+    }
+
+    fn try_load_snapshot(
+        &self,
+        identity: VideoStreamIdentity,
+        generation: u64,
+    ) -> Option<VideoDecodeLoadSnapshot> {
+        let state = self.shared.0.try_lock().ok()?;
+        let epoch = state
+            .pending_config
+            .as_ref()
+            .map(|(epoch, _)| *epoch)
+            .or_else(|| state.access_units.back().map(|(epoch, _)| *epoch))
+            .or_else(|| state.in_flight.map(|(epoch, _)| epoch))
+            .or(state.worker_epoch)?;
+        if epoch.identity != identity || epoch.generation != generation {
+            return None;
+        }
+        let queued_access_units = state
+            .access_units
+            .iter()
+            .filter(|(queued_epoch, _)| *queued_epoch == epoch)
+            .count();
+        let oldest_queued = state
+            .access_units
+            .iter()
+            .filter(|(queued_epoch, _)| *queued_epoch == epoch)
+            .filter_map(|(_, access_unit)| access_unit.local_ingress_at())
+            .min();
+        let oldest_in_flight = state.in_flight.and_then(|(in_flight_epoch, ingress)| {
+            (in_flight_epoch == epoch).then_some(ingress).flatten()
+        });
+        Some(VideoDecodeLoadSnapshot {
+            queued_access_units,
+            oldest_local_ingress_at: oldest_queued.into_iter().chain(oldest_in_flight).min(),
+        })
     }
 }
 
@@ -1037,6 +1098,8 @@ struct VideoRouter {
     events: VideoWorkerEvents,
     #[cfg(test)]
     before_stream_finish: Arc<Mutex<Option<Arc<dyn Fn(VideoStreamIdentity) + Send + Sync>>>>,
+    #[cfg(test)]
+    before_load_snapshot: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 impl VideoRouter {
@@ -1056,6 +1119,8 @@ impl VideoRouter {
             events,
             #[cfg(test)]
             before_stream_finish: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_load_snapshot: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1076,6 +1141,26 @@ impl VideoRouter {
             .clone();
         if let Some(hook) = hook {
             hook(identity);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_before_load_snapshot(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .before_load_snapshot
+            .lock()
+            .expect("load snapshot hook mutex poisoned") = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn invoke_before_load_snapshot(&self) {
+        let hook = self
+            .before_load_snapshot
+            .lock()
+            .expect("load snapshot hook mutex poisoned")
+            .clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -1169,6 +1254,33 @@ impl VideoRouter {
         route
             .input
             .try_push_tagged_access_unit(current_epoch, access_unit)
+    }
+
+    fn encoded_access_unit_queue_depth(
+        &self,
+        identity: VideoStreamIdentity,
+        generation: u64,
+    ) -> Option<usize> {
+        self.video_decode_load_snapshot(identity, generation)
+            .map(|snapshot| snapshot.queued_access_units)
+    }
+
+    fn video_decode_load_snapshot(
+        &self,
+        identity: VideoStreamIdentity,
+        generation: u64,
+    ) -> Option<VideoDecodeLoadSnapshot> {
+        let input = {
+            let state = self.shared.0.try_lock().ok()?;
+            let route = state.streams.get(&identity)?;
+            if state.closed || route.terminal {
+                return None;
+            }
+            route.input.clone()
+        };
+        #[cfg(test)]
+        self.invoke_before_load_snapshot();
+        input.try_load_snapshot(identity, generation)
     }
 
     fn close(&self) {
@@ -1310,6 +1422,23 @@ impl VideoDecodeSender {
         access_unit: EncodedVideoAccessUnit,
     ) -> Result<(), VideoWorkerSendError> {
         self.router.try_send_access_unit(access_unit)
+    }
+
+    pub fn encoded_access_unit_queue_depth(
+        &self,
+        identity: VideoStreamIdentity,
+        generation: u64,
+    ) -> Option<usize> {
+        self.router
+            .encoded_access_unit_queue_depth(identity, generation)
+    }
+
+    pub fn video_decode_load_snapshot(
+        &self,
+        identity: VideoStreamIdentity,
+        generation: u64,
+    ) -> Option<VideoDecodeLoadSnapshot> {
+        self.router.video_decode_load_snapshot(identity, generation)
     }
 }
 
@@ -1605,16 +1734,20 @@ fn run_stream_worker(
             }
             VideoWorkerCommand::AccessUnit { epoch, access_unit } => {
                 let Some(decoder) = active.as_mut() else {
+                    input.finish_access_unit(epoch);
                     continue;
                 };
                 if decoder.epoch != epoch || !events.is_current(epoch) {
+                    input.finish_access_unit(epoch);
                     continue;
                 }
                 let timestamp = access_unit.timestamp();
                 decoder
                     .ingress_by_timestamp
                     .record(timestamp, access_unit.local_ingress_at());
-                match call_decoder_boundary(|| decoder.decoder.submit(access_unit)) {
+                let outcome = call_decoder_boundary(|| decoder.decoder.submit(access_unit));
+                input.finish_access_unit(epoch);
+                match outcome {
                     Ok(DecodeOutcome::NeedMoreData) => {}
                     Ok(DecodeOutcome::Frames(frames)) => {
                         publish_current_frames(&events, decoder, frames)
@@ -1695,8 +1828,9 @@ mod tests {
     };
 
     use super::{
-        VideoDecodeWorker, VideoInputQueue, VideoWorkerEvent, VideoWorkerSendError,
-        VIDEO_ACCESS_UNIT_BYTE_LIMIT, VIDEO_ACCESS_UNIT_ENTRY_LIMIT,
+        VideoDecodeSender, VideoDecodeWorker, VideoInputQueue, VideoRouter, VideoWorkerEvent,
+        VideoWorkerEvents, VideoWorkerSendError, VIDEO_ACCESS_UNIT_BYTE_LIMIT,
+        VIDEO_ACCESS_UNIT_ENTRY_LIMIT,
     };
 
     #[test]
@@ -1725,6 +1859,217 @@ mod tests {
             byte_queue.try_push_access_unit(test_au(7, 17, false, 1)),
             Err(VideoWorkerSendError::Full)
         );
+    }
+
+    #[test]
+    fn sender_load_snapshot_is_read_only_generation_scoped_and_retains_oldest_ingress() {
+        let session_id = SessionId::allocate();
+        let identity = identity_for(session_id, 11);
+        let oldest_ingress = Instant::now();
+        let sender = VideoDecodeSender {
+            router: VideoRouter::new(VideoWorkerEvents::new(None)),
+        };
+        sender
+            .try_send_config(test_config_for(identity, 7))
+            .unwrap();
+        for tick in 0..4 {
+            sender
+                .try_send_access_unit(
+                    test_au_for(identity, 7, tick, false, 1)
+                        .with_local_ingress_at(oldest_ingress + Duration::from_millis(tick)),
+                )
+                .unwrap();
+        }
+
+        let snapshot = sender.video_decode_load_snapshot(identity, 7).unwrap();
+        assert_eq!(snapshot.queued_access_units, 4);
+        assert_eq!(snapshot.oldest_local_ingress_at, Some(oldest_ingress));
+        assert!(sender.video_decode_load_snapshot(identity, 8).is_none());
+        assert!(sender
+            .video_decode_load_snapshot(identity_for(session_id, 12), 7)
+            .is_none());
+        assert_eq!(
+            sender
+                .video_decode_load_snapshot(identity, 7)
+                .unwrap()
+                .queued_access_units,
+            4
+        );
+    }
+
+    #[test]
+    fn access_unit_publication_continues_while_load_sampling_is_between_locks() {
+        let session_id = SessionId::allocate();
+        let identity = identity_for(session_id, 13);
+        let sender = VideoDecodeSender {
+            router: VideoRouter::new(VideoWorkerEvents::new(None)),
+        };
+        sender
+            .try_send_config(test_config_for(identity, 7))
+            .unwrap();
+
+        let (sampling_tx, sampling_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let blocked_once = Arc::new(AtomicBool::new(false));
+        sender.router.set_before_load_snapshot(Arc::new(move || {
+            if !blocked_once.swap(true, Ordering::AcqRel) {
+                sampling_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let sampling_sender = sender.clone();
+        let sampler =
+            std::thread::spawn(move || sampling_sender.video_decode_load_snapshot(identity, 7));
+        sampling_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let ingress = Instant::now();
+        sender
+            .try_send_access_unit(
+                test_au_for(identity, 7, 1, false, 1).with_local_ingress_at(ingress),
+            )
+            .expect("采样不持有 router 锁时 AU 发布必须继续");
+        let input = {
+            let state = sender
+                .router
+                .shared
+                .0
+                .lock()
+                .expect("video router mutex poisoned");
+            state.streams.get(&identity).unwrap().input.clone()
+        };
+        let input_guard = input
+            .shared
+            .0
+            .lock()
+            .expect("video input queue mutex poisoned");
+        release_tx.send(()).unwrap();
+
+        assert!(sampler.join().unwrap().is_none());
+        drop(input_guard);
+        let snapshot = sender.video_decode_load_snapshot(identity, 7).unwrap();
+        assert_eq!(snapshot.queued_access_units, 1);
+        assert_eq!(snapshot.oldest_local_ingress_at, Some(ingress));
+    }
+
+    #[test]
+    fn blocked_decoder_drives_periodic_rate_fallback_at_exact_two_second_boundary() {
+        let session_id = SessionId::allocate();
+        let identity = identity_for(session_id, 14);
+        let submits = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = worker_with_script(
+            DecoderScript::BlockingSubmit {
+                entered: entered_tx,
+                release: Arc::new(Mutex::new(release_rx)),
+                block_after_calls: 0,
+            },
+            submits.clone(),
+        );
+        let sender = worker.sender();
+        sender
+            .try_send_config(test_config_for(identity, 7))
+            .unwrap();
+        recv_backend_selected_for(&worker, identity, 7);
+
+        let origin = Instant::now();
+        let mut controller = crate::video_rate_fallback::VideoRateFallbackController::default();
+        controller.retain_stream(identity, 7, origin);
+
+        sender
+            .try_send_access_unit(
+                test_au_for(identity, 7, 1, true, 1).with_local_ingress_at(origin),
+            )
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for tick in 0..4 {
+            sender
+                .try_send_access_unit(
+                    test_au_for(identity, 7, 2 + tick, false, 1)
+                        .with_local_ingress_at(origin + Duration::from_millis(150 + tick)),
+                )
+                .unwrap();
+        }
+        let snapshot = sender.video_decode_load_snapshot(identity, 7).unwrap();
+        assert_eq!(snapshot.queued_access_units, 4);
+        assert_eq!(snapshot.oldest_local_ingress_at, Some(origin));
+        assert!(worker.events().try_recv().is_none());
+
+        for elapsed_ms in (201..=1_101).step_by(100) {
+            let observed_at = origin + Duration::from_millis(elapsed_ms);
+            assert_eq!(
+                controller.take_due_load_target(observed_at, true),
+                Some((identity, 7))
+            );
+            assert!(controller
+                .observe_load_snapshot(observed_at, true, Some(snapshot))
+                .is_none());
+        }
+        for _ in 0..5 {
+            release_tx.send(()).unwrap();
+        }
+        wait_until(|| submits.load(Ordering::Acquire) == 5);
+        while entered_rx.try_recv().is_ok() {}
+        while worker.events().try_recv().is_some() {}
+        let recovered_at = origin + Duration::from_millis(1_201);
+        assert_eq!(
+            controller.take_due_load_target(recovered_at, true),
+            Some((identity, 7))
+        );
+        let recovered = sender.video_decode_load_snapshot(identity, 7).unwrap();
+        assert_eq!(recovered.queued_access_units, 0);
+        assert!(controller
+            .observe_load_snapshot(recovered_at, true, Some(recovered))
+            .is_none());
+
+        sender
+            .try_send_access_unit(
+                test_au_for(identity, 7, 10, false, 1)
+                    .with_local_ingress_at(origin + Duration::from_millis(1_300)),
+            )
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for tick in 0..4 {
+            sender
+                .try_send_access_unit(
+                    test_au_for(identity, 7, 11 + tick, false, 1)
+                        .with_local_ingress_at(origin + Duration::from_millis(1_450 + tick)),
+                )
+                .unwrap();
+        }
+        let restarted_snapshot = sender.video_decode_load_snapshot(identity, 7).unwrap();
+        assert_eq!(restarted_snapshot.queued_access_units, 4);
+        for elapsed_ms in (1_501..=3_401).step_by(100) {
+            let observed_at = origin + Duration::from_millis(elapsed_ms);
+            assert_eq!(
+                controller.take_due_load_target(observed_at, true),
+                Some((identity, 7))
+            );
+            assert!(controller
+                .observe_load_snapshot(observed_at, true, Some(restarted_snapshot))
+                .is_none());
+        }
+        let boundary = origin + Duration::from_millis(3_501);
+        assert_eq!(
+            controller.take_due_load_target(boundary, true),
+            Some((identity, 7))
+        );
+        assert!(matches!(
+            controller.observe_load_snapshot(boundary, true, Some(restarted_snapshot)),
+            Some(frd_protocol_api::SessionCommand::SetMaxSourceFrameRate {
+                session_id: actual_session_id,
+                generation: 7,
+                max_frames_per_second: 30,
+            }) if actual_session_id == session_id
+        ));
+        assert!(worker.events().try_recv().is_none());
+
+        for _ in 0..5 {
+            release_tx.send(()).unwrap();
+        }
+        stop(worker);
     }
 
     #[test]

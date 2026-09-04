@@ -55,6 +55,7 @@ pub struct InputRouter {
     keyboard_armed: bool,
     modifiers: Modifiers,
     keyboard_domain: KeyboardDomain,
+    restore_remote_keyboard_on_focus: bool,
 }
 
 impl InputRouter {
@@ -63,13 +64,15 @@ impl InputRouter {
             return None;
         }
         let release = self.release_remote_state();
+        self.restore_remote_keyboard_on_focus = false;
         self.gate = gate;
         self.keyboard_domain = match gate {
             InputGate::Blocked => {
                 self.local_keys.clear();
                 KeyboardDomain::LocalChrome
             }
-            InputGate::Interactive { .. } => KeyboardDomain::RemoteSurface,
+            InputGate::Interactive { .. } if self.focused => KeyboardDomain::RemoteSurface,
+            InputGate::Interactive { .. } => KeyboardDomain::LocalChrome,
         };
         self.pointer_armed =
             self.is_interactive() && self.focused && !self.any_local_button_pressed();
@@ -89,11 +92,24 @@ impl InputRouter {
 
     pub fn focus_gained(&mut self) {
         self.focused = true;
+        let restore_remote = std::mem::take(&mut self.restore_remote_keyboard_on_focus)
+            && self.is_interactive()
+            && self.local_keys.is_empty()
+            && self.remote_keys.is_empty();
+        if restore_remote {
+            self.keyboard_domain = KeyboardDomain::RemoteSurface;
+        }
         self.pointer_armed = self.is_interactive() && !self.any_local_button_pressed();
         self.keyboard_armed = self.is_interactive() && self.local_keys.is_empty();
     }
 
     pub fn focus_lost(&mut self) -> Option<InputEvent> {
+        if self.focused {
+            self.restore_remote_keyboard_on_focus = self.is_interactive()
+                && self.keyboard_domain == KeyboardDomain::RemoteSurface
+                && self.local_keys.is_empty()
+                && self.remote_keys.is_empty();
+        }
         self.focused = false;
         self.keyboard_domain = KeyboardDomain::LocalChrome;
         self.local_keys.clear();
@@ -134,6 +150,7 @@ impl InputRouter {
     }
 
     pub fn enter_local_chrome(&mut self) -> Option<InputEvent> {
+        self.restore_remote_keyboard_on_focus = false;
         self.keyboard_domain = KeyboardDomain::LocalChrome;
         self.disarm_remote_ownership()
     }
@@ -142,6 +159,7 @@ impl InputRouter {
         if !self.is_interactive() {
             return false;
         }
+        self.restore_remote_keyboard_on_focus = false;
         self.keyboard_domain = KeyboardDomain::RemoteSurface;
         self.keyboard_armed = self.is_interactive_and_focused() && self.local_keys.is_empty();
         true
@@ -989,6 +1007,121 @@ mod tests {
             input.pre_dispatch_key(key, KeyState::Released, false),
             KeyboardPreDispatch::Remote(None)
         ));
+    }
+
+    #[test]
+    fn clean_remote_keyboard_domain_is_restored_after_focus_returns_in_same_epoch() {
+        let mut input = interactive_input();
+        let key = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04);
+
+        assert_eq!(input.focus_lost(), None);
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+        assert_eq!(
+            input.pre_dispatch_key(key, KeyState::Pressed, false),
+            KeyboardPreDispatch::LocalChrome
+        );
+
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::RemoteSurface);
+    }
+
+    #[test]
+    fn local_keyboard_domain_stays_local_after_focus_returns() {
+        let mut input = interactive_input();
+        assert_eq!(input.enter_local_chrome(), None);
+
+        assert_eq!(input.focus_lost(), None);
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+    }
+
+    #[test]
+    fn held_key_at_focus_loss_releases_remote_and_does_not_restore_its_domain() {
+        let mut input = interactive_input();
+        let key = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04);
+        assert!(matches!(
+            input.pre_dispatch_key(key, KeyState::Pressed, false),
+            KeyboardPreDispatch::Remote(Some(InputEvent::PhysicalKey { .. }))
+        ));
+
+        assert_eq!(input.focus_lost(), Some(InputEvent::ReleaseAll));
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+    }
+
+    #[test]
+    fn local_key_residue_at_focus_loss_prevents_remote_domain_restore() {
+        let mut input = interactive_input();
+        let key = frd_core::PhysicalKeyCode::from_usb_hid_usage(0x04);
+        assert_eq!(input.key(key, KeyState::Pressed, InputOwnership::Ui), None);
+
+        assert_eq!(input.focus_lost(), None);
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+    }
+
+    #[test]
+    fn new_generation_in_same_session_clears_pending_remote_domain_restore() {
+        let mut input = interactive_input();
+        let (session_id, generation) = input.interactive_epoch().unwrap();
+        assert_eq!(input.focus_lost(), None);
+
+        input.set_gate(InputGate::Interactive {
+            session_id,
+            generation: generation + 1,
+        });
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+    }
+
+    #[test]
+    fn new_session_at_same_generation_clears_pending_remote_domain_restore() {
+        let mut input = interactive_input();
+        let (_, generation) = input.interactive_epoch().unwrap();
+        assert_eq!(input.focus_lost(), None);
+
+        input.set_gate(InputGate::Interactive {
+            session_id: SessionId::allocate(),
+            generation,
+        });
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+    }
+
+    #[test]
+    fn blocked_gate_clears_pending_remote_domain_restore() {
+        let mut input = interactive_input();
+        assert_eq!(input.focus_lost(), None);
+
+        assert_eq!(input.set_gate(InputGate::Blocked), None);
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+    }
+
+    #[test]
+    fn interactive_gate_entered_while_unfocused_stays_local_after_focus_returns() {
+        let mut input = InputRouter::default();
+
+        assert_eq!(input.set_gate(InputGate::Blocked), None);
+        assert_eq!(
+            input.set_gate(InputGate::Interactive {
+                session_id: SessionId::allocate(),
+                generation: 1,
+            }),
+            None
+        );
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+
+        input.focus_gained();
+
+        assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
     }
 
     #[test]

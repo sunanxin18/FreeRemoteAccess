@@ -13,3 +13,6 @@ native-ffmpeg = []
 
 [dependencies]
 frd-video-ffmpeg = { path = "../frd-video-ffmpeg" }
+
+[build-dependencies]
+cc = "1"

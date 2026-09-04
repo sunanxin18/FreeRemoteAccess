@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - "main"
+      - "codex/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Rust formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install rustfmt for Rust 1.96.0
+        shell: bash
+        run: |
+          rustup component add rustfmt --toolchain 1.96.0
+          rustup component list --toolchain 1.96.0 --installed | grep '^rustfmt-'
+
+      - name: Verify pinned Rust toolchain
+        shell: bash
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
+
+      - name: Check Rust formatting once
+        run: cargo fmt --all -- --check
+
+  compile-and-test:
+    name: Compile and safe tests (${{ matrix.os }})
+    needs: format
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install required Linux GUI and audio build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            libasound2-dev \
+            libwayland-cursor0 \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Verify pinned Rust toolchain
+        shell: bash
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
+
+      # macOS and Linux are compile/test gates only. They do not create packages
+      # or prove GUI, GPU, audio-device, or live-protocol interoperability.
+      - name: Compile the GUI and core workspace
+        shell: bash
+        run: cargo check --locked --workspace --all-targets
+
+      - name: Run safe core, protocol, and shell tests
+        shell: bash
+        run: >-
+          cargo test --locked
+          -p frd-core
+          -p frd-wire-rfb
+          -p frd-frame
+          -p frd-media-api
+          -p frd-protocol-api
+          -p frd-session
+          -p frd-ui-model
+          -p frd-app
+          -p frd-protocol-apple
+          -p frd-protocol-rdp
+          -p frd-ui-egui
+          -p frd-shell-desktop

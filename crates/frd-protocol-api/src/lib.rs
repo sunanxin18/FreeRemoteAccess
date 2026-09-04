@@ -488,6 +488,11 @@ pub struct PresentationTiming {
 
 pub enum SessionCommand {
     Input(SessionInput),
+    SetMaxSourceFrameRate {
+        session_id: SessionId,
+        generation: u64,
+        max_frames_per_second: u16,
+    },
     ViewportChanged {
         session_id: SessionId,
         generation: u64,

@@ -2070,6 +2070,7 @@ dependencies = [
 name = "frd-video-ffmpeg-plugin"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "frd-video-ffmpeg",
 ]
 

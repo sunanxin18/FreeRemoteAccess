@@ -490,9 +490,9 @@ mod tests {
     use frd_core::PixelRect;
     use frd_ui_model::IslandAction;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        HTBOTTOMRIGHT, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOPLEFT, WM_ENTERSIZEMOVE,
-        WM_EXITSIZEMOVE, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NULL, WM_SETTINGCHANGE,
-        WM_THEMECHANGED,
+        HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOPLEFT,
+        WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NULL,
+        WM_SETTINGCHANGE, WM_THEMECHANGED,
     };
 
     use super::{
@@ -500,7 +500,38 @@ mod tests {
         observe_native_interaction_message, resize_hit, resize_hit_for_window,
         windows_island_native_insets, windows_native_hit, NativeMaximizeClickDecision,
     };
-    use crate::{ChromeHitMap, ChromeHitTarget, ChromeRect};
+    use crate::{
+        ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeRect, ControlIslandPlacement,
+        NativeChromeInsets,
+    };
+
+    fn local_page_layout_with_close() -> crate::ChromeLayouts {
+        ChromeGeometrySnapshot::new(1200, 800, 1.5, NativeChromeInsets::default())
+            .unwrap()
+            .with_window_capabilities(frd_ui_model::IslandWindowCapabilities::WINDOWS)
+            .local_page_layouts(ControlIslandPlacement::default())
+            .expect("valid Windows local-page chrome")
+    }
+
+    fn local_page_hit_map_with_close() -> ChromeHitMap {
+        local_page_layout_with_close().hit_map
+    }
+
+    fn local_close_center() -> (u32, u32) {
+        local_page_layout_with_close()
+            .hit_map
+            .action_rect(IslandAction::CloseWindow)
+            .expect("close capability")
+            .center()
+    }
+
+    fn local_move_center() -> (u32, u32) {
+        local_page_layout_with_close()
+            .overlay
+            .window_move_region
+            .expect("begin-move capability")
+            .center()
+    }
 
     #[test]
     fn windows_native_move_messages_pin_until_the_modal_interaction_exits() {
@@ -591,6 +622,40 @@ mod tests {
             windows_native_hit(&map, maximize_rect.center()),
             HTMAXBUTTON
         );
+    }
+
+    #[test]
+    fn page_move_region_is_native_caption_after_resize_edges_take_priority() {
+        let move_region = ChromeRect {
+            x: 8,
+            y: 8,
+            width: 1184,
+            height: 36,
+        };
+        let map = ChromeHitMap::candidate(
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 1200,
+                height: 800,
+            },
+            Vec::new(),
+            None,
+            Some(move_region),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(windows_native_hit(&map, move_region.center()), HTCAPTION);
+        assert_eq!(resize_hit(1, 1, 1200, 800, 8, 8), Some(HTTOPLEFT));
+    }
+
+    #[test]
+    fn local_close_is_client_input_and_neighboring_bar_is_caption() {
+        let map = local_page_hit_map_with_close();
+
+        assert_eq!(windows_native_hit(&map, local_close_center()), HTCLIENT);
+        assert_eq!(windows_native_hit(&map, local_move_center()), HTCAPTION);
     }
 
     #[test]

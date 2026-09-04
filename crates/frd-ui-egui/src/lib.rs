@@ -1,5 +1,6 @@
 mod connection;
 mod control_island;
+mod local_window_bar;
 mod login_icons;
 mod session;
 
@@ -84,17 +85,23 @@ mod control_island_contract_tests {
 
         assert!(result.action.is_none());
         assert!(result.hit_rects.is_empty());
+        assert!(!result.window_move_requested);
+        assert_eq!(result.window_move_rect, None);
         assert_eq!(result.reveal_line_alpha, 0.5);
     }
 }
 
-pub use connection::{show_connection_form, show_connection_form_with_state, show_page};
+pub use connection::{
+    compact_login_metrics, floating_label_is_raised, show_connection_form,
+    show_connection_form_with_state, show_page, CompactLoginMetrics,
+};
 pub use control_island::{
     control_island_metrics, install_control_island_font, session_chrome_metrics,
     show_control_island, window_action_semantics, ControlIslandRenderInput,
     ControlIslandRenderResult, IslandActionSemantic, SessionChromeMetrics,
     MATERIAL_SYMBOLS_FONT_FAMILY,
 };
+pub use local_window_bar::{show_local_window_bar, LocalWindowBarResult};
 pub use login_icons::{
     install_login_icons_font, LoginIcon, LoginIconSemantic, LOGIN_ICON_BUTTON_SIZE,
     LOGIN_MATERIAL_SYMBOLS_FONT_FAMILY,
@@ -235,24 +242,45 @@ fn login_icons_font_is_registered_as_an_isolated_named_family() {
 
 #[cfg(test)]
 #[test]
-fn desktop_login_card_uses_approved_width_pairs_and_spacing() {
-    let metrics = connection::login_card_metrics(1100.0);
+fn compact_login_metrics_align_identity_fields_and_meet_hit_targets() {
+    let metrics = compact_login_metrics();
 
-    assert_eq!(metrics.card_width, 460.0);
-    assert!(metrics.use_paired_rows);
-    assert_eq!(metrics.corner_radius, 16.0);
-    assert_eq!(metrics.inner_margin, 24.0);
-    assert_eq!(metrics.primary_button_height, 48.0);
+    assert_eq!(metrics.username_width, metrics.password_width);
+    assert_eq!(metrics.field_height, 52.0);
+    assert!(metrics.field_height >= 44.0);
+    assert!(metrics.password_trailing_target >= 44.0);
+    assert_eq!(metrics.window_bar_height, 44.0);
 }
 
 #[cfg(test)]
 #[test]
-fn narrow_login_card_stacks_fields_without_horizontal_clipping() {
-    let metrics = connection::login_card_metrics(480.0);
+fn floating_field_label_persists_when_identity_must_remain_visible() {
+    assert!(!floating_label_is_raised(false, false, false));
+    assert!(floating_label_is_raised(true, false, false));
+    assert!(floating_label_is_raised(false, true, false));
+    assert!(floating_label_is_raised(false, false, true));
+}
 
-    assert_eq!(metrics.card_width, 448.0);
-    assert!(!metrics.use_paired_rows);
-    assert!(metrics.card_width <= 460.0);
+#[cfg(test)]
+#[test]
+fn identity_field_layout_reserves_the_password_hit_target_without_widening_the_frame() {
+    let metrics = compact_login_metrics();
+    let username =
+        connection::compact_identity_field_layout(metrics.username_width, 24.0, 0.0, 8.0);
+    let password = connection::compact_identity_field_layout(
+        metrics.password_width,
+        24.0,
+        metrics.password_trailing_target,
+        8.0,
+    );
+
+    assert_eq!(username.outer_width, password.outer_width);
+    assert_eq!(username.outer_height, password.outer_height);
+    assert_eq!(password.outer_width, 412.0);
+    assert_eq!(password.outer_height, 52.0);
+    assert_eq!(password.text_width, 304.0);
+    assert!(password.trailing_width >= 44.0);
+    assert!(password.trailing_height >= 44.0);
 }
 
 #[cfg(test)]

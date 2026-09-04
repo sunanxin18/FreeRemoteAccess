@@ -39,6 +39,7 @@ $glyphs = [ordered]@{
     'lock' = 0xE899
     'login' = 0xEA77
     'more_horiz' = 0xE5D3
+    'open_with' = 0xE89F
     'pending' = 0xEF64
     'person' = 0xF0D3
     'progress_activity' = 0xE9D0

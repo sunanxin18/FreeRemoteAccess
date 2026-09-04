@@ -1,6 +1,5 @@
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/ffmpeg_bridge.c");
@@ -8,10 +7,12 @@ fn main() {
     if env::var_os("CARGO_FEATURE_NATIVE_FFMPEG").is_none() {
         return;
     }
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
-        || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
-    {
-        panic!("native-ffmpeg 当前只支持 Windows MSVC plugin 构建");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo 必须提供目标操作系统");
+    if !matches!(target_os.as_str(), "windows" | "macos" | "linux") {
+        panic!("native-ffmpeg 仅支持 Windows MSVC、macOS 和 Linux plugin 构建");
+    }
+    if target_os == "windows" && env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        panic!("native-ffmpeg 的 Windows plugin 构建必须使用 MSVC");
     }
 
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -21,36 +22,22 @@ fn main() {
     let include = ffmpeg.join("include");
     let lib_dir = ffmpeg.join("lib");
     require_file(&include.join("libavcodec/avcodec.h"));
-    require_file(&lib_dir.join("avcodec.lib"));
-    require_file(&lib_dir.join("avutil.lib"));
+    require_directory(&lib_dir);
+    if target_os == "windows" {
+        require_file(&lib_dir.join("avcodec.lib"));
+        require_file(&lib_dir.join("avutil.lib"));
+    }
 
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let object = out_dir.join("ffmpeg_bridge.obj");
-    let archive = out_dir.join("frd_ffmpeg_bridge.lib");
-    run(
-        Command::new("cl.exe")
-            .arg("/nologo")
-            .arg("/c")
-            .arg("/O2")
-            .arg("/MD")
-            .arg("/std:c11")
-            .arg("/W4")
-            .arg(format!("/I{}", include.display()))
-            .arg(format!("/Fo{}", object.display()))
-            .arg(&source),
-        "编译 FFmpeg C bridge",
-    );
-    run(
-        Command::new("lib.exe")
-            .arg("/nologo")
-            .arg(format!("/OUT:{}", archive.display()))
-            .arg(&object),
-        "归档 FFmpeg C bridge",
-    );
+    let mut bridge = cc::Build::new();
+    bridge.file(&source).include(&include).warnings(true);
+    if target_os == "windows" {
+        bridge.flag_if_supported("/std:c11");
+    } else {
+        bridge.flag_if_supported("-std=c11");
+    }
+    bridge.compile("frd_ffmpeg_bridge");
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=static=frd_ffmpeg_bridge");
     println!("cargo:rustc-link-lib=dylib=avcodec");
     println!("cargo:rustc-link-lib=dylib=avutil");
 }
@@ -63,9 +50,10 @@ fn require_file(path: &Path) {
     );
 }
 
-fn run(command: &mut Command, action: &str) {
-    let status = command
-        .status()
-        .unwrap_or_else(|error| panic!("无法{action}: {error}"));
-    assert!(status.success(), "{action}失败: {status}");
+fn require_directory(path: &Path) {
+    assert!(
+        path.is_dir(),
+        "缺少 native-ffmpeg 库目录: {}",
+        path.display()
+    );
 }

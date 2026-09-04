@@ -23,9 +23,11 @@ $ExpectedConfigureArguments = @(
     "--disable-static", "--enable-shared", "--disable-programs", "--disable-doc",
     "--disable-everything", "--enable-decoder=hevc", "--enable-parser=hevc",
     "--enable-protocol=file", "--disable-gpl", "--disable-nonfree", "--disable-version3",
-    "--disable-autodetect", "--disable-network", "--disable-x86asm", "--disable-debug",
+    "--disable-autodetect", "--disable-network", "--disable-debug",
     "--enable-stripping"
 )
+$ExpectedX86AsmProvenance = "nasm=NASM version 2.16.01"
+$ExpectedHaveX86Asm = "have_x86asm=1"
 
 function Resolve-RepoPath([string]$Path) {
     if ([IO.Path]::IsPathRooted($Path)) {
@@ -108,6 +110,16 @@ foreach ($argument in $ExpectedConfigureArguments) {
         throw "FFmpeg build provenance 缺少 configure 参数: $argument"
     }
 }
+if ($provenance.Contains("--disable-x86asm")) {
+    throw "FFmpeg build provenance 不得包含 configure 参数: --disable-x86asm"
+}
+if (-not $provenance.Contains($ExpectedX86AsmProvenance)) {
+    throw "FFmpeg build provenance 缺少 x86asm positive provenance: $ExpectedX86AsmProvenance"
+}
+$haveX86AsmLines = @([regex]::Matches($provenance, '(?m)^have_x86asm=[^\r\n]*\r?$') | ForEach-Object { $_.Value.TrimEnd("`r") })
+if ($haveX86AsmLines.Count -ne 1 -or $haveX86AsmLines[0] -cne $ExpectedHaveX86Asm) {
+    throw "FFmpeg build provenance 缺少精确生成头 x86asm 门禁: $ExpectedHaveX86Asm"
+}
 
 $attempt = "$package.stage-$PID-$([Guid]::NewGuid().ToString('N'))"
 $backup = "$package.previous-$PID-$([Guid]::NewGuid().ToString('N'))"
@@ -143,6 +155,9 @@ try {
         }
         $manifest.build.buildId = $BuildId
     }
+    $manifest.source.configureArguments = $ExpectedConfigureArguments
+    $manifest.source | Add-Member -NotePropertyName "x86asmProvenance" -NotePropertyValue $ExpectedX86AsmProvenance -Force
+    $manifest.source | Add-Member -NotePropertyName "haveX86Asm" -NotePropertyValue $ExpectedHaveX86Asm -Force
     $manifest.buildProvenanceSha256 = (Get-FileHash -LiteralPath $provenancePath -Algorithm SHA256).Hash
     $correspondingSourceHash = (Get-FileHash -LiteralPath $sourceAssetPath -Algorithm SHA256).Hash
     $manifest.correspondingSource.sha256 = $correspondingSourceHash

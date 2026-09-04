@@ -113,7 +113,8 @@ pub(crate) fn drain_active_commands(
             SessionCommand::ClipboardWrite(payload) => {
                 optional_commands.push(ActiveOptionalCommand::ClipboardWrite(payload));
             }
-            SessionCommand::ResolveServerIdentity { .. } => {}
+            SessionCommand::ResolveServerIdentity { .. }
+            | SessionCommand::SetMaxSourceFrameRate { .. } => {}
         }
     }
     let events = drain.take_batch();
@@ -149,7 +150,8 @@ pub(crate) fn drain_reactivation_commands(
             SessionCommand::ViewportChanged { .. } => {}
             SessionCommand::Input(_)
             | SessionCommand::ResolveServerIdentity { .. }
-            | SessionCommand::ClipboardWrite(_) => {}
+            | SessionCommand::ClipboardWrite(_)
+            | SessionCommand::SetMaxSourceFrameRate { .. } => {}
         }
     }
     if runtime.requires_shutdown() {
@@ -620,6 +622,63 @@ mod tests {
         assert!(matches!(
             &optional_commands[1],
             ActiveOptionalCommand::ClipboardWrite(payload) if payload.as_bytes() == b"text"
+        ));
+    }
+
+    #[test]
+    fn generic_source_rate_command_is_ignored_by_rdp_command_drains() {
+        let session_id = SessionId::allocate();
+        let (commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize::new(1280, 720).unwrap(),
+                frd_frame::PixelFormat::Bgrx8UnormSrgb,
+            )
+            .unwrap();
+        commands
+            .send(SessionCommand::SetMaxSourceFrameRate {
+                session_id,
+                generation: 1,
+                max_frames_per_second: 30,
+            })
+            .unwrap();
+        let mut input = RdpInputState::new();
+        let mut drain = ActiveCommandDrain::new();
+        let ActiveCommandBatch::Continue {
+            events,
+            optional_commands,
+            pending,
+        } = drain_active_commands(&mut runtime, &mut input, &mut drain).unwrap()
+        else {
+            panic!("unsupported command must not end the active session")
+        };
+        assert!(events.is_empty());
+        assert!(optional_commands.is_empty());
+        assert!(!pending);
+
+        commands
+            .send(SessionCommand::SetMaxSourceFrameRate {
+                session_id,
+                generation: 1,
+                max_frames_per_second: 30,
+            })
+            .unwrap();
+        assert!(matches!(
+            drain_reactivation_commands(&mut runtime, session_id, 1),
+            super::ReactivationCommand::Continue {
+                latest_viewport: None
+            }
         ));
     }
 

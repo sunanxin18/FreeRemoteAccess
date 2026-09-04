@@ -36,10 +36,11 @@ $ExpectedConfigureArguments = @(
     "--disable-version3",
     "--disable-autodetect",
     "--disable-network",
-    "--disable-x86asm",
     "--disable-debug",
     "--enable-stripping"
 )
+$ExpectedX86AsmProvenance = "nasm=NASM version 2.16.01"
+$ExpectedHaveX86Asm = "have_x86asm=1"
 $ExpectedFiles = @(
     "freeremotedesk-windows.exe",
     "codecs/ffmpeg-8.1.2/windows-x86_64/avcodec-62.dll",
@@ -229,6 +230,13 @@ function Assert-ManifestContract($Manifest, [string]$Context) {
     Assert-True ((Get-RequiredProperty $source "releaseFingerprint" "$Context source") -ceq $ExpectedReleaseFingerprint) "$Context release fingerprint 不匹配"
     $configure = @((Get-RequiredProperty $source "configureArguments" "$Context source") | ForEach-Object { [string]$_ })
     Assert-ExactStringSet $configure $ExpectedConfigureArguments "$Context configure arguments"
+    Assert-True ($configure -cnotcontains "--disable-x86asm") "$Context configure arguments 不得包含 --disable-x86asm"
+    $x86asmProvenance = $source.PSObject.Properties["x86asmProvenance"]
+    Assert-True ($null -ne $x86asmProvenance) "$Context 缺少 x86asm positive provenance"
+    Assert-True (([string]$x86asmProvenance.Value) -ceq $ExpectedX86AsmProvenance) "$Context x86asm positive provenance 不匹配"
+    $haveX86Asm = $source.PSObject.Properties["haveX86Asm"]
+    Assert-True ($null -ne $haveX86Asm) "$Context 缺少生成头 x86asm 门禁"
+    Assert-True (([string]$haveX86Asm.Value) -ceq $ExpectedHaveX86Asm) "$Context 生成头 x86asm 门禁不匹配"
 
     $correspondingSource = Get-RequiredProperty $Manifest "correspondingSource" $Context
     Assert-True ((Get-RequiredProperty $correspondingSource "asset" "$Context correspondingSource") -ceq $ExpectedCorrespondingSourceAsset) "$Context 对应源码 asset 不匹配"

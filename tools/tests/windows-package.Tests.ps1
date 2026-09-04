@@ -1,10 +1,32 @@
-$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
+﻿$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $packageRoot = Join-Path $repoRoot "target\package-test"
 $codecRoot = Join-Path $packageRoot "codecs\ffmpeg-8.1.2\windows-x86_64"
+$stager = Join-Path $repoRoot "tools\stage-windows-package.ps1"
 $verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
 $installer = Join-Path $repoRoot "tools\install-windows-package.ps1"
 $bootstrapBuilder = Join-Path $repoRoot "tools\new-windows-installer-bootstrap.ps1"
 $correspondingSourceAsset = Join-Path $repoRoot "target\release-assets\FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip"
+$buildProvenance = Join-Path $repoRoot ".codex-target\ffmpeg-8.1.2\windows-x86_64\Release\build-provenance.txt"
+$manifestTemplate = Join-Path $repoRoot "packaging\windows\ffmpeg-manifest.json"
+$configureRecord = Join-Path $repoRoot "third_party\ffmpeg\8.1.2\configure-windows.txt"
+$expectedX86AsmProvenance = "nasm=NASM version 2.16.01"
+$expectedHaveX86Asm = "have_x86asm=1"
+
+function Copy-Utf8ScriptForWindowsPowerShell([string]$Source, [string]$Destination) {
+    $bom = [Text.Encoding]::UTF8.GetPreamble()
+    $sourceBytes = [IO.File]::ReadAllBytes($Source)
+    $hasBom = $sourceBytes.Length -ge 3 -and
+        $sourceBytes[0] -eq 0xEF -and
+        $sourceBytes[1] -eq 0xBB -and
+        $sourceBytes[2] -eq 0xBF
+    $windowsPowerShellBytes = if ($hasBom) {
+        $sourceBytes
+    }
+    else {
+        [byte[]]@($bom + $sourceBytes)
+    }
+    [IO.File]::WriteAllBytes($Destination, $windowsPowerShellBytes)
+}
 
 Describe "Windows package verification security boundaries" {
     BeforeAll {
@@ -19,8 +41,134 @@ Describe "Windows package verification security boundaries" {
         ($output -join "`n") | Should Match "Windows package verification passed"
     }
 
+    It "stages only x86asm-enabled FFmpeg provenance and records positive evidence" {
+        $template = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestTemplate | ConvertFrom-Json
+        (@($template.source.configureArguments) -ccontains "--disable-x86asm") | Should Be $false
+        ((Get-Content -Raw -LiteralPath $configureRecord).Contains("--disable-x86asm")) | Should Be $false
+
+        $stageRoot = "target/package-test-x86asm-$PID"
+        $stagePath = Join-Path $repoRoot $stageRoot
+        try {
+            $output = & pwsh -NoProfile -File $stager -PackageRoot $stageRoot 2>&1
+            $LASTEXITCODE | Should Be 0
+            ($output -join "`n") | Should Match "Windows package staged"
+
+            $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $stagePath "ffmpeg-manifest.json") | ConvertFrom-Json
+            (@($manifest.source.configureArguments) -ccontains "--disable-x86asm") | Should Be $false
+            $manifest.source.x86asmProvenance | Should Be $expectedX86AsmProvenance
+            $manifest.source.haveX86Asm | Should Be $expectedHaveX86Asm
+
+            $verification = & pwsh -NoProfile -File $verifier -PackageRoot $stagePath 2>&1
+            $LASTEXITCODE | Should Be 0
+            ($verification -join "`n") | Should Match "Windows package verification passed"
+        }
+        finally {
+            if (Test-Path -LiteralPath $stagePath) {
+                Remove-Item -LiteralPath $stagePath -Recurse -Force
+            }
+        }
+    }
+
+    It "rejects provenance that disables x86asm before staging" {
+        $tamperedProvenance = Join-Path $TestDrive "build-provenance-disabled-x86asm.txt"
+        Copy-Item -LiteralPath $buildProvenance -Destination $tamperedProvenance
+        Add-Content -LiteralPath $tamperedProvenance -Value "configure=./configure '--disable-x86asm'" -Encoding UTF8
+
+        $output = & pwsh -NoProfile -File $stager `
+            -PackageRoot "target/package-test-disabled-x86asm-$PID" `
+            -BuildProvenance $tamperedProvenance 2>&1
+
+        $LASTEXITCODE | Should Not Be 0
+        ($output -join "`n") | Should Match "不得包含 configure 参数: --disable-x86asm"
+    }
+
+    It "rejects NASM-present provenance when generated headers disabled x86asm" {
+        $tamperedProvenance = Join-Path $TestDrive "build-provenance-have-x86asm-zero.txt"
+        $provenanceLines = @(Get-Content -LiteralPath $buildProvenance | Where-Object { $_ -cne $expectedHaveX86Asm })
+        $provenanceLines + "have_x86asm=0" | Set-Content -LiteralPath $tamperedProvenance -Encoding UTF8
+
+        $output = & pwsh -NoProfile -File $stager `
+            -PackageRoot "target/package-test-have-x86asm-zero-$PID" `
+            -BuildProvenance $tamperedProvenance 2>&1
+
+        $LASTEXITCODE | Should Not Be 0
+        ($output -join "`n") | Should Match "have_x86asm=1"
+    }
+
+    It "rejects a manifest that reintroduces disabled x86asm" {
+        $manifestPath = Join-Path $packageRoot "ffmpeg-manifest.json"
+        $backup = Join-Path $TestDrive "ffmpeg-manifest.disabled-x86asm.json"
+        Copy-Item -LiteralPath $manifestPath -Destination $backup
+        try {
+            $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
+            $manifest.source.configureArguments += "--disable-x86asm"
+            $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+            $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "configure arguments 不匹配"
+        }
+        finally {
+            Copy-Item -LiteralPath $backup -Destination $manifestPath -Force
+        }
+    }
+
+    It "rejects a manifest without positive x86asm provenance" {
+        $manifestPath = Join-Path $packageRoot "ffmpeg-manifest.json"
+        $backup = Join-Path $TestDrive "ffmpeg-manifest.x86asm-provenance.json"
+        Copy-Item -LiteralPath $manifestPath -Destination $backup
+        try {
+            $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
+            $manifest.source.PSObject.Properties.Remove("x86asmProvenance")
+            $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+            $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "x86asm positive provenance"
+        }
+        finally {
+            Copy-Item -LiteralPath $backup -Destination $manifestPath -Force
+        }
+    }
+
+    It "rejects a manifest without generated-header x86asm evidence" {
+        $manifestPath = Join-Path $packageRoot "ffmpeg-manifest.json"
+        $backup = Join-Path $TestDrive "ffmpeg-manifest.have-x86asm.json"
+        Copy-Item -LiteralPath $manifestPath -Destination $backup
+        try {
+            $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
+            $manifest.source.PSObject.Properties.Remove("haveX86Asm")
+            $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+            $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "生成头 x86asm 门禁"
+        }
+        finally {
+            Copy-Item -LiteralPath $backup -Destination $manifestPath -Force
+        }
+    }
+
+    It "rejects a manifest whose generated-header x86asm evidence is tampered" {
+        $manifestPath = Join-Path $packageRoot "ffmpeg-manifest.json"
+        $backup = Join-Path $TestDrive "ffmpeg-manifest.have-x86asm-tampered.json"
+        Copy-Item -LiteralPath $manifestPath -Destination $backup
+        try {
+            $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
+            $manifest.source | Add-Member -NotePropertyName "haveX86Asm" -NotePropertyValue "have_x86asm=0" -Force
+            $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+            $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "生成头 x86asm 门禁"
+        }
+        finally {
+            Copy-Item -LiteralPath $backup -Destination $manifestPath -Force
+        }
+    }
+
     It "binds the Windows GUI executable bytes into the complete payload manifest" {
-        $manifest = Get-Content -Raw -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
+        $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
         $applicationEntries = @($manifest.files | Where-Object { $_.path -ceq "freeremotedesk-windows.exe" -and $_.role -ceq "application" })
 
         $applicationEntries.Count | Should Be 1
@@ -70,8 +218,10 @@ Describe "Windows package verification security boundaries" {
         Remove-Item Env:OS -ErrorAction SilentlyContinue
         try {
             foreach ($hostUnderTest in $hosts) {
-                $output = & $hostUnderTest.Path -NoProfile -ExecutionPolicy Bypass -File `
-                    $hostUnderTest.Verifier -PackageRoot $packageRoot -RequireTrustedInstall 2>&1
+                $hostPath = $hostUnderTest.Path
+                $hostVerifier = $hostUnderTest.Verifier
+                $output = & $hostPath -NoProfile -ExecutionPolicy Bypass -File `
+                    $hostVerifier -PackageRoot $packageRoot -RequireTrustedInstall 2>&1
                 $exitCode = $LASTEXITCODE
                 $message = $output -join "`n"
 
@@ -117,13 +267,23 @@ Describe "Windows package verification security boundaries" {
 
     It "does not execute a PATH-shadowed PowerShell host during package preflight" {
         $fakeBin = Join-Path $TestDrive "fake-pwsh-bin"
+        $protectedRoot = Join-Path $TestDrive "path-shadow-root"
+        $protectedTools = Join-Path $protectedRoot "tools"
         New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
+        New-Item -ItemType Directory -Force -Path $protectedTools | Out-Null
         Copy-Item -LiteralPath (Join-Path $env:SystemRoot "System32\cmd.exe") -Destination (Join-Path $fakeBin "pwsh.exe")
+        foreach ($name in @("install-windows-package.ps1", "verify-windows-package.ps1")) {
+            Copy-Utf8ScriptForWindowsPowerShell `
+                -Source (Join-Path $repoRoot "tools\$name") `
+                -Destination (Join-Path $protectedTools $name)
+        }
         $oldPath = $env:Path
         try {
             $env:Path = "$fakeBin;$oldPath"
             $hostPath = (Get-Process -Id $PID).Path
-            $output = & $hostPath -NoProfile -File $installer -PackageRoot $packageRoot -WhatIf 2>&1
+            $output = & $hostPath -NoProfile -File `
+                (Join-Path $protectedTools "install-windows-package.ps1") `
+                -PackageRoot $packageRoot -WhatIf 2>&1
             $LASTEXITCODE | Should Be 0
             ($output -join "`n") | Should Match "Windows package verification passed"
         }
@@ -211,12 +371,19 @@ Describe "Windows package verification security boundaries" {
 
     It "publishes the exact corresponding-source ZIP in non-hidden release staging" {
         (Test-Path -LiteralPath $correspondingSourceAsset -PathType Leaf) | Should Be $true
-        $manifest = Get-Content -Raw -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
+        $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
         (Get-FileHash -LiteralPath $correspondingSourceAsset -Algorithm SHA256).Hash | Should Be $manifest.correspondingSource.sha256
     }
 }
 
 Describe "Windows elevation bootstrap security boundary" {
+    BeforeAll {
+        $bootstrapBuilderForHost = Join-Path $TestDrive "new-windows-installer-bootstrap.ps1"
+        Copy-Utf8ScriptForWindowsPowerShell `
+            -Source $bootstrapBuilder `
+            -Destination $bootstrapBuilderForHost
+    }
+
     It "binds elevated installer current directory to the hash-bound package root instead of System32" {
         $cleanPackage = Join-Path $TestDrive "clean package root"
         New-Item -ItemType Directory -Path $cleanPackage | Out-Null
@@ -231,7 +398,7 @@ if (@(Get-ChildItem -LiteralPath (Get-Location).Path -File -Filter '*.dll').Coun
 "@
         $plan = $null
         try {
-            $plan = & $bootstrapBuilder `
+            $plan = & $bootstrapBuilderForHost `
                 -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
                 -VerifierBytes ([Text.Encoding]::UTF8.GetBytes("trusted verifier")) `
                 -PackageRoot $cleanPackage `
@@ -276,7 +443,7 @@ throw 'bounded administrator failure detail'
 "@
         $plan = $null
         try {
-            $plan = & $bootstrapBuilder `
+            $plan = & $bootstrapBuilderForHost `
                 -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
                 -VerifierBytes ([Text.Encoding]::UTF8.GetBytes("trusted verifier")) `
                 -PackageRoot $TestDrive `
@@ -370,7 +537,7 @@ if (`$TrustedVerifierBytes.Length -lt 131072) { throw 'verifier payload was trun
         ([Random]::new(8675309)).NextBytes($largeVerifier)
         $plan = $null
         try {
-            $plan = & $bootstrapBuilder `
+            $plan = & $bootstrapBuilderForHost `
                 -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
                 -VerifierBytes $largeVerifier `
                 -PackageRoot $packageArgument `
@@ -408,7 +575,7 @@ param([string]`$PackageRoot, [switch]`$Elevated, [byte[]]`$TrustedVerifierBytes)
 "@
         $plan = $null
         try {
-            $plan = & $bootstrapBuilder `
+            $plan = & $bootstrapBuilderForHost `
                 -InstallerBytes ([Text.Encoding]::UTF8.GetBytes($installerText)) `
                 -VerifierBytes ([Text.Encoding]::UTF8.GetBytes("trusted verifier")) `
                 -PackageRoot $TestDrive `

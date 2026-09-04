@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Rect, Vec2};
 use frd_core::{PixelRect, PixelSize};
-use frd_ui_egui::control_island_metrics;
+use frd_ui_egui::{compact_login_metrics, control_island_metrics};
 use frd_ui_model::{IslandAction, IslandWindowCapabilities};
 
 use crate::window_chrome::{ChromeRect, NativeChromeInsets};
@@ -289,6 +289,12 @@ impl ChromeHitMap {
         Some(self)
     }
 
+    pub fn action_rect(&self, action: IslandAction) -> Option<ChromeRect> {
+        self.island_actions
+            .iter()
+            .find_map(|(rect, candidate)| (*candidate == action).then_some(*rect))
+    }
+
     pub fn hit_test(&self, point: (u32, u32)) -> Option<ChromeHitTarget> {
         let (x, y) = point;
         if let Some((_, action)) = self
@@ -367,6 +373,21 @@ impl ChromeGeometrySnapshot {
         placement: ControlIslandPlacement,
         visible: bool,
     ) -> Option<ChromeLayouts> {
+        self.layouts_with_local_page_move(placement, visible, false)
+    }
+
+    /// 登录、认证及失败页面使用的本地标题栏拖动带。
+    /// 远程页面始终通过 `layouts` 保持隐藏揭示线为纯视觉元素。
+    pub fn local_page_layouts(self, placement: ControlIslandPlacement) -> Option<ChromeLayouts> {
+        self.layouts_with_local_page_move(placement, false, true)
+    }
+
+    fn layouts_with_local_page_move(
+        self,
+        placement: ControlIslandPlacement,
+        visible: bool,
+        local_page_move: bool,
+    ) -> Option<ChromeLayouts> {
         if !placement.normalized_center_x.is_finite()
             || !placement.top_points.is_finite()
             || placement.top_points < 0.0
@@ -442,7 +463,7 @@ impl ChromeGeometrySnapshot {
             height: sensor_height,
         };
 
-        let (visible_island, reposition_handle, window_move_region) = if visible {
+        let (visible_island, reposition_handle, local_close_rect, window_move_region) = if visible {
             let margin = scaled_points(ISLAND_MARGIN_POINTS, self.scale_factor)?;
             let handle = scaled_points(ISLAND_HANDLE_POINTS, self.scale_factor)?;
             let reposition = ChromeRect {
@@ -451,20 +472,35 @@ impl ChromeGeometrySnapshot {
                 width: handle,
                 height: handle,
             };
-            let window_move = if self.window_capabilities.begin_move {
-                Some(external_move_region(
-                    island_rect,
-                    handle,
-                    margin,
-                    safe_left,
-                    safe_right,
-                )?)
+            (Some(island_rect), Some(reposition), None, None)
+        } else if local_page_move {
+            let height = scaled_points(
+                f64::from(compact_login_metrics().window_bar_height),
+                self.scale_factor,
+            )?
+            .min(self.window_size.height);
+            let local_close_rect = if self.window_capabilities.close {
+                (height <= safe_width).then_some(ChromeRect {
+                    x: safe_right.checked_sub(height)?,
+                    y: 0,
+                    width: height,
+                    height,
+                })
             } else {
                 None
             };
-            (Some(island_rect), Some(reposition), window_move)
+            let move_width = safe_width
+                .checked_sub(local_close_rect.map_or(0, |close_rect| close_rect.width))?;
+            let window_move_region = (self.window_capabilities.begin_move && move_width > 0)
+                .then_some(ChromeRect {
+                    x: safe_left,
+                    y: 0,
+                    width: move_width,
+                    height,
+                });
+            (None, None, local_close_rect, window_move_region)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let overlay = ChromeOverlayLayout {
@@ -476,7 +512,9 @@ impl ChromeGeometrySnapshot {
         };
         let hit_map = ChromeHitMap::candidate(
             remote.content_rect,
-            Vec::new(),
+            local_close_rect
+                .map(|rect| vec![(rect, IslandAction::CloseWindow)])
+                .unwrap_or_default(),
             overlay.island_reposition_handle,
             overlay.window_move_region,
             Vec::new(),
@@ -488,30 +526,6 @@ impl ChromeGeometrySnapshot {
             hit_map,
         })
     }
-}
-
-fn external_move_region(
-    island: ChromeRect,
-    width: u32,
-    gap: u32,
-    safe_left: u32,
-    safe_right: u32,
-) -> Option<ChromeRect> {
-    if island.x >= safe_left.checked_add(width)?.checked_add(gap)? {
-        return Some(ChromeRect {
-            x: island.x.checked_sub(width)?.checked_sub(gap)?,
-            y: island.y,
-            width,
-            height: width.min(island.height),
-        });
-    }
-    let x = island.x.checked_add(island.width)?.checked_add(gap)?;
-    (x.checked_add(width)? <= safe_right).then_some(ChromeRect {
-        x,
-        y: island.y,
-        width,
-        height: width.min(island.height),
-    })
 }
 
 fn clamp_origin_around_center(
@@ -588,10 +602,65 @@ mod tests {
     use frd_ui_model::{IslandAction, IslandWindowCapabilities};
 
     use super::{
-        ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ControlIslandPlacement,
-        ControlIslandState, FloatingChromeController,
+        ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeOverlayLayout,
+        ControlIslandPlacement, ControlIslandState, FloatingChromeController,
     };
     use crate::window_chrome::{ChromeRect, NativeChromeInsets};
+
+    #[test]
+    fn chrome_overlay_layout_keeps_the_original_public_field_set() {
+        let reveal_line_rect = ChromeRect {
+            x: 10,
+            y: 0,
+            width: 160,
+            height: 2,
+        };
+        let layout = ChromeOverlayLayout {
+            reveal_line_rect,
+            top_sensor_rect: ChromeRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 8,
+            },
+            island_rect: None,
+            island_reposition_handle: None,
+            window_move_region: None,
+        };
+
+        assert_eq!(layout.reveal_line_rect, reveal_line_rect);
+    }
+
+    #[test]
+    fn hit_map_exposes_the_published_rect_for_an_action_without_mutation() {
+        let remote = PixelRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let close = ChromeRect {
+            x: 756,
+            y: 0,
+            width: 44,
+            height: 44,
+        };
+        let hit_map = ChromeHitMap::candidate(
+            remote,
+            vec![(close, IslandAction::CloseWindow)],
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("valid close action map");
+
+        assert_eq!(hit_map.action_rect(IslandAction::CloseWindow), Some(close));
+        assert_eq!(hit_map.action_rect(IslandAction::Disconnect), None);
+        assert_eq!(
+            hit_map.hit_test(close.center()),
+            Some(ChromeHitTarget::IslandAction(IslandAction::CloseWindow))
+        );
+    }
 
     #[test]
     fn floating_chrome_hover_reveals_after_150_ms_and_hides_700_ms_after_leave() {
@@ -728,6 +797,60 @@ mod tests {
             Some(ChromeHitTarget::IslandSurface),
             "the complete visible-island candidate must keep transparent material local"
         );
+    }
+
+    #[test]
+    fn local_page_layout_exposes_a_safe_native_window_move_region_only_when_supported() {
+        let windows = ChromeGeometrySnapshot::new(1600, 900, 1.0, NativeChromeInsets::default())
+            .unwrap()
+            .with_window_capabilities(IslandWindowCapabilities::WINDOWS)
+            .local_page_layouts(ControlIslandPlacement::default())
+            .unwrap();
+        let move_region = windows
+            .overlay
+            .window_move_region
+            .expect("Windows login, authentication, and failure pages expose a move strip");
+
+        assert_eq!(move_region.y, 0);
+        assert_eq!(move_region.height, 44);
+        assert_eq!(
+            windows.hit_map.hit_test(move_region.center()),
+            Some(ChromeHitTarget::WindowMoveRegion)
+        );
+
+        let native = ChromeGeometrySnapshot::new(1600, 900, 1.0, NativeChromeInsets::default())
+            .unwrap()
+            .local_page_layouts(ControlIslandPlacement::default())
+            .unwrap();
+        assert_eq!(native.overlay.window_move_region, None);
+        assert_eq!(
+            native
+                .hit_map
+                .hit_test(native.overlay.reveal_line_rect.center()),
+            Some(ChromeHitTarget::RemoteContent)
+        );
+    }
+
+    #[test]
+    fn local_page_layout_separates_close_from_native_move_region() {
+        let layouts = ChromeGeometrySnapshot::new(1600, 900, 1.5, NativeChromeInsets::default())
+            .unwrap()
+            .with_window_capabilities(IslandWindowCapabilities::WINDOWS)
+            .local_page_layouts(ControlIslandPlacement::default())
+            .expect("valid local chrome");
+        let close = layouts
+            .hit_map
+            .action_rect(IslandAction::CloseWindow)
+            .expect("close capability");
+        let drag = layouts
+            .overlay
+            .window_move_region
+            .expect("begin-move capability");
+
+        assert_eq!(close.width, 66);
+        assert_eq!(close.height, 66);
+        assert!(!super::overlaps(Some(close), Some(drag)));
+        assert_eq!(drag.y, 0);
     }
 
     #[test]
@@ -873,13 +996,30 @@ mod tests {
             .layouts(ControlIslandPlacement::default(), true)
             .unwrap();
         let reposition = windows.overlay.island_reposition_handle.unwrap();
-        let window_move = windows.overlay.window_move_region.unwrap();
         assert!(
-            reposition.x + reposition.width <= window_move.x
-                || window_move.x + window_move.width <= reposition.x
-                || reposition.y + reposition.height <= window_move.y
-                || window_move.y + window_move.height <= reposition.y,
-            "repositioning the island and moving the native window need disjoint targets"
+            windows.overlay.window_move_region.is_none(),
+            "the visible move-window button stays in egui client ownership"
+        );
+        assert_eq!(
+            windows.hit_map.hit_test(reposition.center()),
+            Some(ChromeHitTarget::IslandRepositionHandle)
+        );
+    }
+
+    #[test]
+    fn visible_window_move_button_stays_an_egui_client_control() {
+        let windows = ChromeGeometrySnapshot::new(1600, 900, 1.0, NativeChromeInsets::default())
+            .unwrap()
+            .with_window_capabilities(IslandWindowCapabilities::WINDOWS)
+            .layouts(ControlIslandPlacement::default(), true)
+            .unwrap();
+
+        assert_eq!(windows.overlay.window_move_region, None);
+        assert_eq!(
+            windows
+                .hit_map
+                .hit_test(windows.overlay.island_rect.unwrap().center()),
+            Some(ChromeHitTarget::IslandSurface)
         );
     }
 }

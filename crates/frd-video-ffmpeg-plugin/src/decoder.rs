@@ -1,5 +1,31 @@
 use frd_video_ffmpeg::abi::{FrdStatus, RawFrdFfmpegApiV1};
 
+#[cfg(any(feature = "native-ffmpeg", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SoftwareDecodeThreadPolicy {
+    thread_count: i32,
+    thread_type: i32,
+}
+
+#[cfg(any(feature = "native-ffmpeg", test))]
+impl SoftwareDecodeThreadPolicy {
+    fn for_stream(coded_width: u32, coded_height: u32, logical_cpus: usize) -> Self {
+        let long_edge = coded_width.max(coded_height);
+        let short_edge = coded_width.min(coded_height);
+        if long_edge >= 2560 && short_edge >= 1440 && logical_cpus >= 2 {
+            Self {
+                thread_count: 2,
+                thread_type: 1,
+            }
+        } else {
+            Self {
+                thread_count: 1,
+                thread_type: 0,
+            }
+        }
+    }
+}
+
 pub(crate) fn populate_api(output: *mut RawFrdFfmpegApiV1, output_size: usize) -> FrdStatus {
     if output.is_null() || output_size < std::mem::size_of::<RawFrdFfmpegApiV1>() {
         return FrdStatus::INVALID_ARGUMENT;
@@ -15,8 +41,75 @@ pub(crate) fn populate_api(output: *mut RawFrdFfmpegApiV1, output_size: usize) -
     }
 }
 
+#[cfg(test)]
+mod software_decode_thread_policy_tests {
+    use super::SoftwareDecodeThreadPolicy;
+
+    #[test]
+    fn sub_1440p_decode_stays_single_threaded() {
+        assert_eq!(
+            SoftwareDecodeThreadPolicy::for_stream(1920, 1080, 8),
+            SoftwareDecodeThreadPolicy {
+                thread_count: 1,
+                thread_type: 0,
+            }
+        );
+        assert_eq!(
+            SoftwareDecodeThreadPolicy::for_stream(2560, 1439, 8),
+            SoftwareDecodeThreadPolicy {
+                thread_count: 1,
+                thread_type: 0,
+            }
+        );
+        assert_eq!(
+            SoftwareDecodeThreadPolicy::for_stream(1439, 2560, 2),
+            SoftwareDecodeThreadPolicy {
+                thread_count: 1,
+                thread_type: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn at_least_1440p_decode_uses_exactly_two_frame_threads() {
+        assert_eq!(
+            SoftwareDecodeThreadPolicy::for_stream(2560, 1440, 64),
+            SoftwareDecodeThreadPolicy {
+                thread_count: 2,
+                thread_type: 1,
+            }
+        );
+        assert_eq!(
+            SoftwareDecodeThreadPolicy::for_stream(3840, 2160, 64),
+            SoftwareDecodeThreadPolicy {
+                thread_count: 2,
+                thread_type: 1,
+            }
+        );
+        assert_eq!(
+            SoftwareDecodeThreadPolicy::for_stream(1440, 2560, 2),
+            SoftwareDecodeThreadPolicy {
+                thread_count: 2,
+                thread_type: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn single_logical_cpu_forces_one_decode_thread_at_1440p() {
+        assert_eq!(
+            SoftwareDecodeThreadPolicy::for_stream(2560, 1440, 1),
+            SoftwareDecodeThreadPolicy {
+                thread_count: 1,
+                thread_type: 0,
+            }
+        );
+    }
+}
+
 #[cfg(feature = "native-ffmpeg")]
 mod native {
+    use super::SoftwareDecodeThreadPolicy;
     use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::ptr;
@@ -60,12 +153,14 @@ mod native {
         fn frd_native_avcodec_major() -> u32;
         fn frd_native_hevc_decoder_available() -> i32;
         fn frd_native_yuv444p_format() -> i32;
-        fn frd_native_decoder_create(
+        fn frd_native_decoder_create_with_thread_policy(
             extradata: *const u8,
             extradata_len: usize,
             width: i32,
             height: i32,
             timebase: u32,
+            thread_count: i32,
+            thread_type: i32,
             output: *mut *mut NativeDecoder,
         ) -> i32;
         fn frd_native_decoder_submit(
@@ -158,14 +253,24 @@ mod native {
             Err(status) => return status,
         };
         let mut native = ptr::null_mut();
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        let thread_policy = SoftwareDecodeThreadPolicy::for_stream(
+            config.coded_width,
+            config.coded_height,
+            logical_cpus,
+        );
         // SAFETY: scalar bounds and the owned extradata slice were validated above.
         let status = unsafe {
-            frd_native_decoder_create(
+            frd_native_decoder_create_with_thread_policy(
                 extradata.as_ptr(),
                 extradata.len(),
                 config.coded_width as i32,
                 config.coded_height as i32,
                 config.timebase,
+                thread_policy.thread_count,
+                thread_policy.thread_type,
                 &mut native,
             )
         };
@@ -491,6 +596,64 @@ mod native {
         use super::*;
         use frd_video_ffmpeg::abi::FrdByteSlice;
 
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        struct NativeThreadSettings {
+            requested_thread_count: i32,
+            requested_thread_type: i32,
+            active_thread_count: i32,
+            active_thread_type: i32,
+        }
+
+        unsafe extern "C" {
+            fn frd_native_decoder_thread_settings(
+                decoder: *const NativeDecoder,
+                output: *mut NativeThreadSettings,
+            ) -> i32;
+        }
+
+        #[test]
+        fn native_1440p_decoder_activates_requested_two_frame_threads() {
+            let extradata = main444_parameter_sets();
+            let policy = super::super::SoftwareDecodeThreadPolicy::for_stream(2560, 1440, 8);
+            let mut decoder = ptr::null_mut();
+
+            // SAFETY: fixture bytes and output storage remain valid for the call.
+            let status = unsafe {
+                frd_native_decoder_create_with_thread_policy(
+                    extradata.as_ptr(),
+                    extradata.len(),
+                    2560,
+                    1440,
+                    90_000,
+                    policy.thread_count,
+                    policy.thread_type,
+                    &mut decoder,
+                )
+            };
+            assert_eq!(status, NATIVE_OK);
+            assert!(!decoder.is_null());
+
+            let mut settings = NativeThreadSettings::default();
+            // SAFETY: decoder is live and output is writable for this read-only query.
+            assert_eq!(
+                unsafe { frd_native_decoder_thread_settings(decoder, &mut settings) },
+                NATIVE_OK
+            );
+            assert_eq!(
+                settings,
+                NativeThreadSettings {
+                    requested_thread_count: 2,
+                    requested_thread_type: 1,
+                    active_thread_count: 2,
+                    active_thread_type: 1,
+                }
+            );
+
+            // SAFETY: decoder was created successfully and is destroyed exactly once.
+            unsafe { frd_native_decoder_destroy(decoder) };
+        }
+
         #[test]
         fn negative_linesize_is_rejected_before_plane_copy() {
             let state = test_state(2, 2);
@@ -638,6 +801,18 @@ mod native {
         fn yuv444p() -> i32 {
             // SAFETY: constant query has no mutable state or ownership.
             unsafe { frd_native_yuv444p_format() }
+        }
+
+        fn main444_parameter_sets() -> &'static [u8] {
+            let bitstream = include_bytes!("../tests/fixtures/apple-main444-idr.hevc");
+            let mut start_codes = Vec::new();
+            for (offset, bytes) in bitstream.windows(4).enumerate() {
+                if bytes == [0, 0, 0, 1] {
+                    start_codes.push(offset);
+                }
+            }
+            assert_eq!(start_codes.len(), 4, "Main444 fixture 应含四个 Annex-B NAL");
+            &bitstream[..start_codes[3]]
         }
     }
 }

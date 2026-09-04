@@ -253,9 +253,9 @@ try {
         -ExpectedDirectoryName "ffmpeg-$Version" `
         -AllowedRoot $BuildRoot
 
-    & wsl.exe --distribution $WslDistribution -- bash -lc 'command -v bash >/dev/null && command -v make >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null'
+    & wsl.exe --distribution $WslDistribution -- bash -lc 'command -v bash >/dev/null && command -v make >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null && command -v nasm >/dev/null'
     if ($LASTEXITCODE -ne 0) {
-        throw "WSL distribution '$WslDistribution' 缺少 bash/make/x86_64-w64-mingw32-gcc"
+        throw "WSL distribution '$WslDistribution' 缺少 bash/make/x86_64-w64-mingw32-gcc/nasm"
     }
     $sourceWsl = Convert-ToWslPath $SourceDir
     $distWsl = Convert-ToWslPath $DistDir
@@ -276,8 +276,7 @@ try {
         "--disable-nonfree",
         "--disable-version3",
         "--disable-autodetect",
-        "--disable-network",
-        "--disable-x86asm"
+        "--disable-network"
     )
     if ($Configuration -eq "Release") {
         $configureArgs += "--disable-debug", "--enable-stripping"
@@ -300,12 +299,17 @@ try {
         "#define CONFIG_NONFREE 0",
         "#define CONFIG_HEVC_DECODER 1",
         "#define CONFIG_HEVC_PARSER 1",
-        "#define CONFIG_FILE_PROTOCOL 1"
+        "#define CONFIG_FILE_PROTOCOL 1",
+        "#define HAVE_X86ASM 1"
     )) {
         if (-not $configHeader.Contains($required)) {
             throw "FFmpeg 配置缺少必需门禁: $required"
         }
     }
+    if ($configHeader -notmatch '(?m)^\s*#define HAVE_X86ASM 1\s*$') {
+        throw "FFmpeg 配置缺少精确 x86asm 门禁: #define HAVE_X86ASM 1"
+    }
+    $haveX86AsmProvenance = "have_x86asm=1"
 
     $libExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\lib.exe"
     $clExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe"
@@ -364,7 +368,7 @@ try {
     Assert-ExactDirectoryFiles -Directory $CodecDir -ApprovedFileNames $ApprovedBundleFiles
     Assert-ApprovedBundleImports -Dumpbin $dumpbinExe -BundleDirectory $CodecDir
 
-    $toolProvenance = & wsl.exe --distribution $WslDistribution -- bash -lc 'printf "bash="; bash --version | head -1; printf "make="; make --version | head -1; printf "cc="; x86_64-w64-mingw32-gcc --version | head -1'
+    $toolProvenance = & wsl.exe --distribution $WslDistribution -- bash -lc 'printf "bash="; bash --version | head -1; printf "make="; make --version | head -1; printf "cc="; x86_64-w64-mingw32-gcc --version | head -1; printf "nasm="; nasm -v'
     $provenanceStage = "$ProvenanceLog.stage-$AttemptId"
     Assert-UnderBuildRoot $provenanceStage
     @(
@@ -382,6 +386,7 @@ try {
         "msvc_cl_version=$((Get-Item -LiteralPath $clExe).VersionInfo.FileVersion)",
         "configuration=$Configuration",
         "configure=$configureCommand",
+        $haveX86AsmProvenance,
         "codec_files=$($ApprovedBundleFiles -join ',')",
         "codec_imports=VALID",
         "corresponding_source_package=$correspondingSourcePackage",

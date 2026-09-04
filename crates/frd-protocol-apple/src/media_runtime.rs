@@ -32,7 +32,7 @@ use crate::hp_media_diagnostics::{
     adapter_fatal_category, emit_hp_media_fatal, hevc_fatal_category,
     VIDEO_RTP_PARSE_FATAL_CATEGORY,
 };
-use crate::media_negotiation::{AudioMediaFlow, MediaStreamAnswer};
+use crate::media_negotiation::{AudioMediaFlow, ClientMediaStreamCapabilities, MediaStreamAnswer};
 use crate::media_protocol::MediaStreamPortAnnouncement;
 use crate::media_transport::{
     MediaDatagram, MediaRole, MediaTransport, MediaTransportPhase, ReceivedMediaDatagram,
@@ -72,6 +72,7 @@ pub(crate) fn publish_decoded_audio(
 
 pub(crate) struct ViewerMediaState {
     pub(crate) transport: MediaTransport,
+    media_stream_capabilities: ClientMediaStreamCapabilities,
     audio_receiver: ArdAudioReceiver,
     pub(crate) authenticated_audio_packets: u64,
     pub(crate) late_audio_packets: u64,
@@ -464,15 +465,35 @@ impl ViewerMediaState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_for_session(
         session_id: SessionId,
         audio_flow: AudioMediaFlow,
         generation: u64,
         server_address: IpAddr,
     ) -> Result<Self> {
-        Self::new_for_session_with_transport_factory(session_id, audio_flow, || {
-            MediaTransport::new(generation, server_address)
-        })
+        Self::new_for_session_with_capabilities(
+            session_id,
+            audio_flow,
+            generation,
+            server_address,
+            ClientMediaStreamCapabilities::default(),
+        )
+    }
+
+    pub(crate) fn new_for_session_with_capabilities(
+        session_id: SessionId,
+        audio_flow: AudioMediaFlow,
+        generation: u64,
+        server_address: IpAddr,
+        media_stream_capabilities: ClientMediaStreamCapabilities,
+    ) -> Result<Self> {
+        Self::new_for_session_with_transport_factory(
+            session_id,
+            audio_flow,
+            media_stream_capabilities,
+            || MediaTransport::new(generation, server_address),
+        )
     }
 
     #[cfg(test)]
@@ -480,12 +501,18 @@ impl ViewerMediaState {
     where
         F: FnOnce() -> MediaTransport,
     {
-        Self::new_for_session_with_transport_factory(SessionId::allocate(), audio_flow, factory)
+        Self::new_for_session_with_transport_factory(
+            SessionId::allocate(),
+            audio_flow,
+            ClientMediaStreamCapabilities::default(),
+            factory,
+        )
     }
 
     fn new_for_session_with_transport_factory<F>(
         session_id: SessionId,
         audio_flow: AudioMediaFlow,
+        media_stream_capabilities: ClientMediaStreamCapabilities,
         factory: F,
     ) -> Result<Self>
     where
@@ -497,6 +524,7 @@ impl ViewerMediaState {
         transport.set_audio_flow(audio_flow)?;
         Ok(Self {
             transport,
+            media_stream_capabilities,
             audio_receiver: ArdAudioReceiver::new().context("创建 Mac→PC AAC-ELD 接收器失败")?,
             authenticated_audio_packets: 0,
             late_audio_packets: 0,
@@ -566,7 +594,9 @@ impl ViewerMediaState {
             .accept_port_announcement(generation, announcement)?;
         self.transport
             .bind_local_sockets(generation, bind_address)?;
-        let configuration = self.transport.prepare_configuration(generation)?;
+        let configuration = self
+            .transport
+            .prepare_configuration_with_capabilities(generation, self.media_stream_capabilities)?;
         writer.send_private_message(&configuration)?;
         self.transport.mark_configuration_sent(generation)?;
         self.control_stage_trace
@@ -611,6 +641,7 @@ impl ViewerMediaState {
         control_result?;
         let Self {
             transport,
+            media_stream_capabilities: _,
             audio_receiver,
             authenticated_audio_packets,
             late_audio_packets,

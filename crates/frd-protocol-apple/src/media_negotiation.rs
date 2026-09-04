@@ -34,9 +34,7 @@ const MEDIA_CONFIGURATION_STREAM_1_SUPPORTS_60_FPS: u32 = 1 << 0;
 const MEDIA_CONFIGURATION_DO_NOT_SEND_CURSOR: u32 = 1 << 2;
 const MEDIA_CONFIGURATION_CALLER_KIND_ONE: u32 = 1 << 3;
 const SCREEN_SHARING_ONE_VIDEO_CONFIGURATION_FLAGS: u32 =
-    MEDIA_CONFIGURATION_STREAM_1_SUPPORTS_60_FPS
-        | MEDIA_CONFIGURATION_DO_NOT_SEND_CURSOR
-        | MEDIA_CONFIGURATION_CALLER_KIND_ONE;
+    MEDIA_CONFIGURATION_DO_NOT_SEND_CURSOR | MEDIA_CONFIGURATION_CALLER_KIND_ONE;
 
 const SCREEN_SHARING_AUDIO_NEGOTIATOR_MODE: u8 = 8;
 const SCREEN_SHARING_REMOTE_MICROPHONE_NEGOTIATOR_MODE: u8 = 4;
@@ -278,6 +276,11 @@ pub struct ClientMediaStreamConfiguration {
     pub audio: MediaStreamConfigurationEntry,
     pub video_stream_1: MediaStreamConfigurationEntry,
     pub video_stream_2: Option<MediaStreamConfigurationEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClientMediaStreamCapabilities {
+    pub video_stream_1_supports_60_fps: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -819,6 +822,16 @@ fn append_configuration_entry(entry: &MediaStreamConfigurationEntry, destination
 pub fn encode_client_media_stream_configuration(
     configuration: &ClientMediaStreamConfiguration,
 ) -> Result<Vec<u8>> {
+    encode_client_media_stream_configuration_with_capabilities(
+        configuration,
+        ClientMediaStreamCapabilities::default(),
+    )
+}
+
+pub fn encode_client_media_stream_configuration_with_capabilities(
+    configuration: &ClientMediaStreamConfiguration,
+    capabilities: ClientMediaStreamCapabilities,
+) -> Result<Vec<u8>> {
     ensure!(
         matches!(
             configuration.audio.offer.mode,
@@ -867,7 +880,11 @@ pub fn encode_client_media_stream_configuration(
     frame.push(CLIENT_MEDIA_CONFIGURATION_RESERVED);
     frame.extend_from_slice(&0u16.to_be_bytes());
     frame.extend_from_slice(&CLIENT_MEDIA_CONFIGURATION_VERSION.to_be_bytes());
-    frame.extend_from_slice(&SCREEN_SHARING_ONE_VIDEO_CONFIGURATION_FLAGS.to_be_bytes());
+    let mut flags = SCREEN_SHARING_ONE_VIDEO_CONFIGURATION_FLAGS;
+    if capabilities.video_stream_1_supports_60_fps {
+        flags |= MEDIA_CONFIGURATION_STREAM_1_SUPPORTS_60_FPS;
+    }
+    frame.extend_from_slice(&flags.to_be_bytes());
     for length in wire_offer_lengths {
         frame.extend_from_slice(&length.to_be_bytes());
     }
@@ -1664,6 +1681,48 @@ mod tests {
         assert_eq!(offer_plist_mode(&configuration.audio.offer), 8);
         assert_eq!(offer_plist_mode(&configuration.video_stream_1.offer), 7);
         assert!(configuration.video_stream_2.is_none());
+    }
+
+    #[test]
+    fn legacy_client_configuration_struct_literal_remains_source_compatible() {
+        let configuration = ClientMediaStreamConfiguration {
+            session_id: [0x77; 16],
+            audio: entry(MediaNegotiatorMode::Audio, TEST_AUDIO_SSRC, 0x11, 0x22),
+            video_stream_1: entry(MediaNegotiatorMode::Video, TEST_VIDEO_SSRC, 0x33, 0x44),
+            video_stream_2: None,
+        };
+
+        assert!(configuration.video_stream_2.is_none());
+    }
+
+    #[test]
+    fn generated_one_video_configuration_does_not_advertise_60_fps() {
+        let configuration = ClientMediaStreamConfiguration::generate_one_video_with_audio_flow(
+            AudioMediaFlow::MacToPc,
+        )
+        .unwrap();
+        let capabilities = ClientMediaStreamCapabilities::default();
+
+        let frame = encode_client_media_stream_configuration(&configuration).unwrap();
+
+        assert!(!capabilities.video_stream_1_supports_60_fps);
+        assert_eq!(u32::from_be_bytes(frame[6..10].try_into().unwrap()), 0x0c);
+    }
+
+    #[test]
+    fn explicitly_capable_one_video_configuration_advertises_60_fps() {
+        let configuration = ClientMediaStreamConfiguration::generate_one_video().unwrap();
+        let capabilities = ClientMediaStreamCapabilities {
+            video_stream_1_supports_60_fps: true,
+        };
+
+        let frame = encode_client_media_stream_configuration_with_capabilities(
+            &configuration,
+            capabilities,
+        )
+        .unwrap();
+
+        assert_eq!(u32::from_be_bytes(frame[6..10].try_into().unwrap()), 0x0d);
     }
 
     #[test]

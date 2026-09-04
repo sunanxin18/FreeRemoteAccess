@@ -21,6 +21,8 @@ enum {
 typedef struct FrdNativeDecoder {
     AVCodecContext *codec;
     AVFrame *frame;
+    int32_t requested_thread_count;
+    int32_t requested_thread_type;
 } FrdNativeDecoder;
 
 typedef struct FrdNativeFrameView {
@@ -31,6 +33,13 @@ typedef struct FrdNativeFrameView {
     const uint8_t *data[3];
     int32_t linesize[3];
 } FrdNativeFrameView;
+
+typedef struct FrdNativeThreadSettings {
+    int32_t requested_thread_count;
+    int32_t requested_thread_type;
+    int32_t active_thread_count;
+    int32_t active_thread_type;
+} FrdNativeThreadSettings;
 
 static int32_t map_status(int result) {
     if (result >= 0) {
@@ -57,12 +66,14 @@ int32_t frd_native_yuv444p_format(void) {
     return AV_PIX_FMT_YUV444P;
 }
 
-int32_t frd_native_decoder_create(const uint8_t *extradata,
-                                  size_t extradata_len,
-                                  int32_t width,
-                                  int32_t height,
-                                  uint32_t timebase,
-                                  FrdNativeDecoder **output) {
+int32_t frd_native_decoder_create_with_thread_policy(const uint8_t *extradata,
+                                                     size_t extradata_len,
+                                                     int32_t width,
+                                                     int32_t height,
+                                                     uint32_t timebase,
+                                                     int32_t thread_count,
+                                                     int32_t thread_type,
+                                                     FrdNativeDecoder **output) {
     const AVCodec *decoder;
     FrdNativeDecoder *state;
     int result;
@@ -72,7 +83,9 @@ int32_t frd_native_decoder_create(const uint8_t *extradata,
     }
     *output = NULL;
     if (extradata == NULL || extradata_len == 0 || extradata_len > INT_MAX ||
-        width <= 0 || height <= 0 || timebase == 0 || timebase > (uint32_t)INT_MAX) {
+        width <= 0 || height <= 0 || timebase == 0 || timebase > (uint32_t)INT_MAX ||
+        !((thread_count == 1 && thread_type == 0) ||
+          (thread_count == 2 && thread_type == FF_THREAD_FRAME))) {
         return FRD_NATIVE_INVALID_ARGUMENT;
     }
 
@@ -99,6 +112,10 @@ int32_t frd_native_decoder_create(const uint8_t *extradata,
     state->codec->height = height;
     state->codec->pkt_timebase.num = 1;
     state->codec->pkt_timebase.den = (int)timebase;
+    state->codec->thread_count = thread_count;
+    state->codec->thread_type = thread_type;
+    state->requested_thread_count = thread_count;
+    state->requested_thread_type = thread_type;
     state->codec->extradata = (uint8_t *)av_mallocz(extradata_len + AV_INPUT_BUFFER_PADDING_SIZE);
     if (state->codec->extradata == NULL) {
         av_frame_free(&state->frame);
@@ -118,6 +135,18 @@ int32_t frd_native_decoder_create(const uint8_t *extradata,
         return FRD_NATIVE_DECODE_FAILED;
     }
     *output = state;
+    return FRD_NATIVE_OK;
+}
+
+int32_t frd_native_decoder_thread_settings(const FrdNativeDecoder *state,
+                                           FrdNativeThreadSettings *output) {
+    if (state == NULL || state->codec == NULL || output == NULL) {
+        return FRD_NATIVE_INVALID_ARGUMENT;
+    }
+    output->requested_thread_count = state->requested_thread_count;
+    output->requested_thread_type = state->requested_thread_type;
+    output->active_thread_count = state->codec->thread_count;
+    output->active_thread_type = state->codec->active_thread_type;
     return FRD_NATIVE_OK;
 }
 

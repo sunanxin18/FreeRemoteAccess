@@ -1,7 +1,8 @@
 use egui::Ui;
 use frd_app::{AppIntent, AppPage};
 use frd_protocol_api::{
-    ServerIdentityChallenge, ServerIdentityDecision, ServerIdentityValidationFailure,
+    ConnectionStage, ServerIdentityChallenge, ServerIdentityDecision,
+    ServerIdentityValidationFailure,
 };
 
 pub fn show_session_page(
@@ -15,10 +16,13 @@ pub fn show_session_page(
 
     match page {
         AppPage::ConnectionForm(_) => None,
-        AppPage::Connecting { .. }
-        | AppPage::AwaitingFirstFrame { .. }
-        | AppPage::Disconnecting { .. }
-        | AppPage::RemoteSession { .. } => None,
+        AppPage::Connecting {
+            stage, diagnostics, ..
+        }
+        | AppPage::AwaitingFirstFrame {
+            stage, diagnostics, ..
+        } => show_pending_connection(ui, stage, diagnostics.as_deref()),
+        AppPage::Disconnecting { .. } | AppPage::RemoteSession { .. } => None,
         AppPage::Failed { code, .. } => {
             ui.heading("连接失败");
             ui.label(format!("错误代码：{code}"));
@@ -26,6 +30,34 @@ pub fn show_session_page(
                 .clicked()
                 .then_some(AppIntent::ReturnToConnection)
         }
+    }
+}
+
+fn show_pending_connection(
+    ui: &mut Ui,
+    stage: &ConnectionStage,
+    diagnostics: Option<&str>,
+) -> Option<AppIntent> {
+    ui.vertical_centered(|ui| {
+        ui.heading("正在连接");
+        ui.label(connection_stage_label(stage));
+        if let Some(diagnostics) = diagnostics {
+            ui.colored_label(ui.visuals().warn_fg_color, diagnostics);
+        }
+        ui.add_space(12.0);
+        ui.button("取消连接")
+            .clicked()
+            .then_some(AppIntent::CancelConnect)
+    })
+    .inner
+}
+
+fn connection_stage_label(stage: &ConnectionStage) -> &'static str {
+    match stage {
+        ConnectionStage::Connecting => "正在建立安全连接…",
+        ConnectionStage::TransportReady => "安全连接已建立，正在等待远程画面…",
+        ConnectionStage::AwaitingIdentityDecision => "正在等待服务器身份确认…",
+        ConnectionStage::Disconnecting => "正在结束连接…",
     }
 }
 
@@ -97,9 +129,91 @@ fn identity_intent(
 
 #[cfg(test)]
 mod tests {
-    use frd_protocol_api::{evaluate_server_identity, ServerIdentityValidationFailure};
+    use egui::{Context, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
+    use frd_app::{AppIntent, AppPage};
+    use frd_protocol_api::{
+        evaluate_server_identity, ConnectionStage, ServerIdentityValidationFailure,
+    };
+    use frd_ui_model::ConnectionDraft;
 
-    use super::validation_failure_labels;
+    use super::{show_session_page, validation_failure_labels};
+
+    #[test]
+    fn pending_session_page_cancel_button_emits_cancel_connect() {
+        let context = Context::default();
+        context.enable_accesskit();
+        let page = AppPage::Connecting {
+            draft: ConnectionDraft::default(),
+            stage: ConnectionStage::Connecting,
+            diagnostics: None,
+        };
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(520.0, 556.0));
+        let mut initial_intent = None;
+        let mut initial = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| initial_intent = show_session_page(ui, &page, None),
+        );
+        let cancel_bounds = initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree is enabled")
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.label().or_else(|| node.value()) == Some("取消连接"))
+                    .then(|| node.bounds())
+                    .flatten()
+            });
+        initial.textures_delta.clear();
+        let cancel_bounds = cancel_bounds.expect("pending page exposes the cancel button");
+        assert!(initial_intent.is_none());
+        let pointer = egui::pos2(
+            ((cancel_bounds.x0 + cancel_bounds.x1) / 2.0) as f32,
+            ((cancel_bounds.y0 + cancel_bounds.y1) / 2.0) as f32,
+        );
+
+        let mut pressed = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    Event::PointerMoved(pointer),
+                    Event::PointerButton {
+                        pos: pointer,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show_session_page(ui, &page, None);
+            },
+        );
+        pressed.textures_delta.clear();
+
+        let mut released_intent = None;
+        let mut released = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![Event::PointerButton {
+                    pos: pointer,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| released_intent = show_session_page(ui, &page, None),
+        );
+        released.textures_delta.clear();
+
+        assert!(matches!(released_intent, Some(AppIntent::CancelConnect)));
+    }
 
     #[test]
     fn identity_page_labels_include_sanitized_validation_code_and_reason() {

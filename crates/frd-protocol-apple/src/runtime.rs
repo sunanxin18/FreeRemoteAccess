@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use frd_core::{
     ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelPoint, PointerButton,
     PointerButtons, PointerSample, SessionId, WheelDelta,
@@ -42,13 +42,10 @@ fn startup_display_size(
     protocol_id: &frd_core::ProtocolId,
     server_init: DisplaySize,
 ) -> DisplaySize {
-    if protocol_id == &frd_core::ProtocolId::apple_high_performance()
-        && server_init.width > server_init.height
-    {
-        // Current-target ARD transcript: a landscape ServerInit precedes the
-        // 1440x2560 virtual-display request. This is product-identity scoped,
-        // not a global Apple geometry rule.
-        DisplaySize::new(1440, 2560).expect("captured Apple HP geometry is valid")
+    if protocol_id == &frd_core::ProtocolId::apple_high_performance() {
+        // Recovered ARD/ScreenSharing 0x1d mode 0 is the HP product's startup
+        // surface. Other Apple protocol identities retain ServerInit geometry.
+        DisplaySize::new(2560, 1440).expect("recovered Apple HP geometry is valid")
     } else {
         server_init
     }
@@ -471,6 +468,35 @@ fn run_authenticated_session_with_media(
     udp_media_enabled: bool,
     protocol_id: frd_core::ProtocolId,
 ) -> ProtocolExit {
+    let refresh_tier = (protocol_id == frd_core::ProtocolId::apple_high_performance())
+        .then_some(hpss::HighPerformanceRefreshTier::Hz60);
+    run_authenticated_session_with_media_at_refresh_tier(
+        connection,
+        display_name,
+        initial_pixel_size,
+        runtime,
+        session_id,
+        dynamic_resolution_enabled,
+        audio_flow,
+        udp_media_enabled,
+        protocol_id,
+        refresh_tier,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_authenticated_session_with_media_at_refresh_tier(
+    connection: crate::AppleConnection,
+    display_name: String,
+    initial_pixel_size: frd_core::PixelSize,
+    runtime: ProtocolRuntime,
+    session_id: SessionId,
+    dynamic_resolution_enabled: bool,
+    audio_flow: AudioMediaFlow,
+    udp_media_enabled: bool,
+    protocol_id: frd_core::ProtocolId,
+    refresh_tier: Option<hpss::HighPerformanceRefreshTier>,
+) -> ProtocolExit {
     let input_diagnostics = HighPerformanceInputDiagnostics::for_protocol(&protocol_id);
     let result = run_authenticated_session_inner(
         connection,
@@ -482,6 +508,7 @@ fn run_authenticated_session_with_media(
         audio_flow,
         udp_media_enabled,
         &protocol_id,
+        refresh_tier,
         input_diagnostics.clone(),
     );
     if let Err(error) = &result {
@@ -587,8 +614,15 @@ fn run_authenticated_session_inner(
     audio_flow: AudioMediaFlow,
     udp_media_enabled: bool,
     protocol_id: &frd_core::ProtocolId,
+    refresh_tier: Option<hpss::HighPerformanceRefreshTier>,
     input_diagnostics: HighPerformanceInputDiagnostics,
 ) -> Result<()> {
+    let is_product_high_performance =
+        protocol_id == &frd_core::ProtocolId::apple_high_performance();
+    ensure!(
+        is_product_high_performance == refresh_tier.is_some(),
+        "Apple High Performance 刷新率档位与协议身份不一致"
+    );
     let server_init_size = DisplaySize::new(
         u16::try_from(initial_pixel_size.width).context("Apple 初始宽度超出 u16")?,
         u16::try_from(initial_pixel_size.height).context("Apple 初始高度超出 u16")?,
@@ -611,9 +645,14 @@ fn run_authenticated_session_inner(
             .map_err(|error| anyhow::anyhow!(error.code()))?;
     // Same verified startup ordering and timing as the legacy HPSS viewer.
     std::thread::sleep(Duration::from_millis(200));
+    let set_display_config = if let Some(refresh_tier) = refresh_tier {
+        hpss::build_high_performance_set_display_config(&display_name, initial_size, refresh_tier)
+    } else {
+        hpss::build_set_display_config(&display_name)
+    };
     preserve_startup_transport_error(
         connection
-            .write_all(&hpss::build_set_display_config(&display_name))
+            .write_all(&set_display_config)
             .context("发送 Apple SetDisplayConfiguration 失败"),
         HighPerformanceDiagnostic::SetDisplayWriteClosed,
     )?;
@@ -650,8 +689,19 @@ fn run_authenticated_session_inner(
     connection.set_read_timeout(Some(application_frame_read_poll))?;
     let writer = connection.writer_handle()?;
 
-    let mut media =
-        ViewerMediaState::new_for_session(session_id, audio_flow, 1, media_server_address)?;
+    let media_stream_capabilities = crate::media_negotiation::ClientMediaStreamCapabilities {
+        video_stream_1_supports_60_fps: matches!(
+            refresh_tier,
+            Some(hpss::HighPerformanceRefreshTier::Hz60)
+        ),
+    };
+    let mut media = ViewerMediaState::new_for_session_with_capabilities(
+        session_id,
+        audio_flow,
+        1,
+        media_server_address,
+        media_stream_capabilities,
+    )?;
     let mut reader = NetworkReaderRuntime::new_admitted_for_protocol(
         session_id,
         initial_size,
@@ -666,6 +716,7 @@ fn run_authenticated_session_inner(
     let mut disconnect_requested = false;
     let mut readiness_published = false;
     let mut audio_started = false;
+    let mut source_rate_fallback_sent = false;
     #[cfg(test)]
     connection
         .notify_session_runtime_test_event(crate::connection::SessionRuntimeTestEvent::LoopEntered);
@@ -693,6 +744,27 @@ fn run_authenticated_session_inner(
                                 input_diagnostics.observe_runtime_consumed(Instant::now());
                             }
                             pointer.handle(input.event, &writer)?;
+                        }
+                    }
+                    SessionCommand::SetMaxSourceFrameRate {
+                        session_id: command_session_id,
+                        generation: command_generation,
+                        max_frames_per_second,
+                    } => {
+                        if is_product_high_performance
+                            && reader.is_high_performance_confirmed()
+                            && command_session_id == session_id
+                            && command_generation == reader.generation()
+                            && max_frames_per_second == 30
+                            && !source_rate_fallback_sent
+                        {
+                            let message = hpss::build_high_performance_set_display_config(
+                                &display_name,
+                                initial_size,
+                                hpss::HighPerformanceRefreshTier::Hz30,
+                            );
+                            writer.send_private_message(&message)?;
+                            source_rate_fallback_sent = true;
                         }
                     }
                     SessionCommand::ResolveServerIdentity { .. }
@@ -1069,6 +1141,7 @@ mod tests {
         exit: mpsc::Receiver<frd_protocol_api::ProtocolExit>,
         worker: thread::JoinHandle<()>,
         session_id: frd_core::SessionId,
+        expected_startup_framebuffer_request: [u8; 10],
     }
 
     fn read_encrypted_test_message(
@@ -1107,14 +1180,33 @@ mod tests {
             assert_eq!(set_display.len(), 308);
             let display_query = self.read_message();
             assert_eq!(display_query.first(), Some(&0x09));
-            assert_eq!(self.read_message(), [3, 0, 0, 0, 0, 0, 0, 8, 0, 8]);
+            assert_eq!(
+                self.read_message(),
+                self.expected_startup_framebuffer_request
+            );
         }
 
-        fn read_startup_requests(&mut self) -> (Vec<u8>, Vec<u8>) {
+        fn read_startup_requests(&mut self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             let set_display = self.read_message();
             assert_eq!(set_display.first(), Some(&0x1d));
             assert_eq!(set_display.len(), 308);
-            (self.read_message(), self.read_message())
+            (set_display, self.read_message(), self.read_message())
+        }
+
+        fn assert_no_message(&mut self, timeout: Duration) {
+            self.peer.set_read_timeout(Some(timeout)).unwrap();
+            let mut prefix = [0u8; 2];
+            let error = self
+                .peer
+                .read_exact(&mut prefix)
+                .expect_err("no encrypted message should be written");
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ));
+            self.peer
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
         }
     }
 
@@ -1140,6 +1232,13 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         message[26..28].copy_from_slice(&audio_port.to_be_bytes());
+        message
+    }
+
+    fn audio_video_port_announcement_message(ports: [u16; 2]) -> Vec<u8> {
+        let mut message = port_announcement_message(ports[0]);
+        message[32..34].copy_from_slice(&ports[1].to_be_bytes());
+        message[34..38].copy_from_slice(&1u32.to_be_bytes());
         message
     }
 
@@ -1224,7 +1323,43 @@ mod tests {
         protocol_id: frd_core::ProtocolId,
         make_events: impl FnOnce(mpsc::Sender<RuntimeTrace>) -> Box<dyn RuntimeEventSink>,
     ) -> ProductionHarness {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refresh_tier = (protocol_id == frd_core::ProtocolId::apple_high_performance())
+            .then_some(crate::hpss::HighPerformanceRefreshTier::Hz60);
+        start_production_harness_for_refresh_tier(
+            initial_pixel_size,
+            udp_media_enabled,
+            protocol_id,
+            refresh_tier,
+            make_events,
+        )
+    }
+
+    fn start_production_harness_for_refresh_tier(
+        initial_pixel_size: frd_core::PixelSize,
+        udp_media_enabled: bool,
+        protocol_id: frd_core::ProtocolId,
+        refresh_tier: Option<crate::hpss::HighPerformanceRefreshTier>,
+        make_events: impl FnOnce(mpsc::Sender<RuntimeTrace>) -> Box<dyn RuntimeEventSink>,
+    ) -> ProductionHarness {
+        start_production_harness_for_refresh_tier_at(
+            initial_pixel_size,
+            udp_media_enabled,
+            protocol_id,
+            refresh_tier,
+            "127.0.0.1:0",
+            make_events,
+        )
+    }
+
+    fn start_production_harness_for_refresh_tier_at(
+        initial_pixel_size: frd_core::PixelSize,
+        udp_media_enabled: bool,
+        protocol_id: frd_core::ProtocolId,
+        refresh_tier: Option<crate::hpss::HighPerformanceRefreshTier>,
+        listener_address: &str,
+        make_events: impl FnOnce(mpsc::Sender<RuntimeTrace>) -> Box<dyn RuntimeEventSink>,
+    ) -> ProductionHarness {
+        let listener = TcpListener::bind(listener_address).unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (peer, _) = listener.accept().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1237,6 +1372,20 @@ mod tests {
         let (application_frame_read_events_tx, application_frame_read_events) = mpsc::channel();
         connection.set_application_frame_read_test_events(application_frame_read_events_tx);
         let session_id = frd_core::SessionId::allocate();
+        let (startup_width, startup_height) =
+            if protocol_id == frd_core::ProtocolId::apple_high_performance() {
+                (2560u16, 1440u16)
+            } else {
+                (
+                    u16::try_from(initial_pixel_size.width).unwrap(),
+                    u16::try_from(initial_pixel_size.height).unwrap(),
+                )
+            };
+        let [width_hi, width_lo] = startup_width.to_be_bytes();
+        let [height_hi, height_lo] = startup_height.to_be_bytes();
+        let expected_startup_framebuffer_request = [
+            0x03, 0, 0, 0, 0, 0, width_hi, width_lo, height_hi, height_lo,
+        ];
         let (commands, command_rx) = mpsc::channel();
         let (trace_tx, trace) = mpsc::channel();
         let events = make_events(trace_tx.clone());
@@ -1250,7 +1399,7 @@ mod tests {
         );
         let (exit_tx, exit) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let result = super::run_authenticated_session_with_media(
+            let result = super::run_authenticated_session_with_media_at_refresh_tier(
                 connection,
                 "production-session-test".to_owned(),
                 initial_pixel_size,
@@ -1260,6 +1409,7 @@ mod tests {
                 crate::media_negotiation::AudioMediaFlow::MacToPc,
                 udp_media_enabled,
                 protocol_id,
+                refresh_tier,
             );
             exit_tx.send(result).unwrap();
         });
@@ -1272,7 +1422,174 @@ mod tests {
             exit,
             worker,
             session_id,
+            expected_startup_framebuffer_request,
         }
+    }
+
+    fn sent_media_configuration_flags(
+        protocol_id: frd_core::ProtocolId,
+        refresh_tier: Option<crate::hpss::HighPerformanceRefreshTier>,
+    ) -> u32 {
+        let is_product_high_performance =
+            protocol_id == frd_core::ProtocolId::apple_high_performance();
+        let mut harness = start_production_harness_for_refresh_tier(
+            frd_core::PixelSize::new(8, 8).unwrap(),
+            true,
+            protocol_id,
+            refresh_tier,
+            |trace| Box::new(TracingEvents(trace)),
+        );
+        harness.read_verified_startup();
+        if !is_product_high_performance {
+            harness.send_message(&server_state_message(8, 8));
+            assert_eq!(harness.read_message(), [3, 0, 0, 0, 0, 0, 0, 8, 0, 8]);
+        }
+        let reserved_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let media_port = reserved_port.local_addr().unwrap().port();
+        drop(reserved_port);
+        harness.send_message(&port_announcement_message(media_port));
+        let configuration = harness.read_message();
+        assert_eq!(configuration.first(), Some(&0x1c));
+        let flags = u32::from_be_bytes(configuration[6..10].try_into().unwrap());
+        close_pending_production_harness(harness);
+        flags
+    }
+
+    #[test]
+    fn product_high_performance_60_hz_sends_media_configuration_flags_0x0d() {
+        assert_eq!(
+            sent_media_configuration_flags(
+                frd_core::ProtocolId::apple_high_performance(),
+                Some(crate::hpss::HighPerformanceRefreshTier::Hz60),
+            ),
+            0x0d
+        );
+    }
+
+    #[test]
+    fn product_high_performance_30_hz_sends_media_configuration_flags_0x0c() {
+        assert_eq!(
+            sent_media_configuration_flags(
+                frd_core::ProtocolId::apple_high_performance(),
+                Some(crate::hpss::HighPerformanceRefreshTier::Hz30),
+            ),
+            0x0c
+        );
+    }
+
+    #[test]
+    fn standard_apple_sends_media_configuration_flags_0x0c() {
+        assert_eq!(
+            sent_media_configuration_flags(frd_core::ProtocolId::apple_hpss_mvs(), None,),
+            0x0c
+        );
+    }
+
+    #[test]
+    fn active_high_performance_rate_command_writes_exact_encrypted_30_hz_profile_once() {
+        let mut harness = start_production_harness_for_refresh_tier_at(
+            frd_core::PixelSize::new(1920, 1080).unwrap(),
+            true,
+            frd_core::ProtocolId::apple_high_performance(),
+            Some(crate::hpss::HighPerformanceRefreshTier::Hz60),
+            "127.0.0.2:0",
+            |trace| Box::new(TracingEvents(trace)),
+        );
+        harness.read_verified_startup();
+
+        for (session_id, generation, max_frames_per_second) in [
+            (harness.session_id, 1, 30),
+            (frd_core::SessionId::allocate(), 1, 30),
+            (harness.session_id, 2, 30),
+            (harness.session_id, 1, 60),
+        ] {
+            harness
+                .commands
+                .send(SessionCommand::SetMaxSourceFrameRate {
+                    session_id,
+                    generation,
+                    max_frames_per_second,
+                })
+                .unwrap();
+            harness.assert_no_message(Duration::from_millis(250));
+        }
+
+        let media_peers =
+            std::array::from_fn::<_, 2, _>(|_| std::net::UdpSocket::bind("127.0.0.2:0").unwrap());
+        let media_ports =
+            std::array::from_fn(|index| media_peers[index].local_addr().unwrap().port());
+        harness.send_message(&audio_video_port_announcement_message(media_ports));
+        assert_eq!(harness.read_message().first(), Some(&0x1c));
+        harness.send_message(&media_stream_answer_message());
+        for _ in 0..11 {
+            harness.trace.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        for peer in &media_peers {
+            peer.set_nonblocking(true).unwrap();
+            let mut datagram = [0u8; 2_048];
+            while peer.recv(&mut datagram).is_ok() {}
+        }
+
+        harness
+            .commands
+            .send(SessionCommand::SetMaxSourceFrameRate {
+                session_id: harness.session_id,
+                generation: 1,
+                max_frames_per_second: 30,
+            })
+            .unwrap();
+        assert_eq!(
+            harness.read_message(),
+            crate::hpss::build_high_performance_set_display_config(
+                "production-session-test",
+                crate::dynamic_resolution::DisplaySize::new(2560, 1440).unwrap(),
+                crate::hpss::HighPerformanceRefreshTier::Hz30,
+            )
+        );
+
+        harness.send_message(&server_state_message(2560, 1440));
+        harness
+            .commands
+            .send(SessionCommand::SetMaxSourceFrameRate {
+                session_id: harness.session_id,
+                generation: 1,
+                max_frames_per_second: 30,
+            })
+            .unwrap();
+        harness.assert_no_message(Duration::from_millis(250));
+        assert!(matches!(
+            harness.trace.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        for peer in &media_peers {
+            let mut datagram = [0u8; 2_048];
+            assert!(matches!(
+                peer.recv(&mut datagram),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+        close_pending_production_harness(harness);
+    }
+
+    #[test]
+    fn standard_mvs_runtime_ignores_generic_source_rate_command() {
+        let mut harness = start_production_harness(false);
+        harness.read_verified_startup();
+        harness
+            .commands
+            .send(SessionCommand::SetMaxSourceFrameRate {
+                session_id: harness.session_id,
+                generation: 1,
+                max_frames_per_second: 30,
+            })
+            .unwrap();
+
+        harness.assert_no_message(Duration::from_millis(250));
+        close_pending_production_harness(harness);
     }
 
     fn start_production_harness(udp_media_enabled: bool) -> ProductionHarness {
@@ -1307,6 +1624,7 @@ mod tests {
         initial_pixel_size: frd_core::PixelSize,
         udp_media_enabled: bool,
         protocol_id: frd_core::ProtocolId,
+        expected_set_display: Vec<u8>,
         expected_display_query: [u8; 16],
         expected_framebuffer_request: [u8; 10],
     ) {
@@ -1316,7 +1634,8 @@ mod tests {
             protocol_id,
             |trace| Box::new(TracingEvents(trace)),
         );
-        let (display_query, framebuffer_request) = harness.read_startup_requests();
+        let (set_display, display_query, framebuffer_request) = harness.read_startup_requests();
+        assert_eq!(set_display, expected_set_display);
         assert_eq!(display_query, expected_display_query);
         assert_eq!(framebuffer_request, expected_framebuffer_request);
         close_pending_production_harness(harness);
@@ -1328,36 +1647,51 @@ mod tests {
             frd_core::PixelSize::new(1920, 1080).unwrap(),
             true,
             frd_core::ProtocolId::apple_high_performance(),
+            crate::hpss::build_high_performance_set_display_config(
+                "production-session-test",
+                crate::dynamic_resolution::DisplaySize::new(2560, 1440).unwrap(),
+                crate::hpss::HighPerformanceRefreshTier::Hz60,
+            ),
             [
-                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x05, 0xa0, 0x0a, 0x00,
+                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a, 0x00, 0x05, 0xa0,
             ],
-            [0x03, 0, 0, 0, 0, 0, 0x05, 0xa0, 0x0a, 0x00],
+            [0x03, 0, 0, 0, 0, 0, 0x0a, 0x00, 0x05, 0xa0],
         );
     }
 
     #[test]
-    fn high_performance_portrait_server_init_preserves_existing_virtual_geometry() {
+    fn high_performance_portrait_server_init_uses_recovered_primary_mode() {
         assert_startup_geometry(
             frd_core::PixelSize::new(1200, 1920).unwrap(),
             true,
             frd_core::ProtocolId::apple_high_performance(),
+            crate::hpss::build_high_performance_set_display_config(
+                "production-session-test",
+                crate::dynamic_resolution::DisplaySize::new(2560, 1440).unwrap(),
+                crate::hpss::HighPerformanceRefreshTier::Hz60,
+            ),
             [
-                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x07, 0x80,
+                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a, 0x00, 0x05, 0xa0,
             ],
-            [0x03, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x07, 0x80],
+            [0x03, 0, 0, 0, 0, 0, 0x0a, 0x00, 0x05, 0xa0],
         );
     }
 
     #[test]
-    fn high_performance_square_server_init_preserves_existing_geometry() {
+    fn high_performance_square_server_init_uses_recovered_primary_mode() {
         assert_startup_geometry(
             frd_core::PixelSize::new(1200, 1200).unwrap(),
             true,
             frd_core::ProtocolId::apple_high_performance(),
+            crate::hpss::build_high_performance_set_display_config(
+                "production-session-test",
+                crate::dynamic_resolution::DisplaySize::new(2560, 1440).unwrap(),
+                crate::hpss::HighPerformanceRefreshTier::Hz60,
+            ),
             [
-                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x04, 0xb0,
+                0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a, 0x00, 0x05, 0xa0,
             ],
-            [0x03, 0, 0, 0, 0, 0, 0x04, 0xb0, 0x04, 0xb0],
+            [0x03, 0, 0, 0, 0, 0, 0x0a, 0x00, 0x05, 0xa0],
         );
     }
 
@@ -1367,6 +1701,7 @@ mod tests {
             frd_core::PixelSize::new(1920, 1080).unwrap(),
             true,
             frd_core::ProtocolId::apple_hpss_mvs(),
+            crate::hpss::build_set_display_config("production-session-test"),
             [
                 0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x07, 0x80, 0x04, 0x38,
             ],
@@ -1387,6 +1722,19 @@ mod tests {
         assert_eq!(
             super::startup_display_size(&protocol_id, portrait),
             portrait
+        );
+    }
+
+    #[test]
+    fn product_high_performance_startup_size_uses_recovered_primary_mode() {
+        let server_init = crate::dynamic_resolution::DisplaySize::new(1920, 1080).unwrap();
+
+        assert_eq!(
+            super::startup_display_size(
+                &frd_core::ProtocolId::apple_high_performance(),
+                server_init,
+            ),
+            crate::dynamic_resolution::DisplaySize::new(2560, 1440).unwrap()
         );
     }
 
@@ -1864,7 +2212,7 @@ mod tests {
                 generation: 1,
                 size,
                 ..
-            }) if size == frd_core::PixelSize::new(8, 8).unwrap()
+            }) if size == frd_core::PixelSize::new(2560, 1440).unwrap()
         ));
         assert!(matches!(
             harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -1872,7 +2220,7 @@ mod tests {
                 generation: 1,
                 size,
                 ..
-            }) if size == frd_core::PixelSize::new(8, 8).unwrap()
+            }) if size == frd_core::PixelSize::new(2560, 1440).unwrap()
         ));
         assert!(matches!(
             harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),

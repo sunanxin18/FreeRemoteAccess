@@ -279,6 +279,9 @@ enum Cmd {
         /// 保存通过 SRTP 认证的已解密音频 RTP 流（FRDRTP01 诊断格式）
         #[arg(long)]
         media_audio_rtp_out: Option<std::path::PathBuf>,
+        /// 保存通过 SRTP 认证的已解密视频 RTP 流（FRDVTP01 诊断格式）
+        #[arg(long, requires = "udp_media")]
+        media_video_rtp_out: Option<std::path::PathBuf>,
         /// 虚拟显示器名称（0x1d 携带）
         #[arg(long, default_value = "FreeRemoteDesk 虚拟显示器")]
         display_name: String,
@@ -387,6 +390,7 @@ fn run(cli: Cli) -> Result<()> {
             png,
             media_answer_out,
             media_audio_rtp_out,
+            media_video_rtp_out,
             display_name,
             udp_media,
         } => {
@@ -402,6 +406,7 @@ fn run(cli: Cli) -> Result<()> {
                 png.as_deref(),
                 media_answer_out.as_deref(),
                 media_audio_rtp_out.as_deref(),
+                media_video_rtp_out.as_deref(),
                 &display_name,
                 udp_media,
             )
@@ -1145,6 +1150,7 @@ fn cmd_hpss(
     png_out: Option<&std::path::Path>,
     media_answer_out: Option<&std::path::Path>,
     media_audio_rtp_out: Option<&std::path::Path>,
+    media_video_rtp_out: Option<&std::path::Path>,
     display_name: &str,
     udp_media: bool,
 ) -> Result<()> {
@@ -1185,11 +1191,13 @@ fn cmd_hpss(
         c.width,
         c.height,
         sink.as_mut().map(|s| s as &mut dyn std::io::Write),
+        media_video_rtp_out.is_some(),
     )?;
 
     if let Some(mut s) = sink {
         s.flush().context("刷新 MVS 捕获文件失败")?;
     }
+    require_hpss_success(&sess.stats, udp_media)?;
     if let Some(path) = media_answer_out {
         let frame = sess
             .media_answer_frame
@@ -1204,6 +1212,13 @@ fn cmd_hpss(
         }
         std::fs::write(path, sess.audio_rtp_capture.as_bytes())
             .with_context(|| format!("保存已解密音频 RTP 流到 {} 失败", path.display()))?;
+    }
+    if let Some(path) = media_video_rtp_out {
+        if sess.video_rtp_capture.is_empty() {
+            anyhow::bail!("会话未收到通过 SRTP 认证的视频 RTP 包，无法保存诊断流");
+        }
+        std::fs::write(path, sess.video_rtp_capture.as_bytes())
+            .with_context(|| format!("保存已解密视频 RTP 流到 {} 失败", path.display()))?;
     }
     // 尝试解码 MVS 流为 PNG（若提供了 --png）
     if let Some(png_path) = png_out {
@@ -1271,11 +1286,25 @@ fn cmd_hpss(
     if !st.unknown.is_empty() {
         println!("  未识别消息首字节: {:02x?}", st.unknown);
     }
-    if st.mvs_frames > 0 {
+    if udp_media {
+        println!("✓ HPSS 严格 UDP 视频媒体接收成功（已认证视频 RTP）");
+    } else if st.mvs_frames > 0 {
         println!("✓ HPSS 媒体流接收成功（0x1d 协商 → 0x3f3 MVS 流）");
         if let Some(p) = out {
             println!("  MVS 流已保存 {}", p.display());
         }
+    }
+    Ok(())
+}
+
+fn require_hpss_success(stats: &crate::vnc::hpss::HpssStats, udp_media: bool) -> Result<()> {
+    if udp_media && stats.authenticated_video_rtp_packets == 0 {
+        anyhow::bail!(
+            "严格 HP UDP 诊断未收到已认证视频 RTP（MVS={}，Message 2={}，RTCP={}）；协商、认证控制流或 MVS 均不能替代视频数据面成功证据",
+            stats.mvs_frames,
+            stats.media_stream_answers,
+            stats.authenticated_rtcp_packets,
+        );
     }
     Ok(())
 }
@@ -1305,10 +1334,11 @@ mod tests {
     use super::{
         classify_cold_connection_error, cmd_hpss_capture_v2, cmd_mvs_capture_v2_verify,
         create_cold_writer_then, finish_cold_connection_failure, format_cold_verify_json,
-        read_cold_capture_structural_then_strict, replay_offline_mvs_records, rgb_to_png_rgba, Cli,
-        Cmd, ColdConnectionFailure, DEFAULT_PASSWORD_ENV, DEFAULT_USERNAME_ENV,
+        read_cold_capture_structural_then_strict, replay_offline_mvs_records, require_hpss_success,
+        rgb_to_png_rgba, Cli, Cmd, ColdConnectionFailure, DEFAULT_PASSWORD_ENV,
+        DEFAULT_USERNAME_ENV,
     };
-    use crate::vnc::hpss::MvsCaptureWriter;
+    use crate::vnc::hpss::{HpssStats, MvsCaptureWriter};
     use crate::vnc::mvs_stream::{MvsRecord, MvsRect};
     use clap::{CommandFactory, Parser};
 
@@ -2189,6 +2219,74 @@ mod tests {
         };
         assert_eq!(host, None);
         assert!(credentials_stdin_v1);
+    }
+
+    #[test]
+    fn hpss_cli_accepts_video_rtp_capture_output() {
+        let cli = Cli::try_parse_from([
+            "freeremotedesk",
+            "hpss",
+            "example.invalid",
+            "--media-video-rtp-out",
+            "video.rtp",
+            "--udp-media",
+        ])
+        .expect("视频 RTP 诊断落盘参数必须可解析");
+
+        let Cmd::Hpss {
+            media_video_rtp_out,
+            ..
+        } = cli.cmd
+        else {
+            panic!("应解析为 hpss 子命令");
+        };
+        assert_eq!(
+            media_video_rtp_out,
+            Some(std::path::PathBuf::from("video.rtp"))
+        );
+
+        let without_udp = Cli::try_parse_from([
+            "freeremotedesk",
+            "hpss",
+            "example.invalid",
+            "--media-video-rtp-out",
+            "video.rtp",
+        ]);
+        assert!(without_udp.is_err());
+    }
+
+    #[test]
+    fn strict_udp_hpss_rejects_mvs_and_control_evidence_without_video_rtp() {
+        let stats = HpssStats {
+            mvs_frames: 1,
+            media_stream_answers: 1,
+            authenticated_rtcp_packets: 1,
+            ..HpssStats::default()
+        };
+
+        let error = require_hpss_success(&stats, true).unwrap_err();
+
+        assert!(format!("{error:#}").contains("已认证视频 RTP"));
+    }
+
+    #[test]
+    fn strict_udp_hpss_accepts_authenticated_video_rtp() {
+        let stats = HpssStats {
+            authenticated_video_rtp_packets: 1,
+            ..HpssStats::default()
+        };
+
+        require_hpss_success(&stats, true).unwrap();
+    }
+
+    #[test]
+    fn non_strict_hpss_keeps_the_mvs_diagnostic_path() {
+        let stats = HpssStats {
+            mvs_frames: 1,
+            ..HpssStats::default()
+        };
+
+        require_hpss_success(&stats, false).unwrap();
     }
 
     #[test]

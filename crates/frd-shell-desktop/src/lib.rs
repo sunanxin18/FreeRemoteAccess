@@ -11,7 +11,9 @@ mod presentation_timing;
 mod repaint;
 mod ui_fonts;
 mod video_decode_worker;
+mod video_rate_fallback;
 mod window_chrome;
+mod window_presentation;
 
 pub use application::{
     AudioOutputFactory, BackgroundLaunchOutcome, DesktopApplication, DesktopPlatformStores,
@@ -28,10 +30,15 @@ pub use floating_chrome::{
 pub use input::{InputGate, InputOwnership, InputRouter};
 pub use lifecycle::PresentationOperation;
 pub use video_decode_worker::{
-    DecodedVideoFrameHandoff, VideoDecodeSender, VideoDecoderDiagnostics, VideoFrameToken,
-    VideoStreamAdmission, VideoWorkerEvent, VideoWorkerEvents, VideoWorkerSendError,
+    DecodedVideoFrameHandoff, VideoDecodeLoadSnapshot, VideoDecodeSender, VideoDecoderDiagnostics,
+    VideoFrameToken, VideoStreamAdmission, VideoWorkerEvent, VideoWorkerEvents,
+    VideoWorkerSendError,
 };
 pub use window_chrome::{
     AppearancePolicy, ChromeRect, NativeChromeInsets, WindowChromeAdapter, WindowChromeCommand,
     WindowChromeError, TITLE_BAR_HEIGHT_POINTS,
+};
+pub use window_presentation::{
+    LogicalWindowExtent, WindowPresentationController, WindowPresentationMode,
+    WindowPresentationTransition,
 };

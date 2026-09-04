@@ -26,9 +26,9 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
 |---|---|---|---|---|---|
-| Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成，Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；Windows 浮动控制岛 shell 已完成 **受限验证**，不代表任一远程协议互操作，证据见 [`windows-floating-control-island.md`](docs/validation/windows-floating-control-island.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
-| macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；必须保留 macOS 原生标题栏、字体和 Keychain 适配 |
-| Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **计划中**；需实现窗口管理器适配与 Secret Service |
+| Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成；`.github/workflows/build-windows.yml` 已重建为 Rust 1.96、WSL/NASM/x86asm、Main444、Pester、staging/verifier 和 LGPL 对应源码 artifact 的完整门禁，首次 GitHub-hosted run 仍待本分支推送确认。Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
+| macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 macOS 15 编译和安全测试门禁，首次 hosted-runner 结果待本分支推送；尚无原生平台 shell、Keychain、安装包或真机运行验证，不得把 CI 编译冒充客户端支持。 |
+| Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 Ubuntu 24.04 GUI 依赖、workspace 编译和安全测试门禁，首次 hosted-runner 结果待本分支推送；尚无窗口管理器、Secret Service、安装包或真机运行验证。 |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
 | HarmonyOS NEXT 手机/PC | ArkUI/HUKS 边界设计 | 触控/键鼠计划中 | 计划中 | 尚无 | **计划中**；不是 Android 兼容层，须单独完成 ArkUI、HUKS 和构建 POC |
 
@@ -37,8 +37,8 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 客户端平台/路径 | 状态 | 验证范围或阻塞点 |
 |---|---|---|
 | Windows native capability probe | **受限验证** | 2026-09-01 在单台 AMD Radeon 780M Windows 主机完成 D3D12 profile 探针；Main/Main10 报告 hardware exact，Main444 明确不可用。证据为 [`windows-video-capabilities-20260901.json`](docs/validation/windows-video-capabilities-20260901.json)，仅证明能力探针，不证明 native decoder 或远端会话首帧；Task 10 复跑结果见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
-| Windows FFmpeg 8.1.2 Main444 software backend | **受限验证** | 固定签名源码构建的 LGPL 动态插件通过离线 Main444 fixture 精确解码，DX12 YUV444 离屏颜色/crop 门禁与 Windows package staging/verifier 通过；codec present/absent 均不阻止 GUI 启动。此状态只覆盖离线 fixture、GPU readback 与 binary staging，不是 system-owned 安装器、可见 runtime backend 状态或 Apple HP 真机首帧证明，见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
-| Apple High Performance 真机首帧 | **开发中** | RTP/AU 与 decoder pipeline 已实现，但只有已 admission 的 current-generation surface 精确 `FramePresented(FullBaseline)` 才能进入 Ready 并开放输入。本轮独立 environment-provider auto-connect 已发起真实 HP 会话，但稳定返回 `apple_high_performance_unavailable`，未证明 authenticated RTP → Main444 config/AU → FFmpeg → exact present → Ready；不回退 Standard/MVS，见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
+| Windows FFmpeg 8.1.2 Main444 software backend | **受限验证** | 固定签名源码构建的 LGPL 动态插件通过离线 Main444 fixture 精确解码；2026-09-04 Windows x86_64 bundle 已启用 NASM/x86asm，并在 2560x1440 及其竖屏方向使用最多两个 frame threads。新 bundle 通过 Main444、PE imports、manifest、LGPL/对应源码、staging、system-owned 安装器与 trusted-install 门禁；macOS/Linux 共用 C bridge 已实现但尚未在对应主机编译验证。证据见 [`Apple HP 延迟验证`](docs/validation/apple-hp-latency-20260904.md)。 |
+| Apple High Performance 真机首帧与输入 | **受限验证** | 2026-09-04 在一台授权 stock Mac 上完成用户名/密码 HP 会话、认证 RTP、HEVC Main444 软件解码、精确 present、鼠标/键盘输入与持续刷新验证；当前候选以 `0x1d` mode 0 请求并真机确认 2560x1440 pixels / 2560x1440 points / 60Hz（scale 1），初始 Message `0x1c=0x0d`，确认会话内降档时只写一次同几何 30Hz `0x1d`，不重启认证、不发送第二个 `0x1c`。Standard/MVS 保持 `0x1c=0x0c`。当前安装候选 SHA-256 为 `6F3368FE16D05246F54DC6713B0CE7EC3F98B5F508F31AEC2E33305F6DDF8E9A`；20.295 秒受限运动负载记录 246 次呈现，Mac 保持 60Hz；该负载不是持续 60-FPS source，不能作为 decoder 最大吞吐或长期网络结论。证据见 [`Apple HP 延迟验证`](docs/validation/apple-hp-latency-20260904.md)。 |
 | macOS / Linux native video backend | **计划中** | 尚无 native decoder、平台 shell 或 package 构建验证。 |
 | Android native video backend | **计划中** | 尚无 MediaCodec bridge、移动端 shell 或 package 构建验证。 |
 | HarmonyOS NEXT native video backend | **计划中** | 必须单独完成 ArkTS/ArkUI 与 native codec bridge POC；不是 Android 兼容层，当前不冒充 build 支持。 |
@@ -47,22 +47,34 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
 |---|---|---|---|---|
-| macOS | Screen Sharing / Remote Management | `frd-protocol-apple`：严格 Apple High Performance HPSS/MVS | Windows | **开发中**；当前产品仅允许加密 High Performance 路径，设计见 [`Apple High Performance Session`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md)。既有账号密码、共享会话画面/输入及媒体证据早于严格虚拟显示确认门禁，不能证明当前产品模式已被 stock macOS 接受；离线实现允许 `display_count=2` 确认 High Performance 并激活 publisher，但动态分辨率只允许 `display_count=1` |
+| macOS | Screen Sharing / Remote Management | 两条隔离的 Apple 路线：Standard（`displayType=0` compatibility）与 High Performance（`displayType=1/2` virtual display） | Windows | **开发中**；Standard 使用实体桌面且不创建虚拟显示，但当前 FreeRemoteDesk adapter 尚未实现或注册。High Performance 的 type-1 实体屏幕置黑仅有用户观察，尚不是 Windows 客户端端到端互操作结论。两条路线的当前阻塞、已知观察和禁止回退边界见 [`Apple 双模式阻塞记录`](docs/validation/apple-dual-mode-blockers-20260901.md) |
 | Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；私有 adapter 已实现服务器身份验证、TLS、CredSSP/NLA、licensing 与 activation，2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录、首帧或输入互操作；完整离线门禁、构建哈希和未验证边界见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md)；不得要求安装 FreeRemoteDesk 服务端 |
 | Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
 
 ### Windows 客户端连接 macOS 功能明细
 
 本表中既有“已验证/受限验证”记录描述对应认证、MVS、输入或媒体子系统的历史
-证据，不自动继承为当前严格 High Performance 产品组合的互操作结论。当前组合
-必须另外证明 stock macOS 接受虚拟显示、实体显示器按预期置黑并可在断开后恢复；
-完成该有界门禁前，组合状态保持 **开发中**。
+证据，不自动继承为另一条 Apple 模式的完整互操作结论。Standard（`displayType=0`）
+和 High Performance（`displayType=1/2`）必须保持独立；不得借隧道、Standard
+降级或既有子系统证据冒充 High Performance。Standard 仍为**开发中**；High
+Performance 仅按下表 2026-09-04 的有界范围记为**受限验证**，详见
+[`Apple 双模式阻塞记录`](docs/validation/apple-dual-mode-blockers-20260901.md)。
+
+2026-09-04 的当前 Apple HP wire contract 是：初始 scale-1
+2560x1440 pixels / 2560x1440 points at 60Hz，Message `0x1c=0x0d`；仅在
+已确认 HP session 内，load controller 才可单向写入一次同几何 scale-1
+2560x1440/30Hz 的 `0x1d`，不重启认证且不发送第二个 `0x1c`。Standard/MVS
+保持 `0x1c=0x0c`。当前安装候选 SHA-256 为
+`6F3368FE16D05246F54DC6713B0CE7EC3F98B5F508F31AEC2E33305F6DDF8E9A`；早期
+`1280x720` 请求、Mac 选择 `1312x848` 及 bit-clear 候选均已被当前
+scale-1 合同取代，仅作为 validation 中的历史证据。
 
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
 | Mac 账号密码认证 | Apple HPSS 会话 | **已验证** | 使用 Mac 本地用户名/密码；不请求、保存或使用 Apple ID 凭据 |
-| High Performance 虚拟显示与实体显示器置黑 | `frd-protocol-apple` 严格确认门禁 | **开发中** | 产品只选择加密 `APPLE_SRP`，发送现有 `0x1d` 后等待严格 `0x451 ServerState`，确认前不公开 generation/readiness；`display_count=2` 的匹配状态仍可确认 High Performance 并激活 publisher，单显示器限制只属于动态分辨率 eligibility；自动化门禁不能替代实体显示器置黑/恢复与完整远程桌面的真机观察，见 [`设计`](docs/superpowers/specs/2026-08-29-apple-high-performance-session-design.md) |
-| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-31 保留固定捕获仅证明采样候选 `c57dc77` 的 Windows wgpu frame-transaction 路径在有界 Apple HPSS/MVS 真机比较中通过；范围、run id 与二进制身份见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。这不包含后置 runtime 正确性修复，也不包含严格 High Performance 虚拟显示/实体显示器置黑与恢复门禁。 |
+| Apple Standard 实体桌面 | `displayType=0` compatibility；不发 HP 虚拟显示配置 | **开发中** | 使用 Mac 实体桌面、无虚拟显示；当前 FreeRemoteDesk adapter 尚未实现/注册，不能由现有 HPSS/MVS 代码或登录成功替代。须先取得并落实该模式的会话选择、认证、codec-6/经典 RFB 首帧和持续更新证据，见 [`双模式记录`](docs/validation/apple-dual-mode-blockers-20260901.md) |
+| High Performance 虚拟显示与实体显示器置黑 | `displayType=1/2` virtual display；`0x3f2`/`0x1c` + SRTP/SRTCP + HEVC RTP | **受限验证** | 2026-09-04 在一台授权 stock Mac 上完成用户名/密码 HP 会话、认证 RTP、HEVC Main444 软件解码、精确 present、鼠标/键盘输入与持续刷新验证。当前候选真机确认 mode 0 为 2560x1440 pixels / 2560x1440 points / 60Hz（scale 1），初始 `0x1c=0x0d`；已确认会话内降档只写一次同几何 30Hz `0x1d`，不重启认证、不发送第二个 `0x1c`，Standard/MVS 保持 `0x1c=0x0c`。Windows 使用 x86asm + 最多两个 FFmpeg frame threads；受限运动负载后 Mac 仍保持 60Hz，未触发降档；尚未覆盖持续 60-FPS source、最大 decoder throughput、live 30-Hz fallback、任意网络、长期运行或 dynamic resize，实体显示器置黑仍仅是用户观察。当前安装候选 SHA-256 为 `6F3368FE16D05246F54DC6713B0CE7EC3F98B5F508F31AEC2E33305F6DDF8E9A`。证据见 [`Apple HP 延迟验证`](docs/validation/apple-hp-latency-20260904.md) 与 [`双模式记录`](docs/validation/apple-dual-mode-blockers-20260901.md)。 |
+| 完整桌面画面 | Apple HPSS + MVS type-0/type-1 | **已验证** | 2026-08-31 保留固定捕获仅证明采样候选 `c57dc77` 的 Windows wgpu frame-transaction 路径在有界 Apple HPSS/MVS 真机比较中通过；范围、run id 与二进制身份见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。这不证明 Standard adapter，也不证明严格 High Performance 虚拟显示/实体显示器置黑与恢复门禁。 |
 | 增量桌面更新 | ARD 3.10 MVS type-1 | **已验证** | 严格回放 18 条记录并完成有界真机更新；type-1 原位更新持久 CPU surface，只发布 MVS dirty rect，mailbox 不克隆像素，wgpu 只上传对应矩形。`3e375c0` 还把超过 32 个稀疏 dirty rect 确定性分为最多 32 个局部 patch，禁止退化为近整屏的全局包围矩形。2026-08-31 的 `c57dc77` 采样候选通过固定真机比较；后置修复只有离线证据，范围与非结论见 [`windows-apple-wgpu-parity.md`](docs/validation/windows-apple-wgpu-parity.md)。 |
 | 鼠标输入 | Apple 会话输入消息 | **已验证** | 仅窗口与远程内容具备所需焦点时发送；移出窗口不继续注入 |
 | 键盘输入 | Apple 会话输入消息 | **已验证** | 基础按键与修饰键已真机验证；平台 IME 完整适配仍需单列验证 |

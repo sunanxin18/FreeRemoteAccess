@@ -66,13 +66,15 @@ use crate::presentation_timing::{PresentationTimingKey, PresentationTimingTracke
 use crate::repaint::{RepaintPlan, RepaintScheduler};
 use crate::ui_fonts::system_font_definitions;
 use crate::video_decode_worker::{
-    VideoDecodeSender, VideoDecodeWorker, VideoFrameToken, VideoStreamAdmission, VideoWorkerEvent,
-    VideoWorkerEvents,
+    VideoDecodeLoadSnapshot, VideoDecodeSender, VideoDecodeWorker, VideoFrameToken,
+    VideoStreamAdmission, VideoWorkerEvent, VideoWorkerEvents,
 };
+use crate::video_rate_fallback::VideoRateFallbackController;
 use crate::{
     ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeLayouts, ChromeRect,
     ControlIslandPlacement, FloatingChromeController, InputGate, InputOwnership, InputRouter,
-    WindowChromeAdapter, WindowChromeCommand, WindowChromeError,
+    LogicalWindowExtent, WindowChromeAdapter, WindowChromeCommand, WindowChromeError,
+    WindowPresentationController, WindowPresentationMode, WindowPresentationTransition,
 };
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -91,6 +93,10 @@ const TEST_SESSION_CHROME: SessionChromeModel = SessionChromeModel {
     clipboard: CapabilityGlyphState::Unavailable,
     action: Some(IslandAction::Disconnect),
 };
+
+fn protocol_supports_video_rate_fallback(protocol_id: Option<&ProtocolId>) -> bool {
+    protocol_id.is_some_and(|protocol_id| *protocol_id == ProtocolId::apple_high_performance())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForcedRevealError {
@@ -216,6 +222,60 @@ fn completes_first_remote_frame(
     !was_remote_session && is_remote_session && is_full_baseline
 }
 
+fn should_enter_remote_surface_after_focus_gained(
+    page: &AppPage,
+    input: &InputRouter,
+    egui_has_local_keyboard_focus: bool,
+    egui_has_held_input: bool,
+) -> bool {
+    matches!(page, AppPage::RemoteSession { .. })
+        && input.interactive_epoch().is_some()
+        && !egui_has_local_keyboard_focus
+        && !egui_has_held_input
+        && !input.has_remote_held_input()
+}
+
+fn apply_focus_gained_keyboard_domain(
+    page: &AppPage,
+    input: &mut InputRouter,
+    egui_has_local_keyboard_focus: bool,
+    egui_has_held_input: bool,
+) -> Option<frd_core::InputEvent> {
+    let should_enter_remote = should_enter_remote_surface_after_focus_gained(
+        page,
+        input,
+        egui_has_local_keyboard_focus,
+        egui_has_held_input,
+    );
+    input.focus_gained();
+    if should_enter_remote {
+        let _ = input.enter_remote_surface();
+        None
+    } else {
+        input.enter_local_chrome()
+    }
+}
+
+fn transition_after_frame(
+    presentation: &mut WindowPresentationController,
+    was_remote_session: bool,
+    is_remote_session: bool,
+    is_full_baseline: bool,
+) -> Option<WindowPresentationTransition> {
+    completes_first_remote_frame(was_remote_session, is_remote_session, is_full_baseline)
+        .then(|| presentation.observe_first_complete_remote_frame())
+        .flatten()
+}
+
+fn transition_after_cleanup(
+    presentation: &mut WindowPresentationController,
+    returned_to_local_page: bool,
+) -> Option<WindowPresentationTransition> {
+    returned_to_local_page
+        .then(|| presentation.observe_cleanup_returned_local())
+        .flatten()
+}
+
 fn reveal_offline_test_texture_island(
     mode: &DesktopMode,
     input: &InputRouter,
@@ -243,11 +303,83 @@ fn reveal_offline_test_texture_island(
 }
 
 fn control_island_interaction_active(
-    ui_or_tooltip_active: bool,
+    durable_interaction_active: bool,
+    tooltip_active: bool,
     window_move_hovered: bool,
     native_interaction_active: bool,
 ) -> bool {
-    ui_or_tooltip_active || window_move_hovered || native_interaction_active
+    durable_interaction_active || tooltip_active || window_move_hovered || native_interaction_active
+}
+
+fn retained_control_island_interaction_active(
+    _ordinary_hovered_union: bool,
+    focused_union: bool,
+    pressed: bool,
+) -> bool {
+    // Ordinary pointer hover is owned exclusively by the physical island rectangle.
+    focused_union || pressed
+}
+
+fn physical_cursor_in_visible_island(
+    chrome: &FloatingChromeController,
+    chrome_layouts: Option<&ChromeLayouts>,
+    cursor_position: Option<(u32, u32)>,
+) -> bool {
+    chrome.is_visible()
+        && cursor_position.is_some_and(|(x, y)| {
+            chrome_layouts
+                .and_then(|layouts| layouts.overlay.island_rect)
+                .is_some_and(|rect| rect.contains(x, y))
+        })
+}
+
+fn observe_control_island_pin(
+    chrome: &mut FloatingChromeController,
+    chrome_layouts: Option<&ChromeLayouts>,
+    cursor_position: Option<(u32, u32)>,
+    durable_interaction_active: bool,
+    tooltip_active: bool,
+    window_move_hovered: bool,
+    native_interaction_active: bool,
+    now: std::time::Instant,
+) -> bool {
+    let active = physical_cursor_in_visible_island(chrome, chrome_layouts, cursor_position)
+        || control_island_interaction_active(
+            durable_interaction_active,
+            tooltip_active,
+            window_move_hovered,
+            native_interaction_active,
+        );
+    let previous = chrome.state();
+    chrome.observe_island_union(active, active, now);
+    chrome.state() != previous
+}
+
+fn observe_cursor_left_control_island_pin(
+    chrome: &mut FloatingChromeController,
+    chrome_layouts: Option<&ChromeLayouts>,
+    cursor_position: &mut Option<(u32, u32)>,
+    window_move_hovered: &mut bool,
+    tooltip_active: &mut bool,
+    auto_hide_enabled: bool,
+    durable_interaction_active: bool,
+    native_interaction_active: bool,
+    now: std::time::Instant,
+) -> bool {
+    *cursor_position = None;
+    *window_move_hovered = false;
+    *tooltip_active = false;
+    auto_hide_enabled
+        && observe_control_island_pin(
+            chrome,
+            chrome_layouts,
+            *cursor_position,
+            durable_interaction_active,
+            *tooltip_active,
+            *window_move_hovered,
+            native_interaction_active,
+            now,
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -575,6 +707,7 @@ struct PendingLiveSessionPorts {
     commands: mpsc::Sender<SessionCommand>,
     events: mpsc::Receiver<SessionEvent>,
     mailbox: Arc<Mutex<FrameMailbox>>,
+    video_sender: Option<VideoDecodeSender>,
     video_events: VideoWorkerEvents,
 }
 
@@ -584,6 +717,7 @@ struct LiveSessionPorts {
     commands: mpsc::Sender<SessionCommand>,
     events: mpsc::Receiver<SessionEvent>,
     mailbox: Arc<Mutex<FrameMailbox>>,
+    video_sender: Option<VideoDecodeSender>,
     video_events: VideoWorkerEvents,
     frame_compiler: FrameTransactionCompiler,
 }
@@ -596,6 +730,7 @@ impl PendingLiveSessionPorts {
             commands: self.commands,
             events: self.events,
             mailbox: self.mailbox,
+            video_sender: self.video_sender,
             video_events: self.video_events,
             frame_compiler: FrameTransactionCompiler::new(self.session_id),
         }
@@ -972,6 +1107,19 @@ impl SessionHost {
             .is_some_and(|active| active.video_events.is_ready(identity, generation))
     }
 
+    pub fn video_decode_load_snapshot(
+        &self,
+        identity: VideoStreamIdentity,
+        generation: u64,
+    ) -> Option<VideoDecodeLoadSnapshot> {
+        self.active.as_ref().and_then(|active| {
+            (active.session_id == identity.session_id)
+                .then_some(active.video_sender.as_ref())
+                .flatten()?
+                .video_decode_load_snapshot(identity, generation)
+        })
+    }
+
     pub fn drain_frame_updates(&mut self) -> Vec<SurfaceUpdate> {
         self.drain_enqueued_frame_updates()
             .into_iter()
@@ -1278,7 +1426,10 @@ fn launch_live_session(
         command_rx,
         Box::new(ChannelEventSink(event_tx.clone())),
         Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
-        Some(Box::new(DesktopMediaPublisher::new(media_tx, video_sender))),
+        Some(Box::new(DesktopMediaPublisher::new(
+            media_tx,
+            video_sender.clone(),
+        ))),
         Box::new(SharedWake(wake.clone())),
     );
     let session = match factory.create(request, runtime) {
@@ -1371,6 +1522,7 @@ fn launch_live_session(
             commands: command_tx,
             events: event_rx,
             mailbox,
+            video_sender: Some(video_sender),
             video_events,
         },
         start_barrier,
@@ -1995,6 +2147,26 @@ impl DpiTransition {
     }
 }
 
+fn defer_window_presentation_transition(
+    deferred: &mut Option<WindowPresentationTransition>,
+    dpi_transition_pending: bool,
+    transition: WindowPresentationTransition,
+) -> Option<WindowPresentationTransition> {
+    if dpi_transition_pending {
+        *deferred = Some(transition);
+        None
+    } else {
+        Some(transition)
+    }
+}
+
+fn take_deferred_window_presentation_transition(
+    deferred: &mut Option<WindowPresentationTransition>,
+    dpi_transition_pending: bool,
+) -> Option<WindowPresentationTransition> {
+    (!dpi_transition_pending).then(|| deferred.take()).flatten()
+}
+
 #[derive(Default)]
 struct PendingTextureWrites {
     pending: bool,
@@ -2066,34 +2238,91 @@ struct DesktopWindowState {
     video_stage_trace: OwnedVideoStageTrace,
     dpi_transition: DpiTransition,
     pending_texture_writes: PendingTextureWrites,
+    presentation: WindowPresentationController,
+    pending_presentation_transition: Option<WindowPresentationTransition>,
     floating_chrome: FloatingChromeController,
     island_reposition_drag_delta: egui::Vec2,
-    island_ui_interaction_active: bool,
+    island_durable_interaction_active: bool,
+    island_tooltip_active: bool,
     window_move_hovered: bool,
     focus_session_chrome: bool,
 }
 
 impl DesktopWindowState {
-    fn refresh_chrome_geometry(&mut self) -> Option<ChromeLayouts> {
+    fn refresh_chrome_geometry(
+        &mut self,
+        local_page_move: bool,
+        scale_factor: f64,
+    ) -> Option<ChromeLayouts> {
         let insets = self.chrome.native_insets(&self.window);
         let (normalized_center_x, top_points) = self.floating_chrome.normalized_position();
-        let layouts = ChromeGeometrySnapshot::new(
+        let snapshot = ChromeGeometrySnapshot::new(
             self.physical_size.width,
             self.physical_size.height,
-            self.window.scale_factor(),
+            scale_factor,
             insets,
         )?
-        .with_window_capabilities(self.chrome.capabilities())
-        .layouts(
-            ControlIslandPlacement {
-                normalized_center_x,
-                top_points,
-            },
-            self.floating_chrome.is_visible(),
-        )?;
+        .with_window_capabilities(self.chrome.capabilities());
+        let placement = ControlIslandPlacement {
+            normalized_center_x,
+            top_points,
+        };
+        let layouts = if local_page_move {
+            snapshot.local_page_layouts(placement)
+        } else {
+            snapshot.layouts(placement, self.floating_chrome.is_visible())
+        }?;
         self.remote_area = Some(layouts.remote.content_rect);
         self.chrome_layouts = Some(layouts.clone());
         Some(layouts)
+    }
+
+    fn apply_window_presentation_transition(
+        &mut self,
+        transition: WindowPresentationTransition,
+    ) -> bool {
+        let compact = frd_ui_egui::compact_login_metrics();
+        let (extent, minimum) = match transition {
+            WindowPresentationTransition::CompactLocal { extent } => (
+                extent,
+                LogicalSize::new(
+                    f64::from(compact.minimum_window_width),
+                    f64::from(compact.minimum_window_height),
+                ),
+            ),
+            WindowPresentationTransition::RemoteDesktop { extent } => {
+                (extent, LogicalSize::new(520.0, 360.0))
+            }
+        };
+        self.window.set_resizable(true);
+        self.window.set_min_inner_size(Some(minimum));
+        self.window
+            .request_inner_size(LogicalSize::new(extent.width, extent.height))
+            .is_some()
+    }
+
+    fn request_window_presentation_transition(
+        &mut self,
+        transition: WindowPresentationTransition,
+    ) -> bool {
+        let Some(transition) = defer_window_presentation_transition(
+            &mut self.pending_presentation_transition,
+            self.dpi_transition.is_pending(),
+            transition,
+        ) else {
+            return false;
+        };
+        self.apply_window_presentation_transition(transition)
+    }
+
+    fn apply_deferred_window_presentation_transition(&mut self) -> bool {
+        let Some(transition) = take_deferred_window_presentation_transition(
+            &mut self.pending_presentation_transition,
+            self.dpi_transition.is_pending(),
+        ) else {
+            return false;
+        };
+        self.apply_window_presentation_transition(transition)
     }
 
     fn reset_connection_chrome(&mut self, now: std::time::Instant) {
@@ -2102,20 +2331,41 @@ impl DesktopWindowState {
             .set_animations_enabled(self.chrome.appearance_policy().animate);
         self.floating_chrome.force_reveal_after_release(now);
         self.island_reposition_drag_delta = egui::Vec2::ZERO;
-        self.island_ui_interaction_active = false;
+        self.island_durable_interaction_active = false;
+        self.island_tooltip_active = false;
         self.window_move_hovered = false;
     }
 
     fn refresh_control_island_pin(&mut self, now: std::time::Instant) -> bool {
-        let active = control_island_interaction_active(
-            self.island_ui_interaction_active,
+        observe_control_island_pin(
+            &mut self.floating_chrome,
+            self.chrome_layouts.as_ref(),
+            self.cursor_position,
+            self.island_durable_interaction_active,
+            self.island_tooltip_active,
             self.window_move_hovered,
             self.chrome.native_interaction_active(),
-        );
-        let previous = self.floating_chrome.state();
-        self.floating_chrome
-            .observe_island_union(active, active, now);
-        self.floating_chrome.state() != previous
+            now,
+        )
+    }
+
+    fn observe_cursor_left_control_island_pin(
+        &mut self,
+        auto_hide_enabled: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let native_interaction_active = self.chrome.native_interaction_active();
+        observe_cursor_left_control_island_pin(
+            &mut self.floating_chrome,
+            self.chrome_layouts.as_ref(),
+            &mut self.cursor_position,
+            &mut self.window_move_hovered,
+            &mut self.island_tooltip_active,
+            auto_hide_enabled,
+            self.island_durable_interaction_active,
+            native_interaction_active,
+            now,
+        )
     }
 }
 
@@ -2284,6 +2534,7 @@ pub struct DesktopApplication {
     hp_input_diagnostics: HighPerformanceInputShellDiagnostics,
     metrics: FramePipelineMetrics,
     presentation_timing: PresentationTimingTracker,
+    video_rate_fallback: VideoRateFallbackController,
     proxy: EventLoopProxy<DesktopUserEvent>,
     runtime_wake_gate: Arc<RuntimeWakeGate>,
     window: Option<DesktopWindowState>,
@@ -2357,7 +2608,10 @@ fn should_submit_pending_texture_writes(
 mod dpi_transition_tests {
     use frd_core::PixelSize;
 
-    use super::DpiTransition;
+    use super::{
+        defer_window_presentation_transition, take_deferred_window_presentation_transition,
+        DpiTransition,
+    };
 
     #[test]
     fn scale_change_waits_for_the_matching_physical_size() {
@@ -2373,6 +2627,31 @@ mod dpi_transition_tests {
         transition.finish_resize();
         assert!(!transition.is_pending());
         assert_eq!(transition.settle(resized), None);
+    }
+
+    #[test]
+    fn presentation_transition_waits_until_the_dpi_transition_settles() {
+        let transition = crate::WindowPresentationTransition::CompactLocal {
+            extent: crate::LogicalWindowExtent::new(520.0, 600.0),
+        };
+        let mut deferred = None;
+
+        assert_eq!(
+            defer_window_presentation_transition(&mut deferred, true, transition),
+            None
+        );
+        assert_eq!(
+            take_deferred_window_presentation_transition(&mut deferred, true),
+            None
+        );
+        assert_eq!(
+            take_deferred_window_presentation_transition(&mut deferred, false),
+            Some(transition)
+        );
+        assert_eq!(
+            take_deferred_window_presentation_transition(&mut deferred, false),
+            None
+        );
     }
 }
 
@@ -2442,6 +2721,7 @@ impl DesktopApplication {
             hp_input_diagnostics: HighPerformanceInputShellDiagnostics::from_environment(),
             metrics,
             presentation_timing: PresentationTimingTracker::default(),
+            video_rate_fallback: VideoRateFallbackController::default(),
             proxy,
             runtime_wake_gate,
             window: None,
@@ -2485,6 +2765,7 @@ impl DesktopApplication {
             hp_input_diagnostics: HighPerformanceInputShellDiagnostics::from_environment(),
             metrics: FramePipelineMetrics::disabled(),
             presentation_timing: PresentationTimingTracker::default(),
+            video_rate_fallback: VideoRateFallbackController::default(),
             proxy,
             runtime_wake_gate,
             window: None,
@@ -2509,6 +2790,7 @@ impl DesktopApplication {
         &self,
         event_loop: &ActiveEventLoop,
     ) -> Result<DesktopWindowState, FatalReport> {
+        let compact = frd_ui_egui::compact_login_metrics();
         let window = Arc::new(
             event_loop
                 .create_window(
@@ -2516,8 +2798,14 @@ impl DesktopApplication {
                         .with_title("FreeRemoteDesk")
                         .with_window_icon(self.window_configuration.icon.clone())
                         .with_visible(false)
-                        .with_inner_size(LogicalSize::new(1100.0, 720.0))
-                        .with_min_inner_size(LogicalSize::new(520.0, 360.0))
+                        .with_inner_size(LogicalSize::new(
+                            f64::from(compact.initial_window_width),
+                            f64::from(compact.initial_window_height),
+                        ))
+                        .with_min_inner_size(LogicalSize::new(
+                            f64::from(compact.minimum_window_width),
+                            f64::from(compact.minimum_window_height),
+                        ))
                         .with_resizable(true),
                 )
                 .map_err(|_| {
@@ -2638,19 +2926,32 @@ impl DesktopApplication {
             video_stage_trace: OwnedVideoStageTrace::default(),
             dpi_transition: DpiTransition::default(),
             pending_texture_writes: PendingTextureWrites::default(),
+            presentation: WindowPresentationController::new(
+                LogicalWindowExtent::new(
+                    f64::from(compact.initial_window_width),
+                    f64::from(compact.initial_window_height),
+                ),
+                LogicalWindowExtent::new(1100.0, 720.0),
+            ),
+            pending_presentation_transition: None,
             floating_chrome,
             island_reposition_drag_delta: egui::Vec2::ZERO,
-            island_ui_interaction_active: false,
+            island_durable_interaction_active: false,
+            island_tooltip_active: false,
             window_move_hovered: false,
             focus_session_chrome: false,
         };
-        state.refresh_chrome_geometry().ok_or_else(|| {
-            FatalReport::internal(
-                FatalComponent::Window,
-                FatalOperation::Initialize,
-                FatalReason::WindowChromeFailed,
-            )
-        })?;
+        let local_page_move = state.chrome.capabilities().begin_move;
+        let scale_factor = state.window.scale_factor();
+        state
+            .refresh_chrome_geometry(local_page_move, scale_factor)
+            .ok_or_else(|| {
+                FatalReport::internal(
+                    FatalComponent::Window,
+                    FatalOperation::Initialize,
+                    FatalReason::WindowChromeFailed,
+                )
+            })?;
         state.window.set_visible(true);
         Ok(state)
     }
@@ -2676,6 +2977,11 @@ impl DesktopApplication {
 
     fn dispatch_intent(&mut self, intent: AppIntent) {
         let cancelling = matches!(intent, AppIntent::CancelConnect | AppIntent::Disconnect);
+        if matches!(intent, AppIntent::Disconnect) {
+            if let Some(session_id) = self.sessions.active_session_id() {
+                self.video_rate_fallback.retire_session(session_id);
+            }
+        }
         if cancelling {
             self.block_and_release_input();
         }
@@ -2766,6 +3072,7 @@ impl DesktopApplication {
                 | SessionEvent::Closed(_) => {
                     self.metrics.clear_input_probe();
                     self.presentation_timing.reset();
+                    self.video_rate_fallback.retire_session(session_id);
                 }
                 _ => {}
             }
@@ -2802,12 +3109,15 @@ impl DesktopApplication {
         }
 
         let video_admissions = self.sessions.drain_video_admissions();
-        if !video_admissions.is_empty() {
+        let has_video_admissions = !video_admissions.is_empty();
+        if has_video_admissions {
             self.presentation_timing.reset();
             self.launch.controller_mut().clear_presentation_timing();
         }
         let video_events = self.sessions.drain_video_worker_events();
         let active_protocol_id = self.sessions.active_protocol_id();
+        let supports_video_rate_fallback =
+            protocol_supports_video_rate_fallback(active_protocol_id.as_ref());
         let video_drain = if let Some(window) = self.window.as_mut() {
             drain_video_surface_events(window, video_admissions, video_events, active_protocol_id)?
         } else {
@@ -2816,6 +3126,15 @@ impl DesktopApplication {
                 ..VideoSurfaceDrainOutcome::default()
             }
         };
+        if has_video_admissions && supports_video_rate_fallback {
+            if let Some(owner) = self.window.as_ref().and_then(|window| window.video_owner) {
+                self.video_rate_fallback.retain_stream(
+                    owner.identity,
+                    owner.generation,
+                    std::time::Instant::now(),
+                );
+            }
+        }
         outcome.ui_redraw_needed |= video_drain.ui_redraw_needed;
         outcome.frame_redraw_needed |= video_drain.frame_redraw_needed;
         let video_failure = video_drain.failure;
@@ -3032,22 +3351,65 @@ impl DesktopApplication {
         }
     }
 
+    fn sample_video_rate_fallback(&mut self, observed_at: std::time::Instant) {
+        let supports_fallback =
+            protocol_supports_video_rate_fallback(self.sessions.active_protocol_id().as_ref());
+        let Some((identity, generation)) = self
+            .video_rate_fallback
+            .take_due_load_target(observed_at, supports_fallback)
+        else {
+            return;
+        };
+        let snapshot = self
+            .sessions
+            .video_decode_load_snapshot(identity, generation);
+        if let Some(command) =
+            self.video_rate_fallback
+                .observe_load_snapshot(observed_at, supports_fallback, snapshot)
+        {
+            if let Err(error) = self.sessions.send_command(command) {
+                eprintln!("视频源帧率回退命令发送失败：{error:?}");
+            }
+        }
+    }
+
+    fn local_page_window_move_active(&self) -> bool {
+        self.window.as_ref().is_some_and(|window| match &self.mode {
+            DesktopMode::Product => local_page_window_move_enabled(
+                self.launch.controller().page(),
+                self.launch
+                    .controller()
+                    .current_server_identity_challenge()
+                    .is_some(),
+                window.chrome.capabilities(),
+            ),
+            DesktopMode::TestTexture { stage, .. } => {
+                *stage == TestTextureStage::Connection && window.chrome.capabilities().begin_move
+            }
+        })
+    }
+
     fn commit_window_resize(&mut self, size: PixelSize) {
         let mut committed = false;
         let mut presentation_error = None;
+        let local_page_move = self.local_page_window_move_active();
         if let Some(window) = self.window.as_mut() {
             let result = window.compositor.resize(size);
             match window.lifecycle.finish_resize(size, result) {
                 Ok(()) => {
                     window.physical_size = size;
                     window.dpi_transition.finish_resize();
-                    let _ = window.refresh_chrome_geometry();
+                    let scale_factor = window.window.scale_factor();
+                    let _ = window.refresh_chrome_geometry(local_page_move, scale_factor);
                     committed = true;
                 }
                 Err(error) => presentation_error = Some(error),
             }
         }
         if committed {
+            if let Some(window) = self.window.as_mut() {
+                let _ = window.apply_deferred_window_presentation_transition();
+            }
             self.send_viewport_changed();
             self.request_redraw();
         } else if let Some(error) = presentation_error {
@@ -3152,7 +3514,23 @@ impl DesktopApplication {
         } else if !auto_hide_enabled && forced_reveal_diagnostic.is_none() {
             window.floating_chrome.force_reveal_after_release(now);
         }
-        let Some(chrome_layouts) = window.refresh_chrome_geometry() else {
+        let local_page_move = match &self.mode {
+            DesktopMode::Product => local_page_window_move_enabled(
+                self.launch.controller().page(),
+                self.launch
+                    .controller()
+                    .current_server_identity_challenge()
+                    .is_some(),
+                window.chrome.capabilities(),
+            ),
+            DesktopMode::TestTexture { stage, .. } => {
+                *stage == TestTextureStage::Connection && window.chrome.capabilities().begin_move
+            }
+        };
+        let chrome_scale_factor = window.window.scale_factor();
+        let Some(chrome_layouts) =
+            window.refresh_chrome_geometry(local_page_move, chrome_scale_factor)
+        else {
             return;
         };
         let window_maximized = window.window.is_maximized();
@@ -3171,17 +3549,41 @@ impl DesktopApplication {
         let mut tooltip_active = false;
         let mut island_pressed = false;
         let mut island_reposition_delta = egui::Vec2::ZERO;
-        let mut first_remote_frame_presented = false;
-        let chrome_available = product_chrome.is_some();
+        let mut first_remote_frame_boundary = None;
+        let chrome_available = product_chrome.is_some() && !local_page_move;
         let mut output = egui_context.run_ui(raw_input, |root_ui| {
-            if let Some(chrome) = product_chrome.as_ref() {
+            if local_page_move {
+                let mut local_bar_height = frd_ui_egui::compact_login_metrics().window_bar_height;
+                if let Some(bar_rect) = local_window_bar_physical_rect(&chrome_layouts)
+                    .and_then(|rect| chrome_rect_to_logical(rect, chrome_scale_factor))
+                {
+                    local_bar_height = bar_rect.height();
+                    let close_rect = chrome_layouts
+                        .hit_map
+                        .action_rect(IslandAction::CloseWindow)
+                        .and_then(|rect| chrome_rect_to_logical(rect, chrome_scale_factor));
+                    let result =
+                        frd_ui_egui::show_local_window_bar(root_ui.ctx(), bar_rect, close_rect);
+                    rendered_hit_rects.extend(result.hit_rects);
+                    if let Some(action) = result.action {
+                        if let Some(app_intent) = app_intent_for_island_action(action) {
+                            intent = Some(app_intent);
+                        } else {
+                            window_command = window_command_for_island_action(action);
+                        }
+                    }
+                }
+                egui::Panel::top("freeremotedesk-local-page-drag-strip")
+                    .exact_size(local_bar_height)
+                    .frame(egui::Frame::NONE)
+                    .show_separator_line(false)
+                    .show(root_ui, |_| {});
+            }
+            if let Some(chrome) = product_chrome.as_ref().filter(|_| !local_page_move) {
                 let window_capabilities = window.chrome.capabilities();
-                let scale = window.window.scale_factor() as f32;
                 let to_logical = |rect: ChromeRect| {
-                    egui::Rect::from_min_size(
-                        egui::pos2(rect.x as f32 / scale, rect.y as f32 / scale),
-                        egui::vec2(rect.width as f32 / scale, rect.height as f32 / scale),
-                    )
+                    chrome_rect_to_logical(rect, chrome_scale_factor)
+                        .expect("validated chrome scale converts to logical coordinates")
                 };
                 let reveal_line_rect = to_logical(chrome_layouts.overlay.reveal_line_rect);
                 let island_rect = chrome_layouts
@@ -3212,17 +3614,12 @@ impl DesktopApplication {
                 if result.window_move_requested {
                     window_command = Some(WindowChromeCommand::BeginMove);
                 }
-                match result.action {
-                    Some(IslandAction::CancelConnect) => {
-                        intent = Some(AppIntent::CancelConnect);
-                    }
-                    Some(IslandAction::Disconnect) => {
-                        intent = Some(AppIntent::Disconnect);
-                    }
-                    Some(action) => {
+                if let Some(action) = result.action {
+                    if let Some(app_intent) = app_intent_for_island_action(action) {
+                        intent = Some(app_intent);
+                    } else {
                         window_command = window_command_for_island_action(action);
                     }
-                    None => {}
                 }
             }
 
@@ -3237,9 +3634,7 @@ impl DesktopApplication {
                                 connection_busy,
                             );
                         });
-                    } else if controller.current_server_identity_challenge().is_some()
-                        || matches!(controller.page(), AppPage::Failed { .. })
-                    {
+                    } else if local_page_move {
                         egui::CentralPanel::default_margins().show(root_ui, |ui| {
                             intent = frd_ui_egui::show_session_page(
                                 ui,
@@ -3266,8 +3661,12 @@ impl DesktopApplication {
         });
         install_accesskit_root_reveal_action(&mut output.platform_output, chrome_available);
         if auto_hide_enabled && chrome_available {
-            window.island_ui_interaction_active =
-                island_hovered || island_focused || island_pressed || tooltip_active;
+            window.island_durable_interaction_active = retained_control_island_interaction_active(
+                island_hovered,
+                island_focused,
+                island_pressed,
+            );
+            window.island_tooltip_active = tooltip_active;
             window.window_move_hovered = window.cursor_position.is_some_and(|(x, y)| {
                 chrome_layouts
                     .overlay
@@ -3295,23 +3694,11 @@ impl DesktopApplication {
         } else {
             window.island_reposition_drag_delta = egui::Vec2::ZERO;
         }
-        let scale_factor = window.window.scale_factor();
-        let island_actions = rendered_hit_rects
-            .into_iter()
-            .map(|(rect, action)| {
-                logical_rect_to_physical(rect, scale_factor).map(|rect| (rect, action))
-            })
-            .collect::<Option<Vec<_>>>();
-        if let Some(hit_map) = island_actions.and_then(|island_actions| {
-            ChromeHitMap::candidate(
-                chrome_layouts.remote.content_rect,
-                island_actions,
-                chrome_layouts.overlay.island_reposition_handle,
-                chrome_layouts.overlay.window_move_region,
-                Vec::new(),
-            )
-            .and_then(|map| map.with_island_surface(chrome_layouts.overlay.island_rect))
-        }) {
+        if let Some(hit_map) = chrome_hit_map_from_rendered_controls(
+            &chrome_layouts,
+            rendered_hit_rects,
+            chrome_scale_factor,
+        ) {
             window.chrome.publish_hit_map(hit_map.clone());
             window.chrome_hit_map = Some(hit_map);
         }
@@ -3450,8 +3837,8 @@ impl DesktopApplication {
                 );
                 if is_remote_session && completeness == FrameCompleteness::FullBaseline {
                     let egui_context = window.egui_context.clone();
-                    first_remote_frame_presented =
-                        completes_first_remote_frame(was_remote_session, is_remote_session, true);
+                    first_remote_frame_boundary =
+                        Some((was_remote_session, is_remote_session, true));
                     if let Some(release) = self.input.set_gate(InputGate::Interactive {
                         session_id,
                         generation,
@@ -3479,6 +3866,7 @@ impl DesktopApplication {
             Err(error) => Some(error),
         };
         let mut video_timing = None;
+        let mut retained_video_rate_timing = None;
         let video_presentation = video_ready_event_after_confirmation(
             video_token_to_confirm,
             |token| {
@@ -3492,6 +3880,7 @@ impl DesktopApplication {
                     .then_some(())
                     .ok_or(())?;
                 if let Some(local_ingress_at) = token.local_ingress_at() {
+                    let presented_at = std::time::Instant::now();
                     video_timing = self.presentation_timing.observe(
                         PresentationTimingKey {
                             identity: token.identity(),
@@ -3499,8 +3888,16 @@ impl DesktopApplication {
                             worker_epoch_serial: token.worker_epoch_serial(),
                         },
                         local_ingress_at,
-                        std::time::Instant::now(),
+                        presented_at,
                     );
+                    if let Some(timing) = video_timing {
+                        retained_video_rate_timing = Some((
+                            token.identity(),
+                            token.generation(),
+                            presented_at,
+                            std::time::Duration::from_millis(u64::from(timing.smoothed_ms)),
+                        ));
+                    }
                 }
                 Ok::<(), ()>(())
             },
@@ -3540,8 +3937,7 @@ impl DesktopApplication {
                 AppPage::RemoteSession { .. }
             );
             if is_remote_session {
-                first_remote_frame_presented =
-                    completes_first_remote_frame(was_remote_session, is_remote_session, true);
+                first_remote_frame_boundary = Some((was_remote_session, is_remote_session, true));
                 if let Some(release) = self.input.set_gate(InputGate::Interactive {
                     session_id,
                     generation,
@@ -3552,6 +3948,14 @@ impl DesktopApplication {
                 self.send_viewport_changed();
                 self.request_redraw();
             }
+        }
+        if let Some((identity, generation, presented_at, smoothed)) = retained_video_rate_timing {
+            self.video_rate_fallback.retain_present_timing(
+                identity,
+                generation,
+                presented_at,
+                smoothed,
+            );
         }
         if let Some(timing) = video_timing {
             self.launch
@@ -3599,6 +4003,24 @@ impl DesktopApplication {
                 self.request_redraw();
             }
         }
+        let first_remote_frame_presented = first_remote_frame_boundary.is_some_and(
+            |(was_remote_session, is_remote_session, is_full_baseline)| {
+                self.window.as_mut().is_some_and(|window| {
+                    let transition = transition_after_frame(
+                        &mut window.presentation,
+                        was_remote_session,
+                        is_remote_session,
+                        is_full_baseline,
+                    );
+                    if let Some(transition) = transition {
+                        let _ = window.request_window_presentation_transition(transition);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            },
+        );
         if first_remote_frame_presented {
             if let Some(window) = self.window.as_mut() {
                 window.floating_chrome.observe_island_union(
@@ -3948,6 +4370,9 @@ impl DesktopApplication {
     }
 
     fn start_background_cleanup(&mut self) {
+        if let Some(session_id) = self.sessions.active_session_id() {
+            self.video_rate_fallback.retire_session(session_id);
+        }
         let proxy = self.proxy.clone();
         if let Err(failure) = self.sessions.begin_cleanup(move |outcome| {
             let _ = proxy.send_event(DesktopUserEvent::CleanupFinished(outcome));
@@ -4073,6 +4498,8 @@ impl DesktopApplication {
     ) {
         match self.sessions.accept_cleanup_outcome(outcome) {
             Ok(completion) => {
+                self.video_rate_fallback
+                    .retire_session(completion.session_id());
                 if let Some(window) = self.window.as_mut() {
                     transition_video_surface_owner(
                         &mut window.video_owner,
@@ -4094,6 +4521,20 @@ impl DesktopApplication {
                         ),
                     );
                     return;
+                }
+                let returned_to_local_page = cleanup_returned_to_local_page(
+                    self.launch.controller().page(),
+                    self.launch
+                        .controller()
+                        .current_server_identity_challenge()
+                        .is_some(),
+                );
+                if let Some(window) = self.window.as_mut() {
+                    let transition =
+                        transition_after_cleanup(&mut window.presentation, returned_to_local_page);
+                    if let Some(transition) = transition {
+                        let _ = window.request_window_presentation_transition(transition);
+                    }
                 }
             }
             Err(SessionHostError::CleanupFatal(failure)) => {
@@ -4151,6 +4592,9 @@ impl DesktopApplication {
         // Fatal is monotonic. Latch first so no subsequent callback can install
         // a queued launch result while teardown remains on this call stack.
         self.metrics.fatal();
+        if let Some(session_id) = self.sessions.active_session_id() {
+            self.video_rate_fallback.retire_session(session_id);
+        }
         self.block_and_release_input_for_fatal();
         self.detach_window();
         let _ = self.sessions.cancel_pending_launch();
@@ -4371,15 +4815,55 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 self.begin_shutdown(event_loop);
                 return;
             }
-            WindowEvent::Focused(true) => self.input.focus_gained(),
+            WindowEvent::Focused(true) => {
+                let (egui_has_local_keyboard_focus, egui_has_held_input) = self
+                    .window
+                    .as_ref()
+                    .map(|window| {
+                        let egui_has_local_keyboard_focus = window
+                            .egui_context
+                            .memory(|memory| memory.focused().is_some());
+                        let egui_has_held_input = window
+                            .egui_context
+                            .input(|input| !input.keys_down.is_empty() || input.pointer.any_down());
+                        (egui_has_local_keyboard_focus, egui_has_held_input)
+                    })
+                    .unwrap_or((true, true));
+                if let Some(release) = apply_focus_gained_keyboard_domain(
+                    self.launch.controller().page(),
+                    &mut self.input,
+                    egui_has_local_keyboard_focus,
+                    egui_has_held_input,
+                ) {
+                    self.send_input(release);
+                }
+            }
             WindowEvent::Focused(false) => {
                 if let Some(release) = self.input.focus_lost() {
                     self.send_input(release);
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                let auto_hide_enabled = match &self.mode {
+                    DesktopMode::Product => matches!(
+                        self.launch.controller().page(),
+                        AppPage::RemoteSession { .. }
+                    ),
+                    DesktopMode::TestTexture { stage, .. } => {
+                        *stage == TestTextureStage::RemoteSession
+                    }
+                };
+                let pin_changed = self.window.as_mut().is_some_and(|window| {
+                    window.observe_cursor_left_control_island_pin(
+                        auto_hide_enabled,
+                        std::time::Instant::now(),
+                    )
+                });
                 if let Some(release) = self.input.cursor_left() {
                     self.send_input(release);
+                }
+                if pin_changed {
+                    self.request_redraw();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -4391,7 +4875,20 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                     .window
                     .as_ref()
                     .and_then(|window| window.window.is_minimized());
+                let remote_logical_extent = self.window.as_ref().and_then(|window| {
+                    (window.presentation.mode() == WindowPresentationMode::RemoteDesktop).then(
+                        || {
+                            let logical = (*size).to_logical::<f64>(window.window.scale_factor());
+                            LogicalWindowExtent::new(logical.width, logical.height)
+                        },
+                    )
+                });
                 if let Some(size) = PixelSize::new(size.width, size.height) {
+                    if let (Some(window), Some(extent)) =
+                        (self.window.as_mut(), remote_logical_extent)
+                    {
+                        window.presentation.record_user_resize(extent);
+                    }
                     self.commit_window_resize(size);
                 } else if let Some(window) = self.window.as_mut() {
                     window.compositor.pause_presenting();
@@ -4491,6 +4988,7 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             return;
         }
         let now = std::time::Instant::now();
+        self.sample_video_rate_fallback(now);
         self.metrics.advance_phase(now);
         self.publish_metrics_failure();
         let auto_hide_enabled = match &self.mode {
@@ -4549,14 +5047,19 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 .as_ref()
                 .is_some_and(|window| window.physical_size == size);
             if geometry_only {
+                let local_page_move = self.local_page_window_move_active();
                 if let Some(window) = self.window.as_mut() {
-                    let _ = window.refresh_chrome_geometry();
+                    let scale_factor = window.window.scale_factor();
+                    let _ = window.refresh_chrome_geometry(local_page_move, scale_factor);
                 }
                 self.send_viewport_changed();
                 self.request_redraw();
             } else {
                 self.commit_window_resize(size);
             }
+        }
+        if let Some(window) = self.window.as_mut() {
+            let _ = window.apply_deferred_window_presentation_transition();
         }
         if let Some(plan) = self.armed_repaint {
             if now >= plan.deadline {
@@ -4570,6 +5073,9 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             .armed_repaint
             .map(|plan| plan.deadline)
             .into_iter()
+            .chain(self.video_rate_fallback.next_load_observation_deadline(
+                protocol_supports_video_rate_fallback(self.sessions.active_protocol_id().as_ref()),
+            ))
             .chain(self.exit_state.pending_launch_deadline())
             .chain(self.metrics.next_deadline(now))
             .chain(
@@ -4713,6 +5219,66 @@ fn logical_rect_to_physical(rect: egui::Rect, scale_factor: f64) -> Option<Chrom
     })
 }
 
+fn chrome_rect_to_logical(rect: ChromeRect, scale_factor: f64) -> Option<egui::Rect> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 || rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let max_x = rect.x.checked_add(rect.width)?;
+    let max_y = rect.y.checked_add(rect.height)?;
+    let scale = scale_factor as f32;
+    Some(egui::Rect::from_min_max(
+        egui::pos2(rect.x as f32 / scale, rect.y as f32 / scale),
+        egui::pos2(max_x as f32 / scale, max_y as f32 / scale),
+    ))
+}
+
+fn local_window_bar_physical_rect(layouts: &ChromeLayouts) -> Option<ChromeRect> {
+    let mut rects = [
+        layouts.overlay.window_move_region,
+        layouts.hit_map.action_rect(IslandAction::CloseWindow),
+    ]
+    .into_iter()
+    .flatten();
+    let first = rects.next()?;
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x.checked_add(first.width)?;
+    let mut max_y = first.y.checked_add(first.height)?;
+    for rect in rects {
+        min_x = min_x.min(rect.x);
+        min_y = min_y.min(rect.y);
+        max_x = max_x.max(rect.x.checked_add(rect.width)?);
+        max_y = max_y.max(rect.y.checked_add(rect.height)?);
+    }
+    Some(ChromeRect {
+        x: min_x,
+        y: min_y,
+        width: max_x.checked_sub(min_x)?,
+        height: max_y.checked_sub(min_y)?,
+    })
+}
+
+fn chrome_hit_map_from_rendered_controls(
+    layouts: &ChromeLayouts,
+    rendered_hit_rects: Vec<(egui::Rect, IslandAction)>,
+    scale_factor: f64,
+) -> Option<ChromeHitMap> {
+    let actions = rendered_hit_rects
+        .into_iter()
+        .map(|(rect, action)| {
+            logical_rect_to_physical(rect, scale_factor).map(|rect| (rect, action))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ChromeHitMap::candidate(
+        layouts.remote.content_rect,
+        actions,
+        layouts.overlay.island_reposition_handle,
+        layouts.overlay.window_move_region,
+        Vec::new(),
+    )?
+    .with_island_surface(layouts.overlay.island_rect)
+}
+
 fn island_reposition_bounds(
     layouts: &ChromeLayouts,
     physical_size: PixelSize,
@@ -4746,6 +5312,47 @@ fn window_command_for_island_action(action: IslandAction) -> Option<WindowChrome
         | IslandAction::ToggleRemoteAudio
         | IslandAction::OpenClipboard => None,
     }
+}
+
+fn app_intent_for_island_action(action: IslandAction) -> Option<AppIntent> {
+    match action {
+        IslandAction::CancelConnect => Some(AppIntent::CancelConnect),
+        IslandAction::Disconnect => Some(AppIntent::Disconnect),
+        IslandAction::MinimizeWindow
+        | IslandAction::ToggleMaximizeWindow
+        | IslandAction::CloseWindow
+        | IslandAction::ShowSystemMenu
+        | IslandAction::ShowConnectionDetails
+        | IslandAction::ToggleRemoteAudio
+        | IslandAction::OpenClipboard => None,
+    }
+}
+
+fn cleanup_returned_to_local_page(page: &AppPage, has_server_identity_challenge: bool) -> bool {
+    matches!(page, AppPage::ConnectionForm(_) | AppPage::Failed { .. })
+        || (has_server_identity_challenge
+            && matches!(
+                page,
+                AppPage::Connecting {
+                    stage: frd_protocol_api::ConnectionStage::AwaitingIdentityDecision,
+                    ..
+                }
+            ))
+}
+
+fn local_page_window_move_enabled(
+    page: &AppPage,
+    _has_server_identity_challenge: bool,
+    capabilities: frd_ui_model::IslandWindowCapabilities,
+) -> bool {
+    capabilities.begin_move
+        && matches!(
+            page,
+            AppPage::ConnectionForm(_)
+                | AppPage::Connecting { .. }
+                | AppPage::AwaitingFirstFrame { .. }
+                | AppPage::Failed { .. }
+        )
 }
 
 fn pointer_keyboard_ownership(
@@ -5060,6 +5667,20 @@ mod tests {
         VideoSurfaceDrainTarget, WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
+
+    #[test]
+    fn video_rate_fallback_is_enabled_only_for_exact_apple_high_performance() {
+        assert!(super::protocol_supports_video_rate_fallback(Some(
+            &ProtocolId::apple_high_performance()
+        )));
+        assert!(!super::protocol_supports_video_rate_fallback(Some(
+            &ProtocolId::apple_hpss_mvs()
+        )));
+        assert!(!super::protocol_supports_video_rate_fallback(Some(
+            &ProtocolId::rdp()
+        )));
+        assert!(!super::protocol_supports_video_rate_fallback(None));
+    }
 
     #[test]
     fn hp_keyboard_shell_diagnostics_reset_both_stages_for_each_session() {
@@ -5968,6 +6589,7 @@ mod tests {
                 commands,
                 events,
                 mailbox,
+                video_sender: None,
                 video_events: crate::video_decode_worker::VideoWorkerEvents::new(None),
             }
             .accept(),
@@ -6370,6 +6992,190 @@ mod tests {
     }
 
     #[test]
+    fn every_local_page_and_only_local_pages_request_the_platform_move_strip() {
+        let draft = ConnectionDraft::default();
+        assert!(super::local_page_window_move_enabled(
+            &frd_ui_model::Page::ConnectionForm(ConnectionForm::new(draft.clone())),
+            false,
+            frd_ui_model::IslandWindowCapabilities::WINDOWS
+        ));
+        assert!(super::local_page_window_move_enabled(
+            &frd_ui_model::Page::Connecting {
+                draft: draft.clone(),
+                stage: ConnectionStage::Connecting,
+                diagnostics: None,
+            },
+            false,
+            frd_ui_model::IslandWindowCapabilities::WINDOWS
+        ));
+        assert!(super::local_page_window_move_enabled(
+            &frd_ui_model::Page::Connecting {
+                draft: draft.clone(),
+                stage: ConnectionStage::AwaitingIdentityDecision,
+                diagnostics: None,
+            },
+            true,
+            frd_ui_model::IslandWindowCapabilities::WINDOWS
+        ));
+        assert!(super::local_page_window_move_enabled(
+            &frd_ui_model::Page::AwaitingFirstFrame {
+                draft: draft.clone(),
+                stage: ConnectionStage::TransportReady,
+                diagnostics: Some(
+                    "登录信息未能安全保存；本次连接仍可继续，请稍后重试。".to_owned()
+                ),
+            },
+            false,
+            frd_ui_model::IslandWindowCapabilities::WINDOWS
+        ));
+        assert!(super::local_page_window_move_enabled(
+            &frd_ui_model::Page::Failed {
+                draft: draft.clone(),
+                code: "connection_failed".to_owned(),
+            },
+            false,
+            frd_ui_model::IslandWindowCapabilities::WINDOWS
+        ));
+        assert!(!super::local_page_window_move_enabled(
+            &frd_ui_model::Page::Disconnecting {
+                draft: draft.clone(),
+            },
+            false,
+            frd_ui_model::IslandWindowCapabilities::WINDOWS
+        ));
+        assert!(!super::local_page_window_move_enabled(
+            &frd_ui_model::Page::RemoteSession {
+                draft: draft.clone(),
+                capabilities: SessionCapabilities::default(),
+                diagnostics: None,
+            },
+            false,
+            frd_ui_model::IslandWindowCapabilities::WINDOWS
+        ));
+        assert!(!super::local_page_window_move_enabled(
+            &frd_ui_model::Page::ConnectionForm(ConnectionForm::new(ConnectionDraft::default())),
+            false,
+            frd_ui_model::IslandWindowCapabilities::NONE
+        ));
+    }
+
+    #[test]
+    fn focus_gain_enters_remote_surface_only_for_a_clean_interactive_remote_session() {
+        let draft = ConnectionDraft::default();
+        let remote_page = frd_ui_model::Page::RemoteSession {
+            draft: draft.clone(),
+            capabilities: SessionCapabilities::default(),
+            diagnostics: None,
+        };
+        let local_page = frd_ui_model::Page::ConnectionForm(ConnectionForm::new(draft));
+        let mut interactive = crate::InputRouter::default();
+        interactive.set_gate(crate::InputGate::Interactive {
+            session_id: SessionId::allocate(),
+            generation: 1,
+        });
+
+        assert!(super::should_enter_remote_surface_after_focus_gained(
+            &remote_page,
+            &interactive,
+            false,
+            false,
+        ));
+        assert!(!super::should_enter_remote_surface_after_focus_gained(
+            &local_page,
+            &interactive,
+            false,
+            false,
+        ));
+        assert!(!super::should_enter_remote_surface_after_focus_gained(
+            &remote_page,
+            &crate::InputRouter::default(),
+            false,
+            false,
+        ));
+        assert!(!super::should_enter_remote_surface_after_focus_gained(
+            &remote_page,
+            &interactive,
+            true,
+            false,
+        ));
+        assert!(!super::should_enter_remote_surface_after_focus_gained(
+            &remote_page,
+            &interactive,
+            false,
+            true,
+        ));
+
+        interactive.focus_gained();
+        assert!(interactive.enter_remote_surface());
+        let held_key = PhysicalKeyCode::from_usb_hid_usage(0x04);
+        assert!(interactive
+            .key(held_key, KeyState::Pressed, crate::InputOwnership::Remote)
+            .is_some());
+        assert!(!super::should_enter_remote_surface_after_focus_gained(
+            &remote_page,
+            &interactive,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn focus_gain_application_step_overrides_restore_latch_with_current_local_ownership() {
+        fn restore_latched_input() -> crate::InputRouter {
+            let mut input = crate::InputRouter::default();
+            input.focus_gained();
+            input.set_gate(crate::InputGate::Interactive {
+                session_id: SessionId::allocate(),
+                generation: 1,
+            });
+            assert_eq!(
+                input.keyboard_domain(),
+                crate::input::KeyboardDomain::RemoteSurface
+            );
+            assert_eq!(input.focus_lost(), None);
+            assert_eq!(
+                input.keyboard_domain(),
+                crate::input::KeyboardDomain::LocalChrome
+            );
+            input
+        }
+
+        let remote_page = frd_ui_model::Page::RemoteSession {
+            draft: ConnectionDraft::default(),
+            capabilities: SessionCapabilities::default(),
+            diagnostics: None,
+        };
+
+        for (egui_has_local_keyboard_focus, egui_has_held_input) in [(true, false), (false, true)] {
+            let mut input = restore_latched_input();
+
+            assert_eq!(
+                super::apply_focus_gained_keyboard_domain(
+                    &remote_page,
+                    &mut input,
+                    egui_has_local_keyboard_focus,
+                    egui_has_held_input,
+                ),
+                None
+            );
+            assert_eq!(
+                input.keyboard_domain(),
+                crate::input::KeyboardDomain::LocalChrome
+            );
+        }
+
+        let mut input = restore_latched_input();
+        assert_eq!(
+            super::apply_focus_gained_keyboard_domain(&remote_page, &mut input, false, false),
+            None
+        );
+        assert_eq!(
+            input.keyboard_domain(),
+            crate::input::KeyboardDomain::RemoteSurface
+        );
+    }
+
+    #[test]
     fn forced_reveal_blocks_when_release_all_cannot_be_enqueued() {
         let mut input = crate::InputRouter::default();
         input.focus_gained();
@@ -6629,16 +7435,390 @@ mod tests {
     }
 
     #[test]
+    fn presentation_transition_is_driven_by_existing_first_frame_gate() {
+        let mut presentation = crate::WindowPresentationController::new(
+            crate::LogicalWindowExtent::new(520.0, 600.0),
+            crate::LogicalWindowExtent::new(1100.0, 720.0),
+        );
+
+        assert_eq!(
+            super::transition_after_frame(&mut presentation, false, true, false),
+            None
+        );
+        assert_eq!(
+            super::transition_after_frame(&mut presentation, true, true, true),
+            None
+        );
+        assert!(matches!(
+            super::transition_after_frame(&mut presentation, false, true, true),
+            Some(crate::WindowPresentationTransition::RemoteDesktop { extent })
+                if extent == crate::LogicalWindowExtent::new(1100.0, 720.0)
+        ));
+    }
+
+    #[test]
+    fn local_cleanup_transition_waits_for_controller_local_page() {
+        let mut presentation = crate::WindowPresentationController::new(
+            crate::LogicalWindowExtent::new(520.0, 600.0),
+            crate::LogicalWindowExtent::new(1100.0, 720.0),
+        );
+        assert!(presentation.observe_first_complete_remote_frame().is_some());
+        let draft = ConnectionDraft::default();
+        let disconnecting = frd_ui_model::Page::Disconnecting {
+            draft: draft.clone(),
+        };
+        let connection_form = frd_ui_model::Page::ConnectionForm(ConnectionForm::new(draft));
+
+        assert_eq!(
+            super::transition_after_cleanup(
+                &mut presentation,
+                super::cleanup_returned_to_local_page(&disconnecting, false),
+            ),
+            None
+        );
+        assert!(matches!(
+            super::transition_after_cleanup(
+                &mut presentation,
+                super::cleanup_returned_to_local_page(&connection_form, false),
+            ),
+            Some(crate::WindowPresentationTransition::CompactLocal { extent })
+                if extent == crate::LogicalWindowExtent::new(520.0, 600.0)
+        ));
+    }
+
+    #[test]
+    fn local_close_activation_maps_to_native_close() {
+        let layouts =
+            crate::ChromeGeometrySnapshot::new(520, 600, 1.0, crate::NativeChromeInsets::default())
+                .unwrap()
+                .with_window_capabilities(frd_ui_model::IslandWindowCapabilities::WINDOWS)
+                .local_page_layouts(crate::ControlIslandPlacement::default())
+                .expect("compact local chrome geometry");
+        let close = layouts
+            .hit_map
+            .action_rect(frd_ui_model::IslandAction::CloseWindow)
+            .expect("close capability");
+        let drag = layouts
+            .overlay
+            .window_move_region
+            .expect("native move capability");
+        let bar_rect = super::chrome_rect_to_logical(
+            super::local_window_bar_physical_rect(&layouts).expect("local bar geometry"),
+            1.0,
+        )
+        .expect("logical local bar geometry");
+        let close_rect = super::chrome_rect_to_logical(close, 1.0);
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        frd_ui_egui::install_control_island_font(&mut fonts);
+        context.set_fonts(fonts);
+        let mut local_bar_result = None;
+        let mut output = context.run_ui(Default::default(), |context| {
+            local_bar_result = Some(frd_ui_egui::show_local_window_bar(
+                context, bar_rect, close_rect,
+            ));
+        });
+        super::mark_texture_deltas_applied(&mut output.textures_delta);
+        let hit_map = super::chrome_hit_map_from_rendered_controls(
+            &layouts,
+            local_bar_result
+                .expect("local bar renderer returns its hit geometry")
+                .hit_rects,
+            1.0,
+        )
+        .expect("rendered local close geometry publishes atomically");
+
+        let Some(crate::ChromeHitTarget::IslandAction(close_action)) =
+            hit_map.hit_test(close.center())
+        else {
+            panic!("local close remains a UI action");
+        };
+        assert!(super::app_intent_for_island_action(close_action).is_none());
+        assert_eq!(
+            super::window_command_for_island_action(close_action),
+            Some(crate::WindowChromeCommand::Close)
+        );
+        assert_eq!(
+            hit_map.hit_test(drag.center()),
+            Some(crate::ChromeHitTarget::WindowMoveRegion),
+            "the neighboring drag strip remains native HTCAPTION geometry"
+        );
+        assert_eq!(
+            super::pointer_keyboard_ownership(&hit_map, None, close.center()),
+            Some(crate::InputOwnership::Ui)
+        );
+        assert_eq!(
+            super::pointer_keyboard_ownership(&hit_map, None, drag.center()),
+            Some(crate::InputOwnership::Ui)
+        );
+    }
+
+    #[test]
     fn tooltip_window_move_and_native_move_each_keep_the_island_pinned() {
-        for active_source in 0..3 {
-            let sources = [active_source == 0, active_source == 1, active_source == 2];
+        for active_source in 0..4 {
+            let sources = [
+                active_source == 0,
+                active_source == 1,
+                active_source == 2,
+                active_source == 3,
+            ];
             assert!(super::control_island_interaction_active(
-                sources[0], sources[1], sources[2]
+                sources[0], sources[1], sources[2], sources[3]
             ));
         }
         assert!(!super::control_island_interaction_active(
-            false, false, false
+            false, false, false, false
         ));
+    }
+
+    fn visible_island_layout_for_hover_test() -> crate::ChromeLayouts {
+        crate::ChromeGeometrySnapshot::new(1600, 900, 1.0, crate::NativeChromeInsets::default())
+            .expect("valid physical chrome geometry")
+            .layouts(crate::ControlIslandPlacement::default(), true)
+            .expect("visible island geometry")
+    }
+
+    #[test]
+    fn physical_cursor_in_visible_island_background_keeps_it_pinned_without_deadline() {
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        chrome.force_reveal_after_release(now);
+        let layouts = visible_island_layout_for_hover_test();
+        let island = layouts
+            .overlay
+            .island_rect
+            .expect("visible layout publishes the complete island rectangle");
+
+        super::observe_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            Some((island.x + 1, island.y + 1)),
+            false,
+            false,
+            false,
+            false,
+            now,
+        );
+
+        assert_eq!(chrome.state(), crate::ControlIslandState::Pinned);
+        assert_eq!(chrome.next_deadline(), None);
+    }
+
+    #[test]
+    fn physical_cursor_leaving_visible_island_starts_the_700ms_hide_delay() {
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        chrome.force_reveal_after_release(now);
+        let layouts = visible_island_layout_for_hover_test();
+
+        super::observe_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            Some((0, 899)),
+            false,
+            false,
+            false,
+            false,
+            now,
+        );
+
+        assert_eq!(chrome.state(), crate::ControlIslandState::HidePending);
+        assert_eq!(
+            chrome.next_deadline(),
+            Some(now + Duration::from_millis(700))
+        );
+    }
+
+    #[test]
+    fn physical_cursor_reentering_visible_island_cancels_the_pending_hide() {
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        chrome.force_reveal_after_release(now);
+        let layouts = visible_island_layout_for_hover_test();
+        let island = layouts
+            .overlay
+            .island_rect
+            .expect("visible island rectangle");
+
+        super::observe_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            Some((0, 899)),
+            false,
+            false,
+            false,
+            false,
+            now,
+        );
+        assert_eq!(chrome.state(), crate::ControlIslandState::HidePending);
+
+        super::observe_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            Some((island.x + 1, island.y + 1)),
+            false,
+            false,
+            false,
+            false,
+            now + Duration::from_millis(100),
+        );
+
+        assert_eq!(chrome.state(), crate::ControlIslandState::Pinned);
+        assert_eq!(chrome.next_deadline(), None);
+    }
+
+    #[test]
+    fn cursor_left_clears_stale_inside_cursor_and_reentry_cancels_pending_hide() {
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        chrome.force_reveal_after_release(now);
+        let layouts = visible_island_layout_for_hover_test();
+        let island = layouts
+            .overlay
+            .island_rect
+            .expect("visible island rectangle");
+        let mut cursor_position = Some((island.x + 1, island.y + 1));
+        let mut window_move_hovered = true;
+        let mut tooltip_active = false;
+
+        assert!(super::observe_cursor_left_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            &mut cursor_position,
+            &mut window_move_hovered,
+            &mut tooltip_active,
+            true,
+            false,
+            false,
+            now,
+        ));
+        assert_eq!(cursor_position, None);
+        assert!(!window_move_hovered);
+        assert_eq!(chrome.state(), crate::ControlIslandState::HidePending);
+        assert_eq!(
+            chrome.next_deadline(),
+            Some(now + Duration::from_millis(700))
+        );
+
+        cursor_position = Some((island.x + 1, island.y + 1));
+        assert!(super::observe_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            cursor_position,
+            false,
+            false,
+            false,
+            false,
+            now + Duration::from_millis(100),
+        ));
+        assert_eq!(chrome.state(), crate::ControlIslandState::Pinned);
+        assert_eq!(chrome.next_deadline(), None);
+    }
+
+    #[test]
+    fn cursor_left_discards_stale_ordinary_egui_hover_and_pointer_tooltip() {
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        chrome.force_reveal_after_release(now);
+        let layouts = visible_island_layout_for_hover_test();
+        let island = layouts
+            .overlay
+            .island_rect
+            .expect("visible island rectangle");
+        let mut cursor_position = Some((island.x + 1, island.y + 1));
+        let mut window_move_hovered = false;
+        let stale_ordinary_egui_hover = true;
+        let durable_interaction = super::retained_control_island_interaction_active(
+            stale_ordinary_egui_hover,
+            false,
+            false,
+        );
+        let mut pointer_tooltip_active = true;
+
+        assert!(!durable_interaction, "ordinary egui hover is not durable");
+        assert!(super::observe_cursor_left_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            &mut cursor_position,
+            &mut window_move_hovered,
+            &mut pointer_tooltip_active,
+            true,
+            durable_interaction,
+            false,
+            now,
+        ));
+        assert_eq!(cursor_position, None);
+        assert!(!pointer_tooltip_active);
+        assert_eq!(chrome.state(), crate::ControlIslandState::HidePending);
+        assert_eq!(
+            chrome.next_deadline(),
+            Some(now + Duration::from_millis(700))
+        );
+    }
+
+    #[test]
+    fn cursor_left_retains_keyboard_focus_and_pressed_control_pinning() {
+        let now = Instant::now();
+        let layouts = visible_island_layout_for_hover_test();
+        let island = layouts
+            .overlay
+            .island_rect
+            .expect("visible island rectangle");
+
+        for (focused, pressed) in [(true, false), (false, true)] {
+            let mut chrome = crate::FloatingChromeController::connected_default(now);
+            chrome.force_reveal_after_release(now);
+            let mut cursor_position = Some((island.x + 1, island.y + 1));
+            let mut window_move_hovered = false;
+            let mut pointer_tooltip_active = true;
+            let durable_interaction =
+                super::retained_control_island_interaction_active(false, focused, pressed);
+
+            assert!(!super::observe_cursor_left_control_island_pin(
+                &mut chrome,
+                Some(&layouts),
+                &mut cursor_position,
+                &mut window_move_hovered,
+                &mut pointer_tooltip_active,
+                true,
+                durable_interaction,
+                false,
+                now,
+            ));
+            assert_eq!(cursor_position, None);
+            assert!(!pointer_tooltip_active);
+            assert_eq!(chrome.state(), crate::ControlIslandState::Pinned);
+            assert_eq!(chrome.next_deadline(), None);
+        }
+    }
+
+    #[test]
+    fn hidden_reveal_line_does_not_pin_the_control_island() {
+        let now = Instant::now();
+        let mut chrome = crate::FloatingChromeController::connected_default(now);
+        let layouts = crate::ChromeGeometrySnapshot::new(
+            1600,
+            900,
+            1.0,
+            crate::NativeChromeInsets::default(),
+        )
+        .expect("valid physical chrome geometry")
+        .layouts(crate::ControlIslandPlacement::default(), false)
+        .expect("hidden island geometry");
+
+        super::observe_control_island_pin(
+            &mut chrome,
+            Some(&layouts),
+            Some(layouts.overlay.reveal_line_rect.center()),
+            false,
+            false,
+            false,
+            false,
+            now,
+        );
+
+        assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
+        assert_eq!(chrome.next_deadline(), None);
     }
 
     #[test]

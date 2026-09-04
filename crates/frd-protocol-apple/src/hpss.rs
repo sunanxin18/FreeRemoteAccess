@@ -22,7 +22,10 @@ use crate::connection::AppleConnection as RfbConn;
 use crate::dynamic_resolution::DisplaySize;
 use crate::media_negotiation::{self, MediaStreamAnswer};
 use crate::media_protocol::{self, MediaStreamPortAnnouncement};
-use crate::media_transport::{MediaDatagram, MediaRole, MediaTransport, MediaTransportPhase};
+use crate::media_transport::{
+    MediaDatagram, MediaDiscardCounters, MediaRole, MediaSocketReceiveBufferCapacity,
+    MediaTransport, MediaTransportPhase,
+};
 use crate::mvs::{self, MvsRecordKind, MVS_FULL_FRAME_SIGNATURE};
 use crate::mvs_stream::{MvsRecord, MvsRecordAssembler, MvsRect, MAX_MVS_RECORD_PAYLOAD};
 use crate::protocol;
@@ -78,6 +81,35 @@ const DISPLAY_NAME_WIRE_CAPACITY_FIELD: u8 = DISPLAY_NAME_WIRE_CAPACITY as u8;
 const DISPLAY_QUERY_VERSION_BYTES: [u8; 3] = [0x00, 0x00, 0x01];
 const DISPLAY_QUERY_RESERVED_FIELD: u32 = 0;
 const DISPLAY_QUERY_RESERVED_FIELD_COUNT: usize = 2;
+const HIGH_PERFORMANCE_DISPLAY_RECORD_BYTES: u16 = 0x0128;
+const HIGH_PERFORMANCE_DISPLAY_NAME_BYTES: usize = 120;
+const HIGH_PERFORMANCE_DISPLAY_WIDTH_MM_BITS: u32 = 0x43b8_ba2f;
+const HIGH_PERFORMANCE_DISPLAY_HEIGHT_MM_BITS: u32 = 0x434f_d174;
+const HIGH_PERFORMANCE_DISPLAY_MAX_PIXEL_WIDTH: u32 = 3840;
+const HIGH_PERFORMANCE_DISPLAY_MAX_PIXEL_HEIGHT: u32 = 2160;
+const HIGH_PERFORMANCE_DISPLAY_UNKNOWN_CONFIG: u32 = 7;
+const HIGH_PERFORMANCE_DISPLAY_MODE_COUNT: u16 = 5;
+const HIGH_PERFORMANCE_DISPLAY_MODE_BYTES: usize = 0x1c;
+const HIGH_PERFORMANCE_DISPLAY_REFRESH_RATE_30_HZ_BITS: u64 = 0x403e_0000_0000_0000;
+const HIGH_PERFORMANCE_DISPLAY_REFRESH_RATE_60_HZ_BITS: u64 = 0x404e_0000_0000_0000;
+
+/// Apple High Performance `0x1d` 显示模式的显式刷新率档位。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HighPerformanceRefreshTier {
+    /// 30.0 Hz 降级档位。
+    Hz30,
+    /// 60.0 Hz 首选档位。
+    Hz60,
+}
+
+impl HighPerformanceRefreshTier {
+    fn wire_bits(self) -> u64 {
+        match self {
+            Self::Hz30 => HIGH_PERFORMANCE_DISPLAY_REFRESH_RATE_30_HZ_BITS,
+            Self::Hz60 => HIGH_PERFORMANCE_DISPLAY_REFRESH_RATE_60_HZ_BITS,
+        }
+    }
+}
 
 struct SetDisplayConfiguration<'a> {
     display_name: &'a str,
@@ -104,6 +136,108 @@ impl SetDisplayConfiguration<'_> {
             SET_DISPLAY_CONFIGURATION_WIRE_BYTES,
             SET_DISPLAY_CONFIGURATION_RESERVED_BYTE,
         );
+        message
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HighPerformanceDisplayMode {
+    pixel_width: u32,
+    pixel_height: u32,
+    point_width: u32,
+    point_height: u32,
+}
+
+impl HighPerformanceDisplayMode {
+    fn encode_into(self, message: &mut Vec<u8>, refresh_tier: HighPerformanceRefreshTier) {
+        message.extend_from_slice(&self.pixel_width.to_be_bytes());
+        message.extend_from_slice(&self.pixel_height.to_be_bytes());
+        message.extend_from_slice(&self.point_width.to_be_bytes());
+        message.extend_from_slice(&self.point_height.to_be_bytes());
+        message.extend_from_slice(&refresh_tier.wire_bits().to_be_bytes());
+        message.extend_from_slice(&0u32.to_be_bytes());
+    }
+}
+
+struct HighPerformanceSetDisplayConfiguration<'a> {
+    display_name: &'a str,
+    primary: DisplaySize,
+    refresh_tier: HighPerformanceRefreshTier,
+}
+
+impl HighPerformanceSetDisplayConfiguration<'_> {
+    fn encode(self) -> Vec<u8> {
+        let mut display_name = [0u8; HIGH_PERFORMANCE_DISPLAY_NAME_BYTES];
+        let copied_name_bytes = self
+            .display_name
+            .len()
+            .min(HIGH_PERFORMANCE_DISPLAY_NAME_BYTES - 1);
+        display_name[..copied_name_bytes]
+            .copy_from_slice(&self.display_name.as_bytes()[..copied_name_bytes]);
+
+        let primary_pixel_width = u32::from(self.primary.width);
+        let primary_pixel_height = u32::from(self.primary.height);
+        let modes = [
+            HighPerformanceDisplayMode {
+                pixel_width: primary_pixel_width,
+                pixel_height: primary_pixel_height,
+                point_width: primary_pixel_width,
+                point_height: primary_pixel_height,
+            },
+            HighPerformanceDisplayMode {
+                pixel_width: 2880,
+                pixel_height: 1800,
+                point_width: 1440,
+                point_height: 900,
+            },
+            HighPerformanceDisplayMode {
+                pixel_width: 3840,
+                pixel_height: 2160,
+                point_width: 1920,
+                point_height: 1080,
+            },
+            HighPerformanceDisplayMode {
+                pixel_width: 2880,
+                pixel_height: 1620,
+                point_width: 1440,
+                point_height: 810,
+            },
+            HighPerformanceDisplayMode {
+                pixel_width: 2624,
+                pixel_height: 1696,
+                point_width: 1312,
+                point_height: 848,
+            },
+        ];
+
+        let mut message = Vec::with_capacity(SET_DISPLAY_CONFIGURATION_WIRE_BYTES);
+        message.push(HpssClientMessageType::SetDisplayConfiguration as u8);
+        message.push(0);
+        message.extend_from_slice(&0x0130u16.to_be_bytes());
+        message.extend_from_slice(&1u16.to_be_bytes());
+        message.extend_from_slice(&1u16.to_be_bytes());
+        message.extend_from_slice(&0u32.to_be_bytes());
+        message.extend_from_slice(&HIGH_PERFORMANCE_DISPLAY_RECORD_BYTES.to_be_bytes());
+        message.extend_from_slice(&display_name);
+        message.extend_from_slice(&0u32.to_be_bytes());
+        message.extend_from_slice(&0u32.to_be_bytes());
+        message.extend_from_slice(&HIGH_PERFORMANCE_DISPLAY_WIDTH_MM_BITS.to_be_bytes());
+        message.extend_from_slice(&HIGH_PERFORMANCE_DISPLAY_HEIGHT_MM_BITS.to_be_bytes());
+        message.extend_from_slice(&HIGH_PERFORMANCE_DISPLAY_MAX_PIXEL_WIDTH.to_be_bytes());
+        message.extend_from_slice(&HIGH_PERFORMANCE_DISPLAY_MAX_PIXEL_HEIGHT.to_be_bytes());
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message.extend_from_slice(&HIGH_PERFORMANCE_DISPLAY_UNKNOWN_CONFIG.to_be_bytes());
+        message.extend_from_slice(&HIGH_PERFORMANCE_DISPLAY_MODE_COUNT.to_be_bytes());
+        for mode in modes {
+            let mode_start = message.len();
+            mode.encode_into(&mut message, self.refresh_tier);
+            debug_assert_eq!(
+                message.len() - mode_start,
+                HIGH_PERFORMANCE_DISPLAY_MODE_BYTES
+            );
+        }
+        debug_assert_eq!(message.len(), SET_DISPLAY_CONFIGURATION_WIRE_BYTES);
         message
     }
 }
@@ -144,6 +278,8 @@ pub struct HpssStats {
     pub authenticated_video_rtp_packets: usize,
     pub authenticated_video_rtp_payload_bytes: usize,
     pub authenticated_rtcp_packets: usize,
+    pub media_discard_counters: MediaDiscardCounters,
+    pub media_receive_buffer_capacities: Vec<MediaSocketReceiveBufferCapacity>,
     pub unknown: Vec<u8>,
 }
 
@@ -155,6 +291,8 @@ pub struct HpssSession {
     pub media_answer_frame: Option<Vec<u8>>,
     /// 通过 SRTP 认证并解密的音频 RTP 诊断捕获。
     pub audio_rtp_capture: AudioRtpCapture,
+    /// 通过 SRTP 认证并解密的视频 RTP 诊断捕获。
+    pub video_rtp_capture: VideoRtpCapture,
 }
 
 const MVS_CAPTURE_MAGIC: &[u8; 8] = b"FRDMVS01";
@@ -168,7 +306,42 @@ const MAX_MALFORMED_TABLE_DIAGNOSTICS: usize = 1;
 const AUDIO_RTP_CAPTURE_MAGIC: &[u8; 8] = b"FRDRTP01";
 const AUDIO_RTP_CAPTURE_RECORD_LENGTH_BYTES: usize = size_of::<u32>();
 const MAX_AUDIO_RTP_CAPTURE_BYTES: usize = 16 * crate::protocol::limits::BINARY_MEBIBYTE_BYTES;
+const VIDEO_RTP_CAPTURE_MAGIC: &[u8; 8] = b"FRDVTP01";
+const VIDEO_RTP_CAPTURE_ROLE_BYTES: usize = size_of::<u8>();
+const VIDEO_RTP_CAPTURE_RECORD_LENGTH_BYTES: usize = size_of::<u32>();
+const MAX_VIDEO_RTP_CAPTURE_BYTES: usize = 32 * crate::protocol::limits::BINARY_MEBIBYTE_BYTES;
+const TCP_CONTROL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const TCP_CONTROL_ACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(5);
 const UDP_MEDIA_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HpssPollRound {
+    tcp_read_timeout_update: Option<Duration>,
+    drain_udp: bool,
+}
+
+#[derive(Debug, Default)]
+struct HpssPollScheduler {
+    applied_tcp_read_timeout: Option<Duration>,
+}
+
+impl HpssPollScheduler {
+    fn next_round(&mut self, media_phase: MediaTransportPhase) -> HpssPollRound {
+        let drain_udp = media_phase == MediaTransportPhase::Active;
+        let required_timeout = if drain_udp {
+            TCP_CONTROL_ACTIVE_READ_TIMEOUT
+        } else {
+            TCP_CONTROL_HANDSHAKE_READ_TIMEOUT
+        };
+        let tcp_read_timeout_update =
+            (self.applied_tcp_read_timeout != Some(required_timeout)).then_some(required_timeout);
+        self.applied_tcp_read_timeout = Some(required_timeout);
+        HpssPollRound {
+            tcp_read_timeout_update,
+            drain_udp,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct AudioRtpCapture {
@@ -209,6 +382,66 @@ impl AudioRtpCapture {
         }
         self.encoded.extend_from_slice(&packet_len.to_be_bytes());
         self.encoded.extend_from_slice(packet);
+        self.packet_count += 1;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct VideoRtpCapture {
+    encoded: Option<Vec<u8>>,
+    packet_count: usize,
+}
+
+impl Default for VideoRtpCapture {
+    fn default() -> Self {
+        Self {
+            encoded: None,
+            packet_count: 0,
+        }
+    }
+}
+
+impl VideoRtpCapture {
+    fn enabled() -> Self {
+        Self {
+            encoded: Some(VIDEO_RTP_CAPTURE_MAGIC.to_vec()),
+            packet_count: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packet_count == 0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.encoded.as_deref().unwrap_or_default()
+    }
+
+    fn push(&mut self, role: MediaRole, packet: &[u8]) -> Result<()> {
+        let Some(encoded) = self.encoded.as_mut() else {
+            return Ok(());
+        };
+        let role = match role {
+            MediaRole::VideoStream1 => 1,
+            MediaRole::VideoStream2 => 2,
+            MediaRole::Audio => bail!("Video RTP 捕获不支持的媒体角色"),
+        };
+        let packet_len = u32::try_from(packet.len()).context("Video RTP 包长度超过 u32")?;
+        let record_bytes = VIDEO_RTP_CAPTURE_ROLE_BYTES
+            .checked_add(VIDEO_RTP_CAPTURE_RECORD_LENGTH_BYTES)
+            .and_then(|length| length.checked_add(packet.len()))
+            .context("Video RTP 捕获记录长度溢出")?;
+        let next_len = encoded
+            .len()
+            .checked_add(record_bytes)
+            .context("Video RTP 捕获文件长度溢出")?;
+        if next_len > MAX_VIDEO_RTP_CAPTURE_BYTES {
+            bail!("Video RTP 捕获超过最大允许容量");
+        }
+        encoded.push(role);
+        encoded.extend_from_slice(&packet_len.to_be_bytes());
+        encoded.extend_from_slice(packet);
         self.packet_count += 1;
         Ok(())
     }
@@ -400,6 +633,20 @@ fn record_complete_mvs(
 /// 构造 0x1d SetDisplayConfiguration（308B，真机抓包对齐）
 pub fn build_set_display_config(display_name: &str) -> Vec<u8> {
     SetDisplayConfiguration { display_name }.encode()
+}
+
+/// 构造 Apple High Performance 初始虚拟显示使用的已恢复 0x1d wire。
+pub fn build_high_performance_set_display_config(
+    display_name: &str,
+    primary: DisplaySize,
+    refresh_tier: HighPerformanceRefreshTier,
+) -> Vec<u8> {
+    HighPerformanceSetDisplayConfiguration {
+        display_name,
+        primary,
+        refresh_tier,
+    }
+    .encode()
 }
 
 /// 构造现有 HPSS 路径使用的 16 字节 0x09 显示尺寸查询。
@@ -650,6 +897,7 @@ pub fn run(
     init_w: u16,
     init_h: u16,
     sink: Option<&mut dyn std::io::Write>,
+    capture_video_rtp: bool,
 ) -> Result<HpssSession> {
     let media_server_address = conn.peer_addr()?.ip();
     let media_bind_address = conn.local_addr()?.ip();
@@ -688,34 +936,44 @@ pub fn run(
         stats: HpssStats::default(),
         media_answer_frame: None,
         audio_rtp_capture: AudioRtpCapture::default(),
+        video_rtp_capture: if capture_video_rtp {
+            VideoRtpCapture::enabled()
+        } else {
+            VideoRtpCapture::default()
+        },
     };
     let mut collector = HpssMvsCollector::default();
-    conn.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut poll_scheduler = HpssPollScheduler::default();
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut last_full_request = Instant::now();
     let mut seen_full_frame = false;
     let mut tcp_control_open = true;
 
     while Instant::now() < deadline {
-        if media_transport.phase() == MediaTransportPhase::Active {
+        let media_phase = media_transport.phase();
+        let poll_round = poll_scheduler.next_round(media_phase);
+        if let Some(read_timeout) = poll_round.tcp_read_timeout_update {
+            conn.set_read_timeout(Some(read_timeout))?;
+        }
+        if poll_round.drain_udp {
             media_transport
                 .service_control_reports_at(0, Instant::now())
                 .context("发送周期 SRTCP 控制报告失败")?;
         }
+        let accepted_udp = if poll_round.drain_udp {
+            receive_one_udp_round(&mut media_transport, &mut sess)?
+        } else {
+            0
+        };
         if !tcp_control_open {
-            if receive_one_udp_round(&mut media_transport, &mut sess)? == 0 {
+            if accepted_udp == 0 {
                 std::thread::sleep(UDP_MEDIA_IDLE_POLL_INTERVAL);
             }
             continue;
         }
         let m = match conn.read_app_frame() {
             Ok(m) => m,
-            Err(e) if crate::connection::is_timeout(&e) => {
-                if media_transport.phase() == MediaTransportPhase::Active {
-                    receive_one_udp_round(&mut media_transport, &mut sess)?;
-                }
-                continue;
-            }
+            Err(e) if crate::connection::is_timeout(&e) => continue,
             Err(e)
                 if crate::connection::is_peer_closed(&e)
                     && media_transport.phase() == MediaTransportPhase::Active =>
@@ -856,8 +1114,28 @@ pub fn run(
             },
         }
     }
+    snapshot_media_transport_diagnostics(&mut sess, &media_transport)?;
     media_transport.close(0)?;
     Ok(sess)
+}
+
+fn snapshot_media_transport_diagnostics(
+    session: &mut HpssSession,
+    media_transport: &MediaTransport,
+) -> Result<()> {
+    session.stats.media_discard_counters = media_transport.discard_counters();
+    session.stats.media_receive_buffer_capacities = media_transport.receive_buffer_capacities(0)?;
+    let counters = session.stats.media_discard_counters;
+    eprintln!(
+        "[hpss] UDP 传输丢弃统计：unexpected_source={} empty={} truncated={} malformed={} auth_failed={} replay_or_too_old={}",
+        counters.unexpected_source,
+        counters.empty_datagram,
+        counters.truncated_header,
+        counters.malformed_packet,
+        counters.authentication_failed,
+        counters.replay_or_too_old
+    );
+    Ok(())
 }
 
 fn receive_one_udp_round(
@@ -891,6 +1169,7 @@ fn record_authenticated_datagram(
                 MediaRole::VideoStream1 | MediaRole::VideoStream2 => {
                     session.stats.authenticated_video_rtp_packets += 1;
                     session.stats.authenticated_video_rtp_payload_bytes += payload_bytes;
+                    session.video_rtp_capture.push(role, &packet)?;
                 }
             }
         }
@@ -1064,7 +1343,32 @@ mod tests {
             stats: HpssStats::default(),
             media_answer_frame: None,
             audio_rtp_capture: AudioRtpCapture::default(),
+            video_rtp_capture: VideoRtpCapture::default(),
         }
+    }
+
+    #[test]
+    fn media_activation_switches_to_fair_udp_polling_every_round() {
+        let mut scheduler = HpssPollScheduler::default();
+
+        let handshake = scheduler.next_round(MediaTransportPhase::ConfigSent);
+        assert!(!handshake.drain_udp);
+        assert_eq!(
+            handshake.tcp_read_timeout_update,
+            Some(TCP_CONTROL_HANDSHAKE_READ_TIMEOUT)
+        );
+
+        let first_active = scheduler.next_round(MediaTransportPhase::Active);
+        assert!(first_active.drain_udp);
+        assert_eq!(
+            first_active.tcp_read_timeout_update,
+            Some(TCP_CONTROL_ACTIVE_READ_TIMEOUT)
+        );
+        assert!(TCP_CONTROL_ACTIVE_READ_TIMEOUT <= UDP_MEDIA_IDLE_POLL_INTERVAL);
+
+        let next_active = scheduler.next_round(MediaTransportPhase::Active);
+        assert!(next_active.drain_udp);
+        assert_eq!(next_active.tcp_read_timeout_update, None);
     }
 
     #[test]
@@ -1088,6 +1392,12 @@ mod tests {
         let counters = loopback.transport.discard_counters();
         assert_eq!(counters.unexpected_source, 1);
         assert_eq!(counters.empty_datagram, 1);
+        snapshot_media_transport_diagnostics(&mut session, &loopback.transport).unwrap();
+        assert_eq!(session.stats.media_discard_counters, counters);
+        let capacities = &session.stats.media_receive_buffer_capacities;
+        assert_eq!(capacities.len(), 1);
+        assert_eq!(capacities[0].role, MediaRole::Audio);
+        assert!(capacities[0].actual_bytes > 0);
     }
 
     #[test]
@@ -1203,6 +1513,7 @@ mod tests {
             stats: HpssStats::default(),
             media_answer_frame: None,
             audio_rtp_capture: AudioRtpCapture::default(),
+            video_rtp_capture: VideoRtpCapture::default(),
         };
         let record = MvsRecord {
             rect: MvsRect {
@@ -1234,6 +1545,7 @@ mod tests {
             stats: HpssStats::default(),
             media_answer_frame: None,
             audio_rtp_capture: AudioRtpCapture::default(),
+            video_rtp_capture: VideoRtpCapture::default(),
         };
 
         record_authenticated_datagram(
@@ -1270,12 +1582,100 @@ mod tests {
     }
 
     #[test]
+    fn video_rtp_capture_uses_role_tagged_versioned_format() {
+        let stream_one_packet = test_rtp_packet(1, b"stream-one");
+        let stream_two_packet = test_rtp_packet(2, b"stream-two");
+        let mut capture = VideoRtpCapture::enabled();
+
+        capture
+            .push(MediaRole::VideoStream1, &stream_one_packet)
+            .unwrap();
+        capture
+            .push(MediaRole::VideoStream2, &stream_two_packet)
+            .unwrap();
+
+        let mut expected = b"FRDVTP01".to_vec();
+        expected.push(1);
+        expected.extend_from_slice(&(stream_one_packet.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&stream_one_packet);
+        expected.push(2);
+        expected.extend_from_slice(&(stream_two_packet.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&stream_two_packet);
+        assert_eq!(capture.as_bytes(), expected);
+    }
+
+    #[test]
+    fn video_rtp_capture_rejects_non_video_roles_and_budget_overflow() {
+        let packet = test_rtp_packet(1, b"video");
+        let mut capture = VideoRtpCapture::enabled();
+
+        let non_video = capture.push(MediaRole::Audio, &packet).unwrap_err();
+        assert!(format!("{non_video:#}").contains("Video RTP 捕获不支持的媒体角色"));
+
+        capture
+            .encoded
+            .as_mut()
+            .unwrap()
+            .resize(MAX_VIDEO_RTP_CAPTURE_BYTES, 0);
+        let overflow = capture.push(MediaRole::VideoStream1, &packet).unwrap_err();
+        assert!(format!("{overflow:#}").contains("Video RTP 捕获超过最大允许容量"));
+    }
+
+    #[test]
+    fn authenticated_video_rtcp_is_not_written_to_video_rtp_capture() {
+        let mut session = empty_hpss_session();
+        session.video_rtp_capture = VideoRtpCapture::enabled();
+        let rtp = test_rtp_packet(1, b"video");
+
+        record_authenticated_datagram(
+            &mut session,
+            MediaRole::VideoStream1,
+            MediaDatagram::Rtp(rtp.clone()),
+        )
+        .unwrap();
+        record_authenticated_datagram(
+            &mut session,
+            MediaRole::VideoStream2,
+            MediaDatagram::Rtcp(vec![0x80, 201, 0, 1]),
+        )
+        .unwrap();
+
+        let mut expected = b"FRDVTP01".to_vec();
+        expected.push(1);
+        expected.extend_from_slice(&(rtp.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&rtp);
+        assert_eq!(session.video_rtp_capture.as_bytes(), expected);
+        assert_eq!(session.stats.authenticated_rtcp_packets, 1);
+    }
+
+    #[test]
+    fn disabled_video_rtp_capture_does_not_accumulate_or_exhaust_budget() {
+        const PAYLOAD_BYTES: usize = 64 * 1024;
+        let mut session = empty_hpss_session();
+        let packet = test_rtp_packet(1, &vec![0x5a; PAYLOAD_BYTES]);
+        let packet_count = MAX_VIDEO_RTP_CAPTURE_BYTES / packet.len() + 2;
+
+        for _ in 0..packet_count {
+            record_authenticated_datagram(
+                &mut session,
+                MediaRole::VideoStream1,
+                MediaDatagram::Rtp(packet.clone()),
+            )
+            .expect("未启用视频捕获不得因诊断预算终止 UDP 产品会话");
+        }
+
+        assert_eq!(session.stats.authenticated_video_rtp_packets, packet_count);
+        assert_eq!(session.video_rtp_capture.as_bytes(), []);
+    }
+
+    #[test]
     fn authenticated_rtcp_has_a_separate_counter() {
         let mut session = HpssSession {
             display: None,
             stats: HpssStats::default(),
             media_answer_frame: None,
             audio_rtp_capture: AudioRtpCapture::default(),
+            video_rtp_capture: VideoRtpCapture::default(),
         };
 
         record_authenticated_datagram(
@@ -1313,6 +1713,87 @@ mod tests {
         ]);
 
         assert_eq!(m, expected);
+    }
+
+    #[test]
+    fn high_performance_set_display_config_encodes_exact_60_hz_primary_tier() {
+        let display_name = "D".repeat(121);
+        let primary = DisplaySize::new(2560, 1440).unwrap();
+        let message = build_high_performance_set_display_config(
+            &display_name,
+            primary,
+            HighPerformanceRefreshTier::Hz60,
+        );
+
+        assert_eq!(message.len(), 308);
+        assert_eq!(
+            &message[..12],
+            &[0x1d, 0x00, 0x01, 0x30, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 0]
+        );
+        assert_eq!(&message[12..14], &[0x01, 0x28]);
+        assert_eq!(&message[14..133], &[b'D'; 119]);
+        assert_eq!(message[133], 0);
+        assert_eq!(&message[134..142], &[0; 8]);
+        assert_eq!(&message[142..146], &[0x43, 0xb8, 0xba, 0x2f]);
+        assert_eq!(&message[146..150], &[0x43, 0x4f, 0xd1, 0x74]);
+        assert_eq!(&message[150..154], &3840u32.to_be_bytes());
+        assert_eq!(&message[154..158], &2160u32.to_be_bytes());
+        assert_eq!(&message[158..162], &[0; 4]);
+        assert_eq!(&message[162..166], &7u32.to_be_bytes());
+        assert_eq!(&message[166..168], &5u16.to_be_bytes());
+
+        let expected_modes = [
+            (2560, 1440, 2560, 1440),
+            (2880, 1800, 1440, 900),
+            (3840, 2160, 1920, 1080),
+            (2880, 1620, 1440, 810),
+            (2624, 1696, 1312, 848),
+        ];
+        for (mode, expected) in message[168..].chunks_exact(0x1c).zip(expected_modes) {
+            assert_eq!(
+                u32::from_be_bytes(mode[0..4].try_into().unwrap()),
+                expected.0
+            );
+            assert_eq!(
+                u32::from_be_bytes(mode[4..8].try_into().unwrap()),
+                expected.1
+            );
+            assert_eq!(
+                u32::from_be_bytes(mode[8..12].try_into().unwrap()),
+                expected.2
+            );
+            assert_eq!(
+                u32::from_be_bytes(mode[12..16].try_into().unwrap()),
+                expected.3
+            );
+            assert_eq!(&mode[16..24], &[0x40, 0x4e, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(&mode[24..28], &[0; 4]);
+        }
+    }
+
+    #[test]
+    fn high_performance_set_display_config_encodes_exact_30_hz_fallback_tier() {
+        let message = build_high_performance_set_display_config(
+            "Apple HP 30 Hz",
+            DisplaySize::new(2560, 1440).unwrap(),
+            HighPerformanceRefreshTier::Hz30,
+        );
+
+        assert_eq!(message.len(), 308);
+        let modes = message[168..].chunks_exact(0x1c);
+        assert_eq!(modes.len(), 5);
+        for (index, mode) in modes.enumerate() {
+            if index == 0 {
+                assert_eq!(
+                    &mode[..16],
+                    &[
+                        0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x05, 0xa0, 0x00, 0x00, 0x0a, 0x00,
+                        0x00, 0x00, 0x05, 0xa0,
+                    ]
+                );
+            }
+            assert_eq!(&mode[16..24], &[0x40, 0x3e, 0, 0, 0, 0, 0, 0]);
+        }
     }
 
     #[test]
@@ -1494,6 +1975,7 @@ mod tests {
             stats: HpssStats::default(),
             media_answer_frame: None,
             audio_rtp_capture: AudioRtpCapture::default(),
+            video_rtp_capture: VideoRtpCapture::default(),
         };
         let malformed = MvsRecord {
             rect: MvsRect {
