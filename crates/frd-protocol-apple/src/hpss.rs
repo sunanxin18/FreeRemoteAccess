@@ -1375,7 +1375,8 @@ mod tests {
         loopback.send_rtcp();
         let mut session = empty_hpss_session();
 
-        let accepted = receive_one_udp_round(&mut loopback.transport, &mut session).unwrap();
+        let accepted =
+            poll_test_receive_udp_until(&mut loopback.transport, &mut session, 2).unwrap();
 
         assert_eq!(accepted, 2);
         assert_eq!(session.stats.authenticated_audio_rtp_packets, 1);
@@ -1406,9 +1407,26 @@ mod tests {
             packet_count: 0,
         };
 
-        let error = receive_one_udp_round(&mut loopback.transport, &mut session).unwrap_err();
+        let error =
+            poll_test_receive_udp_until(&mut loopback.transport, &mut session, 1).unwrap_err();
 
         assert!(format!("{error:#}").contains("RTP 捕获超过最大允许容量"));
+    }
+
+    fn poll_test_receive_udp_until(
+        media_transport: &mut MediaTransport,
+        session: &mut HpssSession,
+        minimum_accepted: usize,
+    ) -> Result<usize> {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut accepted = 0;
+        loop {
+            accepted += receive_one_udp_round(media_transport, session)?;
+            if accepted >= minimum_accepted || Instant::now() >= deadline {
+                return Ok(accepted);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

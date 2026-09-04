@@ -694,6 +694,22 @@ impl MediaTransport {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn poll_test_receive_decrypted(
+        &mut self,
+        generation: u64,
+        role: MediaRole,
+    ) -> Result<MediaReceiveOutcome> {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let outcome = self.try_recv_decrypted(generation, role)?;
+            if outcome != MediaReceiveOutcome::Empty || Instant::now() >= deadline {
+                return Ok(outcome);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub fn receive_buffer_capacities(
         &self,
         generation: u64,
@@ -1428,7 +1444,7 @@ mod tests {
 
         fn receive_rtcp(&mut self) -> MediaReceiveOutcome {
             self.transport
-                .try_recv_decrypted(Self::GENERATION, MediaRole::Audio)
+                .poll_test_receive_decrypted(Self::GENERATION, MediaRole::Audio)
                 .unwrap()
         }
     }
@@ -1761,7 +1777,7 @@ mod tests {
         loopback.send_rtp(MediaRole::Audio, 1, b"first");
         let MediaReceiveOutcome::Accepted(received) = loopback
             .transport
-            .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+            .poll_test_receive_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
             .unwrap()
         else {
             panic!("authenticated RTP must be accepted");
@@ -1785,7 +1801,7 @@ mod tests {
         assert_eq!(
             loopback
                 .transport
-                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+                .poll_test_receive_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
                 .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::ReplayOrTooOld)
         );
@@ -1793,7 +1809,7 @@ mod tests {
         assert_eq!(
             loopback
                 .transport
-                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+                .poll_test_receive_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
                 .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::AuthenticationFailed)
         );
@@ -1801,7 +1817,7 @@ mod tests {
         assert!(matches!(
             loopback
                 .transport
-                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+                .poll_test_receive_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
                 .unwrap(),
             MediaReceiveOutcome::Accepted(ReceivedMediaDatagram {
                 datagram: MediaDatagram::Rtp(_),
@@ -1839,7 +1855,10 @@ mod tests {
         assert!(matches!(
             loopback
                 .transport
-                .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream1)
+                .poll_test_receive_decrypted(
+                    ThreeRoleLoopback::GENERATION,
+                    MediaRole::VideoStream1,
+                )
                 .unwrap(),
             MediaReceiveOutcome::Accepted(ReceivedMediaDatagram {
                 datagram: MediaDatagram::Rtp(_),
@@ -1857,7 +1876,7 @@ mod tests {
         loopback.send_rtcp(MediaRole::VideoStream1, &sender_report);
         let MediaReceiveOutcome::Accepted(received) = loopback
             .transport
-            .try_recv_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream1)
+            .poll_test_receive_decrypted(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream1)
             .unwrap()
         else {
             panic!("authenticated sender report must be accepted");
@@ -2314,15 +2333,18 @@ mod tests {
         let incoming_keys = derive_session_keys(&incoming_audio_material, SrtpPacketKind::Rtp);
         let protected = protect_rtp_packet(&plaintext, &incoming_keys, 0).unwrap();
         remote.send_to(&protected, local).unwrap();
-        let MediaReceiveOutcome::Accepted(received) =
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap()
+        let MediaReceiveOutcome::Accepted(received) = transport
+            .poll_test_receive_decrypted(7, MediaRole::Audio)
+            .unwrap()
         else {
             panic!("authenticated RTP must be accepted");
         };
         assert_eq!(received.datagram, MediaDatagram::Rtp(plaintext));
         remote.send_to(&protected, local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::ReplayOrTooOld),
             "已认证的重复 SRTP 包应被丢弃，而不是终止媒体会话"
         );
@@ -2413,25 +2435,33 @@ mod tests {
         let attacker = crate::bind_test_udp_loopback();
         attacker.send_to(b"wrong-source", local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::UnexpectedSource)
         );
 
         remote.send_to(&[], local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::EmptyDatagram)
         );
 
         remote.send_to(&[0x80], local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::TruncatedHeader)
         );
 
         remote.send_to(&[0x40, 100], local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::MalformedPacket)
         );
 
@@ -2449,22 +2479,27 @@ mod tests {
         *bad_tag.last_mut().unwrap() ^= 1;
         remote.send_to(&bad_tag, local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::AuthenticationFailed)
         );
 
         let plaintext = rtp_packet(ACCEPTED_SEQUENCE, b"reply");
         let protected = protect_rtp_packet(&plaintext, &rtp_keys, 0).unwrap();
         remote.send_to(&protected, local).unwrap();
-        let MediaReceiveOutcome::Accepted(received) =
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap()
+        let MediaReceiveOutcome::Accepted(received) = transport
+            .poll_test_receive_decrypted(7, MediaRole::Audio)
+            .unwrap()
         else {
             panic!("authenticated RTP must be accepted");
         };
         assert_eq!(received.datagram, MediaDatagram::Rtp(plaintext));
         remote.send_to(&protected, local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::ReplayOrTooOld)
         );
 
@@ -2473,15 +2508,18 @@ mod tests {
         let rtcp_plaintext = build_compound_rtcp_receiver_report(REMOTE_SSRC);
         let protected_rtcp = srtcp_sender.protect(&rtcp_plaintext).unwrap();
         remote.send_to(&protected_rtcp, local).unwrap();
-        let MediaReceiveOutcome::Accepted(received) =
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap()
+        let MediaReceiveOutcome::Accepted(received) = transport
+            .poll_test_receive_decrypted(7, MediaRole::Audio)
+            .unwrap()
         else {
             panic!("authenticated RTCP must be accepted");
         };
         assert_eq!(received.datagram, MediaDatagram::Rtcp(rtcp_plaintext));
         remote.send_to(&protected_rtcp, local).unwrap();
         assert_eq!(
-            transport.try_recv_decrypted(7, MediaRole::Audio).unwrap(),
+            transport
+                .poll_test_receive_decrypted(7, MediaRole::Audio)
+                .unwrap(),
             MediaReceiveOutcome::Discarded(MediaDiscardReason::ReplayOrTooOld)
         );
 
