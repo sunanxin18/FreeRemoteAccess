@@ -710,6 +710,31 @@ impl MediaTransport {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn wait_test_socket_readable(&self, generation: u64, role: MediaRole) -> Result<()> {
+        let socket = &self.socket(generation, role)?.socket;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut probe = vec![0u8; MAX_MEDIA_DATAGRAM_BYTES];
+        loop {
+            match socket.peek_from(&mut probe) {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    anyhow::bail!("等待测试媒体角色 {role:?} UDP 数据报超时")
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("探测测试媒体角色 {role:?} UDP 数据失败"));
+                }
+            }
+        }
+    }
+
     pub fn receive_buffer_capacities(
         &self,
         generation: u64,
@@ -2076,6 +2101,16 @@ mod tests {
         loopback.send_rtp(MediaRole::Audio, 3, b"audio-3");
         loopback.send_rtp(MediaRole::VideoStream1, 1, b"video-1");
         loopback.send_rtp(MediaRole::VideoStream2, 1, b"video-2");
+        for role in [
+            MediaRole::Audio,
+            MediaRole::VideoStream1,
+            MediaRole::VideoStream2,
+        ] {
+            loopback
+                .transport
+                .wait_test_socket_readable(ThreeRoleLoopback::GENERATION, role)
+                .unwrap();
+        }
 
         let mut accepted = Vec::new();
         let first = loopback
@@ -2109,6 +2144,10 @@ mod tests {
             ]
         );
 
+        loopback
+            .transport
+            .wait_test_socket_readable(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+            .unwrap();
         let second = loopback
             .transport
             .drain_receive_round_with_budget(ThreeRoleLoopback::GENERATION, 2, |_, _| Ok(()))
@@ -2144,6 +2183,10 @@ mod tests {
         loopback.send_empty_datagram(MediaRole::Audio);
         loopback.send_rtp(MediaRole::Audio, 1, b"behind-discard-budget");
         loopback.send_rtp(MediaRole::VideoStream2, 1, b"video-after-empty-role");
+        loopback
+            .transport
+            .wait_test_socket_readable(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream2)
+            .unwrap();
 
         let mut accepted = Vec::new();
         let first = loopback
@@ -2162,6 +2205,10 @@ mod tests {
         assert_eq!(first.discarded_total, 2);
         assert_eq!(accepted, vec![MediaRole::VideoStream2]);
 
+        loopback
+            .transport
+            .wait_test_socket_readable(ThreeRoleLoopback::GENERATION, MediaRole::Audio)
+            .unwrap();
         let second = loopback
             .transport
             .drain_receive_round_with_budget(ThreeRoleLoopback::GENERATION, 2, |role, _| {
@@ -2182,6 +2229,10 @@ mod tests {
             .is_err());
 
         loopback.send_rtp(MediaRole::VideoStream1, 1, b"handler-error");
+        loopback
+            .transport
+            .wait_test_socket_readable(ThreeRoleLoopback::GENERATION, MediaRole::VideoStream1)
+            .unwrap();
         let error = loopback
             .transport
             .drain_receive_round_with_budget(ThreeRoleLoopback::GENERATION, 2, |_, _| {
