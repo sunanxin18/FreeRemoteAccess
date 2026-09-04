@@ -15,6 +15,7 @@ $expectedLicenseHashes = @{
     "FFmpeg-LGPL-2.1-or-later.txt" = "246041B6ECF9BC32D718A62C57877C78B5EB397B6467E74ED7AE2626AB189C30"
     "FFmpeg-NOTICE.txt" = "2319907322DA7327C9D6F84B1185C0F71626107F4C81EBC035644DF30ABADB9F"
 }
+$expectedVerifierHash = "448048D712DA0FD81E9C2181CFC34B9B7B965A7E5F24A2FCC990899FCBCAEF72"
 
 function Copy-Utf8ScriptForWindowsPowerShell([string]$Source, [string]$Destination) {
     $bom = [Text.Encoding]::UTF8.GetPreamble()
@@ -55,6 +56,19 @@ Describe "Windows package verification security boundaries" {
             (Get-FileHash -LiteralPath (Join-Path $repoRoot $relativePath) -Algorithm SHA256).Hash |
                 Should Be $expectedLicenseHashes[$name]
         }
+    }
+
+    It "pins the package verifier to the installer's exact LF hash" {
+        $relativePath = "tools/verify-windows-package.ps1"
+        $attributes = & git -C $repoRoot check-attr text eol -- $relativePath 2>&1
+        $LASTEXITCODE | Should Be 0
+        ($attributes -join "`n") | Should Match ([regex]::Escape("$relativePath`: text: set"))
+        ($attributes -join "`n") | Should Match ([regex]::Escape("$relativePath`: eol: lf"))
+        (Get-FileHash -LiteralPath (Join-Path $repoRoot $relativePath) -Algorithm SHA256).Hash |
+            Should Be $expectedVerifierHash
+
+        $installerText = Get-Content -Raw -Encoding UTF8 -LiteralPath $installer
+        $installerText | Should Match ([regex]::Escape("`$expectedVerifierSha256 = `"$expectedVerifierHash`""))
     }
 
     It "reports a bounded verifier reason without exposing its absolute path" {

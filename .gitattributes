@@ -14,6 +14,7 @@
 
 packaging/windows/licenses/FFmpeg-LGPL-2.1-or-later.txt text eol=lf
 packaging/windows/licenses/FFmpeg-NOTICE.txt text eol=lf
+tools/verify-windows-package.ps1 text eol=lf
 
 *.ico binary
 *.png binary

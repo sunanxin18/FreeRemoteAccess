@@ -104,6 +104,10 @@ jobs:
           if ($PSVersionTable.PSVersion.Major -ne 5) {
             throw "Windows package tests require Windows PowerShell 5.1"
           }
+          # GitHub's powershell wrapper injects ErrorActionPreference=Stop, but
+          # these Pester 3 tests intentionally capture failing external commands.
+          # -EnableExit remains the authoritative suite failure signal.
+          $ErrorActionPreference = 'Continue'
           Import-Module Pester -RequiredVersion 3.4.0 -Force
           if ((Get-Module Pester).Version -ne [Version]'3.4.0') {
             throw "Windows package tests require Pester 3.4.0"
