@@ -1,5 +1,12 @@
 # Windows Native RDP Adapter Implementation Plan
 
+**Historical status (2026-09-05):** Tasks 1-9 are implemented and offline-validated. Task 10 is
+`BLOCKED_LIVE` because no independent authorized Windows RDP target or usable local guest is
+available; localhost RDP is prohibited because it could lock or switch the active Codex console.
+Current closure requirements are defined by
+[`2026-09-05-rdp-platform-orthogonality-and-live-closure.md`](2026-09-05-rdp-platform-orthogonality-and-live-closure.md).
+The checkboxes below remain the original execution plan and are not a current progress ledger.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a secure Windows-to-Windows RDP client path that logs into stock Windows Remote Desktop Services, displays the live desktop through the existing wgpu path, and sends keyboard and pointer input without changing Apple HPSS/MVS behavior.

@@ -48,7 +48,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
 |---|---|---|---|---|
 | macOS | Screen Sharing / Remote Management | 两条隔离的 Apple 路线：Standard（`displayType=0` compatibility）与 High Performance（`displayType=1/2` virtual display） | Windows | **开发中**；Standard 使用实体桌面且不创建虚拟显示，但当前 FreeRemoteDesk adapter 尚未实现或注册。High Performance 的 type-1 实体屏幕置黑仅有用户观察，尚不是 Windows 客户端端到端互操作结论。两条路线的当前阻塞、已知观察和禁止回退边界见 [`Apple 双模式阻塞记录`](docs/validation/apple-dual-mode-blockers-20260901.md) |
-| Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；私有 adapter 已实现服务器身份验证、TLS、CredSSP/NLA、licensing 与 activation，2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录、首帧或输入互操作；完整离线门禁、构建哈希和未验证边界见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md)；不得要求安装 FreeRemoteDesk 服务端 |
+| Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；私有 adapter 已实现服务器身份验证、TLS、CredSSP/NLA、licensing、activation 与传统 Bitmap/RemoteFX 路径；Windows composition root 现显式注入 `RdpClientPlatformIdentity::Windows`，不再由构建宿主推断协议身份。2026-09-05 在 `44d932b` 上完成 RDP 114、desktop shell 214、dependency boundary 2 项测试和 Windows package/Pester 29 项门禁，均为 0 failed；Release SHA-256 为 `BE298D369BF19B8A528FF71A6E931E2C3DADFA44BB02217C89D3BEED2C1AEB0D`。EGFX、ZGFX、AVC/AVC420/AVC444 均未实现或验证。因没有与当前 Codex 主机分离的授权 Windows 目标或可用本地 guest，live gate 为 `BLOCKED_LIVE`，且不得以 localhost RDP 替代；完整证据见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md)，不得要求安装 FreeRemoteDesk 服务端 |
 | Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
 
 ### Windows 客户端连接 macOS 功能明细

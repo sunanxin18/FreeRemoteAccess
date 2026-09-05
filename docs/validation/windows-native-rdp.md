@@ -1,10 +1,100 @@
-# Windows 原生 RDP 离线验证记录（2026-08-29）
+# Windows 原生 RDP 离线验证记录（更新于 2026-09-05）
 
 ## 范围与结论
 
 本记录只覆盖 Windows 客户端的离线测试、依赖边界审计和本机构建。它不构成
 Windows Remote Desktop Services 的真机登录、首帧、键鼠、证书、NLA、剪贴板、音频或
 Display Control 互操作证明。因此 README 中 Windows RDP 仍为 **开发中**。
+
+## 2026-09-05 平台身份正交化与交付门禁
+
+本轮在分支 `codex/rdp-platform-orthogonality`、实现基线
+`44d932bd6b000c85210fe0a40612525fd0095aee` 上执行。RDP 依赖保持为
+`ironrdp` 0.17.0 与 `ironrdp-blocking` 0.10.0；实际 Rust 工具链为 rustc/cargo
+1.96.0（`x86_64-pc-windows-msvc`，LLVM 22.1.2）。
+
+### 显式客户端平台身份证据
+
+- `frd-protocol-rdp` 公开闭集枚举 `RdpClientPlatformIdentity`，并把它作为
+  `RdpProtocolFactory::new` 的必填参数保存到每次 `RdpConnectionConfig`；不存在
+  `Default` 或从登录/profile 数据推导身份的路径。
+- Windows composition root 仅在
+  `apps/freeremotedesk-windows/src/main.rs` 显式构造
+  `RdpProtocolFactory::new(RdpClientPlatformIdentity::Windows)`。
+- adapter 的私有 upstream seam 把五个产品身份逐一映射为 IronRDP
+  `MajorPlatformType`；`client_platform_identities_are_explicit_protocol_values` 与
+  `approved_identities_map_to_exact_ironrdp_major_platform_types` 覆盖闭集和精确映射。
+  因此协议身份由客户端 shell composition 注入，不再由编译当前 crate 的宿主
+  `cfg(target_os)` 隐式决定。
+
+### 本地命令与实际结果
+
+下列命令均在
+`D:\FreeRemoteDesk\.worktrees\mac-baseline-rdp-integration` 执行并退出成功：
+
+```powershell
+cargo fmt --all -- --check
+cargo test --locked -p frd-protocol-rdp
+cargo test --locked -p frd-shell-desktop
+cargo test --locked -p freeremotedesk-windows --test dependency_boundary
+cargo test --locked -p frd-ui-model -p frd-app
+cargo check --locked --workspace --all-targets
+cargo test --locked
+cargo tree -p frd-protocol-rdp -e normal
+rg -n "NoCertificateVerification|danger_accept_invalid_certs|SSLKEYLOGFILE|ClearTextPassword|--password" crates/frd-protocol-rdp apps/freeremotedesk-windows
+git diff --check
+cargo build --locked --release -p freeremotedesk-windows
+pwsh -NoProfile -File tools/stage-windows-package.ps1 -PackageRoot target/package-rdp-orthogonality
+pwsh -NoProfile -File tools/verify-windows-package.ps1 -PackageRoot target/package-rdp-orthogonality
+```
+
+另按托管 Windows workflow 的前置方式把同一 Release staged 到
+`target/package-test`，再由 Windows PowerShell 5.1 导入 Pester 3.4.0 并执行：
+
+```powershell
+Invoke-Pester -Script tools/tests/windows-package.Tests.ps1 -EnableExit
+```
+
+| 门禁 | 2026-09-05 实际结果 |
+|---|---|
+| 格式 | 通过 |
+| `frd-protocol-rdp` | 114 passed，0 failed，0 ignored |
+| `frd-shell-desktop` | 214 passed，0 failed，0 ignored |
+| Windows dependency boundary | 2 passed，0 failed，0 ignored |
+| `frd-app` / `frd-ui-model` | 75 / 12 passed，0 failed，0 ignored |
+| 根包 `cargo test --locked` | 166 passed，0 failed，2 ignored；两项均保留显式外部授权 capture fixture 原因 |
+| workspace all-target check | 通过；仅根 legacy MVS capture binary 的 5 个既有 `dead_code` 警告 |
+| 依赖树 | 确认 IronRDP 0.17.0；RDP 可选组件为 `cliprdr` 0.7.0、`displaycontrol` 0.8.0、`rdpsnd` 0.9.0 |
+| 敏感模式扫描 | 仅命中受控的字面 `--password` 拒绝测试及 `--password-provider` 选项名；无明文密码路径、宽松证书验证器或 key-log 开关 |
+| Windows PowerShell 5.1 / Pester 3.4.0 | 29 passed，0 failed，0 skipped/pending/inconclusive |
+| 差异空白检查 | 通过 |
+
+### 当前图形范围与 Windows 包
+
+当前已实现的传统图形基线仅为 Raw Bitmap、Interleaved RLE、RDP 6 Bitmap
+compression 与 RemoteFX，统一发布 BGRX dirty rectangles。当前代码和本轮门禁均不
+构成 RDPGFX/EGFX、ZGFX、AVC/AVC420 或 AVC444 的实现或互操作证据，不得作出这些
+能力声明。
+
+`cargo build --locked --release -p freeremotedesk-windows` 产生
+42,824,704-byte 的 `target/release/freeremotedesk-windows.exe`，SHA-256 为
+`BE298D369BF19B8A528FF71A6E931E2C3DADFA44BB02217C89D3BEED2C1AEB0D`。
+stager 与独立 verifier 均通过。`target/package-rdp-orthogonality` 的完整文件集合
+严格为一个 executable、三个固定 FFmpeg codec DLL、`ffmpeg-manifest.json`、
+`FFmpeg-LGPL-2.1-or-later.txt` 与 `FFmpeg-NOTICE.txt`；Pester 29 项同时覆盖 exact
+package、hash/provenance、DLL shadow、对应源码 staging 与安装/提权边界。该包未签名，
+也不是 Windows RDP 真机互操作证明。
+
+### Live gate：`BLOCKED_LIVE`
+
+本轮没有与当前 Codex 主机分离、经用户授权的原生 Windows Remote Desktop Services
+目标，也没有可用的独立本地 guest。唯一可推定的 localhost 路径可能锁定或切换正在
+运行 Codex 的 active console，因此按安全 ruling 未发起 localhost RDP，也未读取或
+传递任何目标凭据。证书确认、NLA、activation、`FullBaseline`、增量刷新、指针、键盘、
+双轴滚轮、失焦 `ReleaseAll`、显式断开、返回登录页和 known-pin 重连均保持未验证。
+状态为 `BLOCKED_LIVE`，不是测试通过或真机失败；README 的 Windows RDP 状态继续为
+**开发中**。解除阻塞需要用户提供与当前主机隔离的授权 Windows 目标，并通过现有 GUI
+和安全凭据存储执行有界门禁。
 
 ## Mac 基线集成刷新（2026-08-29）
 

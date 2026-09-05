@@ -2,7 +2,11 @@
 
 **Date:** 2026-08-29
 
-**Status:** Approved architecture, narrowed after review; implementation not yet started
+**Status:** Historical approved design; Tasks 1-9 are implemented and offline-validated as of
+2026-09-05, while stock-Windows live interoperability remains blocked on an independent target
+
+**Current closure specification:**
+[`2026-09-05-rdp-platform-orthogonality-and-live-closure-design.md`](2026-09-05-rdp-platform-orthogonality-and-live-closure-design.md)
 
 **Target:** FreeRemoteDesk Windows client to unmodified Windows Remote Desktop Services
 
