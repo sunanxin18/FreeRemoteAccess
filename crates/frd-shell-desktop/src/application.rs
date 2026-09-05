@@ -720,6 +720,7 @@ struct LiveSessionPorts {
     video_sender: Option<VideoDecodeSender>,
     video_events: VideoWorkerEvents,
     frame_compiler: FrameTransactionCompiler,
+    frame_presentation_attached: bool,
 }
 
 impl PendingLiveSessionPorts {
@@ -733,6 +734,7 @@ impl PendingLiveSessionPorts {
             video_sender: self.video_sender,
             video_events: self.video_events,
             frame_compiler: FrameTransactionCompiler::new(self.session_id),
+            frame_presentation_attached: true,
         }
     }
 }
@@ -1153,6 +1155,20 @@ impl SessionHost {
                 },
             });
         };
+        if !active.frame_presentation_attached {
+            if let Ok(mut mailbox) = active.mailbox.lock() {
+                while mailbox.pop_enqueued().is_some() {}
+            }
+            return Ok(CompiledFrameDrain {
+                transactions: Vec::new(),
+                metrics: BatchMetricContext {
+                    batch_started_at: std::time::Instant::now(),
+                    source_update_count: 0,
+                    oldest_age: None,
+                    transaction_count: 0,
+                },
+            });
+        }
         let pre_call_buffered_count = active.frame_compiler.buffered_source_update_count();
         let pre_call_earliest = active.frame_compiler.earliest_buffered_enqueue_at();
         let updates = {
@@ -1231,6 +1247,21 @@ impl SessionHost {
                 })
             }
         }
+    }
+
+    fn retire_frame_presentation(&mut self, session_id: SessionId) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        if active.session_id != session_id {
+            return false;
+        }
+        active.frame_presentation_attached = false;
+        active.frame_compiler = FrameTransactionCompiler::new(session_id);
+        if let Ok(mut mailbox) = active.mailbox.lock() {
+            while mailbox.pop_enqueued().is_some() {}
+        }
+        true
     }
 
     fn active_session_id(&self) -> Option<SessionId> {
@@ -2081,6 +2112,16 @@ trait FrameBatchFailureTarget {
     fn clear_pending_texture_writes(&mut self);
 }
 
+trait TerminalPresentationTarget {
+    fn retire_frame_presentation(&mut self);
+    fn detach_remote_presentation(&mut self);
+}
+
+fn retire_then_detach_terminal_presentation(target: &mut impl TerminalPresentationTarget) {
+    target.retire_frame_presentation();
+    target.detach_remote_presentation();
+}
+
 fn terminate_failed_frame_batch(
     target: &mut impl FrameBatchFailureTarget,
     failure: FrameDrainFailure,
@@ -2678,6 +2719,30 @@ impl FrameBatchFailureTarget for DesktopApplication {
     }
 }
 
+impl TerminalPresentationTarget for DesktopApplication {
+    fn retire_frame_presentation(&mut self) {
+        if let Some(session_id) = self.sessions.active_session_id() {
+            let _ = self.sessions.retire_frame_presentation(session_id);
+        }
+    }
+
+    fn detach_remote_presentation(&mut self) {
+        self.metrics.detach();
+        if let Some(window) = self.window.as_mut() {
+            window.renderer.detach();
+            window.video_renderer.detach();
+            window.remote = None;
+            transition_video_surface_owner(
+                &mut window.video_owner,
+                VideoSurfaceOwnerTransition::CleanupStarted,
+            );
+            window.video = None;
+            window.pending_video = None;
+            window.pending_texture_writes.clear();
+        }
+    }
+}
+
 impl DesktopApplication {
     pub fn runner_result(&self) -> Result<(), FatalReport> {
         self.exit_state.runner_result()
@@ -2977,7 +3042,8 @@ impl DesktopApplication {
 
     fn dispatch_intent(&mut self, intent: AppIntent) {
         let cancelling = matches!(intent, AppIntent::CancelConnect | AppIntent::Disconnect);
-        if matches!(intent, AppIntent::Disconnect) {
+        let disconnecting = matches!(intent, AppIntent::Disconnect);
+        if disconnecting {
             if let Some(session_id) = self.sessions.active_session_id() {
                 self.video_rate_fallback.retire_session(session_id);
             }
@@ -3006,6 +3072,11 @@ impl DesktopApplication {
         };
         match action {
             Some(AppAction::SessionCommand(command)) => {
+                if disconnecting {
+                    if let Some(session_id) = self.sessions.active_session_id() {
+                        let _ = self.sessions.retire_frame_presentation(session_id);
+                    }
+                }
                 if let Err(error) = self.sessions.send_command(command) {
                     eprintln!("会话命令发送失败：{error:?}");
                 }
@@ -3153,19 +3224,7 @@ impl DesktopApplication {
         }
 
         if detach_remote {
-            self.metrics.detach();
-            if let Some(window) = self.window.as_mut() {
-                window.renderer.detach();
-                window.video_renderer.detach();
-                window.remote = None;
-                transition_video_surface_owner(
-                    &mut window.video_owner,
-                    VideoSurfaceOwnerTransition::CleanupStarted,
-                );
-                window.video = None;
-                window.pending_video = None;
-                window.pending_texture_writes.clear();
-            }
+            retire_then_detach_terminal_presentation(self);
         }
         if cleanup_needed {
             self.start_background_cleanup();
@@ -6573,6 +6632,47 @@ mod tests {
         }
     }
 
+    fn test_incremental_damage(
+        session_id: SessionId,
+        revision: u64,
+        at: Instant,
+    ) -> EnqueuedSurfaceUpdate {
+        EnqueuedSurfaceUpdate {
+            enqueued_at: at,
+            update: SurfaceUpdate::Damage {
+                session_id,
+                generation: 1,
+                revision,
+                patches: vec![PixelPatch {
+                    rect: PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    },
+                    stride_bytes: 8,
+                    pixels: PixelBuffer::new(vec![0; 16]),
+                }],
+            },
+        }
+    }
+
+    fn test_incremental_boundary(
+        session_id: SessionId,
+        revision: u64,
+        at: Instant,
+    ) -> EnqueuedSurfaceUpdate {
+        EnqueuedSurfaceUpdate {
+            enqueued_at: at,
+            update: SurfaceUpdate::FrameBoundary {
+                session_id,
+                generation: 1,
+                revision,
+                completeness: FrameCompleteness::Incremental,
+            },
+        }
+    }
+
     fn frame_drain_host(session_id: SessionId) -> SessionHost {
         let mut host = SessionHost::new(
             std::iter::empty::<Arc<dyn ProtocolFactory>>(),
@@ -6595,6 +6695,84 @@ mod tests {
             .accept(),
         );
         host
+    }
+
+    fn establish_frame_baseline(host: &mut SessionHost, session_id: SessionId, at: Instant) {
+        enqueue_frame(host, test_reset(session_id, at));
+        enqueue_frame(host, test_damage(session_id, at + Duration::from_millis(1)));
+        enqueue_frame(
+            host,
+            test_boundary(session_id, at + Duration::from_millis(2)),
+        );
+        assert!(matches!(
+            host.drain_frame_transactions()
+                .unwrap()
+                .transactions
+                .as_slice(),
+            [FrameTransaction::Startup { .. }]
+        ));
+    }
+
+    fn enqueue_incremental_revision(
+        host: &mut SessionHost,
+        session_id: SessionId,
+        revision: u64,
+        at: Instant,
+    ) {
+        enqueue_frame(host, test_incremental_damage(session_id, revision, at));
+        enqueue_frame(host, test_incremental_boundary(session_id, revision, at));
+    }
+
+    #[test]
+    fn retired_frame_presentation_discards_same_and_next_turn_late_revisions() {
+        const SAME_TURN_REVISION: u64 = 1_765;
+        const NEXT_TURN_REVISION: u64 = 1_766;
+        let session_id = SessionId::allocate();
+        let at = Instant::now();
+
+        let mut attached = frame_drain_host(session_id);
+        establish_frame_baseline(&mut attached, session_id, at);
+        enqueue_incremental_revision(
+            &mut attached,
+            session_id,
+            SAME_TURN_REVISION,
+            at + Duration::from_millis(3),
+        );
+        let control = attached.drain_frame_transactions().unwrap();
+        assert!(matches!(
+            control.transactions.as_slice(),
+            [FrameTransaction::Revision { revision, .. }]
+                if revision.session_id == session_id
+                    && revision.generation == 1
+                    && revision.revision == SAME_TURN_REVISION
+        ));
+
+        let mut retired = frame_drain_host(session_id);
+        establish_frame_baseline(&mut retired, session_id, at);
+        enqueue_incremental_revision(
+            &mut retired,
+            session_id,
+            SAME_TURN_REVISION,
+            at + Duration::from_millis(3),
+        );
+        assert!(retired.retire_frame_presentation(session_id));
+        assert!(retired
+            .drain_frame_transactions()
+            .unwrap()
+            .transactions
+            .is_empty());
+
+        enqueue_incremental_revision(
+            &mut retired,
+            session_id,
+            NEXT_TURN_REVISION,
+            at + Duration::from_millis(4),
+        );
+        assert!(retired
+            .drain_frame_transactions()
+            .unwrap()
+            .transactions
+            .is_empty());
     }
 
     fn enqueue_frame(host: &mut SessionHost, envelope: EnqueuedSurfaceUpdate) {
@@ -6809,6 +6987,33 @@ mod tests {
     #[derive(Default)]
     struct RecordingFrameFailureTarget {
         order: Vec<&'static str>,
+    }
+
+    #[derive(Default)]
+    struct RecordingTerminalPresentationTarget {
+        order: Vec<&'static str>,
+    }
+
+    impl super::TerminalPresentationTarget for RecordingTerminalPresentationTarget {
+        fn retire_frame_presentation(&mut self) {
+            self.order.push("retire_frame_presentation");
+        }
+
+        fn detach_remote_presentation(&mut self) {
+            self.order.push("detach_remote_presentation");
+        }
+    }
+
+    #[test]
+    fn terminal_presentation_retires_frame_stream_before_renderer_detach() {
+        let mut target = RecordingTerminalPresentationTarget::default();
+
+        super::retire_then_detach_terminal_presentation(&mut target);
+
+        assert_eq!(
+            target.order,
+            ["retire_frame_presentation", "detach_remote_presentation"]
+        );
     }
 
     impl FrameBatchFailureTarget for RecordingFrameFailureTarget {
