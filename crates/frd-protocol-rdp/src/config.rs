@@ -69,6 +69,16 @@ impl ParsedUsername {
 
 pub struct RdpConnectionConfig {
     pub(crate) request: ConnectRequest,
+    pub(crate) client_platform: RdpClientPlatformIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RdpClientPlatformIdentity {
+    Windows,
+    Macintosh,
+    Ios,
+    Unix,
+    Android,
 }
 
 pub(crate) struct ConnectorCredentials {
@@ -78,6 +88,22 @@ pub(crate) struct ConnectorCredentials {
 }
 
 impl RdpConnectionConfig {
+    pub fn try_new(
+        request: ConnectRequest,
+        client_platform: RdpClientPlatformIdentity,
+    ) -> Result<Self, ProtocolError> {
+        if request.protocol_id != ProtocolId::rdp() {
+            return Err(rdp_error(RDP_PROTOCOL_MISMATCH));
+        }
+        if request.credentials.is_none() {
+            return Err(rdp_error(RDP_CREDENTIALS_REQUIRED));
+        }
+        Ok(Self {
+            request,
+            client_platform,
+        })
+    }
+
     pub(crate) fn take_connector_credentials(
         &mut self,
     ) -> Result<ConnectorCredentials, ProtocolError> {
@@ -107,39 +133,41 @@ impl RdpConnectionConfig {
     }
 }
 
-impl TryFrom<ConnectRequest> for RdpConnectionConfig {
-    type Error = ProtocolError;
-
-    fn try_from(request: ConnectRequest) -> Result<Self, Self::Error> {
-        if request.protocol_id != ProtocolId::rdp() {
-            return Err(rdp_error(RDP_PROTOCOL_MISMATCH));
-        }
-        if request.credentials.is_none() {
-            return Err(rdp_error(RDP_CREDENTIALS_REQUIRED));
-        }
-        Ok(Self { request })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use frd_core::{SecretBuffer, SessionId};
     use frd_protocol_api::{ConnectRequest, Credentials, Endpoint, ProtocolId};
 
-    use super::RdpConnectionConfig;
+    use super::{RdpClientPlatformIdentity, RdpConnectionConfig};
+
+    #[test]
+    fn client_platform_identities_are_explicit_protocol_values() {
+        let approved = [
+            RdpClientPlatformIdentity::Windows,
+            RdpClientPlatformIdentity::Macintosh,
+            RdpClientPlatformIdentity::Ios,
+            RdpClientPlatformIdentity::Unix,
+            RdpClientPlatformIdentity::Android,
+        ];
+
+        assert_eq!(approved.len(), 5);
+    }
 
     #[test]
     fn factory_construction_defers_invalid_username_until_worker_extraction() {
-        let mut config = RdpConnectionConfig::try_from(ConnectRequest {
-            session_id: SessionId::allocate(),
-            endpoint: Endpoint::new("rdp.example", 3389).expect("valid endpoint"),
-            protocol_id: ProtocolId::rdp(),
-            credentials: Some(Credentials {
-                username: " alice".to_owned(),
-                password: SecretBuffer::new(vec![0x01]).take(),
-            }),
-            saved_server_pin: None,
-        })
+        let mut config = RdpConnectionConfig::try_new(
+            ConnectRequest {
+                session_id: SessionId::allocate(),
+                endpoint: Endpoint::new("rdp.example", 3389).expect("valid endpoint"),
+                protocol_id: ProtocolId::rdp(),
+                credentials: Some(Credentials {
+                    username: " alice".to_owned(),
+                    password: SecretBuffer::new(vec![0x01]).take(),
+                }),
+                saved_server_pin: None,
+            },
+            RdpClientPlatformIdentity::Windows,
+        )
         .expect("factory construction must not read or parse the username");
 
         match config.take_connector_credentials() {
@@ -150,16 +178,19 @@ mod tests {
 
     #[test]
     fn connector_secret_validation_is_deferred_until_worker_extraction() {
-        let mut config = RdpConnectionConfig::try_from(ConnectRequest {
-            session_id: SessionId::allocate(),
-            endpoint: Endpoint::new("rdp.example", 3389).expect("valid endpoint"),
-            protocol_id: ProtocolId::rdp(),
-            credentials: Some(Credentials {
-                username: "alice".to_owned(),
-                password: SecretBuffer::new(Vec::new()).take(),
-            }),
-            saved_server_pin: None,
-        })
+        let mut config = RdpConnectionConfig::try_new(
+            ConnectRequest {
+                session_id: SessionId::allocate(),
+                endpoint: Endpoint::new("rdp.example", 3389).expect("valid endpoint"),
+                protocol_id: ProtocolId::rdp(),
+                credentials: Some(Credentials {
+                    username: "alice".to_owned(),
+                    password: SecretBuffer::new(Vec::new()).take(),
+                }),
+                saved_server_pin: None,
+            },
+            RdpClientPlatformIdentity::Windows,
+        )
         .expect("factory construction must not inspect the secret bytes");
 
         match config.take_connector_credentials() {

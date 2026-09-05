@@ -3,10 +3,18 @@ use frd_protocol_api::{
     ProtocolRuntime, ProtocolSession,
 };
 
-use crate::config::RdpConnectionConfig;
+use crate::config::{RdpClientPlatformIdentity, RdpConnectionConfig};
 use crate::runtime::run_protocol_session;
 
-pub struct RdpProtocolFactory;
+pub struct RdpProtocolFactory {
+    client_platform: RdpClientPlatformIdentity,
+}
+
+impl RdpProtocolFactory {
+    pub const fn new(client_platform: RdpClientPlatformIdentity) -> Self {
+        Self { client_platform }
+    }
+}
 
 impl ProtocolFactory for RdpProtocolFactory {
     fn descriptor(&self) -> ProtocolDescriptor {
@@ -18,7 +26,7 @@ impl ProtocolFactory for RdpProtocolFactory {
         request: ConnectRequest,
         runtime: ProtocolRuntime,
     ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
-        let config = RdpConnectionConfig::try_from(request)?;
+        let config = RdpConnectionConfig::try_new(request, self.client_platform)?;
         Ok(Box::new(RdpProtocolSession { config, runtime }))
     }
 }
@@ -39,11 +47,11 @@ impl ProtocolSession for RdpProtocolSession {
 mod tests {
     use frd_protocol_api::{ProtocolFactory, ProtocolId};
 
-    use crate::{ParsedUsername, RdpProtocolFactory};
+    use crate::{ParsedUsername, RdpClientPlatformIdentity, RdpProtocolFactory};
 
     #[test]
     fn factory_exposes_stable_rdp_descriptor() {
-        let descriptor = RdpProtocolFactory.descriptor();
+        let descriptor = RdpProtocolFactory::new(RdpClientPlatformIdentity::Windows).descriptor();
         assert_eq!(descriptor.id, ProtocolId::rdp());
         assert_eq!(descriptor.default_port, 3389);
         assert!(descriptor.credential_requirements.username);

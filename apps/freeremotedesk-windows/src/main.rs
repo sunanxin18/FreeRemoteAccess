@@ -20,7 +20,7 @@ use frd_platform_windows::{
 };
 use frd_protocol_api::{ProtocolCatalog, ProtocolFactory};
 use frd_protocol_apple::{AppleHighPerformanceProtocolFactory, AppleProtocolFactory};
-use frd_protocol_rdp::RdpProtocolFactory;
+use frd_protocol_rdp::{RdpClientPlatformIdentity, RdpProtocolFactory};
 use frd_shell_desktop::{
     AudioOutputFactory, DesktopApplication, DesktopPlatformStores, DesktopUserEvent,
     DesktopWindowConfiguration, FatalComponent, FatalOperation, FatalReason, FatalReport,
@@ -182,7 +182,8 @@ fn run(cli: Cli) -> RunnerOutcome {
     let apple_factory = Arc::new(AppleProtocolFactory) as Arc<dyn ProtocolFactory>;
     let apple_high_performance_factory =
         Arc::new(AppleHighPerformanceProtocolFactory) as Arc<dyn ProtocolFactory>;
-    let rdp_factory = Arc::new(RdpProtocolFactory) as Arc<dyn ProtocolFactory>;
+    let rdp_factory = Arc::new(RdpProtocolFactory::new(RdpClientPlatformIdentity::Windows))
+        as Arc<dyn ProtocolFactory>;
     let factories = [apple_high_performance_factory, apple_factory, rdp_factory];
     let catalog = ProtocolCatalog::new(factories.iter().map(|factory| factory.descriptor().id));
     let provider = EnvironmentCredentialProvider;

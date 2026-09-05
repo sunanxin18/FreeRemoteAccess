@@ -144,6 +144,8 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
         2
     );
     assert_eq!(main_source.matches("RdpProtocolFactory").count(), 2);
+    assert!(main_source
+        .contains("Arc::new(RdpProtocolFactory::new(RdpClientPlatformIdentity::Windows))"));
     assert_eq!(
         main_source
             .matches("Arc::new(AppleProtocolFactory)")
@@ -160,8 +162,7 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
     );
     assert_eq!(
         main_source.matches("Arc::new(RdpProtocolFactory)").count(),
-        1,
-        "the product registers exactly the approved RDP factory"
+        0
     );
     assert!(
         main_source.contains(

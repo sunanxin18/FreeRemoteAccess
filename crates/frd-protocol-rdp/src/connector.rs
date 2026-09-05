@@ -12,13 +12,13 @@ use ironrdp::connector::{
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::pdu::gcc::KeyboardType;
-use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
+use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_blocking::{Framed, ShouldUpgrade};
 
 use crate::audio::{new_rdpsnd, RdpAudioAdapter};
 use crate::clipboard::new_cliprdr;
-use crate::config::RdpConnectionConfig;
+use crate::config::{RdpClientPlatformIdentity, RdpConnectionConfig};
 use crate::display::DisplayControlCapabilityState;
 use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
@@ -28,6 +28,7 @@ use crate::runtime::{
     wait_for_blocking, wait_for_network_future, CancellationCheckedIo, StageCancellation,
 };
 use crate::tls::{credential_free_preflight, establish_verified_tls, VerifiedTlsTransport};
+use crate::upstream::client_platform_type;
 
 const DEFAULT_DESKTOP_SIZE: DesktopSize = DesktopSize {
     width: 1280,
@@ -65,7 +66,7 @@ pub(crate) async fn connect_and_activate(
         upgrade: _,
         audio: _,
         display_capabilities: _,
-    } = negotiate_enhanced_security(&addresses, runtime).await?;
+    } = negotiate_enhanced_security(&addresses, config.client_platform, runtime).await?;
     let preflight_shutdown = preflight_transport
         .try_clone()
         .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
@@ -84,7 +85,8 @@ pub(crate) async fn connect_and_activate(
     )?
     .ok_or_else(|| rdp_error(crate::error::RDP_CANCELLED))?;
 
-    let mut negotiated = negotiate_enhanced_security(&addresses, runtime).await?;
+    let mut negotiated =
+        negotiate_enhanced_security(&addresses, config.client_platform, runtime).await?;
     let audio = negotiated.audio.clone();
     let display_capabilities = negotiated.display_capabilities.clone();
     let verified_shutdown = negotiated
@@ -216,6 +218,7 @@ async fn resolve_addresses(
 
 async fn negotiate_enhanced_security(
     addresses: &[SocketAddr],
+    client_platform: RdpClientPlatformIdentity,
     runtime: &mut ProtocolRuntime,
 ) -> Result<NegotiatedTcp, ProtocolError> {
     let mut last_error = rdp_error(RDP_TCP_FAILED);
@@ -251,6 +254,7 @@ async fn negotiate_enhanced_security(
                 None,
                 DEFAULT_DESKTOP_SIZE,
                 client_addr,
+                client_platform,
             );
             let upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)?;
             Ok::<_, ConnectorError>(NegotiatedTcp {
@@ -383,6 +387,7 @@ fn baseline_connector(
     domain: Option<String>,
     desktop_size: DesktopSize,
     client_addr: SocketAddr,
+    client_platform: RdpClientPlatformIdentity,
 ) -> (
     ClientConnector,
     RdpAudioAdapter,
@@ -418,7 +423,7 @@ fn baseline_connector(
             client_build: 0,
             client_name: "FreeRemoteDesk".to_owned(),
             client_dir: String::new(),
-            platform: client_platform(),
+            platform: client_platform_type(client_platform),
             enable_server_pointer: true,
             request_data: None,
             autologon: false,
@@ -442,50 +447,41 @@ fn baseline_connector(
     (connector, audio, display_capabilities)
 }
 
-#[cfg(windows)]
-fn client_platform() -> MajorPlatformType {
-    MajorPlatformType::WINDOWS
-}
-
-#[cfg(target_os = "macos")]
-fn client_platform() -> MajorPlatformType {
-    MajorPlatformType::MACINTOSH
-}
-
-#[cfg(target_os = "ios")]
-fn client_platform() -> MajorPlatformType {
-    MajorPlatformType::IOS
-}
-
-#[cfg(target_os = "linux")]
-fn client_platform() -> MajorPlatformType {
-    MajorPlatformType::UNIX
-}
-
-#[cfg(target_os = "android")]
-fn client_platform() -> MajorPlatformType {
-    MajorPlatformType::ANDROID
-}
-
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "dragonfly",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-fn client_platform() -> MajorPlatformType {
-    MajorPlatformType::UNIX
-}
-
 #[cfg(test)]
 mod tests {
     use ironrdp::connector::{Credentials, DesktopSize};
     use ironrdp::dvc::DrdynvcClient;
     use ironrdp::pdu::rdp::capability_sets::{
-        CodecId, CodecProperty, RemoteFxContainer, CODEC_ID_REMOTEFX,
+        CodecId, CodecProperty, MajorPlatformType, RemoteFxContainer, CODEC_ID_REMOTEFX,
     };
 
     use super::baseline_connector;
+    use crate::config::RdpClientPlatformIdentity;
+    use crate::upstream::client_platform_type;
+
+    #[test]
+    fn approved_identities_map_to_exact_ironrdp_major_platform_types() {
+        let cases = [
+            (
+                RdpClientPlatformIdentity::Windows,
+                MajorPlatformType::WINDOWS,
+            ),
+            (
+                RdpClientPlatformIdentity::Macintosh,
+                MajorPlatformType::MACINTOSH,
+            ),
+            (RdpClientPlatformIdentity::Ios, MajorPlatformType::IOS),
+            (RdpClientPlatformIdentity::Unix, MajorPlatformType::UNIX),
+            (
+                RdpClientPlatformIdentity::Android,
+                MajorPlatformType::ANDROID,
+            ),
+        ];
+
+        for (identity, expected) in cases {
+            assert_eq!(client_platform_type(identity), expected);
+        }
+    }
 
     #[test]
     fn connector_requires_credssp_and_refuses_tls_only_downgrade() {
@@ -500,6 +496,7 @@ mod tests {
                 height: 720,
             },
             "127.0.0.1:49152".parse().expect("valid client address"),
+            RdpClientPlatformIdentity::Windows,
         );
 
         assert!(!connector.config.enable_tls);
@@ -519,6 +516,7 @@ mod tests {
                 height: 720,
             },
             "127.0.0.1:49152".parse().expect("valid client address"),
+            RdpClientPlatformIdentity::Windows,
         );
         let bitmap = connector
             .config

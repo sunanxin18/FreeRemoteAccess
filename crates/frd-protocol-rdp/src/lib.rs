@@ -17,7 +17,7 @@ mod tls;
 mod upstream;
 mod writer;
 
-pub use config::{ParsedUsername, RdpConnectionConfig};
+pub use config::{ParsedUsername, RdpClientPlatformIdentity, RdpConnectionConfig};
 pub use factory::{RdpProtocolFactory, RdpProtocolSession};
 
 /// Compile-time seam consumed by Task 3's connector without exposing RDP TLS

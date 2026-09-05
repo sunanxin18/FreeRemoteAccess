@@ -478,7 +478,7 @@ mod tests {
         SessionEvent, SurfacePublisher,
     };
 
-    use crate::config::RdpConnectionConfig;
+    use crate::config::{RdpClientPlatformIdentity, RdpConnectionConfig};
     use crate::error::{RDP_DNS_FAILED, RDP_TLS_FAILED};
     use crate::input::RdpInputState;
 
@@ -1624,16 +1624,19 @@ mod tests {
             None,
             Box::new(NoopWake),
         );
-        let config = RdpConnectionConfig::try_from(ConnectRequest {
-            session_id,
-            endpoint: Endpoint::new("no-network.invalid", 3389).expect("valid endpoint"),
-            protocol_id: ProtocolId::rdp(),
-            credentials: Some(Credentials {
-                username: "alice".to_owned(),
-                password: SecretBuffer::new(vec![0x01]).take(),
-            }),
-            saved_server_pin: None,
-        })
+        let config = RdpConnectionConfig::try_new(
+            ConnectRequest {
+                session_id,
+                endpoint: Endpoint::new("no-network.invalid", 3389).expect("valid endpoint"),
+                protocol_id: ProtocolId::rdp(),
+                credentials: Some(Credentials {
+                    username: "alice".to_owned(),
+                    password: SecretBuffer::new(vec![0x01]).take(),
+                }),
+                saved_server_pin: None,
+            },
+            RdpClientPlatformIdentity::Windows,
+        )
         .expect("valid RDP config");
 
         assert_eq!(run_protocol_session(config, runtime), ProtocolExit::Closed);
