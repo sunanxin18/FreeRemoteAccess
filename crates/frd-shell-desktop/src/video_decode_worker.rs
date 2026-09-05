@@ -2816,6 +2816,54 @@ mod tests {
     }
 
     #[test]
+    fn retained_identity_wait_does_not_complete_before_finish_cleanup() {
+        let identity = test_identity();
+        let worker = worker_with_script(DecoderScript::FailBefore, Arc::new(AtomicUsize::new(0)));
+        let (finish_entered_tx, finish_entered_rx) = std::sync::mpsc::channel();
+        let (release_finish_tx, release_finish_rx) = std::sync::mpsc::channel();
+        let release_finish_rx = Arc::new(Mutex::new(release_finish_rx));
+        worker.sender.router.set_before_stream_finish(Arc::new({
+            let release_finish_rx = release_finish_rx.clone();
+            move |actual_identity| {
+                if actual_identity == identity {
+                    let _ = finish_entered_tx.send(());
+                    let _ = release_finish_rx.lock().unwrap().recv();
+                }
+            }
+        }));
+
+        let mut release_finish_tx = Some(release_finish_tx);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker
+                .sender()
+                .try_send_config(test_config_for(identity, 7))
+                .unwrap();
+            recv_backend_selected_for(&worker, identity, 7);
+            worker
+                .sender()
+                .try_send_access_unit(test_au_for(identity, 7, 1, true, 1))
+                .unwrap();
+            recv_decode_failed_for(&worker, identity, 7);
+            finish_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("failed stream 应在 finish 前同步停住");
+
+            assert_eq!(retained_identity_counts(&worker), (1, 1));
+            release_finish_tx.take().unwrap().send(()).unwrap();
+            wait_for_retained_identity_counts(&worker, (0, 0));
+            assert_eq!(retained_identity_counts(&worker), (0, 0));
+        }));
+
+        if let Some(release_finish_tx) = release_finish_tx {
+            let _ = release_finish_tx.send(());
+        }
+        stop(worker);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
     fn published_fatal_closes_au_admission_and_replaces_the_old_input_before_finish() {
         let identity = test_identity();
         let loader_calls = Arc::new(AtomicUsize::new(0));
@@ -3244,7 +3292,7 @@ mod tests {
                     after_first_frame: false,
                 }
             );
-            wait_for_supervisor_revisions(&worker, 2);
+            wait_for_retained_identity_counts(&worker, (0, 0));
         }
 
         let fifth = identity_for(session_id, 5);
@@ -3649,6 +3697,22 @@ mod tests {
         let router_count = worker.sender.router.shared.0.lock().unwrap().streams.len();
         let event_count = worker.events.shared.0.lock().unwrap().streams.len();
         (router_count, event_count)
+    }
+
+    fn wait_for_retained_identity_counts(worker: &VideoDecodeWorker, expected: (usize, usize)) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let actual = retained_identity_counts(worker);
+            if actual == expected {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "retained identity counts 应在 deadline 内达到 {expected:?}，实际为 {actual:?}"
+                );
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn assert_no_frame_for_generation(
