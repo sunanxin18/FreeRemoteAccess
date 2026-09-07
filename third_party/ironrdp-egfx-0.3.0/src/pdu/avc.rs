@@ -145,7 +145,14 @@ impl<'de> Decode<'de> for Avc420BitmapStream<'de> {
         let mut rectangles = Vec::with_capacity(bounded_capacity);
         let mut quant_qual_vals = Vec::with_capacity(bounded_capacity);
         for _ in 0..num_regions {
-            rectangles.push(ExclusiveRectangle::decode(src)?);
+            let rectangle = ExclusiveRectangle::decode(src)?;
+            if rectangle.left >= rectangle.right || rectangle.top >= rectangle.bottom {
+                return Err(invalid_field_err!(
+                    "regionRects",
+                    "rectangle must have positive exclusive width and height"
+                ));
+            }
+            rectangles.push(rectangle);
         }
         for _ in 0..num_regions {
             quant_qual_vals.push(QuantQuality::decode(src)?);
@@ -602,5 +609,22 @@ mod tests {
         assert_eq!(decoded.rectangles[0].right, 1920);
         assert_eq!(decoded.rectangles[0].bottom, 1080);
         assert_eq!(decoded.data, &h264_data);
+    }
+
+    #[test]
+    fn test_decode_rejects_empty_exclusive_region() {
+        let mut encoded = vec![0_u8; 4 + 8 + 2 + 1];
+        let mut cursor = WriteCursor::new(&mut encoded);
+        cursor.write_u32(1);
+        cursor.write_u16(3);
+        cursor.write_u16(4);
+        cursor.write_u16(3);
+        cursor.write_u16(5);
+        cursor.write_u8(22);
+        cursor.write_u8(100);
+        cursor.write_u8(0x65);
+
+        let mut read_cursor = ReadCursor::new(&encoded);
+        assert!(Avc420BitmapStream::decode(&mut read_cursor).is_err());
     }
 }
