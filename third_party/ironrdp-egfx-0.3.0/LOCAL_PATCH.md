@@ -13,6 +13,8 @@ at the encoding boundary. Empty or inverted exclusive rectangles are rejected
 while decoding the PDU, before any payload is dispatched. The public handler and
 renderer contracts do not change. The decoder trait also exposes a default
 health query so a fallible reset can stop the client before a new reset reaches
-the handler. This prevents pixels outside the server's region mask from being
-published while preserving the upstream payload shape and public handler/
+the handler. The failure is terminal for the current EGFX generation: trailing
+PDUs in the same DVC payload are short-circuited and cannot recreate surfaces or
+notify the handler. This prevents pixels outside the server's region mask from
+being published while preserving the upstream payload shape and public handler/
 renderer contracts.

@@ -464,6 +464,16 @@ impl GraphicsPipelineClient {
     // ========================================================================
 
     fn handle_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
+        // A decoder reset failure permanently disables the optional EGFX
+        // stream for this client generation.  A single DVC payload may carry
+        // ResetGraphics followed by CreateSurface/Map/frames; once reset has
+        // failed, do not let those trailing PDUs mutate state or notify the
+        // handler.  The owning adapter can continue serving legacy graphics.
+        if self.decoder_failed {
+            trace!("Ignoring EGFX PDU after decoder reset failure");
+            return Ok(Vec::new());
+        }
+
         match pdu {
             GfxPdu::CapabilitiesConfirm(confirm) => {
                 self.handle_capabilities_confirm(confirm.0);
@@ -1157,6 +1167,18 @@ mod tests {
         );
 
         client.handle_reset_graphics(1920, 1080);
+
+        // ResetGraphics can share one DVC payload with subsequent state
+        // changes.  Once the reset health gate fails, those PDUs must be
+        // ignored rather than recreating surfaces on the disabled stream.
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 7,
+                width: 16,
+                height: 16,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .expect("failed decoder state should short-circuit trailing PDUs");
 
         assert!(client.decoder_failed());
         assert!(!client.is_active());
