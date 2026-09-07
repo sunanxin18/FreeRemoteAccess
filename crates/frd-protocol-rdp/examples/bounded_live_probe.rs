@@ -22,13 +22,20 @@ use frd_protocol_api::{
     SessionCommand, SessionEvent, SurfacePublisher,
 };
 use frd_protocol_rdp::{
-    Avc420DecoderProvider, RdpClientPlatformIdentity, RdpGraphicsCapabilities, RdpGraphicsObserver,
-    RdpProtocolFactory,
+    Avc420DecoderProvider, Avc444DecoderProvider, RdpClientPlatformIdentity,
+    RdpGraphicsCapabilities, RdpGraphicsObserver, RdpProtocolFactory,
 };
 use frd_video_ffmpeg::FfmpegBackend;
 
-const EGFX_OPT_IN_ENV: &str = "FRD_RDP_PROBE_EGFX_AVC420";
+const EGFX_AVC420_OPT_IN_ENV: &str = "FRD_RDP_PROBE_EGFX_AVC420";
+const EGFX_AVC444_OPT_IN_ENV: &str = "FRD_RDP_PROBE_EGFX_AVC444";
 const EGFX_BUNDLE_ENV: &str = "FRD_RDP_PROBE_MACOS_APP";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeEgfxMode {
+    Avc420,
+    Avc444,
+}
 
 #[derive(Default)]
 struct Counts {
@@ -155,34 +162,59 @@ fn remember_pin(path: &Path, pin: [u8; 32]) -> Result<(), &'static str> {
     }
 }
 
-fn egfx_opt_in() -> Result<bool, &'static str> {
-    match std::env::var(EGFX_OPT_IN_ENV) {
-        Ok(value) if value == "1" => Ok(true),
-        Ok(value) if value.is_empty() => Ok(false),
-        Ok(_) => Err("probe_egfx_opt_in_invalid"),
-        Err(std::env::VarError::NotPresent) => Ok(false),
+fn parse_egfx_opt_in(value: Option<&str>) -> Result<bool, &'static str> {
+    match value {
+        Some("1") => Ok(true),
+        Some("") | None => Ok(false),
+        Some(_) => Err("probe_egfx_opt_in_invalid"),
+    }
+}
+
+fn egfx_opt_in(name: &str) -> Result<bool, &'static str> {
+    match std::env::var(name) {
+        Ok(value) => parse_egfx_opt_in(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_egfx_opt_in(None),
         Err(std::env::VarError::NotUnicode(_)) => Err("probe_egfx_opt_in_invalid"),
+    }
+}
+
+fn probe_egfx_mode() -> Result<Option<ProbeEgfxMode>, &'static str> {
+    let avc420 = egfx_opt_in(EGFX_AVC420_OPT_IN_ENV)?;
+    let avc444 = egfx_opt_in(EGFX_AVC444_OPT_IN_ENV)?;
+    probe_egfx_mode_from_flags(avc420, avc444)
+}
+
+fn probe_egfx_mode_from_flags(
+    avc420: bool,
+    avc444: bool,
+) -> Result<Option<ProbeEgfxMode>, &'static str> {
+    match (avc420, avc444) {
+        (true, true) => Err("probe_egfx_multiple_codecs"),
+        (true, false) => Ok(Some(ProbeEgfxMode::Avc420)),
+        (false, true) => Ok(Some(ProbeEgfxMode::Avc444)),
+        (false, false) => Ok(None),
     }
 }
 
 /// Load the exact software backend only for an explicit macOS probe opt-in.
 ///
 /// The normal example path returns `None`, preserving the legacy-only probe.  The returned
-/// factory is already checked against the exact H.264 AVC420/YUV420/8-bit contract; this local
+/// factory is already checked against the exact H.264 profile selected by the opt-in; this local
 /// capability line must not be confused with server confirmation or live decoder evidence.
-fn load_probe_egfx_factory() -> Result<Option<Arc<dyn VideoDecoderFactory>>, &'static str> {
-    if !egfx_opt_in()? {
-        println!(
-            "EGFX AVC420 opt_in=false local_capability=disabled server_confirmation=not_requested"
-        );
+fn load_probe_egfx_factory(
+) -> Result<Option<(ProbeEgfxMode, Arc<dyn VideoDecoderFactory>)>, &'static str> {
+    let Some(mode) = probe_egfx_mode()? else {
+        println!("EGFX opt_in=false local_capability=disabled server_confirmation=not_requested");
         return Ok(None);
-    }
+    };
+    let mode_name = match mode {
+        ProbeEgfxMode::Avc420 => "AVC420",
+        ProbeEgfxMode::Avc444 => "AVC444",
+    };
 
     #[cfg(not(target_os = "macos"))]
     {
-        println!(
-            "EGFX AVC420 opt_in=true local_capability=unavailable reason=macos_bundle_required"
-        );
+        println!("EGFX {mode_name} opt_in=true local_capability=unavailable reason=macos_bundle_required");
         return Err("probe_egfx_macos_only");
     }
 
@@ -193,12 +225,22 @@ fn load_probe_egfx_factory() -> Result<Option<Arc<dyn VideoDecoderFactory>>, &'s
             .map_err(|_| "probe_egfx_backend_unavailable")?;
         let query = VideoDecodeQuery {
             codec: VideoCodec::H264,
-            profile: VideoProfile::H264Avc420,
-            chroma: ChromaFormat::Yuv420,
+            profile: match mode {
+                ProbeEgfxMode::Avc420 => VideoProfile::H264Avc420,
+                ProbeEgfxMode::Avc444 => VideoProfile::H264Avc444,
+            },
+            chroma: match mode {
+                ProbeEgfxMode::Avc420 => ChromaFormat::Yuv420,
+                ProbeEgfxMode::Avc444 => ChromaFormat::Yuv444,
+            },
             bit_depth: 8,
             coded_size: PixelSize::new(1, 1).ok_or("probe_egfx_query_invalid")?,
             frame_rate: None,
-            preferred_outputs: vec![VideoPixelFormat::Yuv420P8].into_boxed_slice(),
+            preferred_outputs: vec![match mode {
+                ProbeEgfxMode::Avc420 => VideoPixelFormat::Yuv420P8,
+                ProbeEgfxMode::Avc444 => VideoPixelFormat::Yuv444P8,
+            }]
+            .into_boxed_slice(),
         };
         let support = backend.query(&query);
         let support_name = match &support {
@@ -212,7 +254,7 @@ fn load_probe_egfx_factory() -> Result<Option<Arc<dyn VideoDecoderFactory>>, &'s
             "not_attached"
         };
         println!(
-            "EGFX AVC420 opt_in=true backend={} local_capability={} provider={} server_confirmation={}",
+            "EGFX {mode_name} opt_in=true backend={} local_capability={} provider={} server_confirmation={}",
             backend.backend_id().as_str(),
             support_name,
             provider_state,
@@ -223,9 +265,18 @@ fn load_probe_egfx_factory() -> Result<Option<Arc<dyn VideoDecoderFactory>>, &'s
             }
         );
         if !support.is_exact() {
-            return Err("probe_egfx_avc420_capability_unavailable");
+            return Err(match mode {
+                ProbeEgfxMode::Avc420 => "probe_egfx_avc420_capability_unavailable",
+                ProbeEgfxMode::Avc444 => "probe_egfx_avc444_capability_unavailable",
+            });
         }
-        Ok(Some(Arc::new(backend) as Arc<dyn VideoDecoderFactory>))
+        if mode == ProbeEgfxMode::Avc444 && !backend.supports_avc420() {
+            return Err("probe_egfx_avc444_requires_avc420_decoder");
+        }
+        Ok(Some((
+            mode,
+            Arc::new(backend) as Arc<dyn VideoDecoderFactory>,
+        )))
     }
 }
 
@@ -286,10 +337,14 @@ fn run() -> Result<(), &'static str> {
             );
         },
     );
-    let factory = if let Some(egfx_factory) = egfx_factory {
+    let factory = if let Some((mode, egfx_factory)) = egfx_factory {
+        let provider: Arc<dyn frd_protocol_rdp::EgfxDecoderProvider> = match mode {
+            ProbeEgfxMode::Avc420 => Arc::new(Avc420DecoderProvider::from_factory(egfx_factory)),
+            ProbeEgfxMode::Avc444 => Arc::new(Avc444DecoderProvider::new(egfx_factory)),
+        };
         RdpProtocolFactory::with_egfx_decoder_provider(
             RdpClientPlatformIdentity::Macintosh,
-            Arc::new(Avc420DecoderProvider::from_factory(egfx_factory)),
+            provider,
         )
     } else {
         RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)
@@ -420,5 +475,38 @@ fn main() {
     if let Err(code) = run() {
         eprintln!("验证未通过 code={code}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_egfx_opt_in, probe_egfx_mode_from_flags, ProbeEgfxMode};
+
+    #[test]
+    fn egfx_opt_in_accepts_only_one() {
+        assert_eq!(parse_egfx_opt_in(Some("1")), Ok(true));
+        assert_eq!(parse_egfx_opt_in(Some("")), Ok(false));
+        assert_eq!(parse_egfx_opt_in(None), Ok(false));
+        assert_eq!(
+            parse_egfx_opt_in(Some("true")),
+            Err("probe_egfx_opt_in_invalid")
+        );
+    }
+
+    #[test]
+    fn egfx_probe_mode_rejects_ambiguous_codec_opt_in() {
+        assert_eq!(probe_egfx_mode_from_flags(false, false), Ok(None));
+        assert_eq!(
+            probe_egfx_mode_from_flags(true, false),
+            Ok(Some(ProbeEgfxMode::Avc420))
+        );
+        assert_eq!(
+            probe_egfx_mode_from_flags(false, true),
+            Ok(Some(ProbeEgfxMode::Avc444))
+        );
+        assert_eq!(
+            probe_egfx_mode_from_flags(true, true),
+            Err("probe_egfx_multiple_codecs")
+        );
     }
 }

@@ -85,6 +85,24 @@ impl FfmpegBackend {
         VideoCapabilityProvider::query(self, &query).is_exact()
     }
 
+    /// 报告生产组合根是否可以精确满足 H.264 AVC444/YUV444P8。
+    ///
+    /// 该查询只检查本地插件能力，不代表服务器已经发送 EGFX AVC444
+    /// `CapabilitiesConfirm`。调用方仍必须等待精确的 WireToSurface1
+    /// profile 和 live 首帧/刷新/恢复门禁。
+    pub fn supports_avc444(&self) -> bool {
+        let query = VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc444,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1, 1).expect("固定探针尺寸有效"),
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+        };
+        VideoCapabilityProvider::query(self, &query).is_exact()
+    }
+
     /// 从当前可执行文件目录下的固定、受信版本目录加载；失败只禁用该 backend。
     pub fn load() -> Result<Self, VideoDecodeError> {
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -1315,6 +1333,7 @@ mod tests {
             ..h264_query()
         });
         assert!(matches!(support, VideoDecodeSupport::SoftwareExact(_)));
+        assert!(backend.supports_avc444());
     }
 
     #[test]
@@ -1322,6 +1341,7 @@ mod tests {
         let mut api = compatible_raw_api();
         api.codec_capabilities = crate::abi::FRD_CODEC_CAP_H264_AVC420;
         let backend = FfmpegBackend::from_raw_api_for_test(api).expect("AVC420 plugin 应可加载");
+        assert!(!backend.supports_avc444());
         let support = backend.query(&VideoDecodeQuery {
             codec: VideoCodec::H264,
             profile: VideoProfile::H264Avc444,
@@ -1382,7 +1402,7 @@ mod tests {
             length_prefixed.extend_from_slice(nal);
         }
 
-        let converted = super::normalize_access_unit(&h264_config().as_input(), &length_prefixed)
+        let converted = super::normalize_access_unit(h264_config().as_input(), &length_prefixed)
             .expect("合法 AVC420 fixture 应转换为 Annex-B");
         let mut expected = Vec::new();
         for nal in nals {

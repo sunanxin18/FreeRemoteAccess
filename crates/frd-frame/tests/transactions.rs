@@ -360,7 +360,7 @@ fn steady_revision_errors_are_exact_and_never_emit() {
             at + Duration::from_millis(6),
             boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
         )]),
-        Ok(transactions) if transactions.is_empty() == false
+        Ok(transactions) if !transactions.is_empty()
     ));
     assert_error!(
         compiler.compile([enqueued(

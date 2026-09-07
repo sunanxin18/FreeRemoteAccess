@@ -40,6 +40,10 @@ impl PixelBuffer {
         self.0.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -95,5 +99,11 @@ mod tests {
 
         assert_eq!(buffer.as_bytes(), &[1, 2, 3, 4]);
         assert_eq!(buffer.as_bytes().as_ptr(), allocation);
+    }
+
+    #[test]
+    fn pixel_buffer_reports_empty_state_without_copying() {
+        assert!(PixelBuffer::new(Vec::new()).is_empty());
+        assert!(!PixelBuffer::new(vec![1]).is_empty());
     }
 }
