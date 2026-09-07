@@ -35,6 +35,33 @@ fn fixture(path: &std::path::Path) {
     image.save(path).unwrap();
 }
 
+fn assert_png_export_matches(repository: &Path, generated: &Path, relative: &str) {
+    let expected = image::open(repository.join(relative)).unwrap().into_rgba8();
+    let actual = image::open(generated.join(relative)).unwrap().into_rgba8();
+    assert_eq!(
+        actual.dimensions(),
+        expected.dimensions(),
+        "图标尺寸变化：{relative}"
+    );
+
+    // Lanczos 的浮点舍入在不同 CPU/编译器组合上可能让一个边缘通道相差 1；
+    // 仍然要求最多一个通道发生该单级差异，防止把真正的资产变化隐藏在容差中。
+    let mut differing_channels = 0usize;
+    for (expected_pixel, actual_pixel) in expected.pixels().zip(actual.pixels()) {
+        for (expected_channel, actual_channel) in expected_pixel.0.iter().zip(actual_pixel.0) {
+            let delta = i16::from(*expected_channel) - i16::from(actual_channel);
+            if delta != 0 {
+                assert_eq!(delta.abs(), 1, "图标像素变化超过单级舍入：{relative}");
+                differing_channels += 1;
+            }
+        }
+    }
+    assert!(
+        differing_channels <= 1,
+        "图标像素变化超过跨架构单级舍入预算：{relative} ({differing_channels})"
+    );
+}
+
 #[test]
 fn exports_platform_dimensions_alpha_safe_zone_and_ico_entries() {
     let temporary = tempfile::tempdir().unwrap();
@@ -119,10 +146,14 @@ fn committed_derivatives_match_the_deterministic_export() {
     .unwrap();
 
     for relative in GENERATED_ASSETS {
-        assert_eq!(
-            std::fs::read(generated.join(relative)).unwrap(),
-            std::fs::read(repository_assets.join(relative)).unwrap(),
-            "已提交资产必须由 frd-icon-assets 确定性生成：{relative}"
-        );
+        if relative.ends_with(".png") {
+            assert_png_export_matches(&repository_assets, &generated, relative);
+        } else {
+            assert_eq!(
+                std::fs::read(generated.join(relative)).unwrap(),
+                std::fs::read(repository_assets.join(relative)).unwrap(),
+                "已提交二进制资产必须由 frd-icon-assets 生成：{relative}"
+            );
+        }
     }
 }

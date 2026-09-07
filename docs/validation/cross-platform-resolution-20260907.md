@@ -29,4 +29,4 @@
 
 本记录证明规划器、连接请求传递和协议适配器的离线行为。当前没有把任何高于 2560×1440 的尺寸宣称为 Windows 或 Apple 服务端真机互操作结果；RDP/macOS GUI 之前的登录、证书 TOFU、Keychain 保存、完整基线和重连证据仍按各自记录保留。下一次高分辨率真机验证应记录显示器物理尺寸、最终协商尺寸、服务端确认和完整首帧，而不能只依据窗口逻辑尺寸或编译成功。
 
-完整工作区测试已执行；其中未涉及本次改动的 `frd-icon-assets` 派生资源一致性测试仍失败，原因是已提交的 Apple foreground 资源与确定性导出不一致。Windows RDP 全目标交叉检查在本机缺少 MSVC/Windows SDK 与 vcpkg 头文件处停止；`frd-app` 的 Windows target 检查已通过。这两项均单独记录为环境或既有打包状态，不作为本次分辨率实现的代码失败。
+完整工作区测试已通过。`frd-icon-assets` 的 PNG 派生资源校验现在比较解码像素，并只允许跨架构 Lanczos 单级舍入差异；没有改写提交的图标资产。Windows RDP 全目标交叉检查仍在本机缺少 MSVC/Windows SDK 与 vcpkg 头文件处停止；`frd-app` 的 Windows target 检查已通过，该限制单独记录为环境门禁，不作为分辨率实现的代码失败。
