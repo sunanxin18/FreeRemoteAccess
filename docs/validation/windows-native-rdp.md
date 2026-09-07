@@ -10,12 +10,13 @@ macOS 无 GUI adapter 的以下具体范围为 **受限验证**。
 
 ## 当前图形能力边界
 
-当前 RDP adapter 默认只启用传统 Bitmap/RemoteFX 图形基线。非敏感
-`RdpGraphicsCapability` 诊断固定记录 `legacy_bitmap=true`、`remotefx=true`，并将
-`egfx_advertised`、`egfx_confirmed`、`avc420` 与 `avc444` 设为 `false`。因此当前
-会话没有广告或启用 RDPGFX、H.264/AVC 或 HEVC；本记录中的 Bitmap/RemoteFX 结果不
-构成现代图形编码的互操作证据。工作树已加入独立的 IronRDP EGFX DVC 接缝和
-codec-neutral H.264 AVC420/FFmpeg bridge，但它们仍未由 RDP connector 注册为默认能力。
+当前 RDP adapter 在没有精确 decoder provider 时只启用传统 Bitmap/RemoteFX 图形基线。
+非敏感 `RdpGraphicsCapability` 诊断在该默认路径记录 `legacy_bitmap=true`、
+`remotefx=true`，并将 `egfx_advertised`、`egfx_confirmed`、`avc420` 与 `avc444` 设为
+`false`。Windows/macOS 组合根在固定 FFmpeg bundle 能力精确匹配时可以显式注入
+AVC420 provider；这条路径会广告 EGFX，但仍必须等待服务器 `CapabilitiesConfirm` 和
+真实首帧、刷新、恢复证据。本记录中的 Bitmap/RemoteFX 结果不构成现代图形编码的互操作
+证据，HEVC 仍未接入 RDP connector。
 
 2026-09-07 的离线 H.264 门禁覆盖精确 `H264Avc420/Yuv420P8` 能力匹配、四字节
 AVC length-prefixed NAL 到 Annex-B 的一次性转换、YUV420 三平面尺寸校验、FFmpeg
@@ -23,9 +24,10 @@ H.264 decoder/parser 构建选项，以及 Linux x86/i686、x86_64/arm64 bundle 
 ABI 的 codec capability 槽为零时会拒绝旧插件；native C bridge 在本机 FFmpeg 头文件
 下完成语法检查和 `native-ffmpeg` cargo check。EGFX handler 已通过离线测试把已映射
 AVC420 RGBA 更新转换为 generation-bound `SurfaceUpdate` 队列；协议中立 YUV420 decoder
-到 IronRDP RGBA 的适配契约也已加入严格的能力、长度前缀、generation 和单帧门禁；EGFX
-Reset 到 runtime generation admission 的消费边界也已通过离线测试，但尚未由生产 connector 注册，也没有 fixture 解码或 Windows 真机
-H.264 互操作证据；Windows x86/ARM64 的 package/runtime gate 仍明确为 unavailable。
+到 IronRDP RGBA 的适配契约也已加入严格的能力、长度前缀、generation 和单帧门禁；active
+session 会消费 EGFX Reset/Damage/FrameBoundary 并提交给 runtime。macOS arm64 已通过
+native HEVC、AVC420、AVC444 fixture，但授权 Windows 目标尚未产生可审计的 EGFX surface
+序列；Windows x86/ARM64 的 package/runtime gate 仍明确为 unavailable。
 
 现代图形的实现顺序固定为 AVC420、RemoteFX 优化、AVC444、HEVC。HEVC 即使先有
 本地解码能力，也必须等到真实生产互操作门禁通过并被服务端实际协商后，才可以成为
@@ -195,13 +197,14 @@ Invoke-Pester -Script tools/tests/windows-package.Tests.ps1 -EnableExit
 
 ### 当前图形范围与 Windows 包
 
-当前已实现并默认启用的传统图形基线仅为 Raw Bitmap、Interleaved RLE、RDP 6 Bitmap
+当前默认启用的传统图形基线仍为 Raw Bitmap、Interleaved RLE、RDP 6 Bitmap
 compression 与 RemoteFX，统一发布 BGRX dirty rectangles。EGFX DVC 接缝、H.264
-AVC420 FFmpeg bridge 和 handler 到 generation-bound `SurfaceUpdate` 队列已在协议中立
-层建立，并增加了未注册的协议中立 decoder 适配契约，但尚未由生产 connector 注册、提交给 runtime、默认广告能力，或完成真实
-RDPGFX/EGFX、ZGFX、AVC/AVC420、AVC444 互操作；当前 AVC444 仅有规范结构 envelope
-校验和 fail-closed 拒绝测试，双流重建、色彩转换和服务器确认仍未完成；不得作出现代
-图形已支持的声明。
+AVC420 FFmpeg bridge、provider 注入和 active-session 到 runtime 的 SurfaceUpdate 提交
+边界已建立，并通过 pinned IronRDP PDU 和 native fixture 离线验证；固定 bundle 缺失时
+仍回退 legacy。真实 RDPGFX/EGFX、ZGFX、AVC/AVC420、AVC444 互操作尚未完成。AVC444
+目前具有规范结构 envelope、V1/V2 双流重建和色彩转换的构造期边界，但生产组合根和
+服务器确认仍关闭；HEVC 仍只有协议无关 decoder/selector 门禁，不能作出现代图形已生产
+支持的声明。
 
 `cargo build --locked --release -p freeremotedesk-windows` 产生
 42,824,704-byte 的 `target/release/freeremotedesk-windows.exe`，SHA-256 为
