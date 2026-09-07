@@ -6,10 +6,22 @@
 # artifact 也会使脚本失败，避免把未执行的 gate 当成通过。
 # Linux bundle verifier 可通过 FRD_LINUX_FFMPEG_BUNDLE 与
 # FRD_LINUX_FFMPEG_PROFILE 显式提供 bundle/profile；缺少任一输入时不计为通过。
+# native fixture 的 FFMPEG_DIR 与 FRD_FFMPEG_TEST_BUNDLE 可使用仓库根相对路径。
 set -u -o pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+
+# Cargo executes build scripts with the package directory as its working
+# directory. Normalize opt-in native fixture paths against the repository
+# root so callers can use the same relative paths as the rest of this script.
+repo_path() {
+    local path="$1"
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+        *) printf '%s/%s\n' "$repo_root" "$path" ;;
+    esac
+}
 
 rust_toolchain="${FRD_RUST_TOOLCHAIN:-1.96.0}"
 if [[ -n "${FRD_RUST_TOOLCHAIN_BIN:-}" ]]; then
@@ -171,6 +183,12 @@ if [[ "${FRD_VERIFY_NATIVE_FFMPEG_FIXTURES:-0}" == 1 ]]; then
     # 下设置 x86_64-apple-darwin，仍然只把实际执行结果记为 native fixture 证据。
     native_bundle="${FRD_FFMPEG_TEST_BUNDLE:-}"
     native_dist="${FFMPEG_DIR:-}"
+    if [[ -n "$native_bundle" ]]; then
+        native_bundle="$(repo_path "$native_bundle")"
+    fi
+    if [[ -n "$native_dist" ]]; then
+        native_dist="$(repo_path "$native_dist")"
+    fi
     if [[ -z "$native_bundle" || -z "$native_dist" || ! -d "$native_bundle" || ! -d "$native_dist" ]]; then
         optional_missing 'native FFmpeg HEVC/AVC420/AVC444 fixtures（需要 FRD_FFMPEG_TEST_BUNDLE 与 FFMPEG_DIR）'
     else
@@ -186,17 +204,22 @@ if [[ "${FRD_VERIFY_NATIVE_FFMPEG_FIXTURES:-0}" == 1 ]]; then
         else
             loader_value="$native_bundle"
         fi
-        native_target_args=()
+        native_test_cmd=(cargo test --locked)
         if [[ -n "${FRD_FFMPEG_TEST_TARGET:-}" ]]; then
-            native_target_args=(--target "$FRD_FFMPEG_TEST_TARGET")
+            native_test_cmd+=(--target "$FRD_FFMPEG_TEST_TARGET")
         fi
+        native_test_cmd+=(
+            -p frd-video-ffmpeg-plugin
+            --features native-ffmpeg
+            --test main444_decode
+            --
+            --nocapture
+        )
         run_gate 'native FFmpeg HEVC/AVC420/AVC444 fixtures' env \
             FFMPEG_DIR="$native_dist" \
             FRD_FFMPEG_TEST_BUNDLE="$native_bundle" \
             "$loader_var=$loader_value" \
-            cargo test --locked "${native_target_args[@]}" \
-            -p frd-video-ffmpeg-plugin --features native-ffmpeg \
-            --test main444_decode -- --nocapture
+            "${native_test_cmd[@]}"
     fi
 else
     if [[ "$strict" == 1 ]]; then
