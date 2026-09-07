@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use frd_core::{PixelRect, PixelSize, SessionId};
@@ -491,28 +492,37 @@ impl H264Decoder for EgfxH264Decoder {
 
 impl EgfxH264Decoder {
     pub(crate) fn reset_checked(&mut self) -> DecoderResult<()> {
-        let Some(generation) = self.generation.checked_add(1) else {
+        let result = (|| {
+            let generation = self
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| DecoderError::msg("AVC420 generation overflow"))?;
+            if let Some(decoder) = self.decoder.as_mut() {
+                decoder
+                    .reset(generation)
+                    .map_err(|_| DecoderError::msg("AVC420 decoder reset failed"))?;
+                let stream = self.stream.as_ref().ok_or_else(|| {
+                    DecoderError::msg("AVC420 stream configuration is unavailable")
+                })?;
+                let mut input = stream.as_input().clone();
+                input.generation = generation;
+                self.stream = Some(
+                    VideoStreamConfig::try_new(input)
+                        .map_err(|_| DecoderError::msg("AVC420 stream reset is invalid"))?,
+                );
+            }
+            self.generation = generation;
+            self.next_timestamp = 0;
+            Ok(())
+        })();
+        if result.is_err() {
+            // IronRDP's H264Decoder::reset has no error return.  Retain the
+            // failure locally so every later decode is rejected and the
+            // owning EGFX adapter can disable the optional stream rather than
+            // publishing a reset with an unusable decoder.
             self.failed = true;
-            return Err(DecoderError::msg("AVC420 generation overflow"));
-        };
-        if let Some(decoder) = self.decoder.as_mut() {
-            decoder
-                .reset(generation)
-                .map_err(|_| DecoderError::msg("AVC420 decoder reset failed"))?;
-            let stream = self
-                .stream
-                .as_ref()
-                .ok_or_else(|| DecoderError::msg("AVC420 stream configuration is unavailable"))?;
-            let mut input = stream.as_input().clone();
-            input.generation = generation;
-            self.stream = Some(
-                VideoStreamConfig::try_new(input)
-                    .map_err(|_| DecoderError::msg("AVC420 stream reset is invalid"))?,
-            );
         }
-        self.generation = generation;
-        self.next_timestamp = 0;
-        Ok(())
+        result
     }
 
     /// Decode an AVC access unit while retaining its protocol-neutral YUV420
@@ -1739,7 +1749,7 @@ impl EgfxSurfacePublisher {
 pub(crate) struct EgfxAdapter {
     inner: GraphicsPipelineClient,
     surface_publisher: Option<EgfxSurfacePublisher>,
-    failed: bool,
+    failed: Arc<AtomicBool>,
 }
 
 #[allow(dead_code)]
@@ -1751,7 +1761,7 @@ impl EgfxAdapter {
         Self {
             inner: GraphicsPipelineClient::new(handler, decoder),
             surface_publisher: None,
-            failed: false,
+            failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1762,12 +1772,12 @@ impl EgfxAdapter {
         Self {
             inner: GraphicsPipelineClient::new(Box::new(publisher.clone()), decoder),
             surface_publisher: Some(publisher),
-            failed: false,
+            failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        !self.failed
+        !self.failed.load(Ordering::Acquire)
             && self.inner.is_active()
             && self
                 .surface_publisher
@@ -1776,7 +1786,7 @@ impl EgfxAdapter {
     }
 
     pub(crate) fn is_failed(&self) -> bool {
-        self.failed
+        self.failed.load(Ordering::Acquire)
     }
 
     pub(crate) fn avc420_confirmed(&self) -> bool {
@@ -1793,6 +1803,18 @@ impl EgfxAdapter {
             .map(EgfxSurfacePublisher::drain)
             .unwrap_or_default()
     }
+
+    /// A display reactivation commits a new runtime generation before the
+    /// server has sent a fresh EGFX ResetGraphics. The pinned IronRDP client
+    /// keeps its decoder and publisher private, so retaining them would make
+    /// the next EGFX frame generation-stale. Disable this optional stream at
+    /// the boundary; legacy Bitmap/RemoteFX continues on the new generation.
+    pub(crate) fn disable_for_reactivation(&self) {
+        self.failed.store(true, Ordering::Release);
+        if let Some(publisher) = &self.surface_publisher {
+            publisher.disable();
+        }
+    }
 }
 
 impl_as_any!(EgfxAdapter);
@@ -1807,7 +1829,7 @@ impl DvcProcessor for EgfxAdapter {
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        if self.failed {
+        if self.failed.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
         match self.inner.process(channel_id, payload) {
@@ -1817,12 +1839,12 @@ impl DvcProcessor for EgfxAdapter {
                     .as_ref()
                     .is_some_and(EgfxSurfacePublisher::is_disabled)
                 {
-                    self.failed = true;
+                    self.failed.store(true, Ordering::Release);
                 }
                 Ok(messages)
             }
             Err(error) => {
-                self.failed = true;
+                self.failed.store(true, Ordering::Release);
                 if let Some(publisher) = &self.surface_publisher {
                     publisher.disable();
                 }
@@ -1880,6 +1902,23 @@ mod tests {
         assert!(!adapter.is_active());
         assert!(!adapter.avc420_confirmed());
         assert!(!adapter.avc444_confirmed());
+    }
+
+    #[test]
+    fn reactivation_disables_the_generation_bound_egfx_stream() {
+        let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        let adapter = EgfxAdapter::with_surface_publisher(
+            Some(Box::new(FailingH264Decoder)),
+            publisher.clone(),
+        );
+
+        assert!(!adapter.is_failed());
+        adapter.disable_for_reactivation();
+
+        assert!(adapter.is_failed());
+        assert!(!adapter.is_active());
+        assert!(publisher.is_disabled());
+        assert!(publisher.drain().is_empty());
     }
 
     #[test]
@@ -2470,6 +2509,7 @@ mod tests {
             Box::new(OneFrameDecoder {
                 frame,
                 resets: Vec::new(),
+                fail_reset: false,
             }),
         );
 
@@ -2500,6 +2540,31 @@ mod tests {
             vec![0x68, 0xce].into_boxed_slice(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn h264_decoder_reset_failure_is_retained_as_a_fail_closed_state() {
+        let stream = avc420_stream_config(
+            SessionId::allocate(),
+            1,
+            PixelSize::new(2, 2).unwrap(),
+            vec![0x67, 0x42].into_boxed_slice(),
+            vec![0x68, 0xce].into_boxed_slice(),
+        )
+        .unwrap();
+        let frame = black_yuv420_frame(&stream);
+        let mut decoder = EgfxH264Decoder::from_decoder(
+            stream,
+            Box::new(OneFrameDecoder {
+                frame,
+                resets: Vec::new(),
+                fail_reset: true,
+            }),
+        );
+
+        assert!(decoder.reset_checked().is_err());
+        assert!(decoder.failed);
+        assert!(decoder.decode(&[0, 0, 0, 2, 0x65, 0x88]).is_err());
     }
 
     #[test]
@@ -2884,6 +2949,7 @@ mod tests {
     struct OneFrameDecoder {
         frame: DecodedVideoFrame,
         resets: Vec<u64>,
+        fail_reset: bool,
     }
 
     struct FailingH264Decoder;
@@ -2911,6 +2977,11 @@ mod tests {
         }
 
         fn reset(&mut self, generation: u64) -> Result<(), VideoDecodeError> {
+            if self.fail_reset {
+                return Err(VideoDecodeError::new(
+                    frd_media_api::VideoDecodeErrorCode::DecodeFailedAfterFirstFrame,
+                ));
+            }
             self.resets.push(generation);
             let mut input = self.frame.as_input().clone();
             input.generation = generation;
@@ -2960,6 +3031,7 @@ mod tests {
             Ok(Box::new(OneFrameDecoder {
                 frame: black_yuv420_frame(config),
                 resets: Vec::new(),
+                fail_reset: false,
             }))
         }
     }

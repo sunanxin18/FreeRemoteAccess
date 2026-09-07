@@ -359,7 +359,7 @@ fn run_active_loop(
         let egfx_frame_confirmed = egfx_updates
             .iter()
             .any(|update| matches!(update, SurfaceUpdate::FrameBoundary { .. }));
-        publish_egfx_surface_updates(runtime, session_id, generation, egfx_updates)?;
+        publish_egfx_surface_updates(runtime, baseline, session_id, generation, egfx_updates)?;
         let previous_graphics = graphics_capability.snapshot();
         observe_egfx_confirmation(active_stage, graphics_capability, egfx_frame_confirmed);
         let current_graphics = graphics_capability.snapshot();
@@ -576,8 +576,18 @@ fn drain_egfx_surface_updates(active_stage: &mut ActiveStage) -> Vec<SurfaceUpda
         .unwrap_or_default()
 }
 
+fn disable_egfx_for_reactivation(active_stage: &mut ActiveStage) {
+    if let Some(adapter) = active_stage
+        .get_dvc::<EgfxAdapter>()
+        .and_then(|channel| channel.channel_processor_downcast_ref::<EgfxAdapter>())
+    {
+        adapter.disable_for_reactivation();
+    }
+}
+
 fn publish_egfx_surface_updates(
     runtime: &mut ProtocolRuntime,
+    baseline: &mut RdpBaseline,
     session_id: SessionId,
     generation: &mut u64,
     updates: Vec<SurfaceUpdate>,
@@ -596,7 +606,16 @@ fn publish_egfx_surface_updates(
                 if update_generation <= *generation {
                     return Err(ProtocolError::InvalidGeneration);
                 }
-                runtime.begin_generation(update_session, update_generation, size, format)?;
+                if format != frd_frame::PixelFormat::Bgrx8UnormSrgb {
+                    return Err(ProtocolError::FramePortRejected);
+                }
+                // EGFX and legacy Bitmap/RemoteFX share the runtime surface.
+                // Rebind the legacy coverage tracker at the same generation
+                // boundary so a later legacy update remains a valid fallback.
+                // `begin_next_generation` allocates the replacement before
+                // committing the runtime reset, preserving fail-closed state
+                // if the replacement cannot be created.
+                baseline.begin_next_generation(runtime, update_generation, size)?;
                 *generation = update_generation;
             }
             update => runtime.publish_surface(update)?,
@@ -750,6 +769,9 @@ fn drive_reactivation(
                 desktop_size,
                 current_max_monitor_area,
             )?;
+            if disposition == ReactivationSurfaceDisposition::Committed {
+                disable_egfx_for_reactivation(active_stage);
+            }
             active_stage.set_fastpath_processor(
                 fast_path::ProcessorBuilder {
                     io_channel_id: activation.io_channel_id(),
@@ -1243,17 +1265,15 @@ mod tests {
             None,
             Box::new(NoopWake),
         );
-        runtime
-            .begin_generation(
-                session_id,
-                1,
-                PixelSize {
-                    width: 2,
-                    height: 2,
-                },
-                PixelFormat::Bgrx8UnormSrgb,
-            )
-            .expect("baseline generation begins");
+        let mut baseline = RdpBaseline::begin(
+            &mut runtime,
+            session_id,
+            PixelSize {
+                width: 2,
+                height: 2,
+            },
+        )
+        .expect("baseline generation begins");
         let mut generation = 1;
         let patch = PixelPatch {
             rect: PixelRect {
@@ -1268,6 +1288,7 @@ mod tests {
 
         publish_egfx_surface_updates(
             &mut runtime,
+            &mut baseline,
             session_id,
             &mut generation,
             vec![
@@ -1297,23 +1318,48 @@ mod tests {
         .expect("EGFX reset and current-generation frame publish");
 
         assert_eq!(generation, 2);
+        {
+            let updates = updates.lock().expect("frame log");
+            assert_eq!(
+                updates.len(),
+                4,
+                "old reset plus new reset, damage and boundary"
+            );
+            assert!(matches!(
+                updates[1],
+                SurfaceUpdate::Reset { generation: 2, .. }
+            ));
+            assert!(matches!(
+                updates[2],
+                SurfaceUpdate::Damage { generation: 2, .. }
+            ));
+            assert!(matches!(
+                updates[3],
+                SurfaceUpdate::FrameBoundary { generation: 2, .. }
+            ));
+        }
+
+        // The legacy baseline must be rebound by the same EGFX reset. A
+        // subsequent Bitmap/RemoteFX update in generation 2 remains a valid
+        // fallback instead of being rejected as stale.
+        let image = DecodedImage::new(IronPixelFormat::RgbA32, 2, 2);
+        publish_graphics_update(
+            &mut runtime,
+            &mut baseline,
+            &image,
+            generation,
+            InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+        )
+        .expect("legacy fallback remains valid after EGFX reset");
         let updates = updates.lock().expect("frame log");
-        assert_eq!(
-            updates.len(),
-            4,
-            "old reset plus new reset, damage and boundary"
-        );
         assert!(matches!(
-            updates[1],
-            SurfaceUpdate::Reset { generation: 2, .. }
-        ));
-        assert!(matches!(
-            updates[2],
-            SurfaceUpdate::Damage { generation: 2, .. }
-        ));
-        assert!(matches!(
-            updates[3],
-            SurfaceUpdate::FrameBoundary { generation: 2, .. }
+            updates.last(),
+            Some(SurfaceUpdate::FrameBoundary { generation: 2, .. })
         ));
     }
 
@@ -1331,10 +1377,21 @@ mod tests {
             None,
             Box::new(NoopWake),
         );
+        let mut baseline = RdpBaseline::begin(
+            &mut runtime,
+            session_id,
+            PixelSize {
+                width: 2,
+                height: 2,
+            },
+        )
+        .expect("baseline generation begins");
+        updates.lock().expect("frame log").clear();
         let mut generation = 1;
 
         let error = publish_egfx_surface_updates(
             &mut runtime,
+            &mut baseline,
             session_id,
             &mut generation,
             vec![SurfaceUpdate::Reset {
@@ -1367,10 +1424,21 @@ mod tests {
             None,
             Box::new(NoopWake),
         );
+        let mut baseline = RdpBaseline::begin(
+            &mut runtime,
+            session_id,
+            PixelSize {
+                width: 2,
+                height: 2,
+            },
+        )
+        .expect("baseline generation begins");
+        updates.lock().expect("frame log").clear();
         let mut generation = 1;
 
         let error = publish_egfx_surface_updates(
             &mut runtime,
+            &mut baseline,
             session_id,
             &mut generation,
             vec![SurfaceUpdate::Reset {
