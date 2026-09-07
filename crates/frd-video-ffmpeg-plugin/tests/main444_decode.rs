@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use frd_video_ffmpeg::abi::{
     FrdByteSlice, FrdCreateDecoderFn, FrdDecodedFrame, FrdDestroyFn, FrdFlushFn, FrdGetFfmpegApiV1,
     FrdReceiveFn, FrdReclaimFrameFn, FrdStatus, FrdSubmitFn, FrdVideoConfig, RawFrdFfmpegApiV1,
-    FRD_API_CONTRACT_REQUIRED, FRD_BITSTREAM_ANNEX_B, FRD_CHROMA_YUV_444, FRD_CODEC_HEVC,
-    FRD_FFMPEG_ABI_VERSION, FRD_FFMPEG_API_SYMBOL, FRD_FFMPEG_API_V1_ALIGNMENT,
-    FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_444_P8,
+    FRD_API_CONTRACT_REQUIRED, FRD_BITSTREAM_ANNEX_B, FRD_CHROMA_YUV_420, FRD_CHROMA_YUV_444,
+    FRD_CODEC_H264, FRD_CODEC_HEVC, FRD_FFMPEG_ABI_VERSION, FRD_FFMPEG_API_SYMBOL,
+    FRD_FFMPEG_API_V1_ALIGNMENT, FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR,
+    FRD_PIXEL_FORMAT_YUV_420_P8, FRD_PIXEL_FORMAT_YUV_444_P8, FRD_PROFILE_H264_AVC420,
     FRD_PROFILE_HEVC_MAIN_444_8, FRD_SUBMIT_RANDOM_ACCESS,
 };
 #[derive(Debug)]
@@ -60,6 +61,94 @@ struct Api {
     flush: FrdFlushFn,
     destroy: FrdDestroyFn,
     reclaim: FrdReclaimFrameFn,
+}
+
+#[test]
+fn fixed_ffmpeg_decodes_synthetic_avc420_idr_to_owned_yuv420p8() {
+    let bitstream = include_bytes!("fixtures/synthetic-avc420-2x2.h264");
+    let metadata = include_str!("fixtures/synthetic-avc420-2x2.json");
+    assert_eq!(
+        hex_sha256(bitstream),
+        json_string(metadata, "fixture_sha256")
+    );
+    let nals = h264_annex_b_nals(bitstream);
+    assert_eq!(
+        nals.iter().map(|nal| nal.kind).collect::<Vec<_>>(),
+        vec![7, 8, 5],
+        "AVC420 fixture 必须只含 SPS/PPS 和单个 IDR"
+    );
+
+    let loaded = unsafe { load_direct_api(&development_codec_bundle()) };
+    let api = loaded.api;
+    let config = FrdVideoConfig {
+        codec: FRD_CODEC_H264,
+        profile: FRD_PROFILE_H264_AVC420,
+        chroma: FRD_CHROMA_YUV_420,
+        bit_depth: 8,
+        // The SPS describes a 2x2 visible crop inside one 16x16 macroblock. The native ABI
+        // carries coded geometry, and the bridge deliberately keeps cropping disabled so the
+        // caller can apply the protocol's visible rectangle separately.
+        coded_width: 16,
+        coded_height: 16,
+        timebase: 90_000,
+        bitstream_format: FRD_BITSTREAM_ANNEX_B,
+        vps: FrdByteSlice {
+            data: std::ptr::null(),
+            len: 0,
+        },
+        sps: byte_slice(nals[0].bytes),
+        pps: byte_slice(nals[1].bytes),
+    };
+
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: config and output storage remain valid for the call; the validated table owns the
+    // returned handle until the matching destroy callback below.
+    assert_eq!(unsafe { (api.create)(&config, &mut handle) }, FrdStatus::OK);
+    assert!(!handle.is_null());
+
+    // The first AVC access unit carries SPS/PPS together with the IDR. Keep those NALs in the
+    // packet as RDP's lazy provider uses the same complete access unit to create the decoder.
+    let access_unit = bitstream.to_vec();
+    // SAFETY: handle is exclusively owned and serialized; input bytes live through the call.
+    let submit_status = unsafe {
+        (api.submit)(
+            handle,
+            access_unit.as_ptr(),
+            access_unit.len(),
+            90_000,
+            FRD_SUBMIT_RANDOM_ACCESS,
+        )
+    };
+    assert!(
+        submit_status == FrdStatus::OK || submit_status == FrdStatus::NEED_MORE_DATA,
+        "AVC420 IDR 必须被 native decoder 接受，实际 {submit_status:?}"
+    );
+
+    let mut decoded = unsafe { receive_one_frame(api, handle) };
+    assert_eq!(decoded.timestamp_ticks, 90_000);
+    assert_eq!(decoded.pixel_format, FRD_PIXEL_FORMAT_YUV_420_P8);
+    assert_eq!(decoded.plane_count, 3);
+    assert_eq!(
+        (decoded.planes[0].width, decoded.planes[0].height),
+        (16, 16)
+    );
+    assert_eq!((decoded.planes[1].width, decoded.planes[1].height), (8, 8));
+    assert_eq!((decoded.planes[2].width, decoded.planes[2].height), (8, 8));
+    for plane in decoded.planes {
+        assert!(plane.stride_bytes >= plane.width);
+        assert_eq!(
+            plane.buffer.len,
+            usize::try_from(plane.stride_bytes * plane.height).unwrap()
+        );
+        assert!(!plane.buffer.data.is_null());
+        // SAFETY: successful receive promises readable plugin-owned storage until reclaim.
+        let bytes = unsafe { std::slice::from_raw_parts(plane.buffer.data, plane.buffer.len) };
+        assert!(bytes.iter().any(|byte| *byte != 0), "解码 plane 不能全为零");
+    }
+    // SAFETY: exactly-once reclamation of the successful receive output.
+    unsafe { (api.reclaim)(handle, &mut decoded) };
+    // SAFETY: final release of the exclusive handle.
+    unsafe { (api.destroy)(handle) };
 }
 
 #[test]
@@ -658,7 +747,15 @@ struct Nal<'a> {
     bytes: &'a [u8],
 }
 
+fn h264_annex_b_nals(input: &[u8]) -> Vec<Nal<'_>> {
+    annex_b_nals_with_header(input, false)
+}
+
 fn annex_b_nals(input: &[u8]) -> Vec<Nal<'_>> {
+    annex_b_nals_with_header(input, true)
+}
+
+fn annex_b_nals_with_header(input: &[u8], hevc: bool) -> Vec<Nal<'_>> {
     let mut starts = Vec::new();
     let mut offset = 0usize;
     while offset + 3 <= input.len() {
@@ -689,7 +786,11 @@ fn annex_b_nals(input: &[u8]) -> Vec<Nal<'_>> {
             let bytes = &input[payload_start..end];
             assert!(bytes.len() >= 2, "HEVC NAL header 必须完整");
             Nal {
-                kind: (bytes[0] >> 1) & 0x3f,
+                kind: if hevc {
+                    (bytes[0] >> 1) & 0x3f
+                } else {
+                    bytes[0] & 0x1f
+                },
                 bytes,
             }
         })
