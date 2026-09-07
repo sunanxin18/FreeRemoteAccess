@@ -71,9 +71,27 @@ run_gate '协议、媒体、视频插件与桌面壳 focused tests' \
     -p frd-protocol-rdp \
     -p frd-shell-desktop
 
-run_gate 'pinned IronRDP EGFX crate tests' \
-    cargo test --manifest-path third_party/ironrdp-egfx-0.3.0/Cargo.toml \
-    --offline --quiet
+run_pinned_egfx_tests() {
+    local manifest='third_party/ironrdp-egfx-0.3.0/Cargo.toml'
+    local lockfile='third_party/ironrdp-egfx-0.3.0/Cargo.lock'
+    local target_dir="$repo_root/target/pinned-ironrdp-egfx"
+    local had_lockfile=0
+    if [[ -e "$lockfile" ]]; then
+        had_lockfile=1
+    fi
+
+    run_gate 'pinned IronRDP EGFX crate tests' \
+        env CARGO_TARGET_DIR="$target_dir" \
+        cargo test --manifest-path "$manifest" --offline --quiet
+
+    # The vendored crate is a library without a committed lockfile. Remove only
+    # the lockfile created by this check; the root target directory is ignored.
+    if (( had_lockfile == 0 )) && [[ -e "$lockfile" ]]; then
+        rm -f "$lockfile"
+    fi
+}
+
+run_pinned_egfx_tests
 
 run_gate '顶层 CLI help' cargo run --locked --quiet -- --help
 run_gate 'hpssview CLI help' cargo run --locked --quiet -- hpssview --help
