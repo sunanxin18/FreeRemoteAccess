@@ -102,11 +102,11 @@ fi
 
 cd "$frd_root"
 if [[ "$frd_cross_build" -eq 1 ]]; then
-  FFMPEG_DIR="$frd_prefix" cargo build --release --target "$FRD_CARGO_TARGET" \
+  FFMPEG_DIR="$frd_prefix" cargo build --locked --release --target "$FRD_CARGO_TARGET" \
     -p frd-video-ffmpeg-plugin --features native-ffmpeg
   frd_plugin="target/$FRD_CARGO_TARGET/release/libfreeremotedesk_ffmpeg.so"
 else
-  FFMPEG_DIR="$frd_prefix" cargo build --release -p frd-video-ffmpeg-plugin --features native-ffmpeg
+  FFMPEG_DIR="$frd_prefix" cargo build --locked --release -p frd-video-ffmpeg-plugin --features native-ffmpeg
   frd_plugin="target/release/libfreeremotedesk_ffmpeg.so"
 fi
 if [[ "$frd_cross_build" -eq 0 && "${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}" == 1 ]]; then

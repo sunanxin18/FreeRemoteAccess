@@ -90,12 +90,12 @@ make install
 cd "$frd_root"
 if [[ "$frd_cross_build" -eq 1 ]]; then
   frd_target_dir="${CARGO_TARGET_DIR:-$frd_root/target}"
-  FFMPEG_DIR="$frd_prefix" cargo build --release --target "$frd_rust_target" \
+  FFMPEG_DIR="$frd_prefix" cargo build --locked --release --target "$frd_rust_target" \
     -p frd-video-ffmpeg-plugin --features native-ffmpeg
   frd_plugin="$frd_target_dir/$frd_rust_target/release/libfreeremotedesk_ffmpeg.dylib"
 else
   frd_target_dir="${CARGO_TARGET_DIR:-$frd_root/target}"
-  FFMPEG_DIR="$frd_prefix" cargo build --release \
+  FFMPEG_DIR="$frd_prefix" cargo build --locked --release \
     -p frd-video-ffmpeg-plugin --features native-ffmpeg
   frd_plugin="$frd_target_dir/release/libfreeremotedesk_ffmpeg.dylib"
 fi
