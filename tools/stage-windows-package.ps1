@@ -1,9 +1,11 @@
 [CmdletBinding()]
 param(
+    [ValidateSet("x86_64", "x86", "arm64")]
+    [string]$Architecture = "x86_64",
     [string]$PackageRoot = "target/package-test",
-    [string]$Application = "target/release/freeremotedesk-windows.exe",
-    [string]$CodecSource = ".codex-target/ffmpeg-8.1.2/windows-x86_64/Release/codec",
-    [string]$BuildProvenance = ".codex-target/ffmpeg-8.1.2/windows-x86_64/Release/build-provenance.txt",
+    [string]$Application,
+    [string]$CodecSource,
+    [string]$BuildProvenance,
     [string]$CorrespondingSourceAsset = ".codex-target/ffmpeg-8.1.2/release-assets/FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip",
     [string]$GitCommit,
     [string]$BuildId
@@ -14,20 +16,65 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $ApprovedDllNames = @("avcodec-62.dll", "avutil-60.dll", "freeremotedesk_ffmpeg.dll")
-$CodecRelativeDirectory = "codecs/ffmpeg-8.1.2/windows-x86_64"
+
+function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
+    switch ($Name) {
+        "x86_64" {
+            return [pscustomobject]@{
+                Architecture = "x86_64"; PlatformDirectory = "windows-x86_64"; FfmpegArch = "x86_64";
+                CrossPrefix = "x86_64-w64-mingw32-"; AssemblyKind = "x86asm";
+                AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
+                RequiresX86Asm = $true; RustTarget = "x86_64-pc-windows-msvc"
+            }
+        }
+        "x86" {
+            return [pscustomobject]@{
+                Architecture = "x86"; PlatformDirectory = "windows-x86"; FfmpegArch = "x86";
+                CrossPrefix = "i686-w64-mingw32-"; AssemblyKind = "x86asm";
+                AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
+                RequiresX86Asm = $true; RustTarget = "i686-pc-windows-msvc"
+            }
+        }
+        "arm64" {
+            return [pscustomobject]@{
+                Architecture = "arm64"; PlatformDirectory = "windows-aarch64"; FfmpegArch = "aarch64";
+                CrossPrefix = "aarch64-w64-mingw32-"; AssemblyKind = "aarch64-neon";
+                AssemblyProvenance = "aarch64-neon=FFmpeg AArch64/NEON"; AssemblyGate = "have_neon=1";
+                RequiresX86Asm = $false; RustTarget = "aarch64-pc-windows-msvc"
+            }
+        }
+        default { throw "不支持的 Windows package 架构: $Name" }
+    }
+}
+
+$ArchitectureProfile = Get-WindowsFfmpegArchitectureProfile $Architecture
+$PlatformDirectory = $ArchitectureProfile.PlatformDirectory
+$CodecRelativeDirectory = "codecs/ffmpeg-8.1.2/$PlatformDirectory"
+$Application = if ([string]::IsNullOrWhiteSpace($Application)) {
+    if ($Architecture -eq "x86_64") { "target/release/freeremotedesk-windows.exe" }
+    else { "target/$($ArchitectureProfile.RustTarget)/release/freeremotedesk-windows.exe" }
+} else { $Application }
+$CodecSource = if ([string]::IsNullOrWhiteSpace($CodecSource)) {
+    ".codex-target/ffmpeg-8.1.2/$PlatformDirectory/Release/codec"
+} else { $CodecSource }
+$BuildProvenance = if ([string]::IsNullOrWhiteSpace($BuildProvenance)) {
+    ".codex-target/ffmpeg-8.1.2/$PlatformDirectory/Release/build-provenance.txt"
+} else { $BuildProvenance }
 $CorrespondingSourceFileName = "FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip"
 $ExpectedSourceUrl = "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz"
 $ExpectedArchiveSha256 = "464BEB5E7BF0C311E68B45AE2F04E9CC2AF88851ABB4082231742A74D97B524C"
 $ExpectedConfigureArguments = @(
-    "--arch=x86_64", "--target-os=mingw32", "--cross-prefix=x86_64-w64-mingw32-",
+    "--arch=$($ArchitectureProfile.FfmpegArch)", "--target-os=mingw32", "--cross-prefix=$($ArchitectureProfile.CrossPrefix)",
     "--disable-static", "--enable-shared", "--disable-programs", "--disable-doc",
     "--disable-everything", "--enable-decoder=hevc,h264", "--enable-parser=hevc,h264",
     "--enable-protocol=file", "--disable-gpl", "--disable-nonfree", "--disable-version3",
-    "--disable-autodetect", "--disable-network", "--disable-debug",
-    "--enable-stripping"
+    "--disable-autodetect", "--disable-network"
 )
-$ExpectedX86AsmProvenance = "nasm=NASM version 2.16.01"
-$ExpectedHaveX86Asm = "have_x86asm=1"
+if ($Architecture -ne "x86_64") { $ExpectedConfigureArguments += "--enable-cross-compile" }
+if (-not $ArchitectureProfile.RequiresX86Asm) { $ExpectedConfigureArguments += "--disable-x86asm" }
+$ExpectedConfigureArguments += "--disable-debug", "--enable-stripping"
+$ExpectedAssemblyProvenance = $ArchitectureProfile.AssemblyProvenance
+$ExpectedAssemblyGate = $ArchitectureProfile.AssemblyGate
 
 function Resolve-RepoPath([string]$Path) {
     if ([IO.Path]::IsPathRooted($Path)) {
@@ -116,9 +163,13 @@ $provenance = Get-Content -Raw -LiteralPath $provenancePath
 foreach ($requiredProvenance in @(
     "source_url=$ExpectedSourceUrl",
     "archive_sha256=$ExpectedArchiveSha256",
+    "platform=$PlatformDirectory",
     "signature=VALID",
     "codec_files=$($ApprovedDllNames -join ',')",
-    "codec_imports=VALID"
+    "codec_imports=VALID",
+    "assembly_kind=$($ArchitectureProfile.AssemblyKind)",
+    "assembly_provenance=$ExpectedAssemblyProvenance",
+    $ExpectedAssemblyGate
 )) {
     if (-not $provenance.Contains($requiredProvenance)) {
         throw "FFmpeg build provenance 缺少门禁: $requiredProvenance"
@@ -129,15 +180,23 @@ foreach ($argument in $ExpectedConfigureArguments) {
         throw "FFmpeg build provenance 缺少 configure 参数: $argument"
     }
 }
-if ($provenance.Contains("--disable-x86asm")) {
+if ($ArchitectureProfile.RequiresX86Asm -and $provenance.Contains("--disable-x86asm")) {
     throw "FFmpeg build provenance 不得包含 configure 参数: --disable-x86asm"
 }
-if (-not $provenance.Contains($ExpectedX86AsmProvenance)) {
-    throw "FFmpeg build provenance 缺少 x86asm positive provenance: $ExpectedX86AsmProvenance"
+if (-not $provenance.Contains($ExpectedAssemblyProvenance)) {
+    throw "FFmpeg build provenance 缺少 $($ArchitectureProfile.AssemblyKind) positive provenance: $ExpectedAssemblyProvenance"
 }
-$haveX86AsmLines = @([regex]::Matches($provenance, '(?m)^have_x86asm=[^\r\n]*\r?$') | ForEach-Object { $_.Value.TrimEnd("`r") })
-if ($haveX86AsmLines.Count -ne 1 -or $haveX86AsmLines[0] -cne $ExpectedHaveX86Asm) {
-    throw "FFmpeg build provenance 缺少精确生成头 x86asm 门禁: $ExpectedHaveX86Asm"
+if ($ArchitectureProfile.RequiresX86Asm) {
+    $haveX86AsmLines = @([regex]::Matches($provenance, '(?m)^have_x86asm=[^\r\n]*\r?$') | ForEach-Object { $_.Value.TrimEnd("`r") })
+    if ($haveX86AsmLines.Count -ne 1 -or $haveX86AsmLines[0] -cne $ExpectedAssemblyGate) {
+        throw "FFmpeg build provenance 缺少精确生成头 x86asm 门禁: $ExpectedAssemblyGate"
+    }
+}
+else {
+    $haveNeonLines = @([regex]::Matches($provenance, '(?m)^have_neon=[^\r\n]*\r?$') | ForEach-Object { $_.Value.TrimEnd("`r") })
+    if ($haveNeonLines.Count -ne 1 -or $haveNeonLines[0] -cne $ExpectedAssemblyGate) {
+        throw "FFmpeg build provenance 缺少精确生成头 AArch64/NEON 门禁: $ExpectedAssemblyGate"
+    }
 }
 
 $attempt = "$package.stage-$PID-$([Guid]::NewGuid().ToString('N'))"
@@ -174,9 +233,22 @@ try {
         }
         $manifest.build.buildId = $BuildId
     }
+    $manifest.platform = $PlatformDirectory
+    $manifest.codecDirectory = $CodecRelativeDirectory
     $manifest.source.configureArguments = $ExpectedConfigureArguments
-    $manifest.source | Add-Member -NotePropertyName "x86asmProvenance" -NotePropertyValue $ExpectedX86AsmProvenance -Force
-    $manifest.source | Add-Member -NotePropertyName "haveX86Asm" -NotePropertyValue $ExpectedHaveX86Asm -Force
+    $manifest.source | Add-Member -NotePropertyName "assemblyKind" -NotePropertyValue $ArchitectureProfile.AssemblyKind -Force
+    $manifest.source | Add-Member -NotePropertyName "assemblyProvenance" -NotePropertyValue $ExpectedAssemblyProvenance -Force
+    $manifest.source | Add-Member -NotePropertyName "assemblyGate" -NotePropertyValue $ExpectedAssemblyGate -Force
+    $manifest.source | Add-Member -NotePropertyName "x86asmProvenance" -NotePropertyValue $(if ($ArchitectureProfile.RequiresX86Asm) { $ExpectedAssemblyProvenance } else { "disabled" }) -Force
+    $manifest.source | Add-Member -NotePropertyName "haveX86Asm" -NotePropertyValue $(if ($ArchitectureProfile.RequiresX86Asm) { "have_x86asm=1" } else { "have_x86asm=0" }) -Force
+    $manifest.files = @(
+        [pscustomobject]@{ path = "freeremotedesk-windows.exe"; role = "application"; sha256 = $null },
+        [pscustomobject]@{ path = "$CodecRelativeDirectory/avcodec-62.dll"; role = "ffmpeg-libavcodec"; sha256 = $null },
+        [pscustomobject]@{ path = "$CodecRelativeDirectory/avutil-60.dll"; role = "ffmpeg-libavutil"; sha256 = $null },
+        [pscustomobject]@{ path = "$CodecRelativeDirectory/freeremotedesk_ffmpeg.dll"; role = "freeremotedesk-ffmpeg-plugin"; sha256 = $null },
+        [pscustomobject]@{ path = "licenses/FFmpeg-LGPL-2.1-or-later.txt"; role = "license"; sha256 = $null },
+        [pscustomobject]@{ path = "licenses/FFmpeg-NOTICE.txt"; role = "notice"; sha256 = $null }
+    )
     $manifest.buildProvenanceSha256 = (Get-FileHash -LiteralPath $provenancePath -Algorithm SHA256).Hash
     $correspondingSourceHash = (Get-FileHash -LiteralPath $sourceAssetPath -Algorithm SHA256).Hash
     $manifest.correspondingSource.sha256 = $correspondingSourceHash

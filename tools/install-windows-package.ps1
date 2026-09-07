@@ -21,7 +21,7 @@ if (-not $Elevated) {
     $verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
     $bootstrapBuilder = Join-Path $repoRoot "tools\new-windows-installer-bootstrap.ps1"
 }
-$expectedVerifierSha256 = "448048D712DA0FD81E9C2181CFC34B9B7B965A7E5F24A2FCC990899FCBCAEF72"
+$expectedVerifierSha256 = "AD92F7213086251698DC86DEF71A4A1E653048AE67827E05F8C11E32686B58ED"
 $expectedBootstrapBuilderSha256 = "BAE11BAE8B7AEE58031D5AE1B0DC3ADC4DFF3C772E96595FF7A054FC2CA698C7"
 $package = [IO.Path]::GetFullPath($PackageRoot)
 $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
@@ -75,8 +75,17 @@ function Read-AdministratorResult([IO.FileStream]$Handle) {
 if (-not $installRoot.StartsWith($programFilesRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw "固定安装目录不在 Program Files 下: $installRoot"
 }
-if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) {
-    throw "windows-x86_64 package 必须由 64 位 PowerShell 安装"
+$manifestPath = Join-Path $package "ffmpeg-manifest.json"
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "安装前缺少 package manifest: $manifestPath"
+}
+$manifestPlatform = [string]((Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json).platform)
+if ([string]::IsNullOrWhiteSpace($manifestPlatform)) {
+    throw "安装前 package manifest 缺少 platform"
+}
+if ($manifestPlatform -ne "windows-x86" -and
+    (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess)) {
+    throw "$manifestPlatform package 必须由 64 位 PowerShell 安装"
 }
 foreach ($systemTool in @($elevationHost, $icacls)) {
     if (-not (Test-Path -LiteralPath $systemTool -PathType Leaf)) {

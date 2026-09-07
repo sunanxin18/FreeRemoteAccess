@@ -2,6 +2,8 @@
 param(
     [ValidateSet("Release", "Debug")]
     [string]$Configuration = "Release",
+    [ValidateSet("x86_64", "x86", "arm64")]
+    [string]$Architecture = "x86_64",
     [string]$WslDistribution = "ubuntu24.04",
     [switch]$ForceRebuild,
     [switch]$RunNativeTests
@@ -19,12 +21,70 @@ $KeyUrl = "https://ffmpeg.org/ffmpeg-devel.asc"
 $ApprovedBundleFiles = @("avcodec-62.dll", "avutil-60.dll", "freeremotedesk_ffmpeg.dll")
 $CorrespondingSourcePackageName = "FreeRemoteDesk-ffmpeg-$Version-corresponding-source.zip"
 
+function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
+    switch ($Name) {
+        "x86_64" {
+            return [pscustomobject]@{
+                Architecture = "x86_64"
+                PlatformDirectory = "windows-x86_64"
+                FfmpegArch = "x86_64"
+                CrossPrefix = "x86_64-w64-mingw32-"
+                CrossCompiler = "x86_64-w64-mingw32-gcc"
+                RustTarget = "x86_64-pc-windows-msvc"
+                MsvcArch = "x64"
+                Machine = "x64"
+                AssemblyKind = "x86asm"
+                AssemblyProvenance = "nasm=NASM version 2.16.01"
+                AssemblyGate = "have_x86asm=1"
+                RequiresX86Asm = $true
+            }
+        }
+        "x86" {
+            return [pscustomobject]@{
+                Architecture = "x86"
+                PlatformDirectory = "windows-x86"
+                FfmpegArch = "x86"
+                CrossPrefix = "i686-w64-mingw32-"
+                CrossCompiler = "i686-w64-mingw32-gcc"
+                RustTarget = "i686-pc-windows-msvc"
+                MsvcArch = "x86"
+                Machine = "x86"
+                AssemblyKind = "x86asm"
+                AssemblyProvenance = "nasm=NASM version 2.16.01"
+                AssemblyGate = "have_x86asm=1"
+                RequiresX86Asm = $true
+            }
+        }
+        "arm64" {
+            return [pscustomobject]@{
+                Architecture = "arm64"
+                PlatformDirectory = "windows-aarch64"
+                FfmpegArch = "aarch64"
+                CrossPrefix = "aarch64-w64-mingw32-"
+                CrossCompiler = "aarch64-w64-mingw32-gcc"
+                RustTarget = "aarch64-pc-windows-msvc"
+                MsvcArch = "arm64"
+                Machine = "arm64"
+                AssemblyKind = "aarch64-neon"
+                AssemblyProvenance = "aarch64-neon=FFmpeg AArch64/NEON"
+                AssemblyGate = "have_neon=1"
+                RequiresX86Asm = $false
+            }
+        }
+        default { throw "不支持的 Windows FFmpeg 架构: $Name" }
+    }
+}
+
+$ArchitectureProfile = Get-WindowsFfmpegArchitectureProfile $Architecture
+$PlatformDirectory = $ArchitectureProfile.PlatformDirectory
+$RequiresExplicitCargoTarget = $Architecture -ne "x86_64"
+
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 Import-Module (Join-Path $PSScriptRoot "ffmpeg-build-common.psm1") -Force
 $BuildRoot = Join-Path $RepoRoot ".codex-target\ffmpeg-$Version"
 $SourceCache = Join-Path $BuildRoot "source-cache"
 $GpgHome = Join-Path $BuildRoot "gnupg"
-$ConfigurationRoot = Join-Path $BuildRoot "windows-x86_64\$Configuration"
+$ConfigurationRoot = Join-Path $BuildRoot "$PlatformDirectory\$Configuration"
 $CodecDir = Join-Path $ConfigurationRoot "codec"
 $ReleaseAssetsDirectory = Join-Path $BuildRoot "release-assets"
 $Archive = Join-Path $SourceCache "ffmpeg-$Version.tar.xz"
@@ -39,7 +99,7 @@ $SourceDir = Join-Path $SourceParent "ffmpeg-$Version"
 $DistDir = Join-Path $AttemptRoot "dist"
 $CodecStage = Join-Path $ConfigurationRoot ".codec.stage-$AttemptId"
 $ConfigureRecord = Join-Path $AttemptRoot "configure-command.txt"
-$BuildLockPath = Join-Path $BuildRoot "windows-x86_64-$Configuration.lock"
+$BuildLockPath = Join-Path $BuildRoot "$PlatformDirectory-$Configuration.lock"
 
 function Assert-UnderBuildRoot([string]$Path) {
     Assert-PathUnderRoot -Path $Path -AllowedRoot $BuildRoot
@@ -106,11 +166,11 @@ function Find-VisualStudioTool([string]$Pattern) {
     return $tool
 }
 
-function Import-VisualStudioEnvironment([string]$DevCmd) {
-    $commandLine = "`"$DevCmd`" -no_logo -arch=x64 -host_arch=x64 >nul && set"
+function Import-VisualStudioEnvironment([string]$DevCmd, [string]$MsvcArch) {
+    $commandLine = "`"$DevCmd`" -no_logo -arch=$MsvcArch -host_arch=x64 >nul && set"
     $lines = & cmd.exe /d /s /c $commandLine
     if ($LASTEXITCODE -ne 0) {
-        throw "无法初始化 Visual Studio x64 环境"
+        throw "无法初始化 Visual Studio $MsvcArch 环境"
     }
     foreach ($line in $lines) {
         $separator = $line.IndexOf('=')
@@ -253,17 +313,25 @@ try {
         -ExpectedDirectoryName "ffmpeg-$Version" `
         -AllowedRoot $BuildRoot
 
-    & wsl.exe --distribution $WslDistribution -- bash -lc 'command -v bash >/dev/null && command -v make >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null && command -v nasm >/dev/null'
+    $requiredWslTools = "command -v bash >/dev/null && command -v make >/dev/null && command -v $($ArchitectureProfile.CrossCompiler) >/dev/null"
+    if ($ArchitectureProfile.RequiresX86Asm) {
+        $requiredWslTools += " && command -v nasm >/dev/null"
+    }
+    & wsl.exe --distribution $WslDistribution -- bash -lc $requiredWslTools
     if ($LASTEXITCODE -ne 0) {
-        throw "WSL distribution '$WslDistribution' 缺少 bash/make/x86_64-w64-mingw32-gcc/nasm"
+        $requiredToolsText = "bash/make/$($ArchitectureProfile.CrossCompiler)"
+        if ($ArchitectureProfile.RequiresX86Asm) {
+            $requiredToolsText += "/nasm"
+        }
+        throw "WSL distribution '$WslDistribution' 缺少 $requiredToolsText"
     }
     $sourceWsl = Convert-ToWslPath $SourceDir
     $distWsl = Convert-ToWslPath $DistDir
     $configureArgs = @(
         "--prefix=$distWsl",
-        "--arch=x86_64",
+        "--arch=$($ArchitectureProfile.FfmpegArch)",
         "--target-os=mingw32",
-        "--cross-prefix=x86_64-w64-mingw32-",
+        "--cross-prefix=$($ArchitectureProfile.CrossPrefix)",
         "--disable-static",
         "--enable-shared",
         "--disable-programs",
@@ -278,6 +346,12 @@ try {
         "--disable-autodetect",
         "--disable-network"
     )
+    if ($RequiresExplicitCargoTarget) {
+        $configureArgs += "--enable-cross-compile"
+    }
+    if (-not $ArchitectureProfile.RequiresX86Asm) {
+        $configureArgs += "--disable-x86asm"
+    }
     if ($Configuration -eq "Release") {
         $configureArgs += "--disable-debug", "--enable-stripping"
     }
@@ -294,50 +368,69 @@ try {
         Get-Content -Raw -LiteralPath (Join-Path $SourceDir "config.h")
         Get-Content -Raw -LiteralPath (Join-Path $SourceDir "config_components.h")
     ) -join "`n"
-    foreach ($required in @(
+    $requiredConfigDefines = @(
         "#define CONFIG_GPL 0",
         "#define CONFIG_NONFREE 0",
         "#define CONFIG_HEVC_DECODER 1",
         "#define CONFIG_HEVC_PARSER 1",
         "#define CONFIG_H264_DECODER 1",
         "#define CONFIG_H264_PARSER 1",
-        "#define CONFIG_FILE_PROTOCOL 1",
-        "#define HAVE_X86ASM 1"
-    )) {
+        "#define CONFIG_FILE_PROTOCOL 1"
+    )
+    if ($ArchitectureProfile.RequiresX86Asm) {
+        $requiredConfigDefines += "#define HAVE_X86ASM 1"
+    }
+    else {
+        $requiredConfigDefines += "#define HAVE_NEON 1"
+    }
+    foreach ($required in $requiredConfigDefines) {
         if (-not $configHeader.Contains($required)) {
             throw "FFmpeg 配置缺少必需门禁: $required"
         }
     }
-    if ($configHeader -notmatch '(?m)^\s*#define HAVE_X86ASM 1\s*$') {
-        throw "FFmpeg 配置缺少精确 x86asm 门禁: #define HAVE_X86ASM 1"
+    if ($ArchitectureProfile.RequiresX86Asm) {
+        if ($configHeader -notmatch '(?m)^\s*#define HAVE_X86ASM 1\s*$') {
+            throw "FFmpeg 配置缺少精确 x86asm 门禁: #define HAVE_X86ASM 1"
+        }
     }
-    $haveX86AsmProvenance = "have_x86asm=1"
+    elseif ($configHeader -notmatch '(?m)^\s*#define HAVE_NEON 1\s*$') {
+        throw "FFmpeg 配置缺少精确 AArch64/NEON 门禁: #define HAVE_NEON 1"
+    }
+    $assemblyGate = $ArchitectureProfile.AssemblyGate
 
-    $libExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\lib.exe"
-    $clExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe"
-    $dumpbinExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe"
+    $libExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\$($ArchitectureProfile.MsvcArch)\lib.exe"
+    $clExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\$($ArchitectureProfile.MsvcArch)\cl.exe"
+    $dumpbinExe = Find-VisualStudioTool "VC\Tools\MSVC\**\bin\Hostx64\$($ArchitectureProfile.MsvcArch)\dumpbin.exe"
     foreach ($library in @(
         @{ Name = "avutil"; Definition = "avutil-60.def" },
         @{ Name = "avcodec"; Definition = "avcodec-62.def" }
     )) {
         $definition = Join-Path $DistDir "lib\$($library.Definition)"
         $outputLibrary = Join-Path $DistDir "lib\$($library.Name).lib"
-        & $libExe /nologo "/def:$definition" /machine:x64 "/out:$outputLibrary"
+        & $libExe /nologo "/def:$definition" "/machine:$($ArchitectureProfile.Machine)" "/out:$outputLibrary"
         if ($LASTEXITCODE -ne 0) {
             throw "生成 MSVC import library 失败: $($library.Name)"
         }
     }
 
     $devCmd = Find-VisualStudioTool "Common7\Tools\VsDevCmd.bat"
-    Import-VisualStudioEnvironment $devCmd
+    Import-VisualStudioEnvironment $devCmd $ArchitectureProfile.MsvcArch
     $env:FFMPEG_DIR = $DistDir
+    $cargoTargetArguments = @()
+    if ($RequiresExplicitCargoTarget) {
+        $cargoTargetArguments = @("--target", $ArchitectureProfile.RustTarget)
+    }
     if ($Configuration -eq "Release") {
-        & cargo.exe build --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg --release
-        $plugin = Join-Path $RepoRoot "target\release\freeremotedesk_ffmpeg.dll"
+        $cargoBuildArguments = @("build", "--locked") + $cargoTargetArguments + @("-p", "frd-video-ffmpeg-plugin", "--features", "native-ffmpeg", "--release")
+        & cargo.exe @cargoBuildArguments
+        $pluginRoot = if ($RequiresExplicitCargoTarget) { Join-Path $RepoRoot "target\$($ArchitectureProfile.RustTarget)\release" } else { Join-Path $RepoRoot "target\release" }
+        $plugin = Join-Path $pluginRoot "freeremotedesk_ffmpeg.dll"
     }
     else {
-        & cargo.exe build --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg
-        $plugin = Join-Path $RepoRoot "target\debug\freeremotedesk_ffmpeg.dll"
+        $cargoBuildArguments = @("build", "--locked") + $cargoTargetArguments + @("-p", "frd-video-ffmpeg-plugin", "--features", "native-ffmpeg")
+        & cargo.exe @cargoBuildArguments
+        $pluginRoot = if ($RequiresExplicitCargoTarget) { Join-Path $RepoRoot "target\$($ArchitectureProfile.RustTarget)\debug" } else { Join-Path $RepoRoot "target\debug" }
+        $plugin = Join-Path $pluginRoot "freeremotedesk_ffmpeg.dll"
     }
     if ($LASTEXITCODE -ne 0) {
         throw "native FFmpeg plugin 构建失败"
@@ -370,7 +463,11 @@ try {
     Assert-ExactDirectoryFiles -Directory $CodecDir -ApprovedFileNames $ApprovedBundleFiles
     Assert-ApprovedBundleImports -Dumpbin $dumpbinExe -BundleDirectory $CodecDir
 
-    $toolProvenance = & wsl.exe --distribution $WslDistribution -- bash -lc 'printf "bash="; bash --version | head -1; printf "make="; make --version | head -1; printf "cc="; x86_64-w64-mingw32-gcc --version | head -1; printf "nasm="; nasm -v'
+    $toolCommand = "printf 'bash='; bash --version | head -1; printf 'make='; make --version | head -1; printf 'cc='; $($ArchitectureProfile.CrossCompiler) --version | head -1"
+    if ($ArchitectureProfile.RequiresX86Asm) {
+        $toolCommand += "; printf 'nasm='; nasm -v"
+    }
+    $toolProvenance = & wsl.exe --distribution $WslDistribution -- bash -lc $toolCommand
     $provenanceStage = "$ProvenanceLog.stage-$AttemptId"
     Assert-UnderBuildRoot $provenanceStage
     @(
@@ -387,8 +484,11 @@ try {
         "msvc_cl=$clExe",
         "msvc_cl_version=$((Get-Item -LiteralPath $clExe).VersionInfo.FileVersion)",
         "configuration=$Configuration",
+        "platform=$PlatformDirectory",
+        "assembly_kind=$($ArchitectureProfile.AssemblyKind)",
+        "assembly_provenance=$($ArchitectureProfile.AssemblyProvenance)",
         "configure=$configureCommand",
-        $haveX86AsmProvenance,
+        $assemblyGate,
         "codec_files=$($ApprovedBundleFiles -join ',')",
         "codec_imports=VALID",
         "corresponding_source_package=$correspondingSourcePackage",
@@ -401,11 +501,13 @@ try {
         $oldPath = $env:PATH
         $env:PATH = "$CodecDir;$($env:PATH)"
         try {
-            & cargo.exe test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg --lib -- --nocapture
+            $cargoTestArguments = @("test", "--locked") + $cargoTargetArguments + @("-p", "frd-video-ffmpeg-plugin", "--features", "native-ffmpeg", "--lib", "--", "--nocapture")
+            & cargo.exe @cargoTestArguments
             if ($LASTEXITCODE -ne 0) {
                 throw "native FFmpeg plugin 单元测试失败"
             }
-            & cargo.exe test --locked -p frd-video-ffmpeg-plugin --test main444_decode -- --nocapture
+            $cargoFixtureArguments = @("test", "--locked") + $cargoTargetArguments + @("-p", "frd-video-ffmpeg-plugin", "--test", "main444_decode", "--", "--nocapture")
+            & cargo.exe @cargoFixtureArguments
             if ($LASTEXITCODE -ne 0) {
                 throw "Main444 fixture integration test 失败"
             }

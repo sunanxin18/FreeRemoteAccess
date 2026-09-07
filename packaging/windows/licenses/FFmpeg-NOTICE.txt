@@ -1,14 +1,17 @@
 FreeRemoteDesk 可选 FFmpeg 视频后端通知
 =====================================
 
-本 Windows 客户端包可在以下版本化目录中包含 FFmpeg 8.1.2 动态库及
-FreeRemoteDesk 的动态加载插件：
+本 Windows 客户端包可在以下版本化目录之一中包含 FFmpeg 8.1.2 动态库及
+FreeRemoteDesk 的动态加载插件（目录由包 manifest 的 platform 字段选择）：
 
   codecs/ffmpeg-8.1.2/windows-x86_64/
+  codecs/ffmpeg-8.1.2/windows-x86/
+  codecs/ffmpeg-8.1.2/windows-aarch64/
 
 FFmpeg 以 GNU Lesser General Public License 2.1 或更高版本许可。本构建关闭
 GPL、nonfree、version3、network 和外部库自动探测，只启用所需的 HEVC decoder、
-HEVC parser 与 file protocol。完整固定 configure 参数和每个 staged 文件的
+H.264 decoder/parser、HEVC parser 与 file protocol。x86/x86_64 使用 NASM/x86asm，
+AArch64 使用 FFmpeg AArch64/NEON 内核。完整固定 configure 参数和每个 staged 文件的
 SHA-256 位于包根目录 ffmpeg-manifest.json。
 
 官方源码：

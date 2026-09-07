@@ -41,6 +41,22 @@ jobs:
   package:
     runs-on: windows-2025
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            rust_target: ""
+            wsl_packages: "gcc-mingw-w64-x86-64"
+            artifact_suffix: x86_64
+          - architecture: x86
+            rust_target: i686-pc-windows-msvc
+            wsl_packages: "gcc-mingw-w64-i686"
+            artifact_suffix: x86
+          - architecture: arm64
+            rust_target: aarch64-pc-windows-msvc
+            wsl_packages: "gcc-aarch64-w64-mingw32"
+            artifact_suffix: arm64
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -59,11 +75,22 @@ jobs:
         shell: pwsh
         run: |
           wsl.exe --install --distribution Ubuntu-24.04 --no-launch
-          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y build-essential mingw-w64 nasm pkg-config xz-utils"
+          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y build-essential ${{ matrix.wsl_packages }} nasm pkg-config xz-utils"
 
-      - name: Build pinned FFmpeg bundle and run native tests
+      - name: Install Rust target for cross package
+        if: matrix.rust_target != ''
         shell: pwsh
-        run: pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -WslDistribution Ubuntu-24.04 -RunNativeTests
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Build pinned FFmpeg bundle with native tests
+        if: matrix.architecture == 'x86_64'
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -Architecture x86_64 -WslDistribution Ubuntu-24.04 -RunNativeTests
+
+      - name: Build pinned FFmpeg bundle for cross target
+        if: matrix.architecture != 'x86_64'
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -Architecture ${{ matrix.architecture }} -WslDistribution Ubuntu-24.04
 
       - name: Run safe Rust tests
         shell: pwsh
@@ -88,17 +115,24 @@ jobs:
 
       - name: Build Windows GUI release without implicit codec copying
         shell: pwsh
-        run: cargo build --locked --release -p freeremotedesk-windows
+        run: |
+          if ('${{ matrix.rust_target }}' -eq '') {
+            cargo build --locked --release -p freeremotedesk-windows
+          }
+          else {
+            cargo build --locked --release --target ${{ matrix.rust_target }} -p freeremotedesk-windows
+          }
 
       - name: Stage Windows package
         shell: pwsh
-        run: pwsh -NoProfile -File tools/stage-windows-package.ps1 -PackageRoot target/package-test
+        run: pwsh -NoProfile -File tools/stage-windows-package.ps1 -Architecture ${{ matrix.architecture }} -PackageRoot target/package-test
 
       - name: Verify Windows package
         shell: pwsh
-        run: pwsh -NoProfile -File tools/verify-windows-package.ps1 -PackageRoot target/package-test
+        run: pwsh -NoProfile -File tools/verify-windows-package.ps1 -Architecture ${{ matrix.architecture }} -PackageRoot target/package-test
 
       - name: Run Windows package Pester tests
+        if: matrix.architecture == 'x86_64'
         shell: powershell
         run: |
           if ($PSVersionTable.PSVersion.Major -ne 5) {
@@ -117,7 +151,7 @@ jobs:
       - name: Upload exact Windows package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: freeremotedesk-windows-package
+          name: freeremotedesk-windows-package-${{ matrix.artifact_suffix }}
           path: target/package-test
           if-no-files-found: error
 
@@ -125,6 +159,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           # The Actions artifact is a transport wrapper. No release is published here.
-          name: freeremotedesk-ffmpeg-8.1.2-corresponding-source
+          name: freeremotedesk-ffmpeg-8.1.2-corresponding-source-${{ matrix.artifact_suffix }}
           path: target/release-assets/FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip
           if-no-files-found: error
