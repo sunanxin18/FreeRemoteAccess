@@ -73,10 +73,15 @@ pub enum VideoProfile {
     H264Baseline,
     H264Main,
     H264High,
+    /// RDPGFX AVC420 的精确 H.264 4:2:0 profile。
+    H264Avc420,
     HevcMain,
     HevcMain10,
     HevcMain4448,
-    CodecSpecific { codec: VideoCodec, profile_idc: u8 },
+    CodecSpecific {
+        codec: VideoCodec,
+        profile_idc: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +95,9 @@ pub enum ChromaFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoBitstreamFormat {
     AnnexB,
+    /// H.264 AVC length-prefixed NAL units as carried by RDPGFX.
+    AvcLengthPrefixed,
+    /// Legacy generic length-prefixed declaration, retained for existing HEVC callers.
     LengthPrefixed,
 }
 
@@ -552,6 +560,29 @@ mod tests {
         }));
 
         assert_eq!(result, Err(VideoContractError::VisibleRectOutOfBounds));
+    }
+
+    #[test]
+    fn avc420_accepts_annex_b_and_avc_length_prefixed_inputs_as_distinct_formats() {
+        let mut annex_b = test_config_with_visible_rect(PixelRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        annex_b.codec = VideoCodec::H264;
+        annex_b.profile = VideoProfile::H264Avc420;
+        annex_b.bitstream_format = VideoBitstreamFormat::AnnexB;
+
+        let mut length_prefixed = annex_b.clone();
+        length_prefixed.bitstream_format = VideoBitstreamFormat::AvcLengthPrefixed;
+
+        assert!(VideoStreamConfig::try_new(annex_b.clone()).is_ok());
+        assert!(VideoStreamConfig::try_new(length_prefixed.clone()).is_ok());
+        assert_ne!(
+            annex_b.bitstream_format, length_prefixed.bitstream_format,
+            "AVC Annex-B 与长度前缀输入必须是可区分的声明"
+        );
     }
 
     #[test]

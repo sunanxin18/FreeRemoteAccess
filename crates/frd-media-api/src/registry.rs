@@ -186,6 +186,47 @@ mod tests {
     }
 
     #[test]
+    fn registry_selects_only_an_exact_h264_avc420_capability() {
+        let registry = VideoDecoderRegistry::new(vec![fake_factory(
+            "h264-avc420",
+            VideoBackendKind::Ffmpeg,
+            VideoBackendAvailability::DecoderReady,
+            VideoDecodeSupport::SoftwareExact(h264_avc420_capability("h264-avc420")),
+        )]);
+
+        let selection = registry
+            .select(&avc420_query())
+            .expect("H.264 AVC420 精确能力应可选择");
+
+        assert_eq!(selection.backend_id.as_str(), "h264-avc420");
+    }
+
+    #[test]
+    fn registry_rejects_h264_capabilities_with_the_wrong_profile_or_chroma() {
+        for capability in [
+            VideoDecodeCapability {
+                profile: VideoProfile::H264High,
+                ..h264_avc420_capability("wrong-profile")
+            },
+            VideoDecodeCapability {
+                chroma: ChromaFormat::Yuv444,
+                output_formats: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+                ..h264_avc420_capability("wrong-chroma")
+            },
+        ] {
+            let backend_id = capability.backend_id.as_str().to_owned();
+            let registry = VideoDecoderRegistry::new(vec![fake_factory(
+                &backend_id,
+                VideoBackendKind::Ffmpeg,
+                VideoBackendAvailability::DecoderReady,
+                VideoDecodeSupport::SoftwareExact(capability),
+            )]);
+
+            assert!(registry.select(&avc420_query()).is_err());
+        }
+    }
+
+    #[test]
     fn capability_rejects_a_query_larger_than_its_exact_dimension_limit() {
         let mut query = main444_query();
         query.coded_size = PixelSize::new(3841, 2160).expect("测试尺寸有效");
@@ -450,6 +491,19 @@ mod tests {
         }
     }
 
+    fn avc420_query() -> VideoDecodeQuery {
+        VideoDecodeQuery {
+            codec: crate::VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1920, 1080).expect("测试尺寸有效"),
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Nv12, VideoPixelFormat::Yuv420P8]
+                .into_boxed_slice(),
+        }
+    }
+
     fn main444_config() -> VideoStreamConfig {
         VideoStreamConfig::try_new(VideoStreamConfigInput {
             identity: VideoStreamIdentity {
@@ -507,6 +561,20 @@ mod tests {
             bit_depth: 10,
             max_coded_size: PixelSize::new(3840, 2160).expect("测试尺寸有效"),
             output_formats: vec![VideoPixelFormat::P010].into_boxed_slice(),
+            requires_bitstream_conversion: false,
+        }
+    }
+
+    fn h264_avc420_capability(backend_id: &str) -> VideoDecodeCapability {
+        VideoDecodeCapability {
+            backend_id: VideoBackendId::new(backend_id),
+            codec: crate::VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            max_coded_size: PixelSize::new(3840, 2160).expect("测试尺寸有效"),
+            output_formats: vec![VideoPixelFormat::Nv12, VideoPixelFormat::Yuv420P8]
+                .into_boxed_slice(),
             requires_bitstream_conversion: false,
         }
     }

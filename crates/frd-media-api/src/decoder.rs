@@ -185,3 +185,50 @@ pub trait VideoDecoder: Send {
     fn flush(&mut self) -> Result<Box<[DecodedVideoFrame]>, VideoDecodeError>;
     fn reset(&mut self, generation: u64) -> Result<(), VideoDecodeError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use frd_core::PixelSize;
+
+    use crate::{
+        ChromaFormat, VideoBackendId, VideoCodec, VideoDecodeCapability, VideoDecodeQuery,
+        VideoPixelFormat, VideoProfile,
+    };
+
+    #[test]
+    fn avc420_capability_requires_the_exact_h264_profile_and_yuv420_output() {
+        let query = VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1920, 1080).expect("测试尺寸有效"),
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Nv12].into_boxed_slice(),
+        };
+        let capability = VideoDecodeCapability {
+            backend_id: VideoBackendId::new("h264-avc420"),
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            max_coded_size: PixelSize::new(3840, 2160).expect("测试尺寸有效"),
+            output_formats: vec![VideoPixelFormat::Nv12].into_boxed_slice(),
+            requires_bitstream_conversion: false,
+        };
+
+        assert!(capability.matches_exactly(&query));
+
+        let mut wrong_profile = capability.clone();
+        wrong_profile.profile = VideoProfile::H264High;
+        assert!(!wrong_profile.matches_exactly(&query));
+
+        let mut wrong_chroma = capability.clone();
+        wrong_chroma.chroma = ChromaFormat::Yuv444;
+        assert!(!wrong_chroma.matches_exactly(&query));
+
+        let mut wrong_output = capability;
+        wrong_output.output_formats = vec![VideoPixelFormat::Yuv444P8].into_boxed_slice();
+        assert!(!wrong_output.matches_exactly(&query));
+    }
+}
