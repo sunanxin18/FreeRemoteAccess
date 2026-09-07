@@ -2262,6 +2262,11 @@ mod tests {
         let mut trailing = encode_avc444_fixture(ironrdp_egfx::pdu::Encoding::LUMA, false);
         trailing.extend_from_slice(&[0xaa]);
         assert!(validate_avc444_bitmap(&trailing).is_err());
+
+        let mut empty_region = encode_avc444_fixture(ironrdp_egfx::pdu::Encoding::LUMA, false);
+        // Outer streamInfo (4), nRect (4), then RDPGFX_RECT16 left/top/right.
+        empty_region[12..14].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(validate_avc444_bitmap(&empty_region).is_err());
     }
 
     #[test]
