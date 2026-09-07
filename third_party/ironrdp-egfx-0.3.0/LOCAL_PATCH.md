@@ -9,7 +9,8 @@ frame, the client validates the wire `regionRects` surface-coordinate mask and
 emits one `BitmapUpdate` for each exclusive region. The AVC metadata parser is
 also corrected to model `RDPGFX_RECT16` with `ExclusiveRectangle`; the public
 server-side `Avc420Region` helper keeps its inclusive bounds and converts them
-at the encoding boundary. The public handler and renderer contracts do not
-change. This prevents pixels outside the server's region mask from being
-published while preserving the upstream payload shape and public handler/
-renderer contracts.
+at the encoding boundary. Empty or inverted exclusive rectangles are rejected
+while decoding the PDU, before any payload is dispatched. The public handler and
+renderer contracts do not change. This prevents pixels outside the server's
+region mask from being published while preserving the upstream payload shape
+and public handler/renderer contracts.
