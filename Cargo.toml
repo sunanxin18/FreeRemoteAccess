@@ -42,6 +42,13 @@ egui-winit = { version = "=0.36.1", default-features = false, features = ["acces
 egui-wgpu = { version = "=0.36.1", default-features = false }
 raw-window-handle = "=0.6.2"
 
+[patch.crates-io]
+# IronRDP 0.10.0 accepts an EGFX DVC processor but does not expose the
+# mandatory early capability bit that tells a server to open the graphics
+# channel. Keep the patch local and minimal: the RDP adapter opts in only when
+# an exact decoder provider is attached; legacy sessions retain upstream flags.
+ironrdp-connector = { path = "third_party/ironrdp-connector-0.10.0" }
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

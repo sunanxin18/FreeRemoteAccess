@@ -508,7 +508,8 @@ fn baseline_connector(
             u32::from(desktop_size.height),
         )?;
         let decoder = provider.create_decoder(session_id, coded_size)?;
-        let publisher = EgfxSurfacePublisher::try_new(session_id, 1)?;
+        let publisher =
+            EgfxSurfacePublisher::try_new(session_id, 1)?.with_expected_coded_size(coded_size);
         let publisher = match provider.create_avc444_decoder(session_id, coded_size) {
             Some(decoder) => publisher.with_avc444_decoder(decoder),
             None => publisher,
@@ -572,6 +573,7 @@ fn baseline_connector(
             compression_type: None,
             pointer_software_rendering: false,
             multitransport_flags: None,
+            support_dynvc_gfx_protocol: egfx_advertised,
             performance_flags: PerformanceFlags::default(),
             desktop_scale_factor: 0,
             hardware_id: None,
@@ -606,13 +608,17 @@ fn test_dynamic_channels_with_egfx(
 
 #[cfg(test)]
 mod tests {
+    use ironrdp::connector::Sequence;
     use ironrdp::connector::{Credentials, DesktopSize};
-    use ironrdp::core::encode_vec;
+    use ironrdp::core::{decode, encode_vec, WriteBuf};
     use ironrdp::dvc::pdu::{CreateRequestPdu, DrdynvcServerPdu};
     use ironrdp::dvc::DrdynvcClient;
+    use ironrdp::pdu::gcc::ClientEarlyCapabilityFlags;
+    use ironrdp::pdu::nego::{self, ResponseFlags, SecurityProtocol};
     use ironrdp::pdu::rdp::capability_sets::{
         CodecId, CodecProperty, MajorPlatformType, RemoteFxContainer, CODEC_ID_REMOTEFX,
     };
+    use ironrdp::pdu::x224::{X224Data, X224};
     use ironrdp::svc::SvcProcessor;
 
     use super::{
@@ -720,6 +726,10 @@ mod tests {
         assert!(!graphics.avc420);
         assert!(!graphics.egfx_confirmed);
         assert!(!graphics.avc444);
+        assert!(
+            connector.config.support_dynvc_gfx_protocol,
+            "an attached EGFX decoder must opt into the early graphics-channel flag"
+        );
 
         let channels = connector
             .get_static_channel_processor_mut::<DrdynvcClient>()
@@ -733,6 +743,61 @@ mod tests {
             .process(&payload)
             .expect("registered EGFX channel should accept create request");
         assert!(channels.get_dvc_by_channel_id(9).is_some());
+    }
+
+    #[test]
+    fn egfx_provider_emits_the_graphics_channel_capability_on_the_wire() {
+        let provider: std::sync::Arc<dyn EgfxDecoderProvider> =
+            std::sync::Arc::new(StubEgfxDecoderProvider);
+        let session_id = SessionId::allocate();
+        let (mut connector, _audio, _display, _graphics) = baseline_connector(
+            Credentials::UsernamePassword {
+                username: "alice".to_owned(),
+                password: String::new(),
+            },
+            None,
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            },
+            "127.0.0.1:49152".parse().expect("valid client address"),
+            RdpClientPlatformIdentity::Windows,
+            session_id,
+            Some(&provider),
+        );
+
+        let mut output = WriteBuf::new();
+        connector
+            .step(&[], &mut output)
+            .expect("emit connection request");
+        let confirm = encode_vec(&X224(nego::ConnectionConfirm::Response {
+            flags: ResponseFlags::empty(),
+            protocol: SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+        }))
+        .expect("encode connection confirm");
+        connector
+            .step(&confirm, &mut WriteBuf::new())
+            .expect("accept connection confirm");
+        connector.mark_security_upgrade_as_done();
+        connector.mark_credssp_as_done();
+
+        let mut initial_output = WriteBuf::new();
+        connector
+            .step(&[], &mut initial_output)
+            .expect("emit GCC connect initial");
+        let x224 = decode::<X224<X224Data<'_>>>(initial_output.filled())
+            .expect("decode emitted X.224 data");
+        let initial = decode::<ironrdp::pdu::mcs::ConnectInitial>(x224.0.data.as_ref())
+            .expect("decode emitted MCS connect initial");
+        let flags = initial
+            .conference_create_request
+            .gcc_blocks()
+            .core
+            .optional_data
+            .early_capability_flags
+            .expect("client emits core early capability flags");
+
+        assert!(flags.contains(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
     }
 
     struct StubEgfxDecoderProvider;
@@ -801,6 +866,7 @@ mod tests {
 
         assert!(!connector.config.enable_tls);
         assert!(connector.config.enable_credssp);
+        assert!(!connector.config.support_dynvc_gfx_protocol);
     }
 
     #[test]

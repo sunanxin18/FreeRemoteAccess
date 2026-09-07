@@ -69,7 +69,6 @@ fn run_active_session_inner(
         graphics_capability.legacy_bitmap && graphics_capability.remotefx,
         "RDP activation must retain the legacy fallback"
     );
-    debug_assert!(!graphics_capability.avc444);
     if let Some(observer) = graphics_observer.as_deref() {
         observer.observe(graphics_capability.snapshot());
     }

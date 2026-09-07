@@ -1156,6 +1156,7 @@ fn decoded_yuv420_to_rgba(frame: &frd_media_api::DecodedVideoFrame) -> DecoderRe
 pub(crate) struct EgfxSurfacePublisher {
     state: Arc<Mutex<EgfxSurfaceState>>,
     avc444_decoder: Option<Arc<Mutex<Box<dyn Avc444Decoder>>>>,
+    expected_coded_size: Option<PixelSize>,
 }
 
 impl fmt::Debug for EgfxSurfacePublisher {
@@ -1163,6 +1164,7 @@ impl fmt::Debug for EgfxSurfacePublisher {
         formatter
             .debug_struct("EgfxSurfacePublisher")
             .field("has_avc444_decoder", &self.avc444_decoder.is_some())
+            .field("expected_coded_size", &self.expected_coded_size)
             .finish()
     }
 }
@@ -1191,7 +1193,17 @@ impl EgfxSurfacePublisher {
                 disabled: false,
             })),
             avc444_decoder: None,
+            expected_coded_size: None,
         })
+    }
+
+    /// Bind the publisher to the coded size used to construct the decoder.
+    /// IronRDP's decoder reset callback does not carry dimensions, so a server
+    /// reset to another size must disable EGFX before publishing a mismatched
+    /// runtime surface. Callers without a decoder may leave this unset.
+    pub(crate) fn with_expected_coded_size(mut self, size: PixelSize) -> Self {
+        self.expected_coded_size = Some(size);
+        self
     }
 
     /// Attach an AVC444 decoder to this publisher.  The caller is responsible
@@ -1209,6 +1221,10 @@ impl EgfxSurfacePublisher {
 
     pub(crate) fn rejected_update_count(&self) -> u64 {
         lock_state(&self.state).rejected_updates
+    }
+
+    pub(crate) fn is_disabled(&self) -> bool {
+        lock_state(&self.state).disabled
     }
 
     fn reject(state: &mut EgfxSurfaceState) {
@@ -1377,6 +1393,17 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             Self::reject(&mut state);
             return;
         };
+        if self
+            .expected_coded_size
+            .is_some_and(|expected| expected != size)
+        {
+            // The pinned IronRDP H264Decoder::reset() API has no dimensions,
+            // so recreating a decoder for this new coded size is impossible at
+            // this boundary. Stop EGFX before changing the runtime surface;
+            // the legacy Bitmap/RemoteFX stream remains available.
+            Self::disable_locked(&mut state);
+            return;
+        }
         if validate_surface_size(size).is_err() {
             Self::reject(&mut state);
             return;
@@ -1736,7 +1763,12 @@ impl EgfxAdapter {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        !self.failed && self.inner.is_active()
+        !self.failed
+            && self.inner.is_active()
+            && self
+                .surface_publisher
+                .as_ref()
+                .is_none_or(|publisher| !publisher.is_disabled())
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -1744,11 +1776,11 @@ impl EgfxAdapter {
     }
 
     pub(crate) fn avc420_confirmed(&self) -> bool {
-        self.inner.codec_capabilities().avc420
+        self.is_active() && self.inner.codec_capabilities().avc420
     }
 
     pub(crate) fn avc444_confirmed(&self) -> bool {
-        self.inner.codec_capabilities().avc444
+        self.is_active() && self.inner.codec_capabilities().avc444
     }
 
     pub(crate) fn drain_surface_updates(&self) -> Vec<SurfaceUpdate> {
@@ -1775,7 +1807,16 @@ impl DvcProcessor for EgfxAdapter {
             return Ok(Vec::new());
         }
         match self.inner.process(channel_id, payload) {
-            Ok(messages) => Ok(messages),
+            Ok(messages) => {
+                if self
+                    .surface_publisher
+                    .as_ref()
+                    .is_some_and(EgfxSurfacePublisher::is_disabled)
+                {
+                    self.failed = true;
+                }
+                Ok(messages)
+            }
             Err(error) => {
                 self.failed = true;
                 if let Some(publisher) = &self.surface_publisher {
@@ -2040,6 +2081,45 @@ mod tests {
             }
         ));
         assert_eq!(publisher_state.rejected_update_count(), 0);
+    }
+
+    #[test]
+    fn publisher_disables_egfx_before_a_reset_changes_decoder_coded_size() {
+        let session_id = SessionId::allocate();
+        let expected = PixelSize::new(1280, 720).unwrap();
+        let mut publisher = EgfxSurfacePublisher::try_new(session_id, 1)
+            .unwrap()
+            .with_expected_coded_size(expected);
+
+        publisher.on_reset_graphics(1024, 768);
+
+        let state = super::lock_state(&publisher.state);
+        assert!(state.disabled);
+        assert_eq!(state.generation, 1);
+        assert!(state.updates.is_empty());
+        drop(state);
+        assert_eq!(publisher.rejected_update_count(), 1);
+    }
+
+    #[test]
+    fn publisher_accepts_a_reset_matching_decoder_coded_size() {
+        let session_id = SessionId::allocate();
+        let expected = PixelSize::new(1280, 720).unwrap();
+        let mut publisher = EgfxSurfacePublisher::try_new(session_id, 1)
+            .unwrap()
+            .with_expected_coded_size(expected);
+
+        publisher.on_reset_graphics(1280, 720);
+
+        let state = super::lock_state(&publisher.state);
+        assert!(!state.disabled);
+        assert_eq!(state.generation, 2);
+        assert_eq!(state.output_size, Some(expected));
+        drop(state);
+        assert!(matches!(
+            publisher.drain().as_slice(),
+            [SurfaceUpdate::Reset { size, .. }] if *size == expected
+        ));
     }
 
     fn encode_avc444_fixture(
