@@ -532,12 +532,16 @@ impl EgfxH264Decoder {
         &mut self,
         data: &[u8],
     ) -> DecoderResult<frd_media_api::DecodedVideoFrame> {
-        if self.failed || !valid_avc_length_prefixed(data) {
-            return Err(DecoderError::msg(
-                "AVC420 payload is not a valid length-prefixed access unit",
-            ));
+        if self.failed {
+            return Err(DecoderError::msg("AVC420 decoder is in a failed state"));
         }
-        self.ensure_decoder(data)?;
+        // MS-RDPEGFX specifies the AVC420 payload as an Annex-B byte stream,
+        // while the pinned IronRDP decoder trait and media backend consume
+        // four-byte length-prefixed NAL units. Normalize either accepted wire
+        // representation once at this boundary; the decoder and all metadata
+        // extraction below then operate on one exact internal format.
+        let normalized = normalize_avc_access_unit(data)?;
+        self.ensure_decoder(&normalized)?;
         let (identity, coded_size) = {
             let stream = self
                 .stream
@@ -546,13 +550,13 @@ impl EgfxH264Decoder {
             (stream.as_input().identity, stream.as_input().coded_size)
         };
         let timestamp = self.next_timestamp()?;
-        let random_access = avc_contains_idr(data);
+        let random_access = avc_contains_idr(&normalized);
         let access_unit = EncodedVideoAccessUnit::try_new(
             identity,
             self.current_generation(),
             timestamp,
             random_access,
-            data.to_vec().into_boxed_slice(),
+            normalized,
         )
         .map_err(|_| DecoderError::msg("AVC420 access unit exceeds the media contract"))?;
 
@@ -940,7 +944,85 @@ fn valid_avc_length_prefixed(data: &[u8]) -> bool {
     !data.is_empty() && offset == data.len()
 }
 
-/// Extract the parameter sets carried in an AVC length-prefixed access unit.
+fn normalize_avc_access_unit(data: &[u8]) -> DecoderResult<Box<[u8]>> {
+    if valid_avc_length_prefixed(data) {
+        return Ok(data.to_vec().into_boxed_slice());
+    }
+
+    let nals = parse_annex_b_nals(data)
+        .ok_or_else(|| DecoderError::msg("AVC420 payload is not a valid AVC access unit"))?;
+    let total = nals.iter().try_fold(0usize, |total, nal| {
+        total
+            .checked_add(4)
+            .and_then(|value| value.checked_add(nal.len()))
+            .ok_or_else(|| DecoderError::msg("AVC420 access unit size overflow"))
+    })?;
+    let mut normalized = Vec::with_capacity(total);
+    for nal in nals {
+        let length = u32::try_from(nal.len())
+            .map_err(|_| DecoderError::msg("AVC420 NAL exceeds four-byte length prefix"))?;
+        normalized.extend_from_slice(&length.to_be_bytes());
+        normalized.extend_from_slice(nal);
+    }
+    Ok(normalized.into_boxed_slice())
+}
+
+fn parse_annex_b_nals(data: &[u8]) -> Option<Vec<&[u8]>> {
+    fn start_code_len(data: &[u8], offset: usize) -> Option<usize> {
+        if offset.checked_add(4)? <= data.len() && data[offset..offset + 4] == [0, 0, 0, 1] {
+            Some(4)
+        } else if offset.checked_add(3)? <= data.len() && data[offset..offset + 3] == [0, 0, 1] {
+            Some(3)
+        } else {
+            None
+        }
+    }
+
+    let mut first_start = None;
+    for offset in 0..data.len() {
+        if start_code_len(data, offset).is_some() {
+            first_start = Some(offset);
+            break;
+        }
+    }
+    if let Some(first_start) = first_start {
+        if data[..first_start].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+    }
+    let mut start = first_start?;
+    let mut nals = Vec::new();
+    loop {
+        let code_len = start_code_len(data, start)?;
+        let nal_start = start.checked_add(code_len)?;
+        if nal_start >= data.len() {
+            return None;
+        }
+        let mut next_start = None;
+        for offset in nal_start..data.len() {
+            if start_code_len(data, offset).is_some() {
+                next_start = Some(offset);
+                break;
+            }
+        }
+        let end = next_start.unwrap_or(data.len());
+        let mut nal_end = end;
+        while nal_end > nal_start && data[nal_end - 1] == 0 {
+            nal_end -= 1;
+        }
+        if nal_end == nal_start {
+            return None;
+        }
+        nals.push(&data[nal_start..nal_end]);
+        let Some(next) = next_start else { break };
+        start = next;
+    }
+    (!nals.is_empty()).then_some(nals)
+}
+
+/// Extract the parameter sets carried in an internally normalized AVC
+/// length-prefixed access unit. Wire data is normalized by
+/// `normalize_avc_access_unit` before this helper is called.
 ///
 /// The EGFX capability exchange does not carry H.264 SPS/PPS. A lazy decoder
 /// therefore accepts only a complete access unit that contains both sets and
@@ -1057,7 +1139,7 @@ pub(crate) fn validate_avc444_bitmap(data: &[u8]) -> DecoderResult<ValidatedAvc4
         .map_err(|_| DecoderError::msg("AVC444 bitmap envelope is malformed"))?;
     if !cursor.remaining().is_empty()
         || stream.stream1.data.is_empty()
-        || !valid_avc_length_prefixed(stream.stream1.data)
+        || normalize_avc_access_unit(stream.stream1.data).is_err()
     {
         return Err(DecoderError::msg(
             "AVC444 stream1 is not a complete AVC access unit",
@@ -1070,7 +1152,7 @@ pub(crate) fn validate_avc444_bitmap(data: &[u8]) -> DecoderResult<ValidatedAvc4
                     "AVC444 luma-and-chroma mode is missing stream2",
                 ));
             };
-            if stream2.data.is_empty() || !valid_avc_length_prefixed(stream2.data) {
+            if stream2.data.is_empty() || normalize_avc_access_unit(stream2.data).is_err() {
                 return Err(DecoderError::msg(
                     "AVC444 chroma stream is not a complete AVC access unit",
                 ));
@@ -2526,6 +2608,33 @@ mod tests {
         assert!(decoder.decode(&[0, 0, 0, 4, 0x65]).is_err());
         decoder.reset();
         assert!(decoder.decode(&[0, 0, 0, 2, 0x65, 0x88]).is_ok());
+    }
+
+    #[test]
+    fn h264_decoder_bridge_accepts_rdp_annex_b_access_units() {
+        let session_id = SessionId::allocate();
+        let stream = avc420_stream_config(
+            session_id,
+            4,
+            PixelSize::new(2, 2).unwrap(),
+            vec![0x67, 0x42].into_boxed_slice(),
+            vec![0x68, 0xce].into_boxed_slice(),
+        )
+        .unwrap();
+        let frame = black_yuv420_frame(&stream);
+        let mut decoder = EgfxH264Decoder::from_decoder(
+            stream,
+            Box::new(OneFrameDecoder {
+                frame,
+                resets: Vec::new(),
+                fail_reset: false,
+            }),
+        );
+
+        let decoded = decoder
+            .decode(&[0, 0, 0, 1, 0x65, 0x88])
+            .expect("RDP AVC420 Annex-B access unit is normalized at the adapter boundary");
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
     }
 
     #[test]

@@ -12,6 +12,7 @@ on:
       - "crates/**"
       - "packaging/windows/**"
       - "third_party/ffmpeg/8.1.2/**"
+      - "third_party/ironrdp-connector-0.10.0/**"
       - "tools/**"
       - ".github/workflows/build-windows.yml"
   push:
@@ -27,6 +28,7 @@ on:
       - "crates/**"
       - "packaging/windows/**"
       - "third_party/ffmpeg/8.1.2/**"
+      - "third_party/ironrdp-connector-0.10.0/**"
       - "tools/**"
       - ".github/workflows/build-windows.yml"
 

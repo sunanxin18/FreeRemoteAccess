@@ -4,6 +4,8 @@
 # AVC420、AVC444、HEVC 首帧/持续刷新/恢复门禁必须由授权的 live probe 单独
 # 记录。设置 FRD_VERIFY_STRICT=1 后，缺少本机可执行的 target/package
 # artifact 也会使脚本失败，避免把未执行的 gate 当成通过。
+# Linux bundle verifier 可通过 FRD_LINUX_FFMPEG_BUNDLE 与
+# FRD_LINUX_FFMPEG_PROFILE 显式提供 bundle/profile；缺少任一输入时不计为通过。
 set -u -o pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -100,7 +102,7 @@ target_specs=(
 )
 
 if [[ "${FRD_VERIFY_SKIP_TARGETS:-0}" == 1 ]]; then
-    printf '\n[SKIP] Windows/Linux target checks（FRD_VERIFY_SKIP_TARGETS=1）\n'
+    printf '\n[SKIP] Windows/Linux/macOS target checks（FRD_VERIFY_SKIP_TARGETS=1）\n'
 else
     for target in "${target_specs[@]}"; do
         if rustc --print target-libdir --target "$target" >/dev/null 2>&1; then
@@ -127,6 +129,13 @@ elif [[ "$(uname -s)" == Darwin ]]; then
     else
         optional_missing "macOS package verifier：$mac_app"
     fi
+elif [[ "$(uname -s)" == Linux ]] \
+    && [[ -n "${FRD_LINUX_FFMPEG_BUNDLE:-}" ]] \
+    && [[ -n "${FRD_LINUX_FFMPEG_PROFILE:-}" ]] \
+    && [[ -x tools/verify-linux-ffmpeg-bundle.sh ]]; then
+    run_gate "Linux FFmpeg bundle verifier：${FRD_LINUX_FFMPEG_PROFILE}" \
+        bash tools/verify-linux-ffmpeg-bundle.sh \
+        "$FRD_LINUX_FFMPEG_BUNDLE" "$FRD_LINUX_FFMPEG_PROFILE"
 elif [[ "${FRD_WINDOWS_PACKAGE_ROOT:-}" != '' && -f tools/verify-windows-package.ps1 ]] \
     && command -v pwsh >/dev/null 2>&1; then
     run_gate 'Windows package verifier' pwsh -NoProfile -File tools/verify-windows-package.ps1 \

@@ -33,6 +33,7 @@ members = [
     "tools/frd-icon-assets",
     "tools/frd-video-capabilities",
 ]
+exclude = ["third_party/ironrdp-egfx-0.3.0"]
 
 [workspace.dependencies]
 winit = "=0.30.13"
@@ -48,6 +49,10 @@ raw-window-handle = "=0.6.2"
 # channel. Keep the patch local and minimal: the RDP adapter opts in only when
 # an exact decoder provider is attached; legacy sessions retain upstream flags.
 ironrdp-connector = { path = "third_party/ironrdp-connector-0.10.0" }
+# The upstream client currently collapses AVC420's surface-coordinate region mask into
+# one outer-rectangle update. Keep the pinned version local so this adapter can
+# publish each validated region without changing the public renderer contract.
+ironrdp-egfx = { path = "third_party/ironrdp-egfx-0.3.0" }
 
 [dependencies]
 anyhow = "1"
