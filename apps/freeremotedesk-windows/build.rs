@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 const PACKAGE_MANIFEST: &str = "../../packaging/windows/ffmpeg-manifest.json";
 const PACKAGE_STAGE_SCRIPT: &str = "../../tools/stage-windows-package.ps1";
 const PACKAGE_VERIFY_SCRIPT: &str = "../../tools/verify-windows-package.ps1";
-const CODEC_DIRECTORY: &str = "codecs/ffmpeg-8.1.2/windows-x86_64";
+const CODEC_DIRECTORY_ROOT: &str = "codecs/ffmpeg-8.1.2/";
 
 fn assert_optional_codec_package_contract() {
     let text = fs::read_to_string(PACKAGE_MANIFEST)
@@ -15,9 +15,16 @@ fn assert_optional_codec_package_contract() {
         manifest["schema"], "freeremotedesk.windows.ffmpeg-package.v1",
         "Windows FFmpeg package manifest schema 不匹配"
     );
-    assert_eq!(
-        manifest["codecDirectory"], CODEC_DIRECTORY,
-        "Windows FFmpeg package manifest codec 目录不得偏离 loader 合约"
+    let codec_directory = manifest["codecDirectory"]
+        .as_str()
+        .expect("Windows FFmpeg package manifest codecDirectory 必须是字符串");
+    assert!(
+        codec_directory.starts_with(CODEC_DIRECTORY_ROOT)
+            && matches!(
+                codec_directory.strip_prefix(CODEC_DIRECTORY_ROOT),
+                Some("windows-x86_64" | "windows-x86" | "windows-aarch64")
+            ),
+        "Windows FFmpeg package manifest codec 目录必须使用受支持的架构 profile"
     );
     assert_eq!(
         manifest["libavcodecMajor"], 62,

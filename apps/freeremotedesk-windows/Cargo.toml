@@ -8,7 +8,7 @@ publish = false
 stage-script = "../../tools/stage-windows-package.ps1"
 verify-script = "../../tools/verify-windows-package.ps1"
 ffmpeg-manifest = "../../packaging/windows/ffmpeg-manifest.json"
-codec-directory = "codecs/ffmpeg-8.1.2/windows-x86_64"
+codec-directory-root = "codecs/ffmpeg-8.1.2/"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
