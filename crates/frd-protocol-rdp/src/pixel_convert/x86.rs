@@ -19,7 +19,19 @@ pub(super) unsafe fn rgba_to_bgrx(source: &[u8], destination: &mut [u8]) {
         _mm_storeu_si128(destination.as_mut_ptr().add(offset).cast(), bgrx);
         offset += 16;
     }
-    super::rgba_to_bgrx_scalar(&source[offset..], &mut destination[offset..source.len()]);
+    let tail_len = source.len() - offset;
+    if tail_len != 0 {
+        // Stage the short tail into a complete vector. This keeps the
+        // supported SSSE3 path entirely in the architecture kernel without
+        // reading past the source or falling back to the scalar converter.
+        let mut rgba_tail = [0_u8; 16];
+        rgba_tail[..tail_len].copy_from_slice(&source[offset..]);
+        let rgba = _mm_loadu_si128(rgba_tail.as_ptr().cast());
+        let bgrx = _mm_or_si128(_mm_shuffle_epi8(rgba, shuffle), alpha);
+        let mut bgrx_tail = [0_u8; 16];
+        _mm_storeu_si128(bgrx_tail.as_mut_ptr().cast(), bgrx);
+        destination[offset..source.len()].copy_from_slice(&bgrx_tail[..tail_len]);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -39,5 +51,17 @@ pub(super) unsafe fn rgba_to_bgrx(source: &[u8], destination: &mut [u8]) {
         _mm_storeu_si128(destination.as_mut_ptr().add(offset).cast(), bgrx);
         offset += 16;
     }
-    super::rgba_to_bgrx_scalar(&source[offset..], &mut destination[offset..source.len()]);
+    let tail_len = source.len() - offset;
+    if tail_len != 0 {
+        // Stage the short tail into a complete vector. This keeps the
+        // supported SSSE3 path entirely in the architecture kernel without
+        // reading past the source or falling back to the scalar converter.
+        let mut rgba_tail = [0_u8; 16];
+        rgba_tail[..tail_len].copy_from_slice(&source[offset..]);
+        let rgba = _mm_loadu_si128(rgba_tail.as_ptr().cast());
+        let bgrx = _mm_or_si128(_mm_shuffle_epi8(rgba, shuffle), alpha);
+        let mut bgrx_tail = [0_u8; 16];
+        _mm_storeu_si128(bgrx_tail.as_mut_ptr().cast(), bgrx);
+        destination[offset..source.len()].copy_from_slice(&bgrx_tail[..tail_len]);
+    }
 }

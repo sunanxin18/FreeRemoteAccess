@@ -112,30 +112,48 @@ unsafe fn yuv_to_rgba_kernel(
             );
             column += 8;
         }
-        if subsampled {
-            super::yuv420_to_rgba_scalar(
-                width - column,
-                1,
-                &y_row[column..],
-                y_stride,
-                &u_row[column / 2..],
-                u_stride,
-                &v_row[column / 2..],
-                v_stride,
-                &mut output_row[column * 4..],
+        let tail_len = width - column;
+        if tail_len != 0 {
+            // Stage up to eight remaining pixels into a vector-sized sample
+            // block. Arithmetic and clamping stay in process_four; only the
+            // final packed bytes for the live pixels are copied out.
+            let mut y_bytes = [0_u8; 8];
+            let mut u_bytes = [0_u8; 8];
+            let mut v_bytes = [0_u8; 8];
+            y_bytes[..tail_len].copy_from_slice(&y_row[column..column + tail_len]);
+            for index in 0..tail_len {
+                let sample = if subsampled {
+                    (column + index) / 2
+                } else {
+                    column + index
+                };
+                u_bytes[index] = u_row[sample];
+                v_bytes[index] = v_row[sample];
+            }
+            let y16: uint16x8_t = vmovl_u8(vld1_u8(y_bytes.as_ptr()));
+            let u16: uint16x8_t = vmovl_u8(vld1_u8(u_bytes.as_ptr()));
+            let v16: uint16x8_t = vmovl_u8(vld1_u8(v_bytes.as_ptr()));
+            let mut packed = [0_u8; 32];
+            write_four(
+                &mut packed[..16],
+                process_four(
+                    vreinterpret_s16_u16(vget_low_u16(y16)),
+                    vreinterpret_s16_u16(vget_low_u16(u16)),
+                    vreinterpret_s16_u16(vget_low_u16(v16)),
+                ),
             );
-        } else {
-            super::yuv444_to_rgba_scalar(
-                width - column,
-                1,
-                &y_row[column..],
-                y_stride,
-                &u_row[column..],
-                u_stride,
-                &v_row[column..],
-                v_stride,
-                &mut output_row[column * 4..],
-            );
+            if tail_len > 4 {
+                write_four(
+                    &mut packed[16..],
+                    process_four(
+                        vreinterpret_s16_u16(vget_high_u16(y16)),
+                        vreinterpret_s16_u16(vget_high_u16(u16)),
+                        vreinterpret_s16_u16(vget_high_u16(v16)),
+                    ),
+                );
+            }
+            output_row[column * 4..(column + tail_len) * 4]
+                .copy_from_slice(&packed[..tail_len * 4]);
         }
     }
 

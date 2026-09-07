@@ -410,4 +410,86 @@ mod tests {
         .expect("valid YUV444 planes");
         assert_eq!(actual, expected);
     }
+
+    #[test]
+    fn dispatched_yuv_kernels_match_reference_for_every_short_width_tail() {
+        let height: usize = 3;
+        for width in 1_usize..=15 {
+            let y_stride = width + 3;
+            let chroma_width = width.div_ceil(2);
+            let chroma_height = height.div_ceil(2);
+            let u420_stride = chroma_width + 2;
+            let v420_stride = chroma_width + 3;
+            let y = (0..y_stride * height)
+                .map(|index| (index as u8).wrapping_mul(13).wrapping_add(5))
+                .collect::<Vec<_>>();
+            let u420 = (0..u420_stride * chroma_height)
+                .map(|index| (index as u8).wrapping_mul(17).wrapping_add(71))
+                .collect::<Vec<_>>();
+            let v420 = (0..v420_stride * chroma_height)
+                .map(|index| (index as u8).wrapping_mul(23).wrapping_add(109))
+                .collect::<Vec<_>>();
+            let mut expected420 = vec![0_u8; width * height * 4];
+            let mut actual420 = vec![0_u8; expected420.len()];
+            yuv420_to_rgba_scalar(
+                width,
+                height,
+                &y,
+                y_stride,
+                &u420,
+                u420_stride,
+                &v420,
+                v420_stride,
+                &mut expected420,
+            );
+            convert_yuv420_to_rgba(
+                width,
+                height,
+                &y,
+                y_stride,
+                &u420,
+                u420_stride,
+                &v420,
+                v420_stride,
+                &mut actual420,
+            )
+            .expect("valid YUV420 planes");
+            assert_eq!(actual420, expected420, "YUV420 width={width}");
+
+            let u444_stride = width + 2;
+            let v444_stride = width + 3;
+            let u444 = (0..u444_stride * height)
+                .map(|index| (index as u8).wrapping_mul(19).wrapping_add(83))
+                .collect::<Vec<_>>();
+            let v444 = (0..v444_stride * height)
+                .map(|index| (index as u8).wrapping_mul(31).wrapping_add(127))
+                .collect::<Vec<_>>();
+            let mut expected444 = vec![0_u8; width * height * 4];
+            let mut actual444 = vec![0_u8; expected444.len()];
+            yuv444_to_rgba_scalar(
+                width,
+                height,
+                &y,
+                y_stride,
+                &u444,
+                u444_stride,
+                &v444,
+                v444_stride,
+                &mut expected444,
+            );
+            convert_yuv444_to_rgba(
+                width,
+                height,
+                &y,
+                y_stride,
+                &u444,
+                u444_stride,
+                &v444,
+                v444_stride,
+                &mut actual444,
+            )
+            .expect("valid YUV444 planes");
+            assert_eq!(actual444, expected444, "YUV444 width={width}");
+        }
+    }
 }

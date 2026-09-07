@@ -92,7 +92,10 @@ fn active_kernel_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_kernel_name, convert_rgba_to_bgrx, rgba_to_bgrx_scalar, PixelConvertError};
+    use super::{
+        active_kernel_name, convert_rgba_to_bgrx, rgba_to_bgrx_scalar, PixelConvertError,
+        BYTES_PER_PIXEL,
+    };
 
     #[test]
     fn conversion_preserves_rgb_order_and_forces_opaque_alpha() {
@@ -126,6 +129,20 @@ mod tests {
 
         for (rgba, bgrx) in source.chunks_exact(4).zip(destination.chunks_exact(4)) {
             assert_eq!(bgrx, &[rgba[2], rgba[1], rgba[0], 0xff]);
+        }
+    }
+
+    #[test]
+    fn conversion_matches_reference_for_every_short_pixel_tail() {
+        for pixel_count in 1..=15 {
+            let source = (0..pixel_count * BYTES_PER_PIXEL)
+                .map(|index| (index as u8).wrapping_mul(29).wrapping_add(7))
+                .collect::<Vec<_>>();
+            let mut expected = vec![0_u8; source.len()];
+            let mut actual = vec![0_u8; source.len()];
+            rgba_to_bgrx_scalar(&source, &mut expected);
+            convert_rgba_to_bgrx(&source, &mut actual).expect("valid pixel buffer");
+            assert_eq!(actual, expected, "pixel_count={pixel_count}");
         }
     }
 
