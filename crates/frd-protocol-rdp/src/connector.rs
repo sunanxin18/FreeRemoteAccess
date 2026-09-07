@@ -609,7 +609,7 @@ fn test_dynamic_channels_with_egfx(
 #[cfg(test)]
 mod tests {
     use ironrdp::connector::Sequence;
-    use ironrdp::connector::{Credentials, DesktopSize};
+    use ironrdp::connector::{ClientConnector, Credentials, DesktopSize};
     use ironrdp::core::{decode, encode_vec, WriteBuf};
     use ironrdp::dvc::pdu::{CreateRequestPdu, DrdynvcServerPdu};
     use ironrdp::dvc::DrdynvcClient;
@@ -750,7 +750,7 @@ mod tests {
         let provider: std::sync::Arc<dyn EgfxDecoderProvider> =
             std::sync::Arc::new(StubEgfxDecoderProvider);
         let session_id = SessionId::allocate();
-        let (mut connector, _audio, _display, _graphics) = baseline_connector(
+        let (connector, _audio, _display, _graphics) = baseline_connector(
             Credentials::UsernamePassword {
                 username: "alice".to_owned(),
                 password: String::new(),
@@ -766,6 +766,37 @@ mod tests {
             Some(&provider),
         );
 
+        let flags = emitted_early_capability_flags(connector);
+
+        assert!(flags.contains(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
+    }
+
+    #[test]
+    fn legacy_connector_omits_the_graphics_channel_capability_on_the_wire() {
+        let session_id = SessionId::allocate();
+        let (connector, _audio, _display, _graphics) = baseline_connector(
+            Credentials::UsernamePassword {
+                username: "alice".to_owned(),
+                password: String::new(),
+            },
+            None,
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            },
+            "127.0.0.1:49152".parse().expect("valid client address"),
+            RdpClientPlatformIdentity::Windows,
+            session_id,
+            None,
+        );
+
+        let flags = emitted_early_capability_flags(connector);
+        assert!(!flags.contains(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
+    }
+
+    fn emitted_early_capability_flags(
+        mut connector: ClientConnector,
+    ) -> ClientEarlyCapabilityFlags {
         let mut output = WriteBuf::new();
         connector
             .step(&[], &mut output)
@@ -789,15 +820,13 @@ mod tests {
             .expect("decode emitted X.224 data");
         let initial = decode::<ironrdp::pdu::mcs::ConnectInitial>(x224.0.data.as_ref())
             .expect("decode emitted MCS connect initial");
-        let flags = initial
+        initial
             .conference_create_request
             .gcc_blocks()
             .core
             .optional_data
             .early_capability_flags
-            .expect("client emits core early capability flags");
-
-        assert!(flags.contains(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
+            .expect("client emits core early capability flags")
     }
 
     struct StubEgfxDecoderProvider;
