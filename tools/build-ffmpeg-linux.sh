@@ -74,6 +74,9 @@ frd_configure_args=(
   --disable-debug --enable-stripping --disable-avdevice --disable-avformat --disable-avfilter
   --disable-swresample --disable-swscale
 )
+if [[ "$frd_arch" == "aarch64" ]]; then
+  frd_configure_args+=(--disable-x86asm)
+fi
 if [[ "$frd_cross_build" -eq 1 ]]; then
   frd_configure_args+=(
     --enable-cross-compile
@@ -88,6 +91,11 @@ make install
 if [[ "$frd_arch" == "x86" || "$frd_arch" == "x86_64" ]]; then
   grep -q '^#define HAVE_X86ASM 1$' config.h || {
     echo "FFmpeg x86 build did not enable HAVE_X86ASM" >&2
+    exit 1
+  }
+else
+  grep -q '^#define HAVE_NEON 1$' config.h || {
+    echo "FFmpeg AArch64 build did not enable HAVE_NEON" >&2
     exit 1
   }
 fi
@@ -112,6 +120,7 @@ cat > "$frd_bundle/FFmpeg-NOTICE.txt" <<NOTICE
 FFmpeg $frd_version, LGPL-2.1-or-later; H.264 and HEVC decoder/parser only.
 Source archive SHA-256: $frd_sha256
 Architecture: $frd_platform
+Assembly: $([[ "$frd_arch" == "aarch64" ]] && echo "aarch64-neon (have_neon=1)" || echo "x86asm (have_x86asm=1)")
 NOTICE
 
 case "$frd_platform" in
