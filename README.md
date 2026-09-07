@@ -172,6 +172,14 @@ HPSS/ARD/MVS 路径。
 实现和真机互操作必须分别验证，不能相互替代。任何新增功能或平台改动都必须
 在同一提交中更新本节。
 
+本地可复现的无凭据验证入口是
+[`tools/verify-rdp-egfx-local.sh`](tools/verify-rdp-egfx-local.sh)。它固定 Rust 1.96.0，
+运行格式、Shell 语法、协议/媒体 focused tests、workspace tests、六个
+Windows/Linux core/video/plugin target checks，并在已有产物时调用 macOS package verifier。
+缺少工具链、package 或 native FFmpeg fixture 会明确显示为未执行；设置
+`FRD_VERIFY_STRICT=1` 才会把这类输入缺失变成失败。该脚本不会读取凭据或执行 RDP live
+连接，因此 AVC420、AVC444、HEVC 的服务器协商、首帧、持续刷新和恢复仍须单独记录。
+
 ### 近期待办
 
 - **Apple 动态 resize（P1）**：保持默认关闭和 **实验性**。以 ARD 3.10
