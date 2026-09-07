@@ -1,0 +1,17 @@
+{
+  "codec": "h264",
+  "profile": "avc444",
+  "chroma": "yuv444",
+  "bit_depth": 8,
+  "bitstream_format": "annex_b",
+  "coded_width": 16,
+  "coded_height": 16,
+  "frame_count": 1,
+  "nal_types": [
+    7,
+    8,
+    5
+  ],
+  "fixture_sha256": "650604d0a95b569e9baed9ba838d1ac2c5df7a0f08447a0dab49582e1887c3d8",
+  "generator": "FFmpeg 7.1.1 libx264 High 4:4:4 Intra synthetic red 16x16 IDR; SEI/AUD removed"
+}
