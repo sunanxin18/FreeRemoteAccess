@@ -18,6 +18,8 @@ AVC420 provider；这条路径会广告 EGFX，但仍必须等待服务器 `Capa
 真实首帧、刷新、恢复证据。本记录中的 Bitmap/RemoteFX 结果不构成现代图形编码的互操作
 证据，HEVC 仍未接入 RDP connector。
 
+标准协议复核也保持这一边界：公开的 [MS-RDPEGFX `RDPGFX_WIRE_TO_SURFACE_PDU_1` codec ID 表](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/fb919fce-cc97-4d2b-8cf5-a737a00ef1a6)列出 AVC420、AVC444 和 AVC444V2，但没有 HEVC codec ID；[Azure Virtual Desktop 图形编码说明](https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encoding) 对 HEVC 的描述属于特定 GPU 产品场景，未公开本客户端需要的 RDP wire profile。因此本客户端不从 Azure 文档推导 HEVC 编号或封装，仍等待精确产品协议/授权抓包和 live 首帧、刷新、恢复证据。
+
 2026-09-07 的离线 H.264 门禁覆盖精确 `H264Avc420/Yuv420P8` 能力匹配、四字节
 AVC length-prefixed NAL 到 Annex-B 的一次性转换、YUV420 三平面尺寸校验、FFmpeg
 H.264 decoder/parser 构建选项，以及 Linux x86/i686、x86_64/arm64 bundle 脚本。FFmpeg 插件
