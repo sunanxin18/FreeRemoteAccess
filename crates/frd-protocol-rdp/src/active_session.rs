@@ -1292,6 +1292,79 @@ mod tests {
     }
 
     #[test]
+    fn egfx_surface_update_rejects_a_stale_session_before_runtime_publication() {
+        let session_id = SessionId::allocate();
+        let stale_session = SessionId::allocate();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let (_commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(RecordingFrames(updates.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut generation = 1;
+
+        let error = publish_egfx_surface_updates(
+            &mut runtime,
+            session_id,
+            &mut generation,
+            vec![SurfaceUpdate::Reset {
+                session_id: stale_session,
+                generation: 2,
+                size: PixelSize {
+                    width: 2,
+                    height: 2,
+                },
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }],
+        )
+        .expect_err("stale EGFX session must fail closed");
+
+        assert_eq!(error, ProtocolError::StaleSession);
+        assert_eq!(generation, 1);
+        assert!(updates.lock().expect("frame log").is_empty());
+    }
+
+    #[test]
+    fn egfx_surface_reset_rejects_a_non_advancing_generation_before_reset_publication() {
+        let session_id = SessionId::allocate();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let (_commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(RecordingFrames(updates.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut generation = 1;
+
+        let error = publish_egfx_surface_updates(
+            &mut runtime,
+            session_id,
+            &mut generation,
+            vec![SurfaceUpdate::Reset {
+                session_id,
+                generation: 1,
+                size: PixelSize {
+                    width: 2,
+                    height: 2,
+                },
+                format: PixelFormat::Bgrx8UnormSrgb,
+            }],
+        )
+        .expect_err("EGFX reset must advance the active generation");
+
+        assert_eq!(error, ProtocolError::InvalidGeneration);
+        assert_eq!(generation, 1);
+        assert!(updates.lock().expect("frame log").is_empty());
+    }
+
+    #[test]
     fn lifecycle_reactivation_starts_a_new_empty_surface_generation() {
         let session_id = SessionId::allocate();
         let updates = Arc::new(Mutex::new(Vec::new()));
