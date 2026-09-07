@@ -313,9 +313,10 @@ impl EgfxCoverage {
 }
 
 /// Adapts the protocol-neutral YUV420 decoder contract to the pinned IronRDP
-/// EGFX callback contract. This type is intentionally a construction seam only;
-/// the production connector does not create it until capability, backend and
-/// live-interoperability gates are all enabled.
+/// EGFX callback contract. The default RDP factory remains legacy-only; a
+/// platform composition root may construct this adapter only after its exact
+/// backend/profile/package checks pass. Server confirmation and the resulting
+/// frame/recovery evidence still remain observable session gates.
 #[allow(dead_code)]
 pub(crate) struct EgfxH264Decoder {
     factory: Option<Arc<dyn VideoDecoderFactory>>,
