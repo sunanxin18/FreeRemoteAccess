@@ -2106,11 +2106,15 @@ impl DvcProcessor for EgfxAdapter {
         }
         match self.inner.process(channel_id, payload) {
             Ok(messages) => {
-                if self.inner.decoder_failed()
-                    || self
-                        .surface_publisher
-                        .as_ref()
-                        .is_some_and(EgfxSurfacePublisher::is_disabled)
+                if self.inner.decoder_failed() {
+                    self.failed.store(true, Ordering::Release);
+                    if let Some(publisher) = &self.surface_publisher {
+                        publisher.disable();
+                    }
+                } else if self
+                    .surface_publisher
+                    .as_ref()
+                    .is_some_and(EgfxSurfacePublisher::is_disabled)
                 {
                     self.failed.store(true, Ordering::Release);
                 }
@@ -2990,6 +2994,10 @@ mod tests {
         );
 
         assert!(adapter.is_failed());
+        assert!(adapter
+            .surface_publisher
+            .as_ref()
+            .is_some_and(EgfxSurfacePublisher::is_disabled));
         assert!(adapter.drain_surface_updates().is_empty());
     }
 
