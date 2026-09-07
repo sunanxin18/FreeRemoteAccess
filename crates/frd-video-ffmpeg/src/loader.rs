@@ -68,6 +68,23 @@ impl fmt::Debug for FfmpegBackend {
 }
 
 impl FfmpegBackend {
+    /// 报告生产 RDP 组合根是否可以精确满足 H.264 AVC420。
+    ///
+    /// 该查询只检查本地插件能力，不代表服务器已经发送 EGFX `CapabilitiesConfirm`。
+    /// 组合根必须在注入 RDP provider 前调用它，以免 HEVC-only 或不完整插件误广告 AVC420。
+    pub fn supports_avc420(&self) -> bool {
+        let query = VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1, 1).expect("固定探针尺寸有效"),
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Yuv420P8].into_boxed_slice(),
+        };
+        VideoCapabilityProvider::query(self, &query).is_exact()
+    }
+
     /// 从当前可执行文件目录下的固定、受信版本目录加载；失败只禁用该 backend。
     pub fn load() -> Result<Self, VideoDecodeError> {
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -1276,6 +1293,14 @@ mod tests {
             }),
             VideoDecodeSupport::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn h264_avc420_gate_rejects_a_hevc_only_plugin() {
+        let mut api = compatible_raw_api();
+        api.codec_capabilities = crate::abi::FRD_CODEC_CAP_HEVC_MAIN_444_8;
+        let backend = FfmpegBackend::from_raw_api_for_test(api).expect("HEVC plugin 应可加载");
+        assert!(!backend.supports_avc420());
     }
 
     #[test]

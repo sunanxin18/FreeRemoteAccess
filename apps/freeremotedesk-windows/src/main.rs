@@ -241,12 +241,18 @@ fn run(cli: Cli) -> RunnerOutcome {
 fn rdp_factory() -> Arc<dyn ProtocolFactory> {
     let platform = RdpClientPlatformIdentity::Windows;
     match frd_video_ffmpeg::FfmpegBackend::load() {
-        Ok(backend) => Arc::new(RdpProtocolFactory::with_egfx_decoder_provider(
-            platform,
-            Arc::new(Avc420DecoderProvider::from_factory(Arc::new(backend))),
-        )),
-        Err(_) => Arc::new(RdpProtocolFactory::new(platform)),
+        Ok(backend) if backend.supports_avc420() => {
+            Arc::new(RdpProtocolFactory::with_egfx_decoder_provider(
+                platform,
+                Arc::new(Avc420DecoderProvider::from_factory(Arc::new(backend))),
+            ))
+        }
+        Err(_) | Ok(_) => legacy_rdp_factory(platform),
     }
+}
+
+fn legacy_rdp_factory(platform: RdpClientPlatformIdentity) -> Arc<dyn ProtocolFactory> {
+    Arc::new(RdpProtocolFactory::new(platform))
 }
 
 fn purge_pending_credentials(credentials: &dyn SecureCredentialStore) -> Result<(), RunnerFailure> {
