@@ -249,12 +249,12 @@ fresh 离线门禁结果如下：
 证书确认/精确 pin、仅 CredSSP/NLA 的连接路径、licensing/activation 基线、BGRX
 脏矩形发布、fast-path 键鼠、单主显示器 Display Control、adapter 内 Unicode 文本
 CLIPRDR，以及 48 kHz
-双声道 PCM RDPSND 发布。离线测试断言 pinned IronRDP 的 outgoing capability 列表仅含
+双声道 PCM RDPSND 发布。没有 decoder provider 时，离线测试断言 pinned IronRDP 的 outgoing capability 列表仅含
 Phase-1 RemoteFX codec；传统图形基线为 Raw、Interleaved RLE、RDP 6 Bitmap 和
 RemoteFX。
 EGFX、ZGFX、AVC/AVC420 与 AVC444 均未完成生产互操作，不得因本次构建而作出支持声明。
-当前 AVC444 仅有规范结构 envelope 校验和 fail-closed 拒绝测试，双流重建、色彩转换
-和服务器确认仍未完成。
+当前 AVC444 已有规范结构 envelope、V1/V2 双流重建和色彩转换的构造期边界，但生产
+组合根和服务器确认仍未完成。
 未纳入当前范围的其他能力仍为：RDPDR/文件/磁盘/设备、AUDIN/客户端麦克风、网关、
 智能卡、打印机和多显示器。
 
