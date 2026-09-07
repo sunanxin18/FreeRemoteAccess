@@ -676,7 +676,6 @@ impl Avc444Decoder for Avc444VideoDecoder {
             .ok_or_else(|| DecoderError::msg("AVC444 surface is unknown"))?;
         let expected_size = expected_size.size;
         let stream1 = self.decode_subframe(bitmap.stream1, expected_size)?;
-        let luma = yuv420_frame(&stream1)?;
         let stream2 = match bitmap.encoding {
             ValidatedAvc444Encoding::LumaAndChroma => {
                 let data = bitmap
@@ -686,7 +685,33 @@ impl Avc444Decoder for Avc444VideoDecoder {
             }
             ValidatedAvc444Encoding::Luma | ValidatedAvc444Encoding::Chroma => None,
         };
-        let chroma = stream2.as_ref().map(yuv420_frame).transpose()?;
+        // CHROMA-only wire PDUs carry their auxiliary YUV420 subframe in
+        // stream1.  stream2 exists only for the combined LUMA_AND_CHROMA
+        // encoding; treating stream1 as luma here loses the stream1 region
+        // mapping and makes every chroma-only update fail with a missing
+        // chroma frame.
+        let (luma, luma_regions, chroma, chroma_regions) = match bitmap.encoding {
+            ValidatedAvc444Encoding::LumaAndChroma => (
+                Some(yuv420_frame(&stream1)?),
+                bitmap.stream1_regions.as_ref(),
+                Some(yuv420_frame(stream2.as_ref().ok_or_else(|| {
+                    DecoderError::msg("AVC444 stream2 is missing")
+                })?)?),
+                bitmap.stream2_regions.as_deref().unwrap_or_default(),
+            ),
+            ValidatedAvc444Encoding::Luma => (
+                Some(yuv420_frame(&stream1)?),
+                bitmap.stream1_regions.as_ref(),
+                None,
+                &[] as &[ironrdp::pdu::geometry::InclusiveRectangle],
+            ),
+            ValidatedAvc444Encoding::Chroma => (
+                None,
+                &[] as &[ironrdp::pdu::geometry::InclusiveRectangle],
+                Some(yuv420_frame(&stream1)?),
+                bitmap.stream1_regions.as_ref(),
+            ),
+        };
         let mode = match (codec_id, bitmap.encoding) {
             (Codec1Type::Avc444, ValidatedAvc444Encoding::Luma) => Avc444ReconstructionMode::Luma,
             (Codec1Type::Avc444, ValidatedAvc444Encoding::Chroma) => {
@@ -704,7 +729,6 @@ impl Avc444Decoder for Avc444VideoDecoder {
             }
             _ => return Err(DecoderError::msg("unexpected AVC444 codec id")),
         };
-        let chroma_regions = bitmap.stream2_regions.as_deref().unwrap_or_default();
         let surface = self
             .surfaces
             .get_mut(&surface_id)
@@ -713,8 +737,8 @@ impl Avc444Decoder for Avc444VideoDecoder {
             .reconstructor
             .apply(
                 mode,
-                &luma,
-                &bitmap.stream1_regions,
+                luma.as_ref(),
+                luma_regions,
                 chroma.as_ref(),
                 chroma_regions,
             )
@@ -2410,6 +2434,56 @@ mod tests {
             frame.data(),
             &[0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 24, 0, 0xff, 0, 24, 0, 0xff,]
         );
+
+        // A subsequent CHROMA-only PDU places its auxiliary subframe and
+        // rectangles in stream1. It must reuse the luma reference established
+        // above and update the existing surface instead of being rejected as
+        // a missing stream2.
+        let chroma_bitmap = Avc444BitmapStream {
+            encoding: ironrdp_egfx::pdu::Encoding::CHROMA,
+            stream1: Avc420BitmapStream {
+                rectangles: vec![region.to_rectangle()],
+                quant_qual_vals: vec![region.to_quant_quality()],
+                data: &[0, 0, 0, 2, 0x65, 0x99],
+            },
+            stream2: None,
+        };
+        let mut encoded_chroma = vec![0_u8; chroma_bitmap.size()];
+        let mut chroma_cursor = WriteCursor::new(&mut encoded_chroma);
+        chroma_bitmap
+            .encode(&mut chroma_cursor)
+            .expect("AVC444 chroma-only fixture encodes");
+        let validated_chroma =
+            validate_avc444_bitmap(&encoded_chroma).expect("AVC444 chroma-only fixture validates");
+        let chroma_frame = decoder
+            .decode(
+                Codec1Type::Avc444,
+                1,
+                &validated_chroma,
+                &ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+            )
+            .expect("AVC444 chroma-only update reuses the luma reference");
+        assert_eq!((chroma_frame.width(), chroma_frame.height()), (2, 2));
+        let chroma_v2_frame = decoder
+            .decode(
+                Codec1Type::Avc444v2,
+                1,
+                &validated_chroma,
+                &ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+            )
+            .expect("AVC444v2 chroma-only update reuses the luma reference");
+        assert_eq!((chroma_v2_frame.width(), chroma_v2_frame.height()), (2, 2));
+
         assert!(provider
             .create_avc444_decoder(session_id, PixelSize::new(2, 2).unwrap())
             .is_some());

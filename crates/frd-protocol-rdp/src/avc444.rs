@@ -187,22 +187,27 @@ impl Yuv444Reconstructor {
     pub(crate) fn apply(
         &mut self,
         mode: Avc444ReconstructionMode,
-        luma: &Yuv420Frame<'_>,
+        luma: Option<&Yuv420Frame<'_>>,
         luma_regions: &[InclusiveRectangle],
         chroma: Option<&Yuv420Frame<'_>>,
         chroma_regions: &[InclusiveRectangle],
     ) -> Result<(), Avc444ReconstructionError> {
-        if luma.width != self.frame.width || luma.height != self.frame.height {
-            return Err(Avc444ReconstructionError::InvalidDimensions);
-        }
         let mut candidate = self.frame.clone();
         let mut candidate_has_luma = self.has_luma_reference;
         match mode {
             Avc444ReconstructionMode::Luma => {
+                let luma = luma.ok_or(Avc444ReconstructionError::InvalidPlane)?;
+                if luma.width != self.frame.width || luma.height != self.frame.height {
+                    return Err(Avc444ReconstructionError::InvalidDimensions);
+                }
                 apply_luma_in_place(&mut candidate, luma, luma_regions)?;
                 candidate_has_luma = true;
             }
             Avc444ReconstructionMode::LumaAndChroma(layout) => {
+                let luma = luma.ok_or(Avc444ReconstructionError::InvalidPlane)?;
+                if luma.width != self.frame.width || luma.height != self.frame.height {
+                    return Err(Avc444ReconstructionError::InvalidDimensions);
+                }
                 let chroma = chroma.ok_or(Avc444ReconstructionError::InvalidPlane)?;
                 if chroma.width != self.frame.width || chroma.height != self.frame.height {
                     return Err(Avc444ReconstructionError::InvalidDimensions);
@@ -452,7 +457,7 @@ mod tests {
         reconstructor
             .apply(
                 Avc444ReconstructionMode::Luma,
-                &source,
+                Some(&source),
                 &[region],
                 None,
                 &[],
@@ -487,7 +492,7 @@ mod tests {
             reconstructor
                 .apply(
                     Avc444ReconstructionMode::Chroma(Avc444ChromaLayout::V1),
-                    &luma,
+                    None,
                     &[],
                     Some(&chroma),
                     &[region.clone()],
@@ -498,7 +503,7 @@ mod tests {
         reconstructor
             .apply(
                 Avc444ReconstructionMode::Luma,
-                &luma,
+                Some(&luma),
                 &[region.clone()],
                 None,
                 &[],
@@ -507,7 +512,7 @@ mod tests {
         reconstructor
             .apply(
                 Avc444ReconstructionMode::Chroma(Avc444ChromaLayout::V1),
-                &luma,
+                None,
                 &[],
                 Some(&chroma),
                 &[region],
@@ -548,7 +553,7 @@ mod tests {
             reconstructor
                 .apply(
                     Avc444ReconstructionMode::Luma,
-                    &source,
+                    Some(&source),
                     &[valid, invalid],
                     None,
                     &[],
@@ -591,7 +596,7 @@ mod tests {
         reconstructor
             .apply(
                 Avc444ReconstructionMode::Luma,
-                &luma,
+                Some(&luma),
                 &[region.clone()],
                 None,
                 &[],
@@ -600,7 +605,7 @@ mod tests {
         reconstructor
             .apply(
                 Avc444ReconstructionMode::Chroma(Avc444ChromaLayout::V2),
-                &luma,
+                None,
                 &[],
                 Some(&chroma),
                 &[region],
