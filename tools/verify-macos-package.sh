@@ -10,10 +10,11 @@ test -x "$app/Contents/MacOS/freeremotedesk-macos"
 test -s "$app/Contents/Resources/FreeRemoteDesk.icns"
 codesign --verify --strict "$app"
 
-case "$(uname -m)" in
-    arm64) expected_arch=arm64; codec_arch=aarch64 ;;
+requested_arch="${FRD_MACOS_ARCH:-$(uname -m)}"
+case "$requested_arch" in
+    arm64|aarch64) requested_arch=arm64; expected_arch=arm64; codec_arch=aarch64 ;;
     x86_64) expected_arch=x86_64; codec_arch=x86_64 ;;
-    *) echo "不支持的 macOS verifier 主机架构: $(uname -m)" >&2; exit 1 ;;
+    *) echo "不支持的 macOS verifier 架构: $requested_arch" >&2; exit 1 ;;
 esac
 
 assert_macho_arch() {

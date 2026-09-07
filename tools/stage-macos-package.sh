@@ -6,9 +6,32 @@ profile="${1:-debug}"
 case "$profile" in debug|release) ;; *) echo '用法：stage-macos-package.sh [debug|release]' >&2; exit 2;; esac
 if [[ "$(uname -s)" != Darwin ]]; then echo '需要 macOS 原生工具链' >&2; exit 1; fi
 export MACOSX_DEPLOYMENT_TARGET=12.0
+host_arch="$(uname -m)"
+requested_arch="${FRD_MACOS_ARCH:-$host_arch}"
+case "$requested_arch" in
+    arm64|aarch64) requested_arch=arm64; codec_arch=aarch64; expected_arch=arm64; rust_target=aarch64-apple-darwin ;;
+    x86_64) codec_arch=x86_64; expected_arch=x86_64; rust_target=x86_64-apple-darwin ;;
+    *) echo "不支持的 macOS package 架构: $requested_arch" >&2; exit 2 ;;
+esac
+cross_build=0
+if [[ "$host_arch" != "$requested_arch" ]]; then cross_build=1; fi
 cd "$repo_root"
-if [[ "$profile" == release ]]; then cargo build -p freeremotedesk-macos --release; else cargo build -p freeremotedesk-macos; fi
-binary="${CARGO_TARGET_DIR:-$repo_root/target}/$profile/freeremotedesk-macos"
+target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+if [[ "$cross_build" -eq 1 ]]; then
+    if [[ "$profile" == release ]]; then
+        cargo build -p freeremotedesk-macos --release --target "$rust_target"
+    else
+        cargo build -p freeremotedesk-macos --target "$rust_target"
+    fi
+    binary="$target_dir/$rust_target/$profile/freeremotedesk-macos"
+else
+    if [[ "$profile" == release ]]; then
+        cargo build -p freeremotedesk-macos --release
+    else
+        cargo build -p freeremotedesk-macos
+    fi
+    binary="$target_dir/$profile/freeremotedesk-macos"
+fi
 app="$repo_root/target/macos/$profile/FreeRemoteDesk.app"
 # 清理固定生成目录，避免旧版编解码器或说明残留影响签名。
 rm -rf "$app"
@@ -21,9 +44,9 @@ swift "$repo_root/tools/create-macos-icon.swift" "$repo_root/assets/app-icon/app
 iconutil -c icns "$icon_work/FreeRemoteDesk.iconset" -o "$app/Contents/Resources/FreeRemoteDesk.icns"
 cp "$repo_root/assets/app-icon/README.md" "$app/Contents/Resources/Icon-Provenance.md"
 # 同架构的固定版本 FFmpeg bundle 可由 build-ffmpeg-macos.sh 生成。
-codec_bundle="$repo_root/target/ffmpeg-macos/bundle"
+codec_build_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-macos}"
+codec_bundle="$codec_build_root/bundle"
 if [[ -d "$codec_bundle" ]]; then
-    case "$(uname -m)" in arm64) codec_arch=aarch64 ;; x86_64) codec_arch=x86_64 ;; *) exit 1 ;; esac
     expected_bundle_files=(
         "FFmpeg-LGPL-2.1-or-later.txt"
         "FFmpeg-NOTICE.txt"
@@ -56,5 +79,5 @@ if [[ -d "$codec_bundle" ]]; then
 fi
 # 仅本机 ad-hoc 签名；不声称 Developer ID 签名、公证或通用二进制。
 codesign --force --sign - "$app"
-"$repo_root/tools/verify-macos-package.sh" "$app"
+FRD_MACOS_ARCH="$requested_arch" "$repo_root/tools/verify-macos-package.sh" "$app"
 printf '%s\n' "$app"

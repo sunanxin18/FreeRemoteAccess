@@ -48,9 +48,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - macos-15
+        include:
+          - os: ubuntu-24.04
+            mac_arch: ""
+          - os: macos-15
+            mac_arch: arm64
+          - os: macos-15-intel
+            mac_arch: x86_64
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -106,5 +110,11 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          cargo build --locked --release -p freeremotedesk-macos
+          if [[ "${{ matrix.mac_arch }}" == x86_64 ]] && ! command -v nasm >/dev/null; then
+            brew install nasm
+          fi
+          bash tools/build-ffmpeg-macos.sh
           bash tools/stage-macos-package.sh release
+        env:
+          FRD_MACOS_ARCH: ${{ matrix.mac_arch }}
+          FRD_FFMPEG_BUILD_ROOT: ${{ github.workspace }}/target/ffmpeg-macos-${{ matrix.mac_arch }}

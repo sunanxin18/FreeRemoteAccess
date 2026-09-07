@@ -142,7 +142,7 @@ mod native {
     }
 
     #[repr(C)]
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Copy)]
     struct NativeFrameView {
         format: i32,
         width: i32,
@@ -150,6 +150,19 @@ mod native {
         timestamp_ticks: i64,
         data: [*const u8; 3],
         linesize: [i32; 3],
+    }
+
+    impl Default for NativeFrameView {
+        fn default() -> Self {
+            Self {
+                format: 0,
+                width: 0,
+                height: 0,
+                timestamp_ticks: 0,
+                data: [std::ptr::null(); 3],
+                linesize: [0; 3],
+            }
+        }
     }
 
     unsafe extern "C" {

@@ -11,7 +11,8 @@ open target/macos/debug/FreeRemoteDesk.app
 ```
 
 需要 macOS、Xcode Command Line Tools 和支持项目依赖的 Rust 工具链。
-产物是当前构建机架构的 `.app`，最低系统版本为 macOS 12.0；并非 universal binary。
+产物默认是当前构建机架构的 `.app`，最低系统版本为 macOS 12.0；并非 universal binary。
+可通过 `FRD_MACOS_ARCH=arm64` 或 `FRD_MACOS_ARCH=x86_64` 显式选择目标架构；跨架构构建还需要对应的 Rust target、Apple SDK 和 Clang 交叉编译能力。
 图标从 `assets/app-icon/apple` 的共同产品图层生成，无预制圆角遮罩。
 脚本执行本机 ad-hoc 签名，不执行 Developer ID 签名或 Apple 公证。
 
@@ -25,7 +26,7 @@ open target/macos/debug/FreeRemoteDesk.app
 `verify-macos-package.sh` 检查结构、签名、依赖和帮助输出，不替代 GUI、键鼠和实机验收。
 密码由 macOS Keychain 保存；连接元数据与证书指纹使用当前用户 Application Support 目录。
 
-可选 FFmpeg bundle 由 `tools/build-ffmpeg-macos.sh` 构建，打包脚本将三库置于
+可选 FFmpeg bundle 由 `tools/build-ffmpeg-macos.sh` 构建，脚本支持 `x86_64` 的 NASM/x86asm 与 `arm64` 的 AArch64/NEON 路径；打包脚本将三库置于
 `Contents/MacOS/codecs/ffmpeg-8-1-2/<architecture>`，许可证与来源说明放入
 `Contents/Resources/codecs/ffmpeg-8-1-2`。macOS 代码签名把代码目录中的带点
 目录名解释为 bundle，因此固定版本目录使用连字符；Windows 布局不变。
