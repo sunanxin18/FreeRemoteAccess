@@ -888,6 +888,42 @@ mod native {
         }
 
         #[test]
+        fn hevc_requires_vps_sps_and_pps_before_decoder_creation() {
+            let bytes = [0x01u8, 0x02u8];
+            let mut config = FrdVideoConfig {
+                codec: FRD_CODEC_HEVC,
+                profile: FRD_PROFILE_HEVC_MAIN_444_8,
+                chroma: FRD_CHROMA_YUV_444,
+                bit_depth: 8,
+                coded_width: 16,
+                coded_height: 16,
+                timebase: 90_000,
+                bitstream_format: FRD_BITSTREAM_ANNEX_B,
+                vps: FrdByteSlice {
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+                sps: FrdByteSlice {
+                    data: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+                pps: FrdByteSlice {
+                    data: ptr::null(),
+                    len: 0,
+                },
+            };
+
+            assert_eq!(validate_config(&config), Ok(()));
+            assert_eq!(annex_b_extradata(&config), Err(FrdStatus::INVALID_ARGUMENT));
+
+            config.pps = FrdByteSlice {
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+            };
+            assert!(annex_b_extradata(&config).is_ok());
+        }
+
+        #[test]
         fn queued_output_is_bounded_by_count_and_aggregate_bytes() {
             assert_eq!(
                 checked_queue_total(MAX_QUEUED_FRAMES, 0, 1),
