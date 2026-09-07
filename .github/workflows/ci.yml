@@ -50,11 +50,8 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            mac_arch: ""
           - os: macos-15
-            mac_arch: arm64
           - os: macos-15-intel
-            mac_arch: x86_64
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -79,8 +76,9 @@ jobs:
           cargo --version --verbose
           test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
 
-      # macOS and Linux are compile/test gates only. They do not create packages
-      # or prove GUI, GPU, audio-device, or live-protocol interoperability.
+      # macOS and Linux are compile/test gates here. The dedicated macOS package
+      # workflow owns FFmpeg staging, package verification and artifacts; neither
+      # workflow proves GUI, GPU, audio-device, or live-protocol interoperability.
       - name: Compile the GUI and core workspace
         shell: bash
         run: cargo check --locked --workspace --all-targets
@@ -105,17 +103,3 @@ jobs:
       - name: Test macOS platform and application
         if: runner.os == 'macOS'
         run: cargo test --locked -p frd-platform-macos -p freeremotedesk-macos
-
-      - name: Build and verify macOS application bundle
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          if [[ "${{ matrix.mac_arch }}" == x86_64 ]] && ! command -v nasm >/dev/null; then
-            brew install nasm
-          fi
-          bash tools/build-ffmpeg-macos.sh
-          bash tools/stage-macos-package.sh release
-        env:
-          FRD_MACOS_ARCH: ${{ matrix.mac_arch }}
-          FRD_FFMPEG_BUILD_ROOT: ${{ github.workspace }}/target/ffmpeg-macos-${{ matrix.mac_arch }}
-          FRD_FFMPEG_RUN_NATIVE_TESTS: "1"
