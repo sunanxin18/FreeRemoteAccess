@@ -23,6 +23,7 @@ typedef struct FrdNativeDecoder {
     AVFrame *frame;
     int32_t requested_thread_count;
     int32_t requested_thread_type;
+    enum AVPixelFormat output_format;
 } FrdNativeDecoder;
 
 typedef struct FrdNativeFrameView {
@@ -62,18 +63,29 @@ int32_t frd_native_hevc_decoder_available(void) {
     return avcodec_find_decoder(AV_CODEC_ID_HEVC) != NULL;
 }
 
+int32_t frd_native_h264_decoder_available(void) {
+    return avcodec_find_decoder(AV_CODEC_ID_H264) != NULL;
+}
+
 int32_t frd_native_yuv444p_format(void) {
     return AV_PIX_FMT_YUV444P;
 }
 
-int32_t frd_native_decoder_create_with_thread_policy(const uint8_t *extradata,
-                                                     size_t extradata_len,
-                                                     int32_t width,
-                                                     int32_t height,
-                                                     uint32_t timebase,
-                                                     int32_t thread_count,
-                                                     int32_t thread_type,
-                                                     FrdNativeDecoder **output) {
+int32_t frd_native_yuv420p_format(void) {
+    return AV_PIX_FMT_YUV420P;
+}
+
+static int32_t frd_native_decoder_create_with_codec_thread_policy(
+    enum AVCodecID codec_id,
+    enum AVPixelFormat output_format,
+    const uint8_t *extradata,
+    size_t extradata_len,
+    int32_t width,
+    int32_t height,
+    uint32_t timebase,
+    int32_t thread_count,
+    int32_t thread_type,
+    FrdNativeDecoder **output) {
     const AVCodec *decoder;
     FrdNativeDecoder *state;
     int result;
@@ -89,7 +101,7 @@ int32_t frd_native_decoder_create_with_thread_policy(const uint8_t *extradata,
         return FRD_NATIVE_INVALID_ARGUMENT;
     }
 
-    decoder = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    decoder = avcodec_find_decoder(codec_id);
     if (decoder == NULL) {
         return FRD_NATIVE_UNSUPPORTED;
     }
@@ -107,7 +119,7 @@ int32_t frd_native_decoder_create_with_thread_policy(const uint8_t *extradata,
     }
 
     state->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    state->codec->codec_id = AV_CODEC_ID_HEVC;
+    state->codec->codec_id = codec_id;
     state->codec->width = width;
     state->codec->height = height;
     state->codec->pkt_timebase.num = 1;
@@ -116,6 +128,7 @@ int32_t frd_native_decoder_create_with_thread_policy(const uint8_t *extradata,
     state->codec->thread_type = thread_type;
     state->requested_thread_count = thread_count;
     state->requested_thread_type = thread_type;
+    state->output_format = output_format;
     state->codec->extradata = (uint8_t *)av_mallocz(extradata_len + AV_INPUT_BUFFER_PADDING_SIZE);
     if (state->codec->extradata == NULL) {
         av_frame_free(&state->frame);
@@ -136,6 +149,69 @@ int32_t frd_native_decoder_create_with_thread_policy(const uint8_t *extradata,
     }
     *output = state;
     return FRD_NATIVE_OK;
+}
+
+int32_t frd_native_decoder_create_with_thread_policy(const uint8_t *extradata,
+                                                     size_t extradata_len,
+                                                     int32_t width,
+                                                     int32_t height,
+                                                     uint32_t timebase,
+                                                     int32_t thread_count,
+                                                     int32_t thread_type,
+                                                     FrdNativeDecoder **output) {
+    return frd_native_decoder_create_with_codec_thread_policy(
+        AV_CODEC_ID_HEVC,
+        AV_PIX_FMT_YUV444P,
+        extradata,
+        extradata_len,
+        width,
+        height,
+        timebase,
+        thread_count,
+        thread_type,
+        output);
+}
+
+int32_t frd_native_decoder_create_h264_with_thread_policy(const uint8_t *extradata,
+                                                          size_t extradata_len,
+                                                          int32_t width,
+                                                          int32_t height,
+                                                          uint32_t timebase,
+                                                          int32_t thread_count,
+                                                          int32_t thread_type,
+                                                          FrdNativeDecoder **output) {
+    return frd_native_decoder_create_with_codec_thread_policy(
+        AV_CODEC_ID_H264,
+        AV_PIX_FMT_YUV420P,
+        extradata,
+        extradata_len,
+        width,
+        height,
+        timebase,
+        thread_count,
+        thread_type,
+        output);
+}
+
+int32_t frd_native_decoder_create_h264_444_with_thread_policy(const uint8_t *extradata,
+                                                              size_t extradata_len,
+                                                              int32_t width,
+                                                              int32_t height,
+                                                              uint32_t timebase,
+                                                              int32_t thread_count,
+                                                              int32_t thread_type,
+                                                              FrdNativeDecoder **output) {
+    return frd_native_decoder_create_with_codec_thread_policy(
+        AV_CODEC_ID_H264,
+        AV_PIX_FMT_YUV444P,
+        extradata,
+        extradata_len,
+        width,
+        height,
+        timebase,
+        thread_count,
+        thread_type,
+        output);
 }
 
 int32_t frd_native_decoder_thread_settings(const FrdNativeDecoder *state,

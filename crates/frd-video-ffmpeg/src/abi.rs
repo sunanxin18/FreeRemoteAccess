@@ -12,11 +12,27 @@ pub const FRD_FFMPEG_AVCODEC_MAJOR: u32 = 62;
 pub const FRD_FFMPEG_API_SYMBOL: &[u8] = b"frd_ffmpeg_get_api_v1\0";
 
 pub const FRD_CODEC_HEVC: u32 = 1;
+pub const FRD_CODEC_H264: u32 = 2;
 pub const FRD_PROFILE_HEVC_MAIN_444_8: u32 = 1;
+pub const FRD_PROFILE_H264_AVC420: u32 = 2;
+pub const FRD_PROFILE_H264_AVC444: u32 = 3;
 pub const FRD_CHROMA_YUV_444: u32 = 1;
+pub const FRD_CHROMA_YUV_420: u32 = 2;
 pub const FRD_BITSTREAM_ANNEX_B: u32 = 1;
+pub const FRD_BITSTREAM_AVC_LENGTH_PREFIXED: u32 = 2;
 pub const FRD_PIXEL_FORMAT_YUV_444_P8: u32 = 1;
+pub const FRD_PIXEL_FORMAT_YUV_420_P8: u32 = 2;
 pub const FRD_SUBMIT_RANDOM_ACCESS: u32 = 1;
+
+/// Plugin capability bits. A zero capability mask is rejected so a pre-AVC plugin cannot
+/// silently be treated as an H.264 backend.
+pub const FRD_CODEC_CAP_HEVC_MAIN_444_8: u32 = 1 << 0;
+pub const FRD_CODEC_CAP_H264_AVC420: u32 = 1 << 1;
+/// H.264 4:4:4 software decode. The RDP wire selector still requires a separate
+/// AVC444 interoperability gate before it may advertise this capability.
+pub const FRD_CODEC_CAP_H264_AVC444: u32 = 1 << 2;
+pub const FRD_CODEC_CAP_ALL_KNOWN: u32 =
+    FRD_CODEC_CAP_HEVC_MAIN_444_8 | FRD_CODEC_CAP_H264_AVC420 | FRD_CODEC_CAP_H264_AVC444;
 
 /// Decoder handle may migrate between threads while remaining exclusively owned and serialized.
 pub const FRD_CONTRACT_HANDLE_MIGRATION_SAFE: u32 = 1 << 0;
@@ -110,8 +126,8 @@ pub struct FrdDecodedFrame {
 }
 
 /// Plugin-populated ABI table. Callback addresses remain integers until every header, contract
-/// flag and required slot has been validated, so zero or arbitrary C output is always valid Rust
-/// data and cannot trigger invalid-function-pointer UB merely by being read.
+/// flag, codec capability and required slot has been validated, so zero or arbitrary C output is
+/// always valid Rust data and cannot trigger invalid-function-pointer UB merely by being read.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RawFrdFfmpegApiV1 {
@@ -120,7 +136,9 @@ pub struct RawFrdFfmpegApiV1 {
     pub abi_version: u32,
     pub avcodec_major: u32,
     pub contract_flags: u32,
-    pub reserved: u32,
+    /// Exact codec/profile slots implemented by this plugin. This occupies the former reserved
+    /// word; a zero value is rejected so an older plugin cannot be used as an AVC backend.
+    pub codec_capabilities: u32,
     pub create_decoder: usize,
     pub submit: usize,
     pub receive: usize,

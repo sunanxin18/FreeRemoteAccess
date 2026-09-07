@@ -1,5 +1,6 @@
 mod application;
 mod cleanup;
+mod display_geometry;
 mod fatal;
 mod floating_chrome;
 mod frame_metrics;
@@ -21,6 +22,10 @@ pub use application::{
     SessionHostError, TestTextureOptions, WakeSink,
 };
 pub use cleanup::{BackgroundCleanupFailure, BackgroundCleanupOutcome};
+pub use display_geometry::{
+    from_window as display_geometry_from_window, logical_extent_from_physical,
+    scale_factor_to_milli,
+};
 pub use fatal::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 pub use floating_chrome::{
     ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeLayouts, ChromeOverlayLayout,

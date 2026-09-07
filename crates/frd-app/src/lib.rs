@@ -1,8 +1,9 @@
 mod controller;
 
 pub use controller::{
-    ActiveSessionError, ActiveSessionSlot, AppAction, AppController, AppControllerError, AppLaunch,
-    AppPlatformStores, DisconnectTransition, IdentityDecisionError, ProductPolicy,
+    persist_profile_job, ActiveSessionError, ActiveSessionSlot, AppAction, AppController,
+    AppControllerError, AppLaunch, AppPlatformStores, DisconnectTransition, IdentityDecisionError,
+    ProductPolicy, ProfilePersistenceJob,
 };
 use frd_core::SessionId;
 use frd_platform_api::ConnectionProfileKey;
@@ -37,7 +38,7 @@ mod tests {
 
     use frd_core::{
         CredentialProviderId, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelSize,
-        SecretBuffer, SessionId, TargetSystem,
+        ResolutionMode, SecretBuffer, SessionId, TargetSystem,
     };
     use frd_frame::FrameCompleteness;
     use frd_platform_api::{
@@ -444,6 +445,33 @@ mod tests {
     }
 
     #[test]
+    fn connect_carries_fixed_resolution_intent_without_touching_credentials() {
+        let catalog = apple_catalog();
+        let store = RecordingStore::default();
+        let mut form = complete_form();
+        form.draft.resolution_mode = ResolutionMode::Fixed(PixelSize::new(3840, 2160).unwrap());
+        let mut controller = AppController::connection_form(form);
+        let submission = controller
+            .connection_form_mut()
+            .expect("connection form is editable")
+            .take_submission(&catalog)
+            .expect("complete form submits");
+
+        let AppAction::StartSession(request, _permit) = controller
+            .handle_intent(submission, &catalog, &store)
+            .expect("connect intent is accepted")
+            .expect("connect starts one worker")
+        else {
+            panic!("connect starts through the session request path");
+        };
+
+        assert_eq!(
+            request.display_intent.mode,
+            ResolutionMode::Fixed(PixelSize::new(3840, 2160).unwrap())
+        );
+    }
+
+    #[test]
     fn effective_capabilities_are_the_protocol_platform_and_policy_intersection() {
         let session_id = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
@@ -670,6 +698,7 @@ mod tests {
                 port: Some(5900),
                 protocol: ProtocolChoice::Automatic,
                 username: String::new(),
+                resolution_mode: ResolutionMode::NativeDisplay,
             },
             resolved_protocol: ProtocolId::apple_high_performance(),
             password: SecretBuffer::new(b"retained-password".to_vec()),
@@ -709,6 +738,7 @@ mod tests {
                 port: Some(5900),
                 protocol: ProtocolChoice::Automatic,
                 username: "test-user".to_owned(),
+                resolution_mode: ResolutionMode::NativeDisplay,
             },
             resolved_protocol: ProtocolId::apple_high_performance(),
             password: SecretBuffer::new(Vec::new()),
@@ -739,6 +769,7 @@ mod tests {
                 port: Some(5900),
                 protocol: ProtocolChoice::Explicit(ProtocolId::rdp()),
                 username: "test-user".to_owned(),
+                resolution_mode: ResolutionMode::NativeDisplay,
             },
             resolved_protocol: ProtocolId::apple_hpss_mvs(),
             password: SecretBuffer::new(b"test-password".to_vec()),
@@ -775,6 +806,7 @@ mod tests {
                 port: Some(5900),
                 protocol: ProtocolChoice::Automatic,
                 username: "test-user".to_owned(),
+                resolution_mode: ResolutionMode::NativeDisplay,
             },
             resolved_protocol: ProtocolId::new("unregistered-test").expect("valid protocol id"),
             password: SecretBuffer::new(b"test-password".to_vec()),
@@ -1203,6 +1235,7 @@ mod tests {
             port: Some(5900),
             protocol: ProtocolChoice::Automatic,
             username: "test-user".to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
         form
@@ -2859,6 +2892,252 @@ mod tests {
         assert!(store.stores.lock().expect("store lock").is_empty());
     }
 
+    fn rdp_tofu_controller(store: &dyn ServerIdentityStore) -> (AppController, SessionId) {
+        let mut controller =
+            AppController::connection_form(ConnectionForm::new(ConnectionDraft::default()));
+        let submission = frd_ui_model::ConnectionSubmission {
+            draft: ConnectionDraft {
+                target_system: Some(TargetSystem::Windows),
+                address: "rdp.invalid".to_owned(),
+                port: Some(3389),
+                protocol: ProtocolChoice::Explicit(ProtocolId::rdp()),
+                username: "test-user".to_owned(),
+                resolution_mode: ResolutionMode::NativeDisplay,
+            },
+            resolved_protocol: ProtocolId::rdp(),
+            password: SecretBuffer::new(b"test-password".to_vec()),
+            remember_on_this_device: false,
+            selected_profile: None,
+        };
+        let AppAction::StartSession(request, _permit) = controller
+            .handle_intent(
+                submission,
+                &ProtocolCatalog::new([ProtocolId::rdp()]),
+                store,
+            )
+            .expect("start")
+            .expect("action")
+        else {
+            panic!("start action")
+        };
+        (controller, request.session_id)
+    }
+
+    fn rdp_tofu_challenge(
+        session_id: SessionId,
+        saved: Option<[u8; 32]>,
+    ) -> ServerIdentityChallenge {
+        let mut value = challenge_with_validation(
+            session_id,
+            7,
+            [0x22; 32],
+            evaluate_server_identity(saved, [0x22; 32]),
+        );
+        value.protocol_id = ProtocolId::rdp();
+        value.endpoint = Endpoint::new("rdp.invalid", 3389).unwrap();
+        value
+    }
+
+    #[test]
+    fn rdp_tofu_first_connection_saves_before_authorizing_and_displays_certificate() {
+        let fixture = RememberFixture::new(&[]);
+        let (mut controller, id) = rdp_tofu_controller(&fixture.identities);
+        let event = rdp_tofu_challenge(id, None);
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(event.clone()),
+            fixture.stores(),
+        );
+        assert_eq!(fixture.identities.stores.lock().unwrap().len(), 1);
+        assert!(matches!(
+            controller.take_pending_server_identity_command(),
+            Some(SessionCommand::ResolveServerIdentity {
+                decision: ServerIdentityDecision::TrustAndRemember,
+                ..
+            })
+        ));
+        assert!(controller.current_server_identity_challenge().is_none());
+        let diagnostics = controller.session_chrome().unwrap().diagnostics.unwrap();
+        assert!(diagnostics.contains("SHA-256") && diagnostics.contains("local test"));
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(event),
+            fixture.stores(),
+        );
+        assert!(controller.take_pending_server_identity_command().is_none());
+        assert_eq!(fixture.identities.stores.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rdp_tofu_changed_certificate_rejects_and_retains_old_pin() {
+        let mut fixture = RememberFixture::new(&[]);
+        fixture.identities = RecordingStore::with_saved_pin([0x11; 32]);
+        let (mut controller, id) = rdp_tofu_controller(&fixture.identities);
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(rdp_tofu_challenge(id, Some([0x11; 32]))),
+            fixture.stores(),
+        );
+        assert!(matches!(
+            controller.take_pending_server_identity_command(),
+            Some(SessionCommand::ResolveServerIdentity {
+                decision: ServerIdentityDecision::Reject,
+                ..
+            })
+        ));
+        assert!(fixture.identities.stores.lock().unwrap().is_empty());
+        assert!(controller
+            .session_chrome()
+            .unwrap()
+            .diagnostics
+            .unwrap()
+            .contains("证书指纹已变化"));
+    }
+
+    #[test]
+    fn rdp_tofu_matching_pin_continues_without_rewriting_store() {
+        let mut fixture = RememberFixture::new(&[]);
+        fixture.identities = RecordingStore::with_saved_pin([0x22; 32]);
+        let (mut controller, id) = rdp_tofu_controller(&fixture.identities);
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(rdp_tofu_challenge(id, Some([0x22; 32]))),
+            fixture.stores(),
+        );
+        assert!(matches!(
+            controller.take_pending_server_identity_command(),
+            Some(SessionCommand::ResolveServerIdentity {
+                decision: ServerIdentityDecision::TrustOnce,
+                ..
+            })
+        ));
+        assert!(fixture.identities.stores.lock().unwrap().is_empty());
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::StageChanged(ConnectionStage::TransportReady),
+            fixture.stores(),
+        );
+        assert!(controller
+            .session_chrome()
+            .unwrap()
+            .diagnostics
+            .unwrap()
+            .contains("SHA-256"));
+    }
+
+    #[test]
+    fn rdp_tofu_ignores_foreign_and_wrong_endpoint_challenges_and_cancel_clears_authorization() {
+        let fixture = RememberFixture::new(&[]);
+        let (mut controller, id) = rdp_tofu_controller(&fixture.identities);
+        let mut wrong = rdp_tofu_challenge(id, None);
+        wrong.endpoint = Endpoint::new("other.invalid", 3389).unwrap();
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(wrong),
+            fixture.stores(),
+        );
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(rdp_tofu_challenge(SessionId::allocate(), None)),
+            fixture.stores(),
+        );
+        assert!(controller.take_pending_server_identity_command().is_none());
+        assert!(fixture.identities.stores.lock().unwrap().is_empty());
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(challenge(id, 7, [0x11; 32])),
+            fixture.stores(),
+        );
+        assert!(controller.current_server_identity_challenge().is_none());
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(rdp_tofu_challenge(id, None)),
+            fixture.stores(),
+        );
+        controller
+            .handle_intent(
+                AppIntent::CancelConnect,
+                &ProtocolCatalog::new([ProtocolId::rdp()]),
+                &fixture.identities,
+            )
+            .unwrap();
+        assert!(controller.take_pending_server_identity_command().is_none());
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(rdp_tofu_challenge(id, None)),
+            fixture.stores(),
+        );
+        assert!(controller.take_pending_server_identity_command().is_none());
+        assert_eq!(fixture.identities.stores.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rdp_tofu_save_failure_rejects_without_credential_authorization() {
+        struct FailingIdentityStore;
+        impl ServerIdentityStore for FailingIdentityStore {
+            fn load_pin(
+                &self,
+                _: &ProtocolId,
+                _: &Endpoint,
+            ) -> Result<Option<[u8; 32]>, PlatformError> {
+                Ok(None)
+            }
+            fn store_pin(
+                &self,
+                _: &ProtocolId,
+                _: &Endpoint,
+                _: [u8; 32],
+            ) -> Result<(), PlatformError> {
+                Err(PlatformError::StorageFailed)
+            }
+        }
+        let fixture = RememberFixture::new(&[]);
+        let failing = FailingIdentityStore;
+        let stores = AppPlatformStores {
+            server_identities: &failing,
+            ..fixture.stores()
+        };
+        let (mut controller, id) = rdp_tofu_controller(&failing);
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::ServerIdentityChallenge(rdp_tofu_challenge(id, None)),
+            stores,
+        );
+        assert!(matches!(
+            controller.take_pending_server_identity_command(),
+            Some(SessionCommand::ResolveServerIdentity {
+                decision: ServerIdentityDecision::Reject,
+                ..
+            })
+        ));
+        assert!(controller
+            .session_chrome()
+            .unwrap()
+            .diagnostics
+            .unwrap()
+            .contains("无法读取或保存服务器证书记录"));
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::Error(ProtocolError::Terminal),
+            stores,
+        );
+        assert!(controller
+            .session_chrome()
+            .unwrap()
+            .diagnostics
+            .unwrap()
+            .contains("无法读取或保存服务器证书记录"));
+        controller.handle_session_event_with_stores(
+            id,
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed),
+            stores,
+        );
+        let diagnostics = controller.session_chrome().unwrap().diagnostics.unwrap();
+        assert!(
+            diagnostics.contains("无法读取或保存服务器证书记录") && diagnostics.contains("SHA-256")
+        );
+    }
+
     fn challenge(
         session_id: SessionId,
         challenge_id: u64,
@@ -2879,6 +3158,7 @@ mod tests {
             protocol_id: ProtocolId::apple_hpss_mvs(),
             credentials: None,
             saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
         }
     }
 

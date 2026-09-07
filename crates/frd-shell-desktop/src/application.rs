@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use frd_app::{AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
+use frd_app::{persist_profile_job, AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
 use frd_compositor_wgpu::{
     PresentError, PresentationCompositor, PresentationHooks, PresentationSurface,
     PresentationSurfaceLease,
 };
 use frd_core::{
-    ButtonState, ContentViewport, KeyState, Modifiers, PhysicalViewport, PixelRect, PixelSize,
-    PointerButton, ProtocolId, SessionId, TargetSystem,
+    ButtonState, ContentViewport, DisplayIntent, KeyState, Modifiers, PhysicalViewport, PixelRect,
+    PixelSize, PointerButton, ProtocolId, ResolutionMode, SessionId, TargetSystem,
 };
 use frd_frame::{
     EnqueuedSurfaceUpdate, FrameCompleteness, FrameMailbox, FrameReset, FrameRevision,
@@ -72,9 +72,9 @@ use crate::video_decode_worker::{
 use crate::video_rate_fallback::VideoRateFallbackController;
 use crate::{
     ChromeGeometrySnapshot, ChromeHitMap, ChromeHitTarget, ChromeLayouts, ChromeRect,
-    ControlIslandPlacement, FloatingChromeController, InputGate, InputOwnership, InputRouter,
-    LogicalWindowExtent, WindowChromeAdapter, WindowChromeCommand, WindowChromeError,
-    WindowPresentationController, WindowPresentationMode, WindowPresentationTransition,
+    FloatingChromeController, InputGate, InputOwnership, InputRouter, LogicalWindowExtent,
+    WindowChromeAdapter, WindowChromeCommand, WindowChromeError, WindowPresentationController,
+    WindowPresentationMode, WindowPresentationTransition,
 };
 
 const FRAME_MAILBOX_ENTRY_LIMIT: usize = 256;
@@ -1618,6 +1618,14 @@ fn drain_audio_media(
 pub enum DesktopUserEvent {
     Wake,
     Repaint,
+    SavedProfileLoaded {
+        key: frd_platform_api::ConnectionProfileKey,
+        result: Result<Option<frd_core::SecretBuffer>, frd_platform_api::PlatformError>,
+    },
+    ProfilePersistenceFinished {
+        session_id: SessionId,
+        warning: Option<frd_ui_model::ProfilePersistenceWarning>,
+    },
     LaunchFinished(BackgroundLaunchOutcome),
     CleanupFinished(BackgroundCleanupOutcome),
     PresentationFatal(PresentationFailure),
@@ -2304,15 +2312,21 @@ impl DesktopWindowState {
             insets,
         )?
         .with_window_capabilities(self.chrome.capabilities());
-        let placement = ControlIslandPlacement {
+        #[cfg(not(target_os = "macos"))]
+        let placement = crate::ControlIslandPlacement {
             normalized_center_x,
             top_points,
         };
+        #[cfg(target_os = "macos")]
+        let _ = (normalized_center_x, top_points, local_page_move);
+        #[cfg(not(target_os = "macos"))]
         let layouts = if local_page_move {
             snapshot.local_page_layouts(placement)
         } else {
             snapshot.layouts(placement, self.floating_chrome.is_visible())
         }?;
+        #[cfg(target_os = "macos")]
+        let layouts = snapshot.titlebar_layouts()?;
         self.remote_area = Some(layouts.remote.content_rect);
         self.chrome_layouts = Some(layouts.clone());
         Some(layouts)
@@ -2582,6 +2596,7 @@ pub struct DesktopApplication {
     mode: DesktopMode,
     exit_state: ApplicationExitState,
     return_to_form_after_cancelled_launch: bool,
+    pending_saved_profile: Option<frd_platform_api::ConnectionProfileKey>,
     repaint_scheduler: RepaintScheduler,
     armed_repaint: Option<RepaintPlan>,
     window_configuration: DesktopWindowConfiguration,
@@ -2793,6 +2808,7 @@ impl DesktopApplication {
             mode: DesktopMode::Product,
             exit_state,
             return_to_form_after_cancelled_launch: false,
+            pending_saved_profile: None,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
             window_configuration: DesktopWindowConfiguration::default(),
@@ -2843,6 +2859,7 @@ impl DesktopApplication {
             },
             exit_state: ApplicationExitState::default(),
             return_to_form_after_cancelled_launch: false,
+            pending_saved_profile: None,
             repaint_scheduler: RepaintScheduler::default(),
             armed_repaint: None,
             window_configuration: DesktopWindowConfiguration::default(),
@@ -2858,7 +2875,7 @@ impl DesktopApplication {
         let compact = frd_ui_egui::compact_login_metrics();
         let window = Arc::new(
             event_loop
-                .create_window(
+                .create_window(platform_window_attributes(
                     Window::default_attributes()
                         .with_title("FreeRemoteDesk")
                         .with_window_icon(self.window_configuration.icon.clone())
@@ -2872,7 +2889,7 @@ impl DesktopApplication {
                             f64::from(compact.minimum_window_height),
                         ))
                         .with_resizable(true),
-                )
+                ))
                 .map_err(|_| {
                     FatalReport::internal(
                         FatalComponent::Window,
@@ -2897,7 +2914,7 @@ impl DesktopApplication {
                 FatalReason::WindowSizeInvalid,
             )
         })?;
-        let instance = dx12_instance();
+        let instance = desktop_gpu_instance();
         let presentation =
             PresentationSurface::create(&instance, PresentationSurfaceLease::new(window.clone()))
                 .map_err(|_| {
@@ -2963,6 +2980,18 @@ impl DesktopApplication {
         let mut floating_chrome =
             FloatingChromeController::connected_default(std::time::Instant::now());
         floating_chrome.set_animations_enabled(chrome.appearance_policy().animate);
+        let initial_remote_extent = window
+            .current_monitor()
+            .and_then(|monitor| {
+                let size = monitor.size();
+                PixelSize::new(size.width, size.height).and_then(|physical| {
+                    crate::display_geometry::logical_extent_from_physical(
+                        physical,
+                        window.scale_factor(),
+                    )
+                })
+            })
+            .unwrap_or(LogicalWindowExtent::new(1100.0, 720.0));
         let mut state = DesktopWindowState {
             chrome,
             window,
@@ -2996,7 +3025,7 @@ impl DesktopApplication {
                     f64::from(compact.initial_window_width),
                     f64::from(compact.initial_window_height),
                 ),
-                LogicalWindowExtent::new(1100.0, 720.0),
+                initial_remote_extent,
             ),
             pending_presentation_transition: None,
             floating_chrome,
@@ -3041,6 +3070,36 @@ impl DesktopApplication {
     }
 
     fn dispatch_intent(&mut self, intent: AppIntent) {
+        if let AppIntent::SelectSavedProfile(selected_key) = &intent {
+            let key = selected_key.clone();
+            if self.pending_saved_profile.is_some() {
+                return;
+            }
+            self.pending_saved_profile = Some(key.clone());
+            let credentials = self.stores.credentials.clone();
+            let proxy = self.proxy.clone();
+            let worker_key = key.clone();
+            let event_key = key.clone();
+            if std::thread::Builder::new()
+                .name("frd-profile-credential-load".to_owned())
+                .spawn(move || {
+                    let result = credentials.load(&worker_key);
+                    let _ = proxy.send_event(DesktopUserEvent::SavedProfileLoaded {
+                        key: event_key,
+                        result,
+                    });
+                })
+                .is_err()
+            {
+                self.pending_saved_profile = None;
+                self.launch.controller_mut().apply_saved_profile_load(
+                    key,
+                    Err(frd_platform_api::PlatformError::StorageFailed),
+                );
+            }
+            self.request_redraw();
+            return;
+        }
         let cancelling = matches!(intent, AppIntent::CancelConnect | AppIntent::Disconnect);
         let disconnecting = matches!(intent, AppIntent::Disconnect);
         if disconnecting {
@@ -3081,11 +3140,31 @@ impl DesktopApplication {
                     eprintln!("会话命令发送失败：{error:?}");
                 }
             }
-            Some(AppAction::StartSession(request, permit)) => {
+            Some(AppAction::StartSession(mut request, permit)) => {
                 self.forced_reveal_diagnostic = None;
                 self.window_command_diagnostic = None;
                 if let Some(window) = self.window.as_mut() {
                     window.reset_connection_chrome(std::time::Instant::now());
+                }
+                if let Some(window) = self.window.as_ref() {
+                    if let Some(geometry) = crate::display_geometry::from_window(
+                        window.window.as_ref(),
+                        window.remote_area,
+                    ) {
+                        request.display_intent = match request.display_intent.mode {
+                            ResolutionMode::NativeDisplay => {
+                                DisplayIntent::native_display(geometry)
+                            }
+                            ResolutionMode::DisplayWorkArea => {
+                                DisplayIntent::display_work_area(geometry)
+                            }
+                            ResolutionMode::WindowContent => {
+                                DisplayIntent::window_content(geometry)
+                            }
+                            ResolutionMode::Fixed(size) => DisplayIntent::fixed(size),
+                            ResolutionMode::ServerManaged => DisplayIntent::server_managed(),
+                        };
+                    }
                 }
                 let target = self
                     .launch
@@ -3115,6 +3194,38 @@ impl DesktopApplication {
             None => {}
         }
         self.request_redraw();
+    }
+
+    fn start_profile_persistence(&mut self, session_id: SessionId) {
+        let Some(job) = self
+            .launch
+            .controller_mut()
+            .take_pending_profile_job(session_id)
+        else {
+            return;
+        };
+        let profiles = self.stores.profiles.clone();
+        let credentials = self.stores.credentials.clone();
+        let worker_credentials = credentials.clone();
+        let proxy = self.proxy.clone();
+        if std::thread::Builder::new()
+            .name("frd-profile-persistence".to_owned())
+            .spawn(move || {
+                let warning =
+                    persist_profile_job(job, profiles.as_ref(), worker_credentials.as_ref());
+                let _ = proxy.send_event(DesktopUserEvent::ProfilePersistenceFinished {
+                    session_id,
+                    warning,
+                });
+            })
+            .is_err()
+        {
+            let _ = credentials.discard(session_id);
+            self.launch.controller_mut().complete_profile_persistence(
+                session_id,
+                Some(frd_ui_model::ProfilePersistenceWarning::SaveFailed),
+            );
+        }
     }
 
     fn drain_runtime(&mut self) -> Result<RuntimeDrainOutcome, FatalReport> {
@@ -3174,9 +3285,48 @@ impl DesktopApplication {
                     | SessionEvent::Error(_)
                     | SessionEvent::Closed(_)
             );
-            self.launch
+            let defer_profile_persistence = matches!(
+                &event,
+                SessionEvent::StageChanged(frd_protocol_api::ConnectionStage::TransportReady)
+            );
+            if defer_profile_persistence {
+                self.launch
+                    .controller_mut()
+                    .handle_session_event_with_stores_deferred_profile(
+                        session_id,
+                        event,
+                        self.stores.as_app_stores(),
+                    );
+                self.start_profile_persistence(session_id);
+            } else {
+                self.launch
+                    .controller_mut()
+                    .handle_session_event_with_stores(
+                        session_id,
+                        event,
+                        self.stores.as_app_stores(),
+                    );
+            }
+            if let Some(command) = self
+                .launch
                 .controller_mut()
-                .handle_session_event_with_stores(session_id, event, self.stores.as_app_stores());
+                .take_pending_server_identity_command()
+            {
+                if self.sessions.send_command(command).is_err() {
+                    self.launch
+                        .controller_mut()
+                        .handle_session_event_with_stores(
+                            session_id,
+                            SessionEvent::Error(frd_protocol_api::ProtocolError::adapter(
+                                frd_protocol_api::ProtocolId::rdp(),
+                                "rdp_identity_command_failed",
+                            )),
+                            self.stores.as_app_stores(),
+                        );
+                    detach_remote = true;
+                    cleanup_needed = true;
+                }
+            }
         }
 
         let video_admissions = self.sessions.drain_video_admissions();
@@ -3570,7 +3720,9 @@ impl DesktopApplication {
             window
                 .floating_chrome
                 .set_animations_enabled(window.chrome.appearance_policy().animate);
-        } else if !auto_hide_enabled && forced_reveal_diagnostic.is_none() {
+        } else if (cfg!(target_os = "macos") || !auto_hide_enabled)
+            && forced_reveal_diagnostic.is_none()
+        {
             window.floating_chrome.force_reveal_after_release(now);
         }
         let local_page_move = match &self.mode {
@@ -3740,6 +3892,11 @@ impl DesktopApplication {
             let delta = island_reposition_delta - window.island_reposition_drag_delta;
             window.island_reposition_drag_delta = island_reposition_delta;
             if delta != egui::Vec2::ZERO {
+                #[cfg(target_os = "macos")]
+                {
+                    window_command = Some(WindowChromeCommand::BeginMove);
+                }
+                #[cfg(not(target_os = "macos"))]
                 if let Some(bounds) = island_reposition_bounds(
                     &chrome_layouts,
                     window.physical_size,
@@ -4732,6 +4889,24 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 self.maybe_finish_exit(event_loop);
             }
             DesktopUserEvent::Repaint => self.synchronize_repaint_deadline(),
+            DesktopUserEvent::SavedProfileLoaded { key, result } => {
+                if self.pending_saved_profile.as_ref() == Some(&key) {
+                    self.pending_saved_profile = None;
+                    self.launch
+                        .controller_mut()
+                        .apply_saved_profile_load(key, result);
+                    self.request_redraw();
+                }
+            }
+            DesktopUserEvent::ProfilePersistenceFinished {
+                session_id,
+                warning,
+            } => {
+                self.launch
+                    .controller_mut()
+                    .complete_profile_persistence(session_id, warning);
+                self.request_redraw();
+            }
             DesktopUserEvent::LaunchFinished(outcome) => {
                 self.handle_launch_finished(event_loop, outcome)
             }
@@ -5178,9 +5353,39 @@ fn spawn_test_texture_driver(
         });
 }
 
-fn dx12_instance() -> wgpu::Instance {
+fn platform_window_attributes(
+    attributes: winit::window::WindowAttributes,
+) -> winit::window::WindowAttributes {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        attributes
+            .with_fullsize_content_view(true)
+            .with_titlebar_transparent(true)
+            .with_title_hidden(true)
+            .with_movable_by_window_background(false)
+            .with_accepts_first_mouse(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        attributes
+    }
+}
+
+fn desktop_gpu_backends() -> wgpu::Backends {
+    #[cfg(target_os = "macos")]
+    {
+        wgpu::Backends::METAL
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        wgpu::Backends::DX12
+    }
+}
+
+fn desktop_gpu_instance() -> wgpu::Instance {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = wgpu::Backends::DX12;
+    descriptor.backends = desktop_gpu_backends();
     wgpu::Instance::new(descriptor)
 }
 
@@ -5203,7 +5408,7 @@ impl PresentationRecoveryBackend for DesktopWindowRecovery<'_> {
         let recovered = pollster::block_on(
             self.window
                 .compositor
-                .recover_gpu_with_new_instance(&mut self.window.renderer, dx12_instance()),
+                .recover_gpu_with_new_instance(&mut self.window.renderer, desktop_gpu_instance()),
         )?;
         self.window
             .video_renderer
@@ -5328,16 +5533,38 @@ fn chrome_hit_map_from_rendered_controls(
             logical_rect_to_physical(rect, scale_factor).map(|rect| (rect, action))
         })
         .collect::<Option<Vec<_>>>()?;
-    ChromeHitMap::candidate(
-        layouts.remote.content_rect,
+    #[cfg(not(target_os = "macos"))]
+    let hit_bounds = layouts.remote.content_rect;
+    #[cfg(target_os = "macos")]
+    let hit_bounds = PixelRect {
+        x: 0,
+        y: 0,
+        width: layouts.remote.content_rect.width,
+        height: layouts
+            .remote
+            .content_rect
+            .y
+            .checked_add(layouts.remote.content_rect.height)?,
+    };
+    let hit_map = ChromeHitMap::candidate(
+        hit_bounds,
         actions,
         layouts.overlay.island_reposition_handle,
         layouts.overlay.window_move_region,
         Vec::new(),
     )?
-    .with_island_surface(layouts.overlay.island_rect)
+    .with_island_surface(layouts.overlay.island_rect)?;
+    #[cfg(target_os = "macos")]
+    {
+        hit_map.restrict_remote_content(layouts.remote.content_rect)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(hit_map)
+    }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn island_reposition_bounds(
     layouts: &ChromeLayouts,
     physical_size: PixelSize,
@@ -5458,7 +5685,7 @@ fn effective_pointer_keyboard_ownership(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn local_chrome_shortcut(
     code: winit::keyboard::KeyCode,
     state: ElementState,
@@ -5474,7 +5701,7 @@ fn local_chrome_shortcut(
         && !modifiers.meta
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn local_chrome_shortcut(
     _code: winit::keyboard::KeyCode,
     _state: ElementState,
@@ -5684,7 +5911,7 @@ mod tests {
     };
     use frd_core::{
         ContentViewport, Endpoint, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelRect,
-        PixelSize, ProtocolId, SecretBuffer, SessionId, TargetSystem,
+        PixelSize, ProtocolId, ResolutionMode, SecretBuffer, SessionId, TargetSystem,
     };
     use frd_frame::{
         EnqueuedSurfaceUpdate, FrameCompleteness, FrameReset, FrameRevision, FrameTransaction,
@@ -5726,6 +5953,12 @@ mod tests {
         VideoSurfaceDrainTarget, WakeSink, WorkerKind, WorkerSpawner,
     };
     use crate::frame_metrics_sink::MetricSinkError;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_gpu_instance_uses_metal() {
+        assert_eq!(super::desktop_gpu_backends(), wgpu::Backends::METAL);
+    }
 
     #[test]
     fn video_rate_fallback_is_enabled_only_for_exact_apple_high_performance() {
@@ -7516,7 +7749,7 @@ mod tests {
         ));
         assert_eq!(chrome.state(), crate::ControlIslandState::Hidden);
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let exact = Modifiers {
                 control: true,
@@ -8760,6 +8993,7 @@ mod tests {
                 password: SecretBuffer::new(vec![0x41]).take(),
             }),
             saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
         };
 
         let before = Instant::now();
@@ -9016,6 +9250,7 @@ mod tests {
                 password: SecretBuffer::new(vec![0x41]).take(),
             }),
             saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
         };
         let TestLaunchOutcome::LaunchRolledBack(failure) =
             host.complete_test_launch(first_permit, TargetSystem::MacOs, first_request)
@@ -9048,6 +9283,7 @@ mod tests {
             port: Some(5900),
             protocol: ProtocolChoice::Explicit(ProtocolId::apple_hpss_mvs()),
             username: "test-user".to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         });
         form.set_password(SecretBuffer::new(vec![0x41]));
         let mut controller = AppController::connection_form(form);
@@ -9615,6 +9851,7 @@ mod tests {
             protocol_id,
             credentials: None,
             saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
         }
     }
 

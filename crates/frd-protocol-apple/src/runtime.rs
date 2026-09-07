@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use frd_core::{
-    ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PixelPoint, PointerButton,
-    PointerButtons, PointerSample, SessionId, WheelDelta,
+    ButtonState, DisplayConstraints, DisplayIntent, DisplayPlanner, InputEvent, KeyState,
+    Modifiers, PhysicalKeyCode, PixelPoint, PointerButton, PointerButtons, PointerSample,
+    SessionId, WheelDelta,
 };
 use frd_protocol_api::{
     AudioState, ConnectionStage, ProtocolError, ProtocolExit, ProtocolRuntime, SessionCapabilities,
@@ -41,11 +42,22 @@ const APPLE_HIGH_PERFORMANCE_ACTIVE_MEDIA_READ_POLL: Duration = Duration::from_m
 fn startup_display_size(
     protocol_id: &frd_core::ProtocolId,
     server_init: DisplaySize,
+    display_intent: DisplayIntent,
 ) -> DisplaySize {
     if protocol_id == &frd_core::ProtocolId::apple_high_performance() {
-        // Recovered ARD/ScreenSharing 0x1d mode 0 is the HP product's startup
-        // surface. Other Apple protocol identities retain ServerInit geometry.
-        DisplaySize::new(2560, 1440).expect("recovered Apple HP geometry is valid")
+        // HPSS owns this virtual display handshake. The local intent may choose
+        // a physical size, but it is still bounded by the Apple wire fields and
+        // aligned to the existing 8-pixel display-query contract.
+        let constraints = DisplayConstraints {
+            max_width: Some(u16::MAX as u32),
+            max_height: Some(u16::MAX as u32),
+            ..Default::default()
+        };
+        let requested = DisplayPlanner::plan(display_intent, constraints)
+            .ok()
+            .and_then(|plan| plan.remote_size)
+            .and_then(|size| DisplaySize::from_viewport(size.width as usize, size.height as usize));
+        requested.unwrap_or_else(|| DisplaySize::new(2560, 1440).expect("有效 Apple HP 回退尺寸"))
     } else {
         server_init
     }
@@ -414,6 +426,7 @@ pub(crate) fn run_authenticated_session(
     runtime: ProtocolRuntime,
     session_id: SessionId,
     protocol_id: frd_core::ProtocolId,
+    display_intent: DisplayIntent,
 ) -> ProtocolExit {
     let EstablishedAppleSession {
         connection,
@@ -429,6 +442,7 @@ pub(crate) fn run_authenticated_session(
         AudioMediaFlow::MacToPc,
         metadata.encoding_profile == crate::session::SessionEncodingProfile::AppleUdpMedia,
         protocol_id,
+        display_intent,
     )
 }
 
@@ -453,6 +467,7 @@ pub fn run_established_hpss_session(
         audio_flow,
         true,
         frd_core::ProtocolId::apple_hpss_mvs(),
+        DisplayIntent::default(),
     )
 }
 
@@ -467,6 +482,7 @@ fn run_authenticated_session_with_media(
     audio_flow: AudioMediaFlow,
     udp_media_enabled: bool,
     protocol_id: frd_core::ProtocolId,
+    display_intent: DisplayIntent,
 ) -> ProtocolExit {
     let refresh_tier = (protocol_id == frd_core::ProtocolId::apple_high_performance())
         .then_some(hpss::HighPerformanceRefreshTier::Hz60);
@@ -481,6 +497,7 @@ fn run_authenticated_session_with_media(
         udp_media_enabled,
         protocol_id,
         refresh_tier,
+        display_intent,
     )
 }
 
@@ -496,6 +513,7 @@ fn run_authenticated_session_with_media_at_refresh_tier(
     udp_media_enabled: bool,
     protocol_id: frd_core::ProtocolId,
     refresh_tier: Option<hpss::HighPerformanceRefreshTier>,
+    display_intent: DisplayIntent,
 ) -> ProtocolExit {
     let input_diagnostics = HighPerformanceInputDiagnostics::for_protocol(&protocol_id);
     let result = run_authenticated_session_inner(
@@ -509,6 +527,7 @@ fn run_authenticated_session_with_media_at_refresh_tier(
         udp_media_enabled,
         &protocol_id,
         refresh_tier,
+        display_intent,
         input_diagnostics.clone(),
     );
     if let Err(error) = &result {
@@ -615,6 +634,7 @@ fn run_authenticated_session_inner(
     udp_media_enabled: bool,
     protocol_id: &frd_core::ProtocolId,
     refresh_tier: Option<hpss::HighPerformanceRefreshTier>,
+    display_intent: DisplayIntent,
     input_diagnostics: HighPerformanceInputDiagnostics,
 ) -> Result<()> {
     let is_product_high_performance =
@@ -628,7 +648,7 @@ fn run_authenticated_session_inner(
         u16::try_from(initial_pixel_size.height).context("Apple 初始高度超出 u16")?,
     )
     .context("Apple 初始显示尺寸无效")?;
-    let initial_size = startup_display_size(protocol_id, server_init_size);
+    let initial_size = startup_display_size(protocol_id, server_init_size, display_intent);
     let media_server_address = connection.peer_addr()?.ip();
     let media_bind_address = connection.local_addr()?.ip();
     if !connection.is_encrypted() {
@@ -965,6 +985,8 @@ mod tests {
     };
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use frd_core::DisplayIntent;
 
     use frd_protocol_api::{
         MailboxSurfacePublisher, ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake,
@@ -1410,6 +1432,7 @@ mod tests {
                 udp_media_enabled,
                 protocol_id,
                 refresh_tier,
+                DisplayIntent::default(),
             );
             exit_tx.send(result).unwrap();
         });
@@ -1716,11 +1739,11 @@ mod tests {
         let protocol_id = frd_core::ProtocolId::apple_hpss_mvs();
 
         assert_eq!(
-            super::startup_display_size(&protocol_id, landscape),
+            super::startup_display_size(&protocol_id, landscape, DisplayIntent::default()),
             landscape
         );
         assert_eq!(
-            super::startup_display_size(&protocol_id, portrait),
+            super::startup_display_size(&protocol_id, portrait, DisplayIntent::default()),
             portrait
         );
     }
@@ -1733,8 +1756,28 @@ mod tests {
             super::startup_display_size(
                 &frd_core::ProtocolId::apple_high_performance(),
                 server_init,
+                DisplayIntent::default(),
             ),
             crate::dynamic_resolution::DisplaySize::new(2560, 1440).unwrap()
+        );
+    }
+
+    #[test]
+    fn product_high_performance_uses_native_physical_intent_above_2560() {
+        let geometry = frd_core::DisplayGeometry::from_physical(
+            frd_core::PixelSize::new(3840, 2160).unwrap(),
+            1000,
+        )
+        .unwrap();
+        let server_init = crate::dynamic_resolution::DisplaySize::new(1920, 1080).unwrap();
+
+        assert_eq!(
+            super::startup_display_size(
+                &frd_core::ProtocolId::apple_high_performance(),
+                server_init,
+                DisplayIntent::native_display(geometry),
+            ),
+            crate::dynamic_resolution::DisplaySize::new(3840, 2160).unwrap()
         );
     }
 
@@ -2495,6 +2538,7 @@ mod tests {
             crate::media_negotiation::AudioMediaFlow::MacToPc,
             false,
             frd_core::ProtocolId::apple_hpss_mvs(),
+            DisplayIntent::default(),
         );
 
         assert!(matches!(

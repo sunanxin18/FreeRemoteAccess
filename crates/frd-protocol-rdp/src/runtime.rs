@@ -17,6 +17,7 @@ use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use crate::active_session::run_active_session;
 use crate::config::RdpConnectionConfig;
 use crate::connector::connect_and_activate;
+use crate::egfx::EgfxDecoderProvider;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_CANCELLED};
 use crate::input::{RdpInputError, RdpInputState};
 
@@ -247,6 +248,7 @@ static NETWORK_STAGE_WORKER: OnceLock<Mutex<Option<TrackedWorker>>> = OnceLock::
 pub(crate) fn run_protocol_session(
     mut config: RdpConnectionConfig,
     mut runtime: ProtocolRuntime,
+    egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
 ) -> ProtocolExit {
     let session_id = config.request.session_id;
     let executor = match tokio::runtime::Builder::new_current_thread()
@@ -257,7 +259,11 @@ pub(crate) fn run_protocol_session(
         Err(_) => return ProtocolExit::Failed(rdp_error(RDP_ACTIVATION_FAILED)),
     };
 
-    let result = match executor.block_on(connect_and_activate(&mut config, &mut runtime)) {
+    let result = match executor.block_on(connect_and_activate(
+        &mut config,
+        &mut runtime,
+        egfx_decoder_provider,
+    )) {
         Ok(session) => run_active_session(session, session_id, &mut runtime),
         Err(error) if error.code() == RDP_CANCELLED => ProtocolExit::Closed,
         Err(error) => ProtocolExit::Failed(error),
@@ -1634,12 +1640,16 @@ mod tests {
                     password: SecretBuffer::new(vec![0x01]).take(),
                 }),
                 saved_server_pin: None,
+                display_intent: frd_core::DisplayIntent::default(),
             },
             RdpClientPlatformIdentity::Windows,
         )
         .expect("valid RDP config");
 
-        assert_eq!(run_protocol_session(config, runtime), ProtocolExit::Closed);
+        assert_eq!(
+            run_protocol_session(config, runtime, None),
+            ProtocolExit::Closed
+        );
         assert_eq!(
             event_rx.try_iter().collect::<Vec<_>>(),
             vec![SessionEvent::StageChanged(ConnectionStage::Connecting)]

@@ -165,6 +165,7 @@ mod tests {
                     password: SecretBuffer::new(vec![0x01]).take(),
                 }),
                 saved_server_pin: None,
+                display_intent: frd_core::DisplayIntent::default(),
             },
             RdpClientPlatformIdentity::Windows,
         )
@@ -188,6 +189,7 @@ mod tests {
                     password: SecretBuffer::new(Vec::new()).take(),
                 }),
                 saved_server_pin: None,
+                display_intent: frd_core::DisplayIntent::default(),
             },
             RdpClientPlatformIdentity::Windows,
         )

@@ -14,7 +14,7 @@ use frd_media_api::{
     VideoCapabilityProvider, VideoCodec, VideoDecodeCapability, VideoDecodeError,
     VideoDecodeErrorCode, VideoDecodeQuery, VideoDecodeSupport, VideoDecoder, VideoDecoderFactory,
     VideoPixelFormat, VideoPlane, VideoProfile, VideoStreamConfig, VideoTimestamp,
-    VideoUnsupportedReason, MAX_DECODED_VIDEO_FRAME_BYTES,
+    VideoUnsupportedReason, MAX_DECODED_VIDEO_FRAME_BYTES, MAX_ENCODED_VIDEO_ACCESS_UNIT_BYTES,
 };
 use libloading::{Library, Symbol};
 
@@ -23,9 +23,12 @@ use crate::abi::{
     FrdByteSlice, FrdCreateDecoderFn, FrdDecodedFrame, FrdDecoderHandle, FrdDestroyFn, FrdFlushFn,
     FrdGetFfmpegApiV1, FrdOwnedBuffer, FrdReceiveFn, FrdReclaimFrameFn, FrdStatus, FrdSubmitFn,
     FrdVideoConfig, RawFrdFfmpegApiV1, FRD_API_CONTRACT_REQUIRED, FRD_BITSTREAM_ANNEX_B,
-    FRD_CHROMA_YUV_444, FRD_CODEC_HEVC, FRD_FFMPEG_API_SYMBOL, FRD_FFMPEG_API_V1_ALIGNMENT,
-    FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_444_P8,
-    FRD_PROFILE_HEVC_MAIN_444_8, FRD_SUBMIT_RANDOM_ACCESS,
+    FRD_CHROMA_YUV_420, FRD_CHROMA_YUV_444, FRD_CODEC_CAP_ALL_KNOWN, FRD_CODEC_CAP_H264_AVC420,
+    FRD_CODEC_CAP_H264_AVC444, FRD_CODEC_CAP_HEVC_MAIN_444_8, FRD_CODEC_H264, FRD_CODEC_HEVC,
+    FRD_FFMPEG_API_SYMBOL, FRD_FFMPEG_API_V1_ALIGNMENT, FRD_FFMPEG_API_V1_SIZE,
+    FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_420_P8, FRD_PIXEL_FORMAT_YUV_444_P8,
+    FRD_PROFILE_H264_AVC420, FRD_PROFILE_H264_AVC444, FRD_PROFILE_HEVC_MAIN_444_8,
+    FRD_SUBMIT_RANDOM_ACCESS,
 };
 
 const MAX_DECODE_FRAMES_PER_BATCH: usize = 8;
@@ -45,6 +48,7 @@ struct LoadedPlugin {
 struct CallableFfmpegApiV1 {
     abi_version: u32,
     avcodec_major: u32,
+    codec_capabilities: u32,
     create_decoder: FrdCreateDecoderFn,
     submit: FrdSubmitFn,
     receive: FrdReceiveFn,
@@ -66,9 +70,49 @@ impl fmt::Debug for FfmpegBackend {
 impl FfmpegBackend {
     /// 从当前可执行文件目录下的固定、受信版本目录加载；失败只禁用该 backend。
     pub fn load() -> Result<Self, VideoDecodeError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             return Err(backend_unavailable());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let executable = std::env::current_exe().map_err(|_| backend_unavailable())?;
+            let trusted = crate::linux_bundle::prepare(
+                &executable,
+                platform_directory_name(),
+                ffmpeg_dependency_names(),
+                plugin_library_name(),
+            )
+            .map_err(|_| backend_unavailable())?;
+            let mut libraries = Vec::new();
+            for path in &trusted.dependencies {
+                libraries.push(open_dependency_library(path)?);
+            }
+            let plugin = open_library(&trusted.plugin)?;
+            let api = load_api(&plugin)?;
+            libraries.push(plugin);
+            Self::from_validated_api(api, libraries)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let executable = std::env::current_exe().map_err(|_| backend_unavailable())?;
+            let trusted = crate::macos_bundle::prepare(
+                &executable,
+                platform_directory_name(),
+                ffmpeg_dependency_names(),
+                plugin_library_name(),
+            )
+            .map_err(|_| backend_unavailable())?;
+            let mut libraries = Vec::new();
+            for path in &trusted.dependencies {
+                libraries.push(open_dependency_library(path)?);
+            }
+            let plugin = open_library(&trusted.plugin)?;
+            let api = load_api(&plugin)?;
+            libraries.push(plugin);
+            Self::from_validated_api(api, libraries)
         }
 
         #[cfg(windows)]
@@ -152,14 +196,25 @@ impl VideoCapabilityProvider for FfmpegBackend {
     }
 
     fn query(&self, query: &VideoDecodeQuery) -> VideoDecodeSupport {
-        if query.codec != VideoCodec::Hevc {
+        let (capability_bit, output_format) = match (query.codec, query.profile, query.chroma) {
+            (VideoCodec::Hevc, VideoProfile::HevcMain4448, ChromaFormat::Yuv444) => {
+                (FRD_CODEC_CAP_HEVC_MAIN_444_8, VideoPixelFormat::Yuv444P8)
+            }
+            (VideoCodec::H264, VideoProfile::H264Avc420, ChromaFormat::Yuv420) => {
+                (FRD_CODEC_CAP_H264_AVC420, VideoPixelFormat::Yuv420P8)
+            }
+            (VideoCodec::H264, VideoProfile::H264Avc444, ChromaFormat::Yuv444) => {
+                (FRD_CODEC_CAP_H264_AVC444, VideoPixelFormat::Yuv444P8)
+            }
+            (_, _, _) if query.codec == VideoCodec::H264 => {
+                return VideoDecodeSupport::Unsupported(VideoUnsupportedReason::ProfileUnavailable)
+            }
+            (_, _, _) => {
+                return VideoDecodeSupport::Unsupported(VideoUnsupportedReason::CodecUnavailable)
+            }
+        };
+        if self.plugin.api.codec_capabilities & capability_bit == 0 {
             return VideoDecodeSupport::Unsupported(VideoUnsupportedReason::CodecUnavailable);
-        }
-        if query.profile != VideoProfile::HevcMain4448 {
-            return VideoDecodeSupport::Unsupported(VideoUnsupportedReason::ProfileUnavailable);
-        }
-        if query.chroma != ChromaFormat::Yuv444 {
-            return VideoDecodeSupport::Unsupported(VideoUnsupportedReason::ChromaUnavailable);
         }
         if query.bit_depth != 8 {
             return VideoDecodeSupport::Unsupported(VideoUnsupportedReason::BitDepthUnavailable);
@@ -168,10 +223,7 @@ impl VideoCapabilityProvider for FfmpegBackend {
         if query.coded_size.width > maximum.width || query.coded_size.height > maximum.height {
             return VideoDecodeSupport::Unsupported(VideoUnsupportedReason::DimensionsUnavailable);
         }
-        if !query
-            .preferred_outputs
-            .contains(&VideoPixelFormat::Yuv444P8)
-        {
+        if !query.preferred_outputs.contains(&output_format) {
             return VideoDecodeSupport::Unsupported(
                 VideoUnsupportedReason::OutputFormatUnavailable,
             );
@@ -179,13 +231,13 @@ impl VideoCapabilityProvider for FfmpegBackend {
 
         VideoDecodeSupport::SoftwareExact(VideoDecodeCapability {
             backend_id: self.backend_id(),
-            codec: VideoCodec::Hevc,
-            profile: VideoProfile::HevcMain4448,
-            chroma: ChromaFormat::Yuv444,
+            codec: query.codec,
+            profile: query.profile,
+            chroma: query.chroma,
             bit_depth: 8,
             max_coded_size: maximum,
-            output_formats: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
-            requires_bitstream_conversion: false,
+            output_formats: vec![output_format].into_boxed_slice(),
+            requires_bitstream_conversion: query.codec == VideoCodec::H264,
         })
     }
 }
@@ -203,9 +255,15 @@ impl VideoDecoderFactory for FfmpegBackend {
             bit_depth: input.bit_depth,
             coded_size: input.coded_size,
             frame_rate: None,
-            preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+            preferred_outputs: vec![output_format_for_input(input)].into_boxed_slice(),
         };
-        if !self.query(&query).is_exact() || input.bitstream_format != VideoBitstreamFormat::AnnexB
+        if !self.query(&query).is_exact()
+            || !matches!(
+                (input.codec, input.bitstream_format),
+                (VideoCodec::Hevc, VideoBitstreamFormat::AnnexB)
+                    | (VideoCodec::H264, VideoBitstreamFormat::AnnexB)
+                    | (VideoCodec::H264, VideoBitstreamFormat::AvcLengthPrefixed)
+            )
         {
             return Err(VideoDecodeError::new(
                 VideoDecodeErrorCode::ExactProfileChromaBitDepthUnsupported,
@@ -330,11 +388,14 @@ impl VideoDecoder for FfmpegDecoder {
         };
         // SAFETY: the input slice is valid for the duration of the call, its size was bounded by
         // `EncodedVideoAccessUnit`, and the exclusive handle cannot be called concurrently.
+        let normalized = normalize_access_unit(input, access_unit.bytes()).map_err(|_| {
+            VideoDecodeError::new(VideoDecodeErrorCode::MalformedOrOverBudgetAccessUnit)
+        })?;
         let status = unsafe {
             (self.plugin.api.submit)(
                 self.handle.0,
-                access_unit.bytes().as_ptr(),
-                access_unit.bytes().len(),
+                normalized.as_ptr(),
+                normalized.len(),
                 timestamp,
                 flags,
             )
@@ -438,9 +499,21 @@ fn create_decoder_handle(
 fn abi_video_config(config: &VideoStreamConfig) -> FrdVideoConfig {
     let input = config.as_input();
     FrdVideoConfig {
-        codec: FRD_CODEC_HEVC,
-        profile: FRD_PROFILE_HEVC_MAIN_444_8,
-        chroma: FRD_CHROMA_YUV_444,
+        codec: match input.codec {
+            VideoCodec::H264 => FRD_CODEC_H264,
+            VideoCodec::Hevc => FRD_CODEC_HEVC,
+        },
+        profile: match input.profile {
+            VideoProfile::H264Avc420 => FRD_PROFILE_H264_AVC420,
+            VideoProfile::H264Avc444 => FRD_PROFILE_H264_AVC444,
+            VideoProfile::HevcMain4448 => FRD_PROFILE_HEVC_MAIN_444_8,
+            _ => 0,
+        },
+        chroma: match input.chroma {
+            ChromaFormat::Yuv420 => FRD_CHROMA_YUV_420,
+            ChromaFormat::Yuv444 => FRD_CHROMA_YUV_444,
+            _ => 0,
+        },
         bit_depth: u32::from(input.bit_depth),
         coded_width: input.coded_size.width,
         coded_height: input.coded_size.height,
@@ -450,6 +523,54 @@ fn abi_video_config(config: &VideoStreamConfig) -> FrdVideoConfig {
         sps: byte_slice(input.parameter_sets.sps()),
         pps: byte_slice(input.parameter_sets.pps()),
     }
+}
+
+fn output_format_for_input(input: &frd_media_api::VideoStreamConfigInput) -> VideoPixelFormat {
+    match input.chroma {
+        ChromaFormat::Yuv420 => VideoPixelFormat::Yuv420P8,
+        _ => VideoPixelFormat::Yuv444P8,
+    }
+}
+
+fn normalize_access_unit(
+    input: &frd_media_api::VideoStreamConfigInput,
+    bytes: &[u8],
+) -> Result<Box<[u8]>, ()> {
+    if input.codec != VideoCodec::H264
+        || input.bitstream_format != VideoBitstreamFormat::AvcLengthPrefixed
+    {
+        return Ok(bytes.to_vec().into_boxed_slice());
+    }
+    let mut output = Vec::with_capacity(bytes.len().saturating_add(4));
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let end_length = offset.checked_add(4).ok_or(())?;
+        if end_length > bytes.len() {
+            return Err(());
+        }
+        let length =
+            u32::from_be_bytes(bytes[offset..end_length].try_into().map_err(|_| ())?) as usize;
+        offset = end_length;
+        let end = offset.checked_add(length).ok_or(())?;
+        if length == 0 || end > bytes.len() {
+            return Err(());
+        }
+        if output
+            .len()
+            .checked_add(4)
+            .and_then(|size| size.checked_add(length))
+            .is_none_or(|size| size > MAX_ENCODED_VIDEO_ACCESS_UNIT_BYTES)
+        {
+            return Err(());
+        }
+        output.extend_from_slice(&[0, 0, 0, 1]);
+        output.extend_from_slice(&bytes[offset..end]);
+        offset = end;
+    }
+    if output.is_empty() {
+        return Err(());
+    }
+    Ok(output.into_boxed_slice())
 }
 
 fn byte_slice(bytes: &[u8]) -> FrdByteSlice {
@@ -482,7 +603,7 @@ fn convert_frame(
         },
         coded_size: input.coded_size,
         visible_rect: input.visible_rect,
-        format: VideoPixelFormat::Yuv444P8,
+        format: output_format_for_input(input),
         colorimetry: input.colorimetry,
         range: input.range,
         planes,
@@ -495,15 +616,26 @@ fn validate_raw_frame_layout(
     raw_frame: &FrdDecodedFrame,
 ) -> Result<(), VideoDecodeError> {
     let invalid = || VideoDecodeError::new(VideoDecodeErrorCode::DecodedFrameLayoutInvalid);
-    if raw_frame.pixel_format != FRD_PIXEL_FORMAT_YUV_444_P8 || raw_frame.plane_count != 3 {
+    let expected_format = match config.as_input().chroma {
+        ChromaFormat::Yuv420 => FRD_PIXEL_FORMAT_YUV_420_P8,
+        ChromaFormat::Yuv444 => FRD_PIXEL_FORMAT_YUV_444_P8,
+        _ => return Err(invalid()),
+    };
+    if raw_frame.pixel_format != expected_format || raw_frame.plane_count != 3 {
         return Err(invalid());
     }
 
     let expected = config.as_input().coded_size;
     let mut total_bytes = 0usize;
-    for plane in &raw_frame.planes {
-        if plane.width != expected.width
-            || plane.height != expected.height
+    for (index, plane) in raw_frame.planes.iter().enumerate() {
+        let (expected_width, expected_height) =
+            if config.as_input().chroma == ChromaFormat::Yuv420 && index > 0 {
+                (expected.width.div_ceil(2), expected.height.div_ceil(2))
+            } else {
+                (expected.width, expected.height)
+            };
+        if plane.width != expected_width
+            || plane.height != expected_height
             || plane.stride_bytes < plane.width
             || plane.buffer.data.is_null()
             || plane.buffer.len == 0
@@ -622,7 +754,8 @@ fn validate_raw_api(raw: RawFrdFfmpegApiV1) -> Result<CallableFfmpegApiV1, Video
         || raw.abi_version != FRD_FFMPEG_ABI_VERSION
         || raw.avcodec_major != FRD_FFMPEG_AVCODEC_MAJOR
         || raw.contract_flags & FRD_API_CONTRACT_REQUIRED != FRD_API_CONTRACT_REQUIRED
-        || raw.reserved != 0
+        || raw.codec_capabilities == 0
+        || raw.codec_capabilities & !FRD_CODEC_CAP_ALL_KNOWN != 0
         || raw.create_decoder == 0
         || raw.submit == 0
         || raw.receive == 0
@@ -649,6 +782,7 @@ fn validate_raw_api(raw: RawFrdFfmpegApiV1) -> Result<CallableFfmpegApiV1, Video
         CallableFfmpegApiV1 {
             abi_version: raw.abi_version,
             avcodec_major: raw.avcodec_major,
+            codec_capabilities: raw.codec_capabilities,
             create_decoder: mem::transmute::<usize, FrdCreateDecoderFn>(raw.create_decoder),
             submit: mem::transmute::<usize, FrdSubmitFn>(raw.submit),
             receive: mem::transmute::<usize, FrdReceiveFn>(raw.receive),
@@ -675,13 +809,30 @@ fn open_library(path: &Path) -> Result<Library, VideoDecodeError> {
         .map_err(|_| backend_unavailable())
 }
 
+#[cfg(target_os = "linux")]
+fn open_dependency_library(path: &Path) -> Result<Library, VideoDecodeError> {
+    use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+
+    // FFmpeg's shared objects retain their SONAME dependency on libavutil. Loading both trusted
+    // files globally in dependency order lets the bundled plugin resolve only this bundle's ABI,
+    // while the plugin itself remains RTLD_LOCAL.
+    unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }
+        .map(Into::into)
+        .map_err(|_| backend_unavailable())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_dependency_library(path: &Path) -> Result<Library, VideoDecodeError> {
+    open_library(path)
+}
+
 #[cfg(unix)]
 fn open_library(path: &Path) -> Result<Library, VideoDecodeError> {
     use libloading::os::unix::{Library as UnixLibrary, RTLD_LOCAL, RTLD_NOW};
 
-    // SAFETY: the production path is canonical, identity checked, non-symlink, and rooted under
-    // non-writable system-owned ancestors. RTLD_NOW fails on unresolved symbols and RTLD_LOCAL
-    // prevents global symbol export.
+    // SAFETY: macOS production paths are canonical non-symlink files inside the verified
+    // signed application bundle. Test-only injection does not establish production trust.
+    // RTLD_NOW requires resolved symbols; RTLD_LOCAL prevents global symbol export.
     unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_LOCAL) }
         .map(Into::into)
         .map_err(|_| backend_unavailable())
@@ -699,6 +850,11 @@ fn backend_unavailable() -> VideoDecodeError {
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const fn platform_directory_name() -> &'static str {
     "windows-x86_64"
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86"))]
+const fn platform_directory_name() -> &'static str {
+    "windows-x86"
 }
 
 #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
@@ -721,6 +877,11 @@ const fn platform_directory_name() -> &'static str {
     "linux-x86_64"
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86"))]
+const fn platform_directory_name() -> &'static str {
+    "linux-x86"
+}
+
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const fn platform_directory_name() -> &'static str {
     "linux-aarch64"
@@ -733,10 +894,12 @@ const fn platform_directory_name() -> &'static str {
 
 #[cfg(not(any(
     all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86"),
     all(target_os = "windows", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86"),
     all(target_os = "linux", target_arch = "aarch64"),
     target_os = "android"
 )))]
@@ -800,11 +963,13 @@ mod tests {
         VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity, VideoTimeBase,
         VideoTimestamp,
     };
+    use sha2::{Digest, Sha256};
 
     use crate::abi::{
         FrdDecodedFrame, FrdDecodedPlane, FrdDecoderHandle, FrdOwnedBuffer, FrdStatus,
-        FrdVideoConfig, RawFrdFfmpegApiV1, FRD_API_CONTRACT_REQUIRED, FRD_FFMPEG_API_V1_ALIGNMENT,
-        FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_444_P8,
+        FrdVideoConfig, RawFrdFfmpegApiV1, FRD_API_CONTRACT_REQUIRED, FRD_CODEC_CAP_ALL_KNOWN,
+        FRD_FFMPEG_API_V1_ALIGNMENT, FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR,
+        FRD_PIXEL_FORMAT_YUV_444_P8,
     };
 
     #[cfg(windows)]
@@ -990,6 +1155,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_api_rejects_plugins_without_codec_capability_slots() {
+        let mut api = compatible_raw_api();
+        api.codec_capabilities = 0;
+        let result = FfmpegBackend::from_raw_api_for_test(api);
+        assert_eq!(
+            result
+                .expect_err("没有新 codec capability slots 的旧 plugin 必须拒绝")
+                .code(),
+            VideoDecodeErrorCode::BackendVersionMismatch
+        );
+    }
+
+    #[test]
     fn relative_application_directory_is_rejected_without_searching_current_directory() {
         let result = FfmpegBackend::load_from_application_dir_for_test(PathBuf::from("codecs"));
 
@@ -1033,6 +1211,143 @@ mod tests {
 
         assert!(matches!(support, VideoDecodeSupport::SoftwareExact(_)));
         assert!(!matches!(support, VideoDecodeSupport::HardwareExact(_)));
+    }
+
+    #[test]
+    fn compatible_plugin_advertises_exact_h264_avc420_and_rejects_wrong_chroma() {
+        let backend = load_fake_plugin_with_abi(FRD_FFMPEG_ABI_VERSION)
+            .expect("兼容且已加载的 API 应注册 factory");
+        let support = backend.query(&h264_query());
+        assert!(matches!(support, VideoDecodeSupport::SoftwareExact(_)));
+        assert!(matches!(
+            backend.query(&VideoDecodeQuery {
+                chroma: ChromaFormat::Yuv444,
+                preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+                ..h264_query()
+            }),
+            VideoDecodeSupport::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn compatible_plugin_advertises_exact_h264_avc444() {
+        let backend = load_fake_plugin_with_abi(FRD_FFMPEG_ABI_VERSION)
+            .expect("兼容且已加载的 API 应注册 factory");
+        let support = backend.query(&VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc444,
+            chroma: ChromaFormat::Yuv444,
+            preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+            ..h264_query()
+        });
+        assert!(matches!(support, VideoDecodeSupport::SoftwareExact(_)));
+    }
+
+    #[test]
+    fn plugin_without_avc444_capability_cannot_satisfy_the_exact_profile() {
+        let mut api = compatible_raw_api();
+        api.codec_capabilities = crate::abi::FRD_CODEC_CAP_H264_AVC420;
+        let backend = FfmpegBackend::from_raw_api_for_test(api).expect("AVC420 plugin 应可加载");
+        let support = backend.query(&VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc444,
+            chroma: ChromaFormat::Yuv444,
+            preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+            ..h264_query()
+        });
+        assert!(matches!(
+            support,
+            VideoDecodeSupport::Unsupported(
+                frd_media_api::VideoUnsupportedReason::CodecUnavailable
+            )
+        ));
+    }
+
+    #[test]
+    fn avc_length_prefixed_access_unit_is_converted_once_to_annex_b() {
+        let config = h264_config();
+        let input = config.as_input();
+        let converted =
+            super::normalize_access_unit(input, &[0, 0, 0, 2, 0x65, 0x88, 0, 0, 0, 1, 0x41])
+                .expect("合法 AVC length-prefixed access unit 应转换");
+        assert_eq!(&*converted, &[0, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x41]);
+        assert!(super::normalize_access_unit(input, &[0, 0, 0, 3, 0x65]).is_err());
+    }
+
+    #[test]
+    fn synthetic_avc420_fixture_preserves_sps_pps_idr_through_length_prefix_bridge() {
+        let fixture = include_bytes!("../tests/fixtures/synthetic-avc420-2x2.h264");
+        let metadata = include_str!("../tests/fixtures/synthetic-avc420-2x2.json");
+        assert!(metadata.contains("\"profile\": \"avc420\""));
+        assert!(metadata.contains("\"coded_width\": 2"));
+        assert!(metadata.contains("\"coded_height\": 2"));
+        let digest = Sha256::digest(fixture);
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            digest,
+            "b7962d9f027d8539af68a2866539a56847af42fa2f73671d64036c7db239a1d7"
+        );
+
+        let nals = annex_b_nals(fixture);
+        assert_eq!(
+            nals.iter().map(|nal| nal[0] & 0x1f).collect::<Vec<_>>(),
+            vec![7, 8, 5],
+            "fixture 必须只含 SPS、PPS 和单个 IDR NAL"
+        );
+
+        let mut length_prefixed = Vec::new();
+        for nal in &nals {
+            length_prefixed.extend_from_slice(
+                &u32::try_from(nal.len())
+                    .expect("fixture NAL 长度必须适合四字节前缀")
+                    .to_be_bytes(),
+            );
+            length_prefixed.extend_from_slice(nal);
+        }
+
+        let converted = super::normalize_access_unit(&h264_config().as_input(), &length_prefixed)
+            .expect("合法 AVC420 fixture 应转换为 Annex-B");
+        let mut expected = Vec::new();
+        for nal in nals {
+            expected.extend_from_slice(&[0, 0, 0, 1]);
+            expected.extend_from_slice(nal);
+        }
+        assert_eq!(&*converted, &expected);
+    }
+
+    fn annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
+        let mut starts = Vec::new();
+        let mut offset = 0;
+        while offset + 3 <= data.len() {
+            let start_len = if offset + 4 <= data.len() && data[offset..offset + 4] == [0, 0, 0, 1]
+            {
+                Some(4)
+            } else if data[offset..offset + 3] == [0, 0, 1] {
+                Some(3)
+            } else {
+                None
+            };
+            if let Some(start_len) = start_len {
+                starts.push((offset, start_len));
+                offset += start_len;
+            } else {
+                offset += 1;
+            }
+        }
+        starts
+            .iter()
+            .enumerate()
+            .map(|(index, &(start, start_len))| {
+                let end = starts
+                    .get(index + 1)
+                    .map(|&(next, _)| next)
+                    .unwrap_or(data.len());
+                &data[start + start_len..end]
+            })
+            .collect()
     }
 
     #[test]
@@ -1233,7 +1548,7 @@ mod tests {
             abi_version: FRD_FFMPEG_ABI_VERSION,
             avcodec_major: FRD_FFMPEG_AVCODEC_MAJOR,
             contract_flags: FRD_API_CONTRACT_REQUIRED,
-            reserved: 0,
+            codec_capabilities: FRD_CODEC_CAP_ALL_KNOWN,
             create_decoder: stub_create as *const () as usize,
             submit: stub_submit as *const () as usize,
             receive: stub_receive as *const () as usize,
@@ -1631,6 +1946,18 @@ mod tests {
         }
     }
 
+    fn h264_query() -> VideoDecodeQuery {
+        VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1920, 1080).expect("测试尺寸有效"),
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Yuv420P8].into_boxed_slice(),
+        }
+    }
+
     fn main444_config() -> VideoStreamConfig {
         VideoStreamConfig::try_new(VideoStreamConfigInput {
             identity: VideoStreamIdentity {
@@ -1658,6 +1985,39 @@ mod tests {
                 Some(vec![0x40].into_boxed_slice()),
                 vec![0x42].into_boxed_slice(),
                 vec![0x44].into_boxed_slice(),
+            )
+            .expect("测试参数集有效"),
+        })
+        .expect("测试配置有效")
+    }
+
+    fn h264_config() -> VideoStreamConfig {
+        VideoStreamConfig::try_new(VideoStreamConfigInput {
+            identity: VideoStreamIdentity {
+                session_id: SessionId::allocate(),
+                stream_id: 8,
+            },
+            generation: 3,
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            coded_size: PixelSize::new(2, 2).expect("测试尺寸有效"),
+            visible_rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            time_base: VideoTimeBase::try_new(90_000).expect("测试 timebase 有效"),
+            bitstream_format: VideoBitstreamFormat::AvcLengthPrefixed,
+            colorimetry: VideoColorimetry::Bt709,
+            range: VideoRange::Limited,
+            chroma_location: ChromaLocation::Left,
+            parameter_sets: VideoParameterSets::try_new(
+                None,
+                vec![0x67, 0x42].into_boxed_slice(),
+                vec![0x68, 0xce].into_boxed_slice(),
             )
             .expect("测试参数集有效"),
         })

@@ -121,6 +121,7 @@ where
             password: password.take(),
         }),
         saved_server_pin: None,
+        display_intent: frd_core::DisplayIntent::default(),
     })
 }
 

@@ -8,7 +8,7 @@ use egui::{
     WidgetInfo, WidgetType,
 };
 use frd_app::{AppIntent, AppPage};
-use frd_core::{SecretBuffer, TargetSystem};
+use frd_core::{PixelSize, ResolutionMode, SecretBuffer, TargetSystem};
 use frd_protocol_api::{ProtocolCatalog, ProtocolSelection};
 use frd_ui_model::{ConnectionForm, ProtocolChoice};
 
@@ -174,6 +174,9 @@ pub fn show_connection_form_with_state(
                             ui.add_space(8.0);
                             show_protocol_selector(ui, form, catalog);
                         }
+                        ui.add_space(12.0);
+
+                        show_resolution_selector(ui, form);
                         ui.add_space(12.0);
 
                         if use_paired_rows {
@@ -399,6 +402,57 @@ fn show_protocol_selector(ui: &mut Ui, form: &mut ConnectionForm, catalog: &Prot
         .response;
     response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, true, "连接协议"));
     show_error(ui, form.errors().protocol.as_deref());
+}
+
+fn show_resolution_selector(ui: &mut Ui, form: &mut ConnectionForm) {
+    field_label(ui, "远程分辨率");
+    let selected = resolution_mode_label(form.draft.resolution_mode);
+    let response = ComboBox::from_id_salt("connection-resolution-mode")
+        .width(ui.available_width())
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for (mode, label) in [
+                (ResolutionMode::NativeDisplay, "显示器原生（推荐）"),
+                (ResolutionMode::DisplayWorkArea, "显示器工作区"),
+                (ResolutionMode::WindowContent, "窗口内容区域"),
+                (ResolutionMode::ServerManaged, "服务器管理"),
+            ] {
+                ui.selectable_value(&mut form.draft.resolution_mode, mode, label);
+            }
+            for (width, height) in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)] {
+                ui.selectable_value(
+                    &mut form.draft.resolution_mode,
+                    ResolutionMode::Fixed(PixelSize { width, height }),
+                    format!("固定 {width}×{height}"),
+                );
+            }
+        })
+        .response;
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, true, "远程分辨率"));
+
+    if let ResolutionMode::Fixed(size) = form.draft.resolution_mode {
+        ui.horizontal(|ui| {
+            ui.label("固定宽高（物理像素）");
+            let mut width = size.width;
+            let mut height = size.height;
+            ui.add(DragValue::new(&mut width).range(1..=u32::MAX));
+            ui.label("×");
+            ui.add(DragValue::new(&mut height).range(1..=u32::MAX));
+            if let Some(next) = PixelSize::new(width, height) {
+                form.draft.resolution_mode = ResolutionMode::Fixed(next);
+            }
+        });
+    }
+}
+
+fn resolution_mode_label(mode: ResolutionMode) -> String {
+    match mode {
+        ResolutionMode::NativeDisplay => "显示器原生（推荐）".to_owned(),
+        ResolutionMode::DisplayWorkArea => "显示器工作区".to_owned(),
+        ResolutionMode::WindowContent => "窗口内容区域".to_owned(),
+        ResolutionMode::ServerManaged => "服务器管理".to_owned(),
+        ResolutionMode::Fixed(size) => format!("固定 {}×{}", size.width, size.height),
+    }
 }
 
 fn show_address_field(ui: &mut Ui, form: &mut ConnectionForm) {

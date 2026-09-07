@@ -625,6 +625,7 @@ mod tests {
             protocol_id: ProtocolId::apple_hpss_mvs(),
             credentials: None,
             saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
         }
     }
 

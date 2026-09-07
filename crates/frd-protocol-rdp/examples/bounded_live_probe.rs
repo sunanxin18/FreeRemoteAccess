@@ -1,0 +1,303 @@
+//! 有界、无 GUI 的 RDP 互操作验证；仅从管道 stdin 接受凭据。
+//! stdin 三行依次是主机、用户名、密码。首次自动保存指纹，变化时拒绝。
+//! FRD_RDP_PROBE_PIN_DIR 指定探针专用指纹目录；不使用或替代产品平台存储。
+//! 仅统计解码发布，不证明窗口呈现、输入、剪贴板或音频播放。
+
+use sha2::{Digest, Sha256};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::Path;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use frd_core::{SecretBuffer, SessionId};
+use frd_frame::{FrameCompleteness, SurfaceUpdate};
+use frd_protocol_api::{
+    ConnectRequest, Credentials, Endpoint, ProtocolError, ProtocolExit, ProtocolFactory,
+    ProtocolId, ProtocolRuntime, RuntimeEventSink, RuntimeWake, ServerIdentityDecision,
+    SessionCommand, SessionEvent, SurfacePublisher,
+};
+use frd_protocol_rdp::{RdpClientPlatformIdentity, RdpProtocolFactory};
+
+#[derive(Default)]
+struct Counts {
+    frames: u64,
+    baselines: u64,
+    patches: u64,
+    pixel_bytes: u64,
+    first_frame: Option<Instant>,
+}
+
+struct Frames(Arc<Mutex<Counts>>);
+
+impl SurfacePublisher for Frames {
+    fn publish(&self, update: SurfaceUpdate) -> Result<(), ProtocolError> {
+        let mut counts = self
+            .0
+            .lock()
+            .map_err(|_| ProtocolError::FramePortRejected)?;
+        match update {
+            SurfaceUpdate::Reset {
+                generation, size, ..
+            } => {
+                println!(
+                    "画面重置 generation={generation} width={} height={}",
+                    size.width, size.height
+                );
+            }
+            SurfaceUpdate::Damage { patches, .. } => {
+                counts.patches += patches.len() as u64;
+                counts.pixel_bytes += patches
+                    .iter()
+                    .map(|patch| patch.pixels.len() as u64)
+                    .sum::<u64>();
+            }
+            SurfaceUpdate::FrameBoundary { completeness, .. } => {
+                counts.frames += 1;
+                counts.baselines += u64::from(completeness == FrameCompleteness::FullBaseline);
+                if counts.first_frame.is_none() {
+                    counts.first_frame = Some(Instant::now());
+                    println!("首帧已解码 completeness={completeness:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Events(mpsc::Sender<SessionEvent>);
+
+impl RuntimeEventSink for Events {
+    fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
+        self.0
+            .send(event)
+            .map_err(|_| ProtocolError::EventPortClosed)
+    }
+}
+
+struct Wake;
+
+impl RuntimeWake for Wake {
+    fn wake(&self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+}
+
+fn read_line(reader: &mut impl BufRead) -> Result<String, &'static str> {
+    let mut line = String::new();
+    if reader
+        .read_line(&mut line)
+        .map_err(|_| "probe_stdin_failed")?
+        == 0
+    {
+        return Err("probe_stdin_closed");
+    }
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    if line.is_empty() {
+        return Err("probe_empty_input");
+    }
+    Ok(line)
+}
+
+fn exit_code(exit: &ProtocolExit) -> &'static str {
+    match exit {
+        ProtocolExit::Closed => "closed",
+        ProtocolExit::Failed(error) => error.code(),
+    }
+}
+
+fn load_pin(path: &Path) -> Result<Option<[u8; 32]>, &'static str> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes.try_into().map(Some).map_err(|_| "probe_pin_invalid"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("probe_pin_read_failed"),
+    }
+}
+
+fn remember_pin(path: &Path, pin: [u8; 32]) -> Result<(), &'static str> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(&pin).map_err(|_| "probe_pin_write_failed")?;
+            file.sync_all().map_err(|_| "probe_pin_write_failed")
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if load_pin(path)? == Some(pin) {
+                Ok(())
+            } else {
+                Err("probe_pin_changed")
+            }
+        }
+        Err(_) => Err("probe_pin_write_failed"),
+    }
+}
+
+fn run() -> Result<(), &'static str> {
+    // 拒绝直接终端输入，避免终端驱动回显密码；由可信父进程写入匿名管道。
+    if io::stdin().is_terminal() {
+        return Err("probe_requires_non_echoing_stdin_pipe");
+    }
+    let mut reader = io::BufReader::new(io::stdin());
+    let host = read_line(&mut reader)?;
+    let username = read_line(&mut reader)?;
+    let mut password = SecretBuffer::from_text(read_line(&mut reader)?);
+    let pin_root =
+        std::env::var_os("FRD_RDP_PROBE_PIN_DIR").ok_or("probe_pin_directory_required")?;
+    let pin_root = std::path::PathBuf::from(pin_root);
+    std::fs::create_dir_all(&pin_root).map_err(|_| "probe_pin_directory_failed")?;
+    let key = Sha256::digest(format!("rdp\0{host}\03389").as_bytes());
+    let name = key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pin_path = pin_root.join(format!("{name}.pin"));
+    let saved_pin = load_pin(&pin_path)?;
+    let session_id = SessionId::allocate();
+    let request = ConnectRequest {
+        session_id,
+        endpoint: Endpoint::new(host, 3389).ok_or("probe_invalid_endpoint")?,
+        protocol_id: ProtocolId::rdp(),
+        credentials: Some(Credentials {
+            username,
+            password: password.take(),
+        }),
+        saved_server_pin: saved_pin,
+        display_intent: frd_core::DisplayIntent::default(),
+    };
+    let (command_tx, command_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let counts = Arc::new(Mutex::new(Counts::default()));
+    let runtime = ProtocolRuntime::new(
+        session_id,
+        command_rx,
+        Box::new(Events(event_tx)),
+        Box::new(Frames(counts.clone())),
+        None,
+        Box::new(Wake),
+    );
+    let session = RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)
+        .create(request, runtime)
+        .map_err(|error| error.code())?;
+    let worker = thread::spawn(move || session.run());
+    let start = Instant::now();
+    let mut disconnect_at = None;
+    let mut last_report = Instant::now();
+    println!(
+        "验证启动 client=macOS protocol=IronRDP input=disabled active_seconds=20 total_seconds=60"
+    );
+    loop {
+        match event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(SessionEvent::StageChanged(stage)) => println!("连接阶段 {stage:?}"),
+            Ok(SessionEvent::ServerIdentityChallenge(challenge)) => {
+                let fingerprint = challenge
+                    .sha256_fingerprint
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                println!(
+                    "身份确认 sha256={fingerprint} validation={:?}",
+                    challenge.validation.kind()
+                );
+                if let Some(failure) = challenge.validation.failure() {
+                    println!(
+                        "身份原因 code={} reason={}",
+                        failure.code(),
+                        failure.reason()
+                    );
+                }
+                let decision = if challenge.validation.is_pin_mismatch() {
+                    println!("服务器证书指纹已变化，停止自动连接；保留原指纹");
+                    ServerIdentityDecision::Reject
+                } else if remember_pin(&pin_path, challenge.sha256_fingerprint).is_ok() {
+                    println!("服务器证书身份已保存/匹配，继续连接");
+                    if saved_pin.is_none() {
+                        ServerIdentityDecision::TrustAndRemember
+                    } else {
+                        ServerIdentityDecision::TrustOnce
+                    }
+                } else {
+                    println!("指纹持久化失败，停止连接");
+                    ServerIdentityDecision::Reject
+                };
+                let _ = command_tx.send(SessionCommand::ResolveServerIdentity {
+                    session_id,
+                    challenge_id: challenge.challenge_id,
+                    decision,
+                });
+            }
+            Ok(SessionEvent::SurfaceGenerationChanged {
+                generation, size, ..
+            }) => {
+                println!(
+                    "激活 generation={generation} width={} height={}",
+                    size.width, size.height
+                );
+            }
+            Ok(SessionEvent::CapabilitiesChanged(caps)) => println!("能力声明 {caps:?}"),
+            Ok(SessionEvent::AudioState(state)) => println!("音频状态 {state:?}"),
+            Ok(SessionEvent::Error(error)) => println!("会话错误 code={}", error.code()),
+            Ok(SessionEvent::Closed(exit)) => println!("关闭事件 code={}", exit_code(&exit)),
+            // 不输出远程剪贴板或底层诊断。
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        let counts_guard = counts.lock().map_err(|_| "probe_counts_failed")?;
+        let active_elapsed = counts_guard.first_frame.map(|time| time.elapsed());
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            println!(
+                "统计 elapsed_seconds={} frames={} full_baselines={} patches={} decoded_bytes={}",
+                start.elapsed().as_secs(),
+                counts_guard.frames,
+                counts_guard.baselines,
+                counts_guard.patches,
+                counts_guard.pixel_bytes
+            );
+            last_report = Instant::now();
+        }
+        drop(counts_guard);
+        if worker.is_finished() {
+            break;
+        }
+        if disconnect_at.is_none()
+            && (start.elapsed() >= Duration::from_secs(60)
+                || active_elapsed.is_some_and(|elapsed| elapsed >= Duration::from_secs(20)))
+        {
+            println!("有界观察结束，发送 Disconnect");
+            let _ = command_tx.send(SessionCommand::Disconnect);
+            disconnect_at = Some(Instant::now());
+        }
+        if disconnect_at.is_some_and(|time| time.elapsed() > Duration::from_secs(15)) {
+            return Err("probe_cleanup_timeout");
+        }
+    }
+    let exit = worker.join().map_err(|_| "probe_worker_panicked")?;
+    let counts = counts.lock().map_err(|_| "probe_counts_failed")?;
+    println!(
+        "验证结果 exit={} frames={} full_baselines={} patches={} decoded_bytes={} cleanup=joined",
+        exit_code(&exit),
+        counts.frames,
+        counts.baselines,
+        counts.patches,
+        counts.pixel_bytes
+    );
+    match exit {
+        ProtocolExit::Failed(error) => Err(error.code()),
+        ProtocolExit::Closed if counts.frames == 0 => Err("probe_no_decoded_frames"),
+        ProtocolExit::Closed => Ok(()),
+    }
+}
+
+fn main() {
+    if let Err(code) = run() {
+        eprintln!("验证未通过 code={code}");
+        std::process::exit(1);
+    }
+}

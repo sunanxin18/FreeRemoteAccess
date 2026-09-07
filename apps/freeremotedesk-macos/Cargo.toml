@@ -1,0 +1,20 @@
+[package]
+name = "freeremotedesk-macos"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+frd-app = { path = "../../crates/frd-app" }
+frd-core = { path = "../../crates/frd-core" }
+frd-media-api = { path = "../../crates/frd-media-api" }
+frd-platform-api = { path = "../../crates/frd-platform-api" }
+frd-platform-macos = { path = "../../crates/frd-platform-macos" }
+frd-protocol-api = { path = "../../crates/frd-protocol-api" }
+frd-protocol-apple = { path = "../../crates/frd-protocol-apple" }
+frd-protocol-rdp = { path = "../../crates/frd-protocol-rdp" }
+frd-shell-desktop = { path = "../../crates/frd-shell-desktop" }
+frd-ui-model = { path = "../../crates/frd-ui-model" }
+frd-video-ffmpeg = { path = "../../crates/frd-video-ffmpeg" }
+winit.workspace = true

@@ -21,7 +21,7 @@ $ExpectedArchiveSha256 = "464BEB5E7BF0C311E68B45AE2F04E9CC2AF88851ABB4082231742A
 $ExpectedConfigureArguments = @(
     "--arch=x86_64", "--target-os=mingw32", "--cross-prefix=x86_64-w64-mingw32-",
     "--disable-static", "--enable-shared", "--disable-programs", "--disable-doc",
-    "--disable-everything", "--enable-decoder=hevc", "--enable-parser=hevc",
+    "--disable-everything", "--enable-decoder=hevc,h264", "--enable-parser=hevc,h264",
     "--enable-protocol=file", "--disable-gpl", "--disable-nonfree", "--disable-version3",
     "--disable-autodetect", "--disable-network", "--disable-debug",
     "--enable-stripping"

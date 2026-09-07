@@ -85,6 +85,7 @@ fn run_factory_offer(offered: Vec<u8>, read_first_byte: bool) -> (ProtocolExit, 
         protocol_id: frd_core::ProtocolId::apple_hpss_mvs(),
         credentials: Some(credentials()),
         saved_server_pin: None,
+        display_intent: frd_core::DisplayIntent::default(),
     };
     let session = AppleProtocolFactory.create(request, runtime).unwrap();
     let exit = session.run();

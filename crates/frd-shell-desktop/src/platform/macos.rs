@@ -25,15 +25,15 @@ impl WindowChromeAdapter for PlatformWindowChrome {
         Ok(())
     }
 
-    fn native_insets(&self, _window: &winit::window::Window) -> NativeChromeInsets {
+    fn native_insets(&self, window: &winit::window::Window) -> NativeChromeInsets {
         NativeChromeInsets {
-            leading_px: 72,
+            leading_px: (80.0 * window.scale_factor()).ceil() as u32,
             trailing_px: 0,
         }
     }
 
     fn capabilities(&self) -> IslandWindowCapabilities {
-        crate::window_chrome::unverified_desktop_capabilities()
+        IslandWindowCapabilities::NONE
     }
 
     fn appearance_policy(&self) -> AppearancePolicy {
@@ -52,9 +52,29 @@ impl WindowChromeAdapter for PlatformWindowChrome {
 
     fn execute(
         &mut self,
-        _window: &winit::window::Window,
-        _command: WindowChromeCommand,
+        window: &winit::window::Window,
+        command: WindowChromeCommand,
     ) -> Result<(), WindowChromeError> {
-        Err(WindowChromeError::UnsupportedWindow)
+        match command {
+            WindowChromeCommand::BeginMove => window
+                .drag_window()
+                .map_err(|_| WindowChromeError::PlatformCallFailed),
+            WindowChromeCommand::Minimize => {
+                window.set_minimized(true);
+                Ok(())
+            }
+            WindowChromeCommand::ToggleMaximize => {
+                let fullscreen = window
+                    .fullscreen()
+                    .is_none()
+                    .then_some(winit::window::Fullscreen::Borderless(None));
+                window.set_fullscreen(fullscreen);
+                Ok(())
+            }
+            // 关闭由原生红色按钮和菜单产生 CloseRequested，保留统一的会话清理。
+            WindowChromeCommand::Close | WindowChromeCommand::ShowSystemMenu => {
+                Err(WindowChromeError::UnsupportedWindow)
+            }
+        }
     }
 }

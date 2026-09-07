@@ -22,6 +22,7 @@ frd-protocol-apple = { path = "../../crates/frd-protocol-apple" }
 frd-protocol-rdp = { path = "../../crates/frd-protocol-rdp" }
 frd-shell-desktop = { path = "../../crates/frd-shell-desktop" }
 frd-ui-model = { path = "../../crates/frd-ui-model" }
+frd-video-ffmpeg = { path = "../../crates/frd-video-ffmpeg" }
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows-sys]

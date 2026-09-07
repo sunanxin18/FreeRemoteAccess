@@ -78,7 +78,7 @@ pub enum WindowChromeError {
     InvalidGeometry,
 }
 
-#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) const fn unverified_desktop_capabilities() -> IslandWindowCapabilities {
     IslandWindowCapabilities::NONE
 }

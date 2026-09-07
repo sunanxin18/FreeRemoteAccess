@@ -231,4 +231,35 @@ mod tests {
         wrong_output.output_formats = vec![VideoPixelFormat::Yuv444P8].into_boxed_slice();
         assert!(!wrong_output.matches_exactly(&query));
     }
+
+    #[test]
+    fn avc444_capability_requires_the_exact_h264_profile_and_yuv444_output() {
+        let query = VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc444,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1920, 1080).expect("测试尺寸有效"),
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+        };
+        let capability = VideoDecodeCapability {
+            backend_id: VideoBackendId::new("h264-avc444"),
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc444,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: 8,
+            max_coded_size: PixelSize::new(3840, 2160).expect("测试尺寸有效"),
+            output_formats: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+            requires_bitstream_conversion: false,
+        };
+
+        assert!(capability.matches_exactly(&query));
+        let mut wrong_chroma = capability.clone();
+        wrong_chroma.chroma = ChromaFormat::Yuv420;
+        assert!(!wrong_chroma.matches_exactly(&query));
+        let mut wrong_profile = capability;
+        wrong_profile.profile = VideoProfile::H264Avc420;
+        assert!(!wrong_profile.matches_exactly(&query));
+    }
 }

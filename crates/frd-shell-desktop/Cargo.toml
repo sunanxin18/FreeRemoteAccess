@@ -23,6 +23,9 @@ pollster = "0.4"
 wgpu.workspace = true
 winit.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [

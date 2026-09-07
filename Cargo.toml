@@ -23,9 +23,11 @@ members = [
     "crates/frd-render-wgpu",
     "crates/frd-compositor-wgpu",
     "crates/frd-platform-windows",
+    "crates/frd-platform-macos",
     "crates/frd-ui-egui",
     "crates/frd-shell-desktop",
     "apps/freeremotedesk-windows",
+    "apps/freeremotedesk-macos",
     "tools/frd-legacy-minifb-lab",
     "tools/frd-wgpu-smoke",
     "tools/frd-icon-assets",
@@ -56,7 +58,7 @@ fdk-aac-sys = "0.5"
 frd-wire-rfb = { path = "crates/frd-wire-rfb" }
 frd-protocol-apple = { path = "crates/frd-protocol-apple" }
 
-[dependencies.windows-sys]
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = ["Win32_NetworkManagement_IpHelper"]
 

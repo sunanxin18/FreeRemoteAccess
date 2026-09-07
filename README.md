@@ -27,7 +27,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 客户端平台 | GUI/渲染 | 本地输入 | 安装包 | 当前可连接目标 | 状态与证据 |
 |---|---|---|---|---|---|
 | Windows | winit + egui + wgpu | 键盘、鼠标 | Release binary staging、固定 FFmpeg DLL/manifest/LGPL/对应源码校验已完成；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成；`.github/workflows/build-windows.yml` 已重建为 Rust 1.96、WSL/NASM/x86asm、Main444、Pester、staging/verifier 和 LGPL 对应源码 artifact 的完整托管门禁。Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
-| macOS | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 macOS 15 workspace 编译和安全测试托管门禁；尚无原生平台 shell、Keychain、安装包或真机运行验证，不得把 CI 编译冒充客户端支持。 |
+| macOS | winit + egui + wgpu/Metal | 键盘、鼠标接口已接入；本轮只验收登录与画面 | ad-hoc signed `.app` staging；FFmpeg 8.1.2 arm64 bundle、Info.plist、arm64 Mach-O、`--verify-codec-bundle` 和包结构验证通过 | Windows 原生 RDP | **受限验证**；2026-09-07 在一台授权 Windows 目标完成 macOS 原生 GUI 的 TLS/CredSSP/NLA、证书首次记录、完整桌面首帧、断开、Keychain 密码保存和“最近连接”免重新输入密码重连。输入注入、长时间运行和公证发布仍未覆盖；见 [`macOS RDP GUI 验证`](docs/validation/macos-native-rdp-gui-20260907.md)。 |
 | Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 Ubuntu 24.04 GUI 依赖、workspace 编译和安全测试托管门禁；尚无窗口管理器、Secret Service、安装包或真机运行验证。 |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
 | HarmonyOS NEXT 手机/PC | ArkUI/HUKS 边界设计 | 触控/键鼠计划中 | 计划中 | 尚无 | **计划中**；不是 Android 兼容层，须单独完成 ArkUI、HUKS 和构建 POC |
@@ -38,8 +38,9 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 |---|---|---|
 | Windows native capability probe | **受限验证** | 2026-09-01 在单台 AMD Radeon 780M Windows 主机完成 D3D12 profile 探针；Main/Main10 报告 hardware exact，Main444 明确不可用。证据为 [`windows-video-capabilities-20260901.json`](docs/validation/windows-video-capabilities-20260901.json)，仅证明能力探针，不证明 native decoder 或远端会话首帧；Task 10 复跑结果见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
 | Windows FFmpeg 8.1.2 Main444 software backend | **受限验证** | 固定签名源码构建的 LGPL 动态插件通过离线 Main444 fixture 精确解码；2026-09-04 Windows x86_64 bundle 已启用 NASM/x86asm，并在 2560x1440 及其竖屏方向使用最多两个 frame threads。新 bundle 通过 Main444、PE imports、manifest、LGPL/对应源码、staging、system-owned 安装器与 trusted-install 门禁；macOS/Linux 共用 C bridge 已实现但尚未在对应主机编译验证。证据见 [`Apple HP 延迟验证`](docs/validation/apple-hp-latency-20260904.md)。 |
+| H.264 AVC420/AVC444 FFmpeg software bridge | **开发中** | 2026-09-07 已加入精确 H.264 AVC420/YUV420 与 AVC444/YUV444 能力槽、AVC length-prefixed→Annex-B 转换、独立 YUV420/YUV444 native decoder entrypoint、FFmpeg H.264 decoder/parser 构建开关及 Linux x86/i686、x86_64、arm64 构建脚本；x86 构建要求 NASM/x86asm，arm64 走 FFmpeg AArch64/NEON 内核。Rust/C bridge、native feature compile、2x2 SPS/PPS/IDR synthetic fixture、协议中立 decoder→IronRDP RGBA 适配契约、EGFX handler 到 generation-bound `SurfaceUpdate` 队列及 runtime Reset→generation 提交边界测试通过；YUV420→RGBA 和 YUV444→RGBA 已加入 AArch64 NEON 与 x86 SSE4.1 leaf kernel，标量只作明确不支持 CPU 的回退。Windows/macOS 组合根现在会在固定 FFmpeg bundle 成功加载且能力精确匹配时注入 AVC420 provider，加载失败仍回退 legacy；该注入路径尚无 Windows 真机首帧、持续刷新或恢复证据。AVC444 wire envelope 已按 RFX_AVC444_BITMAP_STREAM 做严格模式/长度校验，并增加显式 `Avc444Decoder`→RGBA→BGRX/SurfaceUpdate 的可注入分发边界和构造期双流 provider；provider 对精确 coded size、顺序复用 decoder 和区域失败保持 fail-closed，但尚未由生产组合根接线。服务器确认、目标架构 bundle 和真实互操作仍 fail-closed。Windows x86/ARM64 包和运行时门禁尚未完成。 |
 | Apple High Performance 真机首帧与输入 | **受限验证** | 2026-09-04 在一台授权 stock Mac 上完成用户名/密码 HP 会话、认证 RTP、HEVC Main444 软件解码、精确 present、鼠标/键盘输入与持续刷新验证；当前候选以 `0x1d` mode 0 请求并真机确认 2560x1440 pixels / 2560x1440 points / 60Hz（scale 1），初始 Message `0x1c=0x0d`，确认会话内降档时只写一次同几何 30Hz `0x1d`，不重启认证、不发送第二个 `0x1c`。Standard/MVS 保持 `0x1c=0x0c`。当前安装候选 SHA-256 为 `6F3368FE16D05246F54DC6713B0CE7EC3F98B5F508F31AEC2E33305F6DDF8E9A`；20.295 秒受限运动负载记录 246 次呈现，Mac 保持 60Hz；该负载不是持续 60-FPS source，不能作为 decoder 最大吞吐或长期网络结论。证据见 [`Apple HP 延迟验证`](docs/validation/apple-hp-latency-20260904.md)。 |
-| macOS / Linux native video backend | **计划中** | 尚无 native decoder、平台 shell 或 package 构建验证。 |
+| macOS / Linux native video backend | **开发中** | macOS bundle 已有签名/路径门禁；Linux 已加入固定架构目录、同一 owner、非 group/other writable、无 symlink 路径门禁，并按依赖顺序以 `RTLD_GLOBAL` 加载 FFmpeg 依赖。对应平台 native FFmpeg bundle、package verifier 与真机运行验证仍未完成。 |
 | Android native video backend | **计划中** | 尚无 MediaCodec bridge、移动端 shell 或 package 构建验证。 |
 | HarmonyOS NEXT native video backend | **计划中** | 必须单独完成 ArkTS/ArkUI 与 native codec bridge POC；不是 Android 兼容层，当前不冒充 build 支持。 |
 
@@ -48,7 +49,8 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | 服务端系统 | 原生服务 | 客户端协议方向 | 当前客户端 | 总体状态 |
 |---|---|---|---|---|
 | macOS | Screen Sharing / Remote Management | 两条隔离的 Apple 路线：Standard（`displayType=0` compatibility）与 High Performance（`displayType=1/2` virtual display） | Windows | **开发中**；Standard 使用实体桌面且不创建虚拟显示，但当前 FreeRemoteDesk adapter 尚未实现或注册。High Performance 的 type-1 实体屏幕置黑仅有用户观察，尚不是 Windows 客户端端到端互操作结论。两条路线的当前阻塞、已知观察和禁止回退边界见 [`Apple 双模式阻塞记录`](docs/validation/apple-dual-mode-blockers-20260901.md) |
-| Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows | **开发中**；私有 adapter 已实现服务器身份验证、TLS、CredSSP/NLA、licensing、activation 与传统 Bitmap/RemoteFX 路径；Windows composition root 现显式注入 `RdpClientPlatformIdentity::Windows`，不再由构建宿主推断协议身份。2026-09-05 在 `44d932b` 上完成 RDP 114、desktop shell 214、dependency boundary 2 项测试和 Windows package/Pester 29 项门禁，均为 0 failed；Release SHA-256 为 `BE298D369BF19B8A528FF71A6E931E2C3DADFA44BB02217C89D3BEED2C1AEB0D`。EGFX、ZGFX、AVC/AVC420/AVC444 均未实现或验证。因没有与当前 Codex 主机分离的授权 Windows 目标或可用本地 guest，live gate 为 `BLOCKED_LIVE`，且不得以 localhost RDP 替代；完整证据见 [`docs/validation/windows-native-rdp.md`](docs/validation/windows-native-rdp.md)，不得要求安装 FreeRemoteDesk 服务端 |
+| Windows | Remote Desktop Services | 独立 `frd-protocol-rdp` + IronRDP 0.17.0 | Windows、macOS | **受限验证**；RDP TLS、CredSSP/NLA、activation、首次自动保存 SHA-256 指纹、相同指纹继续、变化拒绝且不覆盖，以及传统 Bitmap/RemoteFX 首帧与增量已实现。2026-09-07 macOS 原生 GUI 在授权 Windows 目标完成登录、完整桌面显示、断开和 Keychain 保存密码重连；Windows GUI/DPAPI/键鼠本轮仍未完成真机验收，见 [`Windows RDP 验证`](docs/validation/windows-native-rdp.md) 与 [`macOS RDP GUI 验证`](docs/validation/macos-native-rdp-gui-20260907.md) |
+| Windows | Remote Desktop Services | 同一 RDP adapter 的有界无 GUI 探针 | macOS arm64（探针） | **受限验证**；2026-09-07 对独立授权原生 Windows 完成首次指纹记录、相同指纹新进程重连、TLS/CredSSP/NLA、activation、1280×720 完整画面及增量解码；第二次观察约 20 秒、133 次更新、主动断开并回收。探针存储仅用于测试，不证明 macOS 产品 GUI、Keychain、键鼠或安装包；见 [`验证范围`](docs/validation/windows-native-rdp.md) |
 | Linux | 系统或发行版原生 VNC/RFB 服务 | RFB 3.x 及服务端公开扩展 | 尚无 | **计划中**；不得引入配套守护进程 |
 
 ### Windows 客户端连接 macOS 功能明细
@@ -83,7 +85,7 @@ scale-1 合同取代，仅作为 validation 中的历史证据。
 | UDP 媒体传输 | Apple Message 1/2、`0x1c`、SRTP/SRTCP | **受限验证** | 音频和视频 socket 已完成有界真机互操作；长时间网络稳定性未覆盖 |
 | Windows→Mac 麦克风 | Apple Audio Chat / IDS 路径 | **不支持** | 原生用户名密码 HPSS 会话没有已恢复的 Audio Chat 分支；Apple ID 与服务端助手均超出产品边界 |
 | 剪贴板 | 能力边界已预留 | **计划中** | 当前 Windows 产品未完成端到端剪贴板集成 |
-| 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **开发中** | 自动化状态机、非敏感元数据及本机进程唯一凭据库往返已通过；按本矩阵定义，授权 Mac GUI 的 TransportReady 提交与取消保存删除链路尚未完成有界真机验证，见 `docs/validation/windows-secure-login.md` |
+| 动态保存登录信息 | Windows Credential Manager + 非敏感配置 | **开发中** | Windows 客户端的自动化状态机、非敏感元数据及本机凭据库往返已通过，但 Windows 客户端连接原生目标的 GUI 真机提交/重连仍未验收；macOS 客户端的 Keychain GUI 结果单列于 [`macOS RDP GUI 验证`](docs/validation/macos-native-rdp-gui-20260907.md)。 |
 | 文件传输 | 未选择 | **计划中** | 需先确认各原生服务端支持的协议与安全边界 |
 
 当前桌面 frame port 以自身真实 64 MiB 预算签发不透明 generation admission。
@@ -127,28 +129,41 @@ PE subsystem 2；这是构建证据，不是新的 Mac 互操作证据。
 
 | 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
 |---|---|---|---|
-| 服务器身份与 TLS | RDP TLS + 系统信任链 + SHA-256 pin | **开发中** | 已实现系统信任链、主机名、有效期、server-auth/EKU、仅不受信任签发者可显式确认、精确 pin 重连和指纹变化 fail-closed；错误主机、过期/尚未生效、用途错误及畸形证书不可交互覆盖。身份确认及第二次 TLS 验证前不读取用户名/密码。2026-08-29 证据仅限 `frd-protocol-rdp` 单元测试与 workspace 测试，尚无 Windows 真机证书互操作证明 |
-| 账号密码认证 | CredSSP/NLA | **开发中** | 私有 adapter 已实现只允许 NLA/TLS 的 CredSSP、licensing 与 activation 基线；2026-08-29 证据仅限单元/workspace 测试，尚无 Windows 真机登录或会话证明。凭据不得进入 argv、普通配置、日志或抓包 |
-| 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 已有 `freeremotedesk-windows` Release 构建，设计为 BGRX 脏矩形发布；尚无 Windows 真机首帧证据 |
+| 服务器身份与 TLS | RDP TLS + 首次使用信任 + SHA-256 pin | **开发中** | 2026-09-07 首次自动持久化指纹再继续认证；自签名和无 IP SAN 可连接，相同指纹自动继续，变化停止且不覆盖旧记录；保留证书有效期、用途、格式、握手签名与预检后换证校验。macOS 无 GUI 探针已真机通过首次与重连，Windows 产品 GUI/DPAPI 真机门禁仍未完成；见 [`证据`](docs/validation/windows-native-rdp.md) |
+| 账号密码认证 | CredSSP/NLA | **开发中** | 私有 adapter 已实现只允许 NLA/TLS 的 CredSSP、licensing 与 activation 基线；2026-09-07 macOS 无 GUI 探针已完成 Windows 目标认证与激活；Windows 产品客户端尚无本轮真机登录证明。凭据不得进入 argv、普通配置、日志或抓包 |
+| 基础桌面画面 | Raw、Interleaved RLE、RDP 6 Bitmap、RemoteFX | **开发中** | 已有 `freeremotedesk-windows` Release 构建，设计为 BGRX 脏矩形发布；2026-09-07 macOS 无 GUI 探针已解码 Windows 目标完整画面；Windows 产品窗口呈现仍未验收 |
 | 鼠标与键盘 | RDP fast-path input | **开发中** | 已有离线 scan code、物理修饰键、Unicode、鼠标、滚轮和失焦 `ReleaseAll` 覆盖；当前协议中立 `Modifiers` 没有 Caps/Num/Scroll Lock 状态位，锁定状态同步明确延期且本分支不新增公共输入/UI schema；尚未完成产品互操作 |
 | 动态分辨率与多显示器 | Display Control DVC | **开发中** | 已通过现有 viewport 接口实现单主显示器 latest-only 调整，仅在 DVC 打开且服务端能力就绪后宣告，并在精确 reactivation 尺寸确认后切换 generation；多显示器仍不支持。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
-| 现代图形 | EGFX、ZGFX、AVC/AVC420、AVC444 | **计划中** | 均未实现或验证，不得宣告支持；未来只允许作为 RDP adapter 内部解码路径发布现有 `SurfaceUpdate`，不新增 UI |
+| 本地分辨率优先级 | `DisplayIntent` + 物理 viewport | **开发中** | 桌面 shell 默认以当前显示器物理像素规划初始 DesktopSize，允许超过 2560×1440；协议最大尺寸、帧预算和服务端 Display Control 能力决定最终收敛结果。 |
+| 现代图形 | EGFX、ZGFX、AVC/AVC420、AVC444、HEVC | **开发中** | 已固定 IronRDP 0.17 的 EGFX DVC 接缝、完成 H.264 AVC420 codec-neutral/FFmpeg bridge 离线门禁，并建立 H.264 AVC444/YUV444P8 的独立 FFmpeg backend contract；同时加入 handler 到 generation-bound `SurfaceUpdate` 队列、共享 NEON/SSSE3 BGRX leaf kernel 及 Reset→runtime generation 提交边界验证。`RdpProtocolFactory::with_egfx_decoder_provider` 与 `Avc420DecoderProvider` 已提供应用组合根注入边界，要求精确 media factory 与首个 access unit 的 SPS/PPS，注入路径只广告 AVC420/V8，不会误报 AVC444；Windows/macOS 组合根只在固定 FFmpeg bundle 能力精确匹配时尝试注入，失败仍使用 Bitmap/RemoteFX。AVC444 envelope 已严格解析，显式 `Avc444Decoder` 接缝会在安装 decoder 时完成 WireToSurface1→RGBA→BGRX/SurfaceUpdate 分发，并以独立参考模块覆盖 V1/V2 双流区域组合和事务性边界测试，但 production provider/色彩转换、真实 H.264/AVC444/HEVC 互操作及各架构 native fixture 仍未完成。新增 fail-closed 选择器只有在精确 wire profile、decoder、生产互操作和当前协商同时成立时才让 HEVC 排在首位。实现顺序为 AVC420、RemoteFX 优化、AVC444、HEVC；详见 [`RDP EGFX/H.264 验证记录`](docs/validation/rdp-egfx-h264-20260907.md)。未来只允许作为 RDP adapter 内部解码路径发布现有 `SurfaceUpdate`，不新增 UI |
 | 文本剪贴板 | CLIPRDR | **开发中** | CLIPRDR 仅在私有 RDP adapter 内适配 Unicode 文本，并由现有协商能力作产品门控；Windows 平台剪贴板 gate 本分支未启用，文件能力保持关闭，不能宣称端到端剪贴板。2026-08-29 证据仅限 adapter 单元/workspace 测试，无 Windows 真机互操作证明 |
 | Windows→客户端音频 | RDPSND | **开发中** | 已将共同协商的 48 kHz 双声道 16-bit PCM 通过协议中立 `MediaFrame` 端口发布；`wFormatNo` 按客户端公布的共同格式列表索引验证，媒体背压只降级音频，RDP adapter 不打开平台音频设备。2026-08-29 证据仅限单元/workspace 测试，无 Windows 真机互操作证明 |
 | 客户端麦克风、文件、磁盘与设备 | RDPEAI、CLIPRDR 文件、RDPDR | **计划中** | 不在当前 RDP 开发范围，也不新增入口或公共接口；未来必须单独设计并获得批准 |
 
-当前 RDP 开发只适配 FreeRemoteDesk 已有的统一登录、证书确认、画面、键鼠、
+当前 RDP 开发只适配 FreeRemoteDesk 已有的统一登录、证书身份记录、画面、键鼠、
 动态分辨率、文本剪贴板、远程音频、状态与断开接口，以及实现这些接口所必需的
 IronRDP 协议内部要求。IronRDP 的其他能力不属于当前 roadmap；不得为其扩展当前
 UI、公共接口或平台服务，RDP adapter 的本地改动也不得改变或门控 Apple
 HPSS/ARD/MVS 路径。
+
+### macOS 客户端连接 Windows 功能明细
+
+| 功能 | 协议/模块 | 状态 | 验证范围或阻塞点 |
+|---|---|---|---|
+| 原生窗口与远程内容布局 | macOS winit + egui/Metal shell | **受限验证** | 2026-09-07 staged `.app` 保留 traffic lights，控制岛位于标题栏区域，远程桌面占据内容区；包结构、Info.plist、arm64 Mach-O、FFmpeg bundle 和 ad-hoc 签名通过。 |
+| 服务器身份与 TLS | RDP TLS + SHA-256 TOFU pin | **受限验证** | 首次连接显示自签名证书并保存指纹；相同指纹继续；变化时停止自动连接、不覆盖旧 pin。授权目标指纹与主体详情在连接状态栏显示；换证 fail-closed 由离线测试覆盖。 |
+| 账号密码认证与完整桌面 | CredSSP/NLA + Bitmap/RemoteFX + baseline compiler | **受限验证** | 2026-09-07 使用授权 Windows 目标完成 macOS GUI 登录，显示实际 Windows PowerShell 桌面；修复了首批 RDP 局部 bitmap 在完整覆盖前被误当作全屏 baseline 的黑屏问题。 |
+| 保存登录信息 | macOS Keychain + 独立非敏感 profile metadata | **受限验证** | 勾选“在此设备上保存登录信息”后，TransportReady 在后台提交凭据；断开后从“最近连接”选择记录，密码字段自动恢复为隐藏字符并成功重连。Keychain 读取和提交不阻塞窗口；锁定/授权失败会保留表单并提示重新输入。 |
+| 键盘、鼠标、长时间稳定性 | RDP fast-path input / session lifecycle | **开发中** | 本轮只确认远程桌面呈现和连接生命周期；macOS GUI 的完整键鼠、焦点、滚轮、长时间刷新和多目标覆盖尚未作为本矩阵的真机结论。 |
+| 远程分辨率选择 | 协议无关 `DisplayIntent` + 本地显示器物理像素规划；RDP Display Control | **开发中** | 默认优先当前显示器物理分辨率，支持工作区、窗口内容、固定尺寸（含 3840×2160 以上）和服务器管理；IronRDP 16 位字段与 64 MiB 帧预算只作为实际约束，不设 2560×1440 产品上限。高分辨率实机互操作尚未单独验收。 |
 
 ### 客户端与服务端组合
 
 | 客户端 \ 服务端 | macOS 原生服务 | Windows 原生服务 | Linux 原生服务 |
 |---|---|---|---|
 | Windows | **开发中** | **开发中** | **计划中** |
-| macOS | **计划中** | **计划中** | **计划中** |
+| macOS 产品客户端 | **受限验证**；2026-09-07 原生 GUI 完成登录、证书 pin、完整桌面、断开与 Keychain 密码重连，见[`证据`](docs/validation/macos-native-rdp-gui-20260907.md) | **受限验证**；同一 GUI 实测 Windows RDP，输入、长时稳定性和多目标覆盖未完成 | **计划中** |
+| macOS 无 GUI RDP 探针 | **计划中** | **受限验证**；2026-09-07 首次指纹、重连、认证和完整画面解码，见[证据](docs/validation/windows-native-rdp.md) | **计划中** |
 | Linux | **计划中** | **计划中** | **计划中** |
 | Android | **计划中** | **计划中** | **计划中** |
 | HarmonyOS NEXT 手机/PC | **计划中** | **计划中** | **计划中** |

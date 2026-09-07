@@ -273,6 +273,7 @@ impl ProtocolSession for AppleProtocolSession {
                     self.runtime,
                     self.request.session_id,
                     self.request.protocol_id.clone(),
+                    self.request.display_intent,
                 )
             }
             Err(error) => ProtocolExit::Failed(error),
@@ -456,6 +457,7 @@ mod product_profile_tests {
             protocol_id,
             credentials: Some(credentials()),
             saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
         }
     }
 
@@ -986,6 +988,7 @@ mod product_profile_tests {
                 password: password.take(),
             }),
             saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
         };
 
         let error = match super::connect_authenticated(&request) {

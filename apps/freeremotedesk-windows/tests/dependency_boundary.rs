@@ -125,8 +125,11 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
     concrete_imports.sort();
     assert_eq!(
         concrete_imports,
-        vec!["apps/freeremotedesk-windows/src/main.rs".to_owned()],
-        "only the Windows composition root may import concrete protocol adapters"
+        vec![
+            "apps/freeremotedesk-macos/src/main.rs".to_owned(),
+            "apps/freeremotedesk-windows/src/main.rs".to_owned(),
+        ],
+        "only platform composition roots may import concrete protocol adapters"
     );
 
     let main_source =
@@ -143,9 +146,10 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
             .count(),
         2
     );
-    assert_eq!(main_source.matches("RdpProtocolFactory").count(), 2);
-    assert!(main_source
-        .contains("Arc::new(RdpProtocolFactory::new(RdpClientPlatformIdentity::Windows))"));
+    assert_eq!(main_source.matches("RdpProtocolFactory").count(), 3);
+    assert!(main_source.contains("fn rdp_factory() -> Arc<dyn ProtocolFactory>"));
+    assert!(main_source.contains("RdpProtocolFactory::with_egfx_decoder_provider"));
+    assert!(main_source.contains("RdpProtocolFactory::new(platform)"));
     assert_eq!(
         main_source
             .matches("Arc::new(AppleProtocolFactory)")

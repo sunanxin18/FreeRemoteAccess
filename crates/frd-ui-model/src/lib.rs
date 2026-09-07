@@ -7,7 +7,7 @@ pub use chrome::{
     SessionChromeModel, SessionTiming, SessionTimingSource,
 };
 
-use frd_core::{CredentialProviderId, SecretBuffer, TargetSystem};
+use frd_core::{CredentialProviderId, ResolutionMode, SecretBuffer, TargetSystem};
 use frd_platform_api::{ConnectionProfileKey, SavedConnectionProfile};
 use frd_protocol_api::{
     ConnectionStage, ProtocolCatalog, ProtocolId, ProtocolSelection, SessionCapabilities,
@@ -31,6 +31,7 @@ pub struct ConnectionDraft {
     pub port: Option<u16>,
     pub protocol: ProtocolChoice,
     pub username: String,
+    pub resolution_mode: ResolutionMode,
 }
 
 impl Default for ConnectionDraft {
@@ -41,6 +42,7 @@ impl Default for ConnectionDraft {
             port: None,
             protocol: ProtocolChoice::Automatic,
             username: String::new(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         }
     }
 }
@@ -113,6 +115,7 @@ impl ConnectionForm {
             port: Some(profile.key.port()),
             protocol: ProtocolChoice::Explicit(profile.key.protocol().clone()),
             username: profile.key.username().to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         };
         self.password = SecretBuffer::new(Vec::new());
         self.selected_profile = Some(profile.key.clone());
@@ -131,7 +134,12 @@ impl ConnectionForm {
         &mut self,
         original_identity: &ConnectionDraft,
     ) -> bool {
-        if &self.draft == original_identity {
+        let identity_unchanged = self.draft.target_system == original_identity.target_system
+            && self.draft.address == original_identity.address
+            && self.draft.port == original_identity.port
+            && self.draft.protocol == original_identity.protocol
+            && self.draft.username == original_identity.username;
+        if identity_unchanged {
             return false;
         }
         self.selected_profile = None;
@@ -327,7 +335,7 @@ impl Page {
 
 #[cfg(test)]
 mod tests {
-    use frd_core::{SecretBuffer, TargetSystem};
+    use frd_core::{PixelSize, ResolutionMode, SecretBuffer, TargetSystem};
     use frd_platform_api::{ConnectionProfileKey, SavedConnectionProfile};
     use frd_protocol_api::{ProtocolCatalog, ProtocolId};
 
@@ -379,6 +387,7 @@ mod tests {
             port: Some(3389),
             protocol: super::ProtocolChoice::Automatic,
             username: "draft-user".to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         });
         form.set_password(SecretBuffer::new(b"stale-password".to_vec()));
         form.password_visible = true;
@@ -445,6 +454,21 @@ mod tests {
     }
 
     #[test]
+    fn changing_resolution_mode_does_not_invalidate_saved_credentials() {
+        let profile = saved_profile();
+        let mut form = ConnectionForm::new(ConnectionDraft::default());
+        form.select_profile_metadata(&profile);
+        form.set_loaded_password(SecretBuffer::new(b"vault-password".to_vec()));
+        let original_identity = form.draft.clone();
+
+        form.draft.resolution_mode = ResolutionMode::Fixed(PixelSize::new(3840, 2160).unwrap());
+
+        assert!(!form.invalidate_loaded_secret_after_identity_edit(&original_identity));
+        assert_eq!(form.selected_profile.as_ref(), Some(&profile.key));
+        assert!(!form.password_is_empty());
+    }
+
+    #[test]
     fn every_identity_field_edit_clears_profile_association_and_secret() {
         let profile = saved_profile();
         let base = ConnectionDraft {
@@ -453,6 +477,7 @@ mod tests {
             port: Some(profile.key.port()),
             protocol: super::ProtocolChoice::Explicit(profile.key.protocol().clone()),
             username: profile.key.username().to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         };
         let mut edits = Vec::new();
         let mut target = base.clone();
@@ -507,6 +532,7 @@ mod tests {
             port: Some(5900),
             protocol: super::ProtocolChoice::Automatic,
             username: "test-user".to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
         let catalog = ProtocolCatalog::new([
@@ -530,6 +556,7 @@ mod tests {
             port: Some(5900),
             protocol: super::ProtocolChoice::Automatic,
             username: "test-user".to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
         let catalog = ProtocolCatalog::new([
@@ -556,6 +583,7 @@ mod tests {
             port: Some(3389),
             protocol: super::ProtocolChoice::Automatic,
             username: "test-user".to_owned(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         });
         form.set_password(SecretBuffer::new(b"test-password".to_vec()));
         let catalog = ProtocolCatalog::new([

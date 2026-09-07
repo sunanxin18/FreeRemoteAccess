@@ -75,6 +75,9 @@ pub enum VideoProfile {
     H264High,
     /// RDPGFX AVC420 的精确 H.264 4:2:0 profile。
     H264Avc420,
+    /// RDPGFX AVC444 的精确 H.264 4:4:4 profile；仅在独立 wire/profile
+    /// 能力和真实互操作门禁通过后选择。
+    H264Avc444,
     HevcMain,
     HevcMain10,
     HevcMain4448,

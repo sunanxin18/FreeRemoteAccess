@@ -309,6 +309,35 @@ FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
 - Keep user-facing CLI text and comments in Simplified Chinese.
 - Keep protocol changes consistent across modules when touching the pixel contract (`protocol.rs`, `client.rs`, `framebuffer.rs`, `viewer.rs`).
 
+## Multi-Architecture Protocol and Decode Rules
+
+- Every protocol implementation must separate wire semantics, session state, codec
+  contracts, and platform backends. A protocol change is incomplete until its target
+  behavior is considered independently for Windows x86/i686, Windows x86_64/AMD64,
+  Windows ARM64, Linux x86/i686, Linux x86_64/AMD64, Linux ARM64, macOS x86_64, and
+  macOS ARM64; unsupported targets must have an explicit unavailable gate rather than
+  being inferred from another architecture.
+- Production software decoding must use an architecture-appropriate assembly or SIMD
+  implementation for the codec hot path. Reuse a proven upstream implementation such
+  as FFmpeg's x86/x86_64 assembly or AArch64/NEON path when it exists; otherwise add a
+  reviewed, target-specific assembly implementation. A Rust scalar implementation may
+  exist as a reference, deterministic test oracle, or explicitly marked unsupported-CPU
+  fallback, but it must not be the silent production decoder for a supported target.
+- The assembly requirement applies to software H.264, HEVC, RemoteFX, Bitmap/RLE,
+  pixel conversion, and other shipped codec/decode hot paths. It does not require the
+  RDP wire parser, capability negotiation, session state machine, generation handling,
+  or platform window code to be written in assembly; those layers remain portable Rust.
+- Each assembly/SIMD backend must have compile-time architecture guards, runtime feature
+  checks where required, a portable correctness oracle, byte-for-byte or pixel-for-pixel
+  parity tests, and per-target benchmark evidence. x86/i686 and x86_64/AMD64 must not
+  assume the same register width or instruction set; ARM64 must never execute x86 code.
+- Do not advertise a codec merely because a platform has an assembly routine or a local
+  hardware probe. Advertise it only when the exact wire profile, pixel format, decoder
+  backend, target architecture, package/runtime and live interoperability gates all pass.
+- Architecture-specific optimization must stay below the protocol-neutral decoder and
+  `SurfaceUpdate` contracts, so Windows, macOS and Linux shells do not acquire protocol
+  or instruction-set branches.
+
 ## Testing Guidelines
 - Primary framework: Rust built-in test harness via `cargo test`.
 - Place tests in `#[cfg(test)]` modules near implementation unless a dedicated test utility is needed.

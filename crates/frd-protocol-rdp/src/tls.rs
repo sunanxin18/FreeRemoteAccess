@@ -9,15 +9,13 @@ use rustls::client::{ClientConfig, ClientConnection, Resumption};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme, StreamOwned};
-use rustls_platform_verifier::{ConfigVerifierExt, Verifier};
 use x509_cert::der::Decode as _;
 use x509_cert::ext::pkix::ExtendedKeyUsage;
 use x509_cert::Certificate;
 
 use crate::error::{rdp_error, RDP_SERVER_IDENTITY_CHANGED, RDP_TLS_FAILED};
 use crate::server_identity::{
-    fingerprint_sha256, AcceptedServerIdentity, ObservedServerIdentity, PlatformValidationFailure,
-    SanitizedCertificateNames,
+    fingerprint_sha256, AcceptedServerIdentity, ObservedServerIdentity, SanitizedCertificateNames,
 };
 
 pub(crate) type TlsStream = StreamOwned<ClientConnection, TcpStream>;
@@ -54,7 +52,6 @@ impl VerifiedTlsTransport {
 
 #[derive(Debug)]
 struct PreflightVerifier {
-    platform: Verifier,
     provider: Arc<CryptoProvider>,
     observation: Arc<Mutex<Option<ObservedServerIdentity>>>,
 }
@@ -63,34 +60,16 @@ impl ServerCertVerifier for PreflightVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
+        _intermediates: &[CertificateDer<'_>],
         server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
+        _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let platform_validation = match self.platform.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        ) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let failure = PlatformValidationFailure::from_rustls(error);
-                if failure.is_unknown_issuer() {
-                    match validate_untrusted_leaf_requirements(end_entity, server_name, now) {
-                        Ok(()) => Err(failure),
-                        Err(error) => Err(PlatformValidationFailure::from_rustls(error)),
-                    }
-                } else {
-                    Err(failure)
-                }
-            }
-        };
+        // 首次使用信任以端点和证书指纹识别服务器；不要求公共 CA 或名称 SAN。
+        let leaf_validation = validate_pinned_leaf_requirements(end_entity, server_name, now);
         let observed = ObservedServerIdentity {
             fingerprint: fingerprint_sha256(end_entity.as_ref()),
-            platform_validation,
+            leaf_validation,
             names: certificate_names(end_entity.as_ref()),
         };
         *self.observation.lock().map_err(|_| {
@@ -159,7 +138,7 @@ impl ServerCertVerifier for ExactPinVerifier {
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
-        validate_untrusted_leaf_requirements(end_entity, server_name, now)?;
+        validate_pinned_leaf_requirements(end_entity, server_name, now)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -203,13 +182,11 @@ pub(crate) fn credential_free_preflight(
     endpoint: &Endpoint,
 ) -> Result<ObservedServerIdentity, ProtocolError> {
     let observation = Arc::new(Mutex::new(None));
-    let mut config = platform_client_config()?;
+    let mut config = preflight_client_config()?;
     let provider = config.crypto_provider().clone();
-    let platform = Verifier::new(provider.clone()).map_err(|_| tls_error())?;
     config
         .dangerous()
         .set_certificate_verifier(Arc::new(PreflightVerifier {
-            platform,
             provider,
             observation: observation.clone(),
         }));
@@ -229,33 +206,24 @@ pub(crate) fn establish_verified_tls(
     endpoint: &Endpoint,
     accepted_identity: &AcceptedServerIdentity,
 ) -> Result<VerifiedTlsTransport, ProtocolError> {
-    let (config, exact_pin_mismatch) = match accepted_identity {
-        AcceptedServerIdentity::SystemTrusted { .. } => (platform_client_config()?, None),
-        AcceptedServerIdentity::ExactPin { fingerprint } => {
-            let provider = configured_crypto_provider();
-            let mismatch = Arc::new(AtomicBool::new(false));
-            let mut config = ClientConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
-                .map_err(|_| tls_error())?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(ExactPinVerifier {
-                    fingerprint: *fingerprint,
-                    provider,
-                    mismatch: mismatch.clone(),
-                }))
-                .with_no_client_auth();
-            config.resumption = Resumption::disabled();
-            config.enable_early_data = false;
-            (config, Some(mismatch))
-        }
-    };
+    let AcceptedServerIdentity::ExactPin { fingerprint } = accepted_identity;
+    let provider = configured_crypto_provider();
+    let mismatch = Arc::new(AtomicBool::new(false));
+    let mut config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|_| tls_error())?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ExactPinVerifier {
+            fingerprint: *fingerprint,
+            provider,
+            mismatch: mismatch.clone(),
+        }))
+        .with_no_client_auth();
+    config.resumption = Resumption::disabled();
+    config.enable_early_data = false;
     let tls = match complete_handshake(stream, endpoint, config) {
         Ok(tls) => tls,
-        Err(_)
-            if exact_pin_mismatch
-                .as_ref()
-                .is_some_and(|mismatch| mismatch.load(Ordering::Acquire)) =>
-        {
+        Err(_) if mismatch.load(Ordering::Acquire) => {
             return Err(rdp_error(RDP_SERVER_IDENTITY_CHANGED));
         }
         Err(error) => return Err(error),
@@ -272,8 +240,12 @@ pub(crate) fn establish_verified_tls(
     })
 }
 
-fn platform_client_config() -> Result<ClientConfig, ProtocolError> {
-    let mut config = ClientConfig::with_platform_verifier().map_err(|_| tls_error())?;
+fn preflight_client_config() -> Result<ClientConfig, ProtocolError> {
+    let mut config = ClientConfig::builder_with_provider(configured_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|_| tls_error())?
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
     config.resumption = Resumption::disabled();
     config.enable_early_data = false;
     Ok(config)
@@ -310,13 +282,12 @@ fn certificate_names(leaf_der: &[u8]) -> SanitizedCertificateNames {
     }
 }
 
-fn validate_untrusted_leaf_requirements(
+fn validate_pinned_leaf_requirements(
     end_entity: &CertificateDer<'_>,
-    server_name: &ServerName<'_>,
+    _server_name: &ServerName<'_>,
     now: UnixTime,
 ) -> Result<(), rustls::Error> {
-    let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
-    rustls::client::verify_server_name(&parsed, server_name)?;
+    rustls::server::ParsedCertificate::try_from(end_entity)?;
 
     let certificate = Certificate::from_der(end_entity.as_ref())
         .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
@@ -354,7 +325,7 @@ fn validate_untrusted_leaf_requirements(
         !usages.0.iter().any(|usage| {
             matches!(
                 usage.to_string().as_str(),
-                "1.3.6.1.5.5.7.3.1" | "2.5.29.37.0"
+                "1.3.6.1.5.5.7.3.1" | "1.3.6.1.4.1.311.54.1.2" | "2.5.29.37.0"
             )
         })
     }) {
@@ -392,32 +363,52 @@ mod tests {
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{CertificateError, Error};
 
-    use super::{
-        configured_crypto_provider, validate_untrusted_leaf_requirements, ExactPinVerifier,
-    };
+    use super::{configured_crypto_provider, validate_pinned_leaf_requirements, ExactPinVerifier};
     use crate::server_identity::fingerprint_sha256;
 
     const TEST_NOW: UnixTime = UnixTime::since_unix_epoch(Duration::from_secs(1_767_225_600));
 
     #[test]
-    fn certificate_wrong_host_fixture_is_not_overridable() {
+    fn exact_pin_allows_windows_certificate_without_matching_ip_san() {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(2030, 1, 1);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let certificate = certificate.der();
+        let verifier = ExactPinVerifier {
+            fingerprint: fingerprint_sha256(certificate.as_ref()),
+            provider: configured_crypto_provider(),
+            mismatch: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(verifier
+            .verify_server_cert(
+                certificate,
+                &[],
+                &ServerName::try_from("192.0.2.1").unwrap(),
+                &[],
+                TEST_NOW,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn certificate_accepts_native_remote_desktop_authentication_eku() {
         let certificate = certificate_fixture(
-            "other.test",
+            "rdp.test",
             (2020, 1, 1),
             (2030, 1, 1),
-            vec![ExtendedKeyUsagePurpose::ServerAuth],
+            vec![ExtendedKeyUsagePurpose::Other(vec![
+                1, 3, 6, 1, 4, 1, 311, 54, 1, 2,
+            ])],
         );
-
-        assert!(matches!(
-            validate_untrusted_leaf_requirements(
-                &certificate,
-                &ServerName::try_from("rdp.test").expect("valid server name"),
-                TEST_NOW,
-            ),
-            Err(Error::InvalidCertificate(
-                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
-            ))
-        ));
+        assert!(validate_pinned_leaf_requirements(
+            &certificate,
+            &ServerName::try_from("192.0.2.1").unwrap(),
+            TEST_NOW,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -430,7 +421,7 @@ mod tests {
         );
 
         assert!(matches!(
-            validate_untrusted_leaf_requirements(
+            validate_pinned_leaf_requirements(
                 &certificate,
                 &ServerName::try_from("rdp.test").expect("valid server name"),
                 TEST_NOW,
@@ -449,7 +440,7 @@ mod tests {
         );
 
         assert!(matches!(
-            validate_untrusted_leaf_requirements(
+            validate_pinned_leaf_requirements(
                 &certificate,
                 &ServerName::try_from("rdp.test").expect("valid server name"),
                 TEST_NOW,
@@ -468,7 +459,7 @@ mod tests {
         );
 
         assert!(matches!(
-            validate_untrusted_leaf_requirements(
+            validate_pinned_leaf_requirements(
                 &certificate,
                 &ServerName::try_from("rdp.test").expect("valid server name"),
                 TEST_NOW,

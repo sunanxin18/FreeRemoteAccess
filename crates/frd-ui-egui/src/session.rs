@@ -24,7 +24,19 @@ pub fn show_session_page(
         } => show_pending_connection(ui, stage, diagnostics.as_deref()),
         AppPage::Disconnecting { .. } | AppPage::RemoteSession { .. } => None,
         AppPage::Failed { code, .. } => {
-            ui.heading("连接失败");
+            match code.as_str() {
+                "rdp_server_identity_changed" => {
+                    ui.heading("服务器证书已变化");
+                    ui.label("已停止自动连接，并保留原证书指纹。请核实远程计算机的身份。");
+                }
+                "rdp_identity_store_failed" => {
+                    ui.heading("无法保存或读取服务器证书");
+                    ui.label("证书记录不可用，已停止连接。请检查本机存储后重试。");
+                }
+                _ => {
+                    ui.heading("连接失败");
+                }
+            }
             ui.label(format!("错误代码：{code}"));
             ui.button("返回连接页")
                 .clicked()

@@ -1,10 +1,115 @@
-# Windows 原生 RDP 离线验证记录（更新于 2026-09-05）
+# Windows 原生 RDP 验证记录（更新于 2026-09-07）
 
 ## 范围与结论
 
-本记录只覆盖 Windows 客户端的离线测试、依赖边界审计和本机构建。它不构成
-Windows Remote Desktop Services 的真机登录、首帧、键鼠、证书、NLA、剪贴板、音频或
-Display Control 互操作证明。因此 README 中 Windows RDP 仍为 **开发中**。
+本记录覆盖历史 Windows 客户端离线门禁，以及 2026-09-07 macOS arm64 无 GUI
+探针对独立原生 Windows 目标的有界互操作。最新 TOFU 候选已完成首次指纹保存、
+相同指纹重连、TLS/CredSSP/NLA、activation 与完整画面解码。
+Windows 产品 GUI、键鼠和窗口呈现未在本轮真机验收，产品状态仍为 **开发中**；
+macOS 无 GUI adapter 的以下具体范围为 **受限验证**。
+
+## 当前图形能力边界
+
+当前 RDP adapter 默认只启用传统 Bitmap/RemoteFX 图形基线。非敏感
+`RdpGraphicsCapability` 诊断固定记录 `legacy_bitmap=true`、`remotefx=true`，并将
+`egfx_advertised`、`egfx_confirmed`、`avc420` 与 `avc444` 设为 `false`。因此当前
+会话没有广告或启用 RDPGFX、H.264/AVC 或 HEVC；本记录中的 Bitmap/RemoteFX 结果不
+构成现代图形编码的互操作证据。工作树已加入独立的 IronRDP EGFX DVC 接缝和
+codec-neutral H.264 AVC420/FFmpeg bridge，但它们仍未由 RDP connector 注册为默认能力。
+
+2026-09-07 的离线 H.264 门禁覆盖精确 `H264Avc420/Yuv420P8` 能力匹配、四字节
+AVC length-prefixed NAL 到 Annex-B 的一次性转换、YUV420 三平面尺寸校验、FFmpeg
+H.264 decoder/parser 构建选项，以及 Linux x86/i686、x86_64/arm64 bundle 脚本。FFmpeg 插件
+ABI 的 codec capability 槽为零时会拒绝旧插件；native C bridge 在本机 FFmpeg 头文件
+下完成语法检查和 `native-ffmpeg` cargo check。EGFX handler 已通过离线测试把已映射
+AVC420 RGBA 更新转换为 generation-bound `SurfaceUpdate` 队列；协议中立 YUV420 decoder
+到 IronRDP RGBA 的适配契约也已加入严格的能力、长度前缀、generation 和单帧门禁；EGFX
+Reset 到 runtime generation admission 的消费边界也已通过离线测试，但尚未由生产 connector 注册，也没有 fixture 解码或 Windows 真机
+H.264 互操作证据；Windows x86/ARM64 的 package/runtime gate 仍明确为 unavailable。
+
+现代图形的实现顺序固定为 AVC420、RemoteFX 优化、AVC444、HEVC。HEVC 即使先有
+本地解码能力，也必须等到真实生产互操作门禁通过并被服务端实际协商后，才可以成为
+生产选择器的首选；在此之前继续使用传统回退路径。
+
+## 2026-09-07：首次自动记录证书候选通过有界互操作
+
+用户指定首次自动信任并保存、指纹变化停止自动连接后，在 `9c9f6db` 加本次工作树
+变更的候选上复测。依赖仍为 IronRDP 0.17.0，客户端身份为 Macintosh。
+现行规则见 [首次证书设计](../superpowers/specs/2026-09-07-rdp-first-use-certificate-design.md)。
+用户凭据经非回显终端父进程和匿名 stdin 管道提供，未进入 argv、文件或日志。
+探针专用指纹位于本地忽略的 `target/rdp-tofu-live-pins`，只保存证书 SHA-256，
+不替代 Windows 当前用户 DPAPI 存储，也不声明 macOS GUI 已实现平台凭据服务。
+
+| 真机步骤 | 实际结果 |
+|---|---|
+| 第一次连接 | `Unknown`；自动保存指纹后进入 `TransportReady` 与 activation，1280×720；57 个 frame boundary、1 个 FullBaseline、57 个 patch、20,197,376 decoded bytes |
+| 第一次清理 | `exit=closed cleanup=joined`，进程退出码 0。会话在计划观察上限前结束；本探针没有记录对端正常关闭的进一步原因，不把它计作完整 20 秒观察 |
+| 第二次连接 | 新进程读取同一指纹记录，`PinMatched`；自动继续认证与 activation，1280×720；133 个 frame boundary、1 个 FullBaseline、133 个 patch、41,082,880 decoded bytes |
+| 第二次清理 | 首帧后约 20 秒发送 `Disconnect`，`exit=closed cleanup=joined`，进程退出码 0 |
+| 指纹变化 | 确定性协议/应用/存储测试证明拒绝且不覆盖旧 pin；未修改真实服务器证书 |
+
+frame boundary 数是 decoder 发布次数，不等同于显示帧率。首个 boundary 为
+Incremental，此后覆盖累积到 1 个 FullBaseline；没有把首个局部更新误记为完整首帧。
+该结果验证协议认证和像素解码，不证明 GUI 呈现、颜色观感、输入、音频、剪贴板、
+动态分辨率、长期稳定性或 Windows 客户端包。
+
+离线集成命令：
+
+```text
+cargo test --locked -p frd-protocol-rdp -p frd-app -p frd-platform-windows -p frd-shell-desktop -p frd-ui-egui
+cargo build --locked -p frd-protocol-rdp --example bounded_live_probe
+cargo fmt --all -- --check
+git diff --check
+```
+
+Rust 1.96.0 下 RDP 115、应用 80、平台 26、桌面 shell 204、egui 34 项通过，
+合计 459 项、0 failed。平台测试覆盖跨平台文件发布逻辑，Windows DPAPI 条件编译
+测试未在 macOS 运行。标题栏详情沿用已测试的键盘聚焦 tooltip 与无障碍路径；
+本轮没有 Windows 打包 GUI 的缩放/主题视觉复验，不能宣称完整 GUI 验收。
+
+额外执行根包 `cargo test --locked`，在 macOS arm64 链接失败：未改动的
+`src/arp.rs` 引用 Windows `SendARP` 符号。本次没有修改该既有平台限制，
+不把根包全量测试报告为通过；上述 459 项相关 crate 测试独立通过。
+
+## 2026-09-07 历史尝试：独立目标可达，旧策略在 TLS 阶段阻塞
+
+实现基线为 `9c9f6db`，客户端执行环境为 macOS arm64，Rust 1.96.0。
+本轮用户已提供独立 Windows 目标及测试授权；目标、账号、密码和证书内容不写入
+本记录。历史“没有独立授权目标”的前提已不适用于此次 macOS 探针，但 Windows
+产品 GUI 的真机门禁仍未完成。
+
+| 验证项 | 实际结果 |
+|---|---|
+| 网络 | 目标 TCP 3389 连接成功 |
+| 独立无凭据协议观察 | RDP negotiation 选择 HYBRID（值 2，即 NLA/CredSSP）；TLS 1.3 握手成功。该观察连接未发送认证或桌面会话数据 |
+| 证书观察 | 自签名叶证书，只有 CN，未包含 Subject Alternative Name；有效期为 2026-08-27 至 2027-02-26。按 IP 连接缺少可匹配的 IP SAN |
+| 实际产品 adapter | `RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)` 经现有 runtime 执行，输出 `Connecting` 后返回 `rdp_tls_failed`；未发布可交互身份挑战 |
+| 首帧和清理 | `frames=0 full_baselines=0 patches=0 decoded_bytes=0 cleanup=joined`，探针退出码 1 |
+| 认证、画面、输入 | 未进入凭据认证；密码正确性、activation、首帧、刷新、键鼠均未验证 |
+
+该次尝试的旧实现仅允许“未知签发者且主机名、有效期、用途检查通过”的证书显式确认。
+观察到的无 IP SAN 证书与这一规则不兼容；adapter 只暴露统一 `rdp_tls_failed`，
+没有进一步公开 macOS 信任库的底层错误，因此不把观察推断表述为底层错误日志。
+本轮未绕过 TLS 策略、安装证书、修改服务器设置或实现其他认证路径。
+
+新增 `crates/frd-protocol-rdp/examples/bounded_live_probe.rs` 作为可复用探针，
+只经匿名 stdin 管道读取主机、用户名和密码；终端父进程使用非回显输入，凭据不进入
+argv、文件或日志。若收到允许确认的身份挑战，必须显式输入匹配本次摘要的
+`trust-once <SHA256>`，否则拒绝。此次未出现挑战，未执行信任决定。
+探针最多观察 60 秒，首帧后最多 20 秒，随后断开并最多等待 15 秒清理；
+不发送输入或剪贴板写入，不播放音频，不证明 GUI 渲染。
+
+已运行 `cargo test --locked -p frd-protocol-rdp`：113 passed、0 failed、0 ignored，
+另有 0 项文档测试；探针构建、`cargo fmt --all -- --check` 与 `git diff --check`
+均通过。探针构建命令为
+`cargo build --locked -p frd-protocol-rdp --example bounded_live_probe`。
+初次工具链调用错误地使用
+Homebrew rustc 1.87，因依赖 MSRV 被拒绝；显式前置项目 Rust 1.96.0 工具链路径后
+完成构建与测试，未修改依赖锁文件。
+
+该旧候选的结论为 **TLS 身份阶段阻塞**，不构成 IronRDP 远程 Windows 成功验证。其后继续完整
+门禁需要目标提供与连接地址匹配、满足当前验证规则的证书，或另行设计审查兼容
+Windows 原生自签名证书的明确身份信任方案；不能把本次失败解释为账号密码错误。
 
 ## 2026-09-05 平台身份正交化与交付门禁
 
@@ -71,10 +176,13 @@ Invoke-Pester -Script tools/tests/windows-package.Tests.ps1 -EnableExit
 
 ### 当前图形范围与 Windows 包
 
-当前已实现的传统图形基线仅为 Raw Bitmap、Interleaved RLE、RDP 6 Bitmap
-compression 与 RemoteFX，统一发布 BGRX dirty rectangles。当前代码和本轮门禁均不
-构成 RDPGFX/EGFX、ZGFX、AVC/AVC420 或 AVC444 的实现或互操作证据，不得作出这些
-能力声明。
+当前已实现并默认启用的传统图形基线仅为 Raw Bitmap、Interleaved RLE、RDP 6 Bitmap
+compression 与 RemoteFX，统一发布 BGRX dirty rectangles。EGFX DVC 接缝、H.264
+AVC420 FFmpeg bridge 和 handler 到 generation-bound `SurfaceUpdate` 队列已在协议中立
+层建立，并增加了未注册的协议中立 decoder 适配契约，但尚未由生产 connector 注册、提交给 runtime、默认广告能力，或完成真实
+RDPGFX/EGFX、ZGFX、AVC/AVC420、AVC444 互操作；当前 AVC444 仅有规范结构 envelope
+校验和 fail-closed 拒绝测试，双流重建、色彩转换和服务器确认仍未完成；不得作出现代
+图形已支持的声明。
 
 `cargo build --locked --release -p freeremotedesk-windows` 产生
 42,824,704-byte 的 `target/release/freeremotedesk-windows.exe`，SHA-256 为
@@ -122,7 +230,9 @@ CLIPRDR，以及 48 kHz
 双声道 PCM RDPSND 发布。离线测试断言 pinned IronRDP 的 outgoing capability 列表仅含
 Phase-1 RemoteFX codec；传统图形基线为 Raw、Interleaved RLE、RDP 6 Bitmap 和
 RemoteFX。
-EGFX、ZGFX、AVC/AVC420 与 AVC444 均未实现或验证，不得因本次构建而作出支持声明。
+EGFX、ZGFX、AVC/AVC420 与 AVC444 均未完成生产互操作，不得因本次构建而作出支持声明。
+当前 AVC444 仅有规范结构 envelope 校验和 fail-closed 拒绝测试，双流重建、色彩转换
+和服务器确认仍未完成。
 未纳入当前范围的其他能力仍为：RDPDR/文件/磁盘/设备、AUDIN/客户端麦克风、网关、
 智能卡、打印机和多显示器。
 

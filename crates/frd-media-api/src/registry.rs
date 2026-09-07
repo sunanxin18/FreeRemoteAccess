@@ -186,6 +186,34 @@ mod tests {
     }
 
     #[test]
+    fn hevc_main444_capability_requires_every_exact_decoder_field() {
+        let query = main444_query();
+        let capability = main444_capability("ffmpeg-software");
+
+        assert!(capability.matches_exactly(&query));
+
+        let mut wrong_codec = capability.clone();
+        wrong_codec.codec = VideoCodec::H264;
+        assert!(!wrong_codec.matches_exactly(&query));
+
+        let mut wrong_profile = capability.clone();
+        wrong_profile.profile = VideoProfile::HevcMain10;
+        assert!(!wrong_profile.matches_exactly(&query));
+
+        let mut wrong_chroma = capability.clone();
+        wrong_chroma.chroma = ChromaFormat::Yuv420;
+        assert!(!wrong_chroma.matches_exactly(&query));
+
+        let mut wrong_bit_depth = capability.clone();
+        wrong_bit_depth.bit_depth = 10;
+        assert!(!wrong_bit_depth.matches_exactly(&query));
+
+        let mut wrong_output = capability;
+        wrong_output.output_formats = vec![VideoPixelFormat::P010].into_boxed_slice();
+        assert!(!wrong_output.matches_exactly(&query));
+    }
+
+    #[test]
     fn registry_selects_only_an_exact_h264_avc420_capability() {
         let registry = VideoDecoderRegistry::new(vec![fake_factory(
             "h264-avc420",

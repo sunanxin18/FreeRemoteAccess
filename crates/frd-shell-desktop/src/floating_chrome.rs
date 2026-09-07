@@ -289,6 +289,28 @@ impl ChromeHitMap {
         Some(self)
     }
 
+    pub(crate) fn restrict_remote_content(mut self, content: PixelRect) -> Option<Self> {
+        let bounds = content.checked_bounds()?;
+        let original = self.remote_content.checked_bounds()?;
+        if content.x < self.remote_content.x
+            || content.y < self.remote_content.y
+            || bounds.1.x > original.1.x
+            || bounds.1.y > original.1.y
+        {
+            return None;
+        }
+        if content.y > self.remote_content.y {
+            self.native_chrome.push(ChromeRect {
+                x: content.x,
+                y: self.remote_content.y,
+                width: content.width,
+                height: content.y - self.remote_content.y,
+            });
+        }
+        self.remote_content = content;
+        Some(self)
+    }
+
     pub fn action_rect(&self, action: IslandAction) -> Option<ChromeRect> {
         self.island_actions
             .iter()
@@ -366,6 +388,28 @@ impl ChromeGeometrySnapshot {
     pub fn with_window_capabilities(mut self, capabilities: IslandWindowCapabilities) -> Self {
         self.window_capabilities = capabilities;
         self
+    }
+
+    /// 原生标题栏中的固定控件；绘制和输入共享标题栏下方的远程矩形。
+    pub fn titlebar_layouts(mut self) -> Option<ChromeLayouts> {
+        let inset = self.native.leading_px.max(self.native.trailing_px);
+        self.native = NativeChromeInsets {
+            leading_px: inset,
+            trailing_px: inset,
+        };
+        let mut layouts = self.layouts(ControlIslandPlacement::default(), true)?;
+        let height = layouts.overlay.island_rect?.height;
+        layouts.remote.content_rect.y = height;
+        layouts.remote.content_rect.height = self.window_size.height.checked_sub(height)?;
+        if layouts.remote.content_rect.height == 0 {
+            return None;
+        }
+        layouts.overlay.island_reposition_handle = None;
+        layouts.hit_map.island_reposition_handle = None;
+        layouts.hit_map = layouts
+            .hit_map
+            .restrict_remote_content(layouts.remote.content_rect)?;
+        Some(layouts)
     }
 
     pub fn layouts(
@@ -606,6 +650,37 @@ mod tests {
         ControlIslandPlacement, ControlIslandState, FloatingChromeController,
     };
     use crate::window_chrome::{ChromeRect, NativeChromeInsets};
+
+    #[test]
+    fn native_titlebar_excludes_remote_pixels_and_stays_centered_at_retina_scale() {
+        let snapshot = ChromeGeometrySnapshot::new(
+            2200,
+            1400,
+            2.0,
+            NativeChromeInsets {
+                leading_px: 160,
+                trailing_px: 0,
+            },
+        )
+        .unwrap();
+        let layouts = snapshot.titlebar_layouts().unwrap();
+        let island = layouts.overlay.island_rect.unwrap();
+        assert_eq!(island.center().0, 1100);
+        assert_eq!(layouts.remote.content_rect.y, island.height);
+        assert_eq!(
+            layouts.remote.content_rect.height + layouts.remote.content_rect.y,
+            1400
+        );
+        assert_eq!(
+            layouts.hit_map.hit_test((0, 0)),
+            Some(ChromeHitTarget::NativeChrome)
+        );
+        assert_eq!(
+            layouts.hit_map.hit_test((0, island.height)),
+            Some(ChromeHitTarget::RemoteContent)
+        );
+        assert!(layouts.overlay.island_reposition_handle.is_none());
+    }
 
     #[test]
     fn chrome_overlay_layout_keeps_the_original_public_field_set() {

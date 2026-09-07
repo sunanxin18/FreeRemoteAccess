@@ -2,6 +2,7 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 use frd_core::{PixelSize, SessionId};
+use frd_frame::SurfaceUpdate;
 use frd_protocol_api::{
     ProtocolError, ProtocolExit, ProtocolRuntime, SessionCapabilities, SessionEvent,
 };
@@ -20,8 +21,9 @@ use ironrdp::session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOu
 use crate::audio::{self, RdpAudioAdapter};
 use crate::baseline::RdpBaseline;
 use crate::clipboard::{self, ClipboardServiceAction};
-use crate::connector::ActivatedRdpSession;
+use crate::connector::{ActivatedRdpSession, RdpGraphicsCapability};
 use crate::display::{DisplayControlAdapter, DisplayControlCapabilityState, ResizeConfirmation};
+use crate::egfx::EgfxAdapter;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED};
 use crate::input::RdpInputState;
 use crate::runtime::{
@@ -57,7 +59,13 @@ fn run_active_session_inner(
         transport,
         audio,
         display_capabilities,
+        mut graphics_capability,
     } = session;
+    debug_assert!(
+        graphics_capability.legacy_bitmap && graphics_capability.remotefx,
+        "RDP activation must retain the legacy fallback"
+    );
+    debug_assert!(!graphics_capability.avc444);
     let (framed, _server_public_key) = transport.into_parts();
     let mut writer = OrderedRdpWriter::new(framed);
     if writer
@@ -137,6 +145,7 @@ fn run_active_session_inner(
         &mut display,
         &display_capabilities,
         &audio,
+        &mut graphics_capability,
         &mut published_capabilities,
         &activation_factory,
     );
@@ -170,6 +179,7 @@ fn run_active_loop(
     display: &mut DisplayControlAdapter,
     display_capabilities: &DisplayControlCapabilityState,
     audio: &RdpAudioAdapter,
+    graphics_capability: &mut RdpGraphicsCapability,
     published_capabilities: &mut SessionCapabilities,
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<(), ProtocolError> {
@@ -337,8 +347,47 @@ fn run_active_loop(
                 }
             }
         }
+        publish_egfx_surface_updates(
+            runtime,
+            session_id,
+            generation,
+            drain_egfx_surface_updates(active_stage),
+        )?;
+        observe_egfx_confirmation(active_stage, graphics_capability);
         service_optional_channels(active_stage, writer, runtime, display, audio, Vec::new())?;
     }
+}
+
+fn observe_egfx_confirmation(
+    active_stage: &mut ActiveStage,
+    graphics_capability: &mut RdpGraphicsCapability,
+) {
+    let Some(adapter) = active_stage
+        .get_dvc::<EgfxAdapter>()
+        .and_then(|channel| channel.channel_processor_downcast_ref::<EgfxAdapter>())
+    else {
+        return;
+    };
+
+    apply_egfx_confirmation(
+        graphics_capability,
+        adapter.is_active(),
+        adapter.avc420_confirmed(),
+        adapter.avc444_confirmed(),
+    );
+}
+
+fn apply_egfx_confirmation(
+    graphics_capability: &mut RdpGraphicsCapability,
+    egfx_confirmed: bool,
+    avc420_confirmed: bool,
+    avc444_confirmed: bool,
+) {
+    graphics_capability.egfx_confirmed = egfx_confirmed;
+    graphics_capability.avc420 =
+        graphics_capability.egfx_advertised && egfx_confirmed && avc420_confirmed;
+    graphics_capability.avc444 =
+        graphics_capability.egfx_advertised && egfx_confirmed && avc444_confirmed;
 }
 
 fn refresh_optional_capabilities(
@@ -499,6 +548,43 @@ fn route_active_outputs<S: std::io::Write>(
         }
     }
     Ok(control)
+}
+
+fn drain_egfx_surface_updates(active_stage: &mut ActiveStage) -> Vec<SurfaceUpdate> {
+    active_stage
+        .get_dvc::<EgfxAdapter>()
+        .and_then(|channel| channel.channel_processor_downcast_ref::<EgfxAdapter>())
+        .map(EgfxAdapter::drain_surface_updates)
+        .unwrap_or_default()
+}
+
+fn publish_egfx_surface_updates(
+    runtime: &mut ProtocolRuntime,
+    session_id: SessionId,
+    generation: &mut u64,
+    updates: Vec<SurfaceUpdate>,
+) -> Result<(), ProtocolError> {
+    for update in updates {
+        match update {
+            SurfaceUpdate::Reset {
+                session_id: update_session,
+                generation: update_generation,
+                size,
+                format,
+            } => {
+                if update_session != session_id {
+                    return Err(ProtocolError::StaleSession);
+                }
+                if update_generation <= *generation {
+                    return Err(ProtocolError::InvalidGeneration);
+                }
+                runtime.begin_generation(update_session, update_generation, size, format)?;
+                *generation = update_generation;
+            }
+            update => runtime.publish_surface(update)?,
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -838,7 +924,7 @@ mod tests {
         InputEvent, KeyState, Modifiers, PhysicalKeyCode, PhysicalViewport, PixelRect, PixelSize,
         SessionId,
     };
-    use frd_frame::{FrameCompleteness, SurfaceUpdate};
+    use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
     use frd_media_api::{MediaFrame, MediaPublishError, MediaPublisher};
     use frd_protocol_api::{
         ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionCapabilities,
@@ -853,16 +939,18 @@ mod tests {
 
     use crate::audio::RdpAudioAdapter;
     use crate::baseline::RdpBaseline;
+    use crate::connector::{baseline_graphics_capabilities, RdpGraphicsCapability};
     use crate::display::DisplayControlAdapter;
     use crate::input::RdpInputState;
     use crate::writer::OrderedRdpWriter;
 
     use super::{
-        apply_reactivation_outcome, commit_reactivated_surface, fast_path_input_batches,
-        finalize_reactivated_surface, publish_active_input_capabilities, publish_graphics_update,
-        resume_active_input_capabilities, route_active_outputs, send_pending_resize,
-        stop_and_drain_audio, suspend_active_input_capabilities, ActiveOutputControl,
-        DisplayRetryState, ReactivationOutcome, ReactivationSurfaceDisposition,
+        apply_egfx_confirmation, apply_reactivation_outcome, commit_reactivated_surface,
+        fast_path_input_batches, finalize_reactivated_surface, publish_active_input_capabilities,
+        publish_egfx_surface_updates, publish_graphics_update, resume_active_input_capabilities,
+        route_active_outputs, send_pending_resize, stop_and_drain_audio,
+        suspend_active_input_capabilities, ActiveOutputControl, DisplayRetryState,
+        ReactivationOutcome, ReactivationSurfaceDisposition,
     };
 
     #[test]
@@ -892,6 +980,35 @@ mod tests {
             })
         );
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn active_session_graphics_diagnostic_stays_legacy_only() {
+        let capabilities = baseline_graphics_capabilities();
+        assert!(capabilities.legacy_bitmap);
+        assert!(capabilities.remotefx);
+        assert!(!capabilities.egfx_advertised);
+        assert!(!capabilities.egfx_confirmed);
+        assert!(!capabilities.avc420);
+        assert!(!capabilities.avc444);
+    }
+
+    #[test]
+    fn graphics_diagnostic_requires_server_confirmation_before_avc420() {
+        let mut capabilities = RdpGraphicsCapability {
+            egfx_advertised: true,
+            ..baseline_graphics_capabilities()
+        };
+
+        apply_egfx_confirmation(&mut capabilities, false, true, true);
+        assert!(!capabilities.egfx_confirmed);
+        assert!(!capabilities.avc420);
+        assert!(!capabilities.avc444);
+
+        apply_egfx_confirmation(&mut capabilities, true, true, true);
+        assert!(capabilities.egfx_confirmed);
+        assert!(capabilities.avc420);
+        assert!(capabilities.avc444);
     }
 
     #[test]
@@ -1073,6 +1190,93 @@ mod tests {
     }
 
     #[test]
+    fn egfx_surface_reset_is_admitted_before_current_generation_damage() {
+        let session_id = SessionId::allocate();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let (_commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(RecordingFrames(updates.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        runtime
+            .begin_generation(
+                session_id,
+                1,
+                PixelSize {
+                    width: 2,
+                    height: 2,
+                },
+                PixelFormat::Bgrx8UnormSrgb,
+            )
+            .expect("baseline generation begins");
+        let mut generation = 1;
+        let patch = PixelPatch {
+            rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            stride_bytes: 8,
+            pixels: PixelBuffer::from_boxed_slice(vec![0; 16].into_boxed_slice()),
+        };
+
+        publish_egfx_surface_updates(
+            &mut runtime,
+            session_id,
+            &mut generation,
+            vec![
+                SurfaceUpdate::Reset {
+                    session_id,
+                    generation: 2,
+                    size: PixelSize {
+                        width: 2,
+                        height: 2,
+                    },
+                    format: PixelFormat::Bgrx8UnormSrgb,
+                },
+                SurfaceUpdate::Damage {
+                    session_id,
+                    generation: 2,
+                    revision: 1,
+                    patches: vec![patch],
+                },
+                SurfaceUpdate::FrameBoundary {
+                    session_id,
+                    generation: 2,
+                    revision: 1,
+                    completeness: FrameCompleteness::FullBaseline,
+                },
+            ],
+        )
+        .expect("EGFX reset and current-generation frame publish");
+
+        assert_eq!(generation, 2);
+        let updates = updates.lock().expect("frame log");
+        assert_eq!(
+            updates.len(),
+            4,
+            "old reset plus new reset, damage and boundary"
+        );
+        assert!(matches!(
+            updates[1],
+            SurfaceUpdate::Reset { generation: 2, .. }
+        ));
+        assert!(matches!(
+            updates[2],
+            SurfaceUpdate::Damage { generation: 2, .. }
+        ));
+        assert!(matches!(
+            updates[3],
+            SurfaceUpdate::FrameBoundary { generation: 2, .. }
+        ));
+    }
+
+    #[test]
     fn lifecycle_reactivation_starts_a_new_empty_surface_generation() {
         let session_id = SessionId::allocate();
         let updates = Arc::new(Mutex::new(Vec::new()));
@@ -1123,16 +1327,37 @@ mod tests {
 
         assert_eq!(generation, 2);
         assert_eq!((image.width(), image.height()), (3, 2));
-        let updates = updates.lock().expect("frame log");
+        let update_log = updates.lock().expect("frame log");
         assert!(matches!(
-            &updates[1],
+            &update_log[1],
             SurfaceUpdate::Reset { generation: 2, .. }
         ));
+        // Reactivation starts with an empty surface. A partial bitmap must be
+        // buffered until the decoder has exact coverage; publishing an
+        // incremental boundary here would recreate the black-screen startup
+        // failure seen with real RDP bitmap orderings.
+        assert_eq!(update_log.len(), 2);
+        drop(update_log);
+
+        publish_graphics_update(
+            &mut runtime,
+            &mut baseline,
+            &image,
+            generation,
+            InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 1,
+            },
+        )
+        .expect("full reactivated update publishes");
+        let update_log = updates.lock().expect("frame log");
         assert!(matches!(
-            updates.last(),
+            update_log.last(),
             Some(SurfaceUpdate::FrameBoundary {
                 generation: 2,
-                completeness: FrameCompleteness::Incremental,
+                completeness: FrameCompleteness::FullBaseline,
                 ..
             })
         ));

@@ -15,24 +15,6 @@ const MAX_CERTIFICATE_NAME_BYTES: usize = 256;
 const UNKNOWN_CERTIFICATE_NAME: &str = "未知";
 const IDENTITY_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PlatformValidationFailure {
-    error: rustls::Error,
-}
-
-impl PlatformValidationFailure {
-    pub(crate) fn from_rustls(error: rustls::Error) -> Self {
-        Self { error }
-    }
-
-    pub(crate) fn is_unknown_issuer(&self) -> bool {
-        matches!(
-            self.error,
-            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
-        )
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SanitizedCertificateNames {
     subject: String,
@@ -50,31 +32,23 @@ impl SanitizedCertificateNames {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum IdentityDisposition {
-    SystemTrusted {
-        fingerprint: [u8; 32],
-    },
-    PinMatched {
-        fingerprint: [u8; 32],
-    },
     Challenge {
         fingerprint: [u8; 32],
         subject: String,
         issuer: String,
     },
-    PinMismatch,
     Reject,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AcceptedServerIdentity {
-    SystemTrusted { fingerprint: [u8; 32] },
     ExactPin { fingerprint: [u8; 32] },
 }
 
 #[derive(Debug)]
 pub(crate) struct ObservedServerIdentity {
     pub(crate) fingerprint: [u8; 32],
-    pub(crate) platform_validation: Result<(), PlatformValidationFailure>,
+    pub(crate) leaf_validation: Result<(), rustls::Error>,
     pub(crate) names: SanitizedCertificateNames,
 }
 
@@ -85,27 +59,17 @@ pub(crate) fn fingerprint_sha256(leaf_der: &[u8]) -> [u8; 32] {
 fn classify_identity(
     saved_pin: Option<[u8; 32]>,
     fingerprint: [u8; 32],
-    platform_validation: Result<(), PlatformValidationFailure>,
+    leaf_validation: Result<(), rustls::Error>,
     names: SanitizedCertificateNames,
 ) -> IdentityDisposition {
-    if saved_pin.is_some_and(|saved| saved != fingerprint) {
-        return IdentityDisposition::PinMismatch;
-    }
-    if platform_validation
-        .as_ref()
-        .is_err_and(|failure| !failure.is_unknown_issuer())
-    {
+    let changed = saved_pin.is_some_and(|saved| saved != fingerprint);
+    if !changed && leaf_validation.is_err() {
         return IdentityDisposition::Reject;
     }
-    match saved_pin {
-        Some(saved) if saved == fingerprint => IdentityDisposition::PinMatched { fingerprint },
-        Some(_) => unreachable!("mismatching saved pins returned above"),
-        None if platform_validation.is_ok() => IdentityDisposition::SystemTrusted { fingerprint },
-        None => IdentityDisposition::Challenge {
-            fingerprint,
-            subject: names.subject,
-            issuer: names.issuer,
-        },
+    IdentityDisposition::Challenge {
+        fingerprint,
+        subject: names.subject,
+        issuer: names.issuer,
     }
 }
 
@@ -116,6 +80,7 @@ fn identity_challenge(
     fingerprint: [u8; 32],
     subject: String,
     issuer: String,
+    saved_pin: Option<[u8; 32]>,
 ) -> ServerIdentityChallenge {
     ServerIdentityChallenge {
         session_id,
@@ -125,7 +90,7 @@ fn identity_challenge(
         sha256_fingerprint: fingerprint,
         subject,
         issuer,
-        validation: evaluate_server_identity(None, fingerprint),
+        validation: evaluate_server_identity(saved_pin, fingerprint),
     }
 }
 
@@ -133,6 +98,7 @@ fn wait_for_identity_decision(
     session_id: SessionId,
     challenge_id: u64,
     fingerprint: [u8; 32],
+    changed: bool,
     mut next_command: impl FnMut() -> Option<SessionCommand>,
 ) -> Result<Option<AcceptedServerIdentity>, ProtocolError> {
     loop {
@@ -143,6 +109,9 @@ fn wait_for_identity_decision(
                 challenge_id: command_challenge_id,
                 decision,
             }) if command_session_id == session_id && command_challenge_id == challenge_id => {
+                if changed {
+                    return Err(rdp_error(RDP_SERVER_IDENTITY_CHANGED));
+                }
                 return match decision {
                     ServerIdentityDecision::TrustOnce
                     | ServerIdentityDecision::TrustAndRemember => {
@@ -167,16 +136,9 @@ pub(crate) fn resolve_server_identity(
     match classify_identity(
         saved_pin,
         observed.fingerprint,
-        observed.platform_validation,
+        observed.leaf_validation,
         observed.names,
     ) {
-        IdentityDisposition::SystemTrusted { fingerprint } => {
-            Ok(Some(AcceptedServerIdentity::SystemTrusted { fingerprint }))
-        }
-        IdentityDisposition::PinMatched { fingerprint } => {
-            Ok(Some(AcceptedServerIdentity::ExactPin { fingerprint }))
-        }
-        IdentityDisposition::PinMismatch => Err(rdp_error(RDP_SERVER_IDENTITY_CHANGED)),
         IdentityDisposition::Reject => Err(rdp_error(crate::error::RDP_TLS_FAILED)),
         IdentityDisposition::Challenge {
             fingerprint,
@@ -191,10 +153,15 @@ pub(crate) fn resolve_server_identity(
                 fingerprint,
                 subject,
                 issuer,
+                saved_pin,
             )))?;
-            wait_for_identity_decision(session_id, challenge_id, fingerprint, || {
-                runtime.try_next_command()
-            })
+            wait_for_identity_decision(
+                session_id,
+                challenge_id,
+                fingerprint,
+                saved_pin.is_some_and(|saved| saved != fingerprint),
+                || runtime.try_next_command(),
+            )
         }
     }
 }
@@ -246,12 +213,97 @@ mod tests {
 
     use super::{
         classify_identity, fingerprint_sha256, identity_challenge, wait_for_identity_decision,
-        AcceptedServerIdentity, IdentityDisposition, PlatformValidationFailure,
-        SanitizedCertificateNames,
+        AcceptedServerIdentity, IdentityDisposition, SanitizedCertificateNames,
     };
     use crate::tls::{credential_free_preflight, establish_verified_tls};
 
     const FINGERPRINT: [u8; 32] = [0x31; 32];
+
+    #[test]
+    fn identity_resolution_publishes_unknown_matched_and_changed_before_decision() {
+        use frd_protocol_api::{
+            ProtocolError, ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent,
+            SurfacePublisher,
+        };
+        use std::sync::mpsc;
+        struct Events(mpsc::Sender<SessionEvent>);
+        impl RuntimeEventSink for Events {
+            fn publish(&self, event: SessionEvent) -> Result<(), ProtocolError> {
+                self.0
+                    .send(event)
+                    .map_err(|_| ProtocolError::EventPortClosed)
+            }
+        }
+        struct Frames;
+        impl SurfacePublisher for Frames {
+            fn publish(&self, _: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
+                Ok(())
+            }
+        }
+        struct Wake;
+        impl RuntimeWake for Wake {
+            fn wake(&self) -> Result<(), ProtocolError> {
+                Ok(())
+            }
+        }
+        for (saved, kind) in [
+            (None, ServerIdentityValidationKind::Unknown),
+            (Some(FINGERPRINT), ServerIdentityValidationKind::PinMatched),
+            (Some([0x32; 32]), ServerIdentityValidationKind::PinMismatch),
+        ] {
+            for decision in [
+                ServerIdentityDecision::TrustOnce,
+                ServerIdentityDecision::TrustAndRemember,
+                ServerIdentityDecision::Reject,
+            ] {
+                let session = SessionId::allocate();
+                let (tx, rx) = mpsc::channel();
+                let (events, observed_events) = mpsc::channel();
+                let mut runtime = ProtocolRuntime::new(
+                    session,
+                    rx,
+                    Box::new(Events(events)),
+                    Box::new(Frames),
+                    None,
+                    Box::new(Wake),
+                );
+                tx.send(resolution(session, session.get(), decision))
+                    .unwrap();
+                let result = super::resolve_server_identity(
+                    Endpoint::new("rdp.test", 3389).unwrap(),
+                    saved,
+                    super::ObservedServerIdentity {
+                        fingerprint: FINGERPRINT,
+                        leaf_validation: Ok(()),
+                        names: names(),
+                    },
+                    session,
+                    &mut runtime,
+                );
+                let event = observed_events
+                    .try_recv()
+                    .expect("certificate always published");
+                let SessionEvent::ServerIdentityChallenge(challenge) = event else {
+                    panic!("identity event required")
+                };
+                assert_eq!(challenge.validation.kind(), kind);
+                assert_eq!(challenge.subject, "CN=rdp.test");
+                assert_eq!(challenge.sha256_fingerprint, FINGERPRINT);
+                if kind == ServerIdentityValidationKind::PinMismatch {
+                    assert_eq!(result.unwrap_err().code(), "rdp_server_identity_changed");
+                } else if decision == ServerIdentityDecision::Reject {
+                    assert_eq!(result.unwrap_err().code(), "rdp_server_identity_rejected");
+                } else {
+                    assert_eq!(
+                        result.unwrap(),
+                        Some(AcceptedServerIdentity::ExactPin {
+                            fingerprint: FINGERPRINT
+                        })
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn server_identity_fingerprint_hashes_the_complete_leaf_der() {
@@ -266,39 +318,9 @@ mod tests {
     }
 
     #[test]
-    fn server_identity_system_trust_continues_without_a_challenge() {
+    fn server_identity_system_trust_requires_recording_before_credentials() {
         assert_eq!(
             classify_identity(None, FINGERPRINT, Ok(()), names()),
-            IdentityDisposition::SystemTrusted {
-                fingerprint: FINGERPRINT
-            }
-        );
-    }
-
-    #[test]
-    fn server_identity_exact_saved_pin_wins_before_platform_failure() {
-        assert_eq!(
-            classify_identity(
-                Some(FINGERPRINT),
-                FINGERPRINT,
-                Err(platform_failure(CertificateError::UnknownIssuer)),
-                names(),
-            ),
-            IdentityDisposition::PinMatched {
-                fingerprint: FINGERPRINT
-            }
-        );
-    }
-
-    #[test]
-    fn server_identity_unknown_self_signed_certificate_requires_a_challenge() {
-        assert_eq!(
-            classify_identity(
-                None,
-                FINGERPRINT,
-                Err(platform_failure(CertificateError::UnknownIssuer)),
-                names(),
-            ),
             IdentityDisposition::Challenge {
                 fingerprint: FINGERPRINT,
                 subject: "CN=rdp.test".to_owned(),
@@ -308,9 +330,32 @@ mod tests {
     }
 
     #[test]
-    fn server_identity_non_issuer_failures_reject_even_an_exact_saved_pin() {
+    fn server_identity_exact_saved_pin_wins_before_leaf_failure() {
+        assert_eq!(
+            classify_identity(Some(FINGERPRINT), FINGERPRINT, Ok(()), names(),),
+            IdentityDisposition::Challenge {
+                fingerprint: FINGERPRINT,
+                subject: "CN=rdp.test".to_owned(),
+                issuer: "CN=rdp.test".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn server_identity_unknown_self_signed_certificate_requires_a_challenge() {
+        assert_eq!(
+            classify_identity(None, FINGERPRINT, Ok(()), names(),),
+            IdentityDisposition::Challenge {
+                fingerprint: FINGERPRINT,
+                subject: "CN=rdp.test".to_owned(),
+                issuer: "CN=rdp.test".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn server_identity_invalid_leaf_rejects_even_an_exact_saved_pin() {
         for error in [
-            CertificateError::NotValidForName,
             CertificateError::Expired,
             CertificateError::NotValidYet,
             CertificateError::InvalidPurpose,
@@ -320,7 +365,7 @@ mod tests {
                 classify_identity(
                     Some(FINGERPRINT),
                     FINGERPRINT,
-                    Err(platform_failure(error)),
+                    Err(leaf_failure(error)),
                     names(),
                 ),
                 IdentityDisposition::Reject
@@ -329,10 +374,14 @@ mod tests {
     }
 
     #[test]
-    fn server_identity_saved_pin_mismatch_fails_even_when_system_trusted() {
+    fn server_identity_saved_pin_mismatch_reports_certificate_even_when_system_trusted() {
         assert_eq!(
             classify_identity(Some([0x32; 32]), FINGERPRINT, Ok(()), names()),
-            IdentityDisposition::PinMismatch
+            IdentityDisposition::Challenge {
+                fingerprint: FINGERPRINT,
+                subject: "CN=rdp.test".to_owned(),
+                issuer: "CN=rdp.test".to_owned(),
+            }
         );
     }
 
@@ -347,6 +396,7 @@ mod tests {
             FINGERPRINT,
             "CN=rdp.test".to_owned(),
             "CN=issuer.test".to_owned(),
+            None,
         );
 
         assert_eq!(challenge.session_id, session_id);
@@ -369,7 +419,7 @@ mod tests {
             VecDeque::from([resolution(session_id, 17, ServerIdentityDecision::Reject)]);
 
         let error =
-            wait_for_identity_decision(session_id, 17, FINGERPRINT, || commands.pop_front())
+            wait_for_identity_decision(session_id, 17, FINGERPRINT, false, || commands.pop_front())
                 .expect_err("Reject must fail closed");
 
         assert_eq!(error.protocol_id(), Some(&ProtocolId::rdp()));
@@ -387,7 +437,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            wait_for_identity_decision(session_id, 17, FINGERPRINT, || commands.pop_front()),
+            wait_for_identity_decision(session_id, 17, FINGERPRINT, false, || commands.pop_front()),
             Ok(Some(AcceptedServerIdentity::ExactPin {
                 fingerprint: FINGERPRINT
             }))
@@ -401,7 +451,7 @@ mod tests {
         let mut commands = VecDeque::from([SessionCommand::Disconnect]);
 
         assert_eq!(
-            wait_for_identity_decision(session_id, 17, FINGERPRINT, || commands.pop_front()),
+            wait_for_identity_decision(session_id, 17, FINGERPRINT, false, || commands.pop_front()),
             Ok(None)
         );
     }
@@ -448,7 +498,7 @@ mod tests {
     #[test]
     fn server_identity_tls_preflight_writes_no_application_data_and_exact_pin_reconnects() {
         let (address, server, certificate_der) = spawn_tls_server(2, false);
-        let endpoint = Endpoint::new("localhost", address.port()).expect("valid endpoint");
+        let endpoint = Endpoint::new("127.0.0.1", address.port()).expect("valid endpoint");
 
         let observed = credential_free_preflight(
             TcpStream::connect(address).expect("connect preflight stream"),
@@ -456,7 +506,7 @@ mod tests {
         )
         .expect("credential-free preflight completes");
         assert_eq!(observed.fingerprint, fingerprint_sha256(&certificate_der));
-        assert!(observed.platform_validation.is_err());
+        assert!(observed.leaf_validation.is_ok());
         assert!(!observed.names.subject.is_empty());
         assert!(observed.names.subject.len() <= 256);
         assert!(!observed.names.subject.chars().any(char::is_control));
@@ -482,7 +532,7 @@ mod tests {
     #[test]
     fn server_identity_exact_pin_leaf_change_during_verified_reconnect_is_identity_changed() {
         let (address, server, certificate_der) = spawn_tls_server(1, true);
-        let endpoint = Endpoint::new("localhost", address.port()).expect("valid endpoint");
+        let endpoint = Endpoint::new("127.0.0.1", address.port()).expect("valid endpoint");
         let mut expected_fingerprint = fingerprint_sha256(&certificate_der);
         expected_fingerprint[0] ^= 0xff;
 
@@ -505,8 +555,8 @@ mod tests {
         SanitizedCertificateNames::new("CN=rdp.test", "CN=rdp.test")
     }
 
-    fn platform_failure(error: CertificateError) -> PlatformValidationFailure {
-        PlatformValidationFailure::from_rustls(rustls::Error::InvalidCertificate(error))
+    fn leaf_failure(error: CertificateError) -> rustls::Error {
+        rustls::Error::InvalidCertificate(error)
     }
 
     fn resolution(

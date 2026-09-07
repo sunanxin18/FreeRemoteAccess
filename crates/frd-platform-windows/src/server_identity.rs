@@ -1,4 +1,6 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use frd_core::{Endpoint, ProtocolId};
 use frd_platform_api::{PlatformError, ServerIdentityStore};
@@ -78,16 +80,49 @@ impl ServerIdentityStore for DpapiServerIdentityStore {
         wipe_bytes(&mut plaintext);
         let encrypted = encrypted?;
         let path = self.record_path(protocol, endpoint);
-        let temporary = temporary_path(&path);
-        std::fs::write(&temporary, encrypted).map_err(|_| PlatformError::StorageFailed)?;
-        std::fs::rename(&temporary, &path).map_err(|_| PlatformError::StorageFailed)
+        match write_pin_record(&path, &encrypted) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // 另一连接可能在首次读取之后抢先保存，绝不覆盖其指纹。
+                match self.load_pin(protocol, endpoint)? {
+                    Some(existing) if existing == pin => Ok(()),
+                    Some(_) => Err(PlatformError::ServerIdentityPinMismatch),
+                    None => Err(PlatformError::StorageFailed),
+                }
+            }
+            Err(_) => Err(PlatformError::StorageFailed),
+        }
     }
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(format!(".{}.tmp", std::process::id()));
-    PathBuf::from(temporary)
+fn publish_pin_record(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    // 同目录硬链接原子发布完整记录；目标已存在时必定失败，不使用可覆盖的 rename。
+    std::fs::hard_link(temporary, destination)
+}
+
+fn write_pin_record(destination: &Path, encrypted: &[u8]) -> std::io::Result<()> {
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    let (temporary, mut file) = loop {
+        let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let mut temporary = destination.as_os_str().to_owned();
+        temporary.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+        let temporary = PathBuf::from(temporary);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let prepared = file.write_all(encrypted).and_then(|()| file.sync_all());
+    drop(file);
+    let result = prepared.and_then(|()| publish_pin_record(&temporary, destination));
+    // 无论发布成功或失败，都只清理本次 create_new 创建的临时文件。
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 
 fn wipe_bytes(bytes: &mut [u8]) {
@@ -265,11 +300,73 @@ fn unprotect_current_user(_: &[u8]) -> Result<Vec<u8>, PlatformError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use frd_core::{Endpoint, ProtocolId};
+    #[cfg(windows)]
     use frd_platform_api::{PlatformError, ServerIdentityStore};
     use tempfile::tempdir;
 
+    #[cfg(windows)]
     use super::DpapiServerIdentityStore;
+
+    #[test]
+    fn pin_record_publication_never_replaces_an_existing_pin() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("target.pin");
+        let candidate = directory.path().join("candidate.tmp");
+        std::fs::write(&destination, b"previous certificate").unwrap();
+        std::fs::write(&candidate, b"different certificate").unwrap();
+
+        let result = super::publish_pin_record(&candidate, &destination);
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"previous certificate"
+        );
+    }
+
+    #[test]
+    fn concurrent_pin_record_writers_publish_one_complete_winner_without_temporary_files() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("target.pin");
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let handles = (0u8..8)
+                .map(|value| {
+                    let destination = &destination;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (value, super::write_pin_record(destination, &[value; 4096]))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let winners = results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            vec![winners[0].0; 4096]
+        );
+        for (_, result) in results.into_iter().filter(|(_, result)| result.is_err()) {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[cfg(windows)]
     #[test]

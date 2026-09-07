@@ -38,6 +38,14 @@ fn default_queries() -> Vec<NamedQuery> {
             VideoPixelFormat::Nv12,
         ),
         named_query(
+            "h264_avc420_420_8",
+            VideoCodec::H264,
+            VideoProfile::H264Avc420,
+            ChromaFormat::Yuv420,
+            8,
+            VideoPixelFormat::Yuv420P8,
+        ),
+        named_query(
             "hevc_main_420_8",
             VideoCodec::Hevc,
             VideoProfile::HevcMain,
@@ -245,6 +253,8 @@ fn profile_label(profile: VideoProfile) -> &'static str {
         VideoProfile::H264Baseline => "h264_baseline",
         VideoProfile::H264Main => "h264_main",
         VideoProfile::H264High => "h264_high",
+        VideoProfile::H264Avc420 => "h264_avc420",
+        VideoProfile::H264Avc444 => "h264_avc444",
         VideoProfile::HevcMain => "hevc_main",
         VideoProfile::HevcMain10 => "hevc_main10",
         VideoProfile::HevcMain4448 => "hevc_main444_8",
@@ -338,20 +348,27 @@ mod tests {
     fn default_queries_cover_exact_h264_main_main10_and_main444_contracts() {
         let queries = default_queries();
 
-        assert_eq!(queries.len(), 4);
+        assert_eq!(queries.len(), 5);
         assert_eq!(queries[0].name, "h264_high_420_8");
         assert_eq!(queries[0].query.profile, VideoProfile::H264High);
-        assert_eq!(queries[1].query.profile, VideoProfile::HevcMain);
-        assert_eq!(queries[2].query.profile, VideoProfile::HevcMain10);
-        assert_eq!(queries[2].query.bit_depth, 10);
+        assert_eq!(queries[1].name, "h264_avc420_420_8");
+        assert_eq!(queries[1].query.profile, VideoProfile::H264Avc420);
+        assert_eq!(queries[1].query.chroma, ChromaFormat::Yuv420);
         assert_eq!(
-            queries[2].query.preferred_outputs.as_ref(),
-            &[VideoPixelFormat::P010]
+            queries[1].query.preferred_outputs.as_ref(),
+            &[VideoPixelFormat::Yuv420P8]
         );
-        assert_eq!(queries[3].query.profile, VideoProfile::HevcMain4448);
-        assert_eq!(queries[3].query.chroma, ChromaFormat::Yuv444);
+        assert_eq!(queries[2].query.profile, VideoProfile::HevcMain);
+        assert_eq!(queries[3].query.profile, VideoProfile::HevcMain10);
+        assert_eq!(queries[3].query.bit_depth, 10);
         assert_eq!(
             queries[3].query.preferred_outputs.as_ref(),
+            &[VideoPixelFormat::P010]
+        );
+        assert_eq!(queries[4].query.profile, VideoProfile::HevcMain4448);
+        assert_eq!(queries[4].query.chroma, ChromaFormat::Yuv444);
+        assert_eq!(
+            queries[4].query.preferred_outputs.as_ref(),
             &[VideoPixelFormat::Yuv444P8]
         );
     }
@@ -403,7 +420,7 @@ mod tests {
             serde_json::Value::String("probe_only".into())
         );
         assert!(value["adapters"].is_array());
-        assert_eq!(value["queries"].as_array().map(Vec::len), Some(4));
+        assert_eq!(value["queries"].as_array().map(Vec::len), Some(5));
         for variable in ["USERNAME", "COMPUTERNAME"] {
             if let Ok(secret) = std::env::var(variable) {
                 if !secret.is_empty() {

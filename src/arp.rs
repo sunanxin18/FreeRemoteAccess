@@ -12,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(windows)]
 use windows_sys::Win32::NetworkManagement::IpHelper::SendARP;
 
 use crate::vnc::protocol;
@@ -66,17 +67,26 @@ fn vendor_of(mac: &[u8; 6]) -> &'static str {
 /// 对目标 IP 发送真实 ARP 请求并等待应答（"ARP ping"）。
 /// 在线主机返回 MAC；离线主机在内核内部超时后返回 None。
 pub fn arp_lookup(ip: Ipv4Addr) -> Option<[u8; 6]> {
-    // SendARP 要求以网络字节序传递 IPv4：u32 的内存布局即 4 个地址字节
-    let dest = u32::from_le_bytes(ip.octets());
-    let mut mac_words = [0u32; 2];
-    let mut len: u32 = 8;
-    let rc = unsafe { SendARP(dest, 0, mac_words.as_mut_ptr().cast(), &mut len) };
-    if rc == 0 && len >= 6 {
-        let b0 = mac_words[0].to_le_bytes();
-        let b1 = mac_words[1].to_le_bytes();
-        Some([b0[0], b0[1], b0[2], b0[3], b1[0], b1[1]])
-    } else {
-        None
+    #[cfg(not(windows))]
+    {
+        let _ = ip;
+        return None;
+    }
+
+    #[cfg(windows)]
+    {
+        // SendARP 要求以网络字节序传递 IPv4：u32 的内存布局即 4 个地址字节
+        let dest = u32::from_le_bytes(ip.octets());
+        let mut mac_words = [0u32; 2];
+        let mut len: u32 = 8;
+        let rc = unsafe { SendARP(dest, 0, mac_words.as_mut_ptr().cast(), &mut len) };
+        if rc == 0 && len >= 6 {
+            let b0 = mac_words[0].to_le_bytes();
+            let b1 = mac_words[1].to_le_bytes();
+            Some([b0[0], b0[1], b0[2], b0[3], b1[0], b1[1]])
+        } else {
+            None
+        }
     }
 }
 

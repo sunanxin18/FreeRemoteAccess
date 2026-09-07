@@ -2,22 +2,33 @@
 
 mod active_session;
 mod audio;
+#[allow(dead_code)]
+mod avc444;
 mod baseline;
 mod clipboard;
+#[allow(dead_code)]
+mod codec_selection;
 mod config;
 mod connector;
 mod display;
+mod egfx;
 mod error;
 mod factory;
 mod input;
+mod pixel_convert;
 mod runtime;
 mod server_identity;
 mod surface;
 mod tls;
 mod upstream;
 mod writer;
+mod yuv_convert;
 
 pub use config::{ParsedUsername, RdpClientPlatformIdentity, RdpConnectionConfig};
+pub use egfx::{
+    Avc420DecoderProvider, Avc444Decoder, Avc444DecoderProvider, EgfxDecoderProvider,
+    ValidatedAvc444Bitmap, ValidatedAvc444Encoding,
+};
 pub use factory::{RdpProtocolFactory, RdpProtocolSession};
 
 /// Compile-time seam consumed by Task 3's connector without exposing RDP TLS

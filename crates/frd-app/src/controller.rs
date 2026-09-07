@@ -1,4 +1,4 @@
-use frd_core::{InputEvent, SessionId, SessionInput};
+use frd_core::{DisplayIntent, InputEvent, ResolutionMode, SecretBuffer, SessionId, SessionInput};
 use frd_frame::FrameCompleteness;
 use frd_platform_api::{
     ConnectionProfileKey, ConnectionProfileStore, CredentialProvider, PlatformCapabilities,
@@ -83,6 +83,23 @@ enum PendingProfileAction {
     Delete(ConnectionProfileKey),
 }
 
+/// A profile persistence operation detached from the UI event loop.
+///
+/// Platform credential stores can invoke OS authorization services, so the
+/// desktop shell may execute this job on a worker without holding the
+/// controller lock or blocking native window events.
+#[derive(Clone, Debug)]
+pub enum ProfilePersistenceJob {
+    Remember {
+        session_id: SessionId,
+        profile: SavedConnectionProfile,
+    },
+    Delete {
+        session_id: SessionId,
+        key: ConnectionProfileKey,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppControllerError {
     SessionAlreadyActive,
@@ -113,6 +130,7 @@ impl AppLaunch {
                 .map(ProtocolChoice::Explicit)
                 .unwrap_or(ProtocolChoice::Automatic),
             username: String::new(),
+            resolution_mode: ResolutionMode::NativeDisplay,
         });
 
         let username_provider_failed = options.username_provider.as_ref().is_some_and(|id| {
@@ -185,6 +203,10 @@ pub struct AppController {
     platform_capabilities: PlatformCapabilities,
     policy: ProductPolicy,
     challenge: Option<ServerIdentityChallenge>,
+    identity_target: Option<(frd_protocol_api::ProtocolId, frd_core::Endpoint)>,
+    identity_decided: bool,
+    pending_identity_command: Option<SessionCommand>,
+    certificate_diagnostics: Option<String>,
     inbound_clipboard: Option<ClipboardPayload>,
     audio_state: AudioState,
     presentation_timing: Option<SessionTiming>,
@@ -203,6 +225,10 @@ impl AppController {
             platform_capabilities: PlatformCapabilities::default(),
             policy: ProductPolicy::default(),
             challenge: None,
+            identity_target: None,
+            identity_decided: false,
+            pending_identity_command: None,
+            certificate_diagnostics: None,
             inbound_clipboard: None,
             audio_state: AudioState::Unavailable,
             presentation_timing: None,
@@ -259,6 +285,10 @@ impl AppController {
                 platform_capabilities: PlatformCapabilities::default(),
                 policy: ProductPolicy::default(),
                 challenge: None,
+                identity_target: None,
+                identity_decided: false,
+                pending_identity_command: None,
+                certificate_diagnostics: None,
                 inbound_clipboard: None,
                 audio_state: AudioState::Unavailable,
                 presentation_timing: None,
@@ -280,7 +310,7 @@ impl AppController {
             Page::ConnectionForm(_) => None,
             Page::Connecting { diagnostics, .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Connecting,
-                diagnostics: diagnostics.clone(),
+                diagnostics: self.with_certificate_diagnostics(diagnostics.as_deref()),
                 presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
@@ -288,7 +318,7 @@ impl AppController {
             }),
             Page::AwaitingFirstFrame { diagnostics, .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::WaitingForFrame,
-                diagnostics: diagnostics.clone(),
+                diagnostics: self.with_certificate_diagnostics(diagnostics.as_deref()),
                 presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
@@ -304,7 +334,7 @@ impl AppController {
             }),
             Page::Failed { code, .. } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Failed,
-                diagnostics: Some(code.clone()),
+                diagnostics: self.with_certificate_diagnostics(Some(code)),
                 presentation_timing: None,
                 audio: unavailable,
                 clipboard: unavailable,
@@ -316,7 +346,7 @@ impl AppController {
                 ..
             } => Some(SessionChromeModel {
                 connection: ConnectionGlyph::Connected,
-                diagnostics: diagnostics.clone(),
+                diagnostics: self.with_certificate_diagnostics(diagnostics.as_deref()),
                 presentation_timing: self.presentation_timing,
                 audio: if capabilities.remote_audio {
                     CapabilityGlyphState::Available
@@ -625,10 +655,19 @@ impl AppController {
                 password: submission.password.take(),
             }),
             saved_server_pin,
+            display_intent: match submission.draft.resolution_mode {
+                ResolutionMode::Fixed(size) => DisplayIntent::fixed(size),
+                ResolutionMode::ServerManaged => DisplayIntent::server_managed(),
+                mode => DisplayIntent {
+                    mode,
+                    geometry: None,
+                },
+            },
         };
         self.session_id = Some(session_id);
         self.pending_profile = pending_profile;
         self.reset_session_bound_state();
+        self.identity_target = Some((request.protocol_id.clone(), request.endpoint.clone()));
         self.page = Page::Connecting {
             draft,
             stage: ConnectionStage::Connecting,
@@ -641,6 +680,18 @@ impl AppController {
         &mut self,
         key: ConnectionProfileKey,
         credentials: &dyn SecureCredentialStore,
+    ) {
+        self.apply_saved_profile_load(key.clone(), credentials.load(&key));
+    }
+
+    /// Apply a credential lookup that may have completed on a worker thread.
+    /// The profile metadata is selected before the result is interpreted so a
+    /// locked Keychain leaves the user on the same profile with an actionable
+    /// password error instead of freezing the form.
+    pub fn apply_saved_profile_load(
+        &mut self,
+        key: ConnectionProfileKey,
+        result: Result<Option<SecretBuffer>, PlatformError>,
     ) {
         let Some(form) = self.connection_form_mut() else {
             return;
@@ -655,7 +706,7 @@ impl AppController {
             return;
         };
         form.select_profile_metadata(&profile);
-        match credentials.load(&key) {
+        match result {
             Ok(Some(password)) => form.set_loaded_password(password),
             Ok(None) => form.set_password_error("saved_credential_unavailable"),
             Err(_) => form.set_password_error("credential_storage_failed"),
@@ -709,6 +760,10 @@ impl AppController {
     fn reset_session_bound_state(&mut self) {
         self.generation = 0;
         self.challenge = None;
+        self.identity_target = None;
+        self.identity_decided = false;
+        self.pending_identity_command = None;
+        self.certificate_diagnostics = None;
         self.protocol_capabilities = SessionCapabilities::default();
         self.inbound_clipboard = None;
         self.audio_state = AudioState::Unavailable;
@@ -736,7 +791,7 @@ impl AppController {
 
     #[cfg(test)]
     pub(crate) fn handle_session_event(&mut self, event: SessionEvent) {
-        self.handle_session_event_internal(event, None);
+        self.handle_session_event_internal(event, None, false);
     }
 
     pub fn handle_session_event_with_stores(
@@ -748,13 +803,29 @@ impl AppController {
         if self.session_id != Some(session_id) {
             return;
         }
-        self.handle_session_event_internal(event, Some(stores));
+        self.handle_session_event_internal(event, Some(stores), false);
+    }
+
+    /// Handle a runtime event while deferring profile persistence to the
+    /// platform shell's worker. This is used by native desktop shells whose
+    /// secure stores may block on OS authorization.
+    pub fn handle_session_event_with_stores_deferred_profile(
+        &mut self,
+        session_id: SessionId,
+        event: SessionEvent,
+        stores: AppPlatformStores<'_>,
+    ) {
+        if self.session_id != Some(session_id) {
+            return;
+        }
+        self.handle_session_event_internal(event, Some(stores), true);
     }
 
     fn handle_session_event_internal(
         &mut self,
         event: SessionEvent,
         stores: Option<AppPlatformStores<'_>>,
+        defer_profile_persistence: bool,
     ) {
         if let SessionEvent::Error(error) = &event {
             self.handle_terminal_failure(error.code(), stores);
@@ -784,7 +855,9 @@ impl AppController {
                 if matches!(self.page, Page::RemoteSession { .. }) {
                     return;
                 }
-                let persistence_warning = if stage == ConnectionStage::TransportReady {
+                let persistence_warning = if stage == ConnectionStage::TransportReady
+                    && !defer_profile_persistence
+                {
                     self.session_id.and_then(|session_id| {
                         stores.and_then(|stores| self.finish_pending_profile(session_id, stores))
                     })
@@ -848,7 +921,13 @@ impl AppController {
                 };
             }
             SessionEvent::ServerIdentityChallenge(challenge) => {
-                self.handle_server_identity_challenge(challenge);
+                if challenge.protocol_id == frd_protocol_api::ProtocolId::rdp() {
+                    if let Some(stores) = stores {
+                        self.handle_rdp_identity(challenge, stores);
+                    }
+                } else {
+                    self.handle_server_identity_challenge(challenge);
+                }
             }
             SessionEvent::Error(_) | SessionEvent::Closed(_) => {
                 unreachable!("terminal handled above")
@@ -869,7 +948,9 @@ impl AppController {
         }
         let draft = self.page.retained_draft();
         let already_failed = matches!(self.page, Page::Failed { .. });
+        let certificate_diagnostics = self.certificate_diagnostics.clone();
         self.reset_session_bound_state();
+        self.certificate_diagnostics = certificate_diagnostics;
         if !already_failed {
             self.page = Page::Failed {
                 draft,
@@ -890,84 +971,47 @@ impl AppController {
             self.pending_profile = Some(pending);
             return None;
         }
-        match pending.action {
-            PendingProfileAction::Remember(mut profile) => {
-                let next_order = match stores.profiles.list().ok().and_then(|profiles| {
-                    profiles
-                        .iter()
-                        .map(|profile| profile.last_success_order)
-                        .max()
-                        .unwrap_or(0)
-                        .checked_add(1)
-                }) {
-                    Some(order) => order,
-                    None => {
-                        let _ = stores.credentials.discard(session_id);
-                        return Some(ProfilePersistenceWarning::SaveFailed);
-                    }
-                };
-                profile.last_success_order = next_order;
-                let previous_credential = match stores.credentials.load(&profile.key) {
-                    Ok(previous) => previous,
-                    Err(_) => {
-                        let _ = stores.credentials.discard(session_id);
-                        return Some(ProfilePersistenceWarning::SaveFailed);
-                    }
-                };
-                if stores.credentials.commit(session_id, &profile.key).is_err() {
-                    Self::compensate_credential_commit(
-                        session_id,
-                        &profile.key,
-                        previous_credential,
-                        stores.credentials,
-                    );
-                    return Some(ProfilePersistenceWarning::SaveFailed);
-                }
-                if stores.profiles.upsert(&profile).is_err() {
-                    // 该补偿只覆盖本进程内的部分失败；进程崩溃恢复需要独立事务日志。
-                    Self::compensate_credential_commit(
-                        session_id,
-                        &profile.key,
-                        previous_credential,
-                        stores.credentials,
-                    );
-                    return Some(ProfilePersistenceWarning::SaveFailed);
-                }
-                None
-            }
-            PendingProfileAction::Delete(key) => {
-                if stores.credentials.delete(&key).is_err() {
-                    return Some(ProfilePersistenceWarning::CredentialDeleteFailed);
-                }
-                stores
-                    .profiles
-                    .delete(&key)
-                    .is_err()
-                    .then_some(ProfilePersistenceWarning::MetadataDeleteFailed)
-            }
-        }
+        let job = match pending.action {
+            PendingProfileAction::Remember(profile) => ProfilePersistenceJob::Remember {
+                session_id,
+                profile,
+            },
+            PendingProfileAction::Delete(key) => ProfilePersistenceJob::Delete { session_id, key },
+        };
+        let warning = persist_profile_job(job, stores.profiles, stores.credentials);
+        self.profile_persistence_warning = warning;
+        warning
     }
 
-    fn compensate_credential_commit(
+    /// Move the current session's pending profile operation out of the
+    /// controller so a shell worker can persist it without holding UI state.
+    pub fn take_pending_profile_job(
+        &mut self,
         session_id: SessionId,
-        key: &ConnectionProfileKey,
-        previous_credential: Option<frd_core::SecretBuffer>,
-        credentials: &dyn SecureCredentialStore,
-    ) {
-        match previous_credential {
-            Some(previous) => {
-                // 先移除可能已写入的新值，再恢复旧值。恢复 commit 也可能仅因
-                // pending 删除失败而返回 Err，此时不得再次删除已恢复的旧值。
-                let _ = credentials.delete(key);
-                if credentials.stage(session_id, key, &previous).is_ok() {
-                    let _ = credentials.commit(session_id, key);
-                }
-            }
-            None => {
-                let _ = credentials.delete(key);
-            }
+    ) -> Option<ProfilePersistenceJob> {
+        let pending = self.pending_profile.take()?;
+        if pending.session_id != session_id {
+            self.pending_profile = Some(pending);
+            return None;
         }
-        let _ = credentials.discard(session_id);
+        Some(match pending.action {
+            PendingProfileAction::Remember(profile) => ProfilePersistenceJob::Remember {
+                session_id,
+                profile,
+            },
+            PendingProfileAction::Delete(key) => ProfilePersistenceJob::Delete { session_id, key },
+        })
+    }
+
+    /// Apply the result of a background profile persistence operation.
+    pub fn complete_profile_persistence(
+        &mut self,
+        session_id: SessionId,
+        warning: Option<ProfilePersistenceWarning>,
+    ) {
+        if self.session_id == Some(session_id) {
+            self.profile_persistence_warning = warning;
+        }
     }
 
     fn discard_pending_profile(
@@ -1076,8 +1120,93 @@ impl AppController {
         ))
     }
 
+    fn with_certificate_diagnostics(&self, diagnostics: Option<&str>) -> Option<String> {
+        let diagnostics = diagnostics.map(|message| match message {
+            "rdp_server_identity_changed" => {
+                "服务器证书指纹已变化，已停止自动连接；请核实服务器身份"
+            }
+            "rdp_identity_store_failed" => "无法读取或保存服务器证书记录，已停止连接",
+            _ => message,
+        });
+        match (diagnostics, self.certificate_diagnostics.as_deref()) {
+            (Some(status), Some(certificate)) => Some(format!("{status}\n{certificate}")),
+            (Some(status), None) => Some(status.to_owned()),
+            (None, certificate) => certificate.map(str::to_owned),
+        }
+    }
+
+    /// 由平台 shell 在处理会话事件后发送；取消或终止会话会清除待发授权。
+    pub fn take_pending_server_identity_command(&mut self) -> Option<SessionCommand> {
+        self.pending_identity_command.take()
+    }
+
+    fn handle_rdp_identity(
+        &mut self,
+        challenge: ServerIdentityChallenge,
+        stores: AppPlatformStores<'_>,
+    ) {
+        if Some(challenge.session_id) != self.session_id
+            || self.identity_target.as_ref()
+                != Some(&(challenge.protocol_id.clone(), challenge.endpoint.clone()))
+            || self.identity_decided
+        {
+            return;
+        }
+        self.identity_decided = true;
+        let pin = challenge.sha256_fingerprint;
+        let loaded = stores
+            .server_identities
+            .load_pin(&challenge.protocol_id, &challenge.endpoint);
+        let result = match loaded {
+            Err(_) => Err("rdp_identity_store_failed"),
+            Ok(Some(saved)) if saved != pin => Err("rdp_server_identity_changed"),
+            _ if challenge.validation.is_pin_mismatch() => Err("rdp_server_identity_changed"),
+            Ok(Some(_)) => Ok(ServerIdentityDecision::TrustOnce),
+            Ok(None) if challenge.validation.is_unknown() => stores
+                .server_identities
+                .store_pin(&challenge.protocol_id, &challenge.endpoint, pin)
+                .map(|()| ServerIdentityDecision::TrustAndRemember)
+                .map_err(|error| match error {
+                    PlatformError::ServerIdentityPinMismatch => "rdp_server_identity_changed",
+                    _ => "rdp_identity_store_failed",
+                }),
+            Ok(None) => Err("rdp_identity_store_failed"),
+        };
+        let fingerprint = pin
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        self.certificate_diagnostics = Some(format!(
+            "服务器证书：{}:{}\n主体：{}\n签发者：{}\nSHA-256：{}",
+            challenge.endpoint.host(),
+            challenge.endpoint.port(),
+            challenge.subject,
+            challenge.issuer,
+            fingerprint
+        ));
+        let decision = match result {
+            Ok(decision) => decision,
+            Err(message) => {
+                self.handle_terminal_failure(message, Some(stores));
+                ServerIdentityDecision::Reject
+            }
+        };
+        self.pending_identity_command = Some(SessionCommand::ResolveServerIdentity {
+            session_id: challenge.session_id,
+            challenge_id: challenge.challenge_id,
+            decision,
+        });
+    }
+
     pub fn handle_server_identity_challenge(&mut self, challenge: ServerIdentityChallenge) {
         if Some(challenge.session_id) == self.session_id
+            && self
+                .identity_target
+                .as_ref()
+                .is_none_or(|(protocol, endpoint)| {
+                    protocol == &challenge.protocol_id && endpoint == &challenge.endpoint
+                })
             && !matches!(
                 self.page,
                 Page::ConnectionForm(_) | Page::Disconnecting { .. } | Page::Failed { .. }
@@ -1146,6 +1275,94 @@ impl AppController {
             decision,
         })
     }
+}
+
+/// Persist a detached profile operation. The caller owns the worker boundary;
+/// this function deliberately performs all secure-store calls synchronously so
+/// a platform shell can keep them off its native event loop.
+pub fn persist_profile_job(
+    job: ProfilePersistenceJob,
+    profiles: &dyn ConnectionProfileStore,
+    credentials: &dyn SecureCredentialStore,
+) -> Option<ProfilePersistenceWarning> {
+    match job {
+        ProfilePersistenceJob::Remember {
+            session_id,
+            mut profile,
+        } => {
+            let next_order = match profiles.list().ok().and_then(|profiles| {
+                profiles
+                    .iter()
+                    .map(|profile| profile.last_success_order)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+            }) {
+                Some(order) => order,
+                None => {
+                    let _ = credentials.discard(session_id);
+                    return Some(ProfilePersistenceWarning::SaveFailed);
+                }
+            };
+            profile.last_success_order = next_order;
+            let previous_credential = match credentials.load(&profile.key) {
+                Ok(previous) => previous,
+                Err(_) => {
+                    let _ = credentials.discard(session_id);
+                    return Some(ProfilePersistenceWarning::SaveFailed);
+                }
+            };
+            if credentials.commit(session_id, &profile.key).is_err() {
+                compensate_credential_commit(
+                    session_id,
+                    &profile.key,
+                    previous_credential,
+                    credentials,
+                );
+                return Some(ProfilePersistenceWarning::SaveFailed);
+            }
+            if profiles.upsert(&profile).is_err() {
+                // 该补偿只覆盖本进程内的部分失败；进程崩溃恢复需要独立事务日志。
+                compensate_credential_commit(
+                    session_id,
+                    &profile.key,
+                    previous_credential,
+                    credentials,
+                );
+                return Some(ProfilePersistenceWarning::SaveFailed);
+            }
+            None
+        }
+        ProfilePersistenceJob::Delete { key, .. } => {
+            if credentials.delete(&key).is_err() {
+                return Some(ProfilePersistenceWarning::CredentialDeleteFailed);
+            }
+            profiles
+                .delete(&key)
+                .is_err()
+                .then_some(ProfilePersistenceWarning::MetadataDeleteFailed)
+        }
+    }
+}
+
+fn compensate_credential_commit(
+    session_id: SessionId,
+    key: &ConnectionProfileKey,
+    previous_credential: Option<SecretBuffer>,
+    credentials: &dyn SecureCredentialStore,
+) {
+    match previous_credential {
+        Some(previous) => {
+            let _ = credentials.delete(key);
+            if credentials.stage(session_id, key, &previous).is_ok() {
+                let _ = credentials.commit(session_id, key);
+            }
+        }
+        None => {
+            let _ = credentials.delete(key);
+        }
+    }
+    let _ = credentials.discard(session_id);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

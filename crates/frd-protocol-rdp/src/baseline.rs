@@ -243,6 +243,23 @@ impl RdpBaseline {
         self.coverage
             .validate_current_region(self.coverage.session_id, generation, &region)
             .map_err(map_baseline_error)?;
+
+        // IronRDP may report the first bitmap updates as partial rectangles. A
+        // surface reset cannot be committed to the renderer until the decoded
+        // image has exact full coverage, so keep accumulating coverage without
+        // publishing partial startup transactions. Once coverage is complete,
+        // publish the current decoded image as a bounded full snapshot.
+        if !self.baseline_established {
+            let covered = self
+                .coverage
+                .record(self.coverage.session_id, generation, region)
+                .map_err(map_baseline_error)?;
+            if !covered {
+                return Ok(());
+            }
+            return self.recover_full_snapshot(runtime, image, recovery_patch_bytes);
+        }
+
         let patch = extract_bgrx_patch(image, region.clone())
             .map_err(|_| ProtocolError::FramePortRejected)?;
         let revision = self.next_revision()?;
@@ -304,16 +321,33 @@ impl RdpBaseline {
             .checked_sub(1)
             .ok_or(ProtocolError::FramePortRejected)?;
         for (index, region) in regions.into_iter().enumerate() {
-            let patch =
-                extract_bgrx_patch(image, region).map_err(|_| ProtocolError::FramePortRejected)?;
+            let patch = extract_bgrx_patch(image, region.clone())
+                .map_err(|_| ProtocolError::FramePortRejected)?;
             let revision = self.next_revision()?;
-            runtime.publish_surface(SurfaceUpdate::Damage {
+            let damage = SurfaceUpdate::Damage {
                 session_id: self.coverage.session_id,
                 generation: self.coverage.generation,
                 revision,
                 patches: vec![patch],
-            })?;
-            let completeness = if index == last {
+            };
+            match runtime.publish_surface(damage) {
+                Ok(()) => {}
+                Err(ProtocolError::NeedsFullSnapshot) if !self.baseline_established => {
+                    // A publisher may reject the first attempt while clearing
+                    // stale damage. Rebuild the same bounded patch and retry
+                    // once; the mailbox keeps the generation reset intact.
+                    let retry_patch = extract_bgrx_patch(image, region)
+                        .map_err(|_| ProtocolError::FramePortRejected)?;
+                    runtime.publish_surface(SurfaceUpdate::Damage {
+                        session_id: self.coverage.session_id,
+                        generation: self.coverage.generation,
+                        revision,
+                        patches: vec![retry_patch],
+                    })?;
+                }
+                Err(error) => return Err(error),
+            }
+            let completeness = if (!self.baseline_established && index == 0) || index == last {
                 FrameCompleteness::FullBaseline
             } else {
                 FrameCompleteness::Incremental
@@ -593,7 +627,7 @@ mod tests {
         let image = DecodedImage::new(IronPixelFormat::RgbA32, 4, 4);
 
         baseline
-            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(1, 1, 2, 2), 16)
+            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(0, 0, 3, 3), 16)
             .expect("one recoverable mailbox request rebuilds a full snapshot");
 
         let mut state = frames.lock().expect("frame log");
@@ -614,7 +648,7 @@ mod tests {
                 panic!("recovery must alternate Damage and FrameBoundary");
             };
             assert_eq!(*generation, 1);
-            assert_eq!(*revision, index as u64 + 2);
+            assert_eq!(*revision, index as u64 + 1);
             assert_eq!(patches.len(), 1);
             assert_eq!(patches[0].pixels.len(), 16);
 
@@ -626,14 +660,80 @@ mod tests {
             else {
                 panic!("recovery must alternate Damage and FrameBoundary");
             };
-            assert_eq!(*revision, index as u64 + 2);
-            let expected = if index == 3 {
+            assert_eq!(*revision, index as u64 + 1);
+            let expected = if index == 0 || index == 3 {
                 FrameCompleteness::FullBaseline
             } else {
                 FrameCompleteness::Incremental
             };
             assert_eq!(*completeness, expected);
         }
+        assert!(baseline.baseline_established());
+    }
+
+    #[test]
+    fn baseline_waits_for_exact_coverage_before_publishing_full_baseline() {
+        let session_id = SessionId::allocate();
+        let frames = Arc::new(Mutex::new(FailFirstDamageState {
+            failed_damage: true,
+            updates: Vec::new(),
+        }));
+        let (_commands, command_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoopEvents),
+            Box::new(FailFirstDamageFrames(frames.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let size = PixelSize {
+            width: 4,
+            height: 4,
+        };
+        let mut baseline =
+            RdpBaseline::begin(&mut runtime, session_id, size).expect("generation begins");
+        let image = DecodedImage::new(IronPixelFormat::RgbA32, 4, 4);
+
+        baseline
+            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(1, 1, 1, 1), 16)
+            .expect("partial first update is buffered");
+
+        {
+            let state = frames.lock().expect("frame log");
+            assert_eq!(
+                state
+                    .updates
+                    .iter()
+                    .filter(|update| matches!(update, SurfaceUpdate::FrameBoundary { .. }))
+                    .count(),
+                0
+            );
+        }
+
+        baseline
+            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(0, 0, 3, 3), 16)
+            .expect("exact coverage publishes the complete baseline");
+
+        let state = frames.lock().expect("frame log");
+        let boundaries = state
+            .updates
+            .iter()
+            .filter_map(|update| match update {
+                SurfaceUpdate::FrameBoundary { completeness, .. } => Some(*completeness),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(boundaries.len(), 4);
+        assert_eq!(boundaries[0], FrameCompleteness::FullBaseline);
+        assert_eq!(
+            boundaries[1..3],
+            [
+                FrameCompleteness::Incremental,
+                FrameCompleteness::Incremental,
+            ]
+        );
+        assert_eq!(boundaries[3], FrameCompleteness::FullBaseline);
         assert!(baseline.baseline_established());
     }
 

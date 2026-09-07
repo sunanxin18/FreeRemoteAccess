@@ -4,6 +4,8 @@ use ironrdp::graphics::image_processing::PixelFormat as IronPixelFormat;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::session::image::DecodedImage;
 
+use crate::pixel_convert::convert_rgba_to_bgrx;
+
 const BYTES_PER_PIXEL: usize = 4;
 const FRAME_MAILBOX_PIXEL_BUDGET: u64 = 64 * 1024 * 1024;
 const RENDERER_TEXTURE_BUDGET: u64 = 256 * 1024 * 1024;
@@ -100,6 +102,7 @@ fn extract_bgrx_patch_from_parts(
     pixels
         .try_reserve_exact(byte_count)
         .map_err(|_| RdpSurfaceError::AllocationFailed)?;
+    pixels.resize(byte_count, 0);
 
     let source_x = usize::from(region.left)
         .checked_mul(BYTES_PER_PIXEL)
@@ -113,9 +116,17 @@ fn extract_bgrx_patch_from_parts(
         let row_end = row_start
             .checked_add(source_width)
             .ok_or(RdpSurfaceError::InvalidRegion)?;
-        for source in image_data[row_start..row_end].chunks_exact(BYTES_PER_PIXEL) {
-            pixels.extend_from_slice(&[source[2], source[1], source[0], 0xff]);
-        }
+        let destination_start = usize::from(y - region.top)
+            .checked_mul(source_width)
+            .ok_or(RdpSurfaceError::InvalidRegion)?;
+        let destination_end = destination_start
+            .checked_add(source_width)
+            .ok_or(RdpSurfaceError::InvalidRegion)?;
+        convert_rgba_to_bgrx(
+            &image_data[row_start..row_end],
+            &mut pixels[destination_start..destination_end],
+        )
+        .map_err(|_| RdpSurfaceError::InvalidImageBuffer)?;
     }
 
     debug_assert_eq!(pixels.len(), byte_count);

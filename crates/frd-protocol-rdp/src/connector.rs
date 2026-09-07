@@ -1,7 +1,9 @@
 use std::io::{Read, Write};
 use std::mem;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 
+use frd_core::{DisplayConstraints, DisplayIntent, DisplayPlanner, PixelSize, SessionId};
 use frd_protocol_api::{ConnectionStage, ProtocolError, ProtocolRuntime, SessionEvent};
 use ironrdp::connector::credssp::CredsspSequence;
 use ironrdp::connector::sspi::generator::GeneratorState;
@@ -20,6 +22,7 @@ use crate::audio::{new_rdpsnd, RdpAudioAdapter};
 use crate::clipboard::new_cliprdr;
 use crate::config::{RdpClientPlatformIdentity, RdpConnectionConfig};
 use crate::display::DisplayControlCapabilityState;
+use crate::egfx::{EgfxAdapter, EgfxDecoderProvider, EgfxSurfacePublisher};
 use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
     RDP_NLA_FAILED, RDP_TCP_FAILED, RDP_TLS_FAILED,
@@ -35,12 +38,69 @@ const DEFAULT_DESKTOP_SIZE: DesktopSize = DesktopSize {
     height: 720,
 };
 
+const RDP_INITIAL_DISPLAY_CONSTRAINTS: DisplayConstraints = DisplayConstraints {
+    max_width: Some(u16::MAX as u32),
+    max_height: Some(u16::MAX as u32),
+    max_area: None,
+    max_texture_dimension: None,
+    frame_budget_bytes: Some(64 * 1024 * 1024),
+    bytes_per_pixel: 4,
+};
+
+/// Non-secret graphics capability state for one RDP session.
+///
+/// The legacy baseline is deliberately the only advertised graphics path until
+/// an EGFX adapter and a matching decoder have been registered.  The fields are
+/// kept separate so a later server confirmation cannot be mistaken for a client
+/// decoder capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RdpGraphicsCapability {
+    pub(crate) legacy_bitmap: bool,
+    pub(crate) remotefx: bool,
+    pub(crate) egfx_advertised: bool,
+    pub(crate) egfx_confirmed: bool,
+    pub(crate) avc420: bool,
+    pub(crate) avc444: bool,
+}
+
+impl Default for RdpGraphicsCapability {
+    fn default() -> Self {
+        baseline_graphics_capabilities()
+    }
+}
+
+/// Returns the current legacy-only graphics capability boundary.
+pub(crate) const fn baseline_graphics_capabilities() -> RdpGraphicsCapability {
+    RdpGraphicsCapability {
+        legacy_bitmap: true,
+        remotefx: true,
+        egfx_advertised: false,
+        egfx_confirmed: false,
+        avc420: false,
+        avc444: false,
+    }
+}
+
+fn planned_desktop_size(intent: DisplayIntent) -> DesktopSize {
+    let Some(size) = DisplayPlanner::plan(intent, RDP_INITIAL_DISPLAY_CONSTRAINTS)
+        .ok()
+        .and_then(|plan| plan.remote_size)
+    else {
+        return DEFAULT_DESKTOP_SIZE;
+    };
+    let (Ok(width), Ok(height)) = (u16::try_from(size.width), u16::try_from(size.height)) else {
+        return DEFAULT_DESKTOP_SIZE;
+    };
+    DesktopSize { width, height }
+}
+
 pub(crate) struct ActivatedRdpSession {
     #[allow(dead_code)] // Task 4 consumes the negotiated connector result.
     pub(crate) connection: ConnectionResult,
     pub(crate) transport: VerifiedTlsTransport,
     pub(crate) audio: RdpAudioAdapter,
     pub(crate) display_capabilities: DisplayControlCapabilityState,
+    pub(crate) graphics_capability: RdpGraphicsCapability,
 }
 
 struct NegotiatedTcp {
@@ -49,16 +109,19 @@ struct NegotiatedTcp {
     upgrade: ShouldUpgrade,
     audio: RdpAudioAdapter,
     display_capabilities: DisplayControlCapabilityState,
+    graphics_capability: RdpGraphicsCapability,
 }
 
 pub(crate) async fn connect_and_activate(
     config: &mut RdpConnectionConfig,
     runtime: &mut ProtocolRuntime,
+    egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
 ) -> Result<ActivatedRdpSession, ProtocolError> {
     runtime.publish_event(SessionEvent::StageChanged(ConnectionStage::Connecting))?;
 
     let endpoint = config.request.endpoint.clone();
     let addresses = resolve_addresses(&endpoint, runtime).await?;
+    let desktop_size = planned_desktop_size(config.request.display_intent);
 
     let NegotiatedTcp {
         connector: _,
@@ -66,7 +129,16 @@ pub(crate) async fn connect_and_activate(
         upgrade: _,
         audio: _,
         display_capabilities: _,
-    } = negotiate_enhanced_security(&addresses, config.client_platform, runtime).await?;
+        graphics_capability: _,
+    } = negotiate_enhanced_security(
+        &addresses,
+        config.client_platform,
+        desktop_size,
+        config.request.session_id,
+        egfx_decoder_provider.clone(),
+        runtime,
+    )
+    .await?;
     let preflight_shutdown = preflight_transport
         .try_clone()
         .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
@@ -85,10 +157,18 @@ pub(crate) async fn connect_and_activate(
     )?
     .ok_or_else(|| rdp_error(crate::error::RDP_CANCELLED))?;
 
-    let mut negotiated =
-        negotiate_enhanced_security(&addresses, config.client_platform, runtime).await?;
+    let mut negotiated = negotiate_enhanced_security(
+        &addresses,
+        config.client_platform,
+        desktop_size,
+        config.request.session_id,
+        egfx_decoder_provider,
+        runtime,
+    )
+    .await?;
     let audio = negotiated.audio.clone();
     let display_capabilities = negotiated.display_capabilities.clone();
+    let graphics_capability = negotiated.graphics_capability;
     let verified_shutdown = negotiated
         .transport
         .try_clone()
@@ -195,6 +275,7 @@ pub(crate) async fn connect_and_activate(
         transport,
         audio,
         display_capabilities,
+        graphics_capability,
     })
 }
 
@@ -219,6 +300,9 @@ async fn resolve_addresses(
 async fn negotiate_enhanced_security(
     addresses: &[SocketAddr],
     client_platform: RdpClientPlatformIdentity,
+    desktop_size: DesktopSize,
+    session_id: SessionId,
+    egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
     runtime: &mut ProtocolRuntime,
 ) -> Result<NegotiatedTcp, ProtocolError> {
     let mut last_error = rdp_error(RDP_TCP_FAILED);
@@ -244,18 +328,22 @@ async fn negotiate_enhanced_security(
             .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
         let client_addr = stream.local_addr().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
         let shutdown = stream.try_clone().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
+        let egfx_decoder_provider = egfx_decoder_provider.clone();
         let negotiated = wait_for_blocking(runtime, shutdown, RDP_TLS_FAILED, move |_| {
             let mut framed = Framed::new(stream);
-            let (mut connector, audio, display_capabilities) = baseline_connector(
-                Credentials::SmartCard {
-                    pin: String::new(),
-                    config: None,
-                },
-                None,
-                DEFAULT_DESKTOP_SIZE,
-                client_addr,
-                client_platform,
-            );
+            let (mut connector, audio, display_capabilities, graphics_capability) =
+                baseline_connector(
+                    Credentials::SmartCard {
+                        pin: String::new(),
+                        config: None,
+                    },
+                    None,
+                    desktop_size,
+                    client_addr,
+                    client_platform,
+                    session_id,
+                    egfx_decoder_provider.as_ref(),
+                );
             let upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)?;
             Ok::<_, ConnectorError>(NegotiatedTcp {
                 connector,
@@ -263,6 +351,7 @@ async fn negotiate_enhanced_security(
                 upgrade,
                 audio,
                 display_capabilities,
+                graphics_capability,
             })
         })
         .await?;
@@ -388,19 +477,57 @@ fn baseline_connector(
     desktop_size: DesktopSize,
     client_addr: SocketAddr,
     client_platform: RdpClientPlatformIdentity,
+    session_id: SessionId,
+    egfx_decoder_provider: Option<&Arc<dyn EgfxDecoderProvider>>,
 ) -> (
     ClientConnector,
     RdpAudioAdapter,
     DisplayControlCapabilityState,
+    RdpGraphicsCapability,
 ) {
     let audio = RdpAudioAdapter::new();
     let display_capabilities = DisplayControlCapabilityState::default();
     let observed_display_capabilities = display_capabilities.clone();
-    let dynamic_channels =
+    let egfx = egfx_decoder_provider.and_then(|provider| {
+        let coded_size = PixelSize::new(
+            u32::from(desktop_size.width),
+            u32::from(desktop_size.height),
+        )?;
+        let decoder = provider.create_decoder(session_id, coded_size)?;
+        let publisher = EgfxSurfacePublisher::try_new(session_id, 1)?;
+        let publisher = match provider.create_avc444_decoder(session_id, coded_size) {
+            Some(decoder) => publisher.with_avc444_decoder(decoder),
+            None => publisher,
+        };
+        Some(EgfxAdapter::with_surface_publisher(
+            Some(decoder),
+            publisher,
+        ))
+    });
+    let egfx_advertised = egfx.is_some();
+    let graphics_capability = if egfx_advertised {
+        RdpGraphicsCapability {
+            legacy_bitmap: true,
+            remotefx: true,
+            egfx_advertised: true,
+            egfx_confirmed: false,
+            // The provider proves that the client can advertise AVC420.  The
+            // negotiated codec stays false until the server's
+            // CapabilitiesConfirm is observed by the active-session loop.
+            avc420: false,
+            avc444: false,
+        }
+    } else {
+        baseline_graphics_capabilities()
+    };
+    let mut dynamic_channels =
         DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(move |capabilities| {
             observed_display_capabilities.record(&capabilities);
             Ok(Vec::new())
         }));
+    if let Some(egfx) = egfx {
+        dynamic_channels = dynamic_channels.with_dynamic_channel(egfx);
+    }
     let connector = ClientConnector::new(
         connector::Config {
             credentials,
@@ -444,20 +571,177 @@ fn baseline_connector(
     .with_static_channel(dynamic_channels)
     .with_static_channel(new_cliprdr())
     .with_static_channel(new_rdpsnd(&audio));
-    (connector, audio, display_capabilities)
+    (connector, audio, display_capabilities, graphics_capability)
+}
+
+#[cfg(test)]
+fn test_dynamic_channels_with_egfx(
+    display_capabilities: DisplayControlCapabilityState,
+) -> DrdynvcClient {
+    let observed_display_capabilities = display_capabilities;
+    DrdynvcClient::new()
+        .with_dynamic_channel(DisplayControlClient::new(move |capabilities| {
+            observed_display_capabilities.record(&capabilities);
+            Ok(Vec::new())
+        }))
+        .with_dynamic_channel(EgfxAdapter::new(
+            None,
+            Box::new(crate::egfx::NoopEgfxHandler),
+        ))
 }
 
 #[cfg(test)]
 mod tests {
     use ironrdp::connector::{Credentials, DesktopSize};
+    use ironrdp::core::encode_vec;
+    use ironrdp::dvc::pdu::{CreateRequestPdu, DrdynvcServerPdu};
     use ironrdp::dvc::DrdynvcClient;
     use ironrdp::pdu::rdp::capability_sets::{
         CodecId, CodecProperty, MajorPlatformType, RemoteFxContainer, CODEC_ID_REMOTEFX,
     };
+    use ironrdp::svc::SvcProcessor;
 
-    use super::baseline_connector;
+    use super::{
+        baseline_connector, baseline_graphics_capabilities, planned_desktop_size,
+        test_dynamic_channels_with_egfx, RdpGraphicsCapability,
+    };
     use crate::config::RdpClientPlatformIdentity;
+    use crate::display::DisplayControlCapabilityState;
+    use crate::egfx::EgfxDecoderProvider;
     use crate::upstream::client_platform_type;
+    use frd_core::{DisplayIntent, PixelSize, SessionId};
+    use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder};
+
+    #[test]
+    fn initial_desktop_size_uses_native_physical_pixels_above_2560() {
+        let geometry =
+            frd_core::DisplayGeometry::from_physical(PixelSize::new(3840, 2160).unwrap(), 1000)
+                .unwrap();
+        assert_eq!(
+            planned_desktop_size(DisplayIntent::native_display(geometry)),
+            DesktopSize {
+                width: 3840,
+                height: 2160,
+            }
+        );
+    }
+
+    #[test]
+    fn initial_desktop_size_accepts_five_k_when_surface_budget_allows_it() {
+        assert_eq!(
+            planned_desktop_size(DisplayIntent::fixed(PixelSize::new(5120, 2880).unwrap())),
+            DesktopSize {
+                width: 5120,
+                height: 2880,
+            }
+        );
+    }
+
+    #[test]
+    fn server_managed_keeps_legacy_safe_fallback() {
+        assert_eq!(
+            planned_desktop_size(DisplayIntent::default()),
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            }
+        );
+    }
+
+    #[test]
+    fn baseline_rdp_capabilities_do_not_advertise_h264() {
+        let capabilities = baseline_graphics_capabilities();
+        assert_eq!(RdpGraphicsCapability::default(), capabilities);
+        assert!(capabilities.legacy_bitmap);
+        assert!(capabilities.remotefx);
+        assert!(!capabilities.egfx_advertised);
+        assert!(!capabilities.egfx_confirmed);
+        assert!(!capabilities.avc420);
+        assert!(!capabilities.avc444);
+    }
+
+    #[test]
+    fn egfx_registration_is_separate_from_display_control() {
+        let mut channels =
+            test_dynamic_channels_with_egfx(DisplayControlCapabilityState::default());
+
+        for (channel_id, channel_name) in [
+            (7, "Microsoft::Windows::RDS::DisplayControl"),
+            (8, "Microsoft::Windows::RDS::Graphics"),
+        ] {
+            let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(
+                channel_id,
+                channel_name.to_owned(),
+            ));
+            let payload = encode_vec(&request).expect("encode DVC create request");
+            channels
+                .process(&payload)
+                .expect("registered DVC channel should accept create request");
+            assert!(channels.get_dvc_by_channel_id(channel_id).is_some());
+        }
+    }
+
+    #[test]
+    fn injected_decoder_provider_registers_avc420_without_avc444() {
+        let provider: std::sync::Arc<dyn EgfxDecoderProvider> =
+            std::sync::Arc::new(StubEgfxDecoderProvider);
+        let session_id = SessionId::allocate();
+        let (mut connector, _audio, _display, graphics) = baseline_connector(
+            Credentials::UsernamePassword {
+                username: "alice".to_owned(),
+                password: String::new(),
+            },
+            None,
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            },
+            "127.0.0.1:49152".parse().expect("valid client address"),
+            RdpClientPlatformIdentity::Windows,
+            session_id,
+            Some(&provider),
+        );
+
+        assert!(graphics.egfx_advertised);
+        assert!(!graphics.avc420);
+        assert!(!graphics.egfx_confirmed);
+        assert!(!graphics.avc444);
+
+        let channels = connector
+            .get_static_channel_processor_mut::<DrdynvcClient>()
+            .expect("dynamic virtual channel processor");
+        let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            9,
+            "Microsoft::Windows::RDS::Graphics".to_owned(),
+        ));
+        let payload = encode_vec(&request).expect("encode DVC create request");
+        channels
+            .process(&payload)
+            .expect("registered EGFX channel should accept create request");
+        assert!(channels.get_dvc_by_channel_id(9).is_some());
+    }
+
+    struct StubEgfxDecoderProvider;
+
+    impl EgfxDecoderProvider for StubEgfxDecoderProvider {
+        fn create_decoder(
+            &self,
+            _session_id: SessionId,
+            _coded_size: PixelSize,
+        ) -> Option<Box<dyn H264Decoder>> {
+            Some(Box::new(StubEgfxDecoder))
+        }
+    }
+
+    struct StubEgfxDecoder;
+
+    impl H264Decoder for StubEgfxDecoder {
+        fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+            Err(DecoderError::msg("test decoder is intentionally inert"))
+        }
+
+        fn reset(&mut self) {}
+    }
 
     #[test]
     fn approved_identities_map_to_exact_ironrdp_major_platform_types() {
@@ -485,7 +769,7 @@ mod tests {
 
     #[test]
     fn connector_requires_credssp_and_refuses_tls_only_downgrade() {
-        let (connector, _audio, _display_capabilities) = baseline_connector(
+        let (connector, _audio, _display_capabilities, _graphics_capability) = baseline_connector(
             Credentials::UsernamePassword {
                 username: "alice".to_owned(),
                 password: String::new(),
@@ -497,6 +781,8 @@ mod tests {
             },
             "127.0.0.1:49152".parse().expect("valid client address"),
             RdpClientPlatformIdentity::Windows,
+            SessionId::allocate(),
+            None,
         );
 
         assert!(!connector.config.enable_tls);
@@ -505,19 +791,22 @@ mod tests {
 
     #[test]
     fn connector_offers_only_approved_optional_channels() {
-        let (mut connector, _audio, _display_capabilities) = baseline_connector(
-            Credentials::UsernamePassword {
-                username: "alice".to_owned(),
-                password: String::new(),
-            },
-            None,
-            DesktopSize {
-                width: 1280,
-                height: 720,
-            },
-            "127.0.0.1:49152".parse().expect("valid client address"),
-            RdpClientPlatformIdentity::Windows,
-        );
+        let (mut connector, _audio, _display_capabilities, _graphics_capability) =
+            baseline_connector(
+                Credentials::UsernamePassword {
+                    username: "alice".to_owned(),
+                    password: String::new(),
+                },
+                None,
+                DesktopSize {
+                    width: 1280,
+                    height: 720,
+                },
+                "127.0.0.1:49152".parse().expect("valid client address"),
+                RdpClientPlatformIdentity::Windows,
+                SessionId::allocate(),
+                None,
+            );
         let bitmap = connector
             .config
             .bitmap

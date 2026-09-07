@@ -97,3 +97,14 @@ jobs:
           -p frd-protocol-rdp
           -p frd-ui-egui
           -p frd-shell-desktop
+
+      - name: Test macOS platform and application
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p frd-platform-macos -p freeremotedesk-macos
+
+      - name: Build and verify macOS application bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo build --locked --release -p freeremotedesk-macos
+          bash tools/stage-macos-package.sh release

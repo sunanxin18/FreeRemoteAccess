@@ -3,7 +3,7 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-use frd_core::{PhysicalViewport, PixelSize, SecretBytes, SessionId, SessionInput};
+use frd_core::{DisplayIntent, PhysicalViewport, PixelSize, SecretBytes, SessionId, SessionInput};
 use frd_frame::{FrameCompleteness, FrameMailbox, PixelFormat, SurfaceUpdate};
 use frd_media_api::{MediaFrame, MediaPublishError, MediaPublisher};
 
@@ -224,6 +224,8 @@ pub struct ConnectRequest {
     pub credentials: Option<Credentials>,
     /// 仅由 app 在启动 worker 前加载的一条 endpoint/protocol 精确 pin 快照。
     pub saved_server_pin: Option<[u8; 32]>,
+    /// 协议无关的远程显示尺寸意图；未由桌面 shell 填充时保持服务器管理。
+    pub display_intent: DisplayIntent,
 }
 
 pub trait ProtocolFactory: Send + Sync {

@@ -269,8 +269,8 @@ try {
         "--disable-programs",
         "--disable-doc",
         "--disable-everything",
-        "--enable-decoder=hevc",
-        "--enable-parser=hevc",
+        "--enable-decoder=hevc,h264",
+        "--enable-parser=hevc,h264",
         "--enable-protocol=file",
         "--disable-gpl",
         "--disable-nonfree",
@@ -299,6 +299,8 @@ try {
         "#define CONFIG_NONFREE 0",
         "#define CONFIG_HEVC_DECODER 1",
         "#define CONFIG_HEVC_PARSER 1",
+        "#define CONFIG_H264_DECODER 1",
+        "#define CONFIG_H264_PARSER 1",
         "#define CONFIG_FILE_PROTOCOL 1",
         "#define HAVE_X86ASM 1"
     )) {
