@@ -874,6 +874,73 @@ fn crop_yuv444_to_rgba(
     ))
 }
 
+fn crop_rgba_frame_region(
+    frame: &DecodedFrame,
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+) -> DecoderResult<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(DecoderError::msg("AVC444 region is empty"));
+    }
+    let right = left
+        .checked_add(width)
+        .ok_or_else(|| DecoderError::msg("AVC444 region right edge overflows"))?;
+    let bottom = top
+        .checked_add(height)
+        .ok_or_else(|| DecoderError::msg("AVC444 region bottom edge overflows"))?;
+    if right > frame.width() || bottom > frame.height() {
+        return Err(DecoderError::msg("AVC444 region exceeds decoded frame"));
+    }
+    let frame_width = usize::try_from(frame.width())
+        .map_err(|_| DecoderError::msg("AVC444 frame width overflow"))?;
+    let left =
+        usize::try_from(left).map_err(|_| DecoderError::msg("AVC444 region left overflow"))?;
+    let top = usize::try_from(top).map_err(|_| DecoderError::msg("AVC444 region top overflow"))?;
+    let width =
+        usize::try_from(width).map_err(|_| DecoderError::msg("AVC444 region width overflow"))?;
+    let height =
+        usize::try_from(height).map_err(|_| DecoderError::msg("AVC444 region height overflow"))?;
+    let row_bytes = width
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| DecoderError::msg("AVC444 region row is over budget"))?;
+    let output_len = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| DecoderError::msg("AVC444 region is over budget"))?;
+    if output_len > MAX_AVC444_BITMAP_DATA {
+        return Err(DecoderError::msg("AVC444 region is over budget"));
+    }
+    let source = frame.data();
+    let frame_row_bytes = frame_width
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or_else(|| DecoderError::msg("AVC444 frame row overflows"))?;
+    let frame_height = usize::try_from(frame.height())
+        .map_err(|_| DecoderError::msg("AVC444 frame height overflow"))?;
+    let required_source_len = frame_row_bytes
+        .checked_mul(frame_height)
+        .ok_or_else(|| DecoderError::msg("AVC444 frame buffer overflows"))?;
+    if source.len() < required_source_len {
+        return Err(DecoderError::msg("AVC444 frame buffer is truncated"));
+    }
+    let mut output = vec![0_u8; output_len];
+    for row in 0..height {
+        let source_start = (top + row)
+            .checked_mul(frame_row_bytes)
+            .and_then(|offset| offset.checked_add(left.checked_mul(BYTES_PER_PIXEL)?))
+            .ok_or_else(|| DecoderError::msg("AVC444 region source offset overflows"))?;
+        let source_end = source_start
+            .checked_add(row_bytes)
+            .ok_or_else(|| DecoderError::msg("AVC444 region source end overflows"))?;
+        let destination_start = row
+            .checked_mul(row_bytes)
+            .ok_or_else(|| DecoderError::msg("AVC444 region destination offset overflows"))?;
+        output[destination_start..destination_start + row_bytes]
+            .copy_from_slice(&source[source_start..source_end]);
+    }
+    Ok(output)
+}
+
 fn avc420_stream_config(
     session_id: SessionId,
     generation: u64,
@@ -1103,6 +1170,22 @@ pub struct ValidatedAvc444Bitmap<'a> {
     pub stream2_region_count: usize,
 }
 
+impl<'a> ValidatedAvc444Bitmap<'a> {
+    fn publication_regions(&self) -> Vec<ironrdp::pdu::geometry::InclusiveRectangle> {
+        let mut regions = self.stream1_regions.to_vec();
+        if matches!(self.encoding, ValidatedAvc444Encoding::LumaAndChroma) {
+            if let Some(stream2_regions) = self.stream2_regions.as_deref() {
+                for region in stream2_regions {
+                    if !regions.contains(region) {
+                        regions.push(region.clone());
+                    }
+                }
+            }
+        }
+        regions
+    }
+}
+
 pub(crate) fn validate_avc444_bitmap(data: &[u8]) -> DecoderResult<ValidatedAvc444Bitmap<'_>> {
     if data.is_empty() || data.len() > MAX_AVC444_BITMAP_DATA {
         return Err(DecoderError::msg(
@@ -1183,6 +1266,15 @@ pub(crate) fn validate_avc444_bitmap(data: &[u8]) -> DecoderResult<ValidatedAvc4
     let stream2_data = stream2.as_ref().map(|stream| stream.data);
     let stream2_region_count = stream2.as_ref().map_or(0, |stream| stream.rectangles.len());
     let stream2_regions = stream2.map(|stream| stream.rectangles.into_boxed_slice());
+    if stream1_regions.is_empty()
+        || stream2_regions
+            .as_deref()
+            .is_some_and(|regions| regions.is_empty())
+    {
+        return Err(DecoderError::msg(
+            "AVC444 bitmap stream has no region rectangles",
+        ));
+    }
     Ok(ValidatedAvc444Bitmap {
         encoding,
         stream1: stream1_data,
@@ -1728,13 +1820,80 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             self.fail_avc444();
             return;
         }
-        self.queue_decoded_bitmap_update(
-            wire.surface_id,
-            &wire.destination_rectangle,
-            frame.data(),
-            width,
-            height,
-        );
+        let destination_left = u32::from(wire.destination_rectangle.left);
+        let destination_top = u32::from(wire.destination_rectangle.top);
+        let destination_right = u32::from(wire.destination_rectangle.right);
+        let destination_bottom = u32::from(wire.destination_rectangle.bottom);
+        let mut updates = Vec::new();
+        for region in validated.publication_regions() {
+            let region_left = u32::from(region.left);
+            let region_top = u32::from(region.top);
+            let Some(region_right) = u32::from(region.right).checked_add(1) else {
+                self.fail_avc444();
+                return;
+            };
+            let Some(region_bottom) = u32::from(region.bottom).checked_add(1) else {
+                self.fail_avc444();
+                return;
+            };
+            if region_left < destination_left
+                || region_top < destination_top
+                || region_right > destination_right
+                || region_bottom > destination_bottom
+                || region_left >= region_right
+                || region_top >= region_bottom
+            {
+                self.fail_avc444();
+                return;
+            }
+            let crop_left = region_left - destination_left;
+            let crop_top = region_top - destination_top;
+            let crop_width = region_right - region_left;
+            let crop_height = region_bottom - region_top;
+            let data = match crop_rgba_frame_region(
+                &frame,
+                crop_left,
+                crop_top,
+                crop_width,
+                crop_height,
+            ) {
+                Ok(data) => data,
+                Err(_) => {
+                    self.fail_avc444();
+                    return;
+                }
+            };
+            updates.push((
+                ExclusiveRectangle {
+                    left: region.left,
+                    top: region.top,
+                    right: match u16::try_from(region_right) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            self.fail_avc444();
+                            return;
+                        }
+                    },
+                    bottom: match u16::try_from(region_bottom) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            self.fail_avc444();
+                            return;
+                        }
+                    },
+                },
+                data,
+                crop_width,
+                crop_height,
+            ));
+        }
+        if updates.is_empty() {
+            self.fail_avc444();
+            return;
+        }
+        for (destination, data, width, height) in updates {
+            self.queue_decoded_bitmap_update(wire.surface_id, &destination, &data, width, height);
+        }
     }
 }
 
@@ -2208,6 +2367,85 @@ mod tests {
             }
         ));
         assert_eq!(publisher_state.rejected_update_count(), 0);
+    }
+
+    #[test]
+    fn avc444_publication_applies_substream_region_masks_to_nonzero_destination() {
+        let session_id = SessionId::allocate();
+        let mut publisher = EgfxSurfacePublisher::try_new(session_id, 1)
+            .unwrap()
+            .with_avc444_decoder(Box::new(SolidAvc444Decoder));
+        publisher.on_reset_graphics(8, 8);
+        super::lock_state(&publisher.state).surfaces.insert(
+            1,
+            super::EgfxSurface {
+                width: 8,
+                height: 8,
+                origin_x: 0,
+                origin_y: 0,
+                mapped: true,
+            },
+        );
+
+        let regions = [
+            Avc420Region::new(3, 4, 3, 4, 22, 100),
+            Avc420Region::new(5, 6, 5, 6, 22, 100),
+        ];
+        let stream_data = [0, 0, 0, 2, 0x65, 0x88];
+        let stream = Avc420BitmapStream {
+            rectangles: regions.iter().map(Avc420Region::to_rectangle).collect(),
+            quant_qual_vals: regions.iter().map(Avc420Region::to_quant_quality).collect(),
+            data: &stream_data,
+        };
+        let bitmap = Avc444BitmapStream {
+            encoding: ironrdp_egfx::pdu::Encoding::LUMA,
+            stream1: stream,
+            stream2: None,
+        };
+        let mut bitmap_data = vec![0_u8; bitmap.size()];
+        let mut cursor = WriteCursor::new(&mut bitmap_data);
+        bitmap
+            .encode(&mut cursor)
+            .expect("AVC444 region fixture encodes");
+
+        publisher.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::Avc444,
+            pixel_format: EgfxPixelFormat::XRgb,
+            destination_rectangle: ExclusiveRectangle {
+                left: 2,
+                top: 3,
+                right: 6,
+                bottom: 7,
+            },
+            bitmap_data,
+        }));
+
+        let state = super::lock_state(&publisher.state);
+        assert!(!state.disabled);
+        assert_eq!(state.pending_patches.len(), 2);
+        assert_eq!(
+            state.pending_patches[0].rect,
+            PixelRect {
+                x: 3,
+                y: 4,
+                width: 1,
+                height: 1,
+            }
+        );
+        assert_eq!(
+            state.pending_patches[1].rect,
+            PixelRect {
+                x: 5,
+                y: 6,
+                width: 1,
+                height: 1,
+            }
+        );
+        assert!(state
+            .pending_patches
+            .iter()
+            .all(|patch| patch.pixels.len() == 4));
     }
 
     #[test]
