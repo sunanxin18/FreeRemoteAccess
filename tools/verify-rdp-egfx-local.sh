@@ -130,6 +130,8 @@ else
 fi
 
 if [[ "${FRD_VERIFY_NATIVE_FFMPEG_FIXTURES:-0}" == 1 ]]; then
+    # 可用 FRD_FFMPEG_TEST_TARGET 指定交叉 target；macOS x86_64 可在 Rosetta
+    # 下设置 x86_64-apple-darwin，仍然只把实际执行结果记为 native fixture 证据。
     native_bundle="${FRD_FFMPEG_TEST_BUNDLE:-}"
     native_dist="${FFMPEG_DIR:-}"
     if [[ -z "$native_bundle" || -z "$native_dist" || ! -d "$native_bundle" || ! -d "$native_dist" ]]; then
@@ -147,11 +149,16 @@ if [[ "${FRD_VERIFY_NATIVE_FFMPEG_FIXTURES:-0}" == 1 ]]; then
         else
             loader_value="$native_bundle"
         fi
+        native_target_args=()
+        if [[ -n "${FRD_FFMPEG_TEST_TARGET:-}" ]]; then
+            native_target_args=(--target "$FRD_FFMPEG_TEST_TARGET")
+        fi
         run_gate 'native FFmpeg HEVC/AVC420/AVC444 fixtures' env \
             FFMPEG_DIR="$native_dist" \
             FRD_FFMPEG_TEST_BUNDLE="$native_bundle" \
             "$loader_var=$loader_value" \
-            cargo test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg \
+            cargo test --locked "${native_target_args[@]}" \
+            -p frd-video-ffmpeg-plugin --features native-ffmpeg \
             --test main444_decode -- --nocapture
     fi
 else
