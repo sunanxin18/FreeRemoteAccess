@@ -164,6 +164,35 @@ impl Yuv444Frame {
     pub(crate) fn planes(&self) -> [&[u8]; 3] {
         [&self.y, &self.u, &self.v]
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_planes(
+        width: usize,
+        height: usize,
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+    ) -> Result<Self, Avc444ReconstructionError> {
+        let plane_bytes = width
+            .checked_mul(height)
+            .ok_or(Avc444ReconstructionError::AllocationOverBudget)?;
+        if width == 0
+            || height == 0
+            || plane_bytes > MAX_YUV444_BYTES / 3
+            || y.len() != plane_bytes
+            || u.len() != plane_bytes
+            || v.len() != plane_bytes
+        {
+            return Err(Avc444ReconstructionError::InvalidPlane);
+        }
+        Ok(Self {
+            width,
+            height,
+            y,
+            u,
+            v,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]

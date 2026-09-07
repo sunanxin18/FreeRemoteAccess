@@ -821,35 +821,38 @@ fn crop_yuv444_to_rgba(
     }
     let [y_plane, u_plane, v_plane] = frame.planes();
     let frame_width = frame.width();
-    let full_len = frame_width
-        .checked_mul(frame.height())
-        .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
-        .ok_or_else(|| DecoderError::msg("AVC444 decoded frame is over budget"))?;
-    let mut full_rgba = vec![0_u8; full_len];
-    convert_yuv444_to_rgba(
-        frame_width,
-        frame.height(),
-        y_plane,
-        frame_width,
-        u_plane,
-        frame_width,
-        v_plane,
-        frame_width,
-        &mut full_rgba,
-    )
-    .map_err(|_| DecoderError::msg("AVC444 YUV444 plane conversion failed"))?;
+    let plane_offset = top
+        .checked_mul(frame_width)
+        .and_then(|row| row.checked_add(left))
+        .ok_or_else(|| DecoderError::msg("AVC444 destination offset overflow"))?;
+    let required_plane_len = height
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(frame_width))
+        .and_then(|rows| rows.checked_add(width))
+        .ok_or_else(|| DecoderError::msg("AVC444 destination plane length overflow"))?;
+    let plane_end = plane_offset
+        .checked_add(required_plane_len)
+        .ok_or_else(|| DecoderError::msg("AVC444 destination plane end overflow"))?;
+    if y_plane.len() < plane_end || u_plane.len() < plane_end || v_plane.len() < plane_end {
+        return Err(DecoderError::msg("AVC444 destination plane is truncated"));
+    }
     let output_len = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
         .ok_or_else(|| DecoderError::msg("AVC444 RGBA frame is over budget"))?;
     let mut output = vec![0_u8; output_len];
-    for row in 0..height {
-        let source_start = ((top + row) * frame_width + left) * BYTES_PER_PIXEL;
-        let row_len = width * BYTES_PER_PIXEL;
-        let destination_start = row * row_len;
-        output[destination_start..destination_start + row_len]
-            .copy_from_slice(&full_rgba[source_start..source_start + row_len]);
-    }
+    convert_yuv444_to_rgba(
+        width,
+        height,
+        &y_plane[plane_offset..],
+        frame_width,
+        &u_plane[plane_offset..],
+        frame_width,
+        &v_plane[plane_offset..],
+        frame_width,
+        &mut output,
+    )
+    .map_err(|_| DecoderError::msg("AVC444 YUV444 plane conversion failed"))?;
     Ok(DecodedFrame::new(
         output,
         u32::try_from(width).map_err(|_| DecoderError::msg("AVC444 width overflow"))?,
@@ -1845,6 +1848,8 @@ mod tests {
         Avc444DecoderProvider, Avc444VideoDecoder, EgfxAdapter, EgfxDecoderProvider,
         EgfxH264Decoder, EgfxSurfacePublisher, ValidatedAvc444Encoding,
     };
+    use crate::avc444::Yuv444Frame;
+    use crate::yuv_convert::convert_yuv444_to_rgba;
     use frd_core::{PixelRect, PixelSize, SessionId};
     use frd_frame::{FrameCompleteness, PixelFormat, SurfaceUpdate};
     use frd_media_api::{
@@ -2121,6 +2126,84 @@ mod tests {
             publisher.drain().as_slice(),
             [SurfaceUpdate::Reset { size, .. }] if *size == expected
         ));
+    }
+
+    #[test]
+    fn avc444_crop_converts_only_the_requested_odd_rectangle() {
+        let frame_width = 7;
+        let frame_height = 5;
+        let y = (0..frame_width * frame_height)
+            .map(|index| (16 + index * 3) as u8)
+            .collect::<Vec<_>>();
+        let u = (0..frame_width * frame_height)
+            .map(|index| (80 + index * 5) as u8)
+            .collect::<Vec<_>>();
+        let v = (0..frame_width * frame_height)
+            .map(|index| (120 + index * 7) as u8)
+            .collect::<Vec<_>>();
+        let frame = Yuv444Frame::from_test_planes(
+            frame_width,
+            frame_height,
+            y.clone(),
+            u.clone(),
+            v.clone(),
+        )
+        .expect("test YUV444 frame");
+        let destination = ExclusiveRectangle {
+            left: 1,
+            top: 1,
+            right: 6,
+            bottom: 5,
+        };
+
+        let cropped = super::crop_yuv444_to_rgba(&frame, &destination)
+            .expect("non-zero AVC444 crop converts");
+        assert_eq!((cropped.width(), cropped.height()), (5, 4));
+
+        let mut full = vec![0_u8; frame_width * frame_height * 4];
+        convert_yuv444_to_rgba(
+            frame_width,
+            frame_height,
+            &y,
+            frame_width,
+            &u,
+            frame_width,
+            &v,
+            frame_width,
+            &mut full,
+        )
+        .expect("full reference conversion");
+        let mut expected = Vec::with_capacity(5 * 4 * 4);
+        for row in 1..5 {
+            let start = (row * frame_width + 1) * 4;
+            expected.extend_from_slice(&full[start..start + 5 * 4]);
+        }
+        assert_eq!(cropped.data(), expected.as_slice());
+    }
+
+    #[test]
+    fn avc444_crop_rejects_empty_and_out_of_bounds_rectangles() {
+        let frame = Yuv444Frame::from_test_planes(3, 3, vec![16; 9], vec![128; 9], vec![128; 9])
+            .expect("test YUV444 frame");
+        for destination in [
+            ExclusiveRectangle {
+                left: 1,
+                top: 1,
+                right: 1,
+                bottom: 2,
+            },
+            ExclusiveRectangle {
+                left: 2,
+                top: 2,
+                right: 4,
+                bottom: 3,
+            },
+        ] {
+            assert!(
+                super::crop_yuv444_to_rgba(&frame, &destination).is_err(),
+                "invalid AVC444 rectangle must fail closed"
+            );
+        }
     }
 
     fn encode_avc444_fixture(
