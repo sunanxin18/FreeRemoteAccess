@@ -19,16 +19,16 @@ cd "$repo_root"
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 if [[ "$cross_build" -eq 1 ]]; then
     if [[ "$profile" == release ]]; then
-        cargo build -p freeremotedesk-macos --release --target "$rust_target"
+        cargo build --locked -p freeremotedesk-macos --release --target "$rust_target"
     else
-        cargo build -p freeremotedesk-macos --target "$rust_target"
+        cargo build --locked -p freeremotedesk-macos --target "$rust_target"
     fi
     binary="$target_dir/$rust_target/$profile/freeremotedesk-macos"
 else
     if [[ "$profile" == release ]]; then
-        cargo build -p freeremotedesk-macos --release
+        cargo build --locked -p freeremotedesk-macos --release
     else
-        cargo build -p freeremotedesk-macos
+        cargo build --locked -p freeremotedesk-macos
     fi
     binary="$target_dir/$profile/freeremotedesk-macos"
 fi

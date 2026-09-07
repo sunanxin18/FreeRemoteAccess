@@ -1,0 +1,137 @@
+name: macOS package
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "apps/freeremotedesk-macos/**"
+      - "assets/**"
+      - "crates/**"
+      - "packaging/macos/**"
+      - "third_party/ffmpeg/8.1.2/**"
+      - "tools/build-ffmpeg-macos.sh"
+      - "tools/stage-macos-package.sh"
+      - "tools/verify-macos-package.sh"
+      - "tools/create-macos-icon.swift"
+      - "third_party/ironrdp-connector-0.10.0/**"
+      - ".github/workflows/build-macos.yml"
+  push:
+    branches:
+      - "main"
+      - "codex/**"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "apps/freeremotedesk-macos/**"
+      - "assets/**"
+      - "crates/**"
+      - "packaging/macos/**"
+      - "third_party/ffmpeg/8.1.2/**"
+      - "tools/build-ffmpeg-macos.sh"
+      - "tools/stage-macos-package.sh"
+      - "tools/verify-macos-package.sh"
+      - "tools/create-macos-icon.swift"
+      - "third_party/ironrdp-connector-0.10.0/**"
+      - ".github/workflows/build-macos.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-package-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: macOS ${{ matrix.architecture }} package
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: macos-15
+            host_arch: arm64
+            rust_target: aarch64-apple-darwin
+          - architecture: x86_64
+            runner: macos-15-intel
+            host_arch: x86_64
+            rust_target: x86_64-apple-darwin
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install x86 assembly toolchain
+        if: matrix.architecture == 'x86_64'
+        shell: bash
+        run: brew install nasm
+
+      - name: Verify pinned Rust toolchain
+        shell: bash
+        run: |
+          test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
+          test "$(uname -m)" = "${{ matrix.host_arch }}"
+          rustc --target "${{ matrix.rust_target }}" --version --verbose
+
+      - name: Run focused decoder and protocol tests
+        shell: bash
+        run: >-
+          cargo test --locked
+          -p frd-media-api
+          -p frd-video-ffmpeg
+          -p frd-video-ffmpeg-plugin
+          -p frd-protocol-rdp
+          -p freeremotedesk-macos
+
+      - name: Build exact FFmpeg bundle and native fixtures
+        shell: bash
+        env:
+          FRD_MACOS_ARCH: ${{ matrix.architecture }}
+          FRD_FFMPEG_BUILD_ROOT: ${{ github.workspace }}/target/ffmpeg-macos-${{ matrix.architecture }}
+          FRD_FFMPEG_RUN_NATIVE_TESTS: "1"
+        run: bash tools/build-ffmpeg-macos.sh
+
+      - name: Stage and verify macOS application
+        shell: bash
+        env:
+          FRD_MACOS_ARCH: ${{ matrix.architecture }}
+        run: bash tools/stage-macos-package.sh release
+
+      - name: Stage corresponding FFmpeg source evidence
+        shell: bash
+        run: |
+          source_root="target/ffmpeg-macos-${{ matrix.architecture }}"
+          release_root="target/release-assets/ffmpeg-8.1.2-${{ matrix.architecture }}"
+          test -f "$source_root/ffmpeg-8.1.2.tar.xz"
+          actual_hash="$(shasum -a 256 "$source_root/ffmpeg-8.1.2.tar.xz" | awk '{print $1}')"
+          test "$actual_hash" = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+          mkdir -p "$release_root"
+          cp "$source_root/ffmpeg-8.1.2.tar.xz" "$release_root/"
+          cp third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1 third_party/ffmpeg/8.1.2/changes.diff "$release_root/"
+          {
+            printf 'architecture=%s\n' "${{ matrix.architecture }}"
+            printf 'archive_sha256=%s\n' "$actual_hash"
+            printf 'source_sha256_expected=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c\n'
+            printf 'local_changes=changes.diff\n'
+          } > "$release_root/SOURCE-MANIFEST.txt"
+
+      - name: Upload exact macOS application package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-macos-${{ matrix.architecture }}
+          path: target/macos/release/FreeRemoteDesk.app
+          if-no-files-found: error
+
+      - name: Upload corresponding FFmpeg source evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-ffmpeg-8.1.2-source-${{ matrix.architecture }}
+          path: target/release-assets/ffmpeg-8.1.2-${{ matrix.architecture }}
+          if-no-files-found: error
