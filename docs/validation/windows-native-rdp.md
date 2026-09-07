@@ -71,7 +71,7 @@ Rust 1.96.0 下 RDP 115、应用 80、平台 26、桌面 shell 204、egui 34 项
 `src/arp.rs` 引用 Windows `SendARP` 符号。本次没有修改该既有平台限制，
 不把根包全量测试报告为通过；上述 459 项相关 crate 测试独立通过。
 
-## 2026-09-08：当前提交的 legacy-only 有界回归
+## 2026-09-08：提交 `cec575f` 的 legacy-only 有界回归
 
 在提交 `cec575f` 上再次使用同一个非回显 stdin 探针完成一次独立授权 Windows
 目标的 legacy-only 回归。探针构造 `RdpProtocolFactory::new`，没有注册 EGFX

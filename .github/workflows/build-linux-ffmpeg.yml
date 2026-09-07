@@ -11,6 +11,7 @@ on:
       - "crates/frd-video-ffmpeg-plugin/**"
       - "third_party/ffmpeg/8.1.2/**"
       - "tools/build-ffmpeg-linux.sh"
+      - "tools/verify-linux-ffmpeg-bundle.sh"
       - ".github/workflows/build-linux-ffmpeg.yml"
   push:
     branches:
@@ -24,6 +25,7 @@ on:
       - "crates/frd-video-ffmpeg-plugin/**"
       - "third_party/ffmpeg/8.1.2/**"
       - "tools/build-ffmpeg-linux.sh"
+      - "tools/verify-linux-ffmpeg-bundle.sh"
       - ".github/workflows/build-linux-ffmpeg.yml"
 
 permissions:
@@ -90,6 +92,19 @@ jobs:
           FRD_FFMPEG_CROSS_PREFIX: ${{ matrix.cross_prefix }}
           FRD_CARGO_TARGET: ${{ matrix.cargo_target }}
         run: bash tools/build-ffmpeg-linux.sh
+
+      - name: Verify Linux bundle ELF and plugin ABI
+        shell: bash
+        run: bash tools/verify-linux-ffmpeg-bundle.sh \
+          "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
+
+      - name: Load Linux plugin and call ABI entry point
+        if: matrix.arch == 'x86_64'
+        shell: bash
+        env:
+          FRD_LINUX_FFMPEG_RUNTIME_SMOKE: "1"
+        run: bash tools/verify-linux-ffmpeg-bundle.sh \
+          "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
 
       - name: Run host-side FFmpeg ABI tests
         shell: bash
