@@ -103,6 +103,23 @@ impl FfmpegBackend {
         VideoCapabilityProvider::query(self, &query).is_exact()
     }
 
+    /// 报告生产组合根是否可以精确满足 HEVC Main 4:4:4 8-bit 输出。
+    ///
+    /// 该查询只检查本地插件能力，不代表 RDP 服务端存在或协商了 HEVC
+    /// `WireToSurface1` profile。当前 RDP connector 仍不会因为该结果广告或选择 HEVC。
+    pub fn supports_hevc_main4448(&self) -> bool {
+        let query = VideoDecodeQuery {
+            codec: VideoCodec::Hevc,
+            profile: VideoProfile::HevcMain4448,
+            chroma: ChromaFormat::Yuv444,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1, 1).expect("固定探针尺寸有效"),
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Yuv444P8].into_boxed_slice(),
+        };
+        VideoCapabilityProvider::query(self, &query).is_exact()
+    }
+
     /// 从当前可执行文件目录下的固定、受信版本目录加载；失败只禁用该 backend。
     pub fn load() -> Result<Self, VideoDecodeError> {
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -1295,6 +1312,7 @@ mod tests {
 
         assert!(matches!(support, VideoDecodeSupport::SoftwareExact(_)));
         assert!(!matches!(support, VideoDecodeSupport::HardwareExact(_)));
+        assert!(backend.supports_hevc_main4448());
     }
 
     #[test]
@@ -1351,6 +1369,21 @@ mod tests {
         });
         assert!(matches!(
             support,
+            VideoDecodeSupport::Unsupported(
+                frd_media_api::VideoUnsupportedReason::CodecUnavailable
+            )
+        ));
+    }
+
+    #[test]
+    fn h264_only_plugin_cannot_satisfy_hevc_main4448() {
+        let mut api = compatible_raw_api();
+        api.codec_capabilities =
+            crate::abi::FRD_CODEC_CAP_H264_AVC420 | crate::abi::FRD_CODEC_CAP_H264_AVC444;
+        let backend = FfmpegBackend::from_raw_api_for_test(api).expect("H.264 plugin 应可加载");
+        assert!(!backend.supports_hevc_main4448());
+        assert!(matches!(
+            backend.query(&main444_query()),
             VideoDecodeSupport::Unsupported(
                 frd_media_api::VideoUnsupportedReason::CodecUnavailable
             )
