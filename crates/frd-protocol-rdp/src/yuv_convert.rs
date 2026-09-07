@@ -16,6 +16,21 @@ pub(crate) enum YuvConvertError {
     DestinationTooSmall,
 }
 
+/// Return the minimum byte length needed for a strided plane without allowing
+/// attacker-controlled dimensions or strides to wrap `usize` arithmetic.
+fn required_plane_len(height: usize, stride: usize, row_width: usize) -> Option<usize> {
+    if height == 0 {
+        // Preserve the existing validation contract for a zero-row input:
+        // callers still need to provide one row's worth of storage when the
+        // declared plane width is non-zero.
+        return Some(row_width);
+    }
+    height
+        .checked_sub(1)?
+        .checked_mul(stride)?
+        .checked_add(row_width)
+}
+
 pub(crate) fn convert_yuv420_to_rgba(
     width: usize,
     height: usize,
@@ -36,12 +51,21 @@ pub(crate) fn convert_yuv420_to_rgba(
     if destination.len() < output_len {
         return Err(YuvConvertError::DestinationTooSmall);
     }
+    let Some(y_required) = required_plane_len(height, y_stride, width) else {
+        return Err(YuvConvertError::InvalidPlane);
+    };
+    let Some(u_required) = required_plane_len(chroma_height, u_stride, chroma_width) else {
+        return Err(YuvConvertError::InvalidPlane);
+    };
+    let Some(v_required) = required_plane_len(chroma_height, v_stride, chroma_width) else {
+        return Err(YuvConvertError::InvalidPlane);
+    };
     if y_stride < width
         || u_stride < chroma_width
         || v_stride < chroma_width
-        || y_plane.len() < (height.saturating_sub(1) * y_stride).saturating_add(width)
-        || u_plane.len() < (chroma_height.saturating_sub(1) * u_stride).saturating_add(chroma_width)
-        || v_plane.len() < (chroma_height.saturating_sub(1) * v_stride).saturating_add(chroma_width)
+        || y_plane.len() < y_required
+        || u_plane.len() < u_required
+        || v_plane.len() < v_required
     {
         return Err(YuvConvertError::InvalidPlane);
     }
@@ -137,12 +161,21 @@ pub(crate) fn convert_yuv444_to_rgba(
     if destination.len() < output_len {
         return Err(YuvConvertError::DestinationTooSmall);
     }
+    let Some(y_required) = required_plane_len(height, y_stride, width) else {
+        return Err(YuvConvertError::InvalidPlane);
+    };
+    let Some(u_required) = required_plane_len(height, u_stride, width) else {
+        return Err(YuvConvertError::InvalidPlane);
+    };
+    let Some(v_required) = required_plane_len(height, v_stride, width) else {
+        return Err(YuvConvertError::InvalidPlane);
+    };
     if y_stride < width
         || u_stride < width
         || v_stride < width
-        || y_plane.len() < (height.saturating_sub(1) * y_stride).saturating_add(width)
-        || u_plane.len() < (height.saturating_sub(1) * u_stride).saturating_add(width)
-        || v_plane.len() < (height.saturating_sub(1) * v_stride).saturating_add(width)
+        || y_plane.len() < y_required
+        || u_plane.len() < u_required
+        || v_plane.len() < v_required
     {
         return Err(YuvConvertError::InvalidPlane);
     }
@@ -286,8 +319,57 @@ pub(super) fn yuv444_to_rgba_scalar(
 mod tests {
     use super::{
         convert_yuv420_to_rgba, convert_yuv444_to_rgba, yuv420_to_rgba_scalar,
-        yuv444_to_rgba_scalar,
+        yuv444_to_rgba_scalar, YuvConvertError,
     };
+
+    #[test]
+    fn conversion_rejects_strides_that_overflow_plane_length() {
+        let overflowing_stride = usize::MAX / 2 + 1;
+        let mut destination = [0_u8; 12];
+
+        assert_eq!(
+            convert_yuv420_to_rgba(
+                1,
+                3,
+                &[],
+                overflowing_stride,
+                &[],
+                1,
+                &[],
+                1,
+                &mut destination,
+            ),
+            Err(YuvConvertError::InvalidPlane)
+        );
+        assert_eq!(
+            convert_yuv444_to_rgba(
+                1,
+                3,
+                &[],
+                overflowing_stride,
+                &[],
+                1,
+                &[],
+                1,
+                &mut destination,
+            ),
+            Err(YuvConvertError::InvalidPlane)
+        );
+    }
+
+    #[test]
+    fn conversion_keeps_zero_height_plane_validation_contract() {
+        let mut destination = [];
+
+        assert_eq!(
+            convert_yuv420_to_rgba(1, 0, &[], 1, &[], 1, &[], 1, &mut destination),
+            Err(YuvConvertError::InvalidPlane)
+        );
+        assert_eq!(
+            convert_yuv444_to_rgba(1, 0, &[], 1, &[], 1, &[], 1, &mut destination),
+            Err(YuvConvertError::InvalidPlane)
+        );
+    }
 
     #[test]
     fn dispatched_yuv420_conversion_matches_reference_with_strides_and_odd_edges() {
