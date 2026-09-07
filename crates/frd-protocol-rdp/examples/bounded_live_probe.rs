@@ -10,22 +10,32 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use frd_core::{SecretBuffer, SessionId};
+use frd_core::{PixelSize, SecretBuffer, SessionId};
 use frd_frame::{FrameCompleteness, SurfaceUpdate};
+use frd_media_api::{
+    ChromaFormat, VideoCapabilityProvider, VideoCodec, VideoDecodeQuery, VideoDecoderFactory,
+    VideoPixelFormat, VideoProfile,
+};
 use frd_protocol_api::{
     ConnectRequest, Credentials, Endpoint, ProtocolError, ProtocolExit, ProtocolFactory,
     ProtocolId, ProtocolRuntime, RuntimeEventSink, RuntimeWake, ServerIdentityDecision,
     SessionCommand, SessionEvent, SurfacePublisher,
 };
-use frd_protocol_rdp::{RdpClientPlatformIdentity, RdpProtocolFactory};
+use frd_protocol_rdp::{Avc420DecoderProvider, RdpClientPlatformIdentity, RdpProtocolFactory};
+use frd_video_ffmpeg::FfmpegBackend;
+
+const EGFX_OPT_IN_ENV: &str = "FRD_RDP_PROBE_EGFX_AVC420";
+const EGFX_BUNDLE_ENV: &str = "FRD_RDP_PROBE_MACOS_APP";
 
 #[derive(Default)]
 struct Counts {
+    resets: u64,
     frames: u64,
     baselines: u64,
     patches: u64,
     pixel_bytes: u64,
     first_frame: Option<Instant>,
+    last_frame: Option<Instant>,
 }
 
 struct Frames(Arc<Mutex<Counts>>);
@@ -40,6 +50,7 @@ impl SurfacePublisher for Frames {
             SurfaceUpdate::Reset {
                 generation, size, ..
             } => {
+                counts.resets += 1;
                 println!(
                     "画面重置 generation={generation} width={} height={}",
                     size.width, size.height
@@ -59,6 +70,7 @@ impl SurfacePublisher for Frames {
                     counts.first_frame = Some(Instant::now());
                     println!("首帧已解码 completeness={completeness:?}");
                 }
+                counts.last_frame = Some(Instant::now());
             }
         }
         Ok(())
@@ -140,11 +152,86 @@ fn remember_pin(path: &Path, pin: [u8; 32]) -> Result<(), &'static str> {
     }
 }
 
+fn egfx_opt_in() -> Result<bool, &'static str> {
+    match std::env::var(EGFX_OPT_IN_ENV) {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value.is_empty() => Ok(false),
+        Ok(_) => Err("probe_egfx_opt_in_invalid"),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err("probe_egfx_opt_in_invalid"),
+    }
+}
+
+/// Load the exact software backend only for an explicit macOS probe opt-in.
+///
+/// The normal example path returns `None`, preserving the legacy-only probe.  The returned
+/// factory is already checked against the exact H.264 AVC420/YUV420/8-bit contract; this local
+/// capability line must not be confused with server confirmation or live decoder evidence.
+fn load_probe_egfx_factory() -> Result<Option<Arc<dyn VideoDecoderFactory>>, &'static str> {
+    if !egfx_opt_in()? {
+        println!(
+            "EGFX AVC420 opt_in=false local_capability=disabled server_confirmation=not_requested"
+        );
+        return Ok(None);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!(
+            "EGFX AVC420 opt_in=true local_capability=unavailable reason=macos_bundle_required"
+        );
+        return Err("probe_egfx_macos_only");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = std::env::var_os(EGFX_BUNDLE_ENV).ok_or("probe_egfx_bundle_required")?;
+        let backend = FfmpegBackend::load_from_signed_application_bundle(bundle)
+            .map_err(|_| "probe_egfx_backend_unavailable")?;
+        let query = VideoDecodeQuery {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264Avc420,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth: 8,
+            coded_size: PixelSize::new(1, 1).ok_or("probe_egfx_query_invalid")?,
+            frame_rate: None,
+            preferred_outputs: vec![VideoPixelFormat::Yuv420P8].into_boxed_slice(),
+        };
+        let support = backend.query(&query);
+        let support_name = match &support {
+            frd_media_api::VideoDecodeSupport::SoftwareExact(_) => "software_exact",
+            frd_media_api::VideoDecodeSupport::HardwareExact(_) => "hardware_exact",
+            frd_media_api::VideoDecodeSupport::Unsupported(_) => "unsupported",
+        };
+        let provider_state = if support.is_exact() {
+            "attached"
+        } else {
+            "not_attached"
+        };
+        println!(
+            "EGFX AVC420 opt_in=true backend={} local_capability={} provider={} server_confirmation={}",
+            backend.backend_id().as_str(),
+            support_name,
+            provider_state,
+            if support.is_exact() {
+                "pending"
+            } else {
+                "not_requested"
+            }
+        );
+        if !support.is_exact() {
+            return Err("probe_egfx_avc420_capability_unavailable");
+        }
+        Ok(Some(Arc::new(backend) as Arc<dyn VideoDecoderFactory>))
+    }
+}
+
 fn run() -> Result<(), &'static str> {
     // 拒绝直接终端输入，避免终端驱动回显密码；由可信父进程写入匿名管道。
     if io::stdin().is_terminal() {
         return Err("probe_requires_non_echoing_stdin_pipe");
     }
+    let egfx_factory = load_probe_egfx_factory()?;
     let mut reader = io::BufReader::new(io::stdin());
     let host = read_line(&mut reader)?;
     let username = read_line(&mut reader)?;
@@ -183,7 +270,15 @@ fn run() -> Result<(), &'static str> {
         None,
         Box::new(Wake),
     );
-    let session = RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)
+    let factory = if let Some(egfx_factory) = egfx_factory {
+        RdpProtocolFactory::with_egfx_decoder_provider(
+            RdpClientPlatformIdentity::Macintosh,
+            Arc::new(Avc420DecoderProvider::from_factory(egfx_factory)),
+        )
+    } else {
+        RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)
+    };
+    let session = factory
         .create(request, runtime)
         .map_err(|error| error.code())?;
     let worker = thread::spawn(move || session.run());
@@ -253,8 +348,9 @@ fn run() -> Result<(), &'static str> {
         let active_elapsed = counts_guard.first_frame.map(|time| time.elapsed());
         if last_report.elapsed() >= Duration::from_secs(5) {
             println!(
-                "统计 elapsed_seconds={} frames={} full_baselines={} patches={} decoded_bytes={}",
+                "统计 elapsed_seconds={} resets={} frames={} full_baselines={} patches={} decoded_bytes={}",
                 start.elapsed().as_secs(),
+                counts_guard.resets,
                 counts_guard.frames,
                 counts_guard.baselines,
                 counts_guard.patches,
@@ -280,9 +376,17 @@ fn run() -> Result<(), &'static str> {
     }
     let exit = worker.join().map_err(|_| "probe_worker_panicked")?;
     let counts = counts.lock().map_err(|_| "probe_counts_failed")?;
+    let first_frame_ms = counts
+        .first_frame
+        .map(|time| time.duration_since(start).as_millis());
+    let sustained_refresh_ms = counts
+        .first_frame
+        .zip(counts.last_frame)
+        .map(|(first, last)| last.duration_since(first).as_millis());
     println!(
-        "验证结果 exit={} frames={} full_baselines={} patches={} decoded_bytes={} cleanup=joined",
+        "验证结果 exit={} resets={} frames={} full_baselines={} patches={} decoded_bytes={} first_frame_ms={first_frame_ms:?} sustained_refresh_ms={sustained_refresh_ms:?} cleanup=joined",
         exit_code(&exit),
+        counts.resets,
         counts.frames,
         counts.baselines,
         counts.patches,

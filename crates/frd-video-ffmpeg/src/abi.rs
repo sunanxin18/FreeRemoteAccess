@@ -99,12 +99,21 @@ pub struct FrdVideoConfig {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct FrdOwnedBuffer {
     /// On an OK receive result this is either null for an invalid frame or readable for `len`
     /// bytes until the matching frame-level reclaim callback returns.
     pub data: *const u8,
     pub len: usize,
+}
+
+impl Default for FrdOwnedBuffer {
+    fn default() -> Self {
+        Self {
+            data: core::ptr::null(),
+            len: 0,
+        }
+    }
 }
 
 #[repr(C)]

@@ -137,6 +137,41 @@ impl FfmpegBackend {
         }
     }
 
+    /// 从一个已签名的 macOS 应用包加载固定版本的 FFmpeg bundle。
+    ///
+    /// 这个入口只用于需要验证指定应用包的工具（例如 bounded live probe）。它仍然
+    /// 经过与生产 `load` 相同的 `codesign --verify --deep --strict`、包内路径和符号
+    /// 链接校验；生产客户端继续只从自己的 `current_exe` 推导应用包，避免环境变量
+    /// 改变正式产品的动态库搜索根。
+    #[cfg(target_os = "macos")]
+    pub fn load_from_signed_application_bundle(
+        application_bundle: impl AsRef<Path>,
+    ) -> Result<Self, VideoDecodeError> {
+        let application_bundle = application_bundle.as_ref();
+        if !application_bundle.is_absolute()
+            || application_bundle.extension() != Some(std::ffi::OsStr::new("app"))
+        {
+            return Err(backend_unavailable());
+        }
+        let executable = application_bundle.join("Contents/MacOS/freeremotedesk-macos");
+        let trusted = crate::macos_bundle::prepare(
+            &executable,
+            platform_directory_name(),
+            ffmpeg_dependency_names(),
+            plugin_library_name(),
+        )
+        .map_err(|_| backend_unavailable())?;
+        Self::from_trusted_paths(trusted.dependencies, trusted.plugin)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn load_from_signed_application_bundle(
+        application_bundle: impl AsRef<Path>,
+    ) -> Result<Self, VideoDecodeError> {
+        let _ = application_bundle;
+        Err(backend_unavailable())
+    }
+
     /// 测试专用路径注入，不执行生产受信 ACL/owner 门禁。
     #[cfg(test)]
     fn load_from_application_dir_for_test(
@@ -168,6 +203,20 @@ impl FfmpegBackend {
                 _libraries: libraries,
             }),
         })
+    }
+
+    fn from_trusted_paths(
+        dependencies: Vec<std::path::PathBuf>,
+        plugin_path: std::path::PathBuf,
+    ) -> Result<Self, VideoDecodeError> {
+        let mut libraries = Vec::with_capacity(dependencies.len() + 1);
+        for path in &dependencies {
+            libraries.push(open_dependency_library(path)?);
+        }
+        let plugin = open_library(&plugin_path)?;
+        let api = load_api(&plugin)?;
+        libraries.push(plugin);
+        Self::from_validated_api(api, libraries)
     }
 
     #[cfg(test)]

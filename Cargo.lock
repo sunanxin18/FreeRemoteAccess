@@ -1983,6 +1983,7 @@ dependencies = [
  "frd-frame",
  "frd-media-api",
  "frd-protocol-api",
+ "frd-video-ffmpeg",
  "ironrdp",
  "ironrdp-blocking",
  "ironrdp-egfx",
