@@ -11,6 +11,8 @@ also corrected to model `RDPGFX_RECT16` with `ExclusiveRectangle`; the public
 server-side `Avc420Region` helper keeps its inclusive bounds and converts them
 at the encoding boundary. Empty or inverted exclusive rectangles are rejected
 while decoding the PDU, before any payload is dispatched. The public handler and
-renderer contracts do not change. This prevents pixels outside the server's
-region mask from being published while preserving the upstream payload shape
-and public handler/renderer contracts.
+renderer contracts do not change. The decoder trait also exposes a default
+health query so a fallible reset can stop the client before a new reset reaches
+the handler. This prevents pixels outside the server's region mask from being
+published while preserving the upstream payload shape and public handler/
+renderer contracts.

@@ -388,6 +388,7 @@ pub struct GraphicsPipelineClient {
     decompressed_buffer: Vec<u8>,
 
     state: ClientState,
+    decoder_failed: bool,
     negotiated_caps: Option<CapabilitySet>,
     codec_caps: CodecCapabilities,
 
@@ -408,6 +409,7 @@ impl GraphicsPipelineClient {
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
+            decoder_failed: false,
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
             surfaces: BTreeMap::new(),
@@ -424,7 +426,13 @@ impl GraphicsPipelineClient {
     /// Check if the client has completed capability negotiation
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.state == ClientState::Active
+        self.state == ClientState::Active && !self.decoder_failed
+    }
+
+    /// Check whether the configured decoder reported a reset failure.
+    #[must_use]
+    pub fn decoder_failed(&self) -> bool {
+        self.decoder_failed
     }
 
     /// Get the negotiated capability set
@@ -631,6 +639,11 @@ impl GraphicsPipelineClient {
         // Reset decoder state for new stream
         if let Some(ref mut decoder) = self.h264_decoder {
             decoder.reset();
+            if !decoder.is_healthy() {
+                self.decoder_failed = true;
+                warn!("H.264 decoder reset failed; refusing to publish a new graphics surface");
+                return;
+            }
         }
 
         debug!(width, height, "Graphics reset");
@@ -1029,7 +1042,7 @@ fn crop_decoded_frame_region(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::{DecodedFrame, DecoderResult};
+    use crate::decode::{DecodedFrame, DecoderError, DecoderResult};
     use crate::pdu::{Avc420Region, encode_avc420_bitmap_stream};
     use ironrdp_core::{Encode, WriteCursor};
     use std::sync::{Arc, Mutex};
@@ -1042,6 +1055,17 @@ mod tests {
                 data.extend_from_slice(&[pixel, 0, 0, 0xff]);
             }
             Ok(DecodedFrame::new(data, 4, 4))
+        }
+    }
+
+    struct UnhealthyDecoder;
+    impl H264Decoder for UnhealthyDecoder {
+        fn decode(&mut self, _data: &[u8]) -> DecoderResult<DecodedFrame> {
+            Err(DecoderError::msg("test decoder is unhealthy"))
+        }
+
+        fn is_healthy(&self) -> bool {
+            false
         }
     }
 
@@ -1123,6 +1147,20 @@ mod tests {
         assert!(client.surfaces.is_empty(), "surfaces should be cleared");
         assert!(client.current_frame_id.is_none(), "frame_id should be reset");
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
+    }
+
+    #[test]
+    fn unhealthy_decoder_reset_stops_before_notifying_handler() {
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(TestHandler),
+            Some(Box::new(UnhealthyDecoder)),
+        );
+
+        client.handle_reset_graphics(1920, 1080);
+
+        assert!(client.decoder_failed());
+        assert!(!client.is_active());
+        assert!(client.surfaces.is_empty());
     }
 
     #[test]

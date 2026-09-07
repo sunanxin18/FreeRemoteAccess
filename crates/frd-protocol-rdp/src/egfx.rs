@@ -488,6 +488,10 @@ impl H264Decoder for EgfxH264Decoder {
     fn reset(&mut self) {
         let _ = self.reset_checked();
     }
+
+    fn is_healthy(&self) -> bool {
+        !self.failed
+    }
 }
 
 impl EgfxH264Decoder {
@@ -2102,10 +2106,11 @@ impl DvcProcessor for EgfxAdapter {
         }
         match self.inner.process(channel_id, payload) {
             Ok(messages) => {
-                if self
-                    .surface_publisher
-                    .as_ref()
-                    .is_some_and(EgfxSurfacePublisher::is_disabled)
+                if self.inner.decoder_failed()
+                    || self
+                        .surface_publisher
+                        .as_ref()
+                        .is_some_and(EgfxSurfacePublisher::is_disabled)
                 {
                     self.failed.store(true, Ordering::Release);
                 }
@@ -2944,6 +2949,48 @@ mod tests {
         assert!(decoder.reset_checked().is_err());
         assert!(decoder.failed);
         assert!(decoder.decode(&[0, 0, 0, 2, 0x65, 0x88]).is_err());
+    }
+
+    #[test]
+    fn egfx_adapter_drops_reset_when_h264_decoder_reset_fails() {
+        let session_id = SessionId::allocate();
+        let stream = avc420_stream_config(
+            session_id,
+            1,
+            PixelSize::new(2, 2).unwrap(),
+            vec![0x67, 0x42].into_boxed_slice(),
+            vec![0x68, 0xce].into_boxed_slice(),
+        )
+        .unwrap();
+        let decoder = EgfxH264Decoder::from_decoder(
+            stream.clone(),
+            Box::new(OneFrameDecoder {
+                frame: black_yuv420_frame(&stream),
+                resets: Vec::new(),
+                fail_reset: true,
+            }),
+        );
+        let publisher = EgfxSurfacePublisher::try_new(session_id, 1).expect("generation");
+        let mut adapter = EgfxAdapter::with_surface_publisher(Some(Box::new(decoder)), publisher);
+
+        adapter.start(7).expect("EGFX start succeeds");
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED,
+            })),
+        );
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width: 2,
+                height: 2,
+                monitors: Vec::new(),
+            }),
+        );
+
+        assert!(adapter.is_failed());
+        assert!(adapter.drain_surface_updates().is_empty());
     }
 
     #[test]

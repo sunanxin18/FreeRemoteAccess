@@ -175,6 +175,15 @@ pub trait H264Decoder: Send {
     fn reset(&mut self) {
         // Default: no-op
     }
+
+    /// Report whether the decoder is still able to accept frames after a reset.
+    ///
+    /// The legacy reset hook cannot return an error, so implementations that
+    /// perform fallible state changes can override this query and let the
+    /// graphics client stop before publishing a new surface generation.
+    fn is_healthy(&self) -> bool {
+        true
+    }
 }
 
 // ============================================================================
