@@ -1,0 +1,100 @@
+name: Linux FFmpeg bundles
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/frd-video-ffmpeg/**"
+      - "crates/frd-video-ffmpeg-plugin/**"
+      - "third_party/ffmpeg/8.1.2/**"
+      - "tools/build-ffmpeg-linux.sh"
+      - ".github/workflows/build-linux-ffmpeg.yml"
+  push:
+    branches:
+      - "main"
+      - "codex/**"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/frd-video-ffmpeg/**"
+      - "crates/frd-video-ffmpeg-plugin/**"
+      - "third_party/ffmpeg/8.1.2/**"
+      - "tools/build-ffmpeg-linux.sh"
+      - ".github/workflows/build-linux-ffmpeg.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-ffmpeg-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    name: Linux FFmpeg ${{ matrix.arch }} bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            cargo_target: x86_64-unknown-linux-gnu
+            cc: ""
+            cross_prefix: ""
+          - arch: i686
+            cargo_target: i686-unknown-linux-gnu
+            cc: i686-linux-gnu-gcc
+            cross_prefix: i686-linux-gnu-
+          - arch: aarch64
+            cargo_target: aarch64-unknown-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            cross_prefix: aarch64-linux-gnu-
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust target and native toolchains
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.cargo_target }}"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            nasm \
+            xz-utils \
+            pkg-config \
+            gcc-i686-linux-gnu \
+            libc6-dev-i386-cross \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+
+      - name: Verify pinned Rust toolchain
+        shell: bash
+        run: |
+          test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
+          rustc --target "${{ matrix.cargo_target }}" --version --verbose
+
+      - name: Build and verify exact FFmpeg bundle
+        shell: bash
+        env:
+          FRD_FFMPEG_ARCH: ${{ matrix.arch }}
+          FRD_FFMPEG_CC: ${{ matrix.cc }}
+          FRD_FFMPEG_CROSS_PREFIX: ${{ matrix.cross_prefix }}
+          FRD_CARGO_TARGET: ${{ matrix.cargo_target }}
+        run: bash tools/build-ffmpeg-linux.sh
+
+      - name: Run host-side FFmpeg ABI tests
+        shell: bash
+        run: cargo test --locked -p frd-video-ffmpeg -p frd-video-ffmpeg-plugin
+
+      - name: Upload exact Linux bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-ffmpeg-linux-${{ matrix.arch }}
+          path: target/ffmpeg-linux/bundle/linux-${{ matrix.arch == 'i686' && 'x86' || matrix.arch }}
+          if-no-files-found: error

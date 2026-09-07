@@ -44,6 +44,13 @@ if [[ "$frd_platform" != "$frd_host_platform" ]]; then
   : "${FRD_FFMPEG_CC:?跨架构 Linux 构建必须显式提供 FRD_FFMPEG_CC}"
   : "${FRD_FFMPEG_CROSS_PREFIX:?跨架构 Linux 构建必须显式提供 FRD_FFMPEG_CROSS_PREFIX}"
   : "${FRD_CARGO_TARGET:?跨架构 Linux 构建必须显式提供 FRD_CARGO_TARGET}"
+  frd_cargo_target_env="${FRD_CARGO_TARGET//-/_}"
+  frd_cargo_target_env="${frd_cargo_target_env^^}"
+  export "CC_${frd_cargo_target_env}=$FRD_FFMPEG_CC"
+  export "CARGO_TARGET_${frd_cargo_target_env}_LINKER=$FRD_FFMPEG_CC"
+  if command -v "${FRD_FFMPEG_CROSS_PREFIX}ar" >/dev/null; then
+    export "AR_${frd_cargo_target_env}=${FRD_FFMPEG_CROSS_PREFIX}ar"
+  fi
 fi
 
 mkdir -p "$frd_build"
