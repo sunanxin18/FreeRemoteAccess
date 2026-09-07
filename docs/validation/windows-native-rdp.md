@@ -1,4 +1,4 @@
-# Windows 原生 RDP 验证记录（更新于 2026-09-07）
+# Windows 原生 RDP 验证记录（更新于 2026-09-08）
 
 ## 范围与结论
 
@@ -70,6 +70,25 @@ Rust 1.96.0 下 RDP 115、应用 80、平台 26、桌面 shell 204、egui 34 项
 额外执行根包 `cargo test --locked`，在 macOS arm64 链接失败：未改动的
 `src/arp.rs` 引用 Windows `SendARP` 符号。本次没有修改该既有平台限制，
 不把根包全量测试报告为通过；上述 459 项相关 crate 测试独立通过。
+
+## 2026-09-08：当前提交的 legacy-only 有界回归
+
+在提交 `cec575f` 上再次使用同一个非回显 stdin 探针完成一次独立授权 Windows
+目标的 legacy-only 回归。探针构造 `RdpProtocolFactory::new`，没有注册 EGFX
+decoder provider，因此这次运行只验证当前 Bitmap/RemoteFX fallback 和会话生命周期，
+不宣称服务器或客户端的 AVC420/AVC444/HEVC 能力。
+
+| 真机步骤 | 实际结果 |
+|---|---|
+| 身份与认证 | `Unknown` 证书身份挑战自动保存/匹配后继续；进入 `TransportReady`，TLS/CredSSP/NLA 与 activation 成功 |
+| 画面 | 1280×720；首个完整 baseline 已解码，后续继续收到增量更新 |
+| 有界观察 | 20 秒内 `169` 个 frame boundary、`2` 个 FullBaseline、`169` 个 patch、`38,027,264` decoded bytes |
+| 清理 | 发送 `Disconnect` 后 `exit=closed cleanup=joined`，进程正常回收 |
+| 能力边界 | 未注册 EGFX provider；本次没有 RDPGFX `CapabilitiesConfirm`、AVC420/AVC444 或 HEVC wire 证据 |
+
+该结果确认本提交没有破坏传统 RDP 画面回退路径，也不能替代 EGFX 首帧、持续刷新、
+decoder 失败降级或恢复门禁。探针仍只输出非敏感阶段、指纹摘要和帧统计，凭据不进入
+argv、文件或日志。
 
 ## 2026-09-07 历史尝试：独立目标可达，旧策略在 TLS 阶段阻塞
 
