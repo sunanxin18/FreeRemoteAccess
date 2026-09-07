@@ -11,19 +11,22 @@ AVC420 → RemoteFX 优化 → AVC444 → HEVC；HEVC 最后实现并完成真�
 ## 当前事实
 
 - `frd-protocol-rdp` 固定依赖 IronRDP 0.17.0。
-- 当前连接器只声明传统 Bitmap codec，`client_codecs_capabilities(&[])` 默认产生
-  RemoteFX capability；IronRDP EGFX DVC seam 已固定但只在测试注册，默认连接器仍没有
-  RDPGFX capability advertisement 或 AVC codec dispatch。
+- 没有 decoder provider 时，连接器只声明传统 Bitmap codec，`client_codecs_capabilities(&[])`
+  默认产生 RemoteFX capability；精确 provider 注入后，IronRDP EGFX DVC seam 会设置
+  图形通道 early capability bit，并注册 AVC420 adapter。没有 provider 的默认路径仍不
+  广告 RDPGFX/AVC，保持 legacy fallback。
 - 当前 RDP 解码器支持 Raw Bitmap、Interleaved RLE、RDP 6 Bitmap 和 RemoteFX。
 - `frd-video-ffmpeg` 保留 HEVC Main444 8-bit / YUV444P8 的 Apple High Performance
   路径，并新增了默认关闭的 H.264 AVC420/YUV420P8 ABI、FFmpeg bridge 和 length-prefixed
   转换；EGFX handler 已能把已映射的 AVC420 RGBA 结果排入 generation-bound
-  `SurfaceUpdate` 队列；另有未注册的协议中立 YUV420 decoder 到 IronRDP RGBA 适配契约，
-  但尚未由生产 connector 注册或提交给 runtime。
+  `SurfaceUpdate` 队列。Windows/macOS 组合根在固定 bundle 能力精确匹配时注入
+  `Avc420DecoderProvider`，active session 会将 EGFX Reset/Damage/FrameBoundary 提交给
+  `ProtocolRuntime`；bundle、decoder、DVC 或尺寸校验失败时仍回退到 Bitmap/RemoteFX。
 - `frd-media-api` 的协议中立 decoder registry 已有精确 H.264 AVC420 profile/input
   contract；AVC444 profile、YUV444P8 FFmpeg capability slot 和独立 native entrypoint
-  已通过离线合同测试，但 RDP AVC444 目前只做 RFX_AVC444_BITMAP_STREAM envelope
-  校验，尚未完成 YUV420/Chroma420 双流重建，因此仍不广告或选择它。
+  已通过离线合同测试。RDP AVC444 现在还包含 `RFX_AVC444_BITMAP_STREAM` envelope
+  校验、V1/V2 YUV420/Chroma420 事务性双流重建和显式 `Avc444DecoderProvider` 构造边界，
+  但生产组合根和服务器 wire/profile/live 门禁仍保持关闭。
 
 ## 不变量
 
