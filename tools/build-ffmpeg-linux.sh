@@ -109,6 +109,13 @@ else
   FFMPEG_DIR="$frd_prefix" cargo build --release -p frd-video-ffmpeg-plugin --features native-ffmpeg
   frd_plugin="target/release/libfreeremotedesk_ffmpeg.so"
 fi
+if [[ "$frd_cross_build" -eq 0 && "${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}" == 1 ]]; then
+  # 仅在 native host 上运行与本次 bundle 相同 FFmpeg dist 链接的 plugin 单测；
+  # 交叉架构不能把 hosted x86_64 测试结果冒充目标架构运行证据。
+  FFMPEG_DIR="$frd_prefix" \
+    LD_LIBRARY_PATH="$frd_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    cargo test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg --lib -- --nocapture
+fi
 frd_bundle="$frd_build/bundle/$frd_platform"
 rm -rf "$frd_bundle"
 mkdir -p "$frd_bundle"

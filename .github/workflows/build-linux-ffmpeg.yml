@@ -91,6 +91,7 @@ jobs:
           FRD_FFMPEG_CC: ${{ matrix.cc }}
           FRD_FFMPEG_CROSS_PREFIX: ${{ matrix.cross_prefix }}
           FRD_CARGO_TARGET: ${{ matrix.cargo_target }}
+          FRD_FFMPEG_RUN_NATIVE_TESTS: ${{ matrix.arch == 'x86_64' && '1' || '0' }}
         run: bash tools/build-ffmpeg-linux.sh
 
       - name: Verify Linux bundle ELF and plugin ABI
