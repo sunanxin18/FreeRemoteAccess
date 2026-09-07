@@ -95,6 +95,8 @@ target_specs=(
     x86_64-pc-windows-msvc
     i686-pc-windows-msvc
     aarch64-pc-windows-msvc
+    x86_64-apple-darwin
+    aarch64-apple-darwin
 )
 
 if [[ "${FRD_VERIFY_SKIP_TARGETS:-0}" == 1 ]]; then
@@ -102,7 +104,7 @@ if [[ "${FRD_VERIFY_SKIP_TARGETS:-0}" == 1 ]]; then
 else
     for target in "${target_specs[@]}"; do
         if rustc --print target-libdir --target "$target" >/dev/null 2>&1; then
-            run_gate "协议中立 core/video/plugin target check：$target" \
+        run_gate "协议中立 core/video/plugin target check：$target" \
                 cargo check --locked --target "$target" "${target_crates[@]}"
         else
             optional_missing "协议中立 target check：$target"

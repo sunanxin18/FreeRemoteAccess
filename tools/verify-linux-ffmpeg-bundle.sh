@@ -15,14 +15,20 @@ command -v nm >/dev/null || { echo "verifier 需要 nm" >&2; exit 2; }
 case "$profile" in
   linux-x86_64)
     elf_pattern='ELF 64-bit.*x86-64'
+    expected_class='ELF64'
+    expected_data="2's complement, little endian"
     expected_machine='Advanced Micro Devices X86-64'
     ;;
   linux-x86)
     elf_pattern='ELF 32-bit.*Intel 80386'
+    expected_class='ELF32'
+    expected_data="2's complement, little endian"
     expected_machine='Intel 80386'
     ;;
   linux-aarch64)
     elf_pattern='ELF 64-bit.*ARM aarch64'
+    expected_class='ELF64'
+    expected_data="2's complement, little endian"
     expected_machine='AArch64'
     ;;
   *) echo "不支持的 Linux FFmpeg verifier 架构: $profile" >&2; exit 1 ;;
@@ -59,16 +65,24 @@ actual_set="$(find "$bundle" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' 2>/d
 
 assert_elf() {
   local path="$1"
-  local description
+  local description header elf_class elf_data elf_machine
   description="$(LC_ALL=C file -b "$path")"
   [[ "$description" =~ $elf_pattern ]] || {
     echo "Linux FFmpeg bundle ELF 架构不匹配: $path ($description; 要求 $expected_machine)" >&2
     exit 1
   }
-  grep -aEq '/(Users|home|opt|build|runner)/|[A-Za-z]:\\\\' "$path" && {
+  header="$(readelf -h "$path")"
+  elf_class="$(awk -F: '/^[[:space:]]*Class:/ { value=$2; sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value); print value; exit }' <<<"$header")"
+  elf_data="$(awk -F: '/^[[:space:]]*Data:/ { value=$2; sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value); print value; exit }' <<<"$header")"
+  elf_machine="$(awk -F: '/^[[:space:]]*Machine:/ { value=$2; sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value); print value; exit }' <<<"$header")"
+  [[ "$elf_class" == "$expected_class" && "$elf_data" == "$expected_data" && "$elf_machine" == "$expected_machine" ]] || {
+    echo "Linux FFmpeg bundle ELF header 不匹配: $path (Class=${elf_class:-missing}, Data=${elf_data:-missing}, Machine=${elf_machine:-missing}; 要求 $expected_class, $expected_data, $expected_machine)" >&2
+    exit 1
+  }
+  if grep -aEq '/(Users|home|opt|build|runner)/|[A-Za-z]:\\\\' "$path"; then
     echo "Linux FFmpeg bundle 含开发机绝对路径: $path" >&2
     exit 1
-  } || true
+  fi
 }
 
 assert_soname() {
@@ -88,12 +102,17 @@ needed_libraries() {
 
 assert_no_absolute_rpath() {
   local path="$1"
-  local rpath
+  local rpath entry
+  local -a rpath_entries
   rpath="$(readelf -d "$path" | awk -F'[][]' '/(RPATH|RUNPATH)/ { print $2; exit }')"
-  [[ -z "$rpath" || "$rpath" == '$ORIGIN' || "$rpath" == '$ORIGIN:'* || "$rpath" == *':$ORIGIN' ]] || {
-    echo "ELF RPATH/RUNPATH 必须是空或相对 \$ORIGIN: $path ($rpath)" >&2
-    exit 1
-  }
+  [[ -z "$rpath" ]] && return 0
+  IFS=: read -r -a rpath_entries <<<"$rpath"
+  for entry in "${rpath_entries[@]}"; do
+    [[ "$entry" == '$ORIGIN' ]] || {
+      echo "ELF RPATH/RUNPATH 只能包含独立的 \$ORIGIN 项: $path ($rpath)" >&2
+      exit 1
+    }
+  done
 }
 
 for library in "$bundle/libavcodec.so.62" "$bundle/libavutil.so.60" \
