@@ -69,6 +69,9 @@ run_gate '协议、媒体、视频插件与桌面壳 focused tests' \
     -p frd-protocol-rdp \
     -p frd-shell-desktop
 
+run_gate '顶层 CLI help' cargo run --locked --quiet -- --help
+run_gate 'hpssview CLI help' cargo run --locked --quiet -- hpssview --help
+
 if [[ "${FRD_VERIFY_SKIP_WORKSPACE:-0}" == 1 ]]; then
     printf '\n[SKIP] workspace tests（FRD_VERIFY_SKIP_WORKSPACE=1）\n'
 else
