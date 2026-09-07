@@ -39,7 +39,7 @@ else
     binary="$target_dir/$profile/freeremotedesk-macos"
 fi
 app="$target_dir/macos/$profile/FreeRemoteDesk.app"
-# 清理固定生成目录，避免旧版编解码器或说明残留影响签名。
+# 清理当前 Cargo target root 下的生成目录，避免旧版编解码器或说明残留影响签名。
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/freeremotedesk-macos"
