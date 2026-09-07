@@ -327,11 +327,12 @@ fn run() -> Result<(), &'static str> {
     let graphics_observer: Arc<dyn RdpGraphicsObserver> = Arc::new(
         |capabilities: RdpGraphicsCapabilities| {
             println!(
-                "RDP 图形能力 legacy_bitmap={} remotefx={} egfx_advertised={} egfx_confirmed={} avc420={} avc444={}",
+                "RDP 图形能力 legacy_bitmap={} remotefx={} egfx_advertised={} egfx_confirmed={} egfx_frame_confirmed={} avc420={} avc444={}",
                 capabilities.legacy_bitmap,
                 capabilities.remotefx,
                 capabilities.egfx_advertised,
                 capabilities.egfx_confirmed,
+                capabilities.egfx_frame_confirmed,
                 capabilities.avc420,
                 capabilities.avc444,
             );

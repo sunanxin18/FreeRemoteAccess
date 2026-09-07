@@ -60,6 +60,7 @@ pub(crate) struct RdpGraphicsCapability {
     pub(crate) remotefx: bool,
     pub(crate) egfx_advertised: bool,
     pub(crate) egfx_confirmed: bool,
+    pub(crate) egfx_frame_confirmed: bool,
     pub(crate) avc420: bool,
     pub(crate) avc444: bool,
 }
@@ -71,6 +72,7 @@ impl RdpGraphicsCapability {
             remotefx: self.remotefx,
             egfx_advertised: self.egfx_advertised,
             egfx_confirmed: self.egfx_confirmed,
+            egfx_frame_confirmed: self.egfx_frame_confirmed,
             avc420: self.avc420,
             avc444: self.avc444,
         }
@@ -90,6 +92,7 @@ pub(crate) const fn baseline_graphics_capabilities() -> RdpGraphicsCapability {
         remotefx: true,
         egfx_advertised: false,
         egfx_confirmed: false,
+        egfx_frame_confirmed: false,
         avc420: false,
         avc444: false,
     }
@@ -526,6 +529,7 @@ fn baseline_connector(
             remotefx: true,
             egfx_advertised: true,
             egfx_confirmed: false,
+            egfx_frame_confirmed: false,
             // The provider proves that the client can advertise AVC420.  The
             // negotiated codec stays false until the server's
             // CapabilitiesConfirm is observed by the active-session loop.

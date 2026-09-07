@@ -355,14 +355,13 @@ fn run_active_loop(
                 }
             }
         }
-        publish_egfx_surface_updates(
-            runtime,
-            session_id,
-            generation,
-            drain_egfx_surface_updates(active_stage),
-        )?;
+        let egfx_updates = drain_egfx_surface_updates(active_stage);
+        let egfx_frame_confirmed = egfx_updates
+            .iter()
+            .any(|update| matches!(update, SurfaceUpdate::FrameBoundary { .. }));
+        publish_egfx_surface_updates(runtime, session_id, generation, egfx_updates)?;
         let previous_graphics = graphics_capability.snapshot();
-        observe_egfx_confirmation(active_stage, graphics_capability);
+        observe_egfx_confirmation(active_stage, graphics_capability, egfx_frame_confirmed);
         let current_graphics = graphics_capability.snapshot();
         if previous_graphics != current_graphics {
             if let Some(observer) = graphics_observer {
@@ -376,6 +375,7 @@ fn run_active_loop(
 fn observe_egfx_confirmation(
     active_stage: &mut ActiveStage,
     graphics_capability: &mut RdpGraphicsCapability,
+    egfx_frame_confirmed: bool,
 ) {
     let Some(adapter) = active_stage
         .get_dvc::<EgfxAdapter>()
@@ -389,6 +389,7 @@ fn observe_egfx_confirmation(
         adapter.is_active(),
         adapter.avc420_confirmed(),
         adapter.avc444_confirmed(),
+        egfx_frame_confirmed,
     );
 }
 
@@ -397,8 +398,10 @@ fn apply_egfx_confirmation(
     egfx_confirmed: bool,
     avc420_confirmed: bool,
     avc444_confirmed: bool,
+    egfx_frame_confirmed: bool,
 ) {
     graphics_capability.egfx_confirmed = egfx_confirmed;
+    graphics_capability.egfx_frame_confirmed |= egfx_frame_confirmed;
     graphics_capability.avc420 =
         graphics_capability.egfx_advertised && egfx_confirmed && avc420_confirmed;
     graphics_capability.avc444 =
@@ -1004,6 +1007,7 @@ mod tests {
         assert!(capabilities.remotefx);
         assert!(!capabilities.egfx_advertised);
         assert!(!capabilities.egfx_confirmed);
+        assert!(!capabilities.egfx_frame_confirmed);
         assert!(!capabilities.avc420);
         assert!(!capabilities.avc444);
     }
@@ -1015,15 +1019,37 @@ mod tests {
             ..baseline_graphics_capabilities()
         };
 
-        apply_egfx_confirmation(&mut capabilities, false, true, true);
+        apply_egfx_confirmation(&mut capabilities, false, true, true, false);
         assert!(!capabilities.egfx_confirmed);
+        assert!(!capabilities.egfx_frame_confirmed);
         assert!(!capabilities.avc420);
         assert!(!capabilities.avc444);
 
-        apply_egfx_confirmation(&mut capabilities, true, true, true);
+        apply_egfx_confirmation(&mut capabilities, true, true, true, false);
         assert!(capabilities.egfx_confirmed);
+        assert!(!capabilities.egfx_frame_confirmed);
         assert!(capabilities.avc420);
         assert!(capabilities.avc444);
+    }
+
+    #[test]
+    fn graphics_diagnostic_marks_egfx_only_after_a_published_frame_boundary() {
+        let mut capabilities = RdpGraphicsCapability {
+            egfx_advertised: true,
+            ..baseline_graphics_capabilities()
+        };
+
+        apply_egfx_confirmation(&mut capabilities, true, true, false, false);
+        assert!(capabilities.egfx_confirmed);
+        assert!(!capabilities.egfx_frame_confirmed);
+
+        apply_egfx_confirmation(&mut capabilities, true, true, false, true);
+        assert!(capabilities.egfx_frame_confirmed);
+
+        // The observation is monotonic for the session: a later capability
+        // poll without a frame cannot erase already published evidence.
+        apply_egfx_confirmation(&mut capabilities, true, true, false, false);
+        assert!(capabilities.egfx_frame_confirmed);
     }
 
     #[test]

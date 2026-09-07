@@ -15,6 +15,10 @@ pub struct RdpGraphicsCapabilities {
     pub remotefx: bool,
     pub egfx_advertised: bool,
     pub egfx_confirmed: bool,
+    /// At least one generation-bound EGFX frame boundary reached the runtime.
+    /// This is separate from `egfx_confirmed`: a capability response alone does
+    /// not prove that an EGFX surface was decoded and published.
+    pub egfx_frame_confirmed: bool,
     pub avc420: bool,
     pub avc444: bool,
 }
