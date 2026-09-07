@@ -43,14 +43,17 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            bundle_dir: linux-x86_64
             cargo_target: x86_64-unknown-linux-gnu
             cc: ""
             cross_prefix: ""
           - arch: i686
+            bundle_dir: linux-x86
             cargo_target: i686-unknown-linux-gnu
             cc: i686-linux-gnu-gcc
             cross_prefix: i686-linux-gnu-
           - arch: aarch64
+            bundle_dir: linux-aarch64
             cargo_target: aarch64-unknown-linux-gnu
             cc: aarch64-linux-gnu-gcc
             cross_prefix: aarch64-linux-gnu-
@@ -96,5 +99,5 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: freeremotedesk-ffmpeg-linux-${{ matrix.arch }}
-          path: target/ffmpeg-linux/bundle/linux-${{ matrix.arch == 'i686' && 'x86' || matrix.arch }}
+          path: target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}
           if-no-files-found: error
