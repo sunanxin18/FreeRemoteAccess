@@ -100,6 +100,13 @@ jobs:
           -p frd-ui-egui
           -p frd-shell-desktop
 
+      - name: Test pinned IronRDP EGFX patch
+        shell: bash
+        run: >-
+          cargo test
+          --manifest-path third_party/ironrdp-egfx-0.3.0/Cargo.toml
+          --offline --quiet
+
       - name: Test macOS platform and application
         if: runner.os == 'macOS'
         run: cargo test --locked -p frd-platform-macos -p freeremotedesk-macos
