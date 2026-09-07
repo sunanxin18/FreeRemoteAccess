@@ -1,7 +1,12 @@
-#![cfg(windows)]
+#![cfg(any(
+    windows,
+    all(target_os = "macos", feature = "native-ffmpeg"),
+    all(target_os = "linux", feature = "native-ffmpeg")
+))]
 
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use frd_video_ffmpeg::abi::{
@@ -346,16 +351,35 @@ struct Module(*mut core::ffi::c_void);
 impl Drop for Module {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: this handle came from `LoadLibraryW` and is released exactly once.
-            unsafe { FreeLibrary(self.0) };
+            #[cfg(windows)]
+            {
+                // SAFETY: this handle came from `LoadLibraryW` and is released exactly once.
+                unsafe { FreeLibrary(self.0) };
+            }
+            #[cfg(unix)]
+            {
+                // SAFETY: this handle came from `dlopen` and is released exactly once.
+                unsafe { dlclose(self.0) };
+            }
         }
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" {
     fn LoadLibraryW(path: *const u16) -> *mut core::ffi::c_void;
     fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
     fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn dlopen(path: *const core::ffi::c_char, flags: i32) -> *mut core::ffi::c_void;
+    fn dlsym(
+        module: *mut core::ffi::c_void,
+        name: *const core::ffi::c_char,
+    ) -> *mut core::ffi::c_void;
+    fn dlclose(module: *mut core::ffi::c_void) -> i32;
 }
 
 unsafe fn load_direct_api(bundle: &Path) -> LoadedApi {
@@ -366,13 +390,13 @@ unsafe fn load_direct_api(bundle: &Path) -> LoadedApi {
     );
     // SAFETY: these are absolute paths into the test-only ignored build output. Product trust and
     // ACL policy is not changed or bypassed by product code.
-    let avutil = unsafe { load_module(&bundle.join("avutil-60.dll")) };
+    let avutil = unsafe { load_module(&bundle.join(platform_library_name("avutil"))) };
     // SAFETY: avutil remains loaded while avcodec and the plugin are alive.
-    let avcodec = unsafe { load_module(&bundle.join("avcodec-62.dll")) };
+    let avcodec = unsafe { load_module(&bundle.join(platform_library_name("avcodec"))) };
     // SAFETY: same test-only bundle, held for the entire callback lifetime.
-    let plugin = unsafe { load_module(&bundle.join("freeremotedesk_ffmpeg.dll")) };
+    let plugin = unsafe { load_module(&bundle.join(platform_library_name("plugin"))) };
     // SAFETY: the symbol name and C signature are the versioned Task 4 ABI.
-    let symbol = unsafe { GetProcAddress(plugin.0, FRD_FFMPEG_API_SYMBOL.as_ptr()) };
+    let symbol = unsafe { lookup_symbol(&plugin, FRD_FFMPEG_API_SYMBOL) };
     assert!(
         !symbol.is_null(),
         "native plugin 必须导出 frd_ffmpeg_get_api_v1"
@@ -423,20 +447,102 @@ unsafe fn load_direct_api(bundle: &Path) -> LoadedApi {
 }
 
 unsafe fn load_module(path: &Path) -> Module {
-    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    wide.push(0);
-    // SAFETY: path is a terminated UTF-16 string and the returned handle is owned by `Module`.
-    let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::ffi::OsStrExt;
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        // SAFETY: path is a terminated UTF-16 string and the returned handle is owned by `Module`.
+        unsafe { LoadLibraryW(wide.as_ptr()) }
+    };
+    #[cfg(unix)]
+    let handle = {
+        const RTLD_NOW: i32 = 2;
+        const RTLD_LOCAL: i32 = 0;
+        let path = CString::new(path.to_string_lossy().as_bytes()).expect("路径不能包含 NUL");
+        // SAFETY: path is a terminated C string and the returned handle is owned by `Module`.
+        unsafe { dlopen(path.as_ptr(), RTLD_NOW | RTLD_LOCAL) }
+    };
     assert!(!handle.is_null(), "无法加载测试 DLL: {}", path.display());
     Module(handle)
 }
 
+unsafe fn lookup_symbol(module: &Module, symbol: &[u8]) -> *mut core::ffi::c_void {
+    #[cfg(windows)]
+    {
+        // SAFETY: the ABI symbol is a static NUL-terminated byte string.
+        unsafe { GetProcAddress(module.0, symbol.as_ptr()) }
+    }
+    #[cfg(unix)]
+    {
+        let symbol = CStr::from_bytes_with_nul(symbol).expect("ABI symbol 必须以 NUL 结尾");
+        // SAFETY: module is a live handle and symbol is a terminated C string.
+        unsafe { dlsym(module.0, symbol.as_ptr()) }
+    }
+}
+
+fn platform_library_name(kind: &str) -> &'static str {
+    #[cfg(windows)]
+    {
+        match kind {
+            "avutil" => "avutil-60.dll",
+            "avcodec" => "avcodec-62.dll",
+            "plugin" => "freeremotedesk_ffmpeg.dll",
+            _ => unreachable!("未知 Windows 测试库"),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match kind {
+            "avutil" => "libavutil.60.dylib",
+            "avcodec" => "libavcodec.62.dylib",
+            "plugin" => "libfreeremotedesk_ffmpeg.dylib",
+            _ => unreachable!("未知 macOS 测试库"),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match kind {
+            "avutil" => "libavutil.so.60",
+            "avcodec" => "libavcodec.so.62",
+            "plugin" => "libfreeremotedesk_ffmpeg.so",
+            _ => unreachable!("未知 Linux 测试库"),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    compile_error!("native FFmpeg fixture 只支持 Windows、macOS 和 Linux");
+}
+
 fn development_codec_bundle() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(".codex-target/ffmpeg-8.1.2/windows-x86_64/Release/codec")
-        .canonicalize()
-        .expect("请先运行 tools/build-ffmpeg-windows.ps1 生成测试 bundle")
+    if let Some(bundle) = std::env::var_os("FRD_FFMPEG_TEST_BUNDLE") {
+        return PathBuf::from(bundle)
+            .canonicalize()
+            .expect("FRD_FFMPEG_TEST_BUNDLE 必须指向存在的 bundle");
+    }
+    #[cfg(windows)]
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".codex-target/ffmpeg-8.1.2/windows-x86_64/Release/codec")
+            .canonicalize()
+            .expect("请先运行 tools/build-ffmpeg-windows.ps1 生成测试 bundle")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target/ffmpeg-macos/bundle")
+            .canonicalize()
+            .expect("请先运行 tools/build-ffmpeg-macos.sh 生成测试 bundle")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target/ffmpeg-linux/bundle/linux-x86_64")
+            .canonicalize()
+            .expect("请先运行 tools/build-ffmpeg-linux.sh 生成测试 bundle")
+    }
 }
 
 fn assert_fixture_metadata(metadata: &FixtureMetadata) {

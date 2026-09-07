@@ -528,6 +528,17 @@ mod native {
                 config.pps,
             ]
         };
+        let required_sets = if config.codec == FRD_CODEC_HEVC {
+            &sets[..]
+        } else {
+            &sets[1..]
+        };
+        if required_sets
+            .iter()
+            .any(|set| set.data.is_null() || set.len < 2)
+        {
+            return Err(FrdStatus::INVALID_ARGUMENT);
+        }
         let capacity = sets.iter().try_fold(0usize, |total, set| {
             if set.data.is_null() && set.len == 0 {
                 return Ok(total);

@@ -155,4 +155,13 @@ frd_expected_files="$(printf '%s\n' \
   echo "Linux FFmpeg bundle 文件集合不匹配: $frd_bundle" >&2
   exit 1
 }
+if [[ "$frd_cross_build" -eq 0 && "${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}" == 1 ]]; then
+  # 仅在 native host 上运行当前 bundle 的 HEVC fixture；跨架构构建不能把 hosted host
+  # 的动态库运行结果冒充目标架构证据。
+  FFMPEG_DIR="$frd_prefix" \
+    FRD_FFMPEG_TEST_BUNDLE="$frd_bundle" \
+    LD_LIBRARY_PATH="$frd_bundle${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    cargo test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg \
+      --test main444_decode -- --nocapture
+fi
 echo "Linux FFmpeg bundle: $frd_bundle"

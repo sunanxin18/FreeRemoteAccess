@@ -118,3 +118,4 @@ jobs:
         env:
           FRD_MACOS_ARCH: ${{ matrix.mac_arch }}
           FRD_FFMPEG_BUILD_ROOT: ${{ github.workspace }}/target/ffmpeg-macos-${{ matrix.mac_arch }}
+          FRD_FFMPEG_RUN_NATIVE_TESTS: "1"

@@ -116,6 +116,15 @@ for frd_lib in "$frd_bundle/"*.dylib; do
     exit 1
   }
 done
+if [[ "$frd_cross_build" -eq 0 && "${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}" == 1 ]]; then
+  # 仅在 native host 上运行当前 bundle 的 HEVC fixture；跨架构构建不能把 hosted host
+  # 的动态库运行结果冒充目标架构证据。
+  FFMPEG_DIR="$frd_prefix" \
+    FRD_FFMPEG_TEST_BUNDLE="$frd_bundle" \
+    DYLD_LIBRARY_PATH="$frd_bundle${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+    cargo test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg \
+      --test main444_decode -- --nocapture
+fi
 cp third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1 "$frd_bundle/FFmpeg-LGPL-2.1-or-later.txt"
 cat > "$frd_bundle/FFmpeg-NOTICE.txt" <<NOTICE
 FFmpeg 8.1.2, LGPL-2.1-or-later; source is unmodified, H.264 and HEVC decoder/parser only.
