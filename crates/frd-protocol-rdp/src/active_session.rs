@@ -1,4 +1,5 @@
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::time::Duration;
 
 use frd_core::{PixelSize, SessionId};
@@ -25,6 +26,7 @@ use crate::connector::{ActivatedRdpSession, RdpGraphicsCapability};
 use crate::display::{DisplayControlAdapter, DisplayControlCapabilityState, ResizeConfirmation};
 use crate::egfx::EgfxAdapter;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED};
+use crate::factory::RdpGraphicsObserver;
 use crate::input::RdpInputState;
 use crate::runtime::{
     drain_active_commands, drain_reactivation_commands, ActiveCommandBatch, ActiveCommandDrain,
@@ -42,8 +44,9 @@ pub(crate) fn run_active_session(
     session: ActivatedRdpSession,
     session_id: SessionId,
     runtime: &mut ProtocolRuntime,
+    graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
 ) -> ProtocolExit {
-    match run_active_session_inner(session, session_id, runtime) {
+    match run_active_session_inner(session, session_id, runtime, graphics_observer) {
         Ok(()) => ProtocolExit::Closed,
         Err(error) => ProtocolExit::Failed(error),
     }
@@ -53,6 +56,7 @@ fn run_active_session_inner(
     session: ActivatedRdpSession,
     session_id: SessionId,
     runtime: &mut ProtocolRuntime,
+    graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
 ) -> Result<(), ProtocolError> {
     let ActivatedRdpSession {
         connection,
@@ -66,6 +70,9 @@ fn run_active_session_inner(
         "RDP activation must retain the legacy fallback"
     );
     debug_assert!(!graphics_capability.avc444);
+    if let Some(observer) = graphics_observer.as_deref() {
+        observer.observe(graphics_capability.snapshot());
+    }
     let (framed, _server_public_key) = transport.into_parts();
     let mut writer = OrderedRdpWriter::new(framed);
     if writer
@@ -146,6 +153,7 @@ fn run_active_session_inner(
         &display_capabilities,
         &audio,
         &mut graphics_capability,
+        graphics_observer.as_deref(),
         &mut published_capabilities,
         &activation_factory,
     );
@@ -180,6 +188,7 @@ fn run_active_loop(
     display_capabilities: &DisplayControlCapabilityState,
     audio: &RdpAudioAdapter,
     graphics_capability: &mut RdpGraphicsCapability,
+    graphics_observer: Option<&dyn RdpGraphicsObserver>,
     published_capabilities: &mut SessionCapabilities,
     activation_factory: &ConnectionActivationFactory,
 ) -> Result<(), ProtocolError> {
@@ -353,7 +362,14 @@ fn run_active_loop(
             generation,
             drain_egfx_surface_updates(active_stage),
         )?;
+        let previous_graphics = graphics_capability.snapshot();
         observe_egfx_confirmation(active_stage, graphics_capability);
+        let current_graphics = graphics_capability.snapshot();
+        if previous_graphics != current_graphics {
+            if let Some(observer) = graphics_observer {
+                observer.observe(current_graphics);
+            }
+        }
         service_optional_channels(active_stage, writer, runtime, display, audio, Vec::new())?;
     }
 }

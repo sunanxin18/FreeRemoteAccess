@@ -27,6 +27,7 @@ use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
     RDP_NLA_FAILED, RDP_TCP_FAILED, RDP_TLS_FAILED,
 };
+use crate::factory::RdpGraphicsCapabilities;
 use crate::runtime::{
     wait_for_blocking, wait_for_network_future, CancellationCheckedIo, StageCancellation,
 };
@@ -61,6 +62,19 @@ pub(crate) struct RdpGraphicsCapability {
     pub(crate) egfx_confirmed: bool,
     pub(crate) avc420: bool,
     pub(crate) avc444: bool,
+}
+
+impl RdpGraphicsCapability {
+    pub(crate) const fn snapshot(self) -> RdpGraphicsCapabilities {
+        RdpGraphicsCapabilities {
+            legacy_bitmap: self.legacy_bitmap,
+            remotefx: self.remotefx,
+            egfx_advertised: self.egfx_advertised,
+            egfx_confirmed: self.egfx_confirmed,
+            avc420: self.avc420,
+            avc444: self.avc444,
+        }
+    }
 }
 
 impl Default for RdpGraphicsCapability {

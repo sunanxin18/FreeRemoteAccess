@@ -21,7 +21,10 @@ use frd_protocol_api::{
     ProtocolId, ProtocolRuntime, RuntimeEventSink, RuntimeWake, ServerIdentityDecision,
     SessionCommand, SessionEvent, SurfacePublisher,
 };
-use frd_protocol_rdp::{Avc420DecoderProvider, RdpClientPlatformIdentity, RdpProtocolFactory};
+use frd_protocol_rdp::{
+    Avc420DecoderProvider, RdpClientPlatformIdentity, RdpGraphicsCapabilities, RdpGraphicsObserver,
+    RdpProtocolFactory,
+};
 use frd_video_ffmpeg::FfmpegBackend;
 
 const EGFX_OPT_IN_ENV: &str = "FRD_RDP_PROBE_EGFX_AVC420";
@@ -270,6 +273,19 @@ fn run() -> Result<(), &'static str> {
         None,
         Box::new(Wake),
     );
+    let graphics_observer: Arc<dyn RdpGraphicsObserver> = Arc::new(
+        |capabilities: RdpGraphicsCapabilities| {
+            println!(
+                "RDP 图形能力 legacy_bitmap={} remotefx={} egfx_advertised={} egfx_confirmed={} avc420={} avc444={}",
+                capabilities.legacy_bitmap,
+                capabilities.remotefx,
+                capabilities.egfx_advertised,
+                capabilities.egfx_confirmed,
+                capabilities.avc420,
+                capabilities.avc444,
+            );
+        },
+    );
     let factory = if let Some(egfx_factory) = egfx_factory {
         RdpProtocolFactory::with_egfx_decoder_provider(
             RdpClientPlatformIdentity::Macintosh,
@@ -277,7 +293,8 @@ fn run() -> Result<(), &'static str> {
         )
     } else {
         RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)
-    };
+    }
+    .with_graphics_observer(graphics_observer);
     let session = factory
         .create(request, runtime)
         .map_err(|error| error.code())?;

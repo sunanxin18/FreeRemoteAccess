@@ -19,6 +19,7 @@ use crate::config::RdpConnectionConfig;
 use crate::connector::connect_and_activate;
 use crate::egfx::EgfxDecoderProvider;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_CANCELLED};
+use crate::factory::RdpGraphicsObserver;
 use crate::input::{RdpInputError, RdpInputState};
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -249,6 +250,7 @@ pub(crate) fn run_protocol_session(
     mut config: RdpConnectionConfig,
     mut runtime: ProtocolRuntime,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
+    graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
 ) -> ProtocolExit {
     let session_id = config.request.session_id;
     let executor = match tokio::runtime::Builder::new_current_thread()
@@ -264,7 +266,7 @@ pub(crate) fn run_protocol_session(
         &mut runtime,
         egfx_decoder_provider,
     )) {
-        Ok(session) => run_active_session(session, session_id, &mut runtime),
+        Ok(session) => run_active_session(session, session_id, &mut runtime, graphics_observer),
         Err(error) if error.code() == RDP_CANCELLED => ProtocolExit::Closed,
         Err(error) => ProtocolExit::Failed(error),
     };
@@ -1647,7 +1649,7 @@ mod tests {
         .expect("valid RDP config");
 
         assert_eq!(
-            run_protocol_session(config, runtime, None),
+            run_protocol_session(config, runtime, None, None),
             ProtocolExit::Closed
         );
         assert_eq!(
