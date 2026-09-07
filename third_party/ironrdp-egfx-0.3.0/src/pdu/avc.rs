@@ -2,7 +2,7 @@ use core::fmt;
 
 use bit_field::BitField as _;
 use bitflags::bitflags;
-use ironrdp_pdu::geometry::InclusiveRectangle;
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
     ensure_size, invalid_field_err,
@@ -76,7 +76,9 @@ impl<'de> Decode<'de> for QuantQuality {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, PartialEq, Eq)]
 pub struct Avc420BitmapStream<'a> {
-    pub rectangles: Vec<InclusiveRectangle>,
+    /// Surface-coordinate region mask using the wire-defined exclusive
+    /// right/bottom bounds from `RDPGFX_RECT16`.
+    pub rectangles: Vec<ExclusiveRectangle>,
     pub quant_qual_vals: Vec<QuantQuality>,
     pub data: &'a [u8],
 }
@@ -137,13 +139,13 @@ impl<'de> Decode<'de> for Avc420BitmapStream<'de> {
         // malicious num_regions: each region needs at least one rectangle
         // (8 bytes) plus one QuantQuality entry (2 bytes). The actual read
         // loop will fail with NotEnoughBytes if num_regions is bogus.
-        let per_region = InclusiveRectangle::FIXED_PART_SIZE + QuantQuality::FIXED_PART_SIZE;
+        let per_region = ExclusiveRectangle::ENCODED_SIZE + QuantQuality::FIXED_PART_SIZE;
         let max_possible = src.len() / per_region;
         let bounded_capacity = num_regions_usize.min(max_possible);
         let mut rectangles = Vec::with_capacity(bounded_capacity);
         let mut quant_qual_vals = Vec::with_capacity(bounded_capacity);
         for _ in 0..num_regions {
-            rectangles.push(InclusiveRectangle::decode(src)?);
+            rectangles.push(ExclusiveRectangle::decode(src)?);
         }
         for _ in 0..num_regions {
             quant_qual_vals.push(QuantQuality::decode(src)?);
@@ -295,13 +297,13 @@ impl<'de> Decode<'de> for Avc444BitmapStream<'de> {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Avc420Region {
-    /// Left edge of the region (inclusive)
+    /// Left edge of the region (inclusive internal coordinate)
     pub left: u16,
-    /// Top edge of the region (inclusive)
+    /// Top edge of the region (inclusive internal coordinate)
     pub top: u16,
-    /// Right edge of the region (inclusive)
+    /// Right edge of the region (inclusive internal coordinate)
     pub right: u16,
-    /// Bottom edge of the region (inclusive)
+    /// Bottom edge of the region (inclusive internal coordinate)
     pub bottom: u16,
     /// H.264 quantization parameter (0-51, lower = higher quality)
     pub quantization_parameter: u8,
@@ -342,14 +344,17 @@ impl Avc420Region {
         }
     }
 
-    /// Convert to `InclusiveRectangle` for PDU encoding
+    /// Convert to the wire `ExclusiveRectangle` for PDU encoding.
+    ///
+    /// `Avc420Region` keeps inclusive bounds for the server-side region API;
+    /// `RDPGFX_RECT16` carries the equivalent exclusive right/bottom bounds.
     #[must_use]
-    pub fn to_rectangle(&self) -> InclusiveRectangle {
-        InclusiveRectangle {
+    pub fn to_rectangle(&self) -> ExclusiveRectangle {
+        ExclusiveRectangle {
             left: self.left,
             top: self.top,
-            right: self.right,
-            bottom: self.bottom,
+            right: self.right.saturating_add(1),
+            bottom: self.bottom.saturating_add(1),
         }
     }
 
@@ -486,7 +491,7 @@ pub const fn align_to_16(dimension: u32) -> u32 {
 /// Panics if internal encoding fails (should not happen with valid inputs).
 #[must_use]
 pub fn encode_avc420_bitmap_stream(regions: &[Avc420Region], h264_data: &[u8]) -> Vec<u8> {
-    let rectangles: Vec<InclusiveRectangle> = regions.iter().map(Avc420Region::to_rectangle).collect();
+    let rectangles: Vec<ExclusiveRectangle> = regions.iter().map(Avc420Region::to_rectangle).collect();
 
     let quant_qual_vals: Vec<QuantQuality> = regions.iter().map(Avc420Region::to_quant_quality).collect();
 
@@ -594,6 +599,8 @@ mod tests {
 
         assert_eq!(decoded.rectangles.len(), 1);
         assert_eq!(decoded.quant_qual_vals.len(), 1);
+        assert_eq!(decoded.rectangles[0].right, 1920);
+        assert_eq!(decoded.rectangles[0].bottom, 1080);
         assert_eq!(decoded.data, &h264_data);
     }
 }

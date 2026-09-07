@@ -23,7 +23,7 @@ use frd_media_api::{
 };
 use ironrdp::core::impl_as_any;
 use ironrdp::dvc::{DvcMessage, DvcProcessor};
-use ironrdp::pdu::geometry::{ExclusiveRectangle, Rectangle};
+use ironrdp::pdu::geometry::{ExclusiveRectangle, InclusiveRectangle, Rectangle};
 use ironrdp::pdu::{Decode, PduResult, ReadCursor};
 use ironrdp_egfx::client::{
     BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler, Surface,
@@ -1164,14 +1164,17 @@ pub struct ValidatedAvc444Bitmap<'a> {
     /// Parsed rectangles are owned because IronRDP owns them inside its decoded stream value.
     /// Keeping them here preserves the wire geometry for the future planar adapter without
     /// returning references to a temporary parser value.
-    pub stream1_regions: Box<[ironrdp::pdu::geometry::InclusiveRectangle]>,
-    pub stream2_regions: Option<Box<[ironrdp::pdu::geometry::InclusiveRectangle]>>,
+    /// Regions normalized to inclusive bounds for the existing AVC444
+    /// reconstruction kernels. The wire parser uses exclusive RDPGFX_RECT16
+    /// bounds and conversion is performed once at this validation boundary.
+    pub stream1_regions: Box<[InclusiveRectangle]>,
+    pub stream2_regions: Option<Box<[InclusiveRectangle]>>,
     pub stream1_region_count: usize,
     pub stream2_region_count: usize,
 }
 
 impl<'a> ValidatedAvc444Bitmap<'a> {
-    fn publication_regions(&self) -> Vec<ironrdp::pdu::geometry::InclusiveRectangle> {
+    fn publication_regions(&self) -> Vec<InclusiveRectangle> {
         let mut regions = self.stream1_regions.to_vec();
         if matches!(self.encoding, ValidatedAvc444Encoding::LumaAndChroma) {
             if let Some(stream2_regions) = self.stream2_regions.as_deref() {
@@ -1184,6 +1187,28 @@ impl<'a> ValidatedAvc444Bitmap<'a> {
         }
         regions
     }
+}
+
+fn normalize_avc444_wire_regions(
+    regions: Vec<ExclusiveRectangle>,
+) -> DecoderResult<Box<[InclusiveRectangle]>> {
+    regions
+        .into_iter()
+        .map(|region| {
+            if region.left >= region.right || region.top >= region.bottom {
+                return Err(DecoderError::msg(
+                    "AVC444 region has empty or inverted exclusive bounds",
+                ));
+            }
+            Ok(InclusiveRectangle {
+                left: region.left,
+                top: region.top,
+                right: region.right - 1,
+                bottom: region.bottom - 1,
+            })
+        })
+        .collect::<DecoderResult<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
 }
 
 pub(crate) fn validate_avc444_bitmap(data: &[u8]) -> DecoderResult<ValidatedAvc444Bitmap<'_>> {
@@ -1262,10 +1287,12 @@ pub(crate) fn validate_avc444_bitmap(data: &[u8]) -> DecoderResult<ValidatedAvc4
     };
     let stream1_data = stream.stream1.data;
     let stream1_region_count = stream.stream1.rectangles.len();
-    let stream1_regions = stream.stream1.rectangles.into_boxed_slice();
+    let stream1_regions = normalize_avc444_wire_regions(stream.stream1.rectangles)?;
     let stream2_data = stream2.as_ref().map(|stream| stream.data);
     let stream2_region_count = stream2.as_ref().map_or(0, |stream| stream.rectangles.len());
-    let stream2_regions = stream2.map(|stream| stream.rectangles.into_boxed_slice());
+    let stream2_regions = stream2
+        .map(|stream| normalize_avc444_wire_regions(stream.rectangles))
+        .transpose()?;
     if stream1_regions.is_empty()
         || stream2_regions
             .as_deref()
@@ -2992,6 +3019,16 @@ mod tests {
         let mut cursor = WriteCursor::new(&mut encoded);
         bitmap.encode(&mut cursor).expect("AVC444 fixture encodes");
         let validated = validate_avc444_bitmap(&encoded).expect("AVC444 fixture validates");
+        assert_eq!(validated.stream1_regions[0].right, 1);
+        assert_eq!(validated.stream1_regions[0].bottom, 1);
+        assert_eq!(
+            validated
+                .stream2_regions
+                .as_deref()
+                .expect("luma and chroma has stream2")[0]
+                .right,
+            1
+        );
         let frame = decoder
             .decode(
                 Codec1Type::Avc444,

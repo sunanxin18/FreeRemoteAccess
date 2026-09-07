@@ -775,12 +775,11 @@ impl GraphicsPipelineClient {
         for region in &stream.rectangles {
             let region_left = u32::from(region.left);
             let region_top = u32::from(region.top);
-            let region_right = u32::from(region.right).checked_add(1).ok_or_else(|| {
-                pdu_other_err!("AVC420 region right edge overflows")
-            })?;
-            let region_bottom = u32::from(region.bottom).checked_add(1).ok_or_else(|| {
-                pdu_other_err!("AVC420 region bottom edge overflows")
-            })?;
+            // RDPGFX_RECT16 uses exclusive right/bottom bounds. The decoded
+            // stream already carries those wire coordinates, so do not add an
+            // extra pixel while constructing the publication rectangle.
+            let region_right = u32::from(region.right);
+            let region_bottom = u32::from(region.bottom);
             let destination_left = u32::from(dest_rect.left);
             let destination_top = u32::from(dest_rect.top);
             let destination_right = u32::from(dest_rect.right);
@@ -1032,6 +1031,7 @@ mod tests {
     use super::*;
     use crate::decode::{DecodedFrame, DecoderResult};
     use crate::pdu::{Avc420Region, encode_avc420_bitmap_stream};
+    use ironrdp_core::{Encode, WriteCursor};
     use std::sync::{Arc, Mutex};
 
     struct TestDecoder;
@@ -1189,6 +1189,41 @@ mod tests {
         assert_eq!(updates[1].0.right, 11);
         assert_eq!(updates[1].0.bottom, 21);
         assert_eq!(updates[1].1[0], 0);
+    }
+
+    #[test]
+    fn avc420_region_mask_rejects_empty_exclusive_wire_rectangle() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(CaptureHandler(Arc::clone(&captured))),
+            Some(Box::new(TestDecoder)),
+        );
+        let bitmap = Avc420BitmapStream {
+            rectangles: vec![ExclusiveRectangle {
+                left: 1,
+                top: 1,
+                right: 1,
+                bottom: 2,
+            }],
+            quant_qual_vals: vec![crate::pdu::QuantQuality {
+                quantization_parameter: 22,
+                progressive: false,
+                quality: 100,
+            }],
+            data: &[0, 0, 0, 1, 0x65],
+        };
+        let mut encoded = vec![0_u8; bitmap.size()];
+        let mut cursor = WriteCursor::new(&mut encoded);
+        bitmap.encode(&mut cursor).expect("fixture encodes");
+
+        let destination = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        };
+        assert!(client.decode_avc420(7, &destination, &encoded).is_err());
+        assert!(captured.lock().expect("capture handler mutex").is_empty());
     }
 
     #[test]
