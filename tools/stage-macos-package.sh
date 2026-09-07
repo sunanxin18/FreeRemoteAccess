@@ -17,6 +17,12 @@ cross_build=0
 if [[ "$host_arch" != "$requested_arch" ]]; then cross_build=1; fi
 cd "$repo_root"
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+# Cargo resolves a relative CARGO_TARGET_DIR from the repository working
+# directory below.  Keep the staged App beside that same target root instead
+# of silently writing it to the repository's default target directory.
+if [[ "$target_dir" != /* ]]; then
+    target_dir="$repo_root/$target_dir"
+fi
 if [[ "$cross_build" -eq 1 ]]; then
     if [[ "$profile" == release ]]; then
         cargo build --locked -p freeremotedesk-macos --release --target "$rust_target"
@@ -32,7 +38,7 @@ else
     fi
     binary="$target_dir/$profile/freeremotedesk-macos"
 fi
-app="$repo_root/target/macos/$profile/FreeRemoteDesk.app"
+app="$target_dir/macos/$profile/FreeRemoteDesk.app"
 # 清理固定生成目录，避免旧版编解码器或说明残留影响签名。
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"

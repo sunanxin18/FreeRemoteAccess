@@ -113,7 +113,11 @@ fi
 if [[ "${FRD_VERIFY_SKIP_PACKAGE:-0}" == 1 ]]; then
     printf '\n[SKIP] package verifier（FRD_VERIFY_SKIP_PACKAGE=1）\n'
 elif [[ "$(uname -s)" == Darwin ]]; then
-    mac_app="${FRD_MACOS_APP:-$repo_root/target/macos/release/FreeRemoteDesk.app}"
+    mac_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+    if [[ "$mac_target_dir" != /* ]]; then
+        mac_target_dir="$repo_root/$mac_target_dir"
+    fi
+    mac_app="${FRD_MACOS_APP:-$mac_target_dir/macos/release/FreeRemoteDesk.app}"
     if [[ -d "$mac_app" && -x tools/verify-macos-package.sh ]]; then
         mac_arch="${FRD_MACOS_ARCH:-$(uname -m)}"
         run_gate "macOS package verifier：$mac_arch" env FRD_MACOS_ARCH="$mac_arch" \
