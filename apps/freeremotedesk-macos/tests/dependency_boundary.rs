@@ -22,6 +22,14 @@ fn macos_production_composition_keeps_egfx_live_gate_closed() {
         "macOS composition must keep the default legacy-only graphics gate"
     );
     assert!(
+        entry.contains("legacy_rdp_factory(platform)"),
+        "macOS composition must keep the legacy fallback when the codec bundle is unavailable"
+    );
+    assert!(
+        entry.contains("fn legacy_rdp_factory(platform: RdpClientPlatformIdentity)"),
+        "macOS composition must retain an explicit legacy factory boundary"
+    );
+    assert!(
         !entry.contains("with_egfx_decoder_provider_and_gate"),
         "macOS production composition must not opt into the live EGFX gate"
     );
