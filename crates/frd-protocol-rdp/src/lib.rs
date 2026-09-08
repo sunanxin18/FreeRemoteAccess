@@ -64,3 +64,7 @@ const IDENTITY_VERIFICATION_SEAM: IdentityVerificationSeam = (
     server_identity::resolve_server_identity,
     tls::establish_verified_tls,
 );
+
+#[allow(dead_code)]
+#[path = "progressive/wire.rs"]
+mod progressive_wire;
