@@ -1,10 +1,10 @@
 # FreeRemoteDesk
 
-2026-09-08 当前进度：macOS 仅支持 ARM64。共享会话宿主分离后的完整工作区测试 1706 passed / 0 failed / 16 ignored；此前 `85324f5` ARM64 release 包验证通过。默认生产 RDP 仍为 LegacyOnly；显式 `--rdp-egfx-experiment avc420|avc444` 用于采集互操作证据。
+2026-09-08 当前进度：macOS 仅支持 ARM64。共享帧事务状态迁移后的完整工作区测试 1717 passed / 0 failed / 16 ignored；默认生产 RDP 仍为 LegacyOnly，显式 `--rdp-egfx-experiment avc420|avc444` 用于采集互操作证据。
 
 `707b178` 的1280×720探针取得20秒/70帧 ClearCodec/Progressive混合流，实际AVC计数0。该实验GUI的原生分辨率cache发布失败已由 `64dd9e1` 修复：2560×1440显示器原生模式下真实桌面、开始菜单鼠标、搜索键盘输入、正常断开与退出已受限验证；约三分钟会话最后诊断110帧、失败0。仍不能把混合流归为H.264验收。
 
-`5c00935` 的 Windows run `34192818981`、Linux run `34192818977` 与 macOS run `34192818985` 全部成功，包括 Windows ARM64 原生 runtime。七目标分别通过 Progressive/邻近 EGFX 59 项回归及内核基准；该证据不含后续窗口修正与失败诊断，也不替代实际 AVC、GUI 或 HEVC wire 门禁。见[验证记录](docs/validation/rdp-egfx-h264-20260907.md)和[目标基准](docs/validation/progressive-benchmark-20260908.md)。
+`a60eebd` 的 Windows run `34202134584`、Linux run `34202134581` 与 macOS run `34202134533` 全部成功，包括 Windows ARM64 原生 runtime，覆盖七目标包/解码验证。该证据不含后续共享状态 crate 与 Linux GL 改动，也不替代实际 AVC、GUI 或 HEVC wire 门禁。见[验证记录](docs/validation/rdp-egfx-h264-20260907.md)和[目标基准](docs/validation/progressive-benchmark-20260908.md)。
 
 2026-09-08 GUI 回归：macOS 控制岛自动隐藏、首次窗口按原生工作区适配和隐藏后的默认 RDP 键鼠输入已受限验证。显式 EGFX 另出现 Progressive region coverage 失败；现在致命图形错误会终止会话并显示错误，严格解码检查仍保留，并已增加仅含帧号/矩形/tile 坐标的失败诊断；真实复现尚待执行，故该实验未验收。见[窗口与输入验证](docs/validation/macos-window-chrome-20260908.md)。
 
