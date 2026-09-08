@@ -552,10 +552,14 @@ Linux stage 现在复制
 `share/fonts/freeremotedesk/NotoSansSC-VariableFont_wght.ttf`，静态 verifier 精确
 检查 17,773,248 字节、SHA-256
 `e80613a35583f59b46dbf6cc2eb640f3db0bb0f53fa7f6fbaa7b09faf20e5172` 和 0644 权限。
-GTK runner 通过公开 fontconfig/PangoCairo ABI 为窗口树建立私有 font map；不写入
-全局或用户字体配置，缺少 ABI 或随包字体时不伪造通过。
+GTK runner 通过公开 fontconfig/PangoCairo ABI（PangoFc 位于
+`libpangoft2-1.0.so.0`）为窗口树建立私有 font map；不写入全局或用户字体配置，
+缺少 ABI 或随包字体时不伪造通过。`BundledFontMap::has_bundled_family` 由原生
+runner fixture 断言 `Noto Sans SC` family 实际进入 map，避免只验证文件存在。
 
 本机 macOS 只能执行 `frd-shell-gtk` 非 GTK cfg 测试；Linux GTK 输入控制器和
-PangoCairo 代码需由 Linux 目标 CI 编译。已有 `34223764518`（提交 `43c9b01`）
-证明三架构 X11/Wayland 1×/2× 的 frame、runner、submission 和 observer gap 通过；
-该轮在输入接线之前，不能替代本次新代码的编译与物理输入运行证据。
+PangoCairo 代码由 Linux 目标 CI 编译。`34233406400`（提交 `af77f46`）在
+x86_64、i686、AArch64 上通过 X11/Wayland 1×/2× 的 frame、runner、submission
+和 observer gap；runner 日志包含 `font_map_loaded=true`，离屏登录/连接 PNG
+确认中文可见。测试使用 GTK/GLArea fixture 和合成协议事件，仍不等同于物理键鼠
+注入、发行版硬件 GPU 或真实 RDP 控制验收。
