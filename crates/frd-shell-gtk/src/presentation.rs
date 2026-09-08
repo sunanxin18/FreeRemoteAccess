@@ -18,6 +18,8 @@ pub struct SubmissionDiagnostics {
     pub draw_count: u64,
     pub after_count: u64,
     pub bootstrap_count: u64,
+    pub initial_attach_gap_draw_count: u64,
+    pub layout_gap_draw_count: u64,
     pub confirmed_count: u64,
     pub invalidation_count: u64,
     pub before_frame: i64,
@@ -49,17 +51,52 @@ fn capture_egl_before_identity<T>(
     (error, identity())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationGap {
+    InitialAttach(i64),
+    Layout(i64),
+}
+impl ObservationGap {
+    fn frame(self) -> i64 {
+        match self {
+            Self::InitialAttach(frame) | Self::Layout(frame) => frame,
+        }
+    }
+}
+
 #[derive(Default)]
 struct FrameGate {
     epoch: Rc<Cell<u64>>,
     exhausted: Rc<Cell<bool>>,
     frame: Option<(i64, u64, bool)>,
+    gap: Option<ObservationGap>,
     paint: bool,
     draw: bool,
     rejected: bool,
 }
 impl FrameGate {
+    fn initial_attach(frame: i64) -> Self {
+        Self {
+            gap: Some(ObservationGap::InitialAttach(frame)),
+            ..Self::default()
+        }
+    }
+    fn observes(&self, frame: i64) -> bool {
+        self.frame.is_some_and(|f| f.0 == frame) || self.gap.is_some_and(|gap| gap.frame() == frame)
+    }
+    fn invalidate_layout(&mut self, frame: i64) {
+        let same_frame = self.observes(frame);
+        let rejected = same_frame && self.rejected;
+        if !same_frame {
+            self.paint = false;
+            self.draw = false;
+        }
+        self.invalidate();
+        self.gap = Some(ObservationGap::Layout(frame));
+        self.rejected = rejected;
+    }
     fn begin(&mut self, frame: i64, clean_baseline: bool) {
+        self.gap = None;
         self.frame = Some((
             frame,
             self.epoch.get(),
@@ -70,17 +107,13 @@ impl FrameGate {
         self.rejected = false;
     }
     fn paint(&mut self, frame: i64, region_present: bool) {
-        if self.frame.is_none_or(|f| f.0 != frame) || self.paint || !region_present {
+        if !self.observes(frame) || self.paint || !region_present {
             self.rejected = true;
         }
         self.paint = true;
     }
     fn draw(&mut self, frame: i64, invocation_matches: bool) -> bool {
-        if self.frame.is_none_or(|f| f.0 != frame)
-            || !self.paint
-            || self.draw
-            || !invocation_matches
-        {
+        if !self.observes(frame) || !self.paint || self.draw || !invocation_matches {
             self.rejected = true;
         }
         self.draw = true;
@@ -105,6 +138,7 @@ impl FrameGate {
             self.exhausted.set(true);
         }
         self.frame = None;
+        self.gap = None;
         self.rejected = true;
     }
 }
@@ -302,13 +336,13 @@ mod native {
             }
             let this = Rc::new(Self {
                 state: RefCell::new(State {
-                    gate: FrameGate::default(),
+                    gate: FrameGate::initial_attach(clock.frame_counter()),
                     known: None,
                     draw: None,
                     draw_egl_context: None,
                     ready: None,
                     error: None,
-                    retry_after_layout: false,
+                    retry_after_layout: true,
                     diagnostics: SubmissionDiagnostics::default(),
                 }),
                 area: area.downgrade(),
@@ -341,7 +375,7 @@ mod native {
             let weak = Rc::downgrade(&this);
             let id = area.connect_resize(move |_, _, _| {
                 if let Some(this) = weak.upgrade() {
-                    this.invalidate();
+                    this.invalidate_layout();
                 }
             });
             this.connections
@@ -352,7 +386,7 @@ mod native {
                 if let Some(this) = weak.upgrade() {
                     let geometry = (width, height, surface.scale_factor());
                     if this.geometry.replace(geometry) != geometry {
-                        this.invalidate();
+                        this.invalidate_layout();
                     }
                 }
             });
@@ -371,7 +405,7 @@ mod native {
             let weak = Rc::downgrade(&this);
             let id = this.surface.connect_scale_factor_notify(move |_| {
                 if let Some(this) = weak.upgrade() {
-                    this.invalidate();
+                    this.invalidate_layout();
                 }
             });
             this.connections
@@ -418,8 +452,19 @@ mod native {
             Ok(this)
         }
         pub fn invalidate(&self) {
+            self.state.borrow_mut().invalidate();
+        }
+        fn invalidate_layout(&self) {
             let mut state = self.state.borrow_mut();
-            state.invalidate();
+            // 明确的布局撤销保留同帧 signal 关联，但不补造 BEFORE_PAINT baseline。
+            let frame = self.clock.frame_counter();
+            state.gate.invalidate_layout(frame);
+            state.diagnostics.invalidation_count =
+                state.diagnostics.invalidation_count.saturating_add(1);
+            state.known = None;
+            state.draw = None;
+            state.draw_egl_context = None;
+            state.ready = None;
             state.retry_after_layout = true;
         }
         pub fn take_error(&self) -> Option<SubmissionError> {
@@ -460,6 +505,19 @@ mod native {
                 state.draw = None;
                 state.error = Some(SubmissionError::Association);
                 return Err(SubmissionError::Association);
+            }
+            match state.gate.gap {
+                Some(ObservationGap::InitialAttach(_)) => {
+                    state.diagnostics.initial_attach_gap_draw_count = state
+                        .diagnostics
+                        .initial_attach_gap_draw_count
+                        .saturating_add(1);
+                }
+                Some(ObservationGap::Layout(_)) => {
+                    state.diagnostics.layout_gap_draw_count =
+                        state.diagnostics.layout_gap_draw_count.saturating_add(1);
+                }
+                None => {}
             }
             state.draw_egl_context = draw_identity.map(|id| id.0);
             state.draw = Some(receipt);
@@ -609,6 +667,7 @@ mod native {
             state.diagnostics.exact_draw = exact_draw;
             state.diagnostics.observed_paint = observed_paint;
             state.diagnostics.clean_after = clean.is_ok();
+            let observation_gap = state.gate.gap.is_some();
             let confirmed = state.gate.finish(
                 self.clock.frame_counter(),
                 same && clean.is_ok() && exact_draw,
@@ -633,7 +692,12 @@ mod native {
                 if let Err(error) = clean {
                     state.error = Some(error);
                     state.invalidate();
-                } else if observed_paint && exact_draw && window_context_transition && !same {
+                } else if !observation_gap
+                    && observed_paint
+                    && exact_draw
+                    && window_context_transition
+                    && !same
+                {
                     state.diagnostics.bootstrap_count =
                         state.diagnostics.bootstrap_count.saturating_add(1);
                     state.invalidate();

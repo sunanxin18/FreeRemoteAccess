@@ -93,3 +93,47 @@ fn egl_error_is_captured_before_successful_identity_queries_overwrite_it() {
     assert_eq!(observed, 0x300d);
     assert_eq!(error.get(), 0x3000);
 }
+
+#[test]
+fn initial_attach_and_layout_gaps_never_confirm_or_fabricate_baseline() {
+    for layout in [false, true] {
+        let mut gate = FrameGate::initial_attach(20);
+        if layout {
+            gate.begin(20, true);
+        }
+        gate.paint(20, true);
+        if layout {
+            gate.invalidate_layout(20);
+        }
+        assert!(gate.draw(20, true));
+        assert!(!gate.finish(20, true, true));
+        gate.begin(21, true);
+        gate.paint(21, true);
+        assert!(gate.draw(21, true));
+        assert!(gate.finish(21, true, true));
+    }
+}
+
+#[test]
+fn explicit_gaps_still_reject_wrong_signal_counter_and_duplicate_draw() {
+    for scenario in 0..4 {
+        let mut gate = FrameGate::initial_attach(22);
+        gate.paint(22, true);
+        if scenario == 3 {
+            gate.paint(22, true);
+            gate.invalidate_layout(22);
+        }
+        let accepted = gate.draw(if scenario == 0 { 23 } else { 22 }, scenario != 1);
+        if scenario == 2 {
+            assert!(accepted);
+            assert!(!gate.draw(22, true));
+        } else {
+            assert!(!accepted);
+        }
+        assert!(!gate.finish(22, true, true));
+    }
+    let mut gate = FrameGate::default();
+    gate.invalidate();
+    gate.paint(22, true);
+    assert!(!gate.draw(22, true)); // 任意失效不能冒充显式 gap。
+}

@@ -92,6 +92,8 @@ fn native_gtk_window_submission_roundtrip() {
             "GdkWaylandDisplay"
         }
     );
+    observation_gap_roundtrip(false);
+    observation_gap_roundtrip(true);
     let adapter = Rc::new(GtkFrameArea::new());
     let window = gtk4::Window::builder()
         .title("FreeRemoteDesk EGL 窗口提交测试")
@@ -441,4 +443,108 @@ fn wait_submission(adapter: &GtkFrameArea) -> WindowSubmission {
             adapter.submission_diagnostics()
         );
     }
+}
+
+// 两个独立真实窗口：首次 snapshot 的 resize，以及完成布局后的 UPDATE attach。
+fn observation_gap_roundtrip(attach_in_update: bool) {
+    let adapter = Rc::new(GtkFrameArea::new());
+    let window = gtk4::Window::builder()
+        .default_width(128)
+        .default_height(128)
+        .child(adapter.widget())
+        .build();
+    let resized = Rc::new(Cell::new(None));
+    let resize_hook = {
+        let resized = resized.clone();
+        adapter.widget().connect_resize(move |area, _, _| {
+            resized.set(Some(area.frame_clock().unwrap().frame_counter()));
+        })
+    };
+    window.present();
+    assert!(adapter.widget().is_realized());
+    let clock = window.surface().unwrap().frame_clock();
+    let attached_frame = Rc::new(Cell::new(None));
+    let first_draw_frame = Rc::new(Cell::new(None));
+    let after_hook = Rc::new(RefCell::new(None));
+    let attach = {
+        let adapter = adapter.clone();
+        let window = window.clone();
+        let attached_frame = attached_frame.clone();
+        let first_draw_frame = first_draw_frame.clone();
+        let after_hook = after_hook.clone();
+        move |clock: &gdk::FrameClock| {
+            adapter.enable_window_submission(&window).unwrap();
+            attached_frame.set(Some(clock.frame_counter()));
+            adapter
+                .submit_batch(vec![startup(SessionId::allocate(), 1)])
+                .unwrap();
+            let adapter = adapter.clone();
+            let first_draw_frame = first_draw_frame.clone();
+            *after_hook.borrow_mut() = Some(clock.connect_after_paint(move |_| {
+                let diagnostics = adapter.submission_diagnostics().unwrap();
+                assert!(
+                    adapter.take_submission_error().is_none(),
+                    "合法 gap 不得报错: {diagnostics:?}"
+                );
+                if diagnostics.draw_count > 0 && first_draw_frame.get().is_none() {
+                    assert_eq!(diagnostics.confirmed_count, 0);
+                    assert_eq!(
+                        diagnostics.bootstrap_count, 0,
+                        "gap 不能提供 bootstrap 证据"
+                    );
+                    assert!(adapter.take_window_submission().is_none());
+                    first_draw_frame.set(Some(diagnostics.draw_frame));
+                }
+            }));
+        }
+    };
+    if attach_in_update {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while resized.get().is_none() {
+            pump();
+            assert!(Instant::now() < deadline, "初始布局必须完成");
+        }
+        // 在真实 UPDATE 中挂载，明确错过该帧 BEFORE_PAINT。
+        adapter.widget().add_tick_callback(move |_, clock| {
+            attach(clock);
+            glib::ControlFlow::Break
+        });
+    } else {
+        assert!(resized.get().is_none(), "必须在首次 snapshot 前挂载");
+        attach(&clock);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while first_draw_frame.get().is_none() {
+        pump();
+        assert!(
+            Instant::now() < deadline,
+            "gap 首次绘制超时: {:?}",
+            adapter.submission_diagnostics()
+        );
+    }
+    if attach_in_update {
+        assert_eq!(first_draw_frame.get(), attached_frame.get());
+    } else {
+        assert_eq!(
+            first_draw_frame.get(),
+            resized.get(),
+            "首次 resize 紧接同帧 render"
+        );
+    }
+    let gap_diagnostics = adapter.submission_diagnostics().unwrap();
+    if attach_in_update {
+        assert_eq!(gap_diagnostics.initial_attach_gap_draw_count, 1);
+    } else {
+        assert_eq!(gap_diagnostics.layout_gap_draw_count, 1);
+    }
+    let submission = wait_submission(&adapter);
+    assert!(submission.frame_counter() > first_draw_frame.get().unwrap());
+    assert!(submission.consume().is_ok());
+    assert!(adapter.take_window_submission().is_none());
+    assert!(adapter.submission_diagnostics().unwrap().bootstrap_count > 0);
+    clock.disconnect(after_hook.borrow_mut().take().unwrap());
+    adapter.widget().disconnect(resize_hook);
+    adapter.detach();
+    window.close();
+    println!("native GTK observer gap update_attach={attach_in_update} initial_frame_rejected=1 subsequent_complete_frame=1");
 }

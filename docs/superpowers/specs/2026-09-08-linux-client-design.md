@@ -268,3 +268,12 @@ GTK可在无效Wayland表时保留旧/default表，因此不声称验证了原�
 该表不重复InputRouter的修饰键或held-state。发送失败统一停止当前输入epoch。
 同步IM filter在释放宿主可变借用后执行，commit暂存后由归属结果决定发送；
 异步commit必须携带旧context绑定时取得的token，不得现场重新绑定获得授权。
+
+### 合法观察缺口的处理
+
+GTK4.14的[GLArea snapshot](https://github.com/GNOME/gtk/blob/4.14.0/gtk/gtkglarea.c#L762)
+会先发resize再发render；UPDATE中绑定也可能错过before。两者分别记录带帧号
+的Layout/InitialAttach观察缺口，仅允许同帧真实signal/context/receipt继续
+接受错误检查，本帧不能bootstrap或签proof。布局变化递增epoch并撤销旧证明；
+后续完整before/paint/draw/after才重新bootstrap并确认。不通过补造baseline
+或清除任意Association补救。unrealize/context/mapped变化仍是严格失效。

@@ -490,3 +490,50 @@ Linux x86_64全测试目标类型检查通过（system-deps override，非链接
 YAML、内嵌bash语法及stub失败汇总控制流检查通过。
 
 本地完整workspace终态exit0：78组，1771 passed / 0 failed / 16 ignored；日志 `/tmp/frd-gtk-xkb-diagnostics-workspace.log`。fmt与diff检查通过。
+
+## c18b1f8 原生失败定位完成
+
+GTK run34222262867三架构失败，jobs102047919073/102047919213/102047919273；
+完整日志 `/tmp/frd-gtk-c18/{aarch64,x86_64,i686}.log`。每架构四组adapter与
+四组submission均实际通过，四组runner均失败于first_session_confirmed_connected。
+12组submission均有next_update_consumed=1/confirmed_once=1，GL/EGL负例和
+resize/unrealize保护继续通过，runner失败不再遮蔽它。
+
+全部runner在starts=1/closed=1回form时保留实时终态Submission(Association)：
+GLArea realized/mapped=true、error=false；before/paint/draw/after均1次，
+bootstrap/confirmed为0，invalidation为2；invocation_matches=true、
+current_window/clean_after/draw_surfaceless=true、EGL_SUCCESS=12288。
+这明确排除了本次等待是凭据未启动或实际GL/EGL故障的猜测。
+
+独立源码核对GTK4.14首次snapshot先resize再render，resize撤销gate后同帧
+record_draw会误留永久Association；真实诊断与此合法初始布局缺口吻合。
+另有UPDATE中attach错过before的独立路径。下一修正为两者增加明确的未武装/
+布局撤销状态与真实fixture；本帧不签proof、请求后续完整帧，仍检查所有实际
+关联/GL/EGL错误，不补造baseline或清任意Association。修正尚未原生验证。
+
+## 实际XKB provider实现与验收范围
+
+NativeKeymap实现两个后端：Wayland使用当前GTK键盘设备的有效表，
+同步ref/query/unref；X11使用事件master keyboard ID读取names/aliases，
+核对返回device_spec，GDK错误trap和XkbDesc由RAII退出。标准候选复用唯一
+名称表，冲突HID拒绝；主线程、设备来源和seat身份有校验，动态库生命周期保留。
+公开模块限定Linux x86/x86_64/aarch64，未修改Windows/macOS路径。
+
+独立审查通过。三Linux目标--tests类型检查通过（不可链接system-deps
+占位SDK）；现有纯keymap12/ownership16通过。新增3个libxkbcommon字符串
+查询fixture和1个人工X11 C结构fixture只完成类型检查，Linux执行待CI。
+这些fixture不覆盖实际GTK device/backend getter/X11 server或设备移除
+errortrap，不能称为真实输入。provider尚未接入runner；X11每press同步
+查询的实际成本仍待测量，缓存优化须有真实键表失效机制。
+
+## 初始观察缺口修正（原生待验证）
+
+新增带帧号的InitialAttach/Layout gap，只允许真实同帧关联继续接受GL/EGL
+检查；本帧无baseline，不bootstrap、不确认，随后请求完整重绘。严格失效与
+布局撤销分开，不清既存错误。独立审查通过。
+
+原native_submission中新增两个独立窗口场景：首次snapshot前attach并验证
+resize/render同帧；初始布局后真实UPDATE attach并验证同帧draw。二者都要求
+首帧零确认/零bootstrap/无错误，后续更晚帧唯一可消费证明。旧GL/EGL、
+nextUPDATE、resize/unrealize等矩阵保留。纯presentation_state9项通过，
+三Linux目标--tests类型检查通过（非链接），新增原生场景仍待新CI实际执行。
