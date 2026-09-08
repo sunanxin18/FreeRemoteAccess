@@ -274,17 +274,30 @@ fn rdp_factory_with_backend(
 }
 
 fn emit_experiment_diagnostics(caps: frd_protocol_rdp::RdpGraphicsCapabilities) {
-    let d = caps.egfx_diagnostics;
-    // 仅输出类型化计数；runtime 接受帧不代表窗口已经呈现该帧。
-    let line = format!(
-        "RDP EGFX 验证 egfx_confirmed={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} frames_runtime_accepted_total={} failure_count={}\n",
-        caps.egfx_confirmed,
+    let line = format_experiment_diagnostics(caps.egfx_confirmed, caps.egfx_diagnostics);
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
+fn format_experiment_diagnostics(
+    egfx_confirmed: bool,
+    d: frd_protocol_rdp::RdpEgfxDiagnostics,
+) -> String {
+    // 仅输出类型化计数和静态失败标签；runtime 接受帧不代表窗口已经呈现该帧。
+    format!(
+        "RDP EGFX 验证 egfx_confirmed={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={} failure_count={} first_failure={:?} progressive_failure_detail={:?} publisher_failure_detail={:?} publisher_failure_operation={:?}\n",
+        egfx_confirmed,
         d.avc420_decoded_pictures_total,
         d.avc444_decoded_updates_total,
+        d.clearcodec_decoded_bitmaps_total,
+        d.progressive_decoded_updates_total,
+        d.frames_queued_total,
         d.frames_runtime_accepted_total,
         d.failure_count,
-    );
-    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        d.first_failure,
+        d.progressive_failure_detail,
+        d.publisher_failure_detail,
+        d.publisher_failure_operation,
+    )
 }
 
 fn validate_experiment_support(
@@ -363,9 +376,42 @@ mod tests {
     use frd_shell_desktop::{FatalComponent, FatalOperation, FatalReason, FatalReport};
 
     use super::{
-        finish_event_loop, product_window_configuration, purge_pending_credentials,
-        runner_decision, RunnerFailure, RunnerOutcome,
+        finish_event_loop, format_experiment_diagnostics, product_window_configuration,
+        purge_pending_credentials, runner_decision, RunnerFailure, RunnerOutcome,
     };
+
+    #[test]
+    fn experiment_diagnostics_identifies_publisher_failure_and_codec_attribution() {
+        let diagnostics = frd_protocol_rdp::RdpEgfxDiagnostics {
+            clearcodec_decoded_bitmaps_total: 2,
+            progressive_decoded_updates_total: 3,
+            failure_count: 1,
+            first_failure: Some(frd_protocol_rdp::RdpEgfxFailure::PublisherOutputBounds),
+            publisher_failure_detail: Some("output bounds"),
+            publisher_failure_operation: Some("clearcodec"),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_experiment_diagnostics(true, diagnostics),
+            "RDP EGFX 验证 egfx_confirmed=true avc420_decoded_pictures_total=0 avc444_decoded_updates_total=0 clearcodec_decoded_bitmaps_total=2 progressive_decoded_updates_total=3 frames_queued_total=0 frames_runtime_accepted_total=0 failure_count=1 first_failure=Some(PublisherOutputBounds) progressive_failure_detail=None publisher_failure_detail=Some(\"output bounds\") publisher_failure_operation=Some(\"clearcodec\")\n"
+        );
+    }
+
+    #[test]
+    fn experiment_diagnostics_retains_progressive_static_failure_detail() {
+        let diagnostics = frd_protocol_rdp::RdpEgfxDiagnostics {
+            failure_count: 1,
+            first_failure: Some(frd_protocol_rdp::RdpEgfxFailure::ProgressiveEntropy),
+            progressive_failure_detail: Some("entropy short input"),
+            ..Default::default()
+        };
+        let line = format_experiment_diagnostics(false, diagnostics);
+        assert!(line.contains("first_failure=Some(ProgressiveEntropy)"));
+        assert!(line.contains("progressive_failure_detail=Some(\"entropy short input\")"));
+        assert!(line.ends_with("publisher_failure_detail=None publisher_failure_operation=None\n"));
+        assert_eq!(line.lines().count(), 1);
+        assert_eq!(line, format_experiment_diagnostics(false, diagnostics));
+    }
 
     #[test]
     fn missing_backend_falls_back_only_when_experiment_is_disabled() {
