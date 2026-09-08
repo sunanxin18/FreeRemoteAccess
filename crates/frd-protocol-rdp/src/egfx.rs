@@ -2021,6 +2021,12 @@ impl EgfxSurfacePublisher {
 pub(crate) struct EgfxAdapter {
     inner: GraphicsPipelineClient,
     surface_publisher: Option<EgfxSurfacePublisher>,
+    /// 底层 IronRDP 图形客户端是否持有基础 H.264 解码器。
+    ///
+    /// `GraphicsPipelineClient::codec_capabilities()` 只反映服务器的
+    /// `CapabilitiesConfirm`；即使调用方没有传入解码器，它仍可能报告 AVC 能力。
+    /// 在 adapter 边界保留此事实，避免诊断信息把服务器证据误当成本地能力。
+    h264_decoder_configured: bool,
     failed: Arc<AtomicBool>,
 }
 
@@ -2030,9 +2036,11 @@ impl EgfxAdapter {
         decoder: Option<Box<dyn H264Decoder>>,
         handler: Box<dyn GraphicsPipelineHandler>,
     ) -> Self {
+        let h264_decoder_configured = decoder.is_some();
         Self {
             inner: GraphicsPipelineClient::new(handler, decoder),
             surface_publisher: None,
+            h264_decoder_configured,
             failed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -2041,9 +2049,11 @@ impl EgfxAdapter {
         decoder: Option<Box<dyn H264Decoder>>,
         publisher: EgfxSurfacePublisher,
     ) -> Self {
+        let h264_decoder_configured = decoder.is_some();
         Self {
             inner: GraphicsPipelineClient::new(Box::new(publisher.clone()), decoder),
             surface_publisher: Some(publisher),
+            h264_decoder_configured,
             failed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -2062,11 +2072,11 @@ impl EgfxAdapter {
     }
 
     pub(crate) fn avc420_confirmed(&self) -> bool {
-        self.is_active() && self.inner.codec_capabilities().avc420
+        self.h264_decoder_configured && self.is_active() && self.inner.codec_capabilities().avc420
     }
 
     pub(crate) fn avc444_confirmed(&self) -> bool {
-        self.is_active() && self.inner.codec_capabilities().avc444
+        self.h264_decoder_configured && self.is_active() && self.inner.codec_capabilities().avc444
     }
 
     pub(crate) fn drain_surface_updates(&self) -> Vec<SurfaceUpdate> {
@@ -2179,6 +2189,34 @@ mod tests {
         assert!(!adapter.is_active());
         assert!(!adapter.avc420_confirmed());
         assert!(!adapter.avc444_confirmed());
+    }
+
+    #[test]
+    fn capability_confirmation_does_not_confirm_without_a_base_decoder() {
+        let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1)
+            .expect("generation")
+            .with_avc444_decoder(Box::new(SolidAvc444Decoder));
+        let mut adapter = EgfxAdapter::with_surface_publisher(None, publisher);
+
+        adapter.start(7).expect("EGFX start succeeds");
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(
+                &CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::SMALL_CACHE,
+                },
+            )),
+        );
+
+        assert!(adapter.is_active());
+        assert!(
+            !adapter.avc420_confirmed(),
+            "server confirmation cannot provide a missing base H.264 decoder"
+        );
+        assert!(
+            !adapter.avc444_confirmed(),
+            "an AVC444 publisher cannot provide a missing base H.264 decoder"
+        );
     }
 
     #[test]

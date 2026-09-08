@@ -103,6 +103,7 @@ jobs:
         shell: bash
         env:
           FRD_MACOS_ARCH: ${{ matrix.architecture }}
+          FRD_FFMPEG_BUILD_ROOT: ${{ github.workspace }}/target/ffmpeg-macos-${{ matrix.architecture }}
         run: bash tools/stage-macos-package.sh release
 
       - name: Stage corresponding FFmpeg source evidence
