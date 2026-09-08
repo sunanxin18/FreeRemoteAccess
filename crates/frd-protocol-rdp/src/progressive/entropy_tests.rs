@@ -227,3 +227,23 @@ fn high_bit_width_srl_is_bounded_and_accepts_negative_minimum() {
         }
     }
 }
+
+#[test]
+fn freerdp_c_encoder_nonzero_complete_component() {
+    let mut output = [0; 4096];
+    decode_rlgr1(
+        include_bytes!("fixtures/freerdp_rlgr1_synthetic.bin"),
+        &mut output,
+    )
+    .unwrap();
+    for (i, value) in output.iter().enumerate() {
+        let expected = if i < 4000 {
+            (i % 17) as i16 - 8
+        } else if i == 4095 {
+            1
+        } else {
+            0
+        };
+        assert_eq!(*value, expected, "coefficient {i}");
+    }
+}
