@@ -23,6 +23,19 @@ use frd_shell_desktop::{
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+use frd_shell_gtk::{GtkRunner, GtkRunnerStores};
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+use gtk4::prelude::*;
+
 use crate::cli::{Cli, RdpEgfxExperiment};
 
 struct UnavailableAudioFactory;
@@ -148,6 +161,22 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> RunnerOutcome {
+    #[cfg(all(
+        target_os = "linux",
+        feature = "gtk-shell",
+        any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        // 离线纹理 fixture 仍使用既有 winit 测试入口；正式 Linux 构建走
+        // GTK4 HeaderBar/GLArea 壳。这样不会把测试模式误当成产品窗口验证。
+        if cli.test_texture_options().is_none() {
+            return run_gtk(cli);
+        }
+    }
+    run_winit(cli)
+}
+
+fn run_winit(cli: Cli) -> RunnerOutcome {
     let _single_instance =
         match LinuxSingleInstanceGuard::acquire_for_product("freeremotedesk-linux-product") {
             Ok(guard) => guard,
@@ -236,6 +265,108 @@ fn run(cli: Cli) -> RunnerOutcome {
     application.set_window_configuration(configuration);
     let run_result = event_loop.run_app(&mut application);
     finish_event_loop(run_result, application.runner_result())
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_gtk(cli: Cli) -> RunnerOutcome {
+    let _single_instance =
+        match LinuxSingleInstanceGuard::acquire_for_product("freeremotedesk-linux-product") {
+            Ok(guard) => guard,
+            Err(LinuxSingleInstanceError::AlreadyRunning) => {
+                return RunnerOutcome::from_failure(RunnerFailure::SingleInstanceAlreadyRunning)
+            }
+            Err(LinuxSingleInstanceError::Unavailable) => {
+                return RunnerOutcome::from_failure(RunnerFailure::SingleInstanceUnavailable)
+            }
+        };
+    let rdp_factory = match rdp_factory(cli.rdp_egfx_experiment) {
+        Ok(factory) => factory,
+        Err(code) => return RunnerOutcome::ExperimentUnavailable(code),
+    };
+    if gtk4::init().is_err() {
+        return RunnerOutcome::from_failure(RunnerFailure::EventLoopCreate);
+    }
+    let apple_factory = Arc::new(AppleProtocolFactory) as Arc<dyn ProtocolFactory>;
+    let apple_high_performance_factory =
+        Arc::new(AppleHighPerformanceProtocolFactory) as Arc<dyn ProtocolFactory>;
+    let factories = vec![apple_high_performance_factory, apple_factory, rdp_factory];
+    let catalog = ProtocolCatalog::new(factories.iter().map(|factory| factory.descriptor().id));
+    let provider = EnvironmentCredentialProvider;
+    let launch_options = match cli.launch_options() {
+        Ok(options) => options,
+        Err(_) => return RunnerOutcome::from_failure(RunnerFailure::CommandLineOptions),
+    };
+    let server_identities = match LinuxServerIdentityStore::current_user_default() {
+        Ok(store) => Arc::new(store) as Arc<dyn ServerIdentityStore>,
+        Err(_) => return RunnerOutcome::from_failure(RunnerFailure::IdentityStore),
+    };
+    let profiles = match LinuxConnectionProfileStore::current_user_default() {
+        Ok(store) => Arc::new(store) as Arc<dyn ConnectionProfileStore>,
+        Err(_) => return RunnerOutcome::from_failure(RunnerFailure::IdentityStore),
+    };
+    let credentials = Arc::new(LinuxCredentialStore::new());
+    if let Err(failure) = purge_pending_credentials(credentials.as_ref()) {
+        return RunnerOutcome::from_failure(failure);
+    }
+    let credentials = credentials as Arc<dyn SecureCredentialStore>;
+    let launch_stores = frd_app::AppPlatformStores {
+        server_identities: server_identities.as_ref(),
+        profiles: profiles.as_ref(),
+        credentials: credentials.as_ref(),
+    };
+    let mut launch = AppLaunch::new_with_stores(launch_options, &provider, &catalog, launch_stores);
+    let capabilities = PlatformCapabilities {
+        dynamic_resolution: true,
+        clipboard_read: false,
+        clipboard_write: false,
+        remote_audio: false,
+        text_input: true,
+    };
+    launch
+        .controller_mut()
+        .set_platform_capabilities(capabilities);
+    launch.controller_mut().set_product_policy(ProductPolicy {
+        dynamic_resolution: true,
+        clipboard_read: false,
+        clipboard_write: false,
+        remote_audio: false,
+        text_input: true,
+    });
+    let stores = GtkRunnerStores::new(server_identities, profiles, credentials);
+    let application = gtk4::Application::builder()
+        // 与 Linux desktop entry 的 StartupWMClass 保持同一产品身份；GTK
+        // 会把它映射为 Wayland app-id 及 X11 WM_CLASS 的 class 部分。
+        .application_id("com.sunanxin18.freeremotedesk")
+        .build();
+    let runner = std::rc::Rc::new(GtkRunner::new_with_application(
+        &application,
+        launch,
+        factories,
+        stores,
+        Arc::new(UnavailableAudioFactory),
+    ));
+    let window = runner.window();
+    let quit_application = application.clone();
+    window.connect_close_request(move |_| {
+        // GtkRunner 的 close handler 已先注册：清理未完成时它返回 Stop，
+        // 只有允许关闭的第二次 close 才会到达这里。
+        quit_application.quit();
+        gtk4::glib::Propagation::Proceed
+    });
+    let present_runner = runner.clone();
+    application.connect_activate(move |_| present_runner.present());
+    let application_exit = application.run();
+    if application_exit != gtk4::glib::ExitCode::SUCCESS {
+        return RunnerOutcome::from_failure(RunnerFailure::EventLoopRun);
+    }
+    if runner.runner_result().is_err() {
+        return RunnerOutcome::from_failure(RunnerFailure::EventLoopRun);
+    }
+    RunnerOutcome::Success
 }
 
 fn rdp_factory(

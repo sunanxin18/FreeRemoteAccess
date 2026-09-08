@@ -25,6 +25,13 @@ SYSTEM_LIBRARIES = {
     "libXrandr.so.2", "libXrender.so.1", "libXfixes.so.3", "libxkbcommon.so.0",
     "libxkbcommon-x11.so.0", "libwayland-client.so.0", "libwayland-cursor.so.0",
     "libwayland-egl.so.1", "libEGL.so.1", "libGL.so.1", "libvulkan.so.1",
+    # GTK4/GLArea 产品壳的显式运行时依赖；仅允许发行版提供这些固定 SONAME。
+    "libgtk-4.so.1", "libgdk-4.so.1", "libgdk_pixbuf-2.0.so.0",
+    "libgio-2.0.so.0", "libgobject-2.0.so.0", "libglib-2.0.so.0",
+    "libpango-1.0.so.0", "libpangocairo-1.0.so.0", "libpangoft2-1.0.so.0",
+    "libcairo.so.2", "libcairo-gobject.so.2", "libgraphene-1.0.so.0",
+    "libepoxy.so.0", "libharfbuzz.so.0", "libfribidi.so.0", "libthai.so.0",
+    "libdatrie.so.1", "libXdamage.so.1", "libXcomposite.so.1", "libXext.so.6",
     "ld-linux.so.2", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1",
 }
 

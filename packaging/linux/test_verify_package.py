@@ -66,6 +66,24 @@ class PackageValidation(unittest.TestCase):
     def test_protocol_system_zlib_dependency_is_accepted(self):
         self.verify("(NEEDED) [libc.so.6]\n(NEEDED) [libz.so.1]")
 
+    def test_gtk_runtime_dependencies_are_explicitly_accepted(self):
+        dependencies = "\n".join(
+            f"(NEEDED) [{name}]"
+            for name in (
+                "libgtk-4.so.1",
+                "libgdk-4.so.1",
+                "libgio-2.0.so.0",
+                "libgobject-2.0.so.0",
+                "libglib-2.0.so.0",
+                "libpango-1.0.so.0",
+                "libpangocairo-1.0.so.0",
+                "libcairo.so.2",
+                "libgraphene-1.0.so.0",
+                "libepoxy.so.0",
+            )
+        )
+        self.verify(f"(NEEDED) [libc.so.6]\n{dependencies}")
+
     def test_missing_binary_rejected(self):
         (self.root / "freeremotedesk-linux").unlink()
         with self.assertRaisesRegex(ValueError, "文件集合"):

@@ -358,6 +358,43 @@ impl GtkRunner {
         stores: GtkRunnerStores,
         audio: Arc<dyn AudioOutputFactory>,
     ) -> Self {
+        let window = gtk4::Window::builder()
+            .title("FreeRemoteDesk")
+            .default_width(720)
+            .default_height(680)
+            .build();
+        Self::new_with_window(window, launch, factories, stores, audio)
+    }
+
+    /// 将 runner 绑定到正式 GTK application 的窗口。
+    ///
+    /// 测试仍可使用 [`GtkRunner::new`] 创建非 application window；产品入口
+    /// 应使用这个构造函数，以便 GTK 将 Wayland app-id 和 X11 WM_CLASS 关联到
+    /// 明确的 application id，并采用标准 application 生命周期。
+    pub fn new_with_application(
+        application: &gtk4::Application,
+        launch: AppLaunch,
+        factories: Vec<Arc<dyn ProtocolFactory>>,
+        stores: GtkRunnerStores,
+        audio: Arc<dyn AudioOutputFactory>,
+    ) -> Self {
+        let window = gtk4::ApplicationWindow::builder()
+            .application(application)
+            .title("FreeRemoteDesk")
+            .default_width(720)
+            .default_height(680)
+            .build()
+            .upcast::<gtk4::Window>();
+        Self::new_with_window(window, launch, factories, stores, audio)
+    }
+
+    fn new_with_window(
+        window: gtk4::Window,
+        launch: AppLaunch,
+        factories: Vec<Arc<dyn ProtocolFactory>>,
+        stores: GtkRunnerStores,
+        audio: Arc<dyn AudioOutputFactory>,
+    ) -> Self {
         if let AppPage::ConnectionForm(form) = launch.controller().page() {
             stores.profile_snapshot.replace(form.profiles.clone());
         }
@@ -368,11 +405,6 @@ impl GtkRunner {
         });
         let catalog = ProtocolCatalog::new(factories.iter().map(|f| f.descriptor().id));
         let sessions = SessionHost::new(factories, wake.clone(), audio);
-        let window = gtk4::Window::builder()
-            .title("FreeRemoteDesk")
-            .default_width(720)
-            .default_height(680)
-            .build();
         let header = gtk4::HeaderBar::new();
         let center = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         let status = label("未连接");
@@ -504,6 +536,22 @@ impl GtkRunner {
             observer: state.frames.submission_diagnostics(),
             last_terminal: state.last_terminal,
         })
+    }
+
+    /// 返回产品入口可消费的终止状态。正常关闭、取消和断开都不是失败；
+    /// 只有 runner 保存的失败消息或终止诊断会产生错误。
+    pub fn runner_result(&self) -> Result<(), RunnerTerminalCause> {
+        let state = self
+            .state
+            .try_borrow()
+            .map_err(|_| RunnerTerminalCause::Lifecycle)?;
+        if state.failure.is_some() {
+            Err(state
+                .last_terminal
+                .map_or(RunnerTerminalCause::Lifecycle, |terminal| terminal.cause))
+        } else {
+            Ok(())
+        }
     }
     pub fn present(&self) {
         self.window().present();

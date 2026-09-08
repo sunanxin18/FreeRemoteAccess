@@ -9,6 +9,13 @@ on:
       - "crates/frd-render-state/**"
       - "crates/frd-frame/**"
       - "crates/frd-core/**"
+      - "apps/freeremotedesk-linux/**"
+      - "tools/verify-linux-product-x11.sh"
+      - "crates/frd-app/**"
+      - "crates/frd-platform-linux/**"
+      - "crates/frd-protocol-api/**"
+      - "crates/frd-protocol-apple/**"
+      - "crates/frd-protocol-rdp/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/linux-gtk-adapter.yml"
@@ -19,6 +26,13 @@ on:
       - "crates/frd-render-state/**"
       - "crates/frd-frame/**"
       - "crates/frd-core/**"
+      - "apps/freeremotedesk-linux/**"
+      - "tools/verify-linux-product-x11.sh"
+      - "crates/frd-app/**"
+      - "crates/frd-platform-linux/**"
+      - "crates/frd-protocol-api/**"
+      - "crates/frd-protocol-apple/**"
+      - "crates/frd-protocol-rdp/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/linux-gtk-adapter.yml"
@@ -61,7 +75,7 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y build-essential pkg-config \
-            dbus-x11 xvfb xauth weston "libgtk-4-dev$suffix" "libepoxy-dev$suffix" \
+            dbus-x11 xvfb xauth xdotool x11-utils weston "libgtk-4-dev$suffix" "libepoxy-dev$suffix" \
             "libgl1-mesa-dri$suffix" "libegl-mesa0$suffix" "libglx-mesa0$suffix"
           if [[ "${{ matrix.arch }}" == i686 ]]; then
             sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386
@@ -80,6 +94,16 @@ jobs:
             --target "${{ matrix.target }}" --no-run
           cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --lib
+          # 产品组合根默认开启 GTK shell；这里至少编译完整 Linux app，
+          # 防止 adapter 绿灯而正式入口仍停留在旧 winit 路径。
+          cargo test --locked -p freeremotedesk-linux \
+            --target "${{ matrix.target }}" --no-run
+      - name: Exercise formal Linux product entry on isolated X11
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/verify-linux-product-x11.sh \
+            "$PWD/target/${{ matrix.target }}/debug/freeremotedesk-linux"
       - name: Exercise real GTK adapter on X11 and Wayland
         shell: bash
         run: |

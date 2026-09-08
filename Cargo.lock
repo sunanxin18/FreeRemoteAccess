@@ -2266,8 +2266,10 @@ dependencies = [
  "frd-protocol-apple",
  "frd-protocol-rdp",
  "frd-shell-desktop",
+ "frd-shell-gtk",
  "frd-ui-model",
  "frd-video-ffmpeg",
+ "gtk4",
  "winit",
 ]
 

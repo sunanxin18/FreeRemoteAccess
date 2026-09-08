@@ -11,8 +11,15 @@ desktop entry、hicolor 图标和许可证。支持 i686、x86_64、AArch64 的�
 
 安装目录和文件必须属于同一个安装所有者，不得允许组或其他用户写入，也不得包含
 符号链接。密码只使用客户端宿主的 Secret Service；不可用时不会退回普通配置文件。
-系统运行依赖包括 glibc、libgcc、libstdc++ 和 zlib（libz.so.1）；完整依赖由包验证器检查。
-窗口运行需要 X11 或 Wayland 会话与 Vulkan/GLES 驱动。字体只在当前窗口树的私有
+系统运行依赖包括 glibc、libgcc、libstdc++、zlib（libz.so.1）和 GTK 4.14 运行库；
+GTK 壳的 `libgtk-4.so.1`、`libgdk-4.so.1`、Pango/Cairo、Graphene、Epoxy 等固定
+SONAME 由包验证器逐项检查。窗口运行需要 X11 或 Wayland 会话与 Vulkan/GLES 驱动。
+正式入口使用 GTK ApplicationWindow（app-id `com.sunanxin18.freeremotedesk`）；窗口
+装饰由宿主 compositor 管理，产品控件保持在原生 HeaderBar，远程内容只占据标题栏下方
+的 GLArea。隔离 X11 产品 smoke 可运行：
+`tools/verify-linux-product-x11.sh /绝对路径/freeremotedesk-linux`。
+该 smoke 只验证窗口生命周期、WM_CLASS、焦点和 XTEST 事件，不连接远程服务器。
+字体只在当前窗口树的私有
 Pango 配置中注册，不写入系统或用户字体目录。Linux 音频尚未接入。
 
 运行 `./freeremotedesk-linux --verify-codec-bundle` 验证实际解码器加载；该命令不连接

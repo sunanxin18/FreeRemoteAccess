@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = ["gtk-shell"]
+# Linux 产品默认使用 GTK4 HeaderBar/GLArea 原生壳；`--no-default-features`
+# 只保留给不带 GTK 系统依赖的离线 winit fixture 和交叉构建诊断。
+gtk-shell = ["dep:gtk4", "dep:frd-shell-gtk", "frd-shell-gtk/gtk-shell"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 frd-app = { path = "../../crates/frd-app" }
@@ -18,3 +24,7 @@ frd-shell-desktop = { path = "../../crates/frd-shell-desktop" }
 frd-ui-model = { path = "../../crates/frd-ui-model" }
 frd-video-ffmpeg = { path = "../../crates/frd-video-ffmpeg" }
 winit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "=0.9.7", features = ["v4_14"], optional = true }
+frd-shell-gtk = { path = "../../crates/frd-shell-gtk", optional = true }

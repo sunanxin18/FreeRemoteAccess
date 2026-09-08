@@ -66,6 +66,8 @@ jobs:
             gnome-keyring \
             libglib2.0-bin \
             libasound2-dev \
+            libepoxy-dev \
+            libgtk-4-dev \
             libwayland-cursor0 \
             libwayland-dev \
             libxkbcommon-dev \
