@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FreeRemoteDesk
+Comment=远程桌面客户端
+Exec=freeremotedesk-linux
+TryExec=freeremotedesk-linux
+Icon=freeremotedesk
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupNotify=true

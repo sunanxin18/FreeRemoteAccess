@@ -11,7 +11,7 @@
   和 decoder 通过才允许显式 ValidationOnly 实验。
 - [ ] 接入 Linux Vulkan/GLES 条件后端；在 X11/Wayland 宿主完成真实 GPU/输入与
   窗口装饰验收，保留 Windows DX12 与 macOS ARM64 Metal 行为。
-- [ ] 实现完整 Linux stage/verifier（executable、desktop entry、图标、codec、许可证、
+- [x] 实现完整 Linux stage/verifier（executable、desktop entry、图标、codec、许可证、
   真实 ELF 架构及 trusted-loader 布局）；不存在 native artifact 时失败，不跳过。
 - [ ] CI 构建 Linux i686/x86_64/AArch64 客户端包并执行对应目标 fixture。
 - [ ] 更新 README 客户端/服务器双轴状态，区分编译、包、真实 GUI/Secret Service
@@ -26,3 +26,5 @@ Secret Service 原生脚本已加入 CI，未执行部分和完整客户端门�
 [基础服务验证](../../validation/linux-client-foundation-20260908.md)。
 
 Linux 应用组合根已接入 workspace；macOS 宿主的 all-targets check 和 20 项单元/2 项边界测试通过。Linux 原生应用测试已接入 CI，尚未执行，窗口/输入与完整包仍未验收。
+
+Linux 完整包脚本与三架构 CI 构建/目标加载步骤已实现；9 项合成包拒绝测试和 shell/YAML 检查通过。此时尚未在 Linux 运行新包流程，不勾选三目标 CI 通过门禁。见 packaging/linux/README.md；原生窗口和真实 GPU/输入仍未完成。

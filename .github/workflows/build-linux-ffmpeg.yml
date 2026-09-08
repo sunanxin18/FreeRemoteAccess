@@ -1,4 +1,4 @@
-name: Linux FFmpeg bundles
+name: Linux client and FFmpeg packages
 
 on:
   workflow_dispatch:
@@ -7,9 +7,13 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
-      - "crates/frd-protocol-rdp/**"
-      - "crates/frd-video-ffmpeg/**"
-      - "crates/frd-video-ffmpeg-plugin/**"
+      - "apps/freeremotedesk-linux/**"
+      - "crates/**"
+      - "packaging/linux/**"
+      - "assets/**"
+      - "packaging/windows/licenses/**"
+      - "tools/stage-linux-package.sh"
+      - "tools/verify-linux-package.sh"
       - "third_party/ffmpeg/8.1.2/**"
       - "tools/build-ffmpeg-linux.sh"
       - "tools/verify-linux-ffmpeg-bundle.sh"
@@ -22,9 +26,13 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
-      - "crates/frd-protocol-rdp/**"
-      - "crates/frd-video-ffmpeg/**"
-      - "crates/frd-video-ffmpeg-plugin/**"
+      - "apps/freeremotedesk-linux/**"
+      - "crates/**"
+      - "packaging/linux/**"
+      - "assets/**"
+      - "packaging/windows/licenses/**"
+      - "tools/stage-linux-package.sh"
+      - "tools/verify-linux-package.sh"
       - "third_party/ffmpeg/8.1.2/**"
       - "tools/build-ffmpeg-linux.sh"
       - "tools/verify-linux-ffmpeg-bundle.sh"
@@ -39,7 +47,7 @@ concurrency:
 
 jobs:
   bundle:
-    name: Linux FFmpeg ${{ matrix.arch }} bundle
+    name: Linux client and FFmpeg ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -72,15 +80,19 @@ jobs:
         shell: bash
         run: |
           rustup target add "${{ matrix.cargo_target }}"
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            sudo dpkg --add-architecture i386
+          fi
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             build-essential \
             nasm \
             xz-utils \
-            pkg-config
+            pkg-config libwayland-dev libxkbcommon-dev libasound2-dev desktop-file-utils
           if [[ "${{ matrix.arch }}" == i686 ]]; then
             sudo apt-get install --no-install-recommends -y \
-              gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386 lib32gcc-s1
+              gcc-i686-linux-gnu g++-i686-linux-gnu libc6-dev-i386-cross libc6-i386 lib32gcc-s1 libstdc++6:i386 \
+              libwayland-dev:i386 libxkbcommon-dev:i386 libasound2-dev:i386
           fi
 
       - name: Verify pinned Rust toolchain
@@ -95,6 +107,7 @@ jobs:
           set -euo pipefail
           if [[ "${{ matrix.arch }}" == i686 ]]; then
             export CC_i686_unknown_linux_gnu=i686-linux-gnu-gcc
+            export CXX_i686_unknown_linux_gnu=i686-linux-gnu-g++
             export CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc
           fi
           printf 'ClearCodec runtime target=%s host=%s\n' "${{ matrix.cargo_target }}" "$(uname -m)"
@@ -127,6 +140,39 @@ jobs:
         run: |
           bash tools/verify-linux-ffmpeg-bundle.sh \
             "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
+
+      - name: Build and verify complete Linux client package
+        shell: bash
+        env:
+          FRD_LINUX_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            export CC_i686_unknown_linux_gnu=i686-linux-gnu-gcc
+            export CXX_i686_unknown_linux_gnu=i686-linux-gnu-g++
+            export CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          fi
+          python3 -B -m unittest discover -s packaging/linux -p 'test_*.py'
+          cargo test --locked --target "${{ matrix.cargo_target }}" -p freeremotedesk-linux
+          bash tools/stage-linux-package.sh release
+          FRD_LINUX_PACKAGE_RUNTIME_SMOKE=1 bash tools/verify-linux-package.sh \
+            "target/linux/release/${{ matrix.bundle_dir }}/FreeRemoteDesk" "${{ matrix.bundle_dir }}"
+
+      - name: Archive complete Linux client preserving executable permissions
+        shell: bash
+        run: |
+          mkdir -p target/release-assets
+          tar -C "target/linux/release/${{ matrix.bundle_dir }}" -czf \
+            "target/release-assets/FreeRemoteDesk-${{ matrix.bundle_dir }}.tar.gz" FreeRemoteDesk
+
+      - name: Upload complete Linux client package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-client-${{ matrix.bundle_dir }}
+          path: target/release-assets/FreeRemoteDesk-${{ matrix.bundle_dir }}.tar.gz
+          if-no-files-found: error
 
       - name: Stage corresponding FFmpeg source evidence
         shell: bash

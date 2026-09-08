@@ -87,6 +87,8 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
         "frd-compositor-wgpu",
         "frd-platform-api",
         "frd-platform-windows",
+        "frd-platform-macos",
+        "frd-platform-linux",
         "frd-shell-desktop",
     ] {
         let direct = dependencies.get(neutral).expect("neutral package exists");
@@ -126,6 +128,7 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
     assert_eq!(
         concrete_imports,
         vec![
+            "apps/freeremotedesk-linux/src/main.rs".to_owned(),
             "apps/freeremotedesk-macos/src/main.rs".to_owned(),
             "apps/freeremotedesk-windows/src/main.rs".to_owned(),
         ],
