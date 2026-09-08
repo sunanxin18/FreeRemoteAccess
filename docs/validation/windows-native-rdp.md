@@ -36,7 +36,7 @@ AVC420 provider；这条路径会广告 EGFX，但仍必须等待服务器 `Capa
 | RDP 协议测试 | `cargo test --locked -p frd-protocol-rdp --quiet`：181 passed、0 failed |
 | workspace 测试 | `cargo test --locked --workspace --quiet`：508 passed、9 ignored、0 failed |
 | pinned EGFX 与目标检查 | pinned `ironrdp-egfx` 19 项、8 个 Windows/Linux/macOS core/video/plugin target check 通过 |
-| native FFmpeg fixture | macOS arm64 bundle 的 HEVC/AVC420/AVC444 fixture 5/5 通过，package verifier 通过 |
+| native FFmpeg fixture | macOS arm64 与 x86_64 bundle 的 HEVC/AVC420/AVC444 fixture 各 5/5 通过（x86_64 在 Rosetta 下执行），两个架构的 package verifier 均通过 |
 
 该阶梯没有读取凭据，也没有发起新的 RDP live 连接；真实 EGFX `CapabilitiesConfirm`、
 AVC420/AVC444 首帧、持续刷新、恢复和 HEVC wire profile 门禁继续保持关闭。上述结果
