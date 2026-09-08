@@ -80,6 +80,16 @@
       "path": "licenses/FFmpeg-NOTICE.txt",
       "role": "notice",
       "sha256": null
+    },
+    {
+      "path": "licenses/FreeRDP-APACHE-2.0.txt",
+      "role": "license",
+      "sha256": null
+    },
+    {
+      "path": "licenses/FreeRDP-NOTICE.txt",
+      "role": "notice",
+      "sha256": null
     }
   ]
 }

@@ -1,5 +1,7 @@
 # FreeRemoteDesk
 
+> 2026-09-08 Windows/macOS 打包规则已加入 Progressive 的 Apache-2.0 与 FreeRDP 归属资源，固定文件集合及hash校验同步更新。macOS合成签名包正例/9项拒绝场景及现有debug包临时副本验证通过；新Windows原生Pester与正式重打包仍待CI。
+
 > 2026-09-08 Linux i686/x86_64/ARM64 ClearCodec/NSCodec 各38项测试及2项release基准通过（run `34185964017`）。这是目标进程验证；Progressive与GUI互操作仍须独立验收。见 [基准记录](docs/validation/clearcodec-benchmark-20260908.md)。
 
 > 2026-09-08 最新真实探针：macOS ARM64 已通过 ClearCodec 到 runtime 的完整首帧（1,087 ms，3 次位图解码、2 帧接收），随后仍遇 Progressive `0x0009` 停用。AVC 实际解码为零，持续刷新和 GUI 呈现未验收。此记录更新下方更早的零帧结果；见 [详细证据](docs/validation/rdp-egfx-h264-20260907.md)。

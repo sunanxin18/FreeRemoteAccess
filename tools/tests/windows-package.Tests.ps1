@@ -14,8 +14,10 @@ $expectedHaveX86Asm = "have_x86asm=1"
 $expectedLicenseHashes = @{
     "FFmpeg-LGPL-2.1-or-later.txt" = "246041B6ECF9BC32D718A62C57877C78B5EB397B6467E74ED7AE2626AB189C30"
     "FFmpeg-NOTICE.txt" = "481FC2D37D80C9C2567F940CE3B5A79C28C301920E947D4880BB85DD70B86AD6"
+    "FreeRDP-APACHE-2.0.txt" = "CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30"
+    "FreeRDP-NOTICE.txt" = "0DAE42BC255D72BD75CEBD02D50B74746F218FD37281930E85DAD96133E2B141"
 }
-$expectedVerifierHash = "B81FA6F9D55B42D72816815D145131B40ABF15D2DEA20E636431A175A0FD6166"
+$expectedVerifierHash = "A919C9D9276BA2247FDAF8800F86570A266832C403F267CE921074B4B44EE1C3"
 
 function Copy-Utf8ScriptForWindowsPowerShell([string]$Source, [string]$Destination) {
     $bom = [Text.Encoding]::UTF8.GetPreamble()
@@ -459,6 +461,59 @@ Describe "Windows package verification security boundaries" {
         }
         finally {
             Copy-Item -LiteralPath $backup -Destination $notice -Force
+        }
+    }
+
+    It "requires both Progressive compliance files in the staged manifest" {
+        $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $packageRoot "ffmpeg-manifest.json") | ConvertFrom-Json
+        foreach ($name in @("FreeRDP-APACHE-2.0.txt", "FreeRDP-NOTICE.txt")) {
+            $entries = @($manifest.files | Where-Object { $_.path -ceq "licenses/$name" })
+            $entries.Count | Should Be 1
+            $entries[0].sha256 | Should Be $expectedLicenseHashes[$name]
+            $entries[0].role | Should Be $(if ($name -eq "FreeRDP-NOTICE.txt") { "notice" } else { "license" })
+        }
+    }
+
+    It "rejects missing or modified Progressive compliance files" {
+        foreach ($name in @("FreeRDP-APACHE-2.0.txt", "FreeRDP-NOTICE.txt")) {
+            $path = Join-Path $packageRoot "licenses/$name"
+            $bytes = [IO.File]::ReadAllBytes($path)
+            try {
+                Remove-Item -LiteralPath $path
+                $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+                $LASTEXITCODE | Should Not Be 0
+                ($output -join "`n") | Should Match "manifest 文件不存在"
+                [IO.File]::WriteAllBytes($path, $bytes)
+                Add-Content -LiteralPath $path -Value "tampered" -Encoding UTF8
+                $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+                $LASTEXITCODE | Should Not Be 0
+                ($output -join "`n") | Should Match "实际 staged bytes 不匹配"
+            }
+            finally { [IO.File]::WriteAllBytes($path, $bytes) }
+        }
+    }
+
+    It "rejects Progressive notice substitution even with recomputed manifest hashes" {
+        $path = Join-Path $packageRoot "licenses/FreeRDP-NOTICE.txt"
+        $manifestPath = Join-Path $packageRoot "ffmpeg-manifest.json"
+        $original = [IO.File]::ReadAllBytes($path)
+        $originalManifest = [IO.File]::ReadAllBytes($manifestPath)
+        try {
+            Add-Content -LiteralPath $path -Value "substitution" -Encoding UTF8
+            $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
+            ($manifest.files | Where-Object { $_.path -ceq "licenses/FreeRDP-NOTICE.txt" }).sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            $records = @($manifest.files | Sort-Object { [string]$_.path } | ForEach-Object { "$([string]$_.path)`0$([string]$_.sha256)`n" }) -join ""
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $manifest.payloadSha256 = (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($records)) | ForEach-Object { $_.ToString("X2") }) -join "") }
+            finally { $sha.Dispose() }
+            $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+            $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+            $LASTEXITCODE | Should Not Be 0
+            ($output -join "`n") | Should Match "staged 许可/notice 与固定发布版本不同"
+        }
+        finally {
+            [IO.File]::WriteAllBytes($path, $original)
+            [IO.File]::WriteAllBytes($manifestPath, $originalManifest)
         }
     }
 

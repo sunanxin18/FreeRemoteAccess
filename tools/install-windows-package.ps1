@@ -21,7 +21,7 @@ if (-not $Elevated) {
     $verifier = Join-Path $repoRoot "tools\verify-windows-package.ps1"
     $bootstrapBuilder = Join-Path $repoRoot "tools\new-windows-installer-bootstrap.ps1"
 }
-$expectedVerifierSha256 = "B81FA6F9D55B42D72816815D145131B40ABF15D2DEA20E636431A175A0FD6166"
+$expectedVerifierSha256 = "A919C9D9276BA2247FDAF8800F86570A266832C403F267CE921074B4B44EE1C3"
 $expectedBootstrapBuilderSha256 = "BAE11BAE8B7AEE58031D5AE1B0DC3ADC4DFF3C772E96595FF7A054FC2CA698C7"
 $package = [IO.Path]::GetFullPath($PackageRoot)
 $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)

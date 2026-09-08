@@ -1,0 +1,36 @@
+FreeRemoteDesk - RemoteFX Progressive attribution notice
+
+FreeRemoteDesk includes Rust SSE2/NEON numerical kernels derived from or
+implemented with reference to the following FreeRDP source files, distributed
+under the Apache License, Version 2.0. The accompanying
+FreeRDP-APACHE-2.0.txt contains that license.
+
+Upstream: https://github.com/FreeRDP/FreeRDP
+Revision: 54a873e2710710841c6ec2b756df64285ec6e29a
+
+libfreerdp/codec/progressive.c
+Copyright 2014 Marc-Andre Moreau <marcandre.moreau@gmail.com>
+Copyright 2019 Armin Novak <armin.novak@thincast.com>
+Copyright 2019 Thincast Technologies GmbH
+SHA-256: 102858436412f55a3042dfaefc1ce4d2135cc3fa8be0a58e51ed412f51201605
+
+libfreerdp/codec/rfx_dwt.c
+Copyright 2011 Vic Lee
+SHA-256: 6a72283bede3569f58d02e72b063e712eb0270d5cfecab4952f392bed17fa80b
+
+libfreerdp/primitives/prim_colors.c
+Copyright 2011 Stephen Erisman
+Copyright 2011 Norbert Federa <norbert.federa@thincast.com>
+Copyright 2011 Martin Fleisz <martin.fleisz@thincast.com>
+Copyright 2012 Hewlett-Packard Development Company, L.P.
+SHA-256: f9156ebc5a0598b637b625a937b0e84f8d10ffc8ad80839a344354d669add221
+
+Modifications by FreeRemoteDesk (2026): the numerical operations were adapted
+into Rust SSE2 and AArch64/NEON kernels, separated from strict bounded wire,
+entropy and transactional state handling, and validated with synthetic fixtures.
+FreeRDP itself is not linked as a runtime library. This notice does not imply
+endorsement by the upstream authors.
+
+These license resources are shared by Windows and macOS product packaging;
+their repository location under packaging/windows/licenses is historical and
+does not restrict their application to Windows.

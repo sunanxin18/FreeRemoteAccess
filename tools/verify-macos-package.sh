@@ -15,8 +15,31 @@ plutil -lint "$plist"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$plist")" == 12.0 ]]
 test -x "$app/Contents/MacOS/freeremotedesk-macos"
 test -s "$app/Contents/Resources/FreeRemoteDesk.icns"
-codesign --verify --strict "$app"
 
+# 归属资源采用固定文件集合和固定hash；不能通过同时改manifest与文件绕过。
+license_dir="$app/Contents/Resources/licenses"
+[[ -d "$license_dir" && ! -L "$license_dir" ]] || { echo 'Progressive 许可目录缺失或不是普通目录' >&2; exit 1; }
+expected_license_files=(FreeRDP-APACHE-2.0.txt FreeRDP-NOTICE.txt FreeRDP-SHA256SUMS.txt)
+actual_license_files=()
+while IFS= read -r -d '' resource; do
+    [[ -f "$resource" && ! -L "$resource" ]] || { echo "Progressive 许可必须是普通文件: $resource" >&2; exit 1; }
+    actual_license_files+=("$(basename "$resource")")
+done < <(find "$license_dir" -mindepth 1 -maxdepth 1 -print0)
+[[ "$(printf '%s\n' "${actual_license_files[@]}" | LC_ALL=C sort)" == "$(printf '%s\n' "${expected_license_files[@]}" | LC_ALL=C sort)" ]] || {
+    echo 'Progressive 许可文件集合不匹配' >&2; exit 1
+}
+for name in "${expected_license_files[@]}"; do
+    case "$name" in
+        FreeRDP-APACHE-2.0.txt) expected_hash=cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 ;;
+        FreeRDP-NOTICE.txt) expected_hash=0dae42bc255d72bd75cebd02d50b74746f218fd37281930e85dad96133e2b141 ;;
+        FreeRDP-SHA256SUMS.txt) expected_hash=94ceb958c66970b2d598df7d2ba8ea0024955cc1e44b162702550bb7ed4b279a ;;
+    esac
+    actual_hash="$(shasum -a 256 "$license_dir/$name" | awk '{print $1}')"
+    [[ "$actual_hash" == "$expected_hash" ]] || { echo "Progressive 许可/manifest hash不匹配: $name" >&2; exit 1; }
+done
+
+
+codesign --verify --strict "$app"
 
 assert_macho_arch() {
     local object="$1"

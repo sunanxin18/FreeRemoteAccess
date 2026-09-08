@@ -19,6 +19,8 @@ $ExpectedCorrespondingSourceAsset = "FreeRemoteDesk-ffmpeg-8.1.2-corresponding-s
 $ExpectedLicenseHashes = @{
     "FFmpeg-LGPL-2.1-or-later.txt" = "246041B6ECF9BC32D718A62C57877C78B5EB397B6467E74ED7AE2626AB189C30"
     "FFmpeg-NOTICE.txt" = "481FC2D37D80C9C2567F940CE3B5A79C28C301920E947D4880BB85DD70B86AD6"
+    "FreeRDP-APACHE-2.0.txt" = "CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30"
+    "FreeRDP-NOTICE.txt" = "0DAE42BC255D72BD75CEBD02D50B74746F218FD37281930E85DAD96133E2B141"
 }
 
 function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
@@ -353,7 +355,9 @@ $ExpectedFiles = @(
     "$ApprovedCodecDirectory/avutil-60.dll",
     "$ApprovedCodecDirectory/freeremotedesk_ffmpeg.dll",
     "licenses/FFmpeg-LGPL-2.1-or-later.txt",
-    "licenses/FFmpeg-NOTICE.txt"
+    "licenses/FFmpeg-NOTICE.txt",
+    "licenses/FreeRDP-APACHE-2.0.txt",
+    "licenses/FreeRDP-NOTICE.txt"
 )
 $ExpectedDirectories = @(
     "codecs",
@@ -368,6 +372,8 @@ $ExpectedRoles = @{
     "$ApprovedCodecDirectory/freeremotedesk_ffmpeg.dll" = "freeremotedesk-ffmpeg-plugin"
     "licenses/FFmpeg-LGPL-2.1-or-later.txt" = "license"
     "licenses/FFmpeg-NOTICE.txt" = "notice"
+    "licenses/FreeRDP-APACHE-2.0.txt" = "license"
+    "licenses/FreeRDP-NOTICE.txt" = "notice"
 }
 Assert-ManifestContract $manifest "staged manifest"
 $payloadHash = [string](Get-RequiredProperty $manifest "payloadSha256" "staged manifest")
@@ -408,7 +414,7 @@ foreach ($entry in $manifestFiles) {
 }
 Assert-True ((Get-PayloadSha256 $manifestFiles) -ceq $payloadHash) "staged manifest payload SHA-256 不匹配"
 
-foreach ($licenseName in @("FFmpeg-LGPL-2.1-or-later.txt", "FFmpeg-NOTICE.txt")) {
+foreach ($licenseName in @($ExpectedLicenseHashes.Keys)) {
     $staged = Join-Path $package "licenses\$licenseName"
     Assert-True (Test-Path -LiteralPath $staged -PathType Leaf) "staged 许可/notice 不存在: $staged"
     Assert-True ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash -ceq $ExpectedLicenseHashes[$licenseName]) "staged 许可/notice 与固定发布版本不同: $licenseName"

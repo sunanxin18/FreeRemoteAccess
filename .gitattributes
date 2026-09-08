@@ -24,3 +24,7 @@ tools/verify-windows-package.ps1 text eol=lf
 *.msi binary
 *.deb binary
 *.rpm binary
+
+# Shared Windows/macOS Progressive attribution bytes are hash-pinned.
+packaging/windows/licenses/FreeRDP-APACHE-2.0.txt text eol=lf
+packaging/windows/licenses/FreeRDP-NOTICE.txt text eol=lf

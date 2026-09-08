@@ -101,6 +101,10 @@ jobs:
           FRD_FFMPEG_RUN_NATIVE_TESTS: "1"
         run: bash tools/build-ffmpeg-macos.sh
 
+      - name: Verify macOS package license rejection fixtures
+        shell: bash
+        run: bash tools/tests/macos-package-licenses.sh
+
       - name: Stage and verify macOS application
         shell: bash
         env:

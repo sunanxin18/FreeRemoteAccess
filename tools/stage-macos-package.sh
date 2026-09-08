@@ -49,6 +49,17 @@ trap 'rm -rf "$icon_work"' EXIT
 swift "$repo_root/tools/create-macos-icon.swift" "$repo_root/assets/app-icon/apple" "$icon_work/FreeRemoteDesk.iconset"
 iconutil -c icns "$icon_work/FreeRemoteDesk.iconset" -o "$app/Contents/Resources/FreeRemoteDesk.icns"
 cp "$repo_root/assets/app-icon/README.md" "$app/Contents/Resources/Icon-Provenance.md"
+# Progressive 归属资源由 Windows/macOS 共用；目录名不限定其适用平台。
+license_dest="$app/Contents/Resources/licenses"
+mkdir -p "$license_dest"
+for name in FreeRDP-APACHE-2.0.txt FreeRDP-NOTICE.txt; do
+    cp "$repo_root/packaging/windows/licenses/$name" "$license_dest/$name"
+done
+(
+    cd "$license_dest"
+    shasum -a 256 FreeRDP-APACHE-2.0.txt FreeRDP-NOTICE.txt > FreeRDP-SHA256SUMS.txt
+)
+
 # 同架构的固定版本 FFmpeg bundle 可由 build-ffmpeg-macos.sh 生成。
 codec_build_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-macos}"
 codec_bundle="$codec_build_root/bundle"

@@ -222,6 +222,8 @@ try {
     }
     Copy-Item -LiteralPath (Join-Path $licensesSource "FFmpeg-LGPL-2.1-or-later.txt") -Destination $licenseDestination
     Copy-Item -LiteralPath (Join-Path $licensesSource "FFmpeg-NOTICE.txt") -Destination $licenseDestination
+    Copy-Item -LiteralPath (Join-Path $licensesSource "FreeRDP-APACHE-2.0.txt") -Destination $licenseDestination
+    Copy-Item -LiteralPath (Join-Path $licensesSource "FreeRDP-NOTICE.txt") -Destination $licenseDestination
 
     $manifest = Get-Content -Raw -LiteralPath $templatePath | ConvertFrom-Json
     if (-not [string]::IsNullOrWhiteSpace($GitCommit)) {
@@ -250,7 +252,9 @@ try {
         [pscustomobject]@{ path = "$CodecRelativeDirectory/avutil-60.dll"; role = "ffmpeg-libavutil"; sha256 = $null },
         [pscustomobject]@{ path = "$CodecRelativeDirectory/freeremotedesk_ffmpeg.dll"; role = "freeremotedesk-ffmpeg-plugin"; sha256 = $null },
         [pscustomobject]@{ path = "licenses/FFmpeg-LGPL-2.1-or-later.txt"; role = "license"; sha256 = $null },
-        [pscustomobject]@{ path = "licenses/FFmpeg-NOTICE.txt"; role = "notice"; sha256 = $null }
+        [pscustomobject]@{ path = "licenses/FFmpeg-NOTICE.txt"; role = "notice"; sha256 = $null },
+        [pscustomobject]@{ path = "licenses/FreeRDP-APACHE-2.0.txt"; role = "license"; sha256 = $null },
+        [pscustomobject]@{ path = "licenses/FreeRDP-NOTICE.txt"; role = "notice"; sha256 = $null }
     )
     $manifest.buildProvenanceSha256 = (Get-FileHash -LiteralPath $provenancePath -Algorithm SHA256).Hash
     $correspondingSourceHash = (Get-FileHash -LiteralPath $sourceAssetPath -Algorithm SHA256).Hash
