@@ -1,0 +1,101 @@
+name: Linux native shell probe
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/**", "main"]
+    paths:
+      - "tools/frd-linux-native-shell-probe/**"
+      - ".github/workflows/linux-native-shell-probe.yml"
+  pull_request:
+    paths:
+      - "tools/frd-linux-native-shell-probe/**"
+      - ".github/workflows/linux-native-shell-probe.yml"
+permissions:
+  contents: read
+concurrency:
+  group: linux-native-shell-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-gl:
+    name: Native GTK and GL (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: i686
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install native toolkit and isolated display servers
+        shell: bash
+        run: |
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            sudo dpkg --add-architecture i386
+          fi
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config \
+            dbus-x11 xvfb xauth weston
+          suffix=""
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            suffix=:i386
+            sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu libc6-i386
+          fi
+          sudo apt-get install --no-install-recommends -y \
+            "libgtk-4-dev$suffix" "libepoxy-dev$suffix" "libgl1-mesa-dri$suffix" \
+            "libegl-mesa0$suffix" "libglx-mesa0$suffix"
+      - name: Compile target native-shell probe
+        shell: bash
+        run: |
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            export CC=i686-linux-gnu-gcc
+            export PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          fi
+          bash tools/frd-linux-native-shell-probe/build.sh
+          file target/linux-native-shell-probe/frd-linux-native-shell-probe
+      - name: Run isolated X11 and Wayland GL pipelines
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/linux-native-shell-probe/logs
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
+          # Hosted Mesa software GL validates the native pipeline, not hardware acceleration.
+          export LIBGL_ALWAYS_SOFTWARE=1
+          export GSK_RENDERER=gl
+          probe="$PWD/target/linux-native-shell-probe/frd-linux-native-shell-probe"
+          for scale in 1 2; do
+            GDK_SCALE="$scale" GDK_BACKEND=x11 dbus-run-session -- \
+              xvfb-run -a -s '-screen 0 2400x1800x24' \
+              "$probe" --expect-backend x11 --seconds 3 | \
+              tee "target/linux-native-shell-probe/logs/x11-$scale.jsonl"
+          done
+          weston --backend=headless-backend.so --renderer=pixman \
+            --socket=frd-probe --idle-time=0 --width=2400 --height=1800 \
+            --log="$XDG_RUNTIME_DIR/weston.log" &
+          weston_pid=$!
+          trap 'kill "$weston_pid" 2>/dev/null || true; wait "$weston_pid" 2>/dev/null || true; rm -rf "$XDG_RUNTIME_DIR"' EXIT
+          for attempt in {1..100}; do
+            [[ -S "$XDG_RUNTIME_DIR/frd-probe" ]] && break
+            kill -0 "$weston_pid"
+            sleep 0.1
+          done
+          test -S "$XDG_RUNTIME_DIR/frd-probe"
+          for scale in 1 2; do
+            GDK_SCALE="$scale" GDK_BACKEND=wayland WAYLAND_DISPLAY=frd-probe \
+              dbus-run-session -- "$probe" --expect-backend wayland --seconds 3 | \
+              tee "target/linux-native-shell-probe/logs/wayland-$scale.jsonl"
+          done
+      - name: Upload bounded native pipeline diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-native-shell-probe-${{ matrix.arch }}
+          path: target/linux-native-shell-probe/logs
+          if-no-files-found: warn

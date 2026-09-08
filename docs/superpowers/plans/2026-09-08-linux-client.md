@@ -30,3 +30,5 @@ Linux 应用组合根已接入 workspace；macOS 宿主的 all-targets check 和
 Linux 完整包脚本与三架构 CI 构建/目标加载步骤已实现；9 项合成包拒绝测试和 shell/YAML 检查通过。此时尚未在 Linux 运行新包流程，不勾选三目标 CI 通过门禁。见 packaging/linux/README.md；原生窗口和真实 GPU/输入仍未完成。
 
 2026-09-08 5cd73ea Ubuntu job101972000994 终态成功：隔离 Secret Service 真实往返 1 项明确执行通过，Linux 原生应用20+2通过。其余发行版、真实GUI及远程登录不在此结论范围。
+
+原生窗口技术探针已实现于 tools/frd-linux-native-shell-probe，并新增三架构 X11/Wayland 1×/2× CI；等待真实编译/GL运行，不能勾选原生窗口产品验收。完整包首次 ARM64/x64 校验暴露系统zlib遗漏，修正及失败记录见验证文档。

@@ -59,6 +59,9 @@ class PackageValidation(unittest.TestCase):
     def test_expected_static_contract(self):
         self.verify()
 
+    def test_protocol_system_zlib_dependency_is_accepted(self):
+        self.verify("(NEEDED) [libc.so.6]\n(NEEDED) [libz.so.1]")
+
     def test_missing_binary_rejected(self):
         (self.root / "freeremotedesk-linux").unlink()
         with self.assertRaisesRegex(ValueError, "文件集合"):

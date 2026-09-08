@@ -16,6 +16,8 @@ PROFILES = {
 CODECS = ("FFmpeg-LGPL-2.1-or-later.txt", "FFmpeg-NOTICE.txt", "libavcodec.so.62",
           "libavutil.so.60", "libfreeremotedesk_ffmpeg.so")
 SYSTEM_LIBRARIES = {
+    # flate2/libz-sys 由 Apple 协议及 IronRDP SSPI 依赖图引入。
+    "libz.so.1",
     "libc.so.6", "libm.so.6", "libgcc_s.so.1", "libstdc++.so.6", "libpthread.so.0", "libdl.so.2",
     "librt.so.1", "libutil.so.1", "libudev.so.1", "libfontconfig.so.1", "libfreetype.so.6",
     "libX11.so.6", "libX11-xcb.so.1", "libxcb.so.1", "libXcursor.so.1", "libXi.so.6",

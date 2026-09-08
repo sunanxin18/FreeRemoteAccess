@@ -11,6 +11,7 @@
 
 安装目录和文件必须属于同一个安装所有者，不得允许组或其他用户写入，也不得包含
 符号链接。密码只使用客户端宿主的 Secret Service；不可用时不会退回普通配置文件。
+系统运行依赖包括 glibc、libgcc、libstdc++ 和 zlib（libz.so.1）；完整依赖由包验证器检查。
 窗口运行需要 X11 或 Wayland 会话与 Vulkan/GLES 驱动。Linux 音频尚未接入。
 
 运行 `./freeremotedesk-linux --verify-codec-bundle` 验证实际解码器加载；该命令不连接

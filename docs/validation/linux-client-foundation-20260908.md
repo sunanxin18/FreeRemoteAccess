@@ -47,3 +47,9 @@ Linux 应用入口 baebd80 的宿主测试通过 20 项单元及 2 项边界测�
 2026-09-08 提交 `5cd73ea`，CI run `34198594600` 的 Ubuntu job `101972000994` 已终态 success。日志确认隔离 D-Bus / 临时 GNOME keyring 中 `secure_credentials::native_tests::native_secret_service_authenticated_commit_roundtrip` 实际执行并通过：1 passed / 0 failed / 0 ignored（不是默认忽略项）。该测试覆盖认证前仅暂存、认证提交后的新 store 读取及删除；使用固定合成密码，未访问用户真实凭据。运行日志保存在本机 `/tmp/frd-linux-native-services-5cd.log`。
 
 同一 Ubuntu 原生 job 中 Linux 应用 20 项单元和 2 项依赖边界测试通过，完整工作区编译及安全核心测试通过。范围为 Ubuntu x86_64 的临时 keyring，不是全部 Linux 发行版、锁定 keyring 的交互解锁体验或实际远程登录证明。三架构完整客户端包和原生窗口仍独立待验收。
+
+## 完整包首次目标运行失败与修正
+
+`5cd73ea` Linux run `34198594626` 的 ARM64 job `101971931726` 与 x86_64 job `101971932074` 均完成实际 release 客户端编译，但 verifier 因未审核依赖 `libz.so.1` 失败；不能标为完整包通过。`cargo tree --locked -p freeremotedesk-linux --target aarch64-unknown-linux-gnu -i libz-sys` 确认依赖来自 flate2，经 Apple 协议与 IronRDP SSPI 引入。已将标准 zlib SONAME 纳入明确系统依赖名单，未知库继续拒绝；新增回归后合成包测试 10 项通过。修正后的目标流程尚未重跑。
+
+独立 `tools/frd-linux-native-shell-probe` 与三架构 X11/Wayland CI 验证流程已实现，尚未在 Linux 编译/运行。探针只验证 GTK 原生 HeaderBar 与 GLArea 合成路径；有界 pass 要求实际 backend、mapped、独立内容 allocation、中心位置、viewport 与逻辑尺寸/缩放一致及无 GL错误。CI显式使用软件 Mesa，因此硬件 GPU、鼠标键盘、视觉验收和产品 RDP 集成仍不在通过范围。脚本及工作流 shell/YAML 语法已检查。
