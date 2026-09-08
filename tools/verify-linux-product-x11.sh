@@ -58,7 +58,7 @@ height="$(awk -F= '$1 == "HEIGHT" {print $2}' <<<"$geometry")"
 [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || { echo '窗口几何无效' >&2; exit 1; }
 (( width >= 400 && height >= 400 )) || { echo 'GTK 产品窗口尺寸异常' >&2; exit 1; }
 wm_class="$(xprop -id "$window_id" WM_CLASS)"
-grep -Eq '"freeremotedesk", "freeremotedesk"|"freeremotedesk"' <<<"$wm_class" || {
+grep -Eq 'freeremotedesk' <<<"$wm_class" || {
   echo "GTK application id 未映射为预期 WM_CLASS: $wm_class" >&2
   exit 1
 }
