@@ -15,6 +15,7 @@ type FcConfig = c_void;
 type FontMapPtr = *mut pango::ffi::PangoFontMap;
 type InitConfig = unsafe extern "C" fn() -> *mut FcConfig;
 type AddFont = unsafe extern "C" fn(*mut FcConfig, *const u8) -> c_int;
+type BuildFonts = unsafe extern "C" fn(*mut FcConfig) -> c_int;
 type DestroyConfig = unsafe extern "C" fn(*mut FcConfig);
 type NewFontMap = unsafe extern "C" fn() -> FontMapPtr;
 type SetConfig = unsafe extern "C" fn(FontMapPtr, *mut FcConfig);
@@ -57,12 +58,16 @@ impl BundledFontMap {
         let pangocairo = unsafe { Library::new("libpangocairo-1.0.so.0").ok()? };
         let init: InitConfig = unsafe { symbol(&fontconfig, b"FcInitLoadConfigAndFonts\0")? };
         let add_font: AddFont = unsafe { symbol(&fontconfig, b"FcConfigAppFontAddFile\0")? };
+        let build_fonts: BuildFonts = unsafe { symbol(&fontconfig, b"FcConfigBuildFonts\0")? };
         let destroy_config: DestroyConfig = unsafe { symbol(&fontconfig, b"FcConfigDestroy\0")? };
         let new_font_map: NewFontMap =
             unsafe { symbol(&pangocairo, b"pango_cairo_font_map_new\0")? };
         let set_config: SetConfig = unsafe { symbol(&pango, b"pango_fc_font_map_set_config\0")? };
         let config = unsafe { init() };
-        if config.is_null() || unsafe { add_font(config, path.as_ptr().cast()) } == 0 {
+        if config.is_null()
+            || unsafe { add_font(config, path.as_ptr().cast()) } == 0
+            || unsafe { build_fonts(config) } == 0
+        {
             if !config.is_null() {
                 unsafe { destroy_config(config) };
             }
