@@ -94,7 +94,7 @@ jobs:
           # Ubuntu GCC MinGW packages do not target Windows ARM64.
           # Upstream release and asset digest: mstorsjo/llvm-mingw 20250709.
           $installScript = @'
-          set -eu
+          set -euo pipefail
           archive=/tmp/frd-llvm-mingw-20250709.tar.xz
           curl --fail --location --proto '=https' --tlsv1.2 https://github.com/mstorsjo/llvm-mingw/releases/download/20250709/llvm-mingw-20250709-msvcrt-ubuntu-22.04-x86_64.tar.xz -o "$archive"
           printf '%s  %s\n' 422f13915a41acd8b93566e590531f55d3de6e531575197d51756ff8e8d16525 "$archive" | sha256sum --check --strict
@@ -105,7 +105,15 @@ jobs:
           /opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-clang /tmp/frd-arm64-toolchain-smoke.c -o /tmp/frd-arm64-toolchain-smoke.exe
           /opt/frd-llvm-mingw-20250709/bin/llvm-readobj --file-headers /tmp/frd-arm64-toolchain-smoke.exe | grep 'IMAGE_FILE_MACHINE_ARM64'
           '@
-          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc $installScript
+          # 写入无 BOM 的 LF 脚本，以直接 argv 执行，避免 Windows 换行和二次 shell 引号解析。
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'frd-install-llvm-mingw.sh'
+          $scriptText = $installScript.Replace("`r`n", "`n").Replace("`r", "`n") + "`n"
+          [IO.File]::WriteAllText($scriptPath, $scriptText, [Text.UTF8Encoding]::new($false))
+          $wslScriptPath = & wsl.exe --distribution Ubuntu-24.04 --user root --exec wslpath -a $scriptPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslScriptPath)) {
+            throw "Cannot resolve ARM64 toolchain installation script in WSL"
+          }
+          wsl.exe --distribution Ubuntu-24.04 --user root --exec bash --noprofile --norc ($wslScriptPath.Trim())
           if ($LASTEXITCODE -ne 0) { throw "Pinned Windows ARM64 toolchain verification failed" }
 
       - name: Build pinned FFmpeg bundle with native tests
