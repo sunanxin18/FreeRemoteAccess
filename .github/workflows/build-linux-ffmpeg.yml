@@ -38,27 +38,30 @@ concurrency:
 jobs:
   bundle:
     name: Linux FFmpeg ${{ matrix.arch }} bundle
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
+            runner: ubuntu-24.04
             bundle_dir: linux-x86_64
             cargo_target: x86_64-unknown-linux-gnu
             cc: ""
             cross_prefix: ""
           - arch: i686
+            runner: ubuntu-24.04
             bundle_dir: linux-x86
             cargo_target: i686-unknown-linux-gnu
             cc: i686-linux-gnu-gcc
             cross_prefix: i686-linux-gnu-
           - arch: aarch64
+            runner: ubuntu-24.04-arm
             bundle_dir: linux-aarch64
             cargo_target: aarch64-unknown-linux-gnu
-            cc: aarch64-linux-gnu-gcc
-            cross_prefix: aarch64-linux-gnu-
+            cc: ""
+            cross_prefix: ""
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -72,11 +75,11 @@ jobs:
             build-essential \
             nasm \
             xz-utils \
-            pkg-config \
-            gcc-i686-linux-gnu \
-            libc6-dev-i386-cross \
-            gcc-aarch64-linux-gnu \
-            libc6-dev-arm64-cross
+            pkg-config
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            sudo apt-get install --no-install-recommends -y \
+              gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386 lib32gcc-s1
+          fi
 
       - name: Verify pinned Rust toolchain
         shell: bash
@@ -91,7 +94,7 @@ jobs:
           FRD_FFMPEG_CC: ${{ matrix.cc }}
           FRD_FFMPEG_CROSS_PREFIX: ${{ matrix.cross_prefix }}
           FRD_CARGO_TARGET: ${{ matrix.cargo_target }}
-          FRD_FFMPEG_RUN_NATIVE_TESTS: ${{ matrix.arch == 'x86_64' && '1' || '0' }}
+          FRD_FFMPEG_RUN_TARGET_TESTS: "1"
         run: bash tools/build-ffmpeg-linux.sh
 
       - name: Verify Linux bundle ELF and plugin ABI
@@ -101,7 +104,7 @@ jobs:
             "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
 
       - name: Load Linux plugin and call ABI entry point
-        if: matrix.arch == 'x86_64'
+        if: matrix.arch != 'i686'
         shell: bash
         env:
           FRD_LINUX_FFMPEG_RUNTIME_SMOKE: "1"

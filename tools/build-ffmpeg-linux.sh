@@ -59,6 +59,26 @@ if [[ "$frd_platform" != "$frd_host_platform" ]]; then
   fi
 fi
 
+# 目标测试必须执行目标二进制。x86_64 Linux 可通过内核 IA32 支持运行
+# i686 ELF；其他跨架构组合明确拒绝，不回退到宿主测试。
+frd_run_tests="${FRD_FFMPEG_RUN_TARGET_TESTS:-${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}}"
+frd_test_target=()
+if [[ "$frd_run_tests" == 1 && "$frd_cross_build" == 1 ]]; then
+  [[ "$frd_host_platform" == linux-x86_64 && "$frd_platform" == linux-x86 ]] || {
+    echo "当前宿主不能直接执行所请求的 Linux 目标测试: $frd_host_platform -> $frd_platform" >&2
+    exit 2
+  }
+  [[ "$FRD_CARGO_TARGET" == i686-unknown-linux-gnu ]] || {
+    echo "i686 目标测试要求精确的 i686-unknown-linux-gnu Rust target" >&2
+    exit 2
+  }
+  [[ -f /lib/ld-linux.so.2 ]] || {
+    echo "i686 目标测试需要 libc6-i386 提供 /lib/ld-linux.so.2" >&2
+    exit 2
+  }
+  frd_test_target=(--target "$FRD_CARGO_TARGET")
+fi
+
 mkdir -p "$frd_build"
 if [[ ! -f "$frd_archive" ]]; then
   curl --fail --location --max-time 120 \
@@ -119,12 +139,11 @@ else
   FFMPEG_DIR="$frd_prefix" cargo build --locked --release -p frd-video-ffmpeg-plugin --features native-ffmpeg
   frd_plugin="$frd_target_dir/release/libfreeremotedesk_ffmpeg.so"
 fi
-if [[ "$frd_cross_build" -eq 0 && "${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}" == 1 ]]; then
-  # 仅在 native host 上运行与本次 bundle 相同 FFmpeg dist 链接的 plugin 单测；
-  # 交叉架构不能把 hosted x86_64 测试结果冒充目标架构运行证据。
+if [[ "$frd_run_tests" == 1 ]]; then
+  # 同架构原生执行，或显式 --target i686 执行真实 32 位测试进程。
   FFMPEG_DIR="$frd_prefix" \
     LD_LIBRARY_PATH="$frd_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    cargo test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg --lib -- --nocapture
+    cargo test --locked "${frd_test_target[@]}" -p frd-video-ffmpeg-plugin --features native-ffmpeg --lib -- --nocapture
 fi
 frd_bundle="$frd_build/bundle/$frd_platform"
 rm -rf "$frd_bundle"
@@ -165,13 +184,12 @@ frd_expected_files="$(printf '%s\n' \
   echo "Linux FFmpeg bundle 文件集合不匹配: $frd_bundle" >&2
   exit 1
 }
-if [[ "$frd_cross_build" -eq 0 && "${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}" == 1 ]]; then
-  # 仅在 native host 上运行当前 bundle 的 HEVC fixture；跨架构构建不能把 hosted host
-  # 的动态库运行结果冒充目标架构证据。
+if [[ "$frd_run_tests" == 1 ]]; then
+  # fixture 通过实际目标进程加载本次随包插件，并核验 ABI 和解码像素。
   FFMPEG_DIR="$frd_prefix" \
     FRD_FFMPEG_TEST_BUNDLE="$frd_bundle" \
     LD_LIBRARY_PATH="$frd_bundle${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    cargo test --locked -p frd-video-ffmpeg-plugin --features native-ffmpeg \
+    cargo test --locked "${frd_test_target[@]}" -p frd-video-ffmpeg-plugin --features native-ffmpeg \
       --test main444_decode -- --nocapture
 fi
 echo "Linux FFmpeg bundle: $frd_bundle"

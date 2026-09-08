@@ -6,6 +6,8 @@
 
 [Linux FFmpeg run 34179144122](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34179144122) 在提交 `6b5191f04e0d891e16063efe93ce04cf1dc05e9f` 上完成：x86_64、i686、AArch64 三个 bundle 的构建、ELF/依赖/路径/ABI 导出检查与产物上传均成功，三个对应源码产物也已上传。x86_64 的原生 fixture 与插件加载/ABI 调用通过；i686/AArch64 的加载步骤明确跳过，host-side tests 不构成目标架构运行证据。Linux GUI、目标机交互和 live RDP 尚未验证，因此平台整体仍为 `受限验证`/`开发中`。
 
+后续目标运行门禁已补充：Windows x86 使用 32 位 fixture 进程，Windows ARM64 使用原生 runner 加载同次构建的包；Linux i686 使用 32 位进程，Linux ARM64 使用原生 runner。新配置尚待托管执行通过，不计为已取得的运行证据。
+
 该运行修复了 YAML 折叠 shell 续行，以及 FFmpeg configuration 嵌入临时 `--prefix` 的真实路径泄露；现使用固定 `/usr` 加 `DESTDIR` staging，未放宽 verifier。Windows ARM64 已改固定 LLVM-MinGW，Windows x86 使用静态 libgcc，实际包结果仍待新 CI。macOS Intel CI 暴露的负色度 SIMD 乘加错误已在 `53d10de` 修复，Rosetta 完整 RDP 186 项通过，ARM64 YUV 回归 7 项通过；此前本机 ARM64 通过不能代表 Intel 正确性。
 
 FreeRemoteDesk 是纯 Rust 远程登录客户端。当前产品优先实现 Windows
