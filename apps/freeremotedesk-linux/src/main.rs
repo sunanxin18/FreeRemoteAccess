@@ -34,7 +34,7 @@ use frd_shell_gtk::{GtkRunner, GtkRunnerStores};
     feature = "gtk-shell",
     any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
 ))]
-use gtk4::prelude::*;
+use gtk4::{gio::prelude::*, prelude::*};
 
 use crate::cli::{Cli, RdpEgfxExperiment};
 
