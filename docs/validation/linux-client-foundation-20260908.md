@@ -196,3 +196,7 @@ GL 独立审查补充修正：indexed viewport只操作0，所有clip-distance�
 真实空 SessionHost 验证提取、指标、重复空提取和无效退休；不访问平台服务。shell
 215项单元测试、新外部测试1项及原doctest1项通过，日志
 /tmp/frd-public-frame-api-tests.log。此接口接线准备不代表 GTK 客户端已运行。
+
+
+打包工作流并发策略调整：Windows/Linux/macOS同组保留正在运行的完整验证，最新提交
+排队；原生GL/窗口探针保持独立并发组，可立即验证修正。依据[GitHub官方并发语义](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)，cancel-in-progress=false不取消运行中的任务，默认仅保留最新pending。此配置不修改产品或验收条件。

@@ -39,7 +39,8 @@ permissions:
 
 concurrency:
   group: windows-package-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # 完成长耗时原生验证；同组仅保留最新待运行提交。
+  cancel-in-progress: false
 
 jobs:
   package:
