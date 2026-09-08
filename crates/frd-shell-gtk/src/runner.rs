@@ -401,6 +401,10 @@ impl GtkRunner {
         let font_map = BundledFontMap::load();
         if let Some(map) = font_map.as_ref().and_then(BundledFontMap::map) {
             window.set_font_map(Some(map));
+            // 标题栏和内容树在 GTK 中拥有独立的 widget context；分别绑定
+            // 同一个私有 map，确保标题栏状态与登录表单都能按需回退到随包字体。
+            header.set_font_map(Some(map));
+            stack.set_font_map(Some(map));
         }
         let state = Rc::new(RefCell::new(State {
             owner: Weak::new(),
