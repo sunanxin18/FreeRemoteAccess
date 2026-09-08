@@ -3,8 +3,8 @@ use crate::{drawable_size, PendingBatch, RejectedBatch, SubmitError};
 use frd_core::{ContentViewport, PixelSize};
 use frd_frame::FrameTransaction;
 use frd_render_gl::{
-    DrawReceipt, ExternalContext, GlBatchFailure, GlError, GlOutputContract, GlRenderTarget,
-    RemoteGlRenderer,
+    ConfirmedGlPresentation, DrawReceipt, ExternalContext, GlBatchFailure, GlError,
+    GlOutputContract, GlRenderTarget, RemoteGlRenderer,
 };
 use gtk4::{gdk, glib, prelude::*, GLArea};
 use std::{cell::RefCell, ffi::c_void, rc::Rc};
@@ -16,6 +16,7 @@ pub enum AdapterError {
     InvalidAllocation,
     Gl(GlError),
     Batch(GlBatchFailure),
+    Submission(SubmissionError),
 }
 /// Drawn 只证明本次 GL 命令提交；既不证明 GTK snapshot 呈现，也不触发协议 ACK。
 pub enum AdapterEvent {
@@ -177,6 +178,30 @@ impl GtkFrameArea {
     }
     pub fn take_window_submission(&self) -> Option<WindowSubmission> {
         self.state.borrow().submission.as_ref()?.take_submission()
+    }
+    /// 先消费实际窗口提交证明，再在同一执行器中精确确认并退休帧回执。
+    /// 不切换上下文，不执行 GL 调用；调用者应在提交下一批事务以前调用。
+    pub fn take_confirmed_presentation(
+        &self,
+    ) -> Result<Option<ConfirmedGlPresentation>, AdapterError> {
+        let mut state = self.state.borrow_mut();
+        let Some(submission) = state
+            .submission
+            .as_ref()
+            .and_then(|observer| observer.take_submission())
+        else {
+            return Ok(None);
+        };
+        let draw = submission.consume().map_err(AdapterError::Submission)?;
+        let active = state
+            .active
+            .as_mut()
+            .ok_or(AdapterError::Submission(SubmissionError::Lifecycle))?;
+        active
+            .renderer
+            .confirm_submitted_draw(draw)
+            .map(Some)
+            .map_err(AdapterError::Gl)
     }
     pub fn take_submission_error(&self) -> Option<SubmissionError> {
         self.state.borrow().submission.as_ref()?.take_error()

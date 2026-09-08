@@ -408,8 +408,29 @@ fn native_gtk_login_session_cancel() {
     assert_eq!(starts.load(Ordering::SeqCst), 1, "Enter必须只启动一个会话");
     profiles.set_selected(1);
     until(|| password.text().as_str() == PASSWORD);
+    let resolution = find(&root, "frd-resolution")
+        .downcast::<gtk4::DropDown>()
+        .unwrap();
+    let width = find(&root, "frd-fixed-width")
+        .downcast::<gtk4::Entry>()
+        .unwrap();
+    let height = find(&root, "frd-fixed-height")
+        .downcast::<gtk4::Entry>()
+        .unwrap();
+    assert_eq!(resolution.selected(), 0, "profile原有模式必须恢复");
+    resolution.set_selected(8);
+    width.set_text("0");
+    height.set_text("4608");
+    password.emit_by_name::<()>("activate", &[]);
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "非法固定尺寸不能启动");
+    assert_eq!(password.text().as_str(), PASSWORD, "尺寸编辑不能清除密码");
+    width.set_text("8192");
     password.emit_by_name::<()>("activate", &[]);
     until(|| starts.load(Ordering::SeqCst) == 2 && status.text().contains("准备远程画面"));
+    assert_eq!(
+        display_intents.lock().unwrap()[1].mode,
+        ResolutionMode::Fixed(PixelSize::new(8192, 4608).unwrap())
+    );
     let second_area = find(&root, "frd-remote")
         .downcast::<gtk4::GLArea>()
         .unwrap();
@@ -418,6 +439,9 @@ fn native_gtk_login_session_cancel() {
     until(|| read_increment(&second_area));
     action.emit_clicked();
     until(|| closed.load(Ordering::SeqCst) == 2 && status.text() == "未连接");
+    assert_eq!(resolution.selected(), 8, "返回表单必须保留自定义模式");
+    assert_eq!(width.text().as_str(), "8192");
+    assert_eq!(height.text().as_str(), "4608");
     profiles.set_selected(1);
     until(|| password.text().as_str() == PASSWORD);
     password.emit_by_name::<()>("activate", &[]);

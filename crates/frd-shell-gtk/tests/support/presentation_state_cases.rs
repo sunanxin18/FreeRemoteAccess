@@ -78,3 +78,18 @@ fn clean_after_paint_without_window_context_transition_cannot_confirm() {
     gate.draw(11, true);
     assert!(gate.finish(11, true, true));
 }
+
+#[test]
+fn egl_error_is_captured_before_successful_identity_queries_overwrite_it() {
+    let error = std::cell::Cell::new(0x300d_u32); // EGL_BAD_SURFACE
+    let (observed, identity) = super::capture_egl_before_identity(
+        || error.replace(0x3000),
+        || {
+            error.set(0x3000);
+            true
+        },
+    );
+    assert!(identity);
+    assert_eq!(observed, 0x300d);
+    assert_eq!(error.get(), 0x3000);
+}

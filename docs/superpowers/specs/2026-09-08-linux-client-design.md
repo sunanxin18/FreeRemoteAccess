@@ -172,9 +172,12 @@ alpha1满足premultiplied解释。桌面BGRA内存格式不能成为额外交换
 首帧只发现上下文并请求下一帧；后续 before-paint 对保留上下文建立错误 baseline。
 帧外 make_current 是 surfaceless，只用于 baseline；GTK begin/end_frame 自行重绑窗口。
 
-EGL end_frame 忽略 swap 返回值，但同条返回路径没有调用 eglGetError；Wayland
-notify_committed 只清状态标志。因此同一 observer 可在 after-paint 读取窗口 GL/EGL
-错误，结合原生 current context/draw surface、同一framecounter和真实Surface render
+EGL end_frame 忽略 swap 返回值；Wayland notify_committed 只清状态标志。此前仅检查
+返回路径没有 eglGetError 不足以保证错误未被覆盖：libglvnd 的 eglGetCurrent*
+查询本身也将错误设为 EGL_SUCCESS。observer 必须在 after-paint 首个 EGL 调用
+立即捕获错误，再查询上下文；before-paint 也先保存旧错误，make-current 后立即
+保存其结果，再建立身份和 GL 错误基线。结合原生 current context/draw surface、
+同一framecounter和真实Surface render
 调用栈内的精确draw receipt建立提交确认。首帧、最终空damage、离屏snapshot、resize、
 unrealize、context变化或缺失作用域必须拒绝。该路径仍须native故障注入验证。
 GLX后续可用公开X11 display error_trap_push/pop包住paint，pop返回X请求错误；
@@ -201,3 +204,27 @@ begin-frame 前返回；X11 empty-frame 不执行 GL 操作，Wayland 仅提交 
 [空 clip 分支](https://github.com/GNOME/gtk/blob/4.14.0/gsk/gl/gskglrenderer.c#L363)、
 [X11 empty-frame](https://github.com/GNOME/gtk/blob/4.14.0/gdk/x11/gdkglcontext-x11.c#L43)、
 [Wayland empty-frame](https://github.com/GNOME/gtk/blob/4.14.0/gdk/wayland/gdkglcontext-wayland.c#L87)。
+
+### 原生分辨率选择与消费式呈现接线
+
+Linux 表单使用带持久标签的原生 GTK DropDown 显示当前分辨率模式；顺序与其他
+桌面壳一致，放在目标系统之后、地址之前。支持原生显示器（默认）、工作区、
+窗口内容、服务器管理，以及固定预设和自定义正整数宽高；不添加 2560 或 4K
+上限。非法输入留在表单内解释，不能启动或清除密码。自定义模式显示宽高标签，
+控件沿用 44 逻辑像素目标、原生焦点和主题。
+
+本次复核 [Apple pop-up buttons](https://developer.apple.com/design/human-interface-guidelines/pop-up-buttons)
+与 [M3 menus](https://m3.material.io/components/menus/overview)；M3 站点正文需 JavaScript，
+同时核对官方 [Material Web select](https://github.com/material-components/material-web/blob/main/docs/components/select.md)
+的当前选项与标签语义。没有新增产品流程例外。新增原生信号 fixture 不等于
+键盘/指针视觉验收，后者仍需单独执行。
+
+GL executor 的消费式确认接口只确认 renderer/context/epoch/serial 及共享帧账本，
+本身不证明窗口提交。GTK adapter 必须先消费 WindowSubmission，再在同一个
+renderer 中精确消费 pending receipt；确认不切换 context、不调用 GL 或读取错误。
+此窄入口供后续 runner 生成 FramePresented，不能直接复制 draw.frame() 发送。
+
+06e382a EGL故障负例纠正上述错误语义：固定 [libglvnd v1.7.0 entrypoint](https://github.com/NVIDIA/libglvnd/blob/v1.7.0/src/EGL/libegl.c#L111)
+将错误设为成功，[current查询](https://github.com/NVIDIA/libglvnd/blob/v1.7.0/src/EGL/libegl.c#L519)
+会经过该入口。新增原生负例明确要求捕获 EGL_BAD_SURFACE（0x300d），不能只检查
+没有确认或任意错误。纯闭包顺序测试只是辅助，实际驱动故障注入仍为必须门禁。

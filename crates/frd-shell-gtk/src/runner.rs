@@ -1,7 +1,7 @@
 //! 实际 GTK 产品事件泵；此阶段不发布 FramePresented，也不放宽 controller 输入门禁。
 use crate::{AdapterEvent, GtkFrameArea, SubmitError};
 use frd_app::{persist_profile_job, AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
-use frd_core::{DisplayIntent, ResolutionMode, SecretBuffer, SessionId, TargetSystem};
+use frd_core::{DisplayIntent, PixelSize, ResolutionMode, SecretBuffer, SessionId, TargetSystem};
 use frd_frame::FrameTransaction;
 use frd_platform_api::{
     ConnectionProfileKey, ConnectionProfileStore, PlatformError, SavedConnectionProfile,
@@ -110,6 +110,11 @@ struct Form {
     port: gtk4::Entry,
     username: gtk4::Entry,
     password: gtk4::PasswordEntry,
+    resolution: gtk4::DropDown,
+    fixed_box: gtk4::Box,
+    fixed_width: gtk4::Entry,
+    fixed_height: gtk4::Entry,
+    resolution_error: gtk4::Label,
     remember: gtk4::CheckButton,
     connect: gtk4::Button,
     errors: [gtk4::Label; 4],
@@ -152,6 +157,38 @@ impl Form {
         let target = gtk4::DropDown::from_strings(&["Windows", "macOS"]);
         target.set_widget_name("frd-target");
         field(&root, "远程系统", &target);
+        let resolution = gtk4::DropDown::from_strings(&[
+            "显示器原生（推荐）",
+            "显示器工作区",
+            "窗口内容区域",
+            "服务器管理",
+            "固定 1920 × 1080",
+            "固定 2560 × 1440",
+            "固定 3840 × 2160",
+            "固定 7680 × 4320",
+            "自定义固定尺寸",
+        ]);
+        resolution.set_widget_name("frd-resolution");
+        let resolution_error = field(&root, "远程分辨率", &resolution);
+        let fixed_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        let fixed_width = gtk4::Entry::new();
+        fixed_width.set_widget_name("frd-fixed-width");
+        fixed_width.set_input_purpose(gtk4::InputPurpose::Digits);
+        fixed_width.set_text("1920");
+        let fixed_height = gtk4::Entry::new();
+        fixed_height.set_widget_name("frd-fixed-height");
+        fixed_height.set_input_purpose(gtk4::InputPurpose::Digits);
+        fixed_height.set_text("1080");
+        field(&fixed_box, "宽度（像素）", &fixed_width);
+        field(&fixed_box, "高度（像素）", &fixed_height);
+        fixed_box.set_visible(false);
+        root.append(&fixed_box);
+        let fixed_controls = fixed_box.clone();
+        let fixed_error = resolution_error.clone();
+        resolution.connect_selected_notify(move |dropdown| {
+            fixed_controls.set_visible(dropdown.selected() == 8);
+            fixed_error.set_visible(false);
+        });
         let address = gtk4::Entry::new();
         address.set_widget_name("frd-address");
         address.set_width_chars(28);
@@ -186,6 +223,11 @@ impl Form {
             port,
             username,
             password,
+            resolution,
+            fixed_box,
+            fixed_width,
+            fixed_height,
+            resolution_error,
             remember,
             connect,
             errors,
@@ -364,6 +406,14 @@ fn wire(state: &Rc<RefCell<State>>) {
             s.borrow_mut().submit();
         }
     });
+    for entry in [&widgets.form.fixed_width, &widgets.form.fixed_height] {
+        let weak = Rc::downgrade(state);
+        entry.connect_activate(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.borrow_mut().submit();
+            }
+        });
+    }
     let weak = Rc::downgrade(state);
     widgets.action.connect_clicked(move |_| {
         if let Some(s) = weak.upgrade() {
@@ -491,9 +541,43 @@ impl State {
         if self.loading_profile.is_some() || self.sessions.launch_is_pending() {
             return;
         }
+        let mode = match self.form.resolution.selected() {
+            0 => ResolutionMode::NativeDisplay,
+            1 => ResolutionMode::DisplayWorkArea,
+            2 => ResolutionMode::WindowContent,
+            3 => ResolutionMode::ServerManaged,
+            index => {
+                let size = match index {
+                    4 => PixelSize::new(1920, 1080),
+                    5 => PixelSize::new(2560, 1440),
+                    6 => PixelSize::new(3840, 2160),
+                    7 => PixelSize::new(7680, 4320),
+                    8 => self
+                        .form
+                        .fixed_width
+                        .text()
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                        .zip(self.form.fixed_height.text().trim().parse::<u32>().ok())
+                        .and_then(|(width, height)| PixelSize::new(width, height)),
+                    _ => None,
+                };
+                let Some(size) = size else {
+                    self.form
+                        .resolution_error
+                        .set_text("请输入有效的正整数宽度和高度（像素）");
+                    self.form.resolution_error.set_visible(true);
+                    return;
+                };
+                ResolutionMode::Fixed(size)
+            }
+        };
+        self.form.resolution_error.set_visible(false);
         let Some(form) = self.launch.controller_mut().connection_form_mut() else {
             return;
         };
+        form.draft.resolution_mode = mode;
         let original = form.draft.clone();
         form.draft.target_system = Some(if self.form.target.selected() == 1 {
             TargetSystem::MacOs
@@ -864,6 +948,26 @@ impl State {
         self.form
             .password
             .set_text(form.password_mut().expose_text().unwrap_or(""));
+        let selected = match form.draft.resolution_mode {
+            ResolutionMode::NativeDisplay => 0,
+            ResolutionMode::DisplayWorkArea => 1,
+            ResolutionMode::WindowContent => 2,
+            ResolutionMode::ServerManaged => 3,
+            ResolutionMode::Fixed(size) => {
+                self.form.fixed_width.set_text(&size.width.to_string());
+                self.form.fixed_height.set_text(&size.height.to_string());
+                match (size.width, size.height) {
+                    (1920, 1080) => 4,
+                    (2560, 1440) => 5,
+                    (3840, 2160) => 6,
+                    (7680, 4320) => 7,
+                    _ => 8,
+                }
+            }
+        };
+        self.form.resolution.set_selected(selected);
+        self.form.fixed_box.set_visible(selected == 8);
+        self.form.resolution_error.set_visible(false);
         self.form.remember.set_active(form.remember_on_this_device);
         self.form.profile_keys = form
             .profiles
@@ -913,12 +1017,11 @@ impl State {
         self.status.set_text(status);
         self.action
             .set_visible(!matches!(page, AppPage::ConnectionForm(_)));
-        self.action
-            .set_label(if matches!(page, AppPage::Failed { .. }) {
-                "返回"
-            } else {
-                "取消"
-            });
+        self.action.set_label(match page {
+            AppPage::Failed { .. } => "返回",
+            AppPage::RemoteSession { .. } => "断开连接",
+            _ => "取消",
+        });
         self.action
             .set_sensitive(!self.cancel_pending && !self.cleanup_pending);
         self.form.root.set_sensitive(

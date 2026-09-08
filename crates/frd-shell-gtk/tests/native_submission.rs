@@ -220,12 +220,21 @@ fn native_gtk_window_submission_roundtrip() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         pump();
+        let unexpected = adapter.take_window_submission();
         assert!(
-            adapter.take_window_submission().is_none(),
-            "EGL swap 失败的帧不得确认"
+            unexpected.is_none(),
+            "EGL swap 失败的帧不得确认: injected_frame={:?} received_frame={:?} diagnostics={:?}",
+            egl_injected_frame.get(),
+            unexpected.as_ref().map(WindowSubmission::frame_counter),
+            adapter.submission_diagnostics()
         );
         if let Some(error) = adapter.take_submission_error() {
             assert_eq!(error, SubmissionError::EglFault);
+            assert_eq!(
+                adapter.submission_diagnostics().unwrap().last_egl_error,
+                0x300d,
+                "必须观察到EGL_BAD_SURFACE"
+            );
             assert!(
                 egl_injected_frame.get().is_some(),
                 "必须实际执行失败的 EGL swap"
@@ -293,15 +302,39 @@ fn native_gtk_window_submission_roundtrip() {
     adapter
         .enable_window_submission(&window)
         .expect("新生命周期必须显式重启 observer");
-    let rebuilt = wait_submission(&adapter);
-    let rebuilt_draw = rebuilt.consume().unwrap();
-    assert!(rebuilt_draw.is_valid());
-    assert_eq!(rebuilt_draw.frame().session_id, session_id);
-    assert_eq!(rebuilt_draw.frame().generation, 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let confirmed = loop {
+        pump();
+        if let Some(confirmed) = adapter.take_confirmed_presentation().unwrap() {
+            break confirmed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "消费式确认超时: {:?}",
+            adapter.submission_diagnostics()
+        );
+    }
+    .into_receipt();
+    assert_eq!(confirmed.session_id, session_id);
+    assert_eq!(confirmed.generation, 2);
+    assert_eq!(confirmed.revision, 1);
+    assert!(adapter.take_confirmed_presentation().unwrap().is_none());
+    let previous_frame = clock.frame_counter();
+    adapter.widget().queue_render();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while clock.frame_counter() <= previous_frame {
+        pump();
+        assert!(
+            adapter.take_confirmed_presentation().unwrap().is_none(),
+            "已确认revision不能被重绘重复确认"
+        );
+        assert!(Instant::now() < deadline, "确认后重绘必须实际发生");
+    }
+    assert!(adapter.take_confirmed_presentation().unwrap().is_none());
     adapter.detach();
     clock.disconnect(hook);
     window.close();
-    println!("native GTK window submission backend={backend} scale={scale} actual_egl=1 bootstrap_rejected=1 consume_once=1 gl_fault_rejected=1 egl_fault_rejected=1 wrong_window_rejected=1 resize_revoked=1 recovery=1 unrealize_revoked=1 reenabled=1");
+    println!("native GTK window submission backend={backend} scale={scale} actual_egl=1 bootstrap_rejected=1 consume_once=1 gl_fault_rejected=1 egl_fault_rejected=1 wrong_window_rejected=1 resize_revoked=1 recovery=1 unrealize_revoked=1 reenabled=1 confirmed_once=1");
 }
 
 fn pump() {

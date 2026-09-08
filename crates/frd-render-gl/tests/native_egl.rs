@@ -444,6 +444,57 @@ fn native_egl_renderer_roundtrip() {
         gl.bind_texture(glow::TEXTURE_2D, Some(color));
         gl.delete_texture(unrelated);
         gl.delete_texture(cube);
+        // 这里只实测执行器消费契约，不提供/伪造窗口提交或生产 ACK。
+        {
+            let identity = SessionId::allocate();
+            let mut first = RemoteGlRenderer::create(&context).unwrap();
+            let mut second = RemoteGlRenderer::create(&context).unwrap();
+            first.apply_batch(vec![frame(identity, 1)]).unwrap();
+            second.apply_batch(vec![frame(identity, 1)]).unwrap();
+            let view =
+                ContentViewport::fit(PixelSize::new(2, 2).unwrap(), PixelSize::new(2, 2).unwrap());
+            let foreign = second.draw(&target, view).unwrap().unwrap();
+            assert!(
+                first.confirm_submitted_draw(foreign).is_err(),
+                "相同frame身份不能跨renderer确认"
+            );
+            let stale = first.draw(&target, view).unwrap().unwrap();
+            let current = first.draw(&target, view).unwrap().unwrap();
+            assert!(
+                first.confirm_submitted_draw(stale).is_err(),
+                "较新draw撤销旧serial"
+            );
+            let expected = *current.frame();
+            // 故意留一个 GL 错误，并解绑 current；元数据确认不能观察/清除它。
+            gl.enable(u32::MAX);
+            egl.make_current(display, None, None, None).unwrap();
+            let confirmed = first
+                .confirm_submitted_draw(current)
+                .unwrap()
+                .into_receipt();
+            assert_eq!(confirmed, expected);
+            assert!(
+                egl.get_current_context().is_none(),
+                "确认不能切换宿主上下文"
+            );
+            egl.make_current(display, Some(surface), Some(surface), Some(native))
+                .unwrap();
+            assert_eq!(gl.get_error(), glow::INVALID_ENUM, "确认不能读取GL错误");
+            assert!(
+                first.draw(&target, view).unwrap().is_none(),
+                "同revision重绘不重复发布已消费receipt"
+            );
+            // 外来确认失败不能消费真正所有者的pending状态。
+            let own = second.draw(&target, view).unwrap().unwrap();
+            assert_eq!(
+                second.confirm_submitted_draw(own).unwrap().into_receipt(),
+                expected
+            );
+            assert!(second.draw(&target, view).unwrap().is_none());
+            first.detach().unwrap();
+            second.detach().unwrap();
+            context.drain_deletions().unwrap();
+        }
         let mut renderer = RemoteGlRenderer::create(&context).unwrap();
         let session = SessionId::allocate();
         renderer.apply_batch(vec![frame(session, 1)]).unwrap();
@@ -515,6 +566,7 @@ fn native_egl_renderer_roundtrip() {
         assert_eq!(gl.get_error(), glow::NO_ERROR);
         renderer.apply_batch(vec![frame(session, 2)]).unwrap();
         assert!(!receipt.is_valid(), "写入新代必须撤销旧绘制记录");
+        assert!(renderer.confirm_submitted_draw(receipt).is_err());
         let current = renderer.draw(&target, viewport).unwrap().unwrap();
         assert!(current.is_current());
         // 真正解绑 current；安全入口必须拒绝，且隔离旧纹理/回执。
@@ -528,6 +580,7 @@ fn native_egl_renderer_roundtrip() {
         assert!(renderer.draw(&target, viewport).is_err());
         assert!(!current.is_valid());
         assert!(!current.is_current());
+        assert!(renderer.confirm_submitted_draw(current).is_err());
         egl.make_current(display, Some(surface), Some(surface), Some(native))
             .unwrap();
         assert!(
@@ -637,6 +690,7 @@ fn native_egl_renderer_roundtrip() {
             !final_receipt.is_valid(),
             "非current detach也必须撤销旧绘制记录"
         );
+        assert!(renderer.confirm_submitted_draw(final_receipt).is_err());
         egl.make_current(display, Some(surface), Some(surface), Some(native))
             .unwrap();
         renderer.detach().unwrap();

@@ -3,7 +3,7 @@ use frd_core::{ContentViewport, PixelSize};
 use frd_frame::FrameTransaction;
 use frd_render_state::{
     BatchApplyOutcome, PlannedUpdateData, PresentationReceipt, RecoveryRequirement,
-    RemoteUpdateState,
+    RemoteUpdateState, TransactionError,
 };
 use glow::HasContext;
 use std::{
@@ -270,6 +270,15 @@ impl DrawReceipt {
     /// 此检查本身不证明窗口提交，或当前 FBO 是本次绘制目标。
     pub fn is_current(&self) -> bool {
         self.is_valid() && self.context.check().is_ok()
+    }
+}
+
+/// 已消费执行器 pending receipt 的结果；不独立证明宿主窗口提交。
+/// 只能在宿主先验证窗口提交后，由 confirm_submitted_draw 产生。
+pub struct ConfirmedGlPresentation(PresentationReceipt);
+impl ConfirmedGlPresentation {
+    pub fn into_receipt(self) -> PresentationReceipt {
+        self.0
     }
 }
 
@@ -586,6 +595,28 @@ impl RemoteGlRenderer {
         }
         result
     }
+    /// 消费已由宿主验证提交的 draw；例如 GTK 调用方必须先成功消费
+    /// WindowSubmission。此函数本身不是窗口提交证明，不可对普通 draw 直接 ACK。
+    ///
+    /// 仅确认元数据：不调用 GL、不查询 actual_current、不切换上下文或读取错误。
+    /// GTK after-paint 的 current 是窗口上下文，不要求恢复 GLArea 上下文。
+    pub fn confirm_submitted_draw(
+        &mut self,
+        draw: DrawReceipt,
+    ) -> Result<ConfirmedGlPresentation, GlError> {
+        if thread::current().id() != self.context.0.thread
+            || !Rc::ptr_eq(&draw.context.0, &self.context.0)
+            || !Rc::ptr_eq(&draw.renderer_serial, &self.serial)
+            || draw.epoch != self.epoch
+            || draw.serial != self.serial.get()
+            || !draw.is_valid()
+        {
+            return Err(TransactionError::StalePresentationReceipt.into());
+        }
+        self.state.confirm_presented(draw.receipt)?;
+        Ok(ConfirmedGlPresentation(draw.receipt))
+    }
+
     /// 必须在宿主 unrealize 的有效 current 上下文中调用，再销毁原生上下文。
     pub fn detach(&mut self) -> Result<Option<RecoveryRequirement>, GlError> {
         // 无 current 时仍撤销回执和退休资源；仅实际 GL 删除要求 current。

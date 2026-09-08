@@ -36,6 +36,17 @@ pub struct SubmissionDiagnostics {
     pub clean_after: bool,
     pub draw_surfaceless: bool,
     pub window_context_transition: bool,
+    pub last_egl_error: u32,
+}
+
+// EGL 报告最近一次调用结果；查询 current 身份也可能覆盖错误。
+// 强制先取错误，再允许身份查询，不能照搬 GL 的 sticky error 语义。
+fn capture_egl_before_identity<T>(
+    error: impl FnOnce() -> u32,
+    identity: impl FnOnce() -> T,
+) -> (u32, T) {
+    let error = error();
+    (error, identity())
 }
 
 #[derive(Default)]
@@ -168,9 +179,8 @@ mod native {
                 (!context.is_null() && !display.is_null()).then_some((context, display, surface))
             }
         }
-        fn clean(&self) -> Result<(), SubmissionError> {
+        fn clean(&self, egl: u32) -> Result<(), SubmissionError> {
             // 一次 drain 记录所有本作用域可见错误；上界防止丢失 context 时无限循环。
-            let egl = unsafe { (self.egl_error)() };
             let mut gl_fault = false;
             for _ in 0..32 {
                 let error = unsafe { (self.gl_error)() };
@@ -473,6 +483,7 @@ mod native {
                 })
         }
         fn before(&self) {
+            let egl_before = unsafe { (self.api.egl_error)() };
             let mut state = self.state.borrow_mut();
             state.diagnostics.before_count = state.diagnostics.before_count.saturating_add(1);
             state.diagnostics.before_frame = self.clock.frame_counter();
@@ -486,16 +497,24 @@ mod native {
                 state.invalidate();
                 return;
             }
+            if egl_before != 0x3000 {
+                state.error = Some(SubmissionError::EglFault);
+                state.invalidate();
+            }
             let baseline = state.known.as_ref().map(|known| {
                 // 帧外 surfaceless baseline；GTK begin_frame 将重新绑定窗口 drawable。
                 known.context.make_current();
-                let matches = gdk::GLContext::current().as_ref() == Some(&known.context)
-                    && self
-                        .api
-                        .identity()
-                        .is_some_and(|id| id.0 == known.egl_context && id.1 == known.display);
+                let (egl_make_current, matches) = capture_egl_before_identity(
+                    || unsafe { (self.api.egl_error)() },
+                    || {
+                        gdk::GLContext::current().as_ref() == Some(&known.context)
+                            && self.api.identity().is_some_and(|id| {
+                                id.0 == known.egl_context && id.1 == known.display
+                            })
+                    },
+                );
                 if matches {
-                    self.api.clean()
+                    self.api.clean(egl_make_current)
                 } else {
                     Err(SubmissionError::Association)
                 }
@@ -510,7 +529,13 @@ mod native {
             state.diagnostics.baseline_clean = baseline == Some(Ok(()));
         }
         fn after(&self) {
+            // 必须是这里最先发生的 EGL 调用；GdkGLContext::current 内部也会查询 EGL。
+            let (egl_after, (current, identity)) = capture_egl_before_identity(
+                || unsafe { (self.api.egl_error)() },
+                || (gdk::GLContext::current(), self.api.identity()),
+            );
             let mut state = self.state.borrow_mut();
+            state.diagnostics.last_egl_error = egl_after;
             state.diagnostics.after_count = state.diagnostics.after_count.saturating_add(1);
             state.diagnostics.frame_counter = self.clock.frame_counter();
             state.diagnostics.epoch = state.gate.epoch.get();
@@ -520,15 +545,13 @@ mod native {
                 return;
             }
             // 不调用 make_current；只检查 GSK window end_frame 留下的实际 current。
-            let current = gdk::GLContext::current();
-            let identity = self.api.identity();
             let valid = current.as_ref().is_some_and(|c| {
                 DrawContextExt::surface(c).as_ref() == Some(&self.surface)
                     && !c.is_in_frame()
                     && self.area.upgrade().and_then(|a| a.context()).as_ref() != Some(c)
             }) && identity.is_some_and(|id| !id.2.is_null());
             let clean = if valid {
-                self.api.clean()
+                self.api.clean(egl_after)
             } else {
                 Err(SubmissionError::Unavailable)
             };

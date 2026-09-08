@@ -392,3 +392,30 @@ runner 显示请求现在复用公开 DisplayGeometry 采集，替换旧的 moni
 新增实际 GLArea surfaceless context 到窗口 EGL context/drawable 的转换门禁，
 保留同帧/receipt/错误/lifecycle 约束，最终空帧仍拒绝。新原生矩阵待执行，
 详见设计文档的源码依据。
+
+## 06e382a 原生确认推进及 EGL 负例失败
+
+run34217046408 三架构终态失败：ARM64 job102031159074、i686 job102031159316、
+x86_64 job102031159549。三架构各4组 X11/Wayland 1×/2× 的帧适配与登录 fixture
+通过（每架构8个唯一测试通过结果），新增实际显示请求几何断言也已执行。
+12个窗口fixture不再首次超时，已越过首次确认、GL fault拒绝与恢复，随后全部
+在 EGL fault“失败帧不得确认”断言失败。保留日志 `/tmp/frd-gtk-06e-{x64,i686,arm64}.log`，
+不能将局部推进视为窗口错误门禁完成。
+
+新增消费式GL确认与GTK窄入口；新的原生EGL断言覆盖同frame跨renderer拒绝、
+过期serial、确认后无重复receipt、无current仍可确认且保留GL错误，以及
+quarantine/detach撤销。新增GTK末段将验证窗口证明消费后重绘无重复确认。
+这些新增断言仍待原生CI。原生分辨率选择器新增自定义8192×4608、非法零尺寸
+阻止连接且密码保留、返回后模式恢复的fixture，同样尚未执行。
+
+EGL负例根因已查明：observer先查询current身份，而libglvnd查询入口会将
+错误覆盖为EGL_SUCCESS。修正after最先捕获eglGetError，再查询身份；before
+在make-current前后分别捕获错误，clean使用已保存码。新增原生断言明确要求
+EGL_BAD_SURFACE=0x300d，旧“没有getError就不会清除EGL错误”的推论作废。
+修正后真实矩阵仍待执行，不能以闭包顺序测试代替驱动故障注入。
+
+本轮完整工作区回归：`cargo test --locked --workspace` exit0，78组1765 passed /
+0 failed / 16 ignored，日志 `/tmp/frd-gtk-consumption-workspace.log`。这是macOS
+ARM64宿主结果；GL与GTK新增原生代码只在Linux feature/目标类型检查中编译，
+原生fixture仍须由后续CI运行。独立审查确认adapter先消费窗口证明再确认renderer，
+分辨率非法提交保留密码；RemoteSession按钮文案与Disconnect意图统一为“断开连接”。
