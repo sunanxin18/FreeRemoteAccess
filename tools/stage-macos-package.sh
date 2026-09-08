@@ -10,7 +10,7 @@ host_arch="$(uname -m)"
 requested_arch="${FRD_MACOS_ARCH:-$host_arch}"
 case "$requested_arch" in
     arm64|aarch64) requested_arch=arm64; codec_arch=aarch64; expected_arch=arm64; rust_target=aarch64-apple-darwin ;;
-    x86_64) codec_arch=x86_64; expected_arch=x86_64; rust_target=x86_64-apple-darwin ;;
+    x86_64) echo "macOS 仅构建 ARM64，不再构建 Intel/x86_64" >&2; exit 2 ;;
     *) echo "不支持的 macOS package 架构: $requested_arch" >&2; exit 2 ;;
 esac
 cross_build=0

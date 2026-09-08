@@ -1,5 +1,7 @@
 # FreeRemoteDesk
 
+> 2026-09-08 用户调整构建范围：macOS 仅构建 ARM64；Intel/x86_64 不支持当前构建与发布，不再是交付门禁。此前 Intel/Rosetta 结果仅保留为历史证据。Windows/Linux 的 x86、x86_64、ARM64 范围不变。
+
 ## 2026-09-08 托管 CI 新证据（取代下文 Linux 未执行状态）
 
 [Linux FFmpeg run 34179144122](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34179144122) 在提交 `6b5191f04e0d891e16063efe93ce04cf1dc05e9f` 上完成：x86_64、i686、AArch64 三个 bundle 的构建、ELF/依赖/路径/ABI 导出检查与产物上传均成功，三个对应源码产物也已上传。x86_64 的原生 fixture 与插件加载/ABI 调用通过；i686/AArch64 的加载步骤明确跳过，host-side tests 不构成目标架构运行证据。Linux GUI、目标机交互和 live RDP 尚未验证，因此平台整体仍为 `受限验证`/`开发中`。

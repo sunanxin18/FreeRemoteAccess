@@ -1,5 +1,7 @@
 # macOS 产品包
 
+> 2026-09-08 用户调整构建范围：macOS 仅构建 ARM64；Intel/x86_64 不支持当前构建与发布，不再是交付门禁。此前 Intel/Rosetta 结果仅保留为历史证据。Windows/Linux 的 x86、x86_64、ARM64 范围不变。
+
 macOS 产品入口为 `freeremotedesk-macos`，复用共享桌面界面、会话控制器和协议适配器；
 窗口由 AppKit/winit 管理，图形使用 Metal。Windows 目标使用 IronRDP，Mac 目标注册
 已有 Apple RFB 和 HPSS 协议。注册协议不代表所有编解码器或目标组合已有实机证明。

@@ -311,10 +311,15 @@ FreeRemoteDesk is a Rust CLI with a Windows-first networking/protocol focus.
 
 ## Multi-Architecture Protocol and Decode Rules
 
+- macOS 产品仅支持 ARM64（2026-09-08 用户决定）。后续 CI、应用包、原生
+  decoder 和验收仅覆盖 macOS ARM64；不得新增或恢复 macOS Intel/x86_64 构建。
+  对显式 macOS Intel 构建请求应明确报不支持。Windows/Linux 的 x86、x86_64
+  和 ARM64 支持范围不变；历史 macOS Intel 验证记录不代表当前产品承诺。
+
 - Every protocol implementation must separate wire semantics, session state, codec
   contracts, and platform backends. A protocol change is incomplete until its target
   behavior is considered independently for Windows x86/i686, Windows x86_64/AMD64,
-  Windows ARM64, Linux x86/i686, Linux x86_64/AMD64, Linux ARM64, macOS x86_64, and
+  Windows ARM64, Linux x86/i686, Linux x86_64/AMD64, Linux ARM64, and
   macOS ARM64; unsupported targets must have an explicit unavailable gate rather than
   being inferred from another architecture.
 - Production software decoding must use an architecture-appropriate assembly or SIMD

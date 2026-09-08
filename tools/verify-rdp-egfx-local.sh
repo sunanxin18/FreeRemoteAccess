@@ -9,6 +9,16 @@
 # native fixture 的 FFMPEG_DIR 与 FRD_FFMPEG_TEST_BUNDLE 可使用仓库根相对路径。
 set -u -o pipefail
 
+# 在运行任何构建或测试前拒绝已退出分发范围的 macOS Intel 目标。
+if [[ "${FRD_MACOS_ARCH:-}" == x86_64 || "${FRD_FFMPEG_TEST_TARGET:-}" == x86_64-apple-darwin ]]; then
+    echo "macOS 仅构建与验证 ARM64，不再支持 Intel/x86_64 目标" >&2
+    exit 2
+fi
+if [[ "$(uname -s)" == Darwin && "$(uname -m)" != arm64 ]]; then
+    echo "macOS 本地验证需要 ARM64 原生环境，请勿使用 Intel/Rosetta 工具链" >&2
+    exit 2
+fi
+
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
@@ -134,7 +144,6 @@ target_specs=(
     x86_64-pc-windows-msvc
     i686-pc-windows-msvc
     aarch64-pc-windows-msvc
-    x86_64-apple-darwin
     aarch64-apple-darwin
 )
 
@@ -182,8 +191,7 @@ else
 fi
 
 if [[ "${FRD_VERIFY_NATIVE_FFMPEG_FIXTURES:-0}" == 1 ]]; then
-    # 可用 FRD_FFMPEG_TEST_TARGET 指定交叉 target；macOS x86_64 可在 Rosetta
-    # 下设置 x86_64-apple-darwin，仍然只把实际执行结果记为 native fixture 证据。
+    # 可用 FRD_FFMPEG_TEST_TARGET 指定目标；macOS 只验证 ARM64。
     native_bundle="${FRD_FFMPEG_TEST_BUNDLE:-}"
     native_dist="${FFMPEG_DIR:-}"
     if [[ -n "$native_bundle" ]]; then

@@ -60,18 +60,9 @@ jobs:
             runner: macos-15
             host_arch: arm64
             rust_target: aarch64-apple-darwin
-          - architecture: x86_64
-            runner: macos-15-intel
-            host_arch: x86_64
-            rust_target: x86_64-apple-darwin
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - name: Install x86 assembly toolchain
-        if: matrix.architecture == 'x86_64'
-        shell: bash
-        run: brew install nasm
 
       - name: Verify pinned Rust toolchain
         shell: bash

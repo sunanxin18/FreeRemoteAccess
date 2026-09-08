@@ -8,14 +8,8 @@ frd_host_arch="$(uname -m)"
 frd_arch="${FRD_MACOS_ARCH:-$frd_host_arch}"
 case "$frd_arch" in
   x86_64)
-    frd_platform="macos-x86_64"
-    frd_ffmpeg_arch="x86_64"
-    frd_clang_arch="x86_64"
-    frd_rust_target="x86_64-apple-darwin"
-    frd_macho_arch="x86_64"
-    frd_assembly_kind="x86asm"
-    frd_assembly_gate="have_x86asm=1"
-    frd_requires_nasm=1
+    echo "macOS 仅构建 ARM64，不再构建 Intel/x86_64" >&2
+    exit 2
     ;;
   arm64|aarch64)
     frd_arch="arm64"
@@ -26,17 +20,12 @@ case "$frd_arch" in
     frd_macho_arch="arm64"
     frd_assembly_kind="aarch64-neon"
     frd_assembly_gate="have_neon=1"
-    frd_requires_nasm=0
     ;;
   *)
     echo "不支持的 macOS FFmpeg 架构: $frd_arch" >&2
     exit 2
     ;;
 esac
-if [[ "$frd_requires_nasm" -eq 1 ]] && ! command -v nasm >/dev/null; then
-  echo "macOS $frd_arch FFmpeg build requires NASM/x86asm" >&2
-  exit 2
-fi
 frd_build="${FRD_FFMPEG_BUILD_ROOT:-$frd_root/target/ffmpeg-macos}"
 frd_cross_build=0
 if [[ "$frd_host_arch" != "$frd_arch" ]]; then
@@ -70,22 +59,13 @@ if [[ "$frd_cross_build" -eq 1 ]]; then
     "--extra-ldflags=-arch $frd_clang_arch"
   )
 fi
-if [[ "$frd_requires_nasm" -eq 0 ]]; then
-  frd_configure_args+=(--disable-x86asm)
-fi
+frd_configure_args+=(--disable-x86asm)
 ./configure "${frd_configure_args[@]}"
 make -j "$(sysctl -n hw.ncpu)"
-if [[ "$frd_requires_nasm" -eq 1 ]]; then
-  grep -q '^#define HAVE_X86ASM 1$' config.h || {
-    echo "FFmpeg $frd_arch build did not enable HAVE_X86ASM" >&2
-    exit 1
-  }
-else
-  grep -q '^#define HAVE_NEON 1$' config.h || {
-    echo "FFmpeg arm64 build did not enable HAVE_NEON" >&2
-    exit 1
-  }
-fi
+grep -q '^#define HAVE_NEON 1$' config.h || {
+  echo "FFmpeg arm64 build did not enable HAVE_NEON" >&2
+  exit 1
+}
 make install
 cd "$frd_root"
 if [[ "$frd_cross_build" -eq 1 ]]; then
