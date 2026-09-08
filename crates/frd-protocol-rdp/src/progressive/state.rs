@@ -519,7 +519,9 @@ fn parameters(
             true,
         ),
     };
-    if flags & !1 != 0 {
+    // MS-RDPEGFX v20260511 §2.2.4.2.1.5.4（p63）：FIRST高7位必须忽略。
+    // SIMPLE §2.2.4.2.1.5.3 没有这项规则，仍只接受已定义的difference位。
+    if matches!(tile, ProgressiveTile::Simple(_)) && flags & !1 != 0 {
         return Err(Error::Invalid("tile flags"));
     }
     let difference = if upgrade {

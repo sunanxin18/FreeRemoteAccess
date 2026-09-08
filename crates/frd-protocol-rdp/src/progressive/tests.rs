@@ -493,3 +493,77 @@ fn upgrade_rejects_reference_layout_changed_by_another_context() {
         )
         .is_err());
 }
+
+#[test]
+fn first_tile_reserved_flags_are_ignored_but_difference_and_simple_stay_strict() {
+    for high in [2, 4, 8, 16, 32, 64, 128, 254] {
+        let mut original = first(0, 0, &[4]);
+        if let ProgressiveTile::First(t) = &mut original {
+            t.flags = high;
+        }
+        let mut d = decoder();
+        let update = d
+            .decode(
+                1,
+                1,
+                64,
+                64,
+                &frame(vec![region((0, 0, 64, 64), vec![original.clone()])]),
+            )
+            .unwrap();
+        assert_eq!(update[0].bgra[0], 4);
+        if let ProgressiveTile::First(t) = &mut original {
+            t.flags |= 1;
+        }
+        let mut absent = decoder();
+        assert_eq!(
+            absent
+                .decode(
+                    1,
+                    1,
+                    64,
+                    64,
+                    &frame(vec![region((0, 0, 64, 64), vec![original.clone()])])
+                )
+                .unwrap_err(),
+            Error::MissingTile
+        );
+        d.end_frame(1).unwrap();
+        d.begin_frame(2).unwrap();
+        let mut diff = frame(vec![region((0, 0, 64, 64), vec![original])]);
+        diff.insert(
+            0,
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 64,
+                flags: 1,
+            }),
+        );
+        assert_eq!(d.decode(1, 1, 64, 64, &diff).unwrap()[0].bgra[0], 8);
+        let simple = ProgressiveTile::Simple(TileSimple {
+            quant_idx_y: 0,
+            quant_idx_cb: 0,
+            quant_idx_cr: 0,
+            x_idx: 0,
+            y_idx: 0,
+            flags: high,
+            y_data: &[4],
+            cb_data: &[],
+            cr_data: &[],
+            tail_data: &[],
+        });
+        let mut d = decoder();
+        assert_eq!(
+            d.decode(
+                1,
+                1,
+                64,
+                64,
+                &frame(vec![region((0, 0, 64, 64), vec![simple])])
+            )
+            .unwrap_err(),
+            Error::Invalid("tile flags")
+        );
+        assert_eq!(d.tile_count(), 0);
+    }
+}
