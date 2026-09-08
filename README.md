@@ -4,6 +4,8 @@
 
 RDP 的有界探针已增加非敏感 EGFX 阶段诊断（187 项协议测试通过），区分能力排队、曾确认和后续失败；新真实会话仍待验证，生产编码门禁不变。
 
+最新 RDP 探针（2026-09-08，`d5140a6`）已收到 EGFX 能力确认，但 AVC420/AVC444 未确认，60 秒内无首帧；已主动断开并回收。现代编码仍为实验性且生产默认关闭，详见 [验证记录](docs/validation/rdp-egfx-h264-20260907.md)。
+
 ## 2026-09-08 Linux 三架构目标解码通过
 
 [Linux run 34181521242](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34181521242) 在 `ca8628e` 上三个架构全部成功：x86_64 原生、i686 32 位目标进程、ARM64 原生各通过 11 项 plugin 单元测试与 6 项随包解码 fixture，覆盖 AVC420、AVC444 和 HEVC 离线样本。ELF/依赖/路径/ABI 与产物上传检查通过。该结果补齐 Linux 目标解码执行证据，仍不证明 Linux GUI 或真实 RDP 编码互操作。
