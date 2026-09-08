@@ -19,6 +19,10 @@ class PackageValidation(unittest.TestCase):
         self.root.mkdir(mode=0o755)
         self.add("README.md", REPO / "packaging/linux/README.md")
         self.add("share/applications/freeremotedesk.desktop", REPO / "packaging/linux/freeremotedesk.desktop")
+        self.add(
+            "share/fonts/freeremotedesk/NotoSansSC-VariableFont_wght.ttf",
+            REPO / "assets/fonts/noto-sans-sc/NotoSansSC-VariableFont_wght.ttf",
+        )
         for dest, source in {
             "Icon-Provenance.md": "assets/app-icon/README.md",
             "Material-Symbols-APACHE-2.0.txt": "assets/ui-icons/LICENSE-APACHE-2.0.txt",

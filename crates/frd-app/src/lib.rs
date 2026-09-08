@@ -76,6 +76,43 @@ mod tests {
     }
 
     #[test]
+    fn interactive_input_epoch_is_only_available_for_current_remote_surface() {
+        let session_id = SessionId::allocate();
+        let mut controller = AppController::awaiting_first_frame(session_id, 1);
+        assert_eq!(controller.interactive_input_epoch(), None);
+
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        assert_eq!(controller.interactive_input_epoch(), Some((session_id, 1)));
+
+        controller.handle_session_event(SessionEvent::SurfaceGenerationChanged {
+            session_id,
+            generation: 2,
+            size: PixelSize::new(1280, 720).unwrap(),
+        });
+        assert_eq!(controller.interactive_input_epoch(), None);
+
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 1,
+            revision: 2,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        assert_eq!(controller.interactive_input_epoch(), None);
+        controller.handle_presentation(PresentationEvent::FramePresented {
+            session_id,
+            generation: 2,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        assert_eq!(controller.interactive_input_epoch(), Some((session_id, 2)));
+    }
+
+    #[test]
     fn frame_response_timing_updates_remote_chrome_and_clears_on_generation_and_failure() {
         let session_id = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);

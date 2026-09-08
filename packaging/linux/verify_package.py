@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """静态包门禁；不执行被检查的 ELF，也不把静态检查称为运行证明。"""
 import os
+import hashlib
 from pathlib import Path
 import re
 import stat
@@ -49,6 +50,7 @@ def verify(package, platform, repo):
         "share/licenses/FreeRemoteDesk/Icon-Provenance.md": repo / "assets/app-icon/README.md",
         "share/licenses/FreeRemoteDesk/Material-Symbols-APACHE-2.0.txt": repo / "assets/ui-icons/LICENSE-APACHE-2.0.txt",
         "share/licenses/FreeRemoteDesk/Noto-Sans-SC-OFL.txt": repo / "assets/fonts/noto-sans-sc/OFL.txt",
+        "share/fonts/freeremotedesk/NotoSansSC-VariableFont_wght.ttf": repo / "assets/fonts/noto-sans-sc/NotoSansSC-VariableFont_wght.ttf",
     }
     for name in ("FreeRDP-APACHE-2.0.txt", "FreeRDP-NOTICE.txt"):
         fixed[f"share/licenses/FreeRemoteDesk/{name}"] = repo / "packaging/windows/licenses" / name
@@ -78,6 +80,12 @@ def verify(package, platform, repo):
     require(actual_dirs == dirs, f"包目录集合不匹配：{actual_dirs ^ dirs}")
     for name, source in fixed.items():
         require((root / name).read_bytes() == source.read_bytes(), f"包资源不是当前固定源：{name}")
+    font = root / "share/fonts/freeremotedesk/NotoSansSC-VariableFont_wght.ttf"
+    require(font.stat().st_size == 17773248, "随包 Noto Sans SC 字体大小不匹配")
+    require(hashlib.sha256(font.read_bytes()).hexdigest() ==
+            "e80613a35583f59b46dbf6cc2eb640f3db0bb0f53fa7f6fbaa7b09faf20e5172",
+            "随包 Noto Sans SC 字体摘要不匹配")
+    require(stat.S_IMODE(font.stat().st_mode) == 0o644, "随包字体权限不匹配")
     notice = (root / codec_prefix / "FFmpeg-NOTICE.txt").read_text()
     require("FFmpeg 8.1.2," in notice and f"Architecture: {platform}\n" in notice,
             "FFmpeg notice 版本或架构不匹配")

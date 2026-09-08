@@ -537,3 +537,25 @@ resize/render同帧；初始布局后真实UPDATE attach并验证同帧draw。�
 首帧零确认/零bootstrap/无错误，后续更晚帧唯一可消费证明。旧GL/EGL、
 nextUPDATE、resize/unrealize等矩阵保留。纯presentation_state9项通过，
 三Linux目标--tests类型检查通过（非链接），新增原生场景仍待新CI实际执行。
+## 2026-09-08 GTK 输入与字体接线
+
+`GtkRunner` 现在在每个新建的 GLArea 上安装 GTK 4 key/motion/click/scroll 控制器，
+并复用 `AppController::route_input` 与 `SessionHost::send_command`。输入门只在当前
+session/generation 完成完整首帧窗口提交确认后切换为 `Interactive`；X11 查询实际
+master keyboard 的 XKB 名称，Wayland 使用 GTK 当前设备 keymap，按下成功发送后按
+硬件键码保留 HID 映射用于释放。窗口或 GLArea 失焦、鼠标移出、generation/上下文
+失效和 disconnect 会先用旧代际发送 `ReleaseAll`，再清理 `KeyOwnershipState`。
+指针坐标来自 `GtkFrameArea::current_viewport()`，并按 GLArea scale factor 转换，
+避免使用窗口逻辑尺寸推断远端像素。
+
+Linux stage 现在复制
+`share/fonts/freeremotedesk/NotoSansSC-VariableFont_wght.ttf`，静态 verifier 精确
+检查 17,773,248 字节、SHA-256
+`e80613a35583f59b46dbf6cc2eb640f3db0bb0f53fa7f6fbaa7b09faf20e5172` 和 0644 权限。
+GTK runner 通过公开 fontconfig/PangoCairo ABI 为窗口树建立私有 font map；不写入
+全局或用户字体配置，缺少 ABI 或随包字体时不伪造通过。
+
+本机 macOS 只能执行 `frd-shell-gtk` 非 GTK cfg 测试；Linux GTK 输入控制器和
+PangoCairo 代码需由 Linux 目标 CI 编译。已有 `34223764518`（提交 `43c9b01`）
+证明三架构 X11/Wayland 1×/2× 的 frame、runner、submission 和 observer gap 通过；
+该轮在输入接线之前，不能替代本次新代码的编译与物理输入运行证据。

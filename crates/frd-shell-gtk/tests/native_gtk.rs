@@ -86,6 +86,7 @@ fn native_gtk_frame_adapter_roundtrip() {
     window.present();
     let (receipt, viewport) = wait_draw(&adapter);
     assert!(receipt.is_valid());
+    assert_eq!(adapter.current_viewport(), Some(viewport));
     verify_pixels(&adapter, viewport, expected_scale, [255, 0, 0, 255]);
     adapter.widget().set_error(Some(&glib::Error::new(
         gdk::GLError::NotAvailable,
@@ -100,9 +101,11 @@ fn native_gtk_frame_adapter_roundtrip() {
     let (second, viewport) = wait_draw(&adapter);
     assert!(!receipt.is_valid());
     assert!(second.is_valid());
+    assert_eq!(adapter.current_viewport(), Some(viewport));
     verify_pixels(&adapter, viewport, expected_scale, [64, 160, 224, 255]);
     window.set_child(gtk4::Widget::NONE);
     assert!(!second.is_valid(), "unrealize 必须撤销旧 draw proof");
+    assert_eq!(adapter.current_viewport(), None);
     assert!(adapter
         .drain_events()
         .iter()

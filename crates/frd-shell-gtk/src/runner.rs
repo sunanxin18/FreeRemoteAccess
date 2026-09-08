@@ -1,6 +1,10 @@
 //! GTK 产品事件泵；仅消费实际窗口提交证明后发布首帧，输入仍由 controller 门控。
+use crate::font_fallback::BundledFontMap;
+use crate::input_ownership::{FilterResult, KeyDecision, KeyOwner, KeyOwnershipState, KeyPhase};
+use crate::native_keymap::NativeKeymap;
 use crate::{AdapterError, AdapterEvent, GtkFrameArea, SubmissionError, SubmitError};
 use frd_app::{persist_profile_job, AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
+use frd_core::{ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton};
 use frd_core::{DisplayIntent, PixelSize, ResolutionMode, SecretBuffer, SessionId, TargetSystem};
 use frd_frame::FrameTransaction;
 use frd_platform_api::{
@@ -9,16 +13,17 @@ use frd_platform_api::{
 };
 use frd_protocol_api::{
     ConnectionStage, PresentationEvent, ProtocolCatalog, ProtocolError, ProtocolFactory,
-    SessionCommand, SessionEvent,
+    SessionCommand, SessionEvent, SessionInput,
 };
 use frd_shell_desktop::{
     AcceptedLaunchOutcome, AudioOutputFactory, BackgroundCleanupOutcome, BackgroundLaunchOutcome,
-    SessionHost, WakeSink,
+    InputGate, InputOwnership, InputRouter, SessionHost, WakeSink,
 };
 use frd_ui_model::ProfilePersistenceWarning;
 use gtk4::{glib, prelude::*};
 use std::{
     cell::RefCell,
+    collections::HashMap,
     rc::{Rc, Weak},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -263,6 +268,11 @@ struct State {
     allow_close: bool,
     loading_profile: Option<ConnectionProfileKey>,
     failure: Option<&'static str>,
+    font_map: Option<BundledFontMap>,
+    input: InputRouter,
+    ownership: KeyOwnershipState,
+    keymap: Option<NativeKeymap>,
+    sent_hid_by_hardware: HashMap<u32, PhysicalKeyCode>,
 }
 /// 只保留固定错误分类；不保存 GTK/协议的任意错误字符串。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,6 +396,10 @@ impl GtkRunner {
         remote_container.append(frames.widget());
         stack.add_named(&remote_container, Some("remote"));
         window.set_child(Some(&stack));
+        let font_map = BundledFontMap::load();
+        if let Some(map) = font_map.as_ref().and_then(BundledFontMap::map) {
+            window.set_font_map(Some(map));
+        }
         let state = Rc::new(RefCell::new(State {
             owner: Weak::new(),
             launch,
@@ -413,6 +427,11 @@ impl GtkRunner {
             allow_close: false,
             loading_profile: None,
             failure: None,
+            font_map,
+            input: InputRouter::default(),
+            ownership: KeyOwnershipState::new(),
+            keymap: NativeKeymap::new().ok(),
+            sent_hid_by_hardware: HashMap::new(),
         }));
         state.borrow_mut().owner = Rc::downgrade(&state);
         wire(&state);
@@ -478,6 +497,7 @@ impl Drop for GtkRunner {
     fn drop(&mut self) {
         self.pump.abort();
         let mut state = self.state.borrow_mut();
+        state.release_input_for_gate_change(InputGate::Blocked);
         let _ = state.sessions.cancel_pending_launch();
         let _ = state.sessions.send_command(SessionCommand::Disconnect);
         state.frames.detach();
@@ -583,7 +603,20 @@ fn wire(state: &Rc<RefCell<State>>) {
         s.finish_close();
         glib::Propagation::Stop
     });
+    let weak = Rc::downgrade(state);
+    widgets.window.connect_is_active_notify(move |window| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        if window.is_active() {
+            state.input.focus_gained();
+        } else {
+            state.release_input_on_focus_loss();
+        }
+    });
     install_frame_pump(widgets.frames.widget(), Rc::downgrade(state));
+    install_input_controllers(widgets.frames.widget(), Rc::downgrade(state));
 }
 fn install_frame_pump(area: &gtk4::GLArea, weak: Weak<RefCell<State>>) {
     area.add_tick_callback(move |_, _| {
@@ -597,8 +630,329 @@ fn install_frame_pump(area: &gtk4::GLArea, weak: Weak<RefCell<State>>) {
     });
 }
 
+fn install_input_controllers(area: &gtk4::GLArea, weak: Weak<RefCell<State>>) {
+    area.set_focusable(true);
+    let key = gtk4::EventControllerKey::new();
+    key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let key_weak = weak.clone();
+    key.connect_key_pressed(move |controller, _keyval, hardware, modifiers| {
+        let Some(state) = key_weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        state
+            .borrow_mut()
+            .handle_key(controller, hardware, modifiers, KeyState::Pressed)
+    });
+    let key_weak = weak.clone();
+    key.connect_key_released(move |controller, _keyval, hardware, modifiers| {
+        let Some(state) = key_weak.upgrade() else {
+            return;
+        };
+        let _ = state
+            .borrow_mut()
+            .handle_key(controller, hardware, modifiers, KeyState::Released);
+    });
+    area.add_controller(key);
+
+    let focus_weak = weak.clone();
+    area.connect_has_focus_notify(move |area| {
+        let Some(state) = focus_weak.upgrade() else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        if area.has_focus() {
+            state.input.focus_gained();
+        } else {
+            state.release_input_on_focus_loss();
+        }
+    });
+
+    let motion = gtk4::EventControllerMotion::new();
+    let motion_weak = weak.clone();
+    motion.connect_motion(move |_, x, y| {
+        if let Some(state) = motion_weak.upgrade() {
+            state.borrow_mut().handle_motion(x, y);
+        }
+    });
+    let leave_weak = weak.clone();
+    motion.connect_leave(move |_| {
+        if let Some(state) = leave_weak.upgrade() {
+            state.borrow_mut().release_input_on_cursor_leave();
+        }
+    });
+    area.add_controller(motion);
+
+    let click = gtk4::GestureClick::builder().button(0).build();
+    let press_weak = weak.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        let Some(state) = press_weak.upgrade() else {
+            return;
+        };
+        if let Some(area) = gesture
+            .widget()
+            .and_then(|widget| widget.downcast::<gtk4::GLArea>().ok())
+        {
+            area.grab_focus();
+        }
+        state
+            .borrow_mut()
+            .handle_button(gesture.current_button(), x, y, ButtonState::Pressed);
+    });
+    let release_weak = weak.clone();
+    click.connect_released(move |gesture, _, x, y| {
+        if let Some(state) = release_weak.upgrade() {
+            state
+                .borrow_mut()
+                .handle_button(gesture.current_button(), x, y, ButtonState::Released);
+        }
+    });
+    area.add_controller(click);
+
+    let scroll = gtk4::EventControllerScroll::new(
+        gtk4::EventControllerScrollFlags::VERTICAL
+            | gtk4::EventControllerScrollFlags::HORIZONTAL
+            | gtk4::EventControllerScrollFlags::DISCRETE,
+    );
+    let scroll_weak = weak;
+    scroll.connect_scroll(move |_, dx, dy| {
+        if let Some(state) = scroll_weak.upgrade() {
+            state.borrow_mut().handle_scroll(dx, dy);
+        }
+        glib::Propagation::Stop
+    });
+    area.add_controller(scroll);
+}
+
+fn pointer_button(button: u32) -> Option<PointerButton> {
+    Some(match button {
+        1 => PointerButton::Primary,
+        2 => PointerButton::Middle,
+        3 => PointerButton::Secondary,
+        8 => PointerButton::Back,
+        9 => PointerButton::Forward,
+        _ => return None,
+    })
+}
+
+fn modifiers_to_core(modifiers: gtk4::gdk::ModifierType) -> Modifiers {
+    Modifiers {
+        shift: modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK),
+        control: modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK),
+        alt: modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK),
+        meta: modifiers.contains(gtk4::gdk::ModifierType::META_MASK),
+    }
+}
+
 impl State {
+    fn send_event_for_epoch(&mut self, event: InputEvent, epoch: Option<(SessionId, u64)>) -> bool {
+        let Some((session_id, generation)) = epoch else {
+            return false;
+        };
+        self.sessions
+            .send_command(SessionCommand::Input(SessionInput {
+                session_id,
+                generation,
+                event,
+            }))
+            .is_ok()
+    }
+
+    fn send_routed_input(&mut self, event: InputEvent) -> bool {
+        self.launch
+            .controller()
+            .route_input(event)
+            .is_some_and(|command| self.sessions.send_command(command).is_ok())
+    }
+
+    fn release_input_for_gate_change(&mut self, gate: InputGate) {
+        let old_epoch = self.input.interactive_epoch();
+        let release = self.input.set_gate(gate);
+        if let Some(event) = release {
+            let _ = self.send_event_for_epoch(event, old_epoch);
+        }
+        self.ownership.reset_epoch();
+        self.sent_hid_by_hardware.clear();
+    }
+
+    fn release_input_on_focus_loss(&mut self) {
+        let old_epoch = self.input.interactive_epoch();
+        let release = self.input.focus_lost();
+        if let Some(event) = release {
+            let _ = self.send_event_for_epoch(event, old_epoch);
+        }
+        self.ownership.reset_epoch();
+        self.sent_hid_by_hardware.clear();
+    }
+
+    fn release_input_on_cursor_leave(&mut self) {
+        let old_epoch = self.input.interactive_epoch();
+        let release = self.input.cursor_left();
+        if let Some(event) = release {
+            let _ = self.send_event_for_epoch(event, old_epoch);
+        }
+        self.ownership.reset_epoch();
+        self.sent_hid_by_hardware.clear();
+    }
+
+    fn sync_input_gate(&mut self) {
+        let desired = self
+            .launch
+            .controller()
+            .interactive_input_epoch()
+            .map(|(session_id, generation)| InputGate::Interactive {
+                session_id,
+                generation,
+            })
+            .unwrap_or(InputGate::Blocked);
+        let desired_epoch = match desired {
+            InputGate::Blocked => None,
+            InputGate::Interactive {
+                session_id,
+                generation,
+            } => Some((session_id, generation)),
+        };
+        if self.input.interactive_epoch() != desired_epoch {
+            self.release_input_for_gate_change(desired);
+        }
+        if matches!(desired, InputGate::Interactive { .. }) && self.frames.widget().has_focus() {
+            self.input.focus_gained();
+            let _ = self.input.enter_remote_surface();
+        }
+    }
+
+    fn scale_point(&self, x: f64, y: f64) -> (f32, f32) {
+        let scale = self.frames.widget().scale_factor().max(1) as f64;
+        ((x * scale) as f32, (y * scale) as f32)
+    }
+
+    fn handle_motion(&mut self, x: f64, y: f64) {
+        let Some(viewport) = self.frames.current_viewport() else {
+            return;
+        };
+        let (x, y) = self.scale_point(x, y);
+        if let Some(event) = self
+            .input
+            .pointer_moved(x, y, viewport, InputOwnership::Remote)
+        {
+            if !self.send_routed_input(event) {
+                self.release_input_on_cursor_leave();
+            }
+        }
+    }
+
+    fn handle_button(&mut self, raw_button: u32, x: f64, y: f64, state: ButtonState) {
+        let Some(button) = pointer_button(raw_button) else {
+            return;
+        };
+        let Some(viewport) = self.frames.current_viewport() else {
+            return;
+        };
+        let (x, y) = self.scale_point(x, y);
+        let _ = self.input.enter_remote_surface();
+        if let Some(event) = self
+            .input
+            .pointer_moved(x, y, viewport, InputOwnership::Remote)
+        {
+            let _ = self.send_routed_input(event);
+        }
+        if let Some(event) =
+            self.input
+                .pointer_button(button, state, viewport, InputOwnership::Remote)
+        {
+            let _ = self.send_routed_input(event);
+        }
+    }
+
+    fn handle_scroll(&mut self, dx: f64, dy: f64) {
+        let Some(viewport) = self.frames.current_viewport() else {
+            return;
+        };
+        let clamp = |value: f64| value.round().clamp(-127.0, 127.0) as i8;
+        if let Some(event) =
+            self.input
+                .wheel(clamp(dx), clamp(dy), viewport, InputOwnership::Remote)
+        {
+            let _ = self.send_routed_input(event);
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        controller: &gtk4::EventControllerKey,
+        hardware: u32,
+        modifiers: gtk4::gdk::ModifierType,
+        phase: KeyState,
+    ) -> glib::Propagation {
+        self.input.set_modifiers(modifiers_to_core(modifiers));
+        let code = if phase == KeyState::Released {
+            self.sent_hid_by_hardware.get(&hardware).copied()
+        } else {
+            controller
+                .current_event_device()
+                .and_then(|device| self.keymap.as_mut()?.physical_key(&device, hardware).ok())
+        };
+        let remote_eligible = self.input.interactive_epoch().is_some()
+            && self.input.keyboard_domain() == frd_shell_desktop::KeyboardDomain::RemoteSurface;
+        let repeat = phase == KeyState::Pressed
+            && self.ownership.owner(hardware) == Some(KeyOwner::RemotePhysical);
+        let Some(pending) = self.ownership.begin_key(
+            code.map(|_| hardware),
+            if phase == KeyState::Pressed {
+                KeyPhase::Press
+            } else {
+                KeyPhase::Release
+            },
+            repeat,
+            remote_eligible,
+        ) else {
+            return glib::Propagation::Stop;
+        };
+        let decision = self.ownership.finish_key(pending, FilterResult::default());
+        match decision {
+            KeyDecision::RemotePress { permit, .. } => {
+                let Some(code) = code else {
+                    let _ = self.ownership.confirm_physical_press(permit, false);
+                    return glib::Propagation::Stop;
+                };
+                let event = self.input.dispatch_key_event(
+                    Some(code),
+                    KeyState::Pressed,
+                    false,
+                    true,
+                    false,
+                );
+                let forwarded = event.is_some_and(|event| self.send_routed_input(event));
+                if forwarded {
+                    self.sent_hid_by_hardware.insert(hardware, code);
+                } else if let Some(release) = self.input.keyboard_capability_lost() {
+                    let _ = self.send_routed_input(release);
+                }
+                let _ = self.ownership.confirm_physical_press(permit, forwarded);
+                glib::Propagation::Stop
+            }
+            KeyDecision::RemoteRelease { hardware_keycode } => {
+                let code = self.sent_hid_by_hardware.remove(&hardware_keycode).or(code);
+                let event =
+                    self.input
+                        .dispatch_key_event(code, KeyState::Released, false, true, false);
+                if let Some(event) = event {
+                    let _ = self.send_routed_input(event);
+                }
+                glib::Propagation::Stop
+            }
+            KeyDecision::InputMethod { .. } | KeyDecision::Ignore => {
+                if remote_eligible {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+            KeyDecision::Local => glib::Propagation::Proceed,
+        }
+    }
+
     fn reset_canvas(&mut self) {
+        self.release_input_for_gate_change(InputGate::Blocked);
         self.submission_enabled = false;
         self.pending_frames = None;
         self.frames.detach();
@@ -608,6 +962,7 @@ impl State {
         self.frames.widget().set_visible(false);
         self.remote_container.append(self.frames.widget());
         install_frame_pump(self.frames.widget(), self.owner.clone());
+        install_input_controllers(self.frames.widget(), self.owner.clone());
     }
     fn identity_edited(&mut self) {
         let Some(form) = self.launch.controller_mut().connection_form_mut() else {
@@ -697,6 +1052,9 @@ impl State {
         }
     }
     fn intent(&mut self, intent: AppIntent) {
+        if matches!(intent, AppIntent::CancelConnect | AppIntent::Disconnect) {
+            self.release_input_for_gate_change(InputGate::Blocked);
+        }
         if matches!(intent, AppIntent::CancelConnect | AppIntent::Disconnect)
             && self.sessions.launch_is_pending()
         {
@@ -933,6 +1291,15 @@ impl State {
             if Some(session) != self.active_session {
                 continue;
             }
+            if matches!(
+                event,
+                SessionEvent::SurfaceGenerationChanged { .. }
+                    | SessionEvent::Error(_)
+                    | SessionEvent::Closed(_)
+            ) {
+                // 在 controller 进入 Awaiting/Failed 前，仍用旧代际发送一次释放。
+                self.release_input_for_gate_change(InputGate::Blocked);
+            }
             cleanup |= matches!(event, SessionEvent::Error(_) | SessionEvent::Closed(_));
             let persist = matches!(
                 event,
@@ -1037,6 +1404,7 @@ impl State {
                                 completeness: receipt.completeness,
                             },
                         );
+                        self.sync_input_gate();
                     }
                 }
                 Ok(None) => {}

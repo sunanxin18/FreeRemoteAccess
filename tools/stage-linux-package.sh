@@ -30,8 +30,11 @@ trap 'rm -rf "$attempt"' EXIT
 package="$attempt/FreeRemoteDesk"
 umask 022
 mkdir -p "$package/codecs/ffmpeg-8.1.2/$platform" "$package/share/applications" "$package/share/licenses/FreeRemoteDesk"
+mkdir -p "$package/share/fonts/freeremotedesk"
 install -m 755 "$binary" "$package/freeremotedesk-linux"
 install -m 644 "$codec_bundle"/* "$package/codecs/ffmpeg-8.1.2/$platform/"
+install -m 644 assets/fonts/noto-sans-sc/NotoSansSC-VariableFont_wght.ttf \
+  "$package/share/fonts/freeremotedesk/NotoSansSC-VariableFont_wght.ttf"
 install -m 644 packaging/linux/freeremotedesk.desktop "$package/share/applications/"
 install -m 644 packaging/linux/README.md "$package/README.md"
 install -m 644 assets/app-icon/README.md "$package/share/licenses/FreeRemoteDesk/Icon-Provenance.md"

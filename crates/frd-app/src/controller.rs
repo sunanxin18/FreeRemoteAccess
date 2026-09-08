@@ -740,6 +740,17 @@ impl AppController {
             .intersection(self.policy.as_capabilities())
     }
 
+    /// 返回当前已经完成首帧呈现、允许交互输入的会话代际。
+    /// Connecting、AwaitingFirstFrame、Disconnecting 和 Failed 都必须保持阻断。
+    pub fn interactive_input_epoch(&self) -> Option<(SessionId, u64)> {
+        if matches!(self.page, Page::RemoteSession { .. }) {
+            self.session_id
+                .map(|session_id| (session_id, self.generation))
+        } else {
+            None
+        }
+    }
+
     pub fn set_platform_capabilities(&mut self, capabilities: PlatformCapabilities) {
         self.platform_capabilities = capabilities;
         self.refresh_presented_capabilities();

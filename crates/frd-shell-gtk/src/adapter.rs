@@ -45,6 +45,7 @@ impl Drop for Active {
 struct State {
     pending: PendingBatch,
     active: Option<Active>,
+    viewport: Option<ContentViewport>,
     events: Vec<AdapterEvent>,
     faulted: bool,
     submission: Option<Rc<WindowSubmissionObserver>>,
@@ -63,6 +64,7 @@ impl State {
         self.events
             .retain(|event| !matches!(event, AdapterEvent::Drawn { .. }));
         let discarded_transactions = self.pending.invalidate();
+        self.viewport = None;
         self.event(AdapterEvent::Invalidated {
             discarded_transactions,
         });
@@ -140,6 +142,11 @@ impl GtkFrameArea {
     pub fn widget(&self) -> &GLArea {
         &self.area
     }
+    /// 与最近一次成功 GL draw 使用的同一视口；查询不触发 GL 或 GTK 操作。
+    /// 任何事务、窗口布局或上下文失效都会清除此快照。
+    pub fn current_viewport(&self) -> Option<ContentViewport> {
+        self.state.borrow().viewport
+    }
     pub fn submit_batch(&self, transactions: Vec<FrameTransaction>) -> Result<(), RejectedBatch> {
         let mut state = self.state.borrow_mut();
         if !state.pending.closed && self.area.is_realized() && self.area.error().is_some() {
@@ -148,7 +155,13 @@ impl GtkFrameArea {
                 transactions,
             });
         }
+        let resets_surface = transactions
+            .iter()
+            .any(|transaction| matches!(transaction, FrameTransaction::Startup { .. }));
         state.pending.push(transactions)?;
+        if resets_surface {
+            state.viewport = None;
+        }
         // 失败后只允许新的完整 startup（invalidate 已置位）重新建立执行器。
         state.faulted = false;
         drop(state);
@@ -274,6 +287,8 @@ fn render(
             .map_err(AdapterError::Batch)?;
         if let Some(surface) = outcome.installed_surface {
             active.remote = Some(surface.size);
+            // 新会话/代际必须先绘制新 surface，不能让输入继续使用旧坐标。
+            state.viewport = None;
         }
         state.pending.applied();
     }
@@ -286,8 +301,11 @@ fn render(
         {
             if let Some(observer) = &state.submission {
                 // 不克隆证明。布局或 bootstrap 导致的关联拒绝由独立 observer 错误出口报告。
-                let _ = observer.record_draw(receipt);
+                if observer.record_draw(receipt).is_ok() {
+                    state.viewport = Some(viewport);
+                }
             } else {
+                state.viewport = Some(viewport);
                 state.event(AdapterEvent::Drawn { receipt, viewport });
             }
         }

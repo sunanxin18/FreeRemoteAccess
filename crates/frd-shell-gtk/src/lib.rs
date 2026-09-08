@@ -1,5 +1,7 @@
 //! GTK 4.14 GLArea 帧事务适配器；命令提交事件不是窗口呈现 ACK。
 pub mod display_geometry;
+#[cfg(all(target_os = "linux", feature = "gtk-shell"))]
+mod font_fallback;
 pub mod input_keymap;
 pub mod input_ownership;
 #[cfg(all(

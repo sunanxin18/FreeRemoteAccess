@@ -1,6 +1,6 @@
 # GTK 帧事务适配器
 
-本组件适配 GTK 4.14，以固定 gtk4-rs 0.9.7 的 `v4_14` API 为基线。仅 Linux x86、x86_64、ARM64 的 `gtk-shell` feature 编译 GTK 后端；macOS/Windows 不加载 GTK 系统依赖。它接收已有 `FrameTransaction`，复用 GL 执行器上传、绘制；尚未接入登录窗口、Linux 产品入口、输入或生产呈现 ACK。
+本组件适配 GTK 4.14，以固定 gtk4-rs 0.9.7 的 `v4_14` API 为基线。仅 Linux x86、x86_64、ARM64 的 `gtk-shell` feature 编译 GTK 后端；macOS/Windows 不加载 GTK 系统依赖。它接收已有 `FrameTransaction`，复用 GL 执行器上传、绘制，并由 runner 接入登录窗口、窗口提交确认和原生键鼠输入。
 
 `GtkFrameArea` 应由 GTK 主线程持有，`widget()` 加入宿主窗口。`submit_batch` 仅保留一个完整批次，至多 4096 个事务、256 MiB 像素；拒绝时 `RejectedBatch` 原样返回批次。调用者必须保留并重试 Busy，不能丢弃依赖前序内容的增量。`drain_events` 返回同类合并的有限状态事件。`Drawn` 携带非 Clone `DrawReceipt` 和渲染同一 `ContentViewport`，它只证明 GL 命令提交，不证明 GTK snapshot 被合成或显示，不能发送生产 ACK。
 
@@ -41,7 +41,9 @@ cargo +1.96.0 test --locked -p frd-shell-gtk --features gtk-shell \
 
 产品事件泵使用合并 wake 的异步主线程消息，覆盖启动结果、取消、迟到启动、清理、证书 pending commands、后台加载密码和 deferred profile persistence。controller 读取的 profile store 是只读内存快照；真实目录 list/upsert 在后台 job 中执行，缓存从 AppLaunch 已有目录初始化。选择新连接或修改连接身份会清除已加载的旧密码。不同 session 重建 GLArea 和 frame pump；清理会丢弃旧事务、纹理及事件，防止重连时显示旧会话内容。
 
-当前 runner 尚未消费独立 WindowSubmission，未发布 FramePresented/生产 ACK，也未启用远程输入；界面保持“正在准备远程画面”。Linux 产品入口尚未切换，不能声明完整 GTK 客户端已完成。当前能力继承组合根传入的工厂和策略，不会把尚未接线的视频、音频、剪贴板伪装为支持。
+runner 在确认独立 WindowSubmission 后发布 `FramePresented`，仅在当前完整首帧建立 `InputGate::Interactive`。GLArea 的键盘控制器通过当前 GDK 设备和 XKB 映射解析 USB HID 物理键，释放沿用成功按下时的映射；指针使用同一 `ContentViewport`，窗口失焦、代际变化、画布失效或拖出内容区会发送一次 `ReleaseAll`。输入仍由 `AppController::route_input` 和 `SessionHost` 发送，GTK 不直接依赖 RDP wire 类型。Linux 产品入口尚未切换，不能声明完整 GTK 客户端已完成。当前能力继承组合根传入的工厂和策略，不会把尚未接线的视频、音频、剪贴板伪装为支持。
+
+随 Linux 包提供 Noto Sans SC 变量字体到私有 `share/fonts/freeremotedesk` 目录。runner 通过 fontconfig/PangoCairo 公开 ABI 建立窗口树私有 font map，不修改全局或用户字体配置；缺少该 ABI 时保留宿主字体并让包验证失败，避免用系统安装状态掩盖缺失资源。
 
 2026-09-08 GUI 实现依据：已读取 Apple 官方 DocC text-fields/windows JSON，采用持久字段标签、安全密码字段、合理 Tab 顺序、原生系统窗口控制。M3 主站仅返回 JavaScript，当前工具无可用浏览器，因此改读 Google 官方 Material Web 的 text-field 文档（label、password、验证行为）；不能把此替代读取记录为完整 M3 交互页面或视觉验收。正式 GUI 验收仍需 scale、主题、键盘/IME 和窄窗检查。
 
