@@ -563,3 +563,17 @@ x86_64、i686、AArch64 上通过 X11/Wayland 1×/2× 的 frame、runner、submi
 和 observer gap；runner 日志包含 `font_map_loaded=true`，离屏登录/连接 PNG
 确认中文可见。测试使用 GTK/GLArea fixture 和合成协议事件，仍不等同于物理键鼠
 注入、发行版硬件 GPU 或真实 RDP 控制验收。
+
+## 2026-09-08 跨平台包与目标运行时收口
+
+提交 `af77f46` 的托管包门禁已全部完成：Windows run
+`34233406397` 的 x86_64、i686、ARM64 包 verifier 与 Windows ARM64 原生
+ClearCodec/NSCodec/Progressive 解码器运行时均成功；Linux FFmpeg run
+`34233406570` 的 x86_64、i686、AArch64 包和目标加载 fixture 成功；macOS
+ARM64 run `34233406424` 成功。顶层 CI `34234194817`（文档提交
+`5c7639e`）的格式、核心/协议/桌面测试也成功。
+
+这些结果证明构建、包布局、架构标识、随包解码器加载和指定离线目标 fixture；
+它们不提升 Linux 的产品入口、物理 X11/Wayland 键鼠、硬件 GPU 或真实 RDP
+控制状态。`GtkRunner` 仍是独立 GTK 壳技术路径，Linux 入口当前继续使用
+winit/egui/wgpu，下一门禁仍是产品入口切换及真实桌面控制验收。
