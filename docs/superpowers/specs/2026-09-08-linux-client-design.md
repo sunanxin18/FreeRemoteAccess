@@ -116,3 +116,25 @@ CompiledFrameDrain、FrameCompileFailure、FrameBatchMetricsSnapshot。外部壳
 查看事务、消费取出原事务、读取原错误与四项指标；构造与字段仍受限。原方法体未改，
 没有复制编译器或增加 GTK 类型。retire 是当前会话的永久呈现退休，不能被当作临时
 隐藏或可恢复 GPU 上下文丢失的暂停操作。
+
+
+### GTK 呈现语义与现有后端对齐
+
+当前 wgpu 的 execute_frame_with_fault_scope 顺序为 submit、queue.present、完成错误
+scope、确认原 receipt；不是物理 scanout 证明。GTK 应实现同强度的窗口提交确认，
+不无意提高门槛，也不把离屏draw或时间戳当作提交。
+
+上游 GTK4.14.0 [Wayland实现](https://github.com/GNOME/gtk/blob/4.14.0/gdk/wayland/gdksurface-wayland.c)
+会以 frame callback 时间加估计刷新间隔填写 presentation_time；complete仅表示不再
+填入值。故这些字段仅作诊断。正常 GtkWindow surface_render -> widget snapshot ->
+GLArea render/append GLTexture -> gsk_renderer_render -> end_frame/swap 在 PAINT 中
+同步发生，AFTER_PAINT随后发生。候选接线是在 GLArea render 中确认当前正处于同一
+native surface 的 render 信号栈，绑定 surface/clock/framecounter/context epoch/
+renderer serial/远端revision，在同counter after-paint中消费一次并复核生命周期。
+不能使用 surface::render 的 after handler，它受 true-handled accumulator 截断。
+
+仍须实测和实现：排除离屏snapshot、隐藏/空damage、同帧覆盖和resize/unrealize；
+实际 GSK/backend 提交的错误观察不能只读取 GLArea context。GTK4.14 EGL end-frame
+忽略swap返回值，因此单独after-paint也不足以达到现有clean-scope强度。须固定并核对
+部署的GTK/GSK版本，先取得实际提交链证据再开放生产ACK。此审查是4.14.0上游源码，
+尚未声称Ubuntu具体补丁包或产品窗口通过。
