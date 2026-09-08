@@ -193,6 +193,13 @@ unsafe fn verify_output_contracts(context: &ExternalContext, gl: &glow::Context)
                 }
                 if contract == GlOutputContract::SrgbEncodedRgba8 {
                     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    let previous_base =
+                        gl.get_tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_BASE_LEVEL);
+                    let previous_max =
+                        gl.get_tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL);
+                    // 将level1设为唯一有效mip；不让level0的同尺寸图像破坏附件完整性。
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_BASE_LEVEL, 1);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, 1);
                     gl.tex_image_2d(
                         glow::TEXTURE_2D,
                         1,
@@ -220,6 +227,8 @@ unsafe fn verify_output_contracts(context: &ExternalContext, gl: &glow::Context)
                             .is_err(),
                         "编码RGBA8契约只能接受level0"
                     );
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_BASE_LEVEL, previous_base);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, previous_max);
                     gl.framebuffer_texture_2d(
                         glow::FRAMEBUFFER,
                         glow::COLOR_ATTACHMENT0,
