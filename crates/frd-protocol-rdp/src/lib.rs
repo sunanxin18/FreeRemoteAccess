@@ -66,5 +66,4 @@ const IDENTITY_VERIFICATION_SEAM: IdentityVerificationSeam = (
 );
 
 #[allow(dead_code)]
-#[path = "progressive/wire.rs"]
-mod progressive_wire;
+mod progressive;
