@@ -37,3 +37,24 @@ RDP 首次连接与已存指纹重连、远程画面、无破坏性的鼠标/键
 Keychain 用隔离的合成凭据验证；不为测试保存用户真实密码。
 客户端交付与具体服务端协议功能分别记录，不能把 RDP GUI 通过扩展为 Apple HP、
 音频或其他未执行的真机测试通过。
+
+## 2026-09-08 控制岛隐藏与首次窗口几何修正
+
+macOS ARM64 会话复用共享控制岛隐藏状态机，不在每次重绘时强制显示。
+隐藏只影响产品控件；原生交通灯和标题栏安全区域继续保留。显隐前后的远程内容
+矩形完全相同，渲染与输入继续使用同一矩形，不因悬停而缩放或移动远程桌面。
+
+首次完整远程帧到达后，平台 shell 根据该画面的实际比例、固定有效标题栏高度和
+当前屏幕的原生可用区域计算窗口尺寸。协议请求仍优先本地显示器原生分辨率，不
+降为固定 2560×1440，也不通过拉伸像素消除黑边。后续手动缩放和重连保留用户尺寸；
+任意比例的最大化/全屏窗口仍可能出现等比显示的留边，须由已验证的动态分辨率能力
+另行解决，不能冒充解码失败或偷偷裁剪画面。
+
+本次复核官方 [Apple Windows HIG](https://developer.apple.com/design/human-interface-guidelines/windows)、
+[AppKit FullSizeContentView](https://developer.apple.com/documentation/appkit/nswindow/stylemask-swift.struct/fullsizecontentview)
+与 [Material 3 Toolbars](https://m3.material.io/components/toolbars/overview)。
+保留宿主窗口控制、拖动/缩放和原生安全区域；居中产品控件自动隐藏是既有远程内容
+优先策略，隐藏后仍保留顶部唤出路径和键盘可达性。本次不新增视觉规范例外。
+
+本条覆盖早期 Intel 交付说明：macOS 当前及后续仅支持 ARM64；Intel 不再是构建、
+发布或验收目标。真实用户已授权的登录信息持久化使用 Keychain，不使用普通配置。

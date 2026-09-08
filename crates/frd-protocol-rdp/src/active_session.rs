@@ -25,8 +25,8 @@ use crate::clipboard::{self, ClipboardServiceAction};
 use crate::connector::{ActivatedRdpSession, RdpGraphicsCapability};
 use crate::display::{DisplayControlAdapter, DisplayControlCapabilityState, ResizeConfirmation};
 use crate::egfx::EgfxAdapter;
-use crate::error::{rdp_error, RDP_ACTIVATION_FAILED};
-use crate::factory::RdpGraphicsObserver;
+use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_EGFX_FAILED};
+use crate::factory::{RdpEgfxFailure, RdpGraphicsCapabilities, RdpGraphicsObserver};
 use crate::input::RdpInputState;
 use crate::runtime::{
     drain_active_commands, drain_reactivation_commands, ActiveCommandBatch, ActiveCommandDrain,
@@ -370,13 +370,29 @@ fn run_active_loop(
             .frames_runtime_accepted_total
             .saturating_add(accepted);
         let current_graphics = graphics_capability.snapshot();
-        if previous_graphics != current_graphics {
-            if let Some(observer) = graphics_observer {
-                observer.observe(current_graphics);
-            }
-        }
+        publish_graphics_status(previous_graphics, current_graphics, graphics_observer)?;
         service_optional_channels(active_stage, writer, runtime, display, audio, Vec::new())?;
     }
+}
+
+/// 先发布固定诊断，再终止已失败的图形会话；正常重激活停用不构成失败。
+fn publish_graphics_status(
+    previous: RdpGraphicsCapabilities,
+    current: RdpGraphicsCapabilities,
+    observer: Option<&dyn RdpGraphicsObserver>,
+) -> Result<(), ProtocolError> {
+    if previous != current {
+        if let Some(observer) = observer {
+            observer.observe(current);
+        }
+    }
+    let diagnostics = current.egfx_diagnostics;
+    if diagnostics.first_failure != Some(RdpEgfxFailure::Reactivation)
+        && (diagnostics.failure_count > 0 || diagnostics.first_failure.is_some())
+    {
+        return Err(rdp_error(RDP_EGFX_FAILED));
+    }
+    Ok(())
 }
 
 fn observe_egfx_confirmation(
@@ -1013,6 +1029,53 @@ mod tests {
         suspend_active_input_capabilities, ActiveOutputControl, DisplayRetryState,
         ReactivationOutcome, ReactivationSurfaceDisposition,
     };
+
+    #[test]
+    fn fatal_egfx_status_is_observed_before_sanitized_session_failure() {
+        use crate::factory::RdpEgfxFailure;
+        let previous = RdpGraphicsCapability::default().snapshot();
+        for (count, reason) in [
+            (1, None),
+            (0, Some(RdpEgfxFailure::ProgressiveState)),
+            (1, Some(RdpEgfxFailure::Publisher)),
+        ] {
+            let mut current = previous;
+            current.egfx_diagnostics.failure_count = count;
+            current.egfx_diagnostics.first_failure = reason;
+            current.egfx_diagnostics.progressive_failure_detail =
+                Some("region lacks current frame tiles");
+            let seen = Mutex::new(Vec::new());
+            let observer = |status| seen.lock().unwrap().push(status);
+            let error =
+                super::publish_graphics_status(previous, current, Some(&observer)).unwrap_err();
+            assert_eq!(error.code(), "rdp_egfx_failed");
+            assert_eq!(seen.lock().unwrap().as_slice(), &[current]);
+            assert!(super::publish_graphics_status(current, current, None).is_err());
+        }
+    }
+
+    #[test]
+    fn absent_unconfirmed_and_intentionally_disabled_egfx_remain_nonfatal() {
+        let previous = RdpGraphicsCapability::default().snapshot();
+        assert!(super::publish_graphics_status(previous, previous, None).is_ok());
+        let mut current = previous;
+        current.egfx_advertised = true;
+        current.egfx_confirmed = false;
+        assert!(super::publish_graphics_status(previous, current, None).is_ok());
+        let adapter = crate::egfx::EgfxAdapter::with_surface_publisher(
+            None,
+            crate::egfx::EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap(),
+        );
+        adapter.disable_for_reactivation();
+        assert!(adapter.is_failed());
+        current.egfx_diagnostics = adapter.diagnostics();
+        assert_eq!(current.egfx_diagnostics.failure_count, 1);
+        assert_eq!(
+            current.egfx_diagnostics.first_failure,
+            Some(crate::factory::RdpEgfxFailure::Reactivation)
+        );
+        assert!(super::publish_graphics_status(previous, current, None).is_ok());
+    }
 
     #[test]
     fn active_rdp_input_publishes_only_text_input_capability() {

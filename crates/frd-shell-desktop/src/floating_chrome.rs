@@ -391,14 +391,18 @@ impl ChromeGeometrySnapshot {
     }
 
     /// 原生标题栏中的固定控件；绘制和输入共享标题栏下方的远程矩形。
-    pub fn titlebar_layouts(mut self) -> Option<ChromeLayouts> {
+    pub fn titlebar_layouts(mut self, visible: bool) -> Option<ChromeLayouts> {
         let inset = self.native.leading_px.max(self.native.trailing_px);
         self.native = NativeChromeInsets {
             leading_px: inset,
             trailing_px: inset,
         };
-        let mut layouts = self.layouts(ControlIslandPlacement::default(), true)?;
-        let height = layouts.overlay.island_rect?.height;
+        let height = scaled_points(
+            f64::from(control_island_metrics(self.window_capabilities).height)
+                + ISLAND_MARGIN_POINTS * 2.0,
+            self.scale_factor,
+        )?;
+        let mut layouts = self.layouts(ControlIslandPlacement::default(), visible)?;
         layouts.remote.content_rect.y = height;
         layouts.remote.content_rect.height = self.window_size.height.checked_sub(height)?;
         if layouts.remote.content_rect.height == 0 {
@@ -663,7 +667,7 @@ mod tests {
             },
         )
         .unwrap();
-        let layouts = snapshot.titlebar_layouts().unwrap();
+        let layouts = snapshot.titlebar_layouts(true).unwrap();
         let island = layouts.overlay.island_rect.unwrap();
         assert_eq!(island.center().0, 1100);
         assert_eq!(layouts.remote.content_rect.y, island.height);
@@ -680,6 +684,46 @@ mod tests {
             Some(ChromeHitTarget::RemoteContent)
         );
         assert!(layouts.overlay.island_reposition_handle.is_none());
+    }
+
+    #[test]
+    fn native_titlebar_autohide_preserves_content_and_native_controls() {
+        let snapshot = ChromeGeometrySnapshot::new(
+            2200,
+            1400,
+            2.0,
+            NativeChromeInsets {
+                leading_px: 160,
+                trailing_px: 0,
+            },
+        )
+        .unwrap();
+        let start = Instant::now();
+        let mut chrome = FloatingChromeController::connected_default(start);
+        let hidden = snapshot.titlebar_layouts(chrome.is_visible()).unwrap();
+        assert!(hidden.overlay.island_rect.is_none());
+        chrome.observe_top_sensor(true, false, start);
+        chrome.advance(start + Duration::from_millis(150));
+        let visible = snapshot.titlebar_layouts(chrome.is_visible()).unwrap();
+        assert_eq!(visible.overlay.island_rect.unwrap().center().0, 1100);
+        chrome.observe_island_union(false, false, start + Duration::from_millis(150));
+        chrome.advance(start + Duration::from_millis(850));
+        let hidden_again = snapshot.titlebar_layouts(chrome.is_visible()).unwrap();
+        assert!(hidden_again.overlay.island_rect.is_none());
+        for layouts in [&hidden, &visible, &hidden_again] {
+            assert_eq!(layouts.remote, visible.remote);
+            assert!(layouts.overlay.island_reposition_handle.is_none());
+            assert!(layouts.hit_map.island_reposition_handle.is_none());
+            assert_eq!(
+                layouts.hit_map.hit_test((0, 0)),
+                Some(ChromeHitTarget::NativeChrome)
+            );
+            assert_eq!(
+                layouts.hit_map.hit_test((0, layouts.remote.content_rect.y)),
+                Some(ChromeHitTarget::RemoteContent)
+            );
+        }
+        assert_eq!(hidden.hit_map, hidden_again.hit_map);
     }
 
     #[test]

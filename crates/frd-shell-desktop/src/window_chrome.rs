@@ -84,6 +84,18 @@ pub(crate) const fn unverified_desktop_capabilities() -> IslandWindowCapabilitie
 }
 
 pub trait WindowChromeAdapter {
+    /// 平台可在首次完整帧时按真实工作区计算窗口；默认保留现有平台行为。
+    fn initial_remote_extent(
+        &mut self,
+        _window: &winit::window::Window,
+        _remote: frd_core::PixelSize,
+        _chrome_height: f64,
+    ) -> Option<crate::LogicalWindowExtent> {
+        None
+    }
+    /// 仅消费平台准备的首次定位，后续用户尺寸和全屏不受影响。
+    fn constrain_initial_remote_window(&mut self, _window: &winit::window::Window) {}
+
     fn configure(&mut self, window: &winit::window::Window) -> Result<(), WindowChromeError>;
     fn refresh_for_dpi(&mut self, window: &winit::window::Window) -> Result<(), WindowChromeError>;
     fn native_insets(&self, window: &winit::window::Window) -> NativeChromeInsets;

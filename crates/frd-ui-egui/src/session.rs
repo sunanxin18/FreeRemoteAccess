@@ -29,6 +29,10 @@ pub fn show_session_page(
                     ui.heading("服务器证书已变化");
                     ui.label("已停止自动连接，并保留原证书指纹。请核实远程计算机的身份。");
                 }
+                "rdp_egfx_failed" => {
+                    ui.heading("远程画面解码失败");
+                    ui.label("连接已停止。请使用默认图形模式重新连接。");
+                }
                 "rdp_identity_store_failed" => {
                     ui.heading("无法保存或读取服务器证书");
                     ui.label("证书记录不可用，已停止连接。请检查本机存储后重试。");

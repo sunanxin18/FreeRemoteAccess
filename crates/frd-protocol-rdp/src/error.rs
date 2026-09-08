@@ -2,6 +2,7 @@ use frd_protocol_api::{ProtocolError, ProtocolId};
 
 pub(crate) const RDP_ACTIVATION_FAILED: &str = "rdp_activation_failed";
 pub(crate) const RDP_CANCELLED: &str = "rdp_cancelled";
+pub(crate) const RDP_EGFX_FAILED: &str = "rdp_egfx_failed";
 pub(crate) const RDP_DNS_FAILED: &str = "rdp_dns_failed";
 pub(crate) const RDP_LICENSE_FAILED: &str = "rdp_license_failed";
 pub(crate) const RDP_LOGON_FAILED: &str = "rdp_logon_failed";

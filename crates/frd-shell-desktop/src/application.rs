@@ -2326,7 +2326,7 @@ impl DesktopWindowState {
             snapshot.layouts(placement, self.floating_chrome.is_visible())
         }?;
         #[cfg(target_os = "macos")]
-        let layouts = snapshot.titlebar_layouts()?;
+        let layouts = snapshot.titlebar_layouts(self.floating_chrome.is_visible())?;
         self.remote_area = Some(layouts.remote.content_rect);
         self.chrome_layouts = Some(layouts.clone());
         Some(layouts)
@@ -2351,9 +2351,17 @@ impl DesktopWindowState {
         };
         self.window.set_resizable(true);
         self.window.set_min_inner_size(Some(minimum));
-        self.window
+        let resized = self
+            .window
             .request_inner_size(LogicalSize::new(extent.width, extent.height))
-            .is_some()
+            .is_some();
+        if matches!(
+            transition,
+            WindowPresentationTransition::RemoteDesktop { .. }
+        ) {
+            self.chrome.constrain_initial_remote_window(&self.window);
+        }
+        resized
     }
 
     fn request_window_presentation_transition(
@@ -3720,9 +3728,7 @@ impl DesktopApplication {
             window
                 .floating_chrome
                 .set_animations_enabled(window.chrome.appearance_policy().animate);
-        } else if (cfg!(target_os = "macos") || !auto_hide_enabled)
-            && forced_reveal_diagnostic.is_none()
-        {
+        } else if !auto_hide_enabled && forced_reveal_diagnostic.is_none() {
             window.floating_chrome.force_reveal_after_release(now);
         }
         let local_page_move = match &self.mode {
@@ -4222,6 +4228,25 @@ impl DesktopApplication {
         let first_remote_frame_presented = first_remote_frame_boundary.is_some_and(
             |(was_remote_session, is_remote_session, is_full_baseline)| {
                 self.window.as_mut().is_some_and(|window| {
+                    if is_full_baseline && is_remote_session {
+                        if let (Some(remote), Some(layouts)) = (
+                            window
+                                .video
+                                .map(VideoBinding::remote_binding)
+                                .or(window.remote),
+                            window.chrome_layouts.as_ref(),
+                        ) {
+                            let chrome_height = f64::from(layouts.remote.content_rect.y)
+                                / window.window.scale_factor();
+                            if let Some(extent) = window.chrome.initial_remote_extent(
+                                &window.window,
+                                remote.size,
+                                chrome_height,
+                            ) {
+                                window.presentation.set_initial_remote_extent(extent);
+                            }
+                        }
+                    }
                     let transition = transition_after_frame(
                         &mut window.presentation,
                         was_remote_session,
