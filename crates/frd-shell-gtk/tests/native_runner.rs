@@ -521,7 +521,12 @@ fn native_gtk_login_session_cancel() {
     });
     window.close();
     until("window_closed", &diagnostic, || !window.is_visible());
-    println!("native GTK login saved_secret=1 identity_invalidation=1 enter_single_launch=1 deferred_save=1 cancel_cleanup=1 pending_launch_cancel=1 confirmed_connected=1 context_loss_cleanup=1 retained_terminal_diagnostics=1");
+    let font_map_loaded = runner
+        .diagnostic_snapshot()
+        .expect("关闭窗口后仍应可读取 runner 诊断")
+        .font_map_loaded;
+    assert!(font_map_loaded, "随包 Noto Sans SC 必须进入私有 Pango map");
+    println!("native GTK login saved_secret=1 identity_invalidation=1 enter_single_launch=1 deferred_save=1 cancel_cleanup=1 pending_launch_cancel=1 confirmed_connected=1 context_loss_cleanup=1 retained_terminal_diagnostics=1 font_map_loaded={font_map_loaded}");
 }
 
 // 仅测试读回：真实mock增量须经过host mailbox→compiler→新画布GL上传/绘制。
