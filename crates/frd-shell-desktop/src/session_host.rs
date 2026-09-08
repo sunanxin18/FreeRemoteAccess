@@ -291,15 +291,40 @@ impl PendingLiveSessionPorts {
     }
 }
 
-pub(crate) struct CompiledFrameDrain {
+/// 一次提取的已编译事务与时间快照；只有会话宿主可构造。
+pub struct CompiledFrameDrain {
     pub(crate) transactions: Vec<FrameTransaction>,
     pub(crate) metrics: BatchMetricContext,
 }
 
+/// 原帧编译器的错误及本批次指标，不包含窗口或 GPU 类型。
 #[derive(Debug)]
-pub(crate) struct FrameCompileFailure {
+pub struct FrameCompileFailure {
     pub(crate) error: FrameTransactionError,
     pub(crate) metrics: BatchMetricContext,
+}
+
+impl CompiledFrameDrain {
+    /// 只读查看已编译事务；不会再次提取或重编译 mailbox。
+    pub fn transactions(&self) -> &[FrameTransaction] {
+        &self.transactions
+    }
+    pub fn metrics(&self) -> crate::FrameBatchMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+    /// 消耗本次 drain，交出原有事务所有权，无复制。
+    pub fn into_transactions(self) -> Vec<FrameTransaction> {
+        self.transactions
+    }
+}
+
+impl FrameCompileFailure {
+    pub fn error(&self) -> &FrameTransactionError {
+        &self.error
+    }
+    pub fn metrics(&self) -> crate::FrameBatchMetricsSnapshot {
+        self.metrics.snapshot()
+    }
 }
 
 struct LiveSessionCleanup {
@@ -695,9 +720,9 @@ impl SessionHost {
         updates
     }
 
-    pub(crate) fn drain_frame_transactions(
-        &mut self,
-    ) -> Result<CompiledFrameDrain, FrameCompileFailure> {
+    /// 提取并编译当前 mailbox，保留未闭合事务状态和原始入队时间。
+    /// 空结果不表示会话已经结束；无活动会话或呈现已退休时也返回空批次。
+    pub fn drain_frame_transactions(&mut self) -> Result<CompiledFrameDrain, FrameCompileFailure> {
         let Some(active) = self.active.as_mut() else {
             return Ok(CompiledFrameDrain {
                 transactions: Vec::new(),
@@ -803,7 +828,9 @@ impl SessionHost {
         }
     }
 
-    pub(crate) fn retire_frame_presentation(&mut self, session_id: SessionId) -> bool {
+    /// 永久退休匹配会话的帧呈现，清空其编译状态及待处理更新。
+    /// 仅匹配当前会话时返回 true；不是临时隐藏、缩放或可恢复上下文丢失的暂停接口。
+    pub fn retire_frame_presentation(&mut self, session_id: SessionId) -> bool {
         let Some(active) = self.active.as_mut() else {
             return false;
         };

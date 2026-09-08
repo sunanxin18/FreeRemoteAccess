@@ -51,6 +51,41 @@ pub(crate) struct BatchMetricContext {
     pub(crate) transaction_count: usize,
 }
 
+/// 已编译帧批次的平台无关时间与计数快照，不暴露后端指标状态。
+#[derive(Clone, Copy, Debug)]
+pub struct FrameBatchMetricsSnapshot {
+    batch_started_at: Instant,
+    source_update_count: usize,
+    oldest_age: Option<Duration>,
+    transaction_count: usize,
+}
+
+impl FrameBatchMetricsSnapshot {
+    pub fn batch_started_at(&self) -> Instant {
+        self.batch_started_at
+    }
+    pub fn source_update_count(&self) -> usize {
+        self.source_update_count
+    }
+    pub fn oldest_age(&self) -> Option<Duration> {
+        self.oldest_age
+    }
+    pub fn transaction_count(&self) -> usize {
+        self.transaction_count
+    }
+}
+
+impl BatchMetricContext {
+    pub(crate) fn snapshot(&self) -> FrameBatchMetricsSnapshot {
+        FrameBatchMetricsSnapshot {
+            batch_started_at: self.batch_started_at,
+            source_update_count: self.source_update_count,
+            oldest_age: self.oldest_age,
+            transaction_count: self.transaction_count,
+        }
+    }
+}
+
 impl FramePipelineMetrics {
     pub(crate) fn from_environment(started_at: Instant) -> Result<Self, MetricSinkError> {
         Ok(Self::new(FrameMetricsSink::open_from_environment(

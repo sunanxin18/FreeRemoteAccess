@@ -190,3 +190,9 @@ GL 独立审查补充修正：indexed viewport只操作0，所有clip-distance�
 覆盖不同viewport1值、clip0启用仍颜色正确和cube拒绝后有效capture立即成功。
 最低GL3.3保持。修正后三目标 --tests 编译检查、macOS纯逻辑3项、fmt/diff通过，
 新增原生断言尚待下一轮CI。GTK目标观察严格报告测试最终20项通过，C实现待Linux。
+
+
+共享帧接口已公开，原 drain/retire 方法体保持一致。新增外部 integration test 使用
+真实空 SessionHost 验证提取、指标、重复空提取和无效退休；不访问平台服务。shell
+215项单元测试、新外部测试1项及原doctest1项通过，日志
+/tmp/frd-public-frame-api-tests.log。此接口接线准备不代表 GTK 客户端已运行。

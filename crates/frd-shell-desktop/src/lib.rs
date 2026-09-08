@@ -32,11 +32,12 @@ pub use floating_chrome::{
     ControlIslandPlacement, ControlIslandState, FloatingChromeController, RemoteContentLayout,
     HIDE_DELAY, REVEAL_DELAY, TOP_SENSOR_POINTS,
 };
+pub use frame_metrics::FrameBatchMetricsSnapshot;
 pub use input::{InputGate, InputOwnership, InputRouter};
 pub use lifecycle::PresentationOperation;
 pub use session_host::{
-    AcceptedLaunchOutcome, AudioOutputFactory, BackgroundLaunchOutcome, SessionHost,
-    SessionHostError, WakeSink,
+    AcceptedLaunchOutcome, AudioOutputFactory, BackgroundLaunchOutcome, CompiledFrameDrain,
+    FrameCompileFailure, SessionHost, SessionHostError, WakeSink,
 };
 pub use video_decode_worker::{
     DecodedVideoFrameHandoff, VideoDecodeLoadSnapshot, VideoDecodeSender, VideoDecoderDiagnostics,
