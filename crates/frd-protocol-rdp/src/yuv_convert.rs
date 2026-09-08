@@ -323,6 +323,46 @@ mod tests {
     };
 
     #[test]
+    fn dispatched_yuv444_matches_reference_for_all_chroma_pairs_at_luma_boundaries() {
+        // 覆盖有符号色度乘法的全部输入，尤其是 127/128 两侧。
+        let width = 256;
+        let height = 256;
+        let u = (0..height).flat_map(|_| 0_u8..=255).collect::<Vec<_>>();
+        let v = (0_u8..=255)
+            .flat_map(|sample| std::iter::repeat_n(sample, width))
+            .collect::<Vec<_>>();
+        let mut expected = vec![0; width * height * 4];
+        let mut actual = vec![0; expected.len()];
+        for luma in [0, 15, 16, 17, 64, 128, 235, 255] {
+            let y = vec![luma; width * height];
+            yuv444_to_rgba_scalar(
+                width,
+                height,
+                &y,
+                width,
+                &u,
+                width,
+                &v,
+                width,
+                &mut expected,
+            );
+            convert_yuv444_to_rgba(width, height, &y, width, &u, width, &v, width, &mut actual)
+                .expect("valid YUV444 planes");
+            if let Some(index) = actual.iter().zip(&expected).position(|(a, e)| a != e) {
+                let pixel = index / 4;
+                panic!(
+                    "Y={luma} U={} V={} channel={}: actual={} expected={}",
+                    u[pixel],
+                    v[pixel],
+                    index % 4,
+                    actual[index],
+                    expected[index],
+                );
+            }
+        }
+    }
+
+    #[test]
     fn conversion_rejects_strides_that_overflow_plane_length() {
         let overflowing_stride = usize::MAX / 2 + 1;
         let mut destination = [0_u8; 12];

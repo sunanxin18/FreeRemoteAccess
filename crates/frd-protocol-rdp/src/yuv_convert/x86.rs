@@ -127,15 +127,13 @@ unsafe fn kernel(
     use std::arch::x86::{
         __m128i, _mm_add_epi32, _mm_cvtepu8_epi16, _mm_loadl_epi64, _mm_madd_epi16, _mm_max_epi16,
         _mm_max_epi32, _mm_min_epi32, _mm_set1_epi16, _mm_set1_epi32, _mm_setzero_si128,
-        _mm_srai_epi16, _mm_srai_epi32, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16,
-        _mm_unpacklo_epi16,
+        _mm_srai_epi32, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16, _mm_unpacklo_epi16,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
         __m128i, _mm_add_epi32, _mm_cvtepu8_epi16, _mm_loadl_epi64, _mm_madd_epi16, _mm_max_epi16,
         _mm_max_epi32, _mm_min_epi32, _mm_set1_epi16, _mm_set1_epi32, _mm_setzero_si128,
-        _mm_srai_epi16, _mm_srai_epi32, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16,
-        _mm_unpacklo_epi16,
+        _mm_srai_epi32, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi16, _mm_unpacklo_epi16,
     };
 
     let zero = _mm_setzero_si128();
@@ -273,10 +271,10 @@ unsafe fn kernel(
         let u_center = _mm_sub_epi16(u16, _mm_set1_epi16(128));
         let v_center = _mm_sub_epi16(v16, _mm_set1_epi16(128));
         let y_pairs = _mm_unpacklo_epi16(y_center, zero);
-        let u_sign = _mm_srai_epi16(u_center, 15);
-        let v_sign = _mm_srai_epi16(v_center, 15);
-        let u_pairs = _mm_unpacklo_epi16(u_center, u_sign);
-        let v_pairs = _mm_unpacklo_epi16(v_center, v_sign);
+        // PMADDWD 已按有符号 i16 相乘；相邻 lane 必须为零。
+        // 放入符号扩展的 -1 会额外累加一次负系数，破坏逐像素一致性。
+        let u_pairs = _mm_unpacklo_epi16(u_center, zero);
+        let v_pairs = _mm_unpacklo_epi16(v_center, zero);
         let y_term = _mm_madd_epi16(y_pairs, y_coeff);
         let red = _mm_max_epi32(
             clamp_min,
