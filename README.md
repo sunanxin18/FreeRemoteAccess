@@ -10,6 +10,10 @@ RDP 的有界探针已增加非敏感 EGFX 阶段诊断（187 项协议测试通
 
 未支持的 EGFX WireToSurface1 编码现在明确记录 `UnsupportedCodec` 并停用当前 generation、丢弃排队更新（189 项 RDP 测试通过）；此错误处理不等于已实现 ClearCodec，也不保证服务端自动恢复 legacy。Windows ARM64 AAC 的 clang-cl 目标配置修复仍待托管完整编译验证。
 
+## 2026-09-08 ClearCodec / NSCodec 接线本地验证
+
+ClearCodec 与完整 NSCodec SIMD provider 已接入显式 EGFX publisher；会话共享 sequence/cache，BGRA 直接进入 BGRX patch，纯缓存重置不伪造像素，失败及发布溢出清空 generation。完整 RDP 225 项测试通过，NSCodec 包含微软官方 15×10 全像素示例。真实首帧、跨目标运行和性能仍待验证；生产默认 LegacyOnly 保持。
+
 ## 2026-09-08 ClearCodec 基础状态层验证
 
 ClearCodec 严格状态层、会话级序号/缓存事务与 SIMD 像素内核已注册编译：25 项 ClearCodec/kernel 测试、完整 RDP 214 项通过。含 residual 前缀、bands 位域、RLEX、glyph/cache、零子区域与覆盖元数据预算回归。NSCodec 实际后端和 EGFX 接线仍在开发，因此未打开生产门禁。

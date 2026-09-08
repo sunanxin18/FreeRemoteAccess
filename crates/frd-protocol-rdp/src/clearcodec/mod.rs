@@ -12,6 +12,19 @@ use ironrdp::{
     },
 };
 mod kernels;
+mod nscodec;
+
+pub(crate) type NativeDecoder = Decoder<kernels::NativeKernel, nscodec::SimdNsCodec>;
+
+/// 任何必需像素/子码流内核不可用时，整个 ClearCodec 能力保持关闭。
+pub(crate) fn native_decoder() -> Option<NativeDecoder> {
+    let limits = Limits::default();
+    Some(Decoder::new(
+        kernels::native_kernel()?,
+        nscodec::SimdNsCodec::new(limits.max_pixels).ok()?,
+        limits,
+    ))
+}
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -149,7 +162,7 @@ impl<K: PixelKernel, N: NsCodecProvider> Decoder<K, N> {
         }
         let reset = stream.flags & FLAG_CACHE_RESET != 0;
         if stream.composite.is_none() && !stream.is_glyph_hit() {
-            if stream.flags != FLAG_CACHE_RESET || count != 0 {
+            if stream.flags != FLAG_CACHE_RESET {
                 return Err(Error::Invalid("missing composite"));
             }
             self.full_cursor = 0;

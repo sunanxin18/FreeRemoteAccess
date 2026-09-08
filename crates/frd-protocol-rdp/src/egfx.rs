@@ -238,6 +238,7 @@ struct EgfxSurfaceState {
     pending_patches: Vec<PixelPatch>,
     pending_revision: Option<u64>,
     pending_overflowed: bool,
+    pending_clearcodec: bool,
     updates: VecDeque<SurfaceUpdate>,
     rejected_updates: u64,
     unhandled_codec_count: u64,
@@ -1378,6 +1379,7 @@ fn decoded_yuv420_to_rgba(frame: &frd_media_api::DecodedVideoFrame) -> DecoderRe
 #[derive(Clone)]
 pub(crate) struct EgfxSurfacePublisher {
     state: Arc<Mutex<EgfxSurfaceState>>,
+    clearcodec_decoder: Arc<Mutex<crate::clearcodec::NativeDecoder>>,
     avc444_decoder: Option<Arc<Mutex<Box<dyn Avc444Decoder>>>>,
     expected_coded_size: Option<PixelSize>,
 }
@@ -1398,7 +1400,11 @@ impl EgfxSurfacePublisher {
     /// validated `ResetGraphics` advances to the next generation before its
     /// reset is queued, so the runtime can admit it atomically.
     pub(crate) fn try_new(session_id: SessionId, generation: u64) -> Option<Self> {
-        (generation != 0).then_some(Self {
+        if generation == 0 {
+            return None;
+        }
+        let clearcodec_decoder = crate::clearcodec::native_decoder()?;
+        Some(Self {
             state: Arc::new(Mutex::new(EgfxSurfaceState {
                 session_id,
                 generation,
@@ -1411,6 +1417,7 @@ impl EgfxSurfacePublisher {
                 pending_patches: Vec::new(),
                 pending_revision: None,
                 pending_overflowed: false,
+                pending_clearcodec: false,
                 updates: VecDeque::new(),
                 rejected_updates: 0,
                 unhandled_codec_count: 0,
@@ -1418,6 +1425,7 @@ impl EgfxSurfacePublisher {
                 failure_reason: None,
                 disabled: false,
             })),
+            clearcodec_decoder: Arc::new(Mutex::new(clearcodec_decoder)),
             avc444_decoder: None,
             expected_coded_size: None,
         })
@@ -1474,6 +1482,7 @@ impl EgfxSurfacePublisher {
         state.pending_patches.clear();
         state.pending_revision = None;
         state.pending_overflowed = false;
+        state.pending_clearcodec = false;
         if let Some(coverage) = state.coverage.as_mut() {
             coverage.clear();
         }
@@ -1519,7 +1528,30 @@ impl EgfxSurfacePublisher {
         width: u16,
         height: u16,
     ) -> Option<PixelPatch> {
-        if !surface.mapped
+        let (rect, stride_bytes, expected_len) =
+            Self::checked_patch_layout(state, surface, rectangle, width, height)?;
+        if data.len() != expected_len {
+            return None;
+        }
+        let mut bgrx = vec![0_u8; data.len()];
+        convert_rgba_to_bgrx(data, &mut bgrx).ok()?;
+        Some(PixelPatch {
+            rect,
+            stride_bytes,
+            pixels: PixelBuffer::from_boxed_slice(bgrx.into_boxed_slice()),
+        })
+    }
+
+    fn checked_patch_layout(
+        state: &EgfxSurfaceState,
+        surface: EgfxSurface,
+        rectangle: &ExclusiveRectangle,
+        width: u16,
+        height: u16,
+    ) -> Option<(PixelRect, u32, usize)> {
+        if width == 0
+            || height == 0
+            || !surface.mapped
             || rectangle.left > rectangle.right
             || rectangle.top > rectangle.bottom
             || u32::from(rectangle.right) > surface.width
@@ -1544,22 +1576,17 @@ impl EgfxSurfacePublisher {
             .ok()?
             .checked_mul(usize::try_from(height).ok()?)?
             .checked_mul(4)?;
-        if data.len() != expected_len {
-            return None;
-        }
-        let mut bgrx = vec![0_u8; data.len()];
-        convert_rgba_to_bgrx(data, &mut bgrx).ok()?;
         let stride_bytes = width.checked_mul(BYTES_PER_PIXEL as u32)?;
-        Some(PixelPatch {
-            rect: PixelRect {
+        Some((
+            PixelRect {
                 x,
                 y,
                 width,
                 height,
             },
             stride_bytes,
-            pixels: PixelBuffer::from_boxed_slice(bgrx.into_boxed_slice()),
-        })
+            expected_len,
+        ))
     }
 }
 
@@ -1655,6 +1682,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         state.pending_patches.clear();
         state.pending_revision = None;
         state.pending_overflowed = false;
+        state.pending_clearcodec = false;
         state.generation = generation;
         let session_id = state.session_id;
         Self::push(
@@ -1758,6 +1786,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         let Some(revision) = state.pending_revision.take() else {
             return;
         };
+        let contains_clearcodec = std::mem::take(&mut state.pending_clearcodec);
         // Damage and FrameBoundary are one publication unit. Keep both or publish neither;
         // a partially queued frame would leave the runtime with an uncommitted baseline.
         if state
@@ -1766,9 +1795,17 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             .checked_add(2)
             .is_none_or(|length| length > MAX_PENDING_SURFACE_UPDATES)
         {
+            if contains_clearcodec {
+                state
+                    .failure_reason
+                    .get_or_insert(RdpEgfxFailure::Publisher);
+                Self::disable_locked(&mut state);
+                return;
+            }
             Self::reject(&mut state);
             state.pending_patches.clear();
             state.pending_overflowed = false;
+            state.pending_clearcodec = false;
             if let Some(coverage) = state.coverage.as_mut() {
                 coverage.clear();
             }
@@ -1776,8 +1813,16 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             return;
         }
         if state.pending_overflowed {
+            if contains_clearcodec {
+                state
+                    .failure_reason
+                    .get_or_insert(RdpEgfxFailure::Publisher);
+                Self::disable_locked(&mut state);
+                return;
+            }
             state.pending_patches.clear();
             state.pending_overflowed = false;
+            state.pending_clearcodec = false;
             if let Some(coverage) = state.coverage.as_mut() {
                 coverage.clear();
             }
@@ -1819,10 +1864,27 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         );
     }
 
+    fn on_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
+        let mut state = lock_state(&self.state);
+        if state.disabled {
+            return;
+        }
+        state.unhandled_codec_count = state.unhandled_codec_count.saturating_add(1);
+        state.last_unhandled_codec = Some(u16::from(pdu.codec_id));
+        state
+            .failure_reason
+            .get_or_insert(RdpEgfxFailure::UnsupportedCodec);
+        Self::disable_locked(&mut state);
+    }
+
     fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
         let GfxPdu::WireToSurface1(wire) = pdu else {
             return;
         };
+        if wire.codec_id == Codec1Type::ClearCodec {
+            self.decode_clearcodec(wire);
+            return;
+        }
         if !matches!(wire.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2) {
             let mut state = lock_state(&self.state);
             state.unhandled_codec_count = state.unhandled_codec_count.saturating_add(1);
@@ -1946,6 +2008,101 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
 }
 
 impl EgfxSurfacePublisher {
+    /// ClearCodec 缓存和序号属于会话，普通 ResetGraphics 只改变发布 generation。
+    /// 独立 BGRX 路径直接移动 opaque BGRA，不能走 AVC 的 RGBA 交换通道。
+    fn decode_clearcodec(&mut self, wire: &ironrdp_egfx::pdu::WireToSurface1Pdu) {
+        let mut state = lock_state(&self.state);
+        if state.disabled {
+            return;
+        }
+        let rectangle = &wire.destination_rectangle;
+        // 2.2.4.1 的 compositePayload 是可选项。纯 CACHE_RESET 消息不绘图，
+        // 仍验证 WireToSurface1 surface/rectangle 包络，但不要求映射或非零面积。
+        if wire.bitmap_data.len() == 2 && wire.bitmap_data[0] == 4 {
+            let valid = state.surfaces.get(&wire.surface_id).is_some_and(|surface| {
+                rectangle.left <= rectangle.right
+                    && rectangle.top <= rectangle.bottom
+                    && u32::from(rectangle.right) <= surface.width
+                    && u32::from(rectangle.bottom) <= surface.height
+            });
+            if valid {
+                let result = self
+                    .clearcodec_decoder
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .decode(
+                        &wire.bitmap_data,
+                        rectangle.right - rectangle.left,
+                        rectangle.bottom - rectangle.top,
+                    );
+                if matches!(result, Ok(None)) {
+                    return;
+                }
+            }
+            state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+            Self::disable_locked(&mut state);
+            return;
+        }
+        let layout = rectangle
+            .right
+            .checked_sub(rectangle.left)
+            .zip(rectangle.bottom.checked_sub(rectangle.top))
+            .and_then(|(width, height)| {
+                let surface = state.surfaces.get(&wire.surface_id).copied()?;
+                Self::checked_patch_layout(&state, surface, rectangle, width, height)
+                    .map(|layout| (layout, width, height))
+            });
+        let Some(((rect, stride_bytes, expected_len), width, height)) = layout else {
+            state
+                .failure_reason
+                .get_or_insert(RdpEgfxFailure::Publisher);
+            Self::disable_locked(&mut state);
+            return;
+        };
+        // 不在确定无法发布时消耗 cache/sequence；错误后整个 EGFX 流保持停止。
+        if state.pending_overflowed
+            || state.pending_patches.len() >= MAX_PENDING_SURFACE_UPDATES
+            || state
+                .updates
+                .len()
+                .checked_add(2)
+                .is_none_or(|n| n > MAX_PENDING_SURFACE_UPDATES)
+            || (state.pending_revision.is_none() && state.revision == u64::MAX)
+        {
+            state
+                .failure_reason
+                .get_or_insert(RdpEgfxFailure::Publisher);
+            Self::disable_locked(&mut state);
+            return;
+        }
+        let decoded = self
+            .clearcodec_decoder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .decode(&wire.bitmap_data, width, height);
+        let Ok(Some(pixels)) = decoded else {
+            state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+            Self::disable_locked(&mut state);
+            return;
+        };
+        if pixels.len() != expected_len {
+            state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+            Self::disable_locked(&mut state);
+            return;
+        }
+        Self::queue_patch(
+            &mut state,
+            PixelPatch {
+                rect,
+                stride_bytes,
+                pixels: PixelBuffer::from_boxed_slice(pixels.into_boxed_slice()),
+            },
+        );
+        state.pending_clearcodec = true;
+    }
+}
+
+impl EgfxSurfacePublisher {
     fn queue_bitmap_update(
         &mut self,
         surface_id: u16,
@@ -2007,9 +2164,13 @@ impl EgfxSurfacePublisher {
             Self::reject(&mut state);
             return;
         };
+        Self::queue_patch(&mut state, patch);
+    }
+
+    fn queue_patch(state: &mut EgfxSurfaceState, patch: PixelPatch) {
         if state.pending_revision.is_none() {
             let Some(revision) = state.revision.checked_add(1) else {
-                Self::reject(&mut state);
+                Self::reject(state);
                 return;
             };
             state.revision = revision;
@@ -2021,7 +2182,7 @@ impl EgfxSurfacePublisher {
             }
         }
         if state.pending_patches.len() >= MAX_PENDING_SURFACE_UPDATES {
-            Self::reject(&mut state);
+            Self::reject(state);
             state.pending_overflowed = true;
             return;
         }
@@ -2322,7 +2483,7 @@ mod tests {
 
     #[test]
     fn unsupported_codec_disables_generation_once_and_discards_queued_updates() {
-        for codec_id in [Codec1Type::RemoteFx, Codec1Type::ClearCodec] {
+        for codec_id in [Codec1Type::RemoteFx, Codec1Type::Planar] {
             let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
             let state = publisher.clone();
             let mut adapter = EgfxAdapter::with_surface_publisher(None, publisher);
@@ -3646,6 +3807,304 @@ mod tests {
                 monitors: Vec::new(),
             }),
         );
+        assert!(adapter.drain_surface_updates().is_empty());
+    }
+
+    fn clear_adapter(width: u32, height: u32) -> EgfxAdapter {
+        let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        let mut adapter = EgfxAdapter::with_surface_publisher(None, publisher);
+        adapter.start(7).unwrap();
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(
+                &CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::SMALL_CACHE,
+                },
+            )),
+        );
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width,
+                height,
+                monitors: Vec::new(),
+            }),
+        );
+        adapter
+    }
+    fn clear_surface(adapter: &mut EgfxAdapter, id: u16, w: u16, h: u16, x: u32, y: u32) {
+        process_gfx_pdu(
+            adapter,
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: id,
+                width: w,
+                height: h,
+                pixel_format: EgfxPixelFormat::XRgb,
+            }),
+        );
+        process_gfx_pdu(
+            adapter,
+            GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                surface_id: id,
+                output_origin_x: x,
+                output_origin_y: y,
+            }),
+        );
+    }
+    fn clear_wire(
+        id: u16,
+        seq: u8,
+        rect: ExclusiveRectangle,
+        color: [u8; 3],
+        glyph: bool,
+    ) -> GfxPdu {
+        let mut data = vec![if glyph { 1 } else { 0 }, seq];
+        if glyph {
+            data.extend(42u16.to_le_bytes());
+        }
+        data.extend(4u32.to_le_bytes());
+        data.extend(0u32.to_le_bytes());
+        data.extend(0u32.to_le_bytes());
+        data.extend(color);
+        data.push(((rect.right - rect.left) * (rect.bottom - rect.top)) as u8);
+        GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id: id,
+            codec_id: Codec1Type::ClearCodec,
+            pixel_format: EgfxPixelFormat::XRgb,
+            destination_rectangle: rect,
+            bitmap_data: data,
+        })
+    }
+    #[test]
+    fn clearcodec_gfx_pdu_shares_sequence_and_glyph_across_surfaces_and_reset() {
+        let mut adapter = clear_adapter(4, 2);
+        let rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 2,
+        };
+        clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+        clear_surface(&mut adapter, 2, 2, 2, 2, 0);
+        process_gfx_pdu(
+            &mut adapter,
+            clear_wire(1, 0, rect.clone(), [11, 22, 33], true),
+        );
+        process_gfx_pdu(
+            &mut adapter,
+            clear_wire(2, 1, rect.clone(), [44, 55, 66], false),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        assert!(!adapter.is_failed());
+        let updates = adapter.drain_surface_updates();
+        assert!(
+            matches!(&updates[1],SurfaceUpdate::Damage{generation:2,patches,..} if patches.len()==2 && patches[0].pixels.as_bytes()==[11,22,33,255].repeat(4) && patches[1].rect.x==2 && patches[1].pixels.as_bytes()==[44,55,66,255].repeat(4))
+        );
+        assert!(matches!(
+            updates[2],
+            SurfaceUpdate::FrameBoundary {
+                completeness: FrameCompleteness::FullBaseline,
+                ..
+            }
+        ));
+        // 普通图形reset产生新generation，但不能从0重启会话级序号或丢失glyph。
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width: 2,
+                height: 2,
+                monitors: Vec::new(),
+            }),
+        );
+        clear_surface(&mut adapter, 3, 2, 2, 0, 0);
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 3,
+                codec_id: Codec1Type::ClearCodec,
+                pixel_format: EgfxPixelFormat::XRgb,
+                destination_rectangle: rect,
+                bitmap_data: vec![3, 2, 42, 0],
+            }),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 2 }));
+        let updates = adapter.drain_surface_updates();
+        assert!(!adapter.is_failed());
+        assert!(
+            matches!(&updates[1],SurfaceUpdate::Damage{generation:3,patches,..} if patches[0].pixels.as_bytes()==[11,22,33,255].repeat(4))
+        );
+    }
+    #[test]
+    fn clearcodec_gfx_pdu_preserves_crop_coordinates_and_bgr_channels() {
+        let mut adapter = clear_adapter(4, 3);
+        clear_surface(&mut adapter, 1, 4, 3, 0, 0);
+        process_gfx_pdu(
+            &mut adapter,
+            clear_wire(
+                1,
+                0,
+                ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 3,
+                },
+                [0, 0, 0],
+                false,
+            ),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        adapter.drain_surface_updates();
+        process_gfx_pdu(
+            &mut adapter,
+            clear_wire(
+                1,
+                1,
+                ExclusiveRectangle {
+                    left: 1,
+                    top: 1,
+                    right: 3,
+                    bottom: 3,
+                },
+                [1, 17, 239],
+                false,
+            ),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 2 }));
+        let updates = adapter.drain_surface_updates();
+        assert!(
+            matches!(&updates[0],SurfaceUpdate::Damage{patches,..} if patches[0].rect==PixelRect{x:1,y:1,width:2,height:2} && patches[0].stride_bytes==8 && patches[0].pixels.as_bytes()==[1,17,239,255].repeat(4))
+        );
+        assert!(matches!(
+            updates[1],
+            SurfaceUpdate::FrameBoundary {
+                completeness: FrameCompleteness::Incremental,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn clearcodec_failure_drops_prior_queued_pixels_and_disables_stream() {
+        for kind in 0..3 {
+            let mut adapter = clear_adapter(2, 2);
+            clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+            let rect = ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2,
+            };
+            process_gfx_pdu(
+                &mut adapter,
+                clear_wire(1, 0, rect.clone(), [1, 2, 3], false),
+            );
+            let mut wire = clear_wire(1, if kind == 0 { 0 } else { 1 }, rect, [7, 8, 9], false);
+            if let GfxPdu::WireToSurface1(ref mut p) = wire {
+                if kind == 1 {
+                    p.bitmap_data.push(99);
+                } else if kind == 2 {
+                    p.destination_rectangle.right = 3;
+                }
+            }
+            process_gfx_pdu(&mut adapter, wire);
+            assert!(adapter.is_failed());
+            assert!(adapter.drain_surface_updates().is_empty());
+        }
+    }
+
+    #[test]
+    fn clearcodec_cache_reset_control_advances_sequence_without_pixels_or_mapping() {
+        let mut adapter = clear_adapter(2, 2);
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 1,
+                width: 2,
+                height: 2,
+                pixel_format: EgfxPixelFormat::XRgb,
+            }),
+        );
+        adapter.drain_surface_updates();
+        for (seq, right) in [(0, 0), (1, 2)] {
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                    surface_id: 1,
+                    codec_id: Codec1Type::ClearCodec,
+                    pixel_format: EgfxPixelFormat::XRgb,
+                    destination_rectangle: ExclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right,
+                        bottom: right,
+                    },
+                    bitmap_data: vec![4, seq],
+                }),
+            );
+            assert!(!adapter.is_failed());
+            assert!(adapter.drain_surface_updates().is_empty());
+        }
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+        );
+        process_gfx_pdu(
+            &mut adapter,
+            clear_wire(
+                1,
+                2,
+                ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+                [1, 2, 3],
+                false,
+            ),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        assert!(!adapter.is_failed());
+        assert_eq!(adapter.drain_surface_updates().len(), 2);
+    }
+    #[test]
+    fn clearcodec_frame_publication_overflow_disables_instead_of_losing_reference() {
+        let mut adapter = clear_adapter(2, 2);
+        clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+        process_gfx_pdu(
+            &mut adapter,
+            clear_wire(
+                1,
+                0,
+                ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+                [1, 2, 3],
+                false,
+            ),
+        );
+        let publisher = adapter.surface_publisher.as_ref().unwrap();
+        {
+            let mut state = super::lock_state(&publisher.state);
+            let session_id = state.session_id;
+            while state.updates.len() < super::MAX_PENDING_SURFACE_UPDATES {
+                state.updates.push_back(SurfaceUpdate::Reset {
+                    session_id,
+                    generation: 2,
+                    size: PixelSize::new(2, 2).unwrap(),
+                    format: PixelFormat::Bgrx8UnormSrgb,
+                });
+            }
+        }
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        assert!(adapter.is_failed());
         assert!(adapter.drain_surface_updates().is_empty());
     }
 
