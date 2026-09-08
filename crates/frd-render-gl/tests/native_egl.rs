@@ -135,6 +135,65 @@ fn native_egl_renderer_roundtrip() {
         gl.viewport(0, 0, 2, 2);
         let target = GlRenderTarget::capture(&context, PixelSize::new(2, 2).unwrap()).unwrap();
         assert!(GlRenderTarget::capture(&context, PixelSize::new(3, 2).unwrap()).is_err());
+        // 非二维sRGB附件必须拒绝，恢复绑定且不污染后续有效capture。
+        let cube = gl.create_texture().unwrap();
+        gl.bind_texture(glow::TEXTURE_CUBE_MAP, Some(cube));
+        for face in 0..6 {
+            gl.tex_image_2d(
+                glow::TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                0,
+                glow::SRGB8_ALPHA8 as i32,
+                2,
+                2,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+        }
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_CUBE_MAP_POSITIVE_X,
+            Some(cube),
+            0,
+        );
+        assert_eq!(
+            gl.check_framebuffer_status(glow::FRAMEBUFFER),
+            glow::FRAMEBUFFER_COMPLETE
+        );
+        // 保留另一张尺寸不匹配的二维宿主纹理，覆盖旧实现提前返回的错误路径。
+        let unrelated = gl.create_texture().unwrap();
+        gl.bind_texture(glow::TEXTURE_2D, Some(unrelated));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            1,
+            1,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(None),
+        );
+        assert!(GlRenderTarget::capture(&context, PixelSize::new(2, 2).unwrap()).is_err());
+        assert_eq!(
+            gl.get_parameter_texture(glow::TEXTURE_BINDING_2D),
+            Some(unrelated)
+        );
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(color),
+            0,
+        );
+        // 此前不能调用get_error，否则会掩盖错误泄漏。
+        GlRenderTarget::capture(&context, PixelSize::new(2, 2).unwrap()).unwrap();
+        assert_eq!(gl.get_error(), glow::NO_ERROR);
+        gl.bind_texture(glow::TEXTURE_2D, Some(color));
+        gl.delete_texture(unrelated);
+        gl.delete_texture(cube);
         let mut renderer = RemoteGlRenderer::create(&context).unwrap();
         let session = SessionId::allocate();
         renderer.apply_batch(vec![frame(session, 1)]).unwrap();
@@ -155,7 +214,28 @@ fn native_egl_renderer_roundtrip() {
             std::mem::transmute(egl.get_proc_address("glIsEnabledi").unwrap());
         gl.enable_draw_buffer(glow::BLEND, 1);
         gl.color_mask_draw_buffer(1, false, true, false, true);
+        let indexed_viewports = (gl.version().major, gl.version().minor) >= (4, 1)
+            || gl.supported_extensions().contains("GL_ARB_viewport_array");
+        let host_viewport = [0.25, 0.5, 1.25, 1.5];
+        if indexed_viewports {
+            gl.viewport_f32_slice(1, 1, &[host_viewport]);
+        }
+        gl.enable(glow::CLIP_DISTANCE0);
         let receipt = renderer.draw(&target, viewport).unwrap().unwrap();
+        assert!(gl.is_enabled(glow::CLIP_DISTANCE0), "宿主裁剪状态必须恢复");
+        for index in 1..gl.get_parameter_i32(glow::MAX_CLIP_DISTANCES) as u32 {
+            assert!(!gl.is_enabled(glow::CLIP_DISTANCE0 + index));
+        }
+        if indexed_viewports {
+            let get_float_indexed: unsafe extern "system" fn(u32, u32, *mut f32) =
+                std::mem::transmute(egl.get_proc_address("glGetFloati_v").unwrap());
+            let mut preserved_viewport = [0.0; 4];
+            get_float_indexed(glow::VIEWPORT, 1, preserved_viewport.as_mut_ptr());
+            assert_eq!(
+                preserved_viewport, host_viewport,
+                "宿主viewport1必须保持原值"
+            );
+        }
         let mut mask = [0u8; 4];
         get_boolean_indexed(glow::COLOR_WRITEMASK, 1, mask.as_mut_ptr());
         assert_eq!(mask, [0, 1, 0, 1]);

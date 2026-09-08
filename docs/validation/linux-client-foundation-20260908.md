@@ -175,3 +175,18 @@ job101998659618、macOS job101998659780 通过。已下载两宿主日志到
 该 schema 新增必需的 target_observation，旧 a60/095 原始报告只能用其对应版本
 verifier 复验，不具备目标格式证据。新的 C 查询尚未在 Linux 编译/执行，待后续 CI。
 OpenGL 查询版本依据 [Khronos 官方参考源码](https://github.com/KhronosGroup/OpenGL-Refpages/blob/main/gl4/glGetTexParameter.xml)：GL_TEXTURE_TARGET 仅4.5及以后可用。
+
+
+09565d3 Linux 完整包 run34206959387 已成功，x86_64 job101998580604、AArch64
+job101998580848、i686 job101998580911 的日志均明确记录完整包静态验证和目标进程
+解码器加载通过。macOS ARM64 run34206959528/job101998580553 也已成功，日志明确
+记录包结构、签名和 CLI 验证通过。原始日志 /tmp/frd-package-095-{linux-x64,
+linux-arm64,linux-i686,mac}.log。Windows 同轮仍运行中；不扩大为 GUI、实际AVC或
+后续未推送改动的验证。
+
+
+GL 独立审查补充修正：indexed viewport只操作0，所有clip-distance启用位在绘制期间
+关闭并恢复，非二维附件绑定失败立即处理自身GL错误并恢复宿主绑定。新增原生fixture
+覆盖不同viewport1值、clip0启用仍颜色正确和cube拒绝后有效capture立即成功。
+最低GL3.3保持。修正后三目标 --tests 编译检查、macOS纯逻辑3项、fmt/diff通过，
+新增原生断言尚待下一轮CI。GTK目标观察严格报告测试最终20项通过，C实现待Linux。

@@ -39,3 +39,10 @@ EGL 使用 pbuffer；Mesa 无窗口环境可设置 `EGL_PLATFORM=surfaceless`。
 fixture 测试中才执行像素读回，覆盖非端点颜色/灰度、alpha、上下方向、两种stride、
 letterbox 清黑、错误viewport、真实current解绑、回执撤销和detach。它不证明GTK
 集成、窗口系统呈现或硬件GPU；llvmpipe应明确标为软件GL。
+
+
+后续宿主状态审查修正：支持 viewport-array 时仅更新 viewport 0；保存全部 clip
+启用位，绘制期间禁用并恢复；拒绝非二维附件时立即处理绑定错误、恢复宿主绑定，
+避免污染下一次有效 capture。原生 fixture 覆盖 viewport 1 的小数值保持、clip 0
+启用时的像素正确性及 cube 附件拒绝后的有效 capture。这些新增断言尚待 Linux CI
+运行；三目标编译检查与 macOS 3项纯逻辑测试通过不能替代它。

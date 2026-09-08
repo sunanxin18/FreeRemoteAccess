@@ -186,12 +186,21 @@ impl GlRenderTarget {
             let texture =
                 glow::NativeTexture(std::num::NonZeroU32::new(name).ok_or(GlError::InvalidTarget)?);
             let previous = gl.get_parameter_texture(glow::TEXTURE_BINDING_2D);
+            context.clean()?;
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            // GL 3.3 没有纹理目标查询；非二维附件绑定失败时立即停止，
+            // 不得查询仍绑定的宿主纹理，也不得留下本次绑定产生的错误。
+            if gl.get_error() != glow::NO_ERROR {
+                gl.bind_texture(glow::TEXTURE_2D, previous);
+                context.clean()?;
+                return Err(GlError::InvalidTarget);
+            }
             let dimensions = [
                 gl.get_tex_level_parameter_i32(glow::TEXTURE_2D, level, glow::TEXTURE_WIDTH),
                 gl.get_tex_level_parameter_i32(glow::TEXTURE_2D, level, glow::TEXTURE_HEIGHT),
             ];
             gl.bind_texture(glow::TEXTURE_2D, previous);
+            context.clean()?;
             if dimensions != [self.size.width as i32, self.size.height as i32] {
                 return Err(GlError::InvalidTarget);
             }
@@ -493,9 +502,12 @@ impl RemoteGlRenderer {
             unsafe {
                 let gl = &self.context.0.gl;
                 let saved = DrawState::save(gl);
-                gl.viewport(region[0], region[1], region[2], region[3]);
+                set_viewport_zero(gl, region);
                 for cap in DRAW_DISABLED {
                     gl.disable(cap);
+                }
+                for index in 0..saved.clip_distances.len() {
+                    gl.disable(glow::CLIP_DISTANCE0 + index as u32);
                 }
                 gl.disable_draw_buffer(glow::BLEND, 0);
                 set_scissor_zero(gl, false);
@@ -560,6 +572,16 @@ const DRAW_DISABLED: [u32; 6] = [
     glow::COLOR_LOGIC_OP,
     glow::DITHER,
 ];
+unsafe fn set_viewport_zero(gl: &glow::Context, viewport: [i32; 4]) {
+    let indexed = (gl.version().major, gl.version().minor) >= (4, 1)
+        || gl.supported_extensions().contains("GL_ARB_viewport_array");
+    if indexed {
+        // 非索引 glViewport 会重写所有 viewport；执行器只拥有索引0。
+        gl.viewport_f32_slice(0, 1, &[viewport.map(|value| value as f32)]);
+    } else {
+        gl.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    }
+}
 unsafe fn set_scissor_zero(gl: &glow::Context, enabled: bool) {
     let indexed = (gl.version().major, gl.version().minor) >= (4, 1)
         || gl.supported_extensions().contains("GL_ARB_viewport_array");
@@ -619,6 +641,7 @@ struct DrawState {
     sampler: Option<glow::NativeSampler>,
     viewport: [i32; 4],
     enabled: [bool; 6],
+    clip_distances: Vec<bool>,
     blend: bool,
     scissor: bool,
     srgb: bool,
@@ -648,6 +671,9 @@ impl DrawState {
             blend: gl.is_enabled(glow::BLEND),
             scissor: gl.is_enabled(glow::SCISSOR_TEST),
             enabled: DRAW_DISABLED.map(|cap| gl.is_enabled(cap)),
+            clip_distances: (0..gl.get_parameter_i32(glow::MAX_CLIP_DISTANCES) as u32)
+                .map(|index| gl.is_enabled(glow::CLIP_DISTANCE0 + index))
+                .collect(),
             srgb: gl.is_enabled(glow::FRAMEBUFFER_SRGB),
             mask: gl.get_parameter_bool_array(glow::COLOR_WRITEMASK),
         }
@@ -658,16 +684,17 @@ impl DrawState {
         gl.bind_texture(glow::TEXTURE_2D, self.texture);
         gl.bind_sampler(0, self.sampler);
         gl.active_texture(self.active);
-        gl.viewport(
-            self.viewport[0],
-            self.viewport[1],
-            self.viewport[2],
-            self.viewport[3],
-        );
+        set_viewport_zero(gl, self.viewport);
         for (cap, enabled) in DRAW_DISABLED
             .into_iter()
             .zip(self.enabled)
             .chain([(glow::FRAMEBUFFER_SRGB, self.srgb)])
+            .chain(
+                self.clip_distances
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, enabled)| (glow::CLIP_DISTANCE0 + index as u32, enabled)),
+            )
         {
             if enabled {
                 gl.enable(cap);
