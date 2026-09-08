@@ -2265,7 +2265,7 @@ impl EgfxSurfacePublisher {
     }
 
     /// 只合并同高横向/同宽纵向相接或相交的矩形，绝不跨越未初始化的洞。
-    fn coalesce_progressive_rectangles(mut rects: Vec<PixelRect>) -> Vec<PixelRect> {
+    fn coalesce_backing_rectangles(mut rects: Vec<PixelRect>) -> Vec<PixelRect> {
         rects.sort_unstable_by_key(|r| (r.y, r.height, r.x));
         let mut horizontal: Vec<PixelRect> = Vec::new();
         for rect in rects {
@@ -2360,7 +2360,7 @@ impl EgfxSurfacePublisher {
                 })
                 .collect();
             // 全部 layout 和发布预算先验证，错误会清除整个 generation 的排队像素。
-            let publication = Self::coalesce_progressive_rectangles(rects.clone());
+            let publication = Self::coalesce_backing_rectangles(rects.clone());
             Self::publication_rectangles(&mut state, wire.surface_id, &publication)
                 .map_err(|_| RdpEgfxFailure::Publisher)?;
             for (update, rect) in updates.iter().zip(&rects) {
@@ -2626,7 +2626,10 @@ impl EgfxSurfacePublisher {
         id: u16,
         rects: &[PixelRect],
     ) -> backing::Result<()> {
-        let clipped = Self::publication_rectangles(state, id, rects)?;
+        // backing 已保存本次操作的最终像素；先精确合并损伤，再检查发布预算。
+        // 合并不填补洞，无法合并的离散区域仍受 256 patch / 64 MiB 限制。
+        let rects = Self::coalesce_backing_rectangles(rects.to_vec());
+        let clipped = Self::publication_rectangles(state, id, &rects)?;
         let surface = *state.surfaces.get(&id).ok_or(())?;
         let mut patches = Vec::with_capacity(clipped.len());
         for r in clipped {
@@ -4912,6 +4915,127 @@ mod tests {
         );
     }
     #[test]
+    fn disjoint_cache_destinations_still_fail_closed_without_partial_publication() {
+        use ironrdp_egfx::pdu::{CacheToSurfacePdu, Point};
+        let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        publisher.on_reset_graphics(600, 1);
+        {
+            let mut state = super::lock_state(&publisher.state);
+            state.surfaces.insert(
+                1,
+                super::EgfxSurface {
+                    width: 600,
+                    height: 1,
+                    origin_x: 0,
+                    origin_y: 0,
+                    mapped: true,
+                },
+            );
+            state
+                .backings
+                .create(2, PixelSize::new(1, 1).unwrap())
+                .unwrap();
+            let r = PixelRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            };
+            state.backings.write(2, r, &[1, 2, 3, 255]).unwrap();
+            state.backings.cache_surface(2, r, 3).unwrap();
+        }
+        publisher.drain();
+        publisher.on_cache_to_surface(&CacheToSurfacePdu {
+            cache_slot: 3,
+            surface_id: 1,
+            destination_points: (0..300).map(|i| Point { x: i * 2, y: 0 }).collect(),
+        });
+        assert!(publisher.is_disabled());
+        assert!(publisher.drain().is_empty());
+        let state = super::lock_state(&publisher.state);
+        assert_eq!(state.publisher_failure_detail, Some("publish:patch count"));
+        assert_eq!(state.publisher_failure_operation, Some("cache_to_surface"));
+        assert!(state.pending_patches.is_empty());
+    }
+
+    #[test]
+    fn cache_many_destinations_coalesces_exact_pixels_without_covering_holes() {
+        use ironrdp_egfx::pdu::{CacheToSurfacePdu, Point};
+        let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        publisher.on_reset_graphics(602, 2);
+        super::lock_state(&publisher.state).surfaces.insert(
+            1,
+            super::EgfxSurface {
+                width: 602,
+                height: 2,
+                origin_x: 0,
+                origin_y: 0,
+                mapped: false,
+            },
+        );
+        publisher.on_surface_mapped(1, 0, 0);
+        publisher.drain();
+        let tile = [1, 2, 3, 255, 4, 5, 6, 255];
+        {
+            let mut state = super::lock_state(&publisher.state);
+            state
+                .backings
+                .create(2, PixelSize::new(2, 1).unwrap())
+                .unwrap();
+            let r = PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            };
+            state.backings.write(2, r, &tile).unwrap();
+            state.backings.cache_surface(2, r, 3).unwrap();
+        }
+        // 两条不相连的已知区域之间留两像素的洞，目标数量超过单次发布预算。
+        let points = (0..300)
+            .map(|i| Point {
+                x: i * 2 + if i >= 150 { 2 } else { 0 },
+                y: 0,
+            })
+            .collect();
+        publisher.on_cache_to_surface(&CacheToSurfacePdu {
+            cache_slot: 3,
+            surface_id: 1,
+            destination_points: points,
+        });
+        assert!(!publisher.is_disabled());
+        let state = super::lock_state(&publisher.state);
+        let patches = &state.pending_patches;
+        assert_eq!(patches.len(), 2);
+        for (patch, x) in patches.iter().zip([0, 302]) {
+            assert_eq!(
+                patch.rect,
+                PixelRect {
+                    x,
+                    y: 0,
+                    width: 300,
+                    height: 1
+                }
+            );
+            assert_eq!(patch.pixels.as_bytes(), tile.repeat(150));
+        }
+        assert!(state
+            .backings
+            .read(
+                1,
+                PixelRect {
+                    x: 300,
+                    y: 0,
+                    width: 2,
+                    height: 1
+                }
+            )
+            .is_err());
+        assert_eq!(super::MAX_PENDING_SURFACE_UPDATES, 256);
+        assert_eq!(super::MAX_PENDING_PIXEL_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[test]
     fn gfx_surface_copy_cache_fill_and_evict_update_backing_before_map() {
         use ironrdp_egfx::pdu::{
             CacheToSurfacePdu, Color, EvictCacheEntryPdu, Point, SolidFillPdu, SurfaceToCachePdu,
@@ -5452,7 +5576,7 @@ mod tests {
                 height: 64,
             },
         ];
-        let merged = EgfxSurfacePublisher::coalesce_progressive_rectangles(rects);
+        let merged = EgfxSurfacePublisher::coalesce_backing_rectangles(rects);
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().all(|r| r.width == 64));
     }
