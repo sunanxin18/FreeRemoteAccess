@@ -85,11 +85,6 @@ jobs:
           wsl.exe --install --distribution Ubuntu-24.04 --no-launch
           wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y build-essential ${{ matrix.wsl_packages }} nasm pkg-config xz-utils"
 
-      - name: Install Rust target for cross package
-        if: matrix.rust_target != ''
-        shell: pwsh
-        run: rustup target add ${{ matrix.rust_target }}
-
       - name: Build pinned FFmpeg bundle with native tests
         if: matrix.architecture == 'x86_64'
         shell: pwsh
