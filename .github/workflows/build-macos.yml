@@ -82,6 +82,15 @@ jobs:
           -p frd-protocol-rdp
           -p freeremotedesk-macos
 
+      - name: Run ARM64 ClearCodec and NSCodec parity and bounded benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          printf 'ClearCodec runtime target=%s host=%s\n' "${{ matrix.rust_target }}" "$(uname -m)"
+          cargo test --locked --target "${{ matrix.rust_target }}" -p frd-protocol-rdp clearcodec
+          cargo test --locked --release --target "${{ matrix.rust_target }}" -p frd-protocol-rdp bounded_decode_benchmark -- --ignored --nocapture --test-threads=1
+
       - name: Build exact FFmpeg bundle and native fixtures
         shell: bash
         env:

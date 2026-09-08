@@ -152,6 +152,18 @@ jobs:
         shell: pwsh
         run: cargo test --locked -p frd-video-ffmpeg-plugin --lib
 
+      - name: Run x86 and x64 ClearCodec and NSCodec target runtime
+        if: matrix.architecture != 'arm64'
+        shell: pwsh
+        run: |
+          $target = '${{ matrix.rust_target }}'
+          if ([string]::IsNullOrWhiteSpace($target)) { $target = 'x86_64-pc-windows-msvc' }
+          Write-Host "ClearCodec runtime target=$target host=$([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+          cargo test --locked --target $target -p frd-protocol-rdp clearcodec
+          if ($LASTEXITCODE -ne 0) { throw "ClearCodec target parity failed" }
+          cargo test --locked --release --target $target -p frd-protocol-rdp bounded_decode_benchmark -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "ClearCodec target benchmark failed" }
+
       - name: Run x86 decoder fixtures in a 32-bit process
         if: matrix.architecture == 'x86'
         shell: pwsh
@@ -254,3 +266,15 @@ jobs:
         run: |
           $env:FRD_FFMPEG_TEST_BUNDLE = (Resolve-Path 'target/package-test/codecs/ffmpeg-8.1.2/windows-aarch64').Path
           cargo test --locked --target aarch64-pc-windows-msvc -p frd-video-ffmpeg-plugin --test main444_decode -- --nocapture
+
+      - name: Run native ARM64 ClearCodec and NSCodec parity and bounded benchmark
+        shell: pwsh
+        run: |
+          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) {
+            throw "ClearCodec ARM64 runtime requires a native ARM64 host"
+          }
+          Write-Host "ClearCodec runtime target=aarch64-pc-windows-msvc host=Arm64"
+          cargo test --locked --target aarch64-pc-windows-msvc -p frd-protocol-rdp clearcodec
+          if ($LASTEXITCODE -ne 0) { throw "ClearCodec ARM64 parity failed" }
+          cargo test --locked --release --target aarch64-pc-windows-msvc -p frd-protocol-rdp bounded_decode_benchmark -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "ClearCodec ARM64 benchmark failed" }

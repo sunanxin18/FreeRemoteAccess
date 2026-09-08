@@ -7,6 +7,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "crates/frd-protocol-rdp/**"
       - "crates/frd-video-ffmpeg/**"
       - "crates/frd-video-ffmpeg-plugin/**"
       - "third_party/ffmpeg/8.1.2/**"
@@ -21,6 +22,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "crates/frd-protocol-rdp/**"
       - "crates/frd-video-ffmpeg/**"
       - "crates/frd-video-ffmpeg-plugin/**"
       - "third_party/ffmpeg/8.1.2/**"
@@ -86,6 +88,18 @@ jobs:
         run: |
           test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
           rustc --target "${{ matrix.cargo_target }}" --version --verbose
+
+      - name: Run target ClearCodec and NSCodec parity and bounded benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            export CC_i686_unknown_linux_gnu=i686-linux-gnu-gcc
+            export CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc
+          fi
+          printf 'ClearCodec runtime target=%s host=%s\n' "${{ matrix.cargo_target }}" "$(uname -m)"
+          cargo test --locked --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp clearcodec
+          cargo test --locked --release --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp bounded_decode_benchmark -- --ignored --nocapture --test-threads=1
 
       - name: Build and verify exact FFmpeg bundle
         shell: bash
