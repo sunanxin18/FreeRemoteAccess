@@ -8,7 +8,7 @@ use frd_frame::{
     FrameCompleteness, FrameReset, FrameRevision, FrameTransaction, PixelBuffer, PixelFormat,
     PixelPatch,
 };
-use frd_render_gl::{ExternalContext, GlRenderTarget, RemoteGlRenderer};
+use frd_render_gl::{ExternalContext, GlOutputContract, GlRenderTarget, RemoteGlRenderer};
 use glow::HasContext;
 use khronos_egl as egl;
 use std::{ffi::c_void, rc::Rc};
@@ -44,6 +44,246 @@ fn frame(session: SessionId, generation: u64) -> FrameTransaction {
             completeness: FrameCompleteness::FullBaseline,
         },
     }
+}
+
+// CPU传递函数仅作测试oracle；生产采样、过滤和编码全部在GPU执行。
+fn srgb_decode(value: u8) -> f64 {
+    let encoded = f64::from(value) / 255.0;
+    if encoded <= 0.04045 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_encode(linear: f64) -> u8 {
+    let encoded = if linear <= 0.0031308 {
+        12.92 * linear
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round() as u8
+}
+
+fn expected_filtered_pixel(source: &[[u8; 3]; 4], x: usize, y: usize, side: usize) -> [u8; 4] {
+    let u = ((x as f64 + 0.5) * 2.0 / side as f64 - 0.5).clamp(0.0, 1.0);
+    // 测试读回底部原点；source按顶部行序排列。
+    let v = (((side - 1 - y) as f64 + 0.5) * 2.0 / side as f64 - 0.5).clamp(0.0, 1.0);
+    let mut result = [255; 4];
+    for channel in 0..3 {
+        let top = srgb_decode(source[0][channel]) * (1.0 - u) + srgb_decode(source[1][channel]) * u;
+        let bottom =
+            srgb_decode(source[2][channel]) * (1.0 - u) + srgb_decode(source[3][channel]) * u;
+        result[channel] = srgb_encode(top * (1.0 - v) + bottom * v);
+    }
+    result
+}
+
+unsafe fn verify_output_contracts(context: &ExternalContext, gl: &glow::Context) {
+    let original_srgb = gl.is_enabled(glow::FRAMEBUFFER_SRGB);
+    for source in [
+        [[255, 0, 0], [128, 128, 128], [32, 96, 192], [0, 0, 255]],
+        [[8, 8, 8], [10, 10, 10], [11, 11, 11], [12, 12, 12]],
+    ] {
+        let mut renderer = RemoteGlRenderer::create(context).unwrap();
+        let mut transaction = frame(SessionId::allocate(), 1);
+        if let FrameTransaction::Startup { revision, .. } = &mut transaction {
+            revision.patches[0].stride_bytes = 8;
+            revision.patches[0].pixels = PixelBuffer::new(
+                source
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(index, [r, g, b])| [b, g, r, (index * 47) as u8])
+                    .collect(),
+            );
+        }
+        renderer.apply_batch(vec![transaction]).unwrap();
+        for side in [2, 4] {
+            let mut previous_pixels: Option<Vec<u8>> = None;
+            for (contract, internal_format) in [
+                (GlOutputContract::SrgbFramebuffer, glow::SRGB8_ALPHA8),
+                (GlOutputContract::SrgbEncodedRgba8, glow::RGBA8),
+            ] {
+                let texture = gl.create_texture().unwrap();
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    internal_format as i32,
+                    side,
+                    side,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                let fbo = gl.create_framebuffer().unwrap();
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(texture),
+                    0,
+                );
+                gl.viewport(0, 0, side, side);
+                let size = PixelSize::new(side as u32, side as u32).unwrap();
+                let target =
+                    GlRenderTarget::capture_with_output_contract(context, size, contract).unwrap();
+                let other = if contract == GlOutputContract::SrgbFramebuffer {
+                    GlOutputContract::SrgbEncodedRgba8
+                } else {
+                    assert!(GlRenderTarget::capture(context, size).is_err());
+                    GlOutputContract::SrgbFramebuffer
+                };
+                assert!(
+                    GlRenderTarget::capture_with_output_contract(context, size, other).is_err()
+                );
+                let viewport = ContentViewport::fit_in(
+                    PixelSize::new(2, 2).unwrap(),
+                    size,
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: size.width,
+                        height: size.height,
+                    },
+                )
+                .unwrap();
+                // 两种入口状态都必须恢复，输出均不能依赖宿主遗留的开关。
+                for enabled in [false, true] {
+                    if enabled {
+                        gl.enable(glow::FRAMEBUFFER_SRGB);
+                    } else {
+                        gl.disable(glow::FRAMEBUFFER_SRGB);
+                    }
+                    let receipt = renderer.draw(&target, viewport).unwrap().unwrap();
+                    assert!(receipt.is_valid());
+                    assert_eq!(gl.is_enabled(glow::FRAMEBUFFER_SRGB), enabled);
+                    let mut pixels = vec![0; (side * side * 4) as usize];
+                    gl.read_pixels(
+                        0,
+                        0,
+                        side,
+                        side,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut pixels)),
+                    );
+                    for y in 0..side as usize {
+                        for x in 0..side as usize {
+                            let expected = expected_filtered_pixel(&source, x, y, side as usize);
+                            let offset = (y * side as usize + x) * 4;
+                            for channel in 0..4 {
+                                assert!(pixels[offset + channel].abs_diff(expected[channel]) <= 1,
+                                    "contract={contract:?} side={side} ({x},{y}) channel={channel} actual={} expected={}", pixels[offset + channel], expected[channel]);
+                            }
+                            assert_eq!(pixels[offset + 3], 255);
+                        }
+                    }
+                    if let Some(previous) = &previous_pixels {
+                        for (actual, previous) in pixels.iter().zip(previous) {
+                            assert!(
+                                actual.abs_diff(*previous) <= 1,
+                                "两个输出契约的编码字节必须一致"
+                            );
+                        }
+                    }
+                    previous_pixels = Some(pixels);
+                }
+                if contract == GlOutputContract::SrgbEncodedRgba8 {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        1,
+                        glow::RGBA8 as i32,
+                        side,
+                        side,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    gl.framebuffer_texture_2d(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D,
+                        Some(texture),
+                        1,
+                    );
+                    assert_eq!(
+                        gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                        glow::FRAMEBUFFER_COMPLETE
+                    );
+                    assert!(
+                        GlRenderTarget::capture_with_output_contract(context, size, contract)
+                            .is_err(),
+                        "编码RGBA8契约只能接受level0"
+                    );
+                    gl.framebuffer_texture_2d(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D,
+                        Some(texture),
+                        0,
+                    );
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA16 as i32,
+                        side,
+                        side,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    assert!(
+                        GlRenderTarget::capture_with_output_contract(context, size, contract)
+                            .is_err(),
+                        "LINEAR编码不能代替精确RGBA8格式"
+                    );
+                    let multisample = gl.create_texture().unwrap();
+                    gl.bind_texture(glow::TEXTURE_2D_MULTISAMPLE, Some(multisample));
+                    gl.tex_image_2d_multisample(
+                        glow::TEXTURE_2D_MULTISAMPLE,
+                        1,
+                        glow::RGBA8 as i32,
+                        side,
+                        side,
+                        true,
+                    );
+                    gl.framebuffer_texture_2d(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D_MULTISAMPLE,
+                        Some(multisample),
+                        0,
+                    );
+                    assert_eq!(
+                        gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                        glow::FRAMEBUFFER_COMPLETE
+                    );
+                    assert!(gl.get_parameter_i32(glow::SAMPLES) > 0);
+                    assert!(
+                        GlRenderTarget::capture_with_output_contract(context, size, contract)
+                            .is_err(),
+                        "编码RGBA8契约不接受多采样附件"
+                    );
+                    gl.delete_texture(multisample);
+                }
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(texture);
+            }
+        }
+        renderer.detach().unwrap();
+    }
+    if original_srgb {
+        gl.enable(glow::FRAMEBUFFER_SRGB);
+    } else {
+        gl.disable(glow::FRAMEBUFFER_SRGB);
+    }
+    assert_eq!(gl.get_error(), glow::NO_ERROR);
 }
 
 /// 显式运行；只证明 EGL/GL 实际上传绘制，不证明 GTK 或窗口呈现/ACK。
@@ -110,6 +350,7 @@ fn native_egl_renderer_roundtrip() {
                 .map_or(std::ptr::null(), |f| f as *const c_void)
         });
         println!("native EGL desktop GL fixture; hardware_verified=0; no GTK presentation claim");
+        verify_output_contracts(&context, &gl);
         let color = gl.create_texture().unwrap();
         gl.bind_texture(glow::TEXTURE_2D, Some(color));
         gl.tex_image_2d(

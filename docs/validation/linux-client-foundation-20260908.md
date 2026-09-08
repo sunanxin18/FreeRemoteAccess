@@ -215,3 +215,18 @@ compatible0。Wayland2×实际viewport1920×1186对应960×593逻辑面积。目
 更换计数与观察次数相差1，进一步支持每次render重新capture而非缓存FBO。
 该测量明确阻止当前sRGB-only接口直接接入；下一步必须核对GTK纹理颜色语义，再
 实现明确的GPU输出转换或中间合成，不得把LINEAR附件谎报为sRGB。
+
+
+347a79e 原生窗口 run34209182174 最终三架构全部成功：x64 job102005830389、i686
+job102005830604、ARM64 job102005830614。下载三架构各X11/Wayland1×/2×共12份
+报告，并用该版本严格verifier逐份复验通过。全部目标均RGBA8/LINEAR、compatible0；
+Wayland2×真实缩放及ARM64日志隔离修正取得原生证据。X11包含输入，Wayland仅
+GL/几何；不宣称完整产品登录、键盘焦点全覆盖或硬件GPU通过。artifact目录
+ target/validation/native-shell-347-{x64,i686,arm64}。
+
+
+新增显式SrgbEncodedRgba8输出模式，默认sRGB capture不变。新模式只接受明确宿主
+声明的RGBA8/LINEAR/2D/level0/单采样目标，shader在线性过滤后重新编码sRGB字节，
+没有CPU整帧转色。新增原生测试覆盖两目标输出对照、暗灰分段、2×缩放、alpha/X、
+状态恢复及格式/mip/多采样拒绝。macOS3项纯逻辑和fmt/diff通过，原生断言待CI；
+此实现不表示GTK产品接线或实际窗口最终颜色已通过。

@@ -5,7 +5,7 @@
 本模块不依赖 GTK，也不连接生产远程会话或呈现 ACK。
 
 当前仅接受 desktop OpenGL 3.3+ core 使用方式。GLES、默认 framebuffer、renderbuffer
-颜色附件、未知颜色编码均拒绝。目标必须为当前 COLOR_ATTACHMENT0 的完整 sRGB
+颜色附件、未知颜色编码均拒绝。默认 capture 目标必须为当前 COLOR_ATTACHMENT0 的完整 sRGB
 二维纹理 FBO；复核附件尺寸和完整 viewport。宿主若使用 clip-control，必须保持
 LOWER_LEFT / NEGATIVE_ONE_TO_ONE，否则拒绝绘制。绘制核对远端尺寸、drawable 和
 content rectangle，清黑独立内容 FBO，再绘制远端内容；polygon FILL、viewport、
@@ -46,3 +46,12 @@ letterbox 清黑、错误viewport、真实current解绑、回执撤销和detach�
 避免污染下一次有效 capture。原生 fixture 覆盖 viewport 1 的小数值保持、clip 0
 启用时的像素正确性及 cube 附件拒绝后的有效 capture。这些新增断言尚待 Linux CI
 运行；三目标编译检查与 macOS 3项纯逻辑测试通过不能替代它。
+
+
+显式 GlOutputContract::SrgbEncodedRgba8 通过 capture_with_output_contract 选择，
+只接受LINEAR、精确RGBA8、二维level0、单采样目标。调用者必须保证消费者将字节
+解释为sRGB编码值；不会从LINEAR本身推断。采样继续在线性空间过滤，shader输出前
+重新编码，关闭FRAMEBUFFER_SRGB后写入普通RGBA8；旧capture仍严格要求sRGB附件。
+该能力针对已观察的GTK4.14目标准备，未完成GTK最终snapshot颜色或生产会话接线。
+native fixture比较两契约2×2/4×4输出及CPU测试oracle，含暗灰8/10/11/12、不同X、
+alpha、方向、状态恢复和格式/mip/多采样拒绝；新增断言待本轮Linux CI运行。

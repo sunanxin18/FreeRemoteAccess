@@ -138,3 +138,26 @@ renderer serial/远端revision，在同counter after-paint中消费一次并复�
 忽略swap返回值，因此单独after-paint也不足以达到现有clean-scope强度。须固定并核对
 部署的GTK/GSK版本，先取得实际提交链证据再开放生产ACK。此审查是4.14.0上游源码，
 尚未声称Ubuntu具体补丁包或产品窗口通过。
+
+
+### 普通 RGBA8 中的显式 sRGB 字节输出
+
+三架构实测的 GTK 目标为 RGBA8/LINEAR；LINEAR 是附件的硬件颜色转换属性，不能据此
+自动推断消费者的颜色语义。新增输出契约由宿主显式选择：原 SrgbFramebuffer 保持
+sRGB附件要求；SrgbEncodedRgba8 要求普通RGBA8、LINEAR、二维单采样附件，并约定
+消费者将存储字节作为sRGB编码颜色。未知目标或未声明颜色语义仍拒绝。
+
+输入继续上传sRGB纹理，采样器解码后在线性空间过滤。前一模式由FRAMEBUFFER_SRGB
+完成编码；后一模式由shader按标准分段函数重新编码后写入RGBA8，并关闭硬件编码
+以免重复转换。alpha保持1；原宿主状态在结束时恢复。测试需覆盖暗灰分段附近值、
+非端点颜色、上下方向、2×缩放的线性过滤oracle和两契约交叉拒绝，CPU仅用于测试
+oracle。此后端能力不等于GTK的组合根、提交确认或远程会话接线已完成。
+
+
+颜色语义依据：固定 [GTK4.14 GLArea源码](https://github.com/GNOME/gtk/blob/4.14.0/gtk/gtkglarea.c#L465)
+分配RGBA8并将premultiplied GLTexture直接追加snapshot；[GSK blit shader](https://github.com/GNOME/gtk/blob/4.14.0/gsk/gl/resources/blit.glsl#L13)
+普通texture采样后仅施加alpha/coverage，没有transfer；[GTK官方颜色说明](https://blog.gtk.org/2024/08/11/the-colors-of-gtk/)
+明确4.16颜色状态工作前默认假定sRGB。因此4.14这里应存sRGB编码字节；这不是从
+GL_LINEAR枚举本身推断。精确RGBA8保证通道8bit，新契约仅level0和samples0；输出
+alpha1满足premultiplied解释。桌面BGRA内存格式不能成为额外交换输出红蓝的理由。
+此证据不自动覆盖更新GTK的HDR/广色域color-state，也未完成GTK最终显示像素验收。

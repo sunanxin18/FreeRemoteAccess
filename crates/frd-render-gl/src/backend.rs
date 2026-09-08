@@ -118,15 +118,33 @@ impl ExternalContext {
     }
 }
 
-/// 只绑定当前非默认 FBO；尺寸由宿主声明，draw 时复核 FBO 身份与 sRGB 编码。
+/// 宿主明确声明颜色附件的输出语义，不能仅从GL附件编码推断。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlOutputContract {
+    /// sRGB附件接收线性shader输出，由FRAMEBUFFER_SRGB编码。
+    SrgbFramebuffer,
+    /// RGBA8附件存储sRGB编码字节；由shader显式编码，alpha固定为1。
+    SrgbEncodedRgba8,
+}
+
+/// 只绑定当前非默认FBO；draw时复核尺寸、身份与显式输出契约。
 pub struct GlRenderTarget {
     context: ExternalContext,
     epoch: u64,
     framebuffer: glow::NativeFramebuffer,
     size: PixelSize,
+    output_contract: GlOutputContract,
 }
 impl GlRenderTarget {
     pub fn capture(context: &ExternalContext, size: PixelSize) -> Result<Self, GlError> {
+        Self::capture_with_output_contract(context, size, GlOutputContract::SrgbFramebuffer)
+    }
+    /// 宿主必须确认下游如何解释附件字节；LINEAR附件本身不证明sRGB语义。
+    pub fn capture_with_output_contract(
+        context: &ExternalContext,
+        size: PixelSize,
+        output_contract: GlOutputContract,
+    ) -> Result<Self, GlError> {
         context.clean()?;
         let gl = &context.0.gl;
         let framebuffer = unsafe { gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING) }
@@ -136,6 +154,7 @@ impl GlRenderTarget {
             epoch: context.0.epoch.get(),
             framebuffer,
             size,
+            output_contract,
         };
         target.validate(context)?;
         Ok(target)
@@ -154,8 +173,13 @@ impl GlRenderTarget {
                     glow::DRAW_FRAMEBUFFER,
                     glow::COLOR_ATTACHMENT0,
                     glow::FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING,
-                ) != glow::SRGB as i32
+                ) != match self.output_contract {
+                    GlOutputContract::SrgbFramebuffer => glow::SRGB as i32,
+                    GlOutputContract::SrgbEncodedRgba8 => glow::LINEAR as i32,
+                }
                 || gl.get_parameter_i32(glow::DRAW_BUFFER0) != glow::COLOR_ATTACHMENT0 as i32
+                || (self.output_contract == GlOutputContract::SrgbEncodedRgba8
+                    && gl.get_parameter_i32(glow::SAMPLES) != 0)
             {
                 return Err(GlError::InvalidTarget);
             }
@@ -183,6 +207,9 @@ impl GlRenderTarget {
                 glow::COLOR_ATTACHMENT0,
                 glow::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL,
             );
+            if self.output_contract == GlOutputContract::SrgbEncodedRgba8 && level != 0 {
+                return Err(GlError::InvalidTarget);
+            }
             let texture =
                 glow::NativeTexture(std::num::NonZeroU32::new(name).ok_or(GlError::InvalidTarget)?);
             let previous = gl.get_parameter_texture(glow::TEXTURE_BINDING_2D);
@@ -199,9 +226,17 @@ impl GlRenderTarget {
                 gl.get_tex_level_parameter_i32(glow::TEXTURE_2D, level, glow::TEXTURE_WIDTH),
                 gl.get_tex_level_parameter_i32(glow::TEXTURE_2D, level, glow::TEXTURE_HEIGHT),
             ];
+            let internal_format = gl.get_tex_level_parameter_i32(
+                glow::TEXTURE_2D,
+                level,
+                glow::TEXTURE_INTERNAL_FORMAT,
+            );
             gl.bind_texture(glow::TEXTURE_2D, previous);
             context.clean()?;
-            if dimensions != [self.size.width as i32, self.size.height as i32] {
+            if dimensions != [self.size.width as i32, self.size.height as i32]
+                || (self.output_contract == GlOutputContract::SrgbEncodedRgba8
+                    && internal_format != glow::RGBA8 as i32)
+            {
                 return Err(GlError::InvalidTarget);
             }
             let mut viewport = [0; 4];
@@ -242,11 +277,12 @@ pub struct RemoteGlRenderer {
     surface_size: Option<PixelSize>,
     program: Option<glow::NativeProgram>,
     vao: Option<glow::NativeVertexArray>,
+    encode_srgb_uniform: glow::NativeUniformLocation,
 }
 impl RemoteGlRenderer {
     pub fn create(context: &ExternalContext) -> Result<Self, GlError> {
         context.clean()?;
-        let (program, vao) = unsafe { create_pipeline(&context.0.gl)? };
+        let (program, vao, encode_srgb_uniform) = unsafe { create_pipeline(&context.0.gl)? };
         if let Err(error) = context.clean() {
             context.retire(
                 context.0.epoch.get(),
@@ -267,6 +303,7 @@ impl RemoteGlRenderer {
             surface_size: None,
             program: Some(program),
             vao: Some(vao),
+            encode_srgb_uniform,
         })
     }
     fn ready(&self) -> Result<(), GlError> {
@@ -511,7 +548,12 @@ impl RemoteGlRenderer {
                 }
                 gl.disable_draw_buffer(glow::BLEND, 0);
                 set_scissor_zero(gl, false);
-                gl.enable(glow::FRAMEBUFFER_SRGB);
+                let encode_srgb = target.output_contract == GlOutputContract::SrgbEncodedRgba8;
+                if encode_srgb {
+                    gl.disable(glow::FRAMEBUFFER_SRGB);
+                } else {
+                    gl.enable(glow::FRAMEBUFFER_SRGB);
+                }
                 gl.color_mask_draw_buffer(0, true, true, true, true);
                 gl.clear_color(0.0, 0.0, 0.0, 1.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
@@ -519,6 +561,7 @@ impl RemoteGlRenderer {
                 gl.bind_sampler(0, None);
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 gl.use_program(self.program);
+                gl.uniform_1_i32(Some(&self.encode_srgb_uniform), i32::from(encode_srgb));
                 gl.bind_vertex_array(self.vao);
                 gl.polygon_mode(glow::FRONT_AND_BACK, glow::FILL);
                 gl.draw_arrays(glow::TRIANGLES, 0, 3);
@@ -715,11 +758,23 @@ impl DrawState {
 }
 unsafe fn create_pipeline(
     gl: &glow::Context,
-) -> Result<(glow::NativeProgram, glow::NativeVertexArray), GlError> {
+) -> Result<
+    (
+        glow::NativeProgram,
+        glow::NativeVertexArray,
+        glow::NativeUniformLocation,
+    ),
+    GlError,
+> {
     let program = gl.create_program().map_err(|_| GlError::ResourceCreation)?;
     let sources = [
         (glow::VERTEX_SHADER, "#version 330 core\nout vec2 uv; void main(){ vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2); uv=vec2(p.x,1.0-p.y); gl_Position=vec4(p*2.0-1.0,0.0,1.0); }"),
-        (glow::FRAGMENT_SHADER, "#version 330 core\nin vec2 uv; out vec4 color; uniform sampler2D frame; void main(){color=vec4(texture(frame,uv).bgr,1.0);}"),
+        (glow::FRAGMENT_SHADER, concat!(
+            "#version 330 core\n",
+            "in vec2 uv; out vec4 color; uniform sampler2D frame; uniform bool encode_srgb;\n",
+            "vec3 linear_to_srgb(vec3 c) { return mix(12.92*c, 1.055*pow(c,vec3(1.0/2.4))-0.055, greaterThan(c,vec3(0.0031308))); }\n",
+            "void main(){vec3 c=texture(frame,uv).bgr; color=vec4(encode_srgb ? linear_to_srgb(c) : c,1.0);}",
+        )),
     ];
     for (kind, source) in sources {
         let shader = match gl.create_shader(kind) {
@@ -751,5 +806,10 @@ unsafe fn create_pipeline(
             return Err(GlError::ResourceCreation);
         }
     };
-    Ok((program, vao))
+    let Some(encode_srgb_uniform) = gl.get_uniform_location(program, "encode_srgb") else {
+        gl.delete_vertex_array(vao);
+        gl.delete_program(program);
+        return Err(GlError::ShaderCompilation);
+    };
+    Ok((program, vao, encode_srgb_uniform))
 }

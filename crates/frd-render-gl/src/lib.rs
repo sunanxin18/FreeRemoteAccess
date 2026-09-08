@@ -86,7 +86,9 @@ mod backend;
     feature = "linux-gl",
     any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use backend::{DrawReceipt, ExternalContext, GlRenderTarget, RemoteGlRenderer};
+pub use backend::{
+    DrawReceipt, ExternalContext, GlOutputContract, GlRenderTarget, RemoteGlRenderer,
+};
 
 #[cfg(test)]
 mod tests {
