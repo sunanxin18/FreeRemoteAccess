@@ -53,3 +53,13 @@ Linux 应用入口 baebd80 的宿主测试通过 20 项单元及 2 项边界测�
 `5cd73ea` Linux run `34198594626` 的 ARM64 job `101971931726` 与 x86_64 job `101971932074` 均完成实际 release 客户端编译，但 verifier 因未审核依赖 `libz.so.1` 失败；不能标为完整包通过。`cargo tree --locked -p freeremotedesk-linux --target aarch64-unknown-linux-gnu -i libz-sys` 确认依赖来自 flate2，经 Apple 协议与 IronRDP SSPI 引入。已将标准 zlib SONAME 纳入明确系统依赖名单，未知库继续拒绝；新增回归后合成包测试 10 项通过。修正后的目标流程尚未重跑。
 
 独立 `tools/frd-linux-native-shell-probe` 与三架构 X11/Wayland CI 验证流程已实现，尚未在 Linux 编译/运行。探针只验证 GTK 原生 HeaderBar 与 GLArea 合成路径；有界 pass 要求实际 backend、mapped、独立内容 allocation、中心位置、viewport 与逻辑尺寸/缩放一致及无 GL错误。CI显式使用软件 Mesa，因此硬件 GPU、鼠标键盘、视觉验收和产品 RDP 集成仍不在通过范围。脚本及工作流 shell/YAML 语法已检查。
+
+## 首个完整 Linux 客户端包通过：i686
+
+2026-09-08 `5cd73ea` 的 Linux i686 job `101971932014` 已终态 success。同一32位目标进程通过应用20项单元及2项边界测试；完整 release 客户端、ELF/资源/权限校验、显式 `FRD_LINUX_PACKAGE_RUNTIME_SMOKE=1` 下加载器检查及真实 `--verify-codec-bundle` 均通过。完整 tar 包上传为 artifact `10045359087`（freeremotedesk-client-linux-x86），对应 FFmpeg source artifact `10045362850`。日志 `/tmp/frd-linux-client-i686-5cd.log`。
+
+此证明是 x86_64 Linux 宿主运行真实 i686 进程，不是 i686 GUI、真实输入或 RDP 控制。整个 run `34198594626` 仍为 failure，因为同次 ARM64/x86_64 verifier 拒绝 zlib 依赖；不得用单个目标成功覆盖其余失败。
+
+已下载上述 tar 产物并独立检查：28,838,880 字节，SHA-256 `253dfa97fb5504bc30f841df799d1593d5c5ac7ac4b466ebec1422ddc86427f8`，44 个归档条目；实际客户端为 ELF32/Intel80386、权限0755。未在 macOS 执行该 Linux ELF。
+
+原生窗口探针新增独立 Xvfb 输入驱动及严格 JSONL 校验：仅操作本次 PID/标题匹配的窗口，用实际焦点上的 XTEST 点击/F8，并要求鼠标、按键配对、内容焦点和坐标比例成立；Wayland 不允许宣称输入通过。14 项合成报告回归及脚本语法检查通过。新输入驱动尚未在 Linux 实际运行，不能把这些合成测试算作 GUI 输入证据。

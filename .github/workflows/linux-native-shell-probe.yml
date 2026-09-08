@@ -40,7 +40,7 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y build-essential pkg-config \
-            dbus-x11 xvfb xauth weston
+            dbus-x11 xvfb xauth xdotool weston
           suffix=""
           if [[ "${{ matrix.arch }}" == i686 ]]; then
             suffix=:i386
@@ -56,6 +56,7 @@ jobs:
             export CC=i686-linux-gnu-gcc
             export PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
           fi
+          python3 -B -m unittest discover -s tools/frd-linux-native-shell-probe -p 'test_*.py'
           bash tools/frd-linux-native-shell-probe/build.sh
           file target/linux-native-shell-probe/frd-linux-native-shell-probe
       - name: Run isolated X11 and Wayland GL pipelines
@@ -71,10 +72,8 @@ jobs:
           export GSK_RENDERER=gl
           probe="$PWD/target/linux-native-shell-probe/frd-linux-native-shell-probe"
           for scale in 1 2; do
-            GDK_SCALE="$scale" GDK_BACKEND=x11 dbus-run-session -- \
-              xvfb-run -a -s '-screen 0 2400x1800x24' \
-              "$probe" --expect-backend x11 --seconds 3 | \
-              tee "target/linux-native-shell-probe/logs/x11-$scale.jsonl"
+            bash tools/frd-linux-native-shell-probe/run-x11-input.sh "$probe" \
+              "target/linux-native-shell-probe/logs/x11-$scale.jsonl" "$scale"
           done
           weston --backend=headless-backend.so --renderer=pixman \
             --socket=frd-probe --idle-time=0 --width=2400 --height=1800 \
@@ -91,6 +90,9 @@ jobs:
             GDK_SCALE="$scale" GDK_BACKEND=wayland WAYLAND_DISPLAY=frd-probe \
               dbus-run-session -- "$probe" --expect-backend wayland --seconds 3 | \
               tee "target/linux-native-shell-probe/logs/wayland-$scale.jsonl"
+            python3 tools/frd-linux-native-shell-probe/verify_report.py \
+              "target/linux-native-shell-probe/logs/wayland-$scale.jsonl" \
+              --expect-backend wayland --expect-scale "$scale"
           done
       - name: Upload bounded native pipeline diagnostics
         if: always()
