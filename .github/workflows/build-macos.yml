@@ -78,6 +78,7 @@ jobs:
         run: |
           test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
           test "$(uname -m)" = "${{ matrix.host_arch }}"
+          rustup target add "${{ matrix.rust_target }}"
           rustc --target "${{ matrix.rust_target }}" --version --verbose
 
       - name: Run focused decoder and protocol tests
