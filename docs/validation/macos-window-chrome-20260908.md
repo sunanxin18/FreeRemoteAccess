@@ -56,3 +56,16 @@ outer frame coverage 校验保留，尚需无像素的失败几何证据定位�
 会话不改变。该错误传播修正不代表 Progressive 缺少当前帧 tile 的原因已经解决。
 
 最终自动回归：RDP 307 passed / 3 ignored，UI 34 passed，macOS 应用 18 项单元测试及 2 项依赖边界测试通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。错误终止的 observer 顺序和真实 adapter 重激活豁免有确定性回归；新错误页面尚未通过人为故障注入作 GUI 验证。
+
+
+## 后续诊断与完整工作区验证
+
+Progressive 的确切 coverage 失败现在记录固定大小的数字快照：outer EGFX frame ID、
+surface/context ID、失败矩形、缺失 tile 坐标，以及本帧/本 region 的 tile 数量。
+不包含像素、压缩数据、远程文字或凭据。快照在每次 decode/frame clear/reset 时清空，
+失败时由 EGFX 在释放解码状态前复制到现有实验 observer。
+
+独立只读审查通过；真实 WireToSurface2 回归验证了诊断跨失败清理保留、无部分输出
+和新 adapter 无旧诊断。完整 `cargo test --locked --workspace` 终态 exit 0：
+58 组、1666 passed / 0 failed / 16 ignored。RDP 单独 309 passed / 3 ignored。
+该诊断版本尚未接管当前用户会话进行真实复现，不能据此声明 coverage 根因已修复。

@@ -59,6 +59,7 @@ pub struct RdpEgfxDiagnostics {
     pub avc444_decoded_updates_total: u64,
     pub clearcodec_decoded_bitmaps_total: u64,
     pub progressive_decoded_updates_total: u64,
+    pub progressive_coverage_failure: Option<crate::RdpProgressiveCoverageFailure>,
     pub progressive_failure_detail: Option<&'static str>,
     pub publisher_failure_detail: Option<&'static str>,
     pub publisher_failure_operation: Option<&'static str>,

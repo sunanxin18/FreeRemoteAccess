@@ -48,3 +48,28 @@ Normal 23.06 µs/tile，ReduceExtrapolate 28.30 µs/tile。
 同job的ClearCodec/NSCodec 38项通过、2项默认ignored，随后2项显式基准通过，
 随包FFmpeg6项fixture通过。结合上文，d597212的Progressive七目标测试/内核基准
 已有全部成功记录；不包含后续协议修复，不证明七平台产品GUI或真实AVC。
+
+
+## `5c00935` 更新验证（2026-09-08）
+
+同一源码 SHA `5c0093529165e72e051a07ea1fdc81df5a0bdbb7` 的 Linux run
+`34192818977` 与 macOS run `34192818985` 已整体 success。Windows run
+`34192818981` 的三个 package job 已 success；原生 ARM64 runtime
+`101960797520` 仍在执行，不能用 ARM64 包成功代替目标运行。
+
+下列已完成 job 各通过 Progressive/邻近 EGFX 59 项回归、1 项默认 ignored，
+随后单独执行 release 基准通过。包括 d597212 后的生命周期与缓存发布修正，
+不包含 `85324f5` 的 GUI/致命错误传播和当前新增诊断。
+
+| 目标 | job | Normal µs/tile | ReduceExtrapolate µs/tile |
+| --- | --- | ---: | ---: |
+| Linux x86_64 | 101954189972 | 23.35 | 25.94 |
+| Linux i686 | 101954190098 | 25.86 | 28.69 |
+| Linux ARM64 | 101954190146 | 23.20 | 24.78 |
+| macOS ARM64 | 101954189458 | 12.89 | 14.24 |
+| Windows x86_64 | 101954190024 | 30.01 | 32.25 |
+| Windows i686 | 101954189953 | 25.16 | 29.10 |
+
+计时仍是单分量 DWT + BGRA 的合成内核范围，不是完整 RDP 延迟。
+真实 GUI 的 Progressive region coverage 失败单列于
+[窗口与输入验证](macos-window-chrome-20260908.md)，不能由这些通过项覆盖。

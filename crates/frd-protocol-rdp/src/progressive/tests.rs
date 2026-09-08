@@ -186,6 +186,41 @@ fn masks_share_only_current_egfx_frame_tiles_across_payloads() {
     assert!(d.decode(1, 1, 64, 64, &right).is_err());
 }
 #[test]
+fn coverage_failure_snapshot_is_exact_transactional_and_never_stale() {
+    let mut d = decoder();
+    let bad = frame(vec![region((0, 0, 128, 64), vec![first(0, 0, &[5])])]);
+    assert_eq!(
+        d.decode(7, 42, 128, 64, &bad).unwrap_err(),
+        Error::Invalid("region lacks current frame tiles")
+    );
+    assert_eq!(
+        d.coverage_failure(),
+        Some(CoverageFailure {
+            outer_frame_id: 1,
+            surface_id: 7,
+            codec_context_id: 42,
+            rectangle: (0, 0, 128, 64),
+            missing_tile: (1, 0),
+            frame_tile_count: 1,
+            region_tile_count: 1,
+        })
+    );
+    assert_eq!(d.context_count(), 0);
+    assert_eq!(d.tile_count(), 0);
+    let good = frame(vec![region((0, 0, 64, 64), vec![first(0, 0, &[9])])]);
+    assert_eq!(d.decode(7, 42, 128, 64, &good).unwrap()[0].bgra[0], 9);
+    assert_eq!(d.coverage_failure(), None);
+    d.end_frame(1).unwrap();
+    d.begin_frame(2).unwrap();
+    assert!(d.decode(7, 42, 128, 64, &bad).is_err());
+    assert_eq!(d.coverage_failure().unwrap().outer_frame_id, 2);
+    d.reset();
+    assert_eq!(d.coverage_failure(), None);
+    assert!(d.decode(7, 42, 128, 64, &bad).is_err());
+    assert_eq!(d.coverage_failure(), None);
+}
+
+#[test]
 fn missing_coverage_does_not_commit_decoded_tiles() {
     let mut d = decoder();
     let f = frame(vec![region((0, 0, 128, 64), vec![first(0, 0, &[5])])]);

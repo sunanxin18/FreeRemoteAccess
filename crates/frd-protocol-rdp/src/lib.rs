@@ -31,6 +31,8 @@ pub use egfx::{
     Avc420DecoderProvider, Avc444Decoder, Avc444DecoderProvider, EgfxDecoderProvider,
     ValidatedAvc444Bitmap, ValidatedAvc444Encoding,
 };
+pub use progressive::CoverageFailure as RdpProgressiveCoverageFailure;
+
 pub use factory::{
     RdpEgfxDiagnostics, RdpEgfxFailure, RdpGraphicsAdvertisementGate, RdpGraphicsCapabilities,
     RdpGraphicsObserver, RdpProtocolFactory, RdpProtocolSession,

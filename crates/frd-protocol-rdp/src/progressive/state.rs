@@ -132,12 +132,25 @@ impl<R> Clone for Surface<R> {
     }
 }
 
+/// 固定大小的覆盖失败形状；不含像素、压缩数据或远程文本。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoverageFailure {
+    pub outer_frame_id: u32,
+    pub surface_id: u16,
+    pub codec_context_id: u32,
+    pub rectangle: (u16, u16, u16, u16),
+    pub missing_tile: (u16, u16),
+    pub frame_tile_count: usize,
+    pub region_tile_count: usize,
+}
+
 pub struct Decoder<K: TileDecoder> {
     kernel: K,
     limits: Limits,
     contexts: BTreeMap<ContextKey, Context<K::TileState>>,
     surfaces: BTreeMap<u16, Surface<K::ReferenceState>>,
     frame: Option<u32>,
+    coverage_failure: std::cell::Cell<Option<CoverageFailure>>,
 }
 impl<K: TileDecoder> Decoder<K> {
     pub fn new(kernel: K, limits: Limits) -> Self {
@@ -147,6 +160,7 @@ impl<K: TileDecoder> Decoder<K> {
             contexts: BTreeMap::new(),
             surfaces: BTreeMap::new(),
             frame: None,
+            coverage_failure: std::cell::Cell::new(None),
         }
     }
     /// 外层 EGFX frame 生命周期；不能用 codec 内层 frame_index 代替。
@@ -170,6 +184,7 @@ impl<K: TileDecoder> Decoder<K> {
         Ok(())
     }
     fn clear_frame(&mut self) {
+        self.coverage_failure.set(None);
         for context in self.surfaces.values_mut() {
             context.frame_tiles.clear();
             context.frame_rects.clear();
@@ -184,6 +199,7 @@ impl<K: TileDecoder> Decoder<K> {
             .retain(|(surface, _), _| *surface != surface_id);
     }
     pub fn reset(&mut self) {
+        self.coverage_failure.set(None);
         self.contexts.clear();
         self.surfaces.clear();
         self.frame = None;
@@ -195,6 +211,10 @@ impl<K: TileDecoder> Decoder<K> {
         self.surfaces.values().map(|s| s.references.len()).sum()
     }
 
+    pub fn coverage_failure(&self) -> Option<CoverageFailure> {
+        self.coverage_failure.get()
+    }
+
     /// 整个 bitmap payload 在私有 stage 解码，全部合法才替换 context 并返回可发布更新。
     pub fn decode(
         &mut self,
@@ -204,6 +224,7 @@ impl<K: TileDecoder> Decoder<K> {
         height: u16,
         blocks: &[ProgressiveBlock<'_>],
     ) -> Result<Vec<TileUpdate>> {
+        self.coverage_failure.set(None);
         if self.frame.is_none() {
             return Err(Error::Invalid("missing EGFX frame"));
         }
@@ -282,6 +303,7 @@ impl<K: TileDecoder> Decoder<K> {
                     }
                     stage.codec_frame = Some((expected, seen + 1));
                     self.region(
+                        key,
                         &mut stage,
                         &mut surface,
                         region,
@@ -370,6 +392,7 @@ impl<K: TileDecoder> Decoder<K> {
 
     fn region(
         &self,
+        context_key: ContextKey,
         stage: &mut Context<K::TileState>,
         surface: &mut Surface<K::ReferenceState>,
         region: &ProgressiveRegion<'_>,
@@ -472,10 +495,18 @@ impl<K: TileDecoder> Decoder<K> {
             for y in u32::from(rect.y) / 64..=(rect.bottom() - 1) / 64 {
                 for x in u32::from(rect.x) / 64..=(rect.right() - 1) / 64 {
                     let key = (u16::try_from(x).unwrap(), u16::try_from(y).unwrap());
-                    let pixels = surface
-                        .frame_tiles
-                        .get(&key)
-                        .ok_or(Error::Invalid("region lacks current frame tiles"))?;
+                    let pixels = surface.frame_tiles.get(&key).ok_or_else(|| {
+                        self.coverage_failure.set(Some(CoverageFailure {
+                            outer_frame_id: self.frame.expect("decode requires outer frame"),
+                            surface_id: context_key.0,
+                            codec_context_id: context_key.1,
+                            rectangle: (rect.x, rect.y, rect.width, rect.height),
+                            missing_tile: key,
+                            frame_tile_count: surface.frame_tiles.len(),
+                            region_tile_count: region.tiles.len(),
+                        }));
+                        Error::Invalid("region lacks current frame tiles")
+                    })?;
                     if updates.len() >= self.limits.max_updates_per_call {
                         return Err(Error::ResourceLimit);
                     }

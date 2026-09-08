@@ -255,6 +255,7 @@ struct EgfxSurfaceState {
     avc444_decoded_updates_total: u64,
     clearcodec_decoded_bitmaps_total: u64,
     progressive_decoded_updates_total: u64,
+    progressive_coverage_failure: Option<crate::RdpProgressiveCoverageFailure>,
     progressive_failure_detail: Option<&'static str>,
     publisher_failure_detail: Option<&'static str>,
     publisher_failure_operation: Option<&'static str>,
@@ -1446,6 +1447,7 @@ impl EgfxSurfacePublisher {
                 clearcodec_decoded_bitmaps_total: 0,
                 progressive_decoded_updates_total: 0,
                 progressive_failure_detail: None,
+                progressive_coverage_failure: None,
                 publisher_failure_detail: None,
                 publisher_failure_operation: None,
                 frames_queued_total: 0,
@@ -2298,6 +2300,7 @@ impl EgfxSurfacePublisher {
         state: &mut EgfxSurfaceState,
         error: crate::progressive::Error,
     ) -> RdpEgfxFailure {
+        state.progressive_coverage_failure = state.progressive_decoder.coverage_failure();
         state.progressive_failure_detail = Some(match &error {
             crate::progressive::Error::Invalid(label)
             | crate::progressive::Error::Backend(label) => *label,
@@ -2902,6 +2905,7 @@ impl EgfxAdapter {
             diagnostics.clearcodec_decoded_bitmaps_total = state.clearcodec_decoded_bitmaps_total;
             diagnostics.progressive_decoded_updates_total = state.progressive_decoded_updates_total;
             diagnostics.progressive_failure_detail = state.progressive_failure_detail;
+            diagnostics.progressive_coverage_failure = state.progressive_coverage_failure;
             diagnostics.publisher_failure_detail = state.publisher_failure_detail;
             diagnostics.publisher_failure_operation = state.publisher_failure_operation;
             diagnostics.frames_queued_total = state.frames_queued_total;
@@ -5730,6 +5734,44 @@ mod tests {
         let merged = EgfxSurfacePublisher::coalesce_backing_rectangles(rects);
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().all(|r| r.width == 64));
+    }
+
+    #[test]
+    fn progressive_coverage_shape_survives_adapter_failure_cleanup() {
+        use ironrdp::pdu::codecs::rfx::progressive::{encode_progressive_stream, ProgressiveBlock};
+        let mut adapter = clear_adapter(128, 64);
+        clear_surface(&mut adapter, 1, 128, 64, 0, 0);
+        progressive_start(&mut adapter, 47);
+        let mut wire = progressive_wire(7, 0, (0, 0, 128, 64));
+        if let GfxPdu::WireToSurface2(p) = &mut wire {
+            let mut blocks = crate::progressive::decode_wire(&p.bitmap_data).unwrap();
+            if let ProgressiveBlock::Region(region) = &mut blocks[2] {
+                assert_eq!(region.tiles.len(), 2);
+                region.tiles.pop();
+            }
+            p.bitmap_data = encode_progressive_stream(&blocks).unwrap();
+        }
+        process_gfx_pdu(&mut adapter, wire);
+        assert!(adapter.is_failed());
+        assert!(adapter.drain_surface_updates().is_empty());
+        assert_eq!(
+            adapter.diagnostics().progressive_coverage_failure,
+            Some(crate::RdpProgressiveCoverageFailure {
+                outer_frame_id: 47,
+                surface_id: 1,
+                codec_context_id: 7,
+                rectangle: (0, 0, 128, 64),
+                missing_tile: (1, 0),
+                frame_tile_count: 1,
+                region_tile_count: 1,
+            })
+        );
+        assert_eq!(
+            clear_adapter(128, 64)
+                .diagnostics()
+                .progressive_coverage_failure,
+            None
+        );
     }
 
     #[test]

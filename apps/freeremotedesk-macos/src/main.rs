@@ -284,7 +284,7 @@ fn format_experiment_diagnostics(
 ) -> String {
     // 仅输出类型化计数和静态失败标签；runtime 接受帧不代表窗口已经呈现该帧。
     format!(
-        "RDP EGFX 验证 egfx_confirmed={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={} failure_count={} first_failure={:?} progressive_failure_detail={:?} publisher_failure_detail={:?} publisher_failure_operation={:?}\n",
+        "RDP EGFX 验证 egfx_confirmed={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={} failure_count={} first_failure={:?} progressive_failure_detail={:?} progressive_coverage_failure={:?} publisher_failure_detail={:?} publisher_failure_operation={:?}\n",
         egfx_confirmed,
         d.avc420_decoded_pictures_total,
         d.avc444_decoded_updates_total,
@@ -295,6 +295,7 @@ fn format_experiment_diagnostics(
         d.failure_count,
         d.first_failure,
         d.progressive_failure_detail,
+        d.progressive_coverage_failure,
         d.publisher_failure_detail,
         d.publisher_failure_operation,
     )
@@ -393,7 +394,7 @@ mod tests {
         };
         assert_eq!(
             format_experiment_diagnostics(true, diagnostics),
-            "RDP EGFX 验证 egfx_confirmed=true avc420_decoded_pictures_total=0 avc444_decoded_updates_total=0 clearcodec_decoded_bitmaps_total=2 progressive_decoded_updates_total=3 frames_queued_total=0 frames_runtime_accepted_total=0 failure_count=1 first_failure=Some(PublisherOutputBounds) progressive_failure_detail=None publisher_failure_detail=Some(\"output bounds\") publisher_failure_operation=Some(\"clearcodec\")\n"
+            "RDP EGFX 验证 egfx_confirmed=true avc420_decoded_pictures_total=0 avc444_decoded_updates_total=0 clearcodec_decoded_bitmaps_total=2 progressive_decoded_updates_total=3 frames_queued_total=0 frames_runtime_accepted_total=0 failure_count=1 first_failure=Some(PublisherOutputBounds) progressive_failure_detail=None progressive_coverage_failure=None publisher_failure_detail=Some(\"output bounds\") publisher_failure_operation=Some(\"clearcodec\")\n"
         );
     }
 
@@ -403,11 +404,21 @@ mod tests {
             failure_count: 1,
             first_failure: Some(frd_protocol_rdp::RdpEgfxFailure::ProgressiveEntropy),
             progressive_failure_detail: Some("entropy short input"),
+            progressive_coverage_failure: Some(frd_protocol_rdp::RdpProgressiveCoverageFailure {
+                outer_frame_id: 47,
+                surface_id: 1,
+                codec_context_id: 2,
+                rectangle: (0, 0, 128, 64),
+                missing_tile: (1, 0),
+                frame_tile_count: 1,
+                region_tile_count: 1,
+            }),
             ..Default::default()
         };
         let line = format_experiment_diagnostics(false, diagnostics);
         assert!(line.contains("first_failure=Some(ProgressiveEntropy)"));
         assert!(line.contains("progressive_failure_detail=Some(\"entropy short input\")"));
+        assert!(line.contains("progressive_coverage_failure=Some(CoverageFailure { outer_frame_id: 47, surface_id: 1, codec_context_id: 2, rectangle: (0, 0, 128, 64), missing_tile: (1, 0), frame_tile_count: 1, region_tile_count: 1 })"));
         assert!(line.ends_with("publisher_failure_detail=None publisher_failure_operation=None\n"));
         assert_eq!(line.lines().count(), 1);
         assert_eq!(line, format_experiment_diagnostics(false, diagnostics));
