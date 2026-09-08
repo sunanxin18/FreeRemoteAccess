@@ -57,7 +57,7 @@ jobs:
             artifact_suffix: x86
           - architecture: arm64
             rust_target: aarch64-pc-windows-msvc
-            wsl_packages: "gcc-aarch64-w64-mingw32"
+            wsl_packages: ""
             artifact_suffix: arm64
     steps:
       - name: Check out source
@@ -83,7 +83,30 @@ jobs:
         shell: pwsh
         run: |
           wsl.exe --install --distribution Ubuntu-24.04 --no-launch
-          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y build-essential ${{ matrix.wsl_packages }} nasm pkg-config xz-utils"
+          if ($LASTEXITCODE -ne 0) { throw "WSL installation failed" }
+          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y build-essential ${{ matrix.wsl_packages }} nasm pkg-config xz-utils curl ca-certificates"
+          if ($LASTEXITCODE -ne 0) { throw "WSL dependency installation failed" }
+
+      - name: Install pinned LLVM MinGW for Windows ARM64
+        if: matrix.architecture == 'arm64'
+        shell: pwsh
+        run: |
+          # Ubuntu GCC MinGW packages do not target Windows ARM64.
+          # Upstream release and asset digest: mstorsjo/llvm-mingw 20250709.
+          $installScript = @'
+          set -eu
+          archive=/tmp/frd-llvm-mingw-20250709.tar.xz
+          curl --fail --location --proto '=https' --tlsv1.2 https://github.com/mstorsjo/llvm-mingw/releases/download/20250709/llvm-mingw-20250709-msvcrt-ubuntu-22.04-x86_64.tar.xz -o "$archive"
+          printf '%s  %s\n' 422f13915a41acd8b93566e590531f55d3de6e531575197d51756ff8e8d16525 "$archive" | sha256sum --check --strict
+          mkdir -p /opt/frd-llvm-mingw-20250709
+          tar -xJf "$archive" --strip-components=1 -C /opt/frd-llvm-mingw-20250709
+          /opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-clang --version
+          printf '%s\n' 'int main(void) { return 0; }' > /tmp/frd-arm64-toolchain-smoke.c
+          /opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-clang /tmp/frd-arm64-toolchain-smoke.c -o /tmp/frd-arm64-toolchain-smoke.exe
+          /opt/frd-llvm-mingw-20250709/bin/llvm-readobj --file-headers /tmp/frd-arm64-toolchain-smoke.exe | grep 'IMAGE_FILE_MACHINE_ARM64'
+          '@
+          wsl.exe --distribution Ubuntu-24.04 --user root -- bash -lc $installScript
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Windows ARM64 toolchain verification failed" }
 
       - name: Build pinned FFmpeg bundle with native tests
         if: matrix.architecture == 'x86_64'

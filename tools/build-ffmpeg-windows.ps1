@@ -60,8 +60,8 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
                 Architecture = "arm64"
                 PlatformDirectory = "windows-aarch64"
                 FfmpegArch = "aarch64"
-                CrossPrefix = "aarch64-w64-mingw32-"
-                CrossCompiler = "aarch64-w64-mingw32-gcc"
+                CrossPrefix = "/opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-"
+                CrossCompiler = "/opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-clang"
                 RustTarget = "aarch64-pc-windows-msvc"
                 MsvcArch = "arm64"
                 Machine = "arm64"
@@ -332,6 +332,7 @@ try {
         "--arch=$($ArchitectureProfile.FfmpegArch)",
         "--target-os=mingw32",
         "--cross-prefix=$($ArchitectureProfile.CrossPrefix)",
+        "--cc=$($ArchitectureProfile.CrossCompiler)",
         "--disable-static",
         "--enable-shared",
         "--disable-programs",
@@ -348,6 +349,10 @@ try {
     )
     if ($RequiresExplicitCargoTarget) {
         $configureArgs += "--enable-cross-compile"
+    }
+    if ($Architecture -eq "x86") {
+        # i686 除法等编译器辅助例程静态链接，禁止新增 libgcc DLL 依赖。
+        $configureArgs += "--extra-ldflags=-static-libgcc"
     }
     if (-not $ArchitectureProfile.RequiresX86Asm) {
         $configureArgs += "--disable-x86asm"

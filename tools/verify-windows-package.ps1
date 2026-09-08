@@ -26,7 +26,7 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
         "x86_64" {
             return [pscustomobject]@{
                 Architecture = "x86_64"; PlatformDirectory = "windows-x86_64"; FfmpegArch = "x86_64";
-                CrossPrefix = "x86_64-w64-mingw32-"; AssemblyKind = "x86asm";
+                CrossPrefix = "x86_64-w64-mingw32-"; CrossCompiler = "x86_64-w64-mingw32-gcc"; AssemblyKind = "x86asm";
                 AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
                 RequiresX86Asm = $true; PeMachine = [uint16]0x8664
             }
@@ -34,7 +34,7 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
         "x86" {
             return [pscustomobject]@{
                 Architecture = "x86"; PlatformDirectory = "windows-x86"; FfmpegArch = "x86";
-                CrossPrefix = "i686-w64-mingw32-"; AssemblyKind = "x86asm";
+                CrossPrefix = "i686-w64-mingw32-"; CrossCompiler = "i686-w64-mingw32-gcc"; AssemblyKind = "x86asm";
                 AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
                 RequiresX86Asm = $true; PeMachine = [uint16]0x014c
             }
@@ -42,7 +42,8 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
         "arm64" {
             return [pscustomobject]@{
                 Architecture = "arm64"; PlatformDirectory = "windows-aarch64"; FfmpegArch = "aarch64";
-                CrossPrefix = "aarch64-w64-mingw32-"; AssemblyKind = "aarch64-neon";
+                CrossPrefix = "/opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-";
+                CrossCompiler = "/opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-clang"; AssemblyKind = "aarch64-neon";
                 AssemblyProvenance = "aarch64-neon=FFmpeg AArch64/NEON"; AssemblyGate = "have_neon=1";
                 RequiresX86Asm = $false; PeMachine = [uint16]0xAA64
             }
@@ -327,6 +328,7 @@ $ExpectedConfigureArguments = @(
     "--arch=$($ArchitectureProfile.FfmpegArch)",
     "--target-os=mingw32",
     "--cross-prefix=$($ArchitectureProfile.CrossPrefix)",
+    "--cc=$($ArchitectureProfile.CrossCompiler)",
     "--disable-static",
     "--enable-shared",
     "--disable-programs",
@@ -342,6 +344,7 @@ $ExpectedConfigureArguments = @(
     "--disable-network"
 )
 if ($Architecture -ne "x86_64") { $ExpectedConfigureArguments += "--enable-cross-compile" }
+if ($Architecture -eq "x86") { $ExpectedConfigureArguments += "--extra-ldflags=-static-libgcc" }
 if (-not $ArchitectureProfile.RequiresX86Asm) { $ExpectedConfigureArguments += "--disable-x86asm" }
 $ExpectedConfigureArguments += "--disable-debug", "--enable-stripping"
 $ExpectedFiles = @(

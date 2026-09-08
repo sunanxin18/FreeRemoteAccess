@@ -24,6 +24,7 @@
       "--arch=x86_64",
       "--target-os=mingw32",
       "--cross-prefix=x86_64-w64-mingw32-",
+      "--cc=x86_64-w64-mingw32-gcc",
       "--disable-static",
       "--enable-shared",
       "--disable-programs",

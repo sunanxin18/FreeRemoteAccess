@@ -22,7 +22,7 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
         "x86_64" {
             return [pscustomobject]@{
                 Architecture = "x86_64"; PlatformDirectory = "windows-x86_64"; FfmpegArch = "x86_64";
-                CrossPrefix = "x86_64-w64-mingw32-"; AssemblyKind = "x86asm";
+                CrossPrefix = "x86_64-w64-mingw32-"; CrossCompiler = "x86_64-w64-mingw32-gcc"; AssemblyKind = "x86asm";
                 AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
                 RequiresX86Asm = $true; RustTarget = "x86_64-pc-windows-msvc"
             }
@@ -30,7 +30,7 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
         "x86" {
             return [pscustomobject]@{
                 Architecture = "x86"; PlatformDirectory = "windows-x86"; FfmpegArch = "x86";
-                CrossPrefix = "i686-w64-mingw32-"; AssemblyKind = "x86asm";
+                CrossPrefix = "i686-w64-mingw32-"; CrossCompiler = "i686-w64-mingw32-gcc"; AssemblyKind = "x86asm";
                 AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
                 RequiresX86Asm = $true; RustTarget = "i686-pc-windows-msvc"
             }
@@ -38,7 +38,8 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
         "arm64" {
             return [pscustomobject]@{
                 Architecture = "arm64"; PlatformDirectory = "windows-aarch64"; FfmpegArch = "aarch64";
-                CrossPrefix = "aarch64-w64-mingw32-"; AssemblyKind = "aarch64-neon";
+                CrossPrefix = "/opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-";
+                CrossCompiler = "/opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-clang"; AssemblyKind = "aarch64-neon";
                 AssemblyProvenance = "aarch64-neon=FFmpeg AArch64/NEON"; AssemblyGate = "have_neon=1";
                 RequiresX86Asm = $false; RustTarget = "aarch64-pc-windows-msvc"
             }
@@ -65,12 +66,14 @@ $ExpectedSourceUrl = "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz"
 $ExpectedArchiveSha256 = "464BEB5E7BF0C311E68B45AE2F04E9CC2AF88851ABB4082231742A74D97B524C"
 $ExpectedConfigureArguments = @(
     "--arch=$($ArchitectureProfile.FfmpegArch)", "--target-os=mingw32", "--cross-prefix=$($ArchitectureProfile.CrossPrefix)",
+    "--cc=$($ArchitectureProfile.CrossCompiler)",
     "--disable-static", "--enable-shared", "--disable-programs", "--disable-doc",
     "--disable-everything", "--enable-decoder=hevc,h264", "--enable-parser=hevc,h264",
     "--enable-protocol=file", "--disable-gpl", "--disable-nonfree", "--disable-version3",
     "--disable-autodetect", "--disable-network"
 )
 if ($Architecture -ne "x86_64") { $ExpectedConfigureArguments += "--enable-cross-compile" }
+if ($Architecture -eq "x86") { $ExpectedConfigureArguments += "--extra-ldflags=-static-libgcc" }
 if (-not $ArchitectureProfile.RequiresX86Asm) { $ExpectedConfigureArguments += "--disable-x86asm" }
 $ExpectedConfigureArguments += "--disable-debug", "--enable-stripping"
 $ExpectedAssemblyProvenance = $ArchitectureProfile.AssemblyProvenance
