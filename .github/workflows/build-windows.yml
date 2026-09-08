@@ -72,6 +72,12 @@ jobs:
           if ($rustcVersion -cne '1.96.0') {
             throw "rust-toolchain.toml requires rustc 1.96.0; found $rustcVersion"
           }
+          $rustTarget = '${{ matrix.rust_target }}'
+          if ([string]::IsNullOrWhiteSpace($rustTarget)) {
+            $rustTarget = 'x86_64-pc-windows-msvc'
+          }
+          rustup target add $rustTarget
+          rustc --target $rustTarget --version --verbose
 
       - name: Enable Ubuntu 24.04 FFmpeg build environment
         shell: pwsh
