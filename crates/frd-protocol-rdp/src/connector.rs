@@ -94,6 +94,11 @@ pub(crate) const fn baseline_graphics_capabilities() -> RdpGraphicsCapability {
         remotefx: true,
         egfx_advertised: false,
         egfx_diagnostics: RdpEgfxDiagnostics {
+            avc420_decoded_pictures_total: 0,
+            avc444_decoded_updates_total: 0,
+            clearcodec_decoded_bitmaps_total: 0,
+            frames_queued_total: 0,
+            frames_runtime_accepted_total: 0,
             start_calls: 0,
             capability_messages_queued: 0,
             typed_confirmation_ever: false,

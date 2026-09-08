@@ -359,9 +359,16 @@ fn run_active_loop(
         let egfx_frame_confirmed = egfx_updates
             .iter()
             .any(|update| matches!(update, SurfaceUpdate::FrameBoundary { .. }));
-        publish_egfx_surface_updates(runtime, baseline, session_id, generation, egfx_updates)?;
+        let accepted =
+            publish_egfx_surface_updates(runtime, baseline, session_id, generation, egfx_updates)?;
         let previous_graphics = graphics_capability.snapshot();
         observe_egfx_confirmation(active_stage, graphics_capability, egfx_frame_confirmed);
+        graphics_capability
+            .egfx_diagnostics
+            .frames_runtime_accepted_total = graphics_capability
+            .egfx_diagnostics
+            .frames_runtime_accepted_total
+            .saturating_add(accepted);
         let current_graphics = graphics_capability.snapshot();
         if previous_graphics != current_graphics {
             if let Some(observer) = graphics_observer {
@@ -384,7 +391,13 @@ fn observe_egfx_confirmation(
         return;
     };
 
+    let accepted = graphics_capability
+        .egfx_diagnostics
+        .frames_runtime_accepted_total;
     graphics_capability.egfx_diagnostics = adapter.diagnostics();
+    graphics_capability
+        .egfx_diagnostics
+        .frames_runtime_accepted_total = accepted;
     apply_egfx_confirmation(
         graphics_capability,
         adapter.is_active(),
@@ -592,7 +605,8 @@ fn publish_egfx_surface_updates(
     session_id: SessionId,
     generation: &mut u64,
     updates: Vec<SurfaceUpdate>,
-) -> Result<(), ProtocolError> {
+) -> Result<u64, ProtocolError> {
+    let mut accepted = 0u64;
     for update in updates {
         match update {
             SurfaceUpdate::Reset {
@@ -619,10 +633,16 @@ fn publish_egfx_surface_updates(
                 baseline.begin_next_generation(runtime, update_generation, size)?;
                 *generation = update_generation;
             }
-            update => runtime.publish_surface(update)?,
+            update => {
+                let frame = matches!(update, SurfaceUpdate::FrameBoundary { .. });
+                runtime.publish_surface(update)?;
+                if frame {
+                    accepted = accepted.saturating_add(1);
+                }
+            }
         }
     }
-    Ok(())
+    Ok(accepted)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1287,7 +1307,7 @@ mod tests {
             pixels: PixelBuffer::from_boxed_slice(vec![0; 16].into_boxed_slice()),
         };
 
-        publish_egfx_surface_updates(
+        let accepted = publish_egfx_surface_updates(
             &mut runtime,
             &mut baseline,
             session_id,
@@ -1317,6 +1337,7 @@ mod tests {
             ],
         )
         .expect("EGFX reset and current-generation frame publish");
+        assert_eq!(accepted, 1);
 
         assert_eq!(generation, 2);
         {

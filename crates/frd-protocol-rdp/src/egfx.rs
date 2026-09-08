@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use frd_core::{PixelRect, PixelSize, SessionId};
@@ -248,6 +248,9 @@ struct EgfxSurfaceState {
     rejected_updates: u64,
     unhandled_codec_count: u64,
     last_unhandled_codec: Option<u16>,
+    avc444_decoded_updates_total: u64,
+    clearcodec_decoded_bitmaps_total: u64,
+    frames_queued_total: u64,
     failure_reason: Option<RdpEgfxFailure>,
     disabled: bool,
 }
@@ -1428,6 +1431,9 @@ impl EgfxSurfacePublisher {
                 rejected_updates: 0,
                 unhandled_codec_count: 0,
                 last_unhandled_codec: None,
+                avc444_decoded_updates_total: 0,
+                clearcodec_decoded_bitmaps_total: 0,
+                frames_queued_total: 0,
                 failure_reason: None,
                 disabled: false,
             })),
@@ -1611,7 +1617,8 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         if self.avc444_decoder.is_some() {
             vec![
                 CapabilitySet::V10_7 {
-                    flags: CapabilitiesV107Flags::SMALL_CACHE,
+                    flags: CapabilitiesV107Flags::SMALL_CACHE
+                        | CapabilitiesV107Flags::SCALEDMAP_DISABLE,
                 },
                 CapabilitySet::V8_1 {
                     flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
@@ -1990,6 +1997,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
                 completeness,
             },
         );
+        state.frames_queued_total = state.frames_queued_total.saturating_add(1);
     }
 
     fn on_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
@@ -2129,6 +2137,11 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             self.fail_avc444();
             return;
         }
+        {
+            let mut state = lock_state(&self.state);
+            state.avc444_decoded_updates_total =
+                state.avc444_decoded_updates_total.saturating_add(1);
+        }
         for (destination, data, width, height) in updates {
             self.queue_decoded_bitmap_update(wire.surface_id, &destination, &data, width, height);
         }
@@ -2238,6 +2251,13 @@ impl EgfxSurfacePublisher {
             Self::disable_locked(&mut state);
             return;
         };
+        if pixels.len() != rect.width as usize * rect.height as usize * 4 {
+            state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+            Self::disable_locked(&mut state);
+            return;
+        }
+        state.clearcodec_decoded_bitmaps_total =
+            state.clearcodec_decoded_bitmaps_total.saturating_add(1);
         if state
             .backings
             .write(wire.surface_id, rect, &pixels)
@@ -2475,6 +2495,29 @@ impl EgfxSurfacePublisher {
     }
 }
 
+// 只包装 IronRDP 的 AVC420 picture 解码入口；AVC444 内部双视图不经过这里。
+struct CountedH264Decoder {
+    inner: Box<dyn H264Decoder>,
+    successes: Arc<AtomicU64>,
+}
+impl H264Decoder for CountedH264Decoder {
+    fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+        let frame = self.inner.decode(data)?;
+        let _ = self
+            .successes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            });
+        Ok(frame)
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn is_healthy(&self) -> bool {
+        self.inner.is_healthy()
+    }
+}
+
 /// A protocol-adapter-owned EGFX DVC processor.
 ///
 /// The handler remains outside the RDP transport so the decoder and
@@ -2490,6 +2533,7 @@ pub(crate) struct EgfxAdapter {
     /// `CapabilitiesConfirm`；即使调用方没有传入解码器，它仍可能报告 AVC 能力。
     /// 在 adapter 边界保留此事实，避免诊断信息把服务器证据误当成本地能力。
     h264_decoder_configured: bool,
+    avc420_decoded_pictures_total: Arc<AtomicU64>,
     diagnostics: Mutex<RdpEgfxDiagnostics>,
     failed: Arc<AtomicBool>,
 }
@@ -2501,10 +2545,18 @@ impl EgfxAdapter {
         handler: Box<dyn GraphicsPipelineHandler>,
     ) -> Self {
         let h264_decoder_configured = decoder.is_some();
+        let avc420_decoded_pictures_total = Arc::new(AtomicU64::new(0));
+        let decoder = decoder.map(|inner| {
+            Box::new(CountedH264Decoder {
+                inner,
+                successes: avc420_decoded_pictures_total.clone(),
+            }) as Box<dyn H264Decoder>
+        });
         Self {
             inner: GraphicsPipelineClient::new(handler, decoder),
             surface_publisher: None,
             h264_decoder_configured,
+            avc420_decoded_pictures_total,
             diagnostics: Mutex::new(RdpEgfxDiagnostics::default()),
             failed: Arc::new(AtomicBool::new(false)),
         }
@@ -2515,10 +2567,18 @@ impl EgfxAdapter {
         publisher: EgfxSurfacePublisher,
     ) -> Self {
         let h264_decoder_configured = decoder.is_some();
+        let avc420_decoded_pictures_total = Arc::new(AtomicU64::new(0));
+        let decoder = decoder.map(|inner| {
+            Box::new(CountedH264Decoder {
+                inner,
+                successes: avc420_decoded_pictures_total.clone(),
+            }) as Box<dyn H264Decoder>
+        });
         Self {
             inner: GraphicsPipelineClient::new(Box::new(publisher.clone()), decoder),
             surface_publisher: Some(publisher),
             h264_decoder_configured,
+            avc420_decoded_pictures_total,
             diagnostics: Mutex::new(RdpEgfxDiagnostics::default()),
             failed: Arc::new(AtomicBool::new(false)),
         }
@@ -2533,7 +2593,12 @@ impl EgfxAdapter {
             let state = lock_state(&publisher.state);
             diagnostics.unhandled_codec_count = state.unhandled_codec_count;
             diagnostics.last_unhandled_codec = state.last_unhandled_codec;
+            diagnostics.avc444_decoded_updates_total = state.avc444_decoded_updates_total;
+            diagnostics.clearcodec_decoded_bitmaps_total = state.clearcodec_decoded_bitmaps_total;
+            diagnostics.frames_queued_total = state.frames_queued_total;
         }
+        diagnostics.avc420_decoded_pictures_total =
+            self.avc420_decoded_pictures_total.load(Ordering::Relaxed);
         diagnostics
     }
 
@@ -4327,6 +4392,8 @@ mod tests {
                 }),
             );
             assert!(!adapter.is_failed());
+            assert_eq!(adapter.diagnostics().clearcodec_decoded_bitmaps_total, 0);
+            assert_eq!(adapter.diagnostics().frames_queued_total, 0);
             assert!(adapter.drain_surface_updates().is_empty());
         }
         process_gfx_pdu(
@@ -4483,6 +4550,9 @@ mod tests {
             ),
         );
         assert!(!adapter.is_failed(), "offscreen write is legal");
+        assert_eq!(adapter.diagnostics().clearcodec_decoded_bitmaps_total, 1);
+        assert_eq!(adapter.diagnostics().frames_queued_total, 0);
+        assert_eq!(adapter.diagnostics().frames_runtime_accepted_total, 0);
         assert!(adapter.drain_surface_updates().is_empty());
         process_gfx_pdu(
             &mut adapter,
@@ -4493,6 +4563,8 @@ mod tests {
             }),
         );
         process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        assert_eq!(adapter.diagnostics().clearcodec_decoded_bitmaps_total, 1);
+        assert_eq!(adapter.diagnostics().frames_queued_total, 1);
         let updates = adapter.drain_surface_updates();
         assert!(
             matches!(&updates[0],SurfaceUpdate::Damage{patches,..} if patches[0].pixels.as_bytes()==[3,19,211,255].repeat(4))
@@ -4698,6 +4770,69 @@ mod tests {
         });
         assert!(EgfxSurfacePublisher::check_publication_bytes(&state, 4, 8).is_err());
         assert!(EgfxSurfacePublisher::check_publication_bytes(&state, 4, 12).is_ok());
+    }
+
+    #[test]
+    fn avc420_counter_counts_pictures_not_region_callbacks_or_reset() {
+        struct Picture;
+        impl H264Decoder for Picture {
+            fn decode(&mut self, _: &[u8]) -> super::DecoderResult<super::DecodedFrame> {
+                Ok(super::DecodedFrame::new(vec![0; 8], 2, 1))
+            }
+            fn reset(&mut self) {}
+        }
+        let count = std::sync::Arc::new(super::AtomicU64::new(0));
+        let mut decoder = super::CountedH264Decoder {
+            inner: Box::new(Picture),
+            successes: count.clone(),
+        };
+        decoder.decode(&[1]).unwrap();
+        let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        publisher.on_reset_graphics(2, 1);
+        super::lock_state(&publisher.state).surfaces.insert(
+            1,
+            super::EgfxSurface {
+                width: 2,
+                height: 1,
+                origin_x: 0,
+                origin_y: 0,
+                mapped: true,
+            },
+        );
+        // 一幅picture产生两个区域回调；回调不接触picture计数器。
+        for x in 0..2 {
+            publisher.queue_bitmap_update(
+                1,
+                &ExclusiveRectangle {
+                    left: x,
+                    top: 0,
+                    right: x + 1,
+                    bottom: 1,
+                },
+                Codec1Type::Avc420,
+                &[0; 4],
+                1,
+                1,
+            );
+        }
+        assert_eq!(super::lock_state(&publisher.state).pending_patches.len(), 2);
+        decoder.reset();
+        assert_eq!(count.load(super::Ordering::Relaxed), 1);
+        let mut failed = super::CountedH264Decoder {
+            inner: Box::new(FailingH264Decoder),
+            successes: count.clone(),
+        };
+        assert!(failed.decode(&[1]).is_err());
+        assert_eq!(count.load(super::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn v107_advertisement_explicitly_disables_scaled_mapping() {
+        let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1)
+            .unwrap()
+            .with_avc444_decoder(Box::new(SolidAvc444Decoder));
+        assert!(publisher.capabilities().iter().any(|c| matches!(c,
+            CapabilitySet::V10_7 { flags } if flags.bits() == (CapabilitiesV107Flags::SMALL_CACHE | CapabilitiesV107Flags::SCALEDMAP_DISABLE).bits())));
     }
 
     fn process_gfx_pdu(adapter: &mut EgfxAdapter, pdu: GfxPdu) {

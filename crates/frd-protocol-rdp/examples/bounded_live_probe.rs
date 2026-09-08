@@ -330,6 +330,11 @@ fn run() -> Result<(), &'static str> {
         move |capabilities: RdpGraphicsCapabilities| {
             let mut summary = capabilities;
             summary.egfx_diagnostics.unhandled_codec_count = 0;
+            summary.egfx_diagnostics.avc420_decoded_pictures_total = 0;
+            summary.egfx_diagnostics.avc444_decoded_updates_total = 0;
+            summary.egfx_diagnostics.clearcodec_decoded_bitmaps_total = 0;
+            summary.egfx_diagnostics.frames_queued_total = 0;
+            summary.egfx_diagnostics.frames_runtime_accepted_total = 0;
             let mut last = last_graphics_log
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -360,6 +365,12 @@ fn run() -> Result<(), &'static str> {
                 capabilities.egfx_diagnostics.confirmed_flags,
                 capabilities.egfx_diagnostics.unhandled_codec_count,
                 capabilities.egfx_diagnostics.last_unhandled_codec);
+            println!("RDP EGFX 实际计数 avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} frames_queued_total={} frames_runtime_accepted_total={}",
+                capabilities.egfx_diagnostics.avc420_decoded_pictures_total,
+                capabilities.egfx_diagnostics.avc444_decoded_updates_total,
+                capabilities.egfx_diagnostics.clearcodec_decoded_bitmaps_total,
+                capabilities.egfx_diagnostics.frames_queued_total,
+                capabilities.egfx_diagnostics.frames_runtime_accepted_total);
         },
     );
     let factory = if let Some((mode, egfx_factory)) = egfx_factory {

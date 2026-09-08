@@ -45,6 +45,14 @@ pub enum RdpEgfxFailure {
 /// 本地阶段证据；排队不等于网络写入成功。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RdpEgfxDiagnostics {
+    /// 当前 adapter 生命周期累计值，跨 ResetGraphics 保留；新会话/adapter 从零开始。
+    /// 解码次数不代表可见帧，帧次数也不对 codec 归因。
+    pub avc420_decoded_pictures_total: u64,
+    pub avc444_decoded_updates_total: u64,
+    pub clearcodec_decoded_bitmaps_total: u64,
+    pub frames_queued_total: u64,
+    /// 当前 active session 成功提交给 runtime 的帧数，不等同 GUI 呈现。
+    pub frames_runtime_accepted_total: u64,
     pub start_calls: u64,
     pub capability_messages_queued: u64,
     /// 曾观察到能够解析的服务器 CapabilitiesConfirm，失败后仍保留。
