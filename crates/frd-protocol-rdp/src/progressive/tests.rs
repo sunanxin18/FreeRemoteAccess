@@ -314,7 +314,7 @@ fn malformed_frame_count_rolls_back_and_open_frame_blocks_egfx_end() {
     let mut d = decoder();
     let mut f = frame(vec![region((0, 0, 64, 64), vec![first(0, 0, &[5])])]);
     if let ProgressiveBlock::FrameBegin(b) = &mut f[0] {
-        b.region_count = 2;
+        b.region_count = 0;
     }
     assert!(d.decode(1, 1, 64, 64, &f).is_err());
     assert_eq!(d.tile_count(), 0);
@@ -638,4 +638,46 @@ fn difference_without_context_reuses_only_real_surface_reference() {
         d.decode(1, 4, 64, 64, &diff).unwrap_err(),
         Error::Invalid("difference missing surface reference")
     );
+}
+
+#[test]
+fn declared_extra_regions_and_duplicate_end_are_compatible() {
+    let mut d = decoder();
+    let mut f = frame(vec![region((0, 0, 64, 64), vec![first(0, 0, &[5])])]);
+    if let ProgressiveBlock::FrameBegin(b) = &mut f[0] {
+        b.region_count = 2;
+    }
+    f.push(ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu));
+    assert_eq!(d.decode(1, 1, 64, 64, &f).unwrap().len(), 1);
+    assert!(d
+        .decode(
+            1,
+            1,
+            64,
+            64,
+            &[ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu)]
+        )
+        .unwrap()
+        .is_empty());
+    d.end_frame(1).unwrap();
+}
+
+#[test]
+fn compatibility_does_not_allow_nested_begin_or_orphan_end() {
+    let mut d = decoder();
+    let begin = ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+        frame_index: 0,
+        region_count: 0,
+    });
+    assert!(d.decode(1, 1, 64, 64, &[begin.clone(), begin]).is_err());
+    assert!(d
+        .decode(
+            1,
+            1,
+            64,
+            64,
+            &[ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu)]
+        )
+        .is_err());
+    assert_eq!(d.context_count(), 0);
 }

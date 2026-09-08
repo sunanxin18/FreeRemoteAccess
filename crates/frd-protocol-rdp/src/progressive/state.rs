@@ -96,6 +96,7 @@ struct CachedTile<S> {
 struct Context<S> {
     subband_diffing: bool,
     codec_frame: Option<(usize, usize)>,
+    codec_frame_ended: bool,
     tiles: BTreeMap<TileKey, Arc<CachedTile<S>>>,
 }
 impl<S> Clone for Context<S> {
@@ -103,6 +104,7 @@ impl<S> Clone for Context<S> {
         Self {
             subband_diffing: self.subband_diffing,
             codec_frame: self.codec_frame,
+            codec_frame_ended: self.codec_frame_ended,
             tiles: self.tiles.clone(),
         }
     }
@@ -219,6 +221,7 @@ impl<K: TileDecoder> Decoder<K> {
         let mut stage = old.cloned().unwrap_or_else(|| Context {
             subband_diffing: false,
             codec_frame: None,
+            codec_frame_ended: false,
             tiles: BTreeMap::new(),
         });
         let mut surface = match self.surfaces.get(&surface_id) {
@@ -256,9 +259,17 @@ impl<K: TileDecoder> Decoder<K> {
                         return Err(Error::Invalid("nested codec frame begin"));
                     }
                     stage.codec_frame = Some((usize::from(begin.region_count), 0));
+                    stage.codec_frame_ended = false;
                 }
                 ProgressiveBlock::FrameEnd(_) => match stage.codec_frame {
-                    Some((expected, seen)) if expected == seen => stage.codec_frame = None,
+                    // §2.2.4.2.1.2：声明region数大于实际时SHOULD忽略不一致。
+                    // 实际超出声明仍在Region入口拒绝，不能放宽资源/coverage检查。
+                    Some((expected, seen)) if seen <= expected => {
+                        stage.codec_frame = None;
+                        stage.codec_frame_ended = true;
+                    }
+                    // §2.2.4.2.1.3：忽略已经正常结束后的重复FRAME_END。
+                    None if stage.codec_frame_ended => {}
                     _ => return Err(Error::Invalid("codec frame region count")),
                 },
                 ProgressiveBlock::Region(region) => {
