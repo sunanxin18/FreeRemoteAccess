@@ -152,6 +152,21 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
     assert!(main_source.contains("RdpProtocolFactory::new(platform)"));
     assert_eq!(
         main_source
+            .matches("RdpProtocolFactory::with_egfx_decoder_provider(")
+            .count(),
+        1,
+        "Windows composition must keep the default legacy-only graphics gate"
+    );
+    assert!(
+        !main_source.contains("with_egfx_decoder_provider_and_gate"),
+        "Windows production composition must not opt into the live EGFX gate"
+    );
+    assert!(
+        !main_source.contains("RdpGraphicsAdvertisementGate::LiveInteroperable"),
+        "Windows production composition must not carry a live interoperability claim"
+    );
+    assert_eq!(
+        main_source
             .matches("Arc::new(AppleProtocolFactory)")
             .count(),
         1,

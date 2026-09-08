@@ -10,3 +10,23 @@ fn macos_product_uses_its_platform_adapter_and_shared_protocols() {
     let entry = include_str!("../src/main.rs");
     assert!(entry.contains("RdpClientPlatformIdentity::Macintosh"));
 }
+
+#[test]
+fn macos_production_composition_keeps_egfx_live_gate_closed() {
+    let entry = include_str!("../src/main.rs");
+    assert_eq!(
+        entry
+            .matches("RdpProtocolFactory::with_egfx_decoder_provider(")
+            .count(),
+        1,
+        "macOS composition must keep the default legacy-only graphics gate"
+    );
+    assert!(
+        !entry.contains("with_egfx_decoder_provider_and_gate"),
+        "macOS production composition must not opt into the live EGFX gate"
+    );
+    assert!(
+        !entry.contains("RdpGraphicsAdvertisementGate::LiveInteroperable"),
+        "macOS production composition must not carry a live interoperability claim"
+    );
+}
