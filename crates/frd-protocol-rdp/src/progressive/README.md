@@ -41,3 +41,7 @@ Hewlett-Packard Development Company, L.P. (2012)。
 
 SSE2/NEON六个Windows/Linux target的kernel编译不等于目标运行；完整七目标runtime、
 端到端 Progressive 首帧/持续刷新、GUI验收仍未完成。不能将这些测试作为生产EGFX开放依据。
+
+EGFX接线回归：285项RDP测试通过（3 ignored），实际PDU覆盖native first/upgrade、
+offscreen映射、DeleteContext保留reference、1080p 510tile精确合并与失败清理。
+此时live仍待执行，默认生产门禁保持关闭。

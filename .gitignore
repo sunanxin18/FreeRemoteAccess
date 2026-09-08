@@ -32,3 +32,6 @@ CREDENTIALS.local.md
 Thumbs.db
 *.swp
 *.tmp
+
+# 本地 vendor 独立 Cargo 回归产物
+/third_party/ironrdp-egfx-0.3.0/target/

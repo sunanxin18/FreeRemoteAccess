@@ -229,8 +229,9 @@ struct EgfxSurface {
     mapped: bool,
 }
 
-#[derive(Debug)]
 struct EgfxSurfaceState {
+    progressive_decoder: crate::progressive::NativeDecoder,
+    progressive_frame_id: Option<u32>,
     session_id: SessionId,
     generation: u64,
     output_size: Option<PixelSize>,
@@ -250,6 +251,8 @@ struct EgfxSurfaceState {
     last_unhandled_codec: Option<u16>,
     avc444_decoded_updates_total: u64,
     clearcodec_decoded_bitmaps_total: u64,
+    progressive_decoded_updates_total: u64,
+    progressive_failure_detail: Option<&'static str>,
     frames_queued_total: u64,
     failure_reason: Option<RdpEgfxFailure>,
     disabled: bool,
@@ -1412,8 +1415,11 @@ impl EgfxSurfacePublisher {
             return None;
         }
         let clearcodec_decoder = crate::clearcodec::native_decoder()?;
+        let progressive_decoder = crate::progressive::native_decoder()?;
         Some(Self {
             state: Arc::new(Mutex::new(EgfxSurfaceState {
+                progressive_decoder,
+                progressive_frame_id: None,
                 session_id,
                 generation,
                 output_size: None,
@@ -1433,6 +1439,8 @@ impl EgfxSurfacePublisher {
                 last_unhandled_codec: None,
                 avc444_decoded_updates_total: 0,
                 clearcodec_decoded_bitmaps_total: 0,
+                progressive_decoded_updates_total: 0,
+                progressive_failure_detail: None,
                 frames_queued_total: 0,
                 failure_reason: None,
                 disabled: false,
@@ -1490,6 +1498,8 @@ impl EgfxSurfacePublisher {
 
     fn disable_locked(state: &mut EgfxSurfaceState) {
         state.disabled = true;
+        state.progressive_decoder.reset();
+        state.progressive_frame_id = None;
         state.backings.clear();
         state.updates.clear();
         state.pending_patches.clear();
@@ -1690,6 +1700,8 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             Self::disable_locked(&mut state);
             return;
         }
+        state.progressive_decoder.reset();
+        state.progressive_frame_id = None;
         state.output_size = Some(size);
         state.revision = 0;
         state.surfaces.clear();
@@ -1730,6 +1742,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             Self::disable_locked(&mut state);
             return;
         }
+        state.progressive_decoder.delete_surface(surface.id);
         state.surfaces.insert(
             surface.id,
             EgfxSurface {
@@ -1756,6 +1769,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             Self::reject(&mut state);
             return;
         }
+        state.progressive_decoder.delete_surface(surface_id);
         state.surfaces.remove(&surface_id);
         state.backings.delete(surface_id);
         drop(state);
@@ -1912,11 +1926,43 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         );
     }
 
-    fn on_frame_complete(&mut self, _frame_id: u32) {
+    fn on_frame_started(&mut self, frame_id: u32) {
+        let mut state = lock_state(&self.state);
+        if state.disabled {
+            return;
+        }
+        if let Err(error) = state.progressive_decoder.begin_frame(frame_id) {
+            let reason = Self::progressive_failure(&mut state, error);
+            state.failure_reason.get_or_insert(reason);
+            Self::disable_locked(&mut state);
+            return;
+        }
+        state.progressive_frame_id = Some(frame_id);
+    }
+
+    fn on_delete_encoding_context(&mut self, pdu: &ironrdp_egfx::pdu::DeleteEncodingContextPdu) {
+        let mut state = lock_state(&self.state);
+        if !state.disabled {
+            state
+                .progressive_decoder
+                .delete_context(pdu.surface_id, pdu.codec_context_id);
+        }
+    }
+
+    fn on_frame_complete(&mut self, frame_id: u32) {
         let mut state = lock_state(&self.state);
         if state.disabled {
             Self::reject(&mut state);
             return;
+        }
+        if state.progressive_frame_id.is_some() {
+            if let Err(error) = state.progressive_decoder.end_frame(frame_id) {
+                let reason = Self::progressive_failure(&mut state, error);
+                state.failure_reason.get_or_insert(reason);
+                Self::disable_locked(&mut state);
+                return;
+            }
+            state.progressive_frame_id = None;
         }
         let Some(revision) = state.pending_revision.take() else {
             return;
@@ -2001,16 +2047,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
     }
 
     fn on_wire_to_surface2(&mut self, pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
-        let mut state = lock_state(&self.state);
-        if state.disabled {
-            return;
-        }
-        state.unhandled_codec_count = state.unhandled_codec_count.saturating_add(1);
-        state.last_unhandled_codec = Some(u16::from(pdu.codec_id));
-        state
-            .failure_reason
-            .get_or_insert(RdpEgfxFailure::UnsupportedCodec);
-        Self::disable_locked(&mut state);
+        self.decode_progressive(pdu);
     }
 
     fn on_unhandled_pdu(&mut self, pdu: &GfxPdu) {
@@ -2192,6 +2229,157 @@ impl EgfxSurfacePublisher {
             return RdpEgfxFailure::PublisherOutputBounds;
         }
         RdpEgfxFailure::Publisher
+    }
+
+    /// 只合并同高横向/同宽纵向相接或相交的矩形，绝不跨越未初始化的洞。
+    fn coalesce_progressive_rectangles(mut rects: Vec<PixelRect>) -> Vec<PixelRect> {
+        rects.sort_unstable_by_key(|r| (r.y, r.height, r.x));
+        let mut horizontal: Vec<PixelRect> = Vec::new();
+        for rect in rects {
+            if let Some(last) = horizontal.last_mut() {
+                if last.y == rect.y && last.height == rect.height && rect.x <= last.x + last.width {
+                    last.width = (rect.x + rect.width).max(last.x + last.width) - last.x;
+                    continue;
+                }
+            }
+            horizontal.push(rect);
+        }
+        horizontal.sort_unstable_by_key(|r| (r.x, r.width, r.y));
+        let mut result: Vec<PixelRect> = Vec::new();
+        for rect in horizontal {
+            if let Some(last) = result.last_mut() {
+                if last.x == rect.x && last.width == rect.width && rect.y <= last.y + last.height {
+                    last.height = (rect.y + rect.height).max(last.y + last.height) - last.y;
+                    continue;
+                }
+            }
+            result.push(rect);
+        }
+        result
+    }
+
+    fn progressive_failure(
+        state: &mut EgfxSurfaceState,
+        error: crate::progressive::Error,
+    ) -> RdpEgfxFailure {
+        state.progressive_failure_detail = Some(match &error {
+            crate::progressive::Error::Invalid(label)
+            | crate::progressive::Error::Backend(label) => *label,
+            crate::progressive::Error::MissingTile => "missing tile",
+            crate::progressive::Error::ResourceLimit => "resource limit",
+            crate::progressive::Error::BackendUnavailable => "backend unavailable",
+        });
+        match error {
+            crate::progressive::Error::Backend(
+                "first entropy" | "upgrade entropy" | "upgrade entropy tail",
+            ) => RdpEgfxFailure::ProgressiveEntropy,
+            crate::progressive::Error::Backend(_)
+            | crate::progressive::Error::BackendUnavailable => RdpEgfxFailure::ProgressiveKernel,
+            _ => RdpEgfxFailure::ProgressiveState,
+        }
+    }
+
+    /// Progressive 与 backing 共用 state 锁；不会在 codec 锁内回调 publisher。
+    fn decode_progressive(&mut self, wire: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
+        let mut state = lock_state(&self.state);
+        if state.disabled {
+            return;
+        }
+        let result = (|| -> std::result::Result<(), RdpEgfxFailure> {
+            if wire.codec_id != ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive {
+                state.unhandled_codec_count = state.unhandled_codec_count.saturating_add(1);
+                state.last_unhandled_codec = Some(u16::from(wire.codec_id));
+                return Err(RdpEgfxFailure::UnsupportedCodec);
+            }
+            let surface = *state
+                .surfaces
+                .get(&wire.surface_id)
+                .ok_or(RdpEgfxFailure::PublisherMissingSurface)?;
+            if state.progressive_frame_id.is_none() {
+                state.progressive_failure_detail = Some("missing EGFX frame");
+                return Err(RdpEgfxFailure::ProgressiveState);
+            }
+            Self::ensure_backing(&mut state, wire.surface_id)
+                .map_err(|_| RdpEgfxFailure::Publisher)?;
+            let blocks = crate::progressive::decode_wire(&wire.bitmap_data)
+                .map_err(|_| RdpEgfxFailure::ProgressiveWire)?;
+            let updates = state
+                .progressive_decoder
+                .decode(
+                    wire.surface_id,
+                    wire.codec_context_id,
+                    u16::try_from(surface.width)
+                        .map_err(|_| RdpEgfxFailure::PublisherInvalidRectangle)?,
+                    u16::try_from(surface.height)
+                        .map_err(|_| RdpEgfxFailure::PublisherInvalidRectangle)?,
+                    &blocks,
+                )
+                .map_err(|error| Self::progressive_failure(&mut state, error))?;
+            let copy_kernel =
+                crate::clearcodec::native_kernel().ok_or(RdpEgfxFailure::ProgressiveKernel)?;
+            let rects: Vec<_> = updates
+                .iter()
+                .map(|u| PixelRect {
+                    x: u32::from(u.clip.x),
+                    y: u32::from(u.clip.y),
+                    width: u32::from(u.clip.width),
+                    height: u32::from(u.clip.height),
+                })
+                .collect();
+            // 全部 layout 和发布预算先验证，错误会清除整个 generation 的排队像素。
+            let publication = Self::coalesce_progressive_rectangles(rects.clone());
+            Self::publication_rectangles(&state, wire.surface_id, &publication)
+                .map_err(|_| RdpEgfxFailure::Publisher)?;
+            for (update, rect) in updates.iter().zip(&rects) {
+                state
+                    .backings
+                    .check(wire.surface_id, *rect)
+                    .map_err(|_| RdpEgfxFailure::Publisher)?;
+                let dx = usize::from(
+                    update
+                        .clip
+                        .x
+                        .checked_sub(update.x)
+                        .ok_or(RdpEgfxFailure::Decoder)?,
+                );
+                let dy = usize::from(
+                    update
+                        .clip
+                        .y
+                        .checked_sub(update.y)
+                        .ok_or(RdpEgfxFailure::Decoder)?,
+                );
+                let width = usize::from(update.clip.width);
+                let height = usize::from(update.clip.height);
+                if dx + width > 64 || dy + height > 64 || update.bgra.len() != 64 * 64 * 4 {
+                    return Err(RdpEgfxFailure::Decoder);
+                }
+                let mut cropped = vec![0; width * height * 4];
+                for row in 0..height {
+                    let from = ((dy + row) * 64 + dx) * 4;
+                    crate::clearcodec::PixelKernel::copy_bgra(
+                        &copy_kernel,
+                        &update.bgra[from..from + width * 4],
+                        &mut cropped[row * width * 4..(row + 1) * width * 4],
+                    );
+                }
+                state
+                    .backings
+                    .write(wire.surface_id, *rect, &cropped)
+                    .map_err(|_| RdpEgfxFailure::Publisher)?;
+            }
+            Self::publish_backing(&mut state, wire.surface_id, &publication)
+                .map_err(|_| RdpEgfxFailure::Publisher)?;
+            if !updates.is_empty() {
+                state.progressive_decoded_updates_total =
+                    state.progressive_decoded_updates_total.saturating_add(1);
+            }
+            Ok(())
+        })();
+        if let Err(reason) = result {
+            state.failure_reason.get_or_insert(reason);
+            Self::disable_locked(&mut state);
+        }
     }
 
     /// ClearCodec 缓存和序号属于会话，普通 ResetGraphics 只改变发布 generation。
@@ -2595,6 +2783,8 @@ impl EgfxAdapter {
             diagnostics.last_unhandled_codec = state.last_unhandled_codec;
             diagnostics.avc444_decoded_updates_total = state.avc444_decoded_updates_total;
             diagnostics.clearcodec_decoded_bitmaps_total = state.clearcodec_decoded_bitmaps_total;
+            diagnostics.progressive_decoded_updates_total = state.progressive_decoded_updates_total;
+            diagnostics.progressive_failure_detail = state.progressive_failure_detail;
             diagnostics.frames_queued_total = state.frames_queued_total;
         }
         diagnostics.avc420_decoded_pictures_total =
@@ -2748,6 +2938,9 @@ impl DvcProcessor for EgfxAdapter {
 
     fn close(&mut self, channel_id: u32) {
         self.inner.close(channel_id);
+        if let Some(publisher) = &self.surface_publisher {
+            publisher.disable();
+        }
     }
 }
 
@@ -4833,6 +5026,316 @@ mod tests {
             .with_avc444_decoder(Box::new(SolidAvc444Decoder));
         assert!(publisher.capabilities().iter().any(|c| matches!(c,
             CapabilitySet::V10_7 { flags } if flags.bits() == (CapabilitiesV107Flags::SMALL_CACHE | CapabilitiesV107Flags::SCALEDMAP_DISABLE).bits())));
+    }
+
+    fn progressive_wire(context: u32, phase: u8, rect: (u16, u16, u16, u16)) -> GfxPdu {
+        use ironrdp::pdu::codecs::rfx::{progressive::*, EntropyAlgorithm, RfxRectangle};
+        let mut rlgr = vec![0; 65536];
+        let size = ironrdp::graphics::rlgr::encode(EntropyAlgorithm::Rlgr1, &[0; 4096], &mut rlgr)
+            .unwrap();
+        rlgr.truncate(size);
+        let quant = ComponentCodecQuant {
+            ll3: 6,
+            hl3: 6,
+            lh3: 6,
+            hh3: 6,
+            hl2: 6,
+            lh2: 6,
+            hh2: 6,
+            hl1: 6,
+            lh1: 6,
+            hh1: 6,
+        };
+        let pq = ComponentCodecQuant {
+            ll3: 1,
+            ..ComponentCodecQuant::LOSSLESS
+        };
+        let tile = if phase == 1 {
+            ProgressiveTile::Upgrade(TileUpgrade {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: 0,
+                y_idx: 0,
+                quality: 255,
+                y_srl_data: &[],
+                cb_srl_data: &[],
+                cr_srl_data: &[],
+                y_raw_data: &[0; 8],
+                cb_raw_data: &[0; 8],
+                cr_raw_data: &[0; 8],
+            })
+        } else {
+            ProgressiveTile::First(TileFirst {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: 0,
+                y_idx: 0,
+                quality: 0,
+                flags: if phase == 2 { 1 } else { 0 },
+                y_data: &rlgr,
+                cb_data: &rlgr,
+                cr_data: &rlgr,
+                tail_data: &[],
+            })
+        };
+        let mut tiles = Vec::new();
+        for y in 0..(u32::from(rect.1) + u32::from(rect.3)).div_ceil(64) {
+            for x in 0..(u32::from(rect.0) + u32::from(rect.2)).div_ceil(64) {
+                let mut tile = tile.clone();
+                match &mut tile {
+                    ProgressiveTile::First(t) => {
+                        t.x_idx = x as u16;
+                        t.y_idx = y as u16;
+                    }
+                    ProgressiveTile::Upgrade(t) => {
+                        t.x_idx = x as u16;
+                        t.y_idx = y as u16;
+                    }
+                    _ => unreachable!(),
+                }
+                tiles.push(tile);
+            }
+        }
+        let blocks = [
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 64,
+                flags: 1,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(ProgressiveRegion {
+                tile_size: 64,
+                rects: vec![RfxRectangle {
+                    x: rect.0,
+                    y: rect.1,
+                    width: rect.2,
+                    height: rect.3,
+                }],
+                quant_vals: vec![quant],
+                quant_prog_vals: vec![ProgressiveCodecQuant {
+                    quality: 50,
+                    y_quant: pq,
+                    cb_quant: pq,
+                    cr_quant: pq,
+                }],
+                flags: 0,
+                tiles,
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ];
+        GfxPdu::WireToSurface2(ironrdp_egfx::pdu::WireToSurface2Pdu {
+            surface_id: 1,
+            codec_id: ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive,
+            codec_context_id: context,
+            pixel_format: EgfxPixelFormat::XRgb,
+            bitmap_data: encode_progressive_stream(&blocks).unwrap(),
+        })
+    }
+    fn progressive_start(adapter: &mut EgfxAdapter, id: u32) {
+        process_gfx_pdu(
+            adapter,
+            GfxPdu::StartFrame(StartFramePdu {
+                timestamp: Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id: id,
+            }),
+        );
+    }
+    #[test]
+    fn progressive_gfx_first_upgrade_endframe_uses_actual_native_path_and_mask() {
+        let mut adapter = clear_adapter(64, 64);
+        clear_surface(&mut adapter, 1, 64, 64, 0, 0);
+        progressive_start(&mut adapter, 1);
+        process_gfx_pdu(&mut adapter, progressive_wire(7, 0, (0, 0, 32, 64)));
+        process_gfx_pdu(&mut adapter, progressive_wire(7, 1, (32, 0, 32, 64)));
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        assert!(!adapter.is_failed(), "{:?}", adapter.diagnostics());
+        assert_eq!(adapter.diagnostics().progressive_decoded_updates_total, 2);
+        let updates = adapter.drain_surface_updates();
+        assert!(
+            matches!(&updates[1],SurfaceUpdate::Damage{patches,..} if patches.len()==2 && patches[0].rect.width==32 && patches[1].rect.x==32
+            && patches.iter().all(|p|p.pixels.as_bytes()==[128,128,128,255].repeat(32*64)))
+        );
+        assert!(matches!(
+            updates[2],
+            SurfaceUpdate::FrameBoundary {
+                completeness: FrameCompleteness::FullBaseline,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn progressive_offscreen_then_map_preserves_decoded_backing() {
+        let mut adapter = clear_adapter(64, 64);
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 64,
+                pixel_format: EgfxPixelFormat::XRgb,
+            }),
+        );
+        progressive_start(&mut adapter, 1);
+        process_gfx_pdu(&mut adapter, progressive_wire(7, 0, (0, 0, 64, 64)));
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        assert!(!adapter.is_failed());
+        assert_eq!(adapter.drain_surface_updates().len(), 1);
+        progressive_start(&mut adapter, 2);
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 2 }));
+        let updates = adapter.drain_surface_updates();
+        assert!(!adapter.is_failed());
+        assert!(
+            matches!(&updates[0],SurfaceUpdate::Damage{patches,..} if patches[0].pixels.as_bytes()==[128,128,128,255].repeat(4096))
+        );
+    }
+    #[test]
+    fn progressive_delete_context_retains_surface_reference_but_delete_surface_clears_it() {
+        let mut adapter = clear_adapter(64, 64);
+        clear_surface(&mut adapter, 1, 64, 64, 0, 0);
+        progressive_start(&mut adapter, 1);
+        process_gfx_pdu(&mut adapter, progressive_wire(7, 0, (0, 0, 64, 64)));
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        adapter.drain_surface_updates();
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::DeleteEncodingContext(ironrdp_egfx::pdu::DeleteEncodingContextPdu {
+                surface_id: 1,
+                codec_context_id: 7,
+            }),
+        );
+        progressive_start(&mut adapter, 2);
+        process_gfx_pdu(&mut adapter, progressive_wire(8, 2, (0, 0, 64, 64)));
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 2 }));
+        assert!(!adapter.is_failed());
+        assert_eq!(adapter.diagnostics().progressive_decoded_updates_total, 2);
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::DeleteSurface(ironrdp_egfx::pdu::DeleteSurfacePdu { surface_id: 1 }),
+        );
+        clear_surface(&mut adapter, 1, 64, 64, 0, 0);
+        progressive_start(&mut adapter, 3);
+        process_gfx_pdu(&mut adapter, progressive_wire(9, 2, (0, 0, 64, 64)));
+        assert!(adapter.is_failed());
+        assert!(adapter.drain_surface_updates().is_empty());
+        assert_eq!(
+            adapter.diagnostics().first_failure,
+            Some(crate::factory::RdpEgfxFailure::ProgressiveState)
+        );
+    }
+    #[test]
+    fn progressive_bad_wire_and_missing_first_fail_closed_with_precise_stage() {
+        for wire_error in [true, false] {
+            let mut adapter = clear_adapter(64, 64);
+            clear_surface(&mut adapter, 1, 64, 64, 0, 0);
+            progressive_start(&mut adapter, 1);
+            let mut wire = progressive_wire(7, if wire_error { 0 } else { 1 }, (0, 0, 64, 64));
+            if wire_error {
+                if let GfxPdu::WireToSurface2(p) = &mut wire {
+                    p.bitmap_data.pop();
+                }
+            }
+            process_gfx_pdu(&mut adapter, wire);
+            assert!(adapter.is_failed());
+            assert!(adapter.drain_surface_updates().is_empty());
+            assert_eq!(
+                adapter.diagnostics().first_failure,
+                Some(if wire_error {
+                    crate::factory::RdpEgfxFailure::ProgressiveWire
+                } else {
+                    crate::factory::RdpEgfxFailure::ProgressiveState
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_full_hd_baseline_coalesces_510_tiles_without_relaxing_queue_limit() {
+        let mut adapter = clear_adapter(1920, 1080);
+        clear_surface(&mut adapter, 1, 1920, 1080, 0, 0);
+        progressive_start(&mut adapter, 1);
+        process_gfx_pdu(&mut adapter, progressive_wire(7, 0, (0, 0, 1920, 1080)));
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        assert!(!adapter.is_failed(), "{:?}", adapter.diagnostics());
+        let updates = adapter.drain_surface_updates();
+        assert!(
+            matches!(&updates[1],SurfaceUpdate::Damage{patches,..} if patches.len()==1 && patches[0].rect.width==1920 && patches[0].rect.height==1080)
+        );
+        assert_eq!(adapter.diagnostics().progressive_decoded_updates_total, 1);
+    }
+    #[test]
+    fn progressive_rectangle_coalescing_preserves_uninitialized_holes() {
+        let rects = vec![
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
+            PixelRect {
+                x: 128,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
+            PixelRect {
+                x: 0,
+                y: 64,
+                width: 64,
+                height: 64,
+            },
+        ];
+        let merged = EgfxSurfacePublisher::coalesce_progressive_rectangles(rects);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|r| r.width == 64));
+    }
+
+    #[test]
+    fn progressive_entropy_failure_keeps_only_static_detail_and_no_pixels() {
+        use ironrdp::pdu::codecs::rfx::progressive::{
+            encode_progressive_stream, ProgressiveBlock, ProgressiveTile,
+        };
+        let mut adapter = clear_adapter(64, 64);
+        clear_surface(&mut adapter, 1, 64, 64, 0, 0);
+        progressive_start(&mut adapter, 1);
+        let mut wire = progressive_wire(7, 0, (0, 0, 64, 64));
+        if let GfxPdu::WireToSurface2(p) = &mut wire {
+            let mut blocks = crate::progressive::decode_wire(&p.bitmap_data).unwrap();
+            if let ProgressiveBlock::Region(r) = &mut blocks[2] {
+                if let ProgressiveTile::First(t) = &mut r.tiles[0] {
+                    t.y_data = &[];
+                }
+            }
+            p.bitmap_data = encode_progressive_stream(&blocks).unwrap();
+        }
+        process_gfx_pdu(&mut adapter, wire);
+        assert!(adapter.is_failed());
+        assert!(adapter.drain_surface_updates().is_empty());
+        assert_eq!(
+            adapter.diagnostics().first_failure,
+            Some(crate::factory::RdpEgfxFailure::ProgressiveEntropy)
+        );
+        assert_eq!(
+            adapter.diagnostics().progressive_failure_detail,
+            Some("first entropy")
+        );
     }
 
     fn process_gfx_pdu(adapter: &mut EgfxAdapter, pdu: GfxPdu) {
