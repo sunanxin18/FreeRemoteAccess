@@ -62,6 +62,8 @@ Secret Service 往返证据。后续 Linux 原生 CI 需独立运行临时 D-Bus
 
 RemoteRenderer::record_in 已能接收离屏 TextureView，但当前 compositor 的 acquire/present 持有 SurfaceTexture，当前 pass 要求 sRGB 目标。GtkGLArea 的实际 FBO 编码与完成强度均须实测，不能把未知目标标为 sRGB，也不能把上传、queue_render 或 callback 到达当作实际呈现确认。
 
-下一实现方向：先分离现有 RemoteUpdateState、计划与 receipt 状态机，保留 wgpu 行为与测试；Linux GL 执行器再消费同一事务计划。在 GTK current-context 生命周期内管理 texture/FBO，禁止每帧读回CPU。BGRX/BGRA方向与色阶用四角fixture验证，视频后续按原 VideoFrameLayout/VideoColorSelection 采样平面。unrealize/context丢失必须撤销未确认 receipt，并在释放GL资源后请求新完整基线；不能确认旧代帧。
+已将 RemoteUpdateState、计划与 receipt 状态机提取到 frd-render-wgpu 的 transaction_state 模块，保留根路径公开类型、wgpu 执行与成功确认行为。该模块暂时复用既有 RendererError，尚不是独立于渲染 crate 的公共执行器接口。macOS Metal 下 38 项渲染测试及 1 项文档测试通过，完整工作区 1706 项通过；此提取不改变任何平台能力声明。
+
+下一实现方向：Linux GL 执行器消费同一事务计划。在 GTK current-context 生命周期内管理 texture/FBO，禁止每帧读回CPU。BGRX/BGRA方向与色阶用四角fixture验证，视频后续按原 VideoFrameLayout/VideoColorSelection 采样平面。unrealize/context丢失必须撤销未确认 receipt，并在释放GL资源后请求新完整基线；不能确认旧代帧。
 
 该结论来自固定依赖源码与[GtkGLArea官方文档](https://docs.gtk.org/gtk4/class.GLArea.html)审查，不是GTK/wgpu互操作已实现。独立原生窗口探针仍需CI运行，完整GL执行器及产品接线尚未实现。
