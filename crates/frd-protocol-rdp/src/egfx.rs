@@ -1654,6 +1654,9 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             // so recreating a decoder for this new coded size is impossible at
             // this boundary. Stop EGFX before changing the runtime surface;
             // the legacy Bitmap/RemoteFX stream remains available.
+            state
+                .failure_reason
+                .get_or_insert(RdpEgfxFailure::PublisherCodedSizeMismatch);
             Self::disable_locked(&mut state);
             return;
         }
@@ -1798,7 +1801,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             if contains_clearcodec {
                 state
                     .failure_reason
-                    .get_or_insert(RdpEgfxFailure::Publisher);
+                    .get_or_insert(RdpEgfxFailure::PublisherQueueLimit);
                 Self::disable_locked(&mut state);
                 return;
             }
@@ -1816,7 +1819,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             if contains_clearcodec {
                 state
                     .failure_reason
-                    .get_or_insert(RdpEgfxFailure::Publisher);
+                    .get_or_insert(RdpEgfxFailure::PublisherQueueLimit);
                 Self::disable_locked(&mut state);
                 return;
             }
@@ -2008,6 +2011,42 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
 }
 
 impl EgfxSurfacePublisher {
+    /// 固定分类仅含本地状态，不保留桌面载荷或上游错误文本。
+    fn clearcodec_layout_failure(
+        state: &EgfxSurfaceState,
+        surface_id: u16,
+        rectangle: &ExclusiveRectangle,
+    ) -> RdpEgfxFailure {
+        let Some(surface) = state.surfaces.get(&surface_id) else {
+            return RdpEgfxFailure::PublisherMissingSurface;
+        };
+        if rectangle.left >= rectangle.right
+            || rectangle.top >= rectangle.bottom
+            || u32::from(rectangle.right) > surface.width
+            || u32::from(rectangle.bottom) > surface.height
+        {
+            return RdpEgfxFailure::PublisherInvalidRectangle;
+        }
+        if !surface.mapped {
+            return RdpEgfxFailure::PublisherUnmappedSurface;
+        }
+        let Some(output) = state.output_size else {
+            return RdpEgfxFailure::PublisherMissingOutput;
+        };
+        if surface
+            .origin_x
+            .checked_add(u32::from(rectangle.right))
+            .is_none_or(|end| end > output.width)
+            || surface
+                .origin_y
+                .checked_add(u32::from(rectangle.bottom))
+                .is_none_or(|end| end > output.height)
+        {
+            return RdpEgfxFailure::PublisherOutputBounds;
+        }
+        RdpEgfxFailure::Publisher
+    }
+
     /// ClearCodec 缓存和序号属于会话，普通 ResetGraphics 只改变发布 generation。
     /// 独立 BGRX 路径直接移动 opaque BGRA，不能走 AVC 的 RGBA 交换通道。
     fn decode_clearcodec(&mut self, wire: &ironrdp_egfx::pdu::WireToSurface1Pdu) {
@@ -2053,9 +2092,8 @@ impl EgfxSurfacePublisher {
                     .map(|layout| (layout, width, height))
             });
         let Some(((rect, stride_bytes, expected_len), width, height)) = layout else {
-            state
-                .failure_reason
-                .get_or_insert(RdpEgfxFailure::Publisher);
+            let reason = Self::clearcodec_layout_failure(&state, wire.surface_id, rectangle);
+            state.failure_reason.get_or_insert(reason);
             Self::disable_locked(&mut state);
             return;
         };
@@ -2069,9 +2107,12 @@ impl EgfxSurfacePublisher {
                 .is_none_or(|n| n > MAX_PENDING_SURFACE_UPDATES)
             || (state.pending_revision.is_none() && state.revision == u64::MAX)
         {
-            state
-                .failure_reason
-                .get_or_insert(RdpEgfxFailure::Publisher);
+            let reason = if state.pending_revision.is_none() && state.revision == u64::MAX {
+                RdpEgfxFailure::PublisherRevisionOverflow
+            } else {
+                RdpEgfxFailure::PublisherQueueLimit
+            };
+            state.failure_reason.get_or_insert(reason);
             Self::disable_locked(&mut state);
             return;
         }
@@ -4106,6 +4147,69 @@ mod tests {
         process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
         assert!(adapter.is_failed());
         assert!(adapter.drain_surface_updates().is_empty());
+    }
+
+    #[test]
+    fn clearcodec_layout_failure_diagnostics_are_precise_without_payload() {
+        for (kind, expected) in [
+            (0, super::RdpEgfxFailure::PublisherMissingSurface),
+            (1, super::RdpEgfxFailure::PublisherUnmappedSurface),
+            (2, super::RdpEgfxFailure::PublisherInvalidRectangle),
+            (3, super::RdpEgfxFailure::PublisherMissingOutput),
+            (4, super::RdpEgfxFailure::PublisherOutputBounds),
+            (5, super::RdpEgfxFailure::PublisherQueueLimit),
+            (6, super::RdpEgfxFailure::PublisherRevisionOverflow),
+        ] {
+            let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+            publisher.on_reset_graphics(2, 2);
+            if kind != 0 {
+                super::lock_state(&publisher.state).surfaces.insert(
+                    1,
+                    super::EgfxSurface {
+                        width: 2,
+                        height: 2,
+                        origin_x: 0,
+                        origin_y: 0,
+                        mapped: false,
+                    },
+                );
+                if kind != 1 {
+                    publisher.on_surface_mapped(1, if kind == 4 { 1 } else { 0 }, 0);
+                }
+            }
+            {
+                let mut state = super::lock_state(&publisher.state);
+                if kind == 3 {
+                    state.output_size = None;
+                }
+                if kind == 5 {
+                    state.pending_overflowed = true;
+                }
+                if kind == 6 {
+                    state.revision = u64::MAX;
+                }
+            }
+            let pdu = clear_wire(
+                1,
+                0,
+                ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: if kind == 2 { 3 } else { 2 },
+                    bottom: 2,
+                },
+                [1, 2, 3],
+                false,
+            );
+            publisher.on_unhandled_pdu(&pdu);
+            assert_eq!(
+                super::lock_state(&publisher.state).failure_reason,
+                Some(expected),
+                "kind={kind}"
+            );
+            assert!(publisher.is_disabled());
+            assert!(publisher.drain().is_empty());
+        }
     }
 
     fn process_gfx_pdu(adapter: &mut EgfxAdapter, pdu: GfxPdu) {
