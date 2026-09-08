@@ -611,8 +611,7 @@ mod tests {
             .decode_bgr24(&fixture(&missing, 1, 0), 8, 1)
             .is_err());
     }
-    #[test]
-    fn microsoft_section_four_example_matches_published_pixels() {
+    fn microsoft_example() -> (Vec<u8>, Vec<u8>) {
         // MS-RDPNSC v20240423 §4：官方 15×10 压缩示例及完整 BGRA 期望值。
         fn hex(s: &str) -> Vec<u8> {
             s.split_whitespace()
@@ -625,7 +624,42 @@ mod tests {
             .chunks_exact(4)
             .flat_map(|p| p[..3].iter().copied())
             .collect();
+        (compressed, expected)
+    }
+
+    #[test]
+    fn microsoft_section_four_example_matches_published_pixels() {
+        let (compressed, expected) = microsoft_example();
         let decoder = SimdNsCodec::new(150).unwrap();
         assert_eq!(decoder.decode_bgr24(&compressed, 15, 10).unwrap(), expected);
+    }
+    #[test]
+    #[ignore = "有界性能采样，使用 --release --ignored --nocapture 单独执行"]
+    fn bounded_decode_benchmark_nscodec() {
+        use std::{hint::black_box, time::Instant};
+        assert!(!cfg!(debug_assertions), "benchmark 必须使用 --release");
+        let (compressed, expected) = microsoft_example();
+        let decoder = SimdNsCodec::new(150).unwrap();
+        assert_eq!(decoder.decode_bgr24(&compressed, 15, 10).unwrap(), expected);
+        for _ in 0..32 {
+            black_box(
+                decoder
+                    .decode_bgr24(black_box(&compressed), 15, 10)
+                    .unwrap(),
+            );
+        }
+        let iterations = 100000;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(
+                decoder
+                    .decode_bgr24(black_box(&compressed), 15, 10)
+                    .unwrap(),
+            );
+        }
+        let elapsed = start.elapsed();
+        println!("FRD_BENCH arch={} backend={} kernel=nscodec-ms-example-15x10 iterations={} elapsed_ns={} ns_decode={:.3} allocations=included",
+            std::env::consts::ARCH, if cfg!(target_arch = "aarch64") { "neon" } else { "sse2" },
+            iterations, elapsed.as_nanos(), elapsed.as_nanos() as f64 / iterations as f64);
     }
 }

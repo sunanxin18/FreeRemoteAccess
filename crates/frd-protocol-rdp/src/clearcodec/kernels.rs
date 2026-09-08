@@ -252,4 +252,57 @@ mod tests {
             }
         }
     }
+    /// 目标机器执行；数字是逻辑输出吞吐量，不代表网络或端到端帧率。
+    #[test]
+    #[ignore = "有界性能采样，使用 --release --ignored --nocapture 单独执行"]
+    fn bounded_decode_benchmark_kernels() {
+        use std::{hint::black_box, time::Instant};
+        assert!(!cfg!(debug_assertions), "benchmark 必须使用 --release");
+        let k = native_kernel().expect("目标 CPU 没有生产 SIMD 内核");
+        let backend = if cfg!(target_arch = "aarch64") {
+            "neon"
+        } else {
+            "sse2-ssse3"
+        };
+        let pixels = 1920 * 1080;
+        let source: Vec<u8> = (0..pixels * 4).map(|i| (i * 71) as u8).collect();
+        let mut destination = vec![0; source.len()];
+        let bgr = &source[..pixels * 3];
+        let column = &source[..1080 * 4];
+        let stride = 1920 * 4;
+        let column_span = 1079 * stride + 4;
+        for name in ["fill", "copy", "expand", "scatter"] {
+            let iterations = if name == "scatter" { 10000 } else { 256 };
+            let mut run = || {
+                match name {
+                    "fill" => k.fill_bgra(black_box(&mut destination), black_box([3, 5, 7, 255])),
+                    "copy" => k.copy_bgra(black_box(&source), black_box(&mut destination)),
+                    "expand" => k.expand_bgr24(black_box(bgr), black_box(&mut destination)),
+                    _ => k.scatter_column(
+                        black_box(column),
+                        black_box(&mut destination[..column_span]),
+                        black_box(stride),
+                    ),
+                }
+                black_box(&destination);
+            };
+            for _ in 0..8 {
+                run();
+            }
+            let start = Instant::now();
+            for _ in 0..iterations {
+                run();
+            }
+            let elapsed = start.elapsed();
+            let bytes = if name == "scatter" {
+                column.len()
+            } else {
+                source.len()
+            };
+            println!("FRD_BENCH arch={} backend={} kernel={} iterations={} logical_output_bytes={} elapsed_ns={} mib_s={:.3} stride={}",
+                std::env::consts::ARCH, backend, name, iterations, bytes, elapsed.as_nanos(),
+                bytes as f64 * iterations as f64 / elapsed.as_secs_f64() / 1048576.0,
+                if name == "scatter" { stride } else { 0 });
+        }
+    }
 }
