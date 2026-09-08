@@ -40,6 +40,11 @@ pub struct RdpEgfxDiagnostics {
     pub capability_messages_queued: u64,
     /// 曾观察到能够解析的服务器 CapabilitiesConfirm，失败后仍保留。
     pub typed_confirmation_ever: bool,
+    pub confirmed_version: Option<u32>,
+    /// V10.1 没有 flags 字段，保持 None。
+    pub confirmed_flags: Option<u32>,
+    pub unhandled_codec_count: u64,
+    pub last_unhandled_codec: Option<u16>,
     pub failure_count: u64,
     pub first_failure: Option<RdpEgfxFailure>,
 }

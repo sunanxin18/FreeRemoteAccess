@@ -240,6 +240,8 @@ struct EgfxSurfaceState {
     pending_overflowed: bool,
     updates: VecDeque<SurfaceUpdate>,
     rejected_updates: u64,
+    unhandled_codec_count: u64,
+    last_unhandled_codec: Option<u16>,
     disabled: bool,
 }
 
@@ -1410,6 +1412,8 @@ impl EgfxSurfacePublisher {
                 pending_overflowed: false,
                 updates: VecDeque::new(),
                 rejected_updates: 0,
+                unhandled_codec_count: 0,
+                last_unhandled_codec: None,
                 disabled: false,
             })),
             avc444_decoder: None,
@@ -1818,6 +1822,9 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             return;
         };
         if !matches!(wire.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2) {
+            let mut state = lock_state(&self.state);
+            state.unhandled_codec_count = state.unhandled_codec_count.saturating_add(1);
+            state.last_unhandled_codec = Some(u16::from(wire.codec_id));
             return;
         }
         let Some(decoder) = self.avc444_decoder.as_ref() else {
@@ -2063,10 +2070,16 @@ impl EgfxAdapter {
     }
 
     pub(crate) fn diagnostics(&self) -> RdpEgfxDiagnostics {
-        *self
+        let mut diagnostics = *self
             .diagnostics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(publisher) = &self.surface_publisher {
+            let state = lock_state(&publisher.state);
+            diagnostics.unhandled_codec_count = state.unhandled_codec_count;
+            diagnostics.last_unhandled_codec = state.last_unhandled_codec;
+        }
+        diagnostics
     }
 
     fn record_failure(&self, reason: RdpEgfxFailure) {
@@ -2154,11 +2167,25 @@ impl DvcProcessor for EgfxAdapter {
             return Ok(Vec::new());
         }
         let result = self.inner.process(channel_id, payload);
-        if self.inner.negotiated_capabilities().is_some() {
-            self.diagnostics
+        if let Some(capability) = self.inner.negotiated_capabilities() {
+            let diagnostics = self
+                .diagnostics
                 .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .typed_confirmation_ever = true;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            diagnostics.typed_confirmation_ever = true;
+            diagnostics.confirmed_version = Some(capability.version().0);
+            diagnostics.confirmed_flags = match capability {
+                CapabilitySet::V8 { flags } => Some(flags.bits()),
+                CapabilitySet::V8_1 { flags } => Some(flags.bits()),
+                CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => Some(flags.bits()),
+                CapabilitySet::V10_1 => None,
+                CapabilitySet::V10_3 { flags } => Some(flags.bits()),
+                CapabilitySet::V10_4 { flags }
+                | CapabilitySet::V10_5 { flags }
+                | CapabilitySet::V10_6 { flags }
+                | CapabilitySet::V10_6Err { flags } => Some(flags.bits()),
+                CapabilitySet::V10_7 { flags } => Some(flags.bits()),
+            };
         }
         match result {
             Ok(messages) => {
@@ -2230,6 +2257,86 @@ mod tests {
         ResetGraphicsPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn diagnostics_preserve_confirmation_version_and_flags() {
+        for (capability, avc420, expected_flags) in [
+            (
+                CapabilitySet::V8 {
+                    flags: super::CapabilitiesV8Flags::SMALL_CACHE,
+                },
+                false,
+                Some(2),
+            ),
+            (
+                CapabilitySet::V8_1 {
+                    flags: CapabilitiesV81Flags::SMALL_CACHE,
+                },
+                false,
+                Some(2),
+            ),
+            (
+                CapabilitySet::V8_1 {
+                    flags: CapabilitiesV81Flags::AVC420_ENABLED,
+                },
+                true,
+                Some(0x10),
+            ),
+            (CapabilitySet::V10_1, true, None),
+        ] {
+            let mut adapter =
+                EgfxAdapter::new(Some(Box::new(FailingH264Decoder)), Box::new(TestHandler));
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&capability)),
+            );
+            assert_eq!(adapter.avc420_confirmed(), avc420);
+            let diagnostics = adapter.diagnostics();
+            assert_eq!(diagnostics.confirmed_version, Some(capability.version().0));
+            assert_eq!(diagnostics.confirmed_flags, expected_flags);
+            adapter.process(7, &[0]).unwrap();
+            assert_eq!(
+                adapter.diagnostics().confirmed_version,
+                diagnostics.confirmed_version
+            );
+            assert_eq!(
+                adapter.diagnostics().confirmed_flags,
+                diagnostics.confirmed_flags
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_count_unhandled_codec_without_changing_publication() {
+        let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        let adapter = EgfxAdapter::with_surface_publisher(None, publisher.clone());
+        for (index, codec_id) in [Codec1Type::RemoteFx, Codec1Type::ClearCodec]
+            .into_iter()
+            .enumerate()
+        {
+            publisher.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id,
+                pixel_format: EgfxPixelFormat::XRgb,
+                destination_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+                bitmap_data: vec![0xA5],
+            }));
+            let diagnostics = adapter.diagnostics();
+            assert_eq!(
+                diagnostics.unhandled_codec_count,
+                u64::try_from(index + 1).unwrap()
+            );
+            assert_eq!(diagnostics.last_unhandled_codec, Some(u16::from(codec_id)));
+            assert_eq!(diagnostics.failure_count, 0);
+            assert!(!adapter.is_failed());
+            assert!(adapter.drain_surface_updates().is_empty());
+        }
+    }
 
     #[test]
     fn diagnostics_distinguish_unconfirmed_from_confirmed_then_failed() {

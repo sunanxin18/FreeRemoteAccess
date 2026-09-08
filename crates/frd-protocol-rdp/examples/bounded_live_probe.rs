@@ -336,12 +336,16 @@ fn run() -> Result<(), &'static str> {
                 capabilities.avc420,
                 capabilities.avc444,
             );
-            println!("RDP EGFX 阶段 start_calls={} capability_messages_queued={} typed_confirmation_ever={} failure_count={} first_failure={:?}",
+            println!("RDP EGFX 阶段 start_calls={} capability_messages_queued={} typed_confirmation_ever={} failure_count={} first_failure={:?} confirmed_version={:x?} confirmed_flags={:x?} unhandled_codec_count={} last_unhandled_codec={:x?}",
                 capabilities.egfx_diagnostics.start_calls,
                 capabilities.egfx_diagnostics.capability_messages_queued,
                 capabilities.egfx_diagnostics.typed_confirmation_ever,
                 capabilities.egfx_diagnostics.failure_count,
-                capabilities.egfx_diagnostics.first_failure);
+                capabilities.egfx_diagnostics.first_failure,
+                capabilities.egfx_diagnostics.confirmed_version,
+                capabilities.egfx_diagnostics.confirmed_flags,
+                capabilities.egfx_diagnostics.unhandled_codec_count,
+                capabilities.egfx_diagnostics.last_unhandled_codec);
         },
     );
     let factory = if let Some((mode, egfx_factory)) = egfx_factory {
