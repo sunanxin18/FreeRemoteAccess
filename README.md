@@ -1,5 +1,7 @@
 # FreeRemoteDesk
 
+> 2026-09-08 最新真实探针：macOS ARM64 已通过 ClearCodec 到 runtime 的完整首帧（1,087 ms，3 次位图解码、2 帧接收），随后仍遇 Progressive `0x0009` 停用。AVC 实际解码为零，持续刷新和 GUI 呈现未验收。此记录更新下方更早的零帧结果；见 [详细证据](docs/validation/rdp-egfx-h264-20260907.md)。
+
 > 2026-09-08 EGFX 最新验证：离屏表面与缓存支持通过 235 项 RDP 测试；真实 Windows 已越过未映射失败点，但在 RemoteFX Progressive `0x0009` 停止，60 秒零帧并正常回收。EGFX/AVC 首帧仍未验收，详见 [验证记录](docs/validation/rdp-egfx-h264-20260907.md)。
 
 > 2026-09-08 用户调整构建范围：macOS 仅构建 ARM64；Intel/x86_64 不支持当前构建与发布，不再是交付门禁。此前 Intel/Rosetta 结果仅保留为历史证据。Windows/Linux 的 x86、x86_64、ARM64 范围不变。

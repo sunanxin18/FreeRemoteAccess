@@ -285,6 +285,7 @@ fn run() -> Result<(), &'static str> {
     if io::stdin().is_terminal() {
         return Err("probe_requires_non_echoing_stdin_pipe");
     }
+    let egfx_mode = probe_egfx_mode()?;
     let egfx_factory = load_probe_egfx_factory()?;
     let mut reader = io::BufReader::new(io::stdin());
     let host = read_line(&mut reader)?;
@@ -326,8 +327,13 @@ fn run() -> Result<(), &'static str> {
     );
     // 高频编码计数最多每五秒输出一次；能力、编码类型和失败状态变化立即输出。
     let last_graphics_log = Mutex::new(None::<(RdpGraphicsCapabilities, Instant)>);
+    let final_graphics = Arc::new(Mutex::new(None::<RdpGraphicsCapabilities>));
+    let observer_graphics = final_graphics.clone();
     let graphics_observer: Arc<dyn RdpGraphicsObserver> = Arc::new(
         move |capabilities: RdpGraphicsCapabilities| {
+            *observer_graphics
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(capabilities);
             let mut summary = capabilities;
             summary.egfx_diagnostics.unhandled_codec_count = 0;
             summary.egfx_diagnostics.avc420_decoded_pictures_total = 0;
@@ -504,8 +510,36 @@ fn run() -> Result<(), &'static str> {
     match exit {
         ProtocolExit::Failed(error) => Err(error.code()),
         ProtocolExit::Closed if counts.frames == 0 => Err("probe_no_decoded_frames"),
-        ProtocolExit::Closed => Ok(()),
+        ProtocolExit::Closed => {
+            let latest = final_graphics.lock().map_err(|_| "probe_graphics_failed")?;
+            validate_egfx_result(egfx_mode, latest.as_ref().map(|c| &c.egfx_diagnostics))
+        }
     }
+}
+
+// AVC opt-in 必须验证真实 codec 使用，不能以 ClearCodec 首帧替代 AVC 验收。
+fn validate_egfx_result(
+    mode: Option<ProbeEgfxMode>,
+    diagnostics: Option<&frd_protocol_rdp::RdpEgfxDiagnostics>,
+) -> Result<(), &'static str> {
+    let Some(mode) = mode else {
+        return Ok(());
+    };
+    let evidence = diagnostics.ok_or("probe_egfx_evidence_missing")?;
+    if evidence.failure_count != 0 {
+        return Err("probe_egfx_pipeline_failed");
+    }
+    let decoded = match mode {
+        ProbeEgfxMode::Avc420 => evidence.avc420_decoded_pictures_total,
+        ProbeEgfxMode::Avc444 => evidence.avc444_decoded_updates_total,
+    };
+    if decoded == 0 {
+        return Err("probe_requested_avc_not_decoded");
+    }
+    if evidence.frames_runtime_accepted_total == 0 {
+        return Err("probe_egfx_no_runtime_frames");
+    }
+    Ok(())
 }
 
 fn main() {
@@ -518,6 +552,30 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{parse_egfx_opt_in, probe_egfx_mode_from_flags, ProbeEgfxMode};
+
+    #[test]
+    fn avc_probe_rejects_clearcodec_only_and_failure_after_first_frame() {
+        let mut evidence = frd_protocol_rdp::RdpEgfxDiagnostics {
+            clearcodec_decoded_bitmaps_total: 3,
+            frames_runtime_accepted_total: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&evidence)),
+            Err("probe_requested_avc_not_decoded")
+        );
+        evidence.avc444_decoded_updates_total = 1;
+        assert_eq!(
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&evidence)),
+            Ok(())
+        );
+        evidence.failure_count = 1;
+        assert_eq!(
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&evidence)),
+            Err("probe_egfx_pipeline_failed")
+        );
+        assert_eq!(super::validate_egfx_result(None, None), Ok(()));
+    }
 
     #[test]
     fn egfx_opt_in_accepts_only_one() {
