@@ -66,7 +66,8 @@ RemoteRenderer::record_in 已能接收离屏 TextureView，但当前 compositor 
 
 下一实现方向：Linux GL 执行器消费同一事务计划。在 GTK current-context 生命周期内管理 texture/FBO，禁止每帧读回CPU。BGRX/BGRA方向与色阶用四角fixture验证，视频后续按原 VideoFrameLayout/VideoColorSelection 采样平面。unrealize/context丢失必须撤销未确认 receipt，并在释放GL资源后请求新完整基线；不能确认旧代帧。
 
-该结论来自固定依赖源码与[GtkGLArea官方文档](https://docs.gtk.org/gtk4/class.GLArea.html)审查，不是GTK/wgpu互操作已实现。独立原生窗口探针已有三架构 X11 1× 运行报告，边框校验修正后离线复验通过；2×/Wayland 待复跑，GL 执行器第一阶段见下节；GTK 产品接线尚未实现。
+该结论来自固定依赖源码与[GtkGLArea官方文档](https://docs.gtk.org/gtk4/class.GLArea.html)审查，不是 GTK/wgpu 互操作已被自动推断。Linux GL 执行器已完成第一阶段，GTK runner 已在 GTK Application/ApplicationWindow 的正式组合根中消费同一帧事务；三架构 X11/Wayland 1×/2× fixture 和正式入口窗口 smoke 的证据见
+`docs/validation/linux-client-foundation-20260908.md`。这些运行仍不等价于硬件 GPU、物理 Wayland 输入、窗口装饰视觉验收或真实 RDP 控制。
 
 ### 共享状态 crate 的提交边界
 
@@ -172,7 +173,7 @@ oracle。此后端能力不等于GTK的组合根、提交确认或远程会话�
 明确4.16颜色状态工作前默认假定sRGB。因此4.14这里应存sRGB编码字节；这不是从
 GL_LINEAR枚举本身推断。精确RGBA8保证通道8bit，新契约仅level0和samples0；输出
 alpha1满足premultiplied解释。桌面BGRA内存格式不能成为额外交换输出红蓝的理由。
-此证据不自动覆盖更新GTK的HDR/广色域color-state，也未完成GTK最终显示像素验收。
+此证据不自动覆盖更新 GTK 的 HDR/广色域 color-state；软件 Mesa fixture 只证明契约和绘制路径，GTK 在真实硬件上的最终显示像素、窗口装饰与物理输入仍待单独验收。
 
 
 ### GTK 4.14 窗口错误观察的实现路径
