@@ -230,7 +230,10 @@ mod runner;
     feature = "gtk-shell",
     any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use runner::{GtkRunner, GtkRunnerStores};
+pub use runner::{
+    GtkRunner, GtkRunnerStores, RunnerDiagnostics, RunnerTerminalCause,
+    TerminalPresentationDiagnostics,
+};
 
 #[cfg(all(
     target_os = "linux",

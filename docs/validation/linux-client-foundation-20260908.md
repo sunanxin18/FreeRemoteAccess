@@ -455,3 +455,38 @@ events优先，终止时退休匹配session的帧编译器；不新增像素协�
 0 failed / 16 ignored，日志 `/tmp/frd-gtk-runner-connected-workspace.log`。
 `cargo fmt --all -- --check` 通过。该macOS宿主测试不执行Linux原生GTK分支；
 新增runner确认、下一UPDATE消费和PNG视觉产物仍等待新CI，不能据此声明已验收。
+
+## 643912f runner等待失败及首批视觉产物
+
+GTK run34220754796三架构均FAILURE：ARM64 job102043043225、i686
+job102043043555、x86_64 job102043043635。逐job下载的日志与产物位于
+`/tmp/frd-gtk-643912f/`。每架构四组 native_gtk 实际通过，四组runner均在
+通用until的10秒边界超时。最后成功输出为saved-credentials-masked快照；
+日志缺少等待点名称与当前状态，不能归因为首帧、凭据或observer某一分支。
+
+每个case脚本在runner失败时提前退出，native_submission未执行；
+next_update_consumed=1缺失属于未运行，不是该用例已经运行失败。
+confirmed_connected=1/context_loss_cleanup=1也未出现，新增runner仍未验收。
+下一轮补具名等待及脱敏状态诊断，并分别执行全部fixture后汇总失败，保留
+原超时和全部断言，不用增大超时掩盖故障。
+
+36份PNG覆盖三架构X11/Wayland1×/2×的登录明暗与密码掩码，没有connected图。
+主代理实际查看x86_64 X11 1×明色与Wayland2×暗色样例：布局确实生成，但
+中文为缺字方框；当前GTK尚未接入随包Noto Sans SC回退，视觉验收失败。
+不能仅在CI安装中文字体后宣称产品问题解决。PNG仍为WidgetPaintable/GSK
+离屏产物，不是原生桌面截图或硬件输入证据。
+
+## XKB公共映射与终止诊断补齐
+
+纯XKB键名映射已提交e025bf5：唯一标准名称/HID表、四字节精确字段、未知及
+布局alias拒绝；菜单键使用canonical COMP，补齐五个日文/韩文canonical名称。
+独立审查修正MENU误作canonical的遗漏，针对COMP先失败后修复，focused
+keymap12/12通过。原生provider和实际事件来源尚未接入，不等于键盘可用。
+
+runner新增具名等待和终止前脱敏诊断：保留具体错误枚举、GLArea状态及observer
+计数；cleanup后仍可读取，新连接清除旧数据。adapter先退休observer时明确
+标记使用缓存快照。独立复审通过；新增原生清理后保留断言仍待CI执行。
+Linux x86_64全测试目标类型检查通过（system-deps override，非链接）；
+YAML、内嵌bash语法及stub失败汇总控制流检查通过。
+
+本地完整workspace终态exit0：78组，1771 passed / 0 failed / 16 ignored；日志 `/tmp/frd-gtk-xkb-diagnostics-workspace.log`。fmt与diff检查通过。

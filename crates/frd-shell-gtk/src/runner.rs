@@ -1,5 +1,5 @@
 //! GTK 产品事件泵；仅消费实际窗口提交证明后发布首帧，输入仍由 controller 门控。
-use crate::{AdapterEvent, GtkFrameArea, SubmitError};
+use crate::{AdapterError, AdapterEvent, GtkFrameArea, SubmissionError, SubmitError};
 use frd_app::{persist_profile_job, AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
 use frd_core::{DisplayIntent, PixelSize, ResolutionMode, SecretBuffer, SessionId, TargetSystem};
 use frd_frame::FrameTransaction;
@@ -255,6 +255,8 @@ struct State {
     pending_frames: Option<Vec<FrameTransaction>>,
     submission_enabled: bool,
     active_session: Option<SessionId>,
+    last_terminal: Option<TerminalPresentationDiagnostics>,
+    last_observer: Option<crate::presentation::SubmissionDiagnostics>,
     cleanup_pending: bool,
     cancel_pending: bool,
     closing: bool,
@@ -262,6 +264,63 @@ struct State {
     loading_profile: Option<ConnectionProfileKey>,
     failure: Option<&'static str>,
 }
+/// 只保留固定错误分类；不保存 GTK/协议的任意错误字符串。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunnerTerminalCause {
+    Cleanup,
+    Lifecycle,
+    Invalidated { discarded_transactions: usize },
+    Submission(SubmissionError),
+    GtkContext,
+    Loader,
+    InvalidAllocation,
+    Gl(frd_render_gl::GlError),
+    Batch(frd_render_gl::GlError),
+    FrameCompile,
+    Submit(SubmitError),
+}
+impl RunnerTerminalCause {
+    fn from_adapter(error: &AdapterError) -> Self {
+        match error {
+            AdapterError::GtkContext => Self::GtkContext,
+            AdapterError::Loader => Self::Loader,
+            AdapterError::InvalidAllocation => Self::InvalidAllocation,
+            AdapterError::Gl(error) => Self::Gl(*error),
+            AdapterError::Batch(error) => Self::Batch(error.error),
+            AdapterError::Submission(error) => Self::Submission(*error),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalPresentationDiagnostics {
+    pub cause: RunnerTerminalCause,
+    pub failure: Option<&'static str>,
+    pub gl_area_realized: bool,
+    pub gl_area_mapped: bool,
+    pub gl_area_has_error: bool,
+    pub submission_enabled: bool,
+    pub observer: Option<crate::presentation::SubmissionDiagnostics>,
+    /// adapter 已退休 observer 时，明确使用上次 drain/绑定时取得的快照。
+    pub observer_is_cached: bool,
+}
+
+/// 固定阶段/布尔值及 observer 数值快照；不含表单、目标、凭据或远程文本。
+#[derive(Debug)]
+pub struct RunnerDiagnostics {
+    pub phase: &'static str,
+    pub failure: Option<&'static str>,
+    pub gl_area_realized: bool,
+    pub gl_area_mapped: bool,
+    pub gl_area_has_error: bool,
+    pub submission_enabled: bool,
+    pub launch_pending: bool,
+    pub cleanup_pending: bool,
+    pub cancel_pending: bool,
+    pub pending_transactions: usize,
+    pub observer: Option<crate::presentation::SubmissionDiagnostics>,
+    pub last_terminal: Option<TerminalPresentationDiagnostics>,
+}
+
 /// 主线程 runner 所有者；必须保留至 window close/异步 cleanup 完成。
 pub struct GtkRunner {
     state: Rc<RefCell<State>>,
@@ -346,6 +405,8 @@ impl GtkRunner {
             pending_frames: None,
             submission_enabled: false,
             active_session: None,
+            last_terminal: None,
+            last_observer: None,
             cleanup_pending: false,
             cancel_pending: false,
             closing: false,
@@ -373,6 +434,32 @@ impl GtkRunner {
     }
     pub fn window(&self) -> gtk4::Window {
         self.state.borrow().window.clone()
+    }
+    /// 只读诊断，不执行 GL 或驱动 GTK 事件；正在借用时返回 None，不重入。
+    pub fn diagnostic_snapshot(&self) -> Option<RunnerDiagnostics> {
+        let state = self.state.try_borrow().ok()?;
+        let phase = match state.launch.controller().page() {
+            AppPage::ConnectionForm(_) => "form",
+            AppPage::Connecting { .. } => "connecting",
+            AppPage::AwaitingFirstFrame { .. } => "awaiting_first_frame",
+            AppPage::RemoteSession { .. } => "remote_session",
+            AppPage::Disconnecting { .. } => "disconnecting",
+            AppPage::Failed { .. } => "failed",
+        };
+        Some(RunnerDiagnostics {
+            phase,
+            failure: state.failure,
+            gl_area_realized: state.frames.widget().is_realized(),
+            gl_area_mapped: state.frames.widget().is_mapped(),
+            gl_area_has_error: state.frames.widget().error().is_some(),
+            submission_enabled: state.submission_enabled,
+            launch_pending: state.sessions.launch_is_pending(),
+            cleanup_pending: state.cleanup_pending,
+            cancel_pending: state.cancel_pending,
+            pending_transactions: state.pending_frames.as_ref().map_or(0, Vec::len),
+            observer: state.frames.submission_diagnostics(),
+            last_terminal: state.last_terminal,
+        })
     }
     pub fn present(&self) {
         self.window().present();
@@ -626,6 +713,8 @@ impl State {
         );
         match action {
             Ok(Some(AppAction::StartSession(mut request, permit))) => {
+                self.last_terminal = None;
+                self.last_observer = None;
                 self.reset_canvas();
                 self.active_session = Some(request.session_id);
                 // Stack 是标题栏下方的同一个内容矩形；连接前远程 GLArea 尚未分配尺寸。
@@ -681,6 +770,7 @@ impl State {
         if self.cleanup_pending {
             return;
         }
+        self.record_terminal(RunnerTerminalCause::Cleanup);
         if let Some(session) = self.active_session.take() {
             self.sessions.retire_frame_presentation(session);
         }
@@ -877,11 +967,15 @@ impl State {
         self.finish_close();
     }
     fn drain_frames(&mut self) {
+        if let Some(observer) = self.frames.submission_diagnostics() {
+            self.last_observer = Some(observer);
+        }
         for event in self.frames.drain_events() {
             match event {
                 AdapterEvent::Drawn { .. } => {} // 无窗口证明的 draw 永远不能升级 controller。
-                AdapterEvent::Failed(_) => {
+                AdapterEvent::Failed(error) => {
                     self.failure = Some("远程画面渲染失败，已停止会话");
+                    self.record_terminal(RunnerTerminalCause::from_adapter(&error));
                     self.intent(AppIntent::CancelConnect);
                     self.cleanup();
                     return;
@@ -894,6 +988,9 @@ impl State {
                         && !self.cleanup_pending
                     {
                         self.failure = Some("画面上下文已失效，请重新连接");
+                        self.record_terminal(RunnerTerminalCause::Invalidated {
+                            discarded_transactions,
+                        });
                         self.intent(AppIntent::CancelConnect);
                         self.cleanup();
                         return;
@@ -914,11 +1011,17 @@ impl State {
         }
         if self.submission_enabled {
             if !self.frames.widget().is_realized() || self.frames.widget().error().is_some() {
-                self.fail_presentation("画面上下文已失效，请重新连接");
+                self.fail_presentation(
+                    "画面上下文已失效，请重新连接",
+                    RunnerTerminalCause::Lifecycle,
+                );
                 return;
             }
-            if self.frames.take_submission_error().is_some() {
-                self.fail_presentation("窗口画面提交失败，请重新连接");
+            if let Some(error) = self.frames.take_submission_error() {
+                self.fail_presentation(
+                    "窗口画面提交失败，请重新连接",
+                    RunnerTerminalCause::Submission(error),
+                );
                 return;
             }
             // 先消费上一轮 after-paint 的精确证明，再允许新上传/draw 撤销 serial。
@@ -937,8 +1040,11 @@ impl State {
                     }
                 }
                 Ok(None) => {}
-                Err(_) => {
-                    self.fail_presentation("窗口画面确认失效，请重新连接");
+                Err(error) => {
+                    self.fail_presentation(
+                        "窗口画面确认失效，请重新连接",
+                        RunnerTerminalCause::from_adapter(&error),
+                    );
                     return;
                 }
             }
@@ -953,6 +1059,7 @@ impl State {
                 }
                 Err(_) => {
                     self.failure = Some("远程画面事务无效，已停止会话");
+                    self.record_terminal(RunnerTerminalCause::FrameCompile);
                     self.intent(AppIntent::CancelConnect);
                     self.cleanup();
                     return;
@@ -966,11 +1073,15 @@ impl State {
                 return;
             }
             if !self.submission_enabled {
-                if self.frames.enable_window_submission(&self.window).is_err() {
-                    self.fail_presentation("此窗口暂不支持画面提交确认，请重新连接");
+                if let Err(error) = self.frames.enable_window_submission(&self.window) {
+                    self.fail_presentation(
+                        "此窗口暂不支持画面提交确认，请重新连接",
+                        RunnerTerminalCause::Submission(error),
+                    );
                     return;
                 }
                 self.submission_enabled = true;
+                self.last_observer = self.frames.submission_diagnostics();
             }
         }
         if let Some(batch) = self.pending_frames.take() {
@@ -979,14 +1090,33 @@ impl State {
                     self.pending_frames = Some(rejected.transactions);
                 } else {
                     self.failure = Some("远程画面暂不可用，请重新连接");
+                    self.record_terminal(RunnerTerminalCause::Submit(rejected.reason));
                     self.intent(AppIntent::CancelConnect);
                     self.cleanup();
                 }
             }
         }
     }
-    fn fail_presentation(&mut self, message: &'static str) {
+    fn record_terminal(&mut self, cause: RunnerTerminalCause) {
+        // 同一连接保留最早终止原因，随后的 cleanup 不覆盖它。
+        if self.last_terminal.is_some() {
+            return;
+        }
+        let observer = self.frames.submission_diagnostics();
+        self.last_terminal = Some(TerminalPresentationDiagnostics {
+            cause,
+            failure: self.failure,
+            gl_area_realized: self.frames.widget().is_realized(),
+            gl_area_mapped: self.frames.widget().is_mapped(),
+            gl_area_has_error: self.frames.widget().error().is_some(),
+            submission_enabled: self.submission_enabled,
+            observer: observer.or(self.last_observer),
+            observer_is_cached: observer.is_none() && self.last_observer.is_some(),
+        });
+    }
+    fn fail_presentation(&mut self, message: &'static str, cause: RunnerTerminalCause) {
         self.failure = Some(message);
+        self.record_terminal(cause);
         self.intent(AppIntent::Disconnect);
         self.cleanup();
     }

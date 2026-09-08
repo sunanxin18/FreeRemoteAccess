@@ -249,7 +249,11 @@ fn find_optional(root: &gtk4::Widget, name: &str) -> Option<gtk4::Widget> {
     }
     None
 }
-fn until(mut condition: impl FnMut() -> bool) {
+fn until(
+    name: &'static str,
+    diagnostic: &impl Fn() -> String,
+    mut condition: impl FnMut() -> bool,
+) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         for _ in 0..128 {
@@ -262,7 +266,11 @@ fn until(mut condition: impl FnMut() -> bool) {
         if condition() {
             return;
         }
-        assert!(Instant::now() < deadline, "GTK runner状态超时");
+        assert!(
+            Instant::now() < deadline,
+            "GTK runner wait={name} timed_out; {}",
+            diagnostic()
+        );
         std::thread::sleep(Duration::from_millis(3));
     }
 }
@@ -336,13 +344,23 @@ fn native_gtk_login_session_cancel() {
         .downcast::<gtk4::Button>()
         .unwrap();
     let status = find(&root, "frd-status").downcast::<gtk4::Label>().unwrap();
+    let diagnostic = || {
+        format!(
+            "starts={} closed={} snapshot={:?}",
+            starts.load(Ordering::SeqCst),
+            closed.load(Ordering::SeqCst),
+            runner.diagnostic_snapshot()
+        )
+    };
     if let Some(artifacts) = &artifacts {
         artifacts.login_themes(&window);
     }
     connect.emit_clicked();
     assert_eq!(starts.load(Ordering::SeqCst), 0, "无效表单不能启动");
     profiles.set_selected(1);
-    until(|| password.text().as_str() == PASSWORD);
+    until("load_initial_saved_credentials", &diagnostic, || {
+        password.text().as_str() == PASSWORD
+    });
     if let Some(artifacts) = &artifacts {
         artifacts.masked_credentials(&window, &password);
     }
@@ -351,11 +369,15 @@ fn native_gtk_login_session_cancel() {
     connect.emit_clicked();
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     profiles.set_selected(1);
-    until(|| password.text().as_str() == PASSWORD);
+    until("reload_after_new_connection", &diagnostic, || {
+        password.text().as_str() == PASSWORD
+    });
     target.set_selected(1);
     assert!(password.text().is_empty(), "改变远程身份必须清除旧凭据");
     profiles.set_selected(1);
-    until(|| password.text().as_str() == PASSWORD);
+    until("reload_after_identity_edit", &diagnostic, || {
+        password.text().as_str() == PASSWORD
+    });
     find(&root, "frd-remember")
         .downcast::<gtk4::CheckButton>()
         .unwrap()
@@ -363,7 +385,9 @@ fn native_gtk_login_session_cancel() {
     // 原生PasswordEntry激活信号与按钮同一路径；不是XTEST硬件按键注入证明。
     password.emit_by_name::<()>("activate", &[]);
     password.emit_by_name::<()>("activate", &[]);
-    until(|| starts.load(Ordering::SeqCst) == 1 && status.text() == "已连接");
+    until("first_session_confirmed_connected", &diagnostic, || {
+        starts.load(Ordering::SeqCst) == 1 && status.text() == "已连接"
+    });
     // 检查真正交给协议工厂的请求，不能以转换函数单测代替 runner 接线。
     let requested = display_intents.lock().unwrap()[0];
     assert_eq!(requested.mode, ResolutionMode::NativeDisplay);
@@ -397,18 +421,28 @@ fn native_gtk_login_session_cancel() {
     let first_area = find(&root, "frd-remote")
         .downcast::<gtk4::GLArea>()
         .unwrap();
-    until(|| first_area.context().is_some());
-    until(|| read_increment(&first_area));
+    until("first_area_context", &diagnostic, || {
+        first_area.context().is_some()
+    });
+    until("first_area_increment", &diagnostic, || {
+        read_increment(&first_area)
+    });
     if let Some(artifacts) = &artifacts {
         artifacts.capture(&window, "connected");
     }
     assert_eq!(first_area.scale_factor(), scale);
-    until(|| stores.saves.load(Ordering::SeqCst) == 1);
+    until("deferred_profile_save", &diagnostic, || {
+        stores.saves.load(Ordering::SeqCst) == 1
+    });
     action.emit_clicked();
-    until(|| closed.load(Ordering::SeqCst) == 1 && status.text() == "未连接");
+    until("first_session_disconnect_cleanup", &diagnostic, || {
+        closed.load(Ordering::SeqCst) == 1 && status.text() == "未连接"
+    });
     assert_eq!(starts.load(Ordering::SeqCst), 1, "Enter必须只启动一个会话");
     profiles.set_selected(1);
-    until(|| password.text().as_str() == PASSWORD);
+    until("load_second_session_credentials", &diagnostic, || {
+        password.text().as_str() == PASSWORD
+    });
     let resolution = find(&root, "frd-resolution")
         .downcast::<gtk4::DropDown>()
         .unwrap();
@@ -427,35 +461,67 @@ fn native_gtk_login_session_cancel() {
     assert_eq!(password.text().as_str(), PASSWORD, "尺寸编辑不能清除密码");
     width.set_text("8192");
     password.emit_by_name::<()>("activate", &[]);
-    until(|| starts.load(Ordering::SeqCst) == 2 && status.text() == "已连接");
+    until("second_session_confirmed_connected", &diagnostic, || {
+        starts.load(Ordering::SeqCst) == 2 && status.text() == "已连接"
+    });
     assert_eq!(
         display_intents.lock().unwrap()[1].mode,
         ResolutionMode::Fixed(PixelSize::new(8192, 4608).unwrap())
+    );
+    assert!(
+        runner
+            .diagnostic_snapshot()
+            .unwrap()
+            .last_terminal
+            .is_none(),
+        "新连接不能混入上次终止诊断"
     );
     let second_area = find(&root, "frd-remote")
         .downcast::<gtk4::GLArea>()
         .unwrap();
     assert_ne!(first_area, second_area, "新会话必须替换旧画面对象");
-    until(|| second_area.context().is_some());
-    until(|| read_increment(&second_area));
+    until("second_area_context", &diagnostic, || {
+        second_area.context().is_some()
+    });
+    until("second_area_increment", &diagnostic, || {
+        read_increment(&second_area)
+    });
     // 已连接后上下文失效也必须退出，不得让旧提交重新升级状态。
     second_area.set_error(Some(&glib::Error::new(
         gtk4::gdk::GLError::NotAvailable,
         "fixture context loss",
     )));
     second_area.queue_render();
-    until(|| closed.load(Ordering::SeqCst) == 2 && status.text() == "未连接");
+    until("context_loss_cleanup", &diagnostic, || {
+        closed.load(Ordering::SeqCst) == 2 && status.text() == "未连接"
+    });
+    let terminal = runner
+        .diagnostic_snapshot()
+        .unwrap()
+        .last_terminal
+        .expect("清理后保留终止前诊断");
+    assert!(terminal.observer.is_some(), "重建空画布不能抹掉前 observer");
+    assert!(terminal.submission_enabled);
+    assert!(matches!(
+        terminal.cause,
+        frd_shell_gtk::RunnerTerminalCause::Lifecycle
+    ));
+    assert!(terminal.gl_area_has_error);
     assert_eq!(resolution.selected(), 8, "返回表单必须保留自定义模式");
     assert_eq!(width.text().as_str(), "8192");
     assert_eq!(height.text().as_str(), "4608");
     profiles.set_selected(1);
-    until(|| password.text().as_str() == PASSWORD);
+    until("load_cancelled_session_credentials", &diagnostic, || {
+        password.text().as_str() == PASSWORD
+    });
     password.emit_by_name::<()>("activate", &[]);
     action.emit_clicked();
-    until(|| status.text() == "未连接");
+    until("pending_launch_cancel_cleanup", &diagnostic, || {
+        status.text() == "未连接"
+    });
     window.close();
-    until(|| !window.is_visible());
-    println!("native GTK login saved_secret=1 identity_invalidation=1 enter_single_launch=1 deferred_save=1 cancel_cleanup=1 pending_launch_cancel=1 confirmed_connected=1 context_loss_cleanup=1");
+    until("window_closed", &diagnostic, || !window.is_visible());
+    println!("native GTK login saved_secret=1 identity_invalidation=1 enter_single_launch=1 deferred_save=1 cancel_cleanup=1 pending_launch_cancel=1 confirmed_connected=1 context_loss_cleanup=1 retained_terminal_diagnostics=1");
 }
 
 // 仅测试读回：真实mock增量须经过host mailbox→compiler→新画布GL上传/绘制。

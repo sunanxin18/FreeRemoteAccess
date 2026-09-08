@@ -104,15 +104,32 @@ jobs:
           cat > "$fixture_script" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
-          cargo test --locked -p frd-shell-gtk --features gtk-shell \
+          fixture_failures=0
+          if cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --test native_gtk \
-            native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture
-          GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
+            native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture; then
+            echo "native_fixture=native_gtk result=passed"
+          else
+            echo "native_fixture=native_gtk result=failed"
+            fixture_failures=1
+          fi
+          if GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --test native_runner \
-            native_gtk_login_session_cancel -- --exact --ignored --nocapture
-          GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
+            native_gtk_login_session_cancel -- --exact --ignored --nocapture; then
+            echo "native_fixture=native_runner result=passed"
+          else
+            echo "native_fixture=native_runner result=failed"
+            fixture_failures=1
+          fi
+          if GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --test native_submission \
-            native_gtk_window_submission_roundtrip -- --exact --ignored --nocapture
+            native_gtk_window_submission_roundtrip -- --exact --ignored --nocapture; then
+            echo "native_fixture=native_submission result=passed"
+          else
+            echo "native_fixture=native_submission result=failed"
+            fixture_failures=1
+          fi
+          exit "$fixture_failures"
           SH
           case_failures=0
           for scale in 1 2; do
