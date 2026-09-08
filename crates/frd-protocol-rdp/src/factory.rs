@@ -15,10 +15,14 @@ use crate::runtime::run_protocol_session;
 /// advertisement. `LiveInteroperable` is reserved for a platform/server pair
 /// whose exact wire profile, first frame, sustained refresh and recovery gates
 /// were recorded separately.
+/// `ValidationOnly` 允许验证工具采集这些证据，但不代表证据已经成立。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RdpGraphicsAdvertisementGate {
     /// Keep the legacy Bitmap/RemoteFX advertisement.
     LegacyOnly,
+    /// 仅供显式选择的有界互操作验证；不声明生产环境或实机验证已通过。
+    /// 仍要求 provider 为当前会话创建精确匹配的 decoder。
+    ValidationOnly,
     /// Permit EGFX capability advertisement after an exact live gate passed.
     LiveInteroperable,
 }
@@ -123,7 +127,8 @@ impl RdpProtocolFactory {
     /// Stage an application-owned EGFX decoder provider without advertising it.
     ///
     /// The default remains legacy-only until the caller supplies an explicit
-    /// [`RdpGraphicsAdvertisementGate::LiveInteroperable`] through
+    /// [`RdpGraphicsAdvertisementGate::LiveInteroperable`]（生产证据已通过）或
+    /// [`RdpGraphicsAdvertisementGate::ValidationOnly`]（显式采集验证证据），通过
     /// [`Self::with_egfx_decoder_provider_and_gate`]. The provider is
     /// deliberately an IronRDP decoder boundary rather than an FFmpeg
     /// dependency, so each client platform can supply its own exact backend
@@ -141,8 +146,8 @@ impl RdpProtocolFactory {
 
     /// Construct a factory with an explicit graphics advertisement gate.
     /// Production callers may use `LiveInteroperable` only after the exact
-    /// platform/server evidence has passed; bounded probes use the same
-    /// explicit path and do not alter the default factory.
+    /// platform/server evidence has passed.
+    /// 有界验证工具应显式使用 `ValidationOnly`；默认 factory 仍保留 legacy 路径。
     pub fn with_egfx_decoder_provider_and_gate(
         client_platform: RdpClientPlatformIdentity,
         provider: Arc<dyn EgfxDecoderProvider>,
@@ -279,6 +284,19 @@ mod tests {
         assert_eq!(
             factory.graphics_advertisement_gate,
             RdpGraphicsAdvertisementGate::LegacyOnly
+        );
+    }
+
+    #[test]
+    fn explicit_validation_only_gate_is_retained_by_factory() {
+        let factory = RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
+            RdpClientPlatformIdentity::Macintosh,
+            Arc::new(NoopProvider),
+            RdpGraphicsAdvertisementGate::ValidationOnly,
+        );
+        assert_eq!(
+            factory.graphics_advertisement_gate,
+            RdpGraphicsAdvertisementGate::ValidationOnly
         );
     }
 

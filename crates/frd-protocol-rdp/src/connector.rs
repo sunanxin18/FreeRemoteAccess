@@ -538,6 +538,7 @@ fn baseline_connector(
             matches!(
                 graphics_advertisement_gate,
                 RdpGraphicsAdvertisementGate::LiveInteroperable
+                    | RdpGraphicsAdvertisementGate::ValidationOnly
             )
         })
         .and_then(|provider| {
@@ -811,6 +812,56 @@ mod tests {
 
         assert_eq!(graphics, baseline_graphics_capabilities());
         assert!(!connector.config.support_dynvc_gfx_protocol);
+    }
+
+    #[test]
+    fn validation_only_advertises_only_when_provider_creates_exact_decoder() {
+        struct UnsupportedProvider;
+        impl EgfxDecoderProvider for UnsupportedProvider {
+            fn create_decoder(
+                &self,
+                _session_id: SessionId,
+                _coded_size: PixelSize,
+            ) -> Option<Box<dyn H264Decoder>> {
+                None
+            }
+        }
+
+        let supported: std::sync::Arc<dyn EgfxDecoderProvider> =
+            std::sync::Arc::new(StubEgfxDecoderProvider);
+        let unsupported: std::sync::Arc<dyn EgfxDecoderProvider> =
+            std::sync::Arc::new(UnsupportedProvider);
+        for (provider, expected) in [
+            (None, false),
+            (Some(&unsupported), false),
+            (Some(&supported), true),
+        ] {
+            let (connector, _audio, _display, graphics) = baseline_connector(
+                Credentials::UsernamePassword {
+                    username: "alice".to_owned(),
+                    password: String::new(),
+                },
+                None,
+                DesktopSize {
+                    width: 1280,
+                    height: 720,
+                },
+                "127.0.0.1:49152".parse().expect("valid client address"),
+                RdpClientPlatformIdentity::Macintosh,
+                SessionId::allocate(),
+                provider,
+                RdpGraphicsAdvertisementGate::ValidationOnly,
+            );
+            assert_eq!(graphics.egfx_advertised, expected);
+            assert_eq!(connector.config.support_dynvc_gfx_protocol, expected);
+            assert!(!graphics.egfx_confirmed);
+            assert!(!graphics.egfx_frame_confirmed);
+            assert!(!graphics.avc420);
+            assert!(!graphics.avc444);
+            if !expected {
+                assert_eq!(graphics, baseline_graphics_capabilities());
+            }
+        }
     }
 
     #[test]

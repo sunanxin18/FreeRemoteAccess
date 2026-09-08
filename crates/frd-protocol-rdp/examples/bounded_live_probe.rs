@@ -392,7 +392,7 @@ fn run() -> Result<(), &'static str> {
         RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
             RdpClientPlatformIdentity::Macintosh,
             provider,
-            frd_protocol_rdp::RdpGraphicsAdvertisementGate::LiveInteroperable,
+            frd_protocol_rdp::RdpGraphicsAdvertisementGate::ValidationOnly,
         )
     } else {
         RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)
