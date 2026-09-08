@@ -270,7 +270,9 @@ Wayland 使用 GTK 公开
 [get_xkb_keymap](https://github.com/GNOME/gtk/blob/4.14.0/gdk/wayland/gdkwaylanddevice.h)
 获取事件设备的当前借用表；查询直接使用 GTK hardwarecode，不再次加减8。
 X11 使用事件设备的实际设备ID与 XKB names，而不是默认core keyboard。
-这两个原生provider仍待实现；纯键名fixture不等于 compositor 事件验证。
+在本设计初稿阶段，这两个原生 provider 仍待实现；当前实现已由 GTK runner
+接入并在 Linux 三架构 fixture 中执行，但纯合成事件仍不等于 compositor 的物理
+键鼠事件验证。
 GTK可在无效Wayland表时保留旧/default表，因此不声称验证了原始compositor FD。
 
 输入接线继续复用 InputRouter、KeyOwnershipState 与 AppController.route_input。
