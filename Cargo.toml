@@ -29,6 +29,7 @@ members = [
     "crates/frd-shell-desktop",
     "apps/freeremotedesk-windows",
     "apps/freeremotedesk-macos",
+    "apps/freeremotedesk-linux",
     "tools/frd-legacy-minifb-lab",
     "tools/frd-wgpu-smoke",
     "tools/frd-icon-assets",

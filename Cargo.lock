@@ -2170,6 +2170,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "freeremotedesk-linux"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "frd-app",
+ "frd-core",
+ "frd-media-api",
+ "frd-platform-api",
+ "frd-platform-linux",
+ "frd-protocol-api",
+ "frd-protocol-apple",
+ "frd-protocol-rdp",
+ "frd-shell-desktop",
+ "frd-ui-model",
+ "frd-video-ffmpeg",
+ "winit",
+]
+
+[[package]]
 name = "freeremotedesk-macos"
 version = "0.1.0"
 dependencies = [

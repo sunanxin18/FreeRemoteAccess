@@ -126,3 +126,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: bash tools/verify-linux-secret-service.sh
+
+      - name: Test Linux application composition
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p freeremotedesk-linux

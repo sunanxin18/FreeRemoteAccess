@@ -7,7 +7,7 @@
   非回显环境 provider、Secret Service stage/commit/discard 与失败关闭。
 - [ ] 用合成目录和注入 keyring 完成平台服务回归；Linux 原生临时 D-Bus/keyring
   往返单列，不把 macOS 上的 mock/Unix 文件测试称为 Secret Service 运行证明。
-- [ ] 新增 Linux 应用组合根与依赖边界检查，默认 LegacyOnly，只有精确 bundle
+- [x] 新增 Linux 应用组合根与依赖边界检查，默认 LegacyOnly，只有精确 bundle
   和 decoder 通过才允许显式 ValidationOnly 实验。
 - [ ] 接入 Linux Vulkan/GLES 条件后端；在 X11/Wayland 宿主完成真实 GPU/输入与
   窗口装饰验收，保留 Windows DX12 与 macOS ARM64 Metal 行为。
@@ -24,3 +24,5 @@ Progressive coverage、实际 AVC 与 HEVC wire/live 门禁仍由原 RDP 计划�
 2026-09-08 基础服务实现与三 Linux 目标 check 已完成，17 项合成平台测试通过；
 Secret Service 原生脚本已加入 CI，未执行部分和完整客户端门禁见
 [基础服务验证](../../validation/linux-client-foundation-20260908.md)。
+
+Linux 应用组合根已接入 workspace；macOS 宿主的 all-targets check 和 20 项单元/2 项边界测试通过。Linux 原生应用测试已接入 CI，尚未执行，窗口/输入与完整包仍未验收。
