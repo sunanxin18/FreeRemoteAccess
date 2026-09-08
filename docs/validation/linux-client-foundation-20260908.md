@@ -298,3 +298,9 @@ GTK critical为致命错误。该证据覆盖GLArea帧适配组件，不包含�
 可能漏掉第五帧，后续阻塞阶段读到迟到输出。仅测试同步改为等确切timestamp5帧；
 保留两秒边界和空队列断言。最终215单元+2外部API+1文档测试通过，
 日志`/tmp/frd-keyboard-public-api-green.log`；首败`/tmp/frd-keyboard-public-api-tests.log`。
+
+
+窗口提交接线补充只读 `DrawReceipt::is_current()`：同时核对旧回执有效性和实际
+所属上下文，不切换context，也不读取或消费GL错误。它不证明当前FBO或窗口提交。
+原生EGL fixture增加解绑时false但回执仍有效、重新绑定true、绘制失败撤销后false。
+三Linux目标包含fixture的编译检查通过；新增原生断言尚待CI执行。

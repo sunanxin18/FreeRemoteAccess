@@ -266,6 +266,11 @@ impl DrawReceipt {
             && self.context.0.epoch.get() == self.epoch
             && self.renderer_serial.get() == self.serial
     }
+    /// 查询回执所属上下文是否实际 current；不切换上下文，也不读取/清除 GL 错误。
+    /// 此检查本身不证明窗口提交，或当前 FBO 是本次绘制目标。
+    pub fn is_current(&self) -> bool {
+        self.is_valid() && self.context.check().is_ok()
+    }
 }
 
 pub struct RemoteGlRenderer {

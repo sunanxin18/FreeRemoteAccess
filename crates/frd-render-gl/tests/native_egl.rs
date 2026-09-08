@@ -516,10 +516,18 @@ fn native_egl_renderer_roundtrip() {
         renderer.apply_batch(vec![frame(session, 2)]).unwrap();
         assert!(!receipt.is_valid(), "写入新代必须撤销旧绘制记录");
         let current = renderer.draw(&target, viewport).unwrap().unwrap();
+        assert!(current.is_current());
         // 真正解绑 current；安全入口必须拒绝，且隔离旧纹理/回执。
+        egl.make_current(display, None, None, None).unwrap();
+        assert!(!current.is_current());
+        assert!(current.is_valid(), "只读current查询不能撤销绘制记录");
+        egl.make_current(display, Some(surface), Some(surface), Some(native))
+            .unwrap();
+        assert!(current.is_current());
         egl.make_current(display, None, None, None).unwrap();
         assert!(renderer.draw(&target, viewport).is_err());
         assert!(!current.is_valid());
+        assert!(!current.is_current());
         egl.make_current(display, Some(surface), Some(surface), Some(native))
             .unwrap();
         assert!(
