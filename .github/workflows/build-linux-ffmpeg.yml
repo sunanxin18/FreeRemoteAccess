@@ -96,16 +96,18 @@ jobs:
 
       - name: Verify Linux bundle ELF and plugin ABI
         shell: bash
-        run: bash tools/verify-linux-ffmpeg-bundle.sh \
-          "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
+        run: |
+          bash tools/verify-linux-ffmpeg-bundle.sh \
+            "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
 
       - name: Load Linux plugin and call ABI entry point
         if: matrix.arch == 'x86_64'
         shell: bash
         env:
           FRD_LINUX_FFMPEG_RUNTIME_SMOKE: "1"
-        run: bash tools/verify-linux-ffmpeg-bundle.sh \
-          "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
+        run: |
+          bash tools/verify-linux-ffmpeg-bundle.sh \
+            "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
 
       - name: Stage corresponding FFmpeg source evidence
         shell: bash
