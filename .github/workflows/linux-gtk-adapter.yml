@@ -80,8 +80,10 @@ jobs:
             dbus-x11 xvfb xauth xdotool x11-utils weston "libgtk-4-dev$suffix" "libepoxy-dev$suffix" \
             "libgl1-mesa-dri$suffix" "libegl-mesa0$suffix" "libglx-mesa0$suffix"
           if [[ "${{ matrix.arch }}" == i686 ]]; then
-            sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386
+            sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu g++-i686-linux-gnu libc6-dev-i386-cross libc6-i386
             echo 'CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc' >> "$GITHUB_ENV"
+            echo 'CXX_i686_unknown_linux_gnu=i686-linux-gnu-g++' >> "$GITHUB_ENV"
+            echo 'CC_i686_unknown_linux_gnu=i686-linux-gnu-gcc' >> "$GITHUB_ENV"
             echo 'PKG_CONFIG_ALLOW_CROSS=1' >> "$GITHUB_ENV"
             echo 'PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig' >> "$GITHUB_ENV"
           fi
@@ -125,13 +127,17 @@ jobs:
             rm -rf "$runtime_root"
           }
           trap cleanup EXIT
-          export LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=gl G_DEBUG=fatal-criticals
+          # Keep fatal GTK diagnostics scoped to the fixture process.  Weston is
+          # a separate compositor and may emit benign GLib warnings while it
+          # boots; inheriting G_DEBUG=fatal-criticals would abort it before the
+          # Wayland product smoke can connect.
+          export LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=gl
           fixture_script="$log_dir/run-fixture.sh"
           cat > "$fixture_script" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
           fixture_failures=0
-          if cargo test --locked -p frd-shell-gtk --features gtk-shell \
+          if G_DEBUG=fatal-criticals cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --test native_gtk \
             native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture; then
             echo "native_fixture=native_gtk result=passed"
@@ -139,7 +145,7 @@ jobs:
             echo "native_fixture=native_gtk result=failed"
             fixture_failures=1
           fi
-          if GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
+          if G_DEBUG=fatal-criticals GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --test native_runner \
             native_gtk_login_session_cancel -- --exact --ignored --nocapture; then
             echo "native_fixture=native_runner result=passed"
@@ -147,7 +153,7 @@ jobs:
             echo "native_fixture=native_runner result=failed"
             fixture_failures=1
           fi
-          if GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
+          if G_DEBUG=fatal-criticals GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --test native_submission \
             native_gtk_window_submission_roundtrip -- --exact --ignored --nocapture; then
             echo "native_fixture=native_submission result=passed"
