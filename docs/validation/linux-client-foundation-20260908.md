@@ -237,3 +237,15 @@ GL/几何；不宣称完整产品登录、键盘焦点全覆盖或硬件GPU通�
 构造处发现FRAMEBUFFER_INCOMPLETE_ATTACHMENT(36054)，未到契约拒绝断言。
 level1与base0尺寸配置不一致，需修复测试纹理base/max层配置，保留完整性断言和
 生产level0限制。首轮结果保留为失败，不以编译或前段颜色检查代替完整原生通过。
+
+
+c349a72 修复测试资源后，run34210588972三架构原生EGL全部通过：i686 job102010382129、
+x64 job102010382396、ARM64 job102010382473，各1 passed/0 failed/0 ignored，日志
+/tmp/frd-gl-c349-{i686,x64,arm64}.log。完整fixture执行了双输出契约颜色/暗灰/线性
+缩放oracle和mip/格式/多采样拒绝，以及原生命周期/宿主状态检查。只证明软件GL执行，
+GTK最终snapshot颜色和完整产品会话仍待接线验收；7bf失败记录保留。
+
+09565d3 Windows run34206959365最终成功，三包job101998579467/101998579622/
+101998579637及ARM64原生job102008224653均完成。原生日志/tmp/frd-windows-arm64-095.log
+明确6项DLL测试、38项ClearCodec/NSCodec与2项显式基准、61项Progressive相关与1项
+显式基准通过。同revision七目标包/解码验证闭合，不涵盖后来GTK/颜色输出改动。

@@ -54,4 +54,4 @@ letterbox 清黑、错误viewport、真实current解绑、回执撤销和detach�
 重新编码，关闭FRAMEBUFFER_SRGB后写入普通RGBA8；旧capture仍严格要求sRGB附件。
 该能力针对已观察的GTK4.14目标准备，未完成GTK最终snapshot颜色或生产会话接线。
 native fixture比较两契约2×2/4×4输出及CPU测试oracle，含暗灰8/10/11/12、不同X、
-alpha、方向、状态恢复和格式/mip/多采样拒绝；新增断言待本轮Linux CI运行。
+alpha、方向、状态恢复和格式/mip/多采样拒绝；新增断言已在c349a72三架构软件EGL CI运行通过（run34210588972），仍不代表GTK窗口最终颜色。
