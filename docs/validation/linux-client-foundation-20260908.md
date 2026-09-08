@@ -69,3 +69,13 @@ Linux 应用入口 baebd80 的宿主测试通过 20 项单元及 2 项边界测�
 将 SessionHost/启动 barrier/取消/媒体工作线程/帧事务和清理从 application.rs 提取至 session_host.rs，未引入 GTK 或改变平台窗口。既有根 API 保留，新增 AcceptedLaunchOutcome 根重导出，供后续原生壳匹配后台启动结果。生产状态保持私有；跨模块呈现测试仅用 cfg(test) 窄接口。主代理比对启动、取消、事件发送、清理、回滚及视频/帧方法体，保持原逻辑。
 
 全部既有 shell214项及新增公开API doctest通过；最终完整 cargo test --locked --workspace 终态exit0，62组1706 passed/0 failed/16 ignored。该证据来自macOS ARM64宿主，不代表GTK产品接线或Linux原生GUI完成。
+
+## a60eebd 原生包与窗口探针证据
+
+Linux run `34202134581` 的 ARM64 job `101983147418` 与 x86_64 job `101983147612` 已成功，均实际通过应用20+2测试、完整release构建、包静态校验、显式目标进程解码器加载及产物上传。此前 zlib 名单遗漏已在目标环境复验关闭。同轮 i686 仍运行，不能提前声明整个 run 成功。
+
+原生窗口 run `34202134605` 三架构均实际编译成功，在首个 X11 1× 报告校验处失败。原始报告记录 ARM64/x86_64各89帧、i686为91帧，零GL错误；各有配对鼠标/键盘事件，内容焦点及窗口活跃，标题栏操作零次。实际标题栏 bounds 为 `(-1,-1,952,47)`，内容为 `(0,46,950,584)`，左右各外扩1逻辑点且底边恰好相接。旧 verifier 不允许负原点，造成错误拒绝。
+
+新增实测fixture先触发旧规则失败；修正规则只允许固定探针主题中最多1逻辑点的对称标题栏外扩，内容保持窗口左边对齐，并保留接缝、DPI、焦点、配对及无标题栏误点击条件。16项回归通过，下载的三份 `x11-1.jsonl` 均通过 `--require-input` 离线复验。原 run 仍是失败；此复验不补充未执行的2×、Wayland、任意主题或完整产品GUI验收。GL renderer实际是软件llvmpipe，不是硬件GPU证明。
+
+基础 CI run `34202134493` Ubuntu成功；macOS完成编译与安全测试后，在获取 pinned EGFX 的 arbitrary 依赖时因 `index.crates.io` DNS超时失败。确认终态后仅重跑失败job，attempt2仍在运行；没有修改锁文件或跳过测试。

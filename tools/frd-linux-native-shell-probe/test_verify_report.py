@@ -25,6 +25,19 @@ def fixture(scale=1, backend=1, with_input=False):
             {"gl_version": "4.5 (Core Profile) Mesa"}, summary, detail]
 
 
+def observed_border_fixture(scale=1):
+    """复刻 a60 x64 X11 scale1 报告数字；scale2 只是比例合成 fixture。"""
+    rows = fixture(scale, with_input=True)
+    rows[1]["gl_renderer"] = "llvmpipe (LLVM 20.1.2, 256 bits)"
+    rows[2]["gl_version"] = "4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.2"
+    rows[-2].update(frames=89, header_x=-1, header_y=-1, header_w=952, header_h=47,
+                    content_x=0, content_y=46, content_w=950, content_h=584,
+                    viewport_w=950 * scale, viewport_h=584 * scale,
+                    pointer_x=475, pointer_y=429)
+    rows[-1].update(pointer_pixel_x=475 * scale, pointer_pixel_y=429 * scale)
+    return rows
+
+
 def text(records):
     return "\n".join(json.dumps(row) for row in records) + "\n"
 
@@ -38,6 +51,25 @@ class ReportValidation(unittest.TestCase):
     def test_valid_x11_input_scales(self):
         for scale in (1, 2):
             v.verify_text(text(fixture(scale, with_input=True)), "x11", scale, True)
+
+    def test_observed_gtk_border_bounds_with_input(self):
+        for scale in (1, 2):
+            rows = observed_border_fixture(scale)
+            v.verify_text(text(rows), "x11", scale, True)
+
+    def test_header_border_and_content_alignment_rejected(self):
+        mutations = ({"header_x": -2}, {"header_y": -2},
+                     {"header_x": 1}, {"header_y": 1},
+                     {"header_w": 951}, {"header_w": 953},
+                     {"content_x": -1}, {"content_y": -1},
+                     {"content_x": 1},
+                     {"header_x": 0, "content_x": 1},
+                     {"header_y": 4, "content_y": 51})
+        for mutation in mutations:
+            rows = observed_border_fixture()
+            rows[-2].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                v.verify_text(text(rows), "x11", 1, True)
 
     def test_wayland_input_claim_rejected(self):
         with self.assertRaisesRegex(ValueError, "Wayland 输入"):

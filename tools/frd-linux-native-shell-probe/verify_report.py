@@ -91,8 +91,17 @@ def verify_text(text, expected_backend, expected_scale, require_input=False):
             "缺少成功 GL 绘制或分配证据")
     for name in ("header_w", "header_h", "content_w", "content_h", "viewport_w", "viewport_h"):
         require(summary[name] > 0, "分配或 viewport 为空")
-    for name in ("header_x", "header_y", "content_x", "content_y"):
-        require(summary[name] >= 0, "分配坐标不能为负")
+    # 固定 CI GTK 主题的边界盒可向外扩 1 逻辑点；不是任意主题的产品保证。
+    # 内容保持窗口左边对齐，标题栏必须左右对称覆盖它，不能借负坐标掩盖偏移。
+    require(summary["content_x"] == 0 and summary["content_y"] >= 0,
+            "内容原点必须非负且与窗口左边对齐")
+    require(-1 <= summary["header_y"] <= 0, "标题栏顶部外扩超出固定探针边界")
+    left_outset = summary["content_x"] - summary["header_x"]
+    right_outset = (summary["header_x"] + summary["header_w"] -
+                    summary["content_x"] - summary["content_w"])
+    require(0 <= left_outset <= 1 and 0 <= right_outset <= 1 and
+            abs(left_outset - right_outset) <= 0.02,
+            "标题栏必须在一逻辑点内左右对称覆盖内容")
     require(0 <= summary["center_error"] <= 1, "中心控件偏离窗口中心")
     gap = summary["content_y"] - summary["header_y"] - summary["header_h"]
     require(-1 <= gap <= 2, "标题栏与内容重叠或存在额外空白工具条")
