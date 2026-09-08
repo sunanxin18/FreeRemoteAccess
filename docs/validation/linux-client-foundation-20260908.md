@@ -200,3 +200,18 @@ GL 独立审查补充修正：indexed viewport只操作0，所有clip-distance�
 
 打包工作流并发策略调整：Windows/Linux/macOS同组保留正在运行的完整验证，最新提交
 排队；原生GL/窗口探针保持独立并发组，可立即验证修正。依据[GitHub官方并发语义](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)，cancel-in-progress=false不取消运行中的任务，默认仅保留最新pending。此配置不修改产品或验收条件。
+
+
+347a79e 原生 GL run34209182139 三架构全部成功：x64 job102005830534、i686
+job102005830626、ARM64 job102005830776 各明确执行1 passed/0 failed/0 ignored。
+日志 /tmp/frd-gl-347-{x64,i686,arm64}.log，包含新增viewport/clip/cube恢复断言。
+这是软件 EGL 原生执行，仍不代表硬件GPU/GTK呈现/生产RDP控制。
+
+
+347a79e GTK ARM64 job102005830614成功：X11/Wayland各1×/2×，X11含真实输入，
+Wayland仅GL/几何。已下载 target/validation/native-shell-347-arm64。四份目标记录均为
+GL4.5core、TEXTURE_2D、RGBA8(32856)、LINEAR(9729)、samples0、query_errors0、
+compatible0。Wayland2×实际viewport1920×1186对应960×593逻辑面积。目标对象每帧
+更换计数与观察次数相差1，进一步支持每次render重新capture而非缓存FBO。
+该测量明确阻止当前sRGB-only接口直接接入；下一步必须核对GTK纹理颜色语义，再
+实现明确的GPU输出转换或中间合成，不得把LINEAR附件谎报为sRGB。
