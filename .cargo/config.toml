@@ -1,0 +1,7 @@
+# FDK-AAC 0.5 未调用 cc::Build::cpp(true)，虽然输入是 .cpp，仍读取 CC/CFLAGS。
+# Windows ARM64 固定点实现需要 GNU 风格内联汇编，使用 Clang 的 MSVC ABI 驱动
+# 及其实际 GNU 兼容模式，不能只为 cl.exe 伪造架构宏。
+# 仅影响 aarch64-pc-windows-msvc；Windows x86/x64 和其他平台不变。
+[env]
+CC_aarch64_pc_windows_msvc = "clang-cl"
+CFLAGS_aarch64_pc_windows_msvc = "/clang:-fgnuc-version=4.2.1"

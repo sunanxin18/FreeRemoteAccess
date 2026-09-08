@@ -242,6 +242,7 @@ struct EgfxSurfaceState {
     rejected_updates: u64,
     unhandled_codec_count: u64,
     last_unhandled_codec: Option<u16>,
+    failure_reason: Option<RdpEgfxFailure>,
     disabled: bool,
 }
 
@@ -1414,6 +1415,7 @@ impl EgfxSurfacePublisher {
                 rejected_updates: 0,
                 unhandled_codec_count: 0,
                 last_unhandled_codec: None,
+                failure_reason: None,
                 disabled: false,
             })),
             avc444_decoder: None,
@@ -1825,6 +1827,13 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             let mut state = lock_state(&self.state);
             state.unhandled_codec_count = state.unhandled_codec_count.saturating_add(1);
             state.last_unhandled_codec = Some(u16::from(wire.codec_id));
+            // 无法解码的更新使整个 generation 不再可信，清除之前排队的画面。
+            state
+                .failure_reason
+                .get_or_insert(RdpEgfxFailure::UnsupportedCodec);
+            if !state.disabled {
+                Self::disable_locked(&mut state);
+            }
             return;
         }
         let Some(decoder) = self.avc444_decoder.as_ref() else {
@@ -2200,7 +2209,12 @@ impl DvcProcessor for EgfxAdapter {
                     .as_ref()
                     .is_some_and(EgfxSurfacePublisher::is_disabled)
                 {
-                    self.record_failure(RdpEgfxFailure::Publisher);
+                    let reason = self
+                        .surface_publisher
+                        .as_ref()
+                        .and_then(|publisher| lock_state(&publisher.state).failure_reason)
+                        .unwrap_or(RdpEgfxFailure::Publisher);
+                    self.record_failure(reason);
                     self.failed.store(true, Ordering::Release);
                 }
                 Ok(messages)
@@ -2307,14 +2321,39 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_count_unhandled_codec_without_changing_publication() {
-        let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
-        let adapter = EgfxAdapter::with_surface_publisher(None, publisher.clone());
-        for (index, codec_id) in [Codec1Type::RemoteFx, Codec1Type::ClearCodec]
-            .into_iter()
-            .enumerate()
-        {
-            publisher.on_unhandled_pdu(&GfxPdu::WireToSurface1(WireToSurface1Pdu {
+    fn unsupported_codec_disables_generation_once_and_discards_queued_updates() {
+        for codec_id in [Codec1Type::RemoteFx, Codec1Type::ClearCodec] {
+            let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+            let state = publisher.clone();
+            let mut adapter = EgfxAdapter::with_surface_publisher(None, publisher);
+            adapter.start(7).unwrap();
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(
+                    &CapabilitySet::V10_7 {
+                        flags: CapabilitiesV107Flags::SMALL_CACHE,
+                    },
+                )),
+            );
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                    width: 2,
+                    height: 2,
+                    monitors: Vec::new(),
+                }),
+            );
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::CreateSurface(CreateSurfacePdu {
+                    surface_id: 1,
+                    width: 2,
+                    height: 2,
+                    pixel_format: EgfxPixelFormat::XRgb,
+                }),
+            );
+            assert!(!super::lock_state(&state.state).updates.is_empty());
+            let wire = GfxPdu::WireToSurface1(WireToSurface1Pdu {
                 surface_id: 1,
                 codec_id,
                 pixel_format: EgfxPixelFormat::XRgb,
@@ -2325,15 +2364,30 @@ mod tests {
                     bottom: 2,
                 },
                 bitmap_data: vec![0xA5],
-            }));
+            });
+            process_gfx_pdu(&mut adapter, wire.clone());
             let diagnostics = adapter.diagnostics();
-            assert_eq!(
-                diagnostics.unhandled_codec_count,
-                u64::try_from(index + 1).unwrap()
-            );
+            assert_eq!(diagnostics.unhandled_codec_count, 1);
             assert_eq!(diagnostics.last_unhandled_codec, Some(u16::from(codec_id)));
-            assert_eq!(diagnostics.failure_count, 0);
-            assert!(!adapter.is_failed());
+            assert_eq!(diagnostics.failure_count, 1);
+            assert_eq!(
+                diagnostics.first_failure,
+                Some(super::RdpEgfxFailure::UnsupportedCodec)
+            );
+            assert!(state.is_disabled());
+            assert!(adapter.is_failed());
+            assert!(!adapter.is_active());
+            assert!(adapter.drain_surface_updates().is_empty());
+            process_gfx_pdu(&mut adapter, wire);
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                    width: 2,
+                    height: 2,
+                    monitors: Vec::new(),
+                }),
+            );
+            assert_eq!(adapter.diagnostics(), diagnostics);
             assert!(adapter.drain_surface_updates().is_empty());
         }
     }

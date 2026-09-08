@@ -8,6 +8,8 @@ RDP 的有界探针已增加非敏感 EGFX 阶段诊断（187 项协议测试通
 
 进一步定位：服务器在该次 EGFX 会话选择 V8.1、未启用 AVC420，并发送当前未处理的 ClearCodec（0x8）。该路径仍为实验性，不能宣称 H.264 登录与画面已验证。
 
+未支持的 EGFX WireToSurface1 编码现在明确记录 `UnsupportedCodec` 并停用当前 generation、丢弃排队更新（189 项 RDP 测试通过）；此错误处理不等于已实现 ClearCodec，也不保证服务端自动恢复 legacy。Windows ARM64 AAC 的 clang-cl 目标配置修复仍待托管完整编译验证。
+
 ## 2026-09-08 Linux 三架构目标解码通过
 
 [Linux run 34181521242](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34181521242) 在 `ca8628e` 上三个架构全部成功：x86_64 原生、i686 32 位目标进程、ARM64 原生各通过 11 项 plugin 单元测试与 6 项随包解码 fixture，覆盖 AVC420、AVC444 和 HEVC 离线样本。ELF/依赖/路径/ABI 与产物上传检查通过。该结果补齐 Linux 目标解码执行证据，仍不证明 Linux GUI 或真实 RDP 编码互操作。

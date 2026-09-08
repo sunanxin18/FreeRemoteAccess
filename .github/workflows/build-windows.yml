@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -20,6 +21,7 @@ on:
       - "main"
       - "codex/**"
     paths:
+      - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -156,6 +158,16 @@ jobs:
         run: |
           $env:FRD_FFMPEG_TEST_BUNDLE = (Resolve-Path '.codex-target/ffmpeg-8.1.2/windows-x86/Release/codec').Path
           cargo test --locked --target i686-pc-windows-msvc -p frd-video-ffmpeg-plugin --test main444_decode -- --nocapture
+
+      - name: Compile ARM64 AAC with the target C++ backend
+        if: matrix.architecture == 'arm64'
+        shell: pwsh
+        run: |
+          # 完整编译第三方 AAC，不能用宏检查代替真实 ARM64 汇编构建证据。
+          clang-cl --version
+          if ($LASTEXITCODE -ne 0) { throw "Windows ARM64 AAC requires clang-cl" }
+          cargo build --locked --release --target aarch64-pc-windows-msvc -p fdk-aac-sys
+          if ($LASTEXITCODE -ne 0) { throw "Windows ARM64 AAC compilation failed" }
 
       - name: Build Windows GUI release without implicit codec copying
         shell: pwsh

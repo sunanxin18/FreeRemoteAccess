@@ -30,6 +30,7 @@ pub enum RdpEgfxFailure {
     PayloadProcessing,
     Decoder,
     Publisher,
+    UnsupportedCodec,
     Reactivation,
 }
 
