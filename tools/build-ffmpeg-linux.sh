@@ -69,10 +69,14 @@ fi
 frd_attempt=$(mktemp -d "$frd_build/build.XXXXXX")
 trap 'rm -rf "$frd_attempt"' EXIT
 tar -xf "$frd_archive" -C "$frd_attempt"
-frd_prefix="$frd_attempt/dist"
+frd_stage="$frd_attempt/dist"
+frd_prefix="$frd_stage/usr"
 cd "$frd_attempt/ffmpeg-$frd_version"
 frd_configure_args=(
-  --prefix="$frd_prefix" --arch="$frd_arch" --target-os=linux
+  # configure 参数会原样进入 avcodec_configuration() 的运行时字符串。
+  # 使用固定逻辑安装前缀，临时构建目录仅通过 make 的 DESTDIR 传入，
+  # 避免将 CI /home/runner 路径固化进随包动态库。
+  --prefix=/usr --arch="$frd_arch" --target-os=linux
   --disable-static --enable-shared
   --disable-programs --disable-doc --disable-everything
   --enable-decoder=hevc,h264 --enable-parser=hevc,h264 --enable-protocol=file
@@ -92,7 +96,7 @@ if [[ "$frd_cross_build" -eq 1 ]]; then
 fi
 ./configure "${frd_configure_args[@]}"
 make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
-make install
+make DESTDIR="$frd_stage" install
 
 if [[ "$frd_arch" == "x86" || "$frd_arch" == "x86_64" ]]; then
   grep -q '^#define HAVE_X86ASM 1$' config.h || {
