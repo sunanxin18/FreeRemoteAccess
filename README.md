@@ -1,5 +1,7 @@
 # FreeRemoteDesk
 
+> 2026-09-08 EGFX 最新验证：离屏表面与缓存支持通过 235 项 RDP 测试；真实 Windows 已越过未映射失败点，但在 RemoteFX Progressive `0x0009` 停止，60 秒零帧并正常回收。EGFX/AVC 首帧仍未验收，详见 [验证记录](docs/validation/rdp-egfx-h264-20260907.md)。
+
 > 2026-09-08 用户调整构建范围：macOS 仅构建 ARM64；Intel/x86_64 不支持当前构建与发布，不再是交付门禁。此前 Intel/Rosetta 结果仅保留为历史证据。Windows/Linux 的 x86、x86_64、ARM64 范围不变。
 
 RDP 的有界探针已增加非敏感 EGFX 阶段诊断（187 项协议测试通过），区分能力排队、曾确认和后续失败；新真实会话仍待验证，生产编码门禁不变。
