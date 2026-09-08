@@ -247,3 +247,66 @@ fn freerdp_c_encoder_nonzero_complete_component() {
         assert_eq!(*value, expected, "coefficient {i}");
     }
 }
+
+#[test]
+fn terminal_full_zero_run_consumes_one_complete_symbol_then_exact_padding() {
+    // 从4096这个公开系数总数生成run，与任何会话字节无关。
+    let mut bits = Vec::new();
+    let mut zeros = 4096;
+    let mut kp = 8;
+    while zeros >= 1 << (kp / 8) {
+        bits.push(0);
+        zeros -= 1 << (kp / 8);
+        kp = (kp + 4).min(80);
+    }
+    bits.push(1);
+    for bit in (0..kp / 8).rev() {
+        bits.push(u8::from(zeros & (1 << bit) != 0));
+    }
+    assert_eq!(bits.len(), 31);
+    let short = pack_bits(&bits);
+    let mut output = [17; 4096];
+    decode_rlgr1(&short, &mut output).unwrap();
+    assert_eq!(output, [0; 4096]);
+    for negative in [0, 1] {
+        let mut complete = bits.clone();
+        complete.extend([negative, 0, 0]); // sign + GR(0), kr=1
+        let encoded = pack_bits(&complete);
+        decode_rlgr1(&encoded, &mut output).unwrap();
+        assert_eq!(output, [0; 4096]);
+        let mut extra = encoded.clone();
+        extra.push(0);
+        assert_eq!(decode_rlgr1(&extra, &mut output), Err(Error::TrailingData));
+        let mut bad_padding = encoded.clone();
+        *bad_padding.last_mut().unwrap() |= 1;
+        assert_eq!(
+            decode_rlgr1(&bad_padding, &mut output),
+            Err(Error::TrailingData)
+        );
+    }
+    // 终端符号虽不写入输出，仍须满足i16范围；不能绕过数值校验。
+    for (negative, code, valid) in [(0, 32767u32, false), (1, 32767, true), (1, 32768, false)] {
+        let mut terminal = bits.clone();
+        terminal.push(negative);
+        terminal.extend(std::iter::repeat_n(1, (code >> 1) as usize));
+        terminal.extend([0, (code & 1) as u8]);
+        output.fill(17);
+        let result = decode_rlgr1(&pack_bits(&terminal), &mut output);
+        if valid {
+            assert_eq!(result, Ok(()));
+            assert_eq!(output, [0; 4096]);
+        } else {
+            assert_eq!(result, Err(Error::CoefficientRange));
+            assert_eq!(output, [17; 4096]);
+        }
+    }
+    // 非零sign已到达最后bit，缺失GR，不能把缺失数据补零。
+    let mut truncated = bits.clone();
+    truncated.push(1);
+    output.fill(17);
+    assert_eq!(
+        decode_rlgr1(&pack_bits(&truncated), &mut output),
+        Err(Error::Truncated)
+    );
+    assert_eq!(output, [17; 4096]);
+}

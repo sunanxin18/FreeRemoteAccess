@@ -113,6 +113,15 @@ pub fn decode_rlgr1(data: &[u8], output: &mut [i16]) -> Result<()> {
             }
             pos += run;
             if pos == result.len() {
+                // 微软encoder的short尾与完整末符号均可结束精确覆盖的run。
+                // 仅在short零对齐不成立时消费一个符号；绝不跳过任意残留。
+                if reader.clone().finish_zero_padding().is_err() {
+                    let negative = reader.read(1)? != 0;
+                    let magnitude = gr(&mut reader, &mut krp)?
+                        .checked_add(1)
+                        .ok_or(Error::CoefficientRange)?;
+                    signed(magnitude, negative)?;
+                }
                 break;
             }
             let negative = reader.read(1)? != 0;
