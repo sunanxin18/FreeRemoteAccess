@@ -12,6 +12,7 @@ use ironrdp::{
     },
 };
 mod kernels;
+pub(crate) use kernels::{native_kernel, NativeKernel};
 mod nscodec;
 
 pub(crate) type NativeDecoder = Decoder<kernels::NativeKernel, nscodec::SimdNsCodec>;
