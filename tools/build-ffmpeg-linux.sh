@@ -10,6 +10,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 frd_root="$PWD"
+# Cargo 会从工作区根目录解析相对 CARGO_TARGET_DIR。这里统一保存绝对 target 根，
+# 防止插件查找回退到仓库默认 target 目录中的旧产物。
+frd_target_dir="${CARGO_TARGET_DIR:-$frd_root/target}"
+if [[ "$frd_target_dir" != /* ]]; then
+  frd_target_dir="$frd_root/$frd_target_dir"
+fi
 frd_version="8.1.2"
 frd_sha256="464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
 frd_build="${FRD_FFMPEG_BUILD_ROOT:-$frd_root/target/ffmpeg-linux}"
@@ -104,10 +110,10 @@ cd "$frd_root"
 if [[ "$frd_cross_build" -eq 1 ]]; then
   FFMPEG_DIR="$frd_prefix" cargo build --locked --release --target "$FRD_CARGO_TARGET" \
     -p frd-video-ffmpeg-plugin --features native-ffmpeg
-  frd_plugin="target/$FRD_CARGO_TARGET/release/libfreeremotedesk_ffmpeg.so"
+  frd_plugin="$frd_target_dir/$FRD_CARGO_TARGET/release/libfreeremotedesk_ffmpeg.so"
 else
   FFMPEG_DIR="$frd_prefix" cargo build --locked --release -p frd-video-ffmpeg-plugin --features native-ffmpeg
-  frd_plugin="target/release/libfreeremotedesk_ffmpeg.so"
+  frd_plugin="$frd_target_dir/release/libfreeremotedesk_ffmpeg.so"
 fi
 if [[ "$frd_cross_build" -eq 0 && "${FRD_FFMPEG_RUN_NATIVE_TESTS:-0}" == 1 ]]; then
   # 仅在 native host 上运行与本次 bundle 相同 FFmpeg dist 链接的 plugin 单测；
