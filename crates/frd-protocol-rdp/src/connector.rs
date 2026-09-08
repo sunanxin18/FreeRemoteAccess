@@ -99,6 +99,8 @@ pub(crate) const fn baseline_graphics_capabilities() -> RdpGraphicsCapability {
             clearcodec_decoded_bitmaps_total: 0,
             progressive_decoded_updates_total: 0,
             progressive_failure_detail: None,
+            publisher_failure_detail: None,
+            publisher_failure_operation: None,
             frames_queued_total: 0,
             frames_runtime_accepted_total: 0,
             start_calls: 0,

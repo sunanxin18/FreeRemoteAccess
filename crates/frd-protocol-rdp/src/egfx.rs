@@ -253,6 +253,8 @@ struct EgfxSurfaceState {
     clearcodec_decoded_bitmaps_total: u64,
     progressive_decoded_updates_total: u64,
     progressive_failure_detail: Option<&'static str>,
+    publisher_failure_detail: Option<&'static str>,
+    publisher_failure_operation: Option<&'static str>,
     frames_queued_total: u64,
     failure_reason: Option<RdpEgfxFailure>,
     disabled: bool,
@@ -1441,6 +1443,8 @@ impl EgfxSurfacePublisher {
                 clearcodec_decoded_bitmaps_total: 0,
                 progressive_decoded_updates_total: 0,
                 progressive_failure_detail: None,
+                publisher_failure_detail: None,
+                publisher_failure_operation: None,
                 frames_queued_total: 0,
                 failure_reason: None,
                 disabled: false,
@@ -1739,6 +1743,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         let size = PixelSize::new(u32::from(surface.width), u32::from(surface.height))
             .expect("checked dimensions");
         if state.backings.create(surface.id, size).is_err() {
+            Self::publisher_error(&mut state, "create_surface:backing allocation");
             Self::disable_locked(&mut state);
             return;
         }
@@ -1801,6 +1806,10 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
                 .valid_rectangles(surface_id, MAX_PENDING_SURFACE_UPDATES)
                 .and_then(|rects| Self::publish_backing(&mut state, surface_id, &rects));
             if result.is_err() {
+                Self::publisher_error(&mut state, "map_surface:valid rectangles");
+                state
+                    .publisher_failure_operation
+                    .get_or_insert("map_surface");
                 Self::disable_locked(&mut state);
                 return;
             }
@@ -1827,7 +1836,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
                 .iter()
                 .map(backing::rect)
                 .collect::<backing::Result<Vec<_>>>()?;
-            Self::publication_rectangles(&state, pdu.surface_id, &rects)?;
+            Self::publication_rectangles(&mut state, pdu.surface_id, &rects)?;
             state.backings.fill(
                 pdu.surface_id,
                 &rects,
@@ -1836,6 +1845,10 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             Self::publish_backing(&mut state, pdu.surface_id, &rects)
         })();
         if result.is_err() {
+            Self::publisher_error(&mut state, "solid_fill:backing");
+            state
+                .publisher_failure_operation
+                .get_or_insert("solid_fill");
             Self::disable_locked(&mut state);
         }
     }
@@ -1858,7 +1871,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
                     height: r.height,
                 })
                 .collect::<Vec<_>>();
-            Self::publication_rectangles(&state, pdu.destination_surface_id, &rects)?;
+            Self::publication_rectangles(&mut state, pdu.destination_surface_id, &rects)?;
             let rects = state.backings.copy_surface(
                 pdu.source_surface_id,
                 r,
@@ -1868,6 +1881,10 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             Self::publish_backing(&mut state, pdu.destination_surface_id, &rects)
         })();
         if result.is_err() {
+            Self::publisher_error(&mut state, "surface_to_surface:copy surface");
+            state
+                .publisher_failure_operation
+                .get_or_insert("surface_to_surface");
             Self::disable_locked(&mut state);
         }
     }
@@ -1885,6 +1902,10 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             )
         })();
         if result.is_err() {
+            Self::publisher_error(&mut state, "surface_to_cache:cache surface");
+            state
+                .publisher_failure_operation
+                .get_or_insert("surface_to_cache");
             Self::disable_locked(&mut state);
         }
     }
@@ -1902,6 +1923,10 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             Self::publish_backing(&mut state, pdu.surface_id, &rects)
         })();
         if result.is_err() {
+            Self::publisher_error(&mut state, "cache_to_surface:copy cache");
+            state
+                .publisher_failure_operation
+                .get_or_insert("cache_to_surface");
             Self::disable_locked(&mut state);
         }
     }
@@ -1911,6 +1936,10 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             return;
         }
         if state.backings.evict(pdu.cache_slot).is_err() {
+            Self::publisher_error(&mut state, "evict_cache:missing entry");
+            state
+                .publisher_failure_operation
+                .get_or_insert("evict_cache");
             Self::disable_locked(&mut state);
         }
     }
@@ -2328,7 +2357,7 @@ impl EgfxSurfacePublisher {
                 .collect();
             // 全部 layout 和发布预算先验证，错误会清除整个 generation 的排队像素。
             let publication = Self::coalesce_progressive_rectangles(rects.clone());
-            Self::publication_rectangles(&state, wire.surface_id, &publication)
+            Self::publication_rectangles(&mut state, wire.surface_id, &publication)
                 .map_err(|_| RdpEgfxFailure::Publisher)?;
             for (update, rect) in updates.iter().zip(&rects) {
                 state
@@ -2378,6 +2407,9 @@ impl EgfxSurfacePublisher {
         })();
         if let Err(reason) = result {
             state.failure_reason.get_or_insert(reason);
+            state
+                .publisher_failure_operation
+                .get_or_insert("progressive");
             Self::disable_locked(&mut state);
         }
     }
@@ -2414,18 +2446,24 @@ impl EgfxSurfacePublisher {
                 }
             }
             state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+            state
+                .publisher_failure_operation
+                .get_or_insert("clearcodec");
             Self::disable_locked(&mut state);
             return;
         }
         let validated = backing::rect(rectangle).and_then(|rect| {
             Self::ensure_backing(&mut state, wire.surface_id)?;
             state.backings.check(wire.surface_id, rect)?;
-            Self::publication_rectangles(&state, wire.surface_id, &[rect])?;
+            Self::publication_rectangles(&mut state, wire.surface_id, &[rect])?;
             Ok(rect)
         });
         let Ok(rect) = validated else {
             let reason = Self::clearcodec_layout_failure(&state, wire.surface_id, rectangle);
             state.failure_reason.get_or_insert(reason);
+            state
+                .publisher_failure_operation
+                .get_or_insert("clearcodec");
             Self::disable_locked(&mut state);
             return;
         };
@@ -2436,31 +2474,43 @@ impl EgfxSurfacePublisher {
             .decode(&wire.bitmap_data, rect.width as u16, rect.height as u16);
         let Ok(Some(pixels)) = decoded else {
             state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+            state
+                .publisher_failure_operation
+                .get_or_insert("clearcodec");
             Self::disable_locked(&mut state);
             return;
         };
         if pixels.len() != rect.width as usize * rect.height as usize * 4 {
             state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+            state
+                .publisher_failure_operation
+                .get_or_insert("clearcodec");
             Self::disable_locked(&mut state);
             return;
         }
         state.clearcodec_decoded_bitmaps_total =
             state.clearcodec_decoded_bitmaps_total.saturating_add(1);
-        if state
+        let written = state
             .backings
             .write(wire.surface_id, rect, &pixels)
-            .is_err()
-            || Self::publish_backing(&mut state, wire.surface_id, &[rect]).is_err()
+            .map_err(|_| Self::publisher_error(&mut state, "clearcodec:backing write"));
+        if written.is_err() || Self::publish_backing(&mut state, wire.surface_id, &[rect]).is_err()
         {
             state
                 .failure_reason
                 .get_or_insert(RdpEgfxFailure::Publisher);
+            state
+                .publisher_failure_operation
+                .get_or_insert("clearcodec");
             Self::disable_locked(&mut state);
         }
     }
 }
 
 impl EgfxSurfacePublisher {
+    fn publisher_error(state: &mut EgfxSurfaceState, detail: &'static str) {
+        state.publisher_failure_detail.get_or_insert(detail);
+    }
     fn ensure_backing(state: &mut EgfxSurfaceState, id: u16) -> backing::Result<()> {
         if !state.backings.contains(id) {
             let s = state.surfaces.get(&id).ok_or(())?;
@@ -2496,17 +2546,23 @@ impl EgfxSurfacePublisher {
         Ok(())
     }
     fn publication_rectangles(
-        state: &EgfxSurfaceState,
+        state: &mut EgfxSurfaceState,
         id: u16,
         rects: &[PixelRect],
     ) -> backing::Result<Vec<PixelRect>> {
-        let s = state.surfaces.get(&id).ok_or(())?;
-        if !s.mapped {
+        let Some(surface) = state.surfaces.get(&id).copied() else {
+            Self::publisher_error(state, "publish:missing surface");
+            return Err(());
+        };
+        if !surface.mapped {
             return Ok(Vec::new());
         }
-        let output = state.output_size.ok_or(())?;
-        let maxw = output.width.saturating_sub(s.origin_x);
-        let maxh = output.height.saturating_sub(s.origin_y);
+        let Some(output) = state.output_size else {
+            Self::publisher_error(state, "publish:missing output");
+            return Err(());
+        };
+        let maxw = output.width.saturating_sub(surface.origin_x);
+        let maxh = output.height.saturating_sub(surface.origin_y);
         let clipped: Vec<_> = rects
             .iter()
             .filter_map(|r| {
@@ -2529,23 +2585,35 @@ impl EgfxSurfacePublisher {
             .try_fold(0usize, |sum, r| {
                 sum.checked_add(r.width as usize * r.height as usize * 4)
             })
-            .ok_or(())?;
-        Self::check_publication_bytes(state, new_bytes, MAX_PENDING_PIXEL_BYTES)?;
-        if !clipped.is_empty()
-            && (state.pending_overflowed
-                || state
-                    .pending_patches
-                    .len()
-                    .checked_add(clipped.len())
-                    .is_none_or(|n| n > MAX_PENDING_SURFACE_UPDATES)
-                || state
-                    .updates
-                    .len()
-                    .checked_add(2)
-                    .is_none_or(|n| n > MAX_PENDING_SURFACE_UPDATES)
-                || (state.pending_revision.is_none() && state.revision == u64::MAX))
-        {
-            return Err(());
+            .ok_or_else(|| Self::publisher_error(state, "publish:byte overflow"))?;
+        Self::check_publication_bytes(state, new_bytes, MAX_PENDING_PIXEL_BYTES)
+            .map_err(|_| Self::publisher_error(state, "publish:pixel budget"))?;
+        if !clipped.is_empty() {
+            let failure = if state.pending_overflowed {
+                Some("publish:pending overflow")
+            } else if state
+                .pending_patches
+                .len()
+                .checked_add(clipped.len())
+                .is_none_or(|n| n > MAX_PENDING_SURFACE_UPDATES)
+            {
+                Some("publish:patch count")
+            } else if state
+                .updates
+                .len()
+                .checked_add(2)
+                .is_none_or(|n| n > MAX_PENDING_SURFACE_UPDATES)
+            {
+                Some("publish:queue count")
+            } else if state.pending_revision.is_none() && state.revision == u64::MAX {
+                Some("publish:revision overflow")
+            } else {
+                None
+            };
+            if let Some(detail) = failure {
+                Self::publisher_error(state, detail);
+                return Err(());
+            }
         }
         Ok(clipped)
     }
@@ -2558,9 +2626,18 @@ impl EgfxSurfacePublisher {
         let surface = *state.surfaces.get(&id).ok_or(())?;
         let mut patches = Vec::with_capacity(clipped.len());
         for r in clipped {
-            let pixels = state.backings.read(id, r)?;
-            let x = surface.origin_x.checked_add(r.x).ok_or(())?;
-            let y = surface.origin_y.checked_add(r.y).ok_or(())?;
+            let pixels = state
+                .backings
+                .read(id, r)
+                .map_err(|_| Self::publisher_error(state, "publish:backing read"))?;
+            let x = surface
+                .origin_x
+                .checked_add(r.x)
+                .ok_or_else(|| Self::publisher_error(state, "publish:x overflow"))?;
+            let y = surface
+                .origin_y
+                .checked_add(r.y)
+                .ok_or_else(|| Self::publisher_error(state, "publish:y overflow"))?;
             patches.push(PixelPatch {
                 rect: PixelRect { x, y, ..r },
                 stride_bytes: r.width * 4,
@@ -2639,6 +2716,8 @@ impl EgfxSurfacePublisher {
             Self::reject(&mut state);
             return;
         }
+        let prior_detail = state.publisher_failure_detail;
+        let prior_operation = state.publisher_failure_operation;
         let result = (|| {
             let rect = backing::rect(destination_rectangle)?;
             if rect.width != u32::from(width)
@@ -2649,13 +2728,15 @@ impl EgfxSurfacePublisher {
             }
             Self::ensure_backing(&mut state, surface_id)?;
             state.backings.check(surface_id, rect)?;
-            Self::publication_rectangles(&state, surface_id, &[rect])?;
+            Self::publication_rectangles(&mut state, surface_id, &[rect])?;
             let mut pixels = vec![0; data.len()];
             convert_rgba_to_bgrx(data, &mut pixels).map_err(|_| ())?;
             state.backings.write(surface_id, rect, &pixels)?;
             Self::publish_backing(&mut state, surface_id, &[rect])
         })();
         if result.is_err() {
+            state.publisher_failure_detail = prior_detail;
+            state.publisher_failure_operation = prior_operation;
             Self::reject(&mut state);
         }
     }
@@ -2785,6 +2866,8 @@ impl EgfxAdapter {
             diagnostics.clearcodec_decoded_bitmaps_total = state.clearcodec_decoded_bitmaps_total;
             diagnostics.progressive_decoded_updates_total = state.progressive_decoded_updates_total;
             diagnostics.progressive_failure_detail = state.progressive_failure_detail;
+            diagnostics.publisher_failure_detail = state.publisher_failure_detail;
+            diagnostics.publisher_failure_operation = state.publisher_failure_operation;
             diagnostics.frames_queued_total = state.frames_queued_total;
         }
         diagnostics.avc420_decoded_pictures_total =
@@ -4931,8 +5014,11 @@ mod tests {
             width: 4096,
             height: 4096,
         };
-        assert!(EgfxSurfacePublisher::publication_rectangles(&state, 1, &[rect, rect]).is_err());
+        assert!(
+            EgfxSurfacePublisher::publication_rectangles(&mut state, 1, &[rect, rect]).is_err()
+        );
         assert!(!state.backings.contains(1));
+        assert_eq!(state.publisher_failure_detail, Some("publish:pixel budget"));
     }
 
     #[test]
@@ -5336,6 +5422,100 @@ mod tests {
             adapter.diagnostics().progressive_failure_detail,
             Some("entropy truncated")
         );
+    }
+
+    #[test]
+    fn publisher_failure_detail_distinguishes_unknown_backing_read_and_missing_cache() {
+        let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        let mut state = super::lock_state(&publisher.state);
+        state.output_size = PixelSize::new(2, 2);
+        state.surfaces.insert(
+            1,
+            super::EgfxSurface {
+                width: 2,
+                height: 2,
+                origin_x: 0,
+                origin_y: 0,
+                mapped: true,
+            },
+        );
+        state
+            .backings
+            .create(1, PixelSize::new(2, 2).unwrap())
+            .unwrap();
+        assert!(EgfxSurfacePublisher::publish_backing(
+            &mut state,
+            1,
+            &[PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2
+            }]
+        )
+        .is_err());
+        assert_eq!(state.publisher_failure_detail, Some("publish:backing read"));
+        drop(state);
+        let mut adapter = clear_adapter(2, 2);
+        clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::CacheToSurface(ironrdp_egfx::pdu::CacheToSurfacePdu {
+                cache_slot: 99,
+                surface_id: 1,
+                destination_points: vec![ironrdp_egfx::pdu::Point { x: 0, y: 0 }],
+            }),
+        );
+        assert!(adapter.is_failed());
+        assert_eq!(
+            adapter.diagnostics().publisher_failure_detail,
+            Some("cache_to_surface:copy cache")
+        );
+        assert_eq!(
+            adapter.diagnostics().publisher_failure_operation,
+            Some("cache_to_surface")
+        );
+    }
+
+    #[test]
+    fn publisher_soft_avc_rejection_restores_prior_diagnostics_and_does_not_disable() {
+        for prior in [None, Some("prior diagnostic")] {
+            let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+            {
+                let mut state = super::lock_state(&publisher.state);
+                state.output_size = PixelSize::new(2, 2);
+                state.pending_overflowed = true;
+                state.surfaces.insert(
+                    1,
+                    super::EgfxSurface {
+                        width: 2,
+                        height: 2,
+                        origin_x: 0,
+                        origin_y: 0,
+                        mapped: true,
+                    },
+                );
+                state.publisher_failure_detail = prior;
+                state.publisher_failure_operation = prior;
+            }
+            publisher.queue_decoded_bitmap_update(
+                1,
+                &ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+                &[0; 16],
+                2,
+                2,
+            );
+            let state = super::lock_state(&publisher.state);
+            assert!(!state.disabled);
+            assert_eq!(state.failure_reason, None);
+            assert_eq!(state.publisher_failure_detail, prior);
+            assert_eq!(state.publisher_failure_operation, prior);
+        }
     }
 
     fn process_gfx_pdu(adapter: &mut EgfxAdapter, pdu: GfxPdu) {

@@ -56,6 +56,8 @@ pub struct RdpEgfxDiagnostics {
     pub clearcodec_decoded_bitmaps_total: u64,
     pub progressive_decoded_updates_total: u64,
     pub progressive_failure_detail: Option<&'static str>,
+    pub publisher_failure_detail: Option<&'static str>,
+    pub publisher_failure_operation: Option<&'static str>,
     pub frames_queued_total: u64,
     /// 当前 active session 成功提交给 runtime 的帧数，不等同 GUI 呈现。
     pub frames_runtime_accepted_total: u64,
