@@ -4,7 +4,7 @@
 //! fontconfig/PangoCairo 的公开 C ABI 建立私有 font map。不会修改进程全局
 //! fontconfig，也不会写入用户配置或安装系统字体。
 
-use gtk4::pango::{self, glib};
+use gtk4::pango::{self, glib, prelude::*};
 use libloading::Library;
 use std::{
     ffi::{c_int, c_void, CString},
@@ -93,6 +93,14 @@ impl BundledFontMap {
 
     pub fn map(&self) -> Option<&pango::FontMap> {
         self.map.as_ref()
+    }
+
+    pub fn has_bundled_family(&self) -> bool {
+        self.map.as_ref().is_some_and(|map| {
+            map.list_families()
+                .iter()
+                .any(|family| family.name().starts_with("Noto Sans SC"))
+        })
     }
 }
 

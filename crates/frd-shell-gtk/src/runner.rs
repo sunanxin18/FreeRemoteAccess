@@ -341,6 +341,7 @@ pub struct RunnerDiagnostics {
     pub cleanup_pending: bool,
     pub cancel_pending: bool,
     pub pending_transactions: usize,
+    pub font_map_loaded: bool,
     pub observer: Option<crate::presentation::SubmissionDiagnostics>,
     pub last_terminal: Option<TerminalPresentationDiagnostics>,
 }
@@ -496,6 +497,10 @@ impl GtkRunner {
             cleanup_pending: state.cleanup_pending,
             cancel_pending: state.cancel_pending,
             pending_transactions: state.pending_frames.as_ref().map_or(0, Vec::len),
+            font_map_loaded: state
+                .font_map
+                .as_ref()
+                .is_some_and(BundledFontMap::has_bundled_family),
             observer: state.frames.submission_diagnostics(),
             last_terminal: state.last_terminal,
         })
