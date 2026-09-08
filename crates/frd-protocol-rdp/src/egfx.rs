@@ -2426,6 +2426,30 @@ impl EgfxSurfacePublisher {
 
     /// ClearCodec 缓存和序号属于会话，普通 ResetGraphics 只改变发布 generation。
     /// 独立 BGRX 路径直接移动 opaque BGRA，不能走 AVC 的 RGBA 交换通道。
+    fn clearcodec_error_detail(error: &crate::clearcodec::Error) -> &'static str {
+        match error {
+            crate::clearcodec::Error::Invalid(_) => "clearcodec:invalid",
+            crate::clearcodec::Error::Sequence { .. } => "clearcodec:sequence",
+            crate::clearcodec::Error::MissingCache(_) => "clearcodec:missing-cache",
+            crate::clearcodec::Error::ResourceLimit => "clearcodec:resource-limit",
+            crate::clearcodec::Error::NsCodecUnavailable => "clearcodec:nscodec-unavailable",
+        }
+    }
+
+    fn record_clearcodec_decode_failure(
+        state: &mut EgfxSurfaceState,
+        error: &crate::clearcodec::Error,
+    ) {
+        state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
+        state
+            .publisher_failure_detail
+            .get_or_insert(Self::clearcodec_error_detail(error));
+        state
+            .publisher_failure_operation
+            .get_or_insert("clearcodec");
+        Self::disable_locked(state);
+    }
+
     fn decode_clearcodec(&mut self, wire: &ironrdp_egfx::pdu::WireToSurface1Pdu) {
         let mut state = lock_state(&self.state);
         if state.disabled {
@@ -2451,8 +2475,13 @@ impl EgfxSurfacePublisher {
                         rectangle.right - rectangle.left,
                         rectangle.bottom - rectangle.top,
                     );
-                if matches!(result, Ok(None)) {
-                    return;
+                match result {
+                    Ok(None) => return,
+                    Err(error) => {
+                        Self::record_clearcodec_decode_failure(&mut state, &error);
+                        return;
+                    }
+                    Ok(Some(_)) => {}
                 }
             }
             state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
@@ -2482,13 +2511,19 @@ impl EgfxSurfacePublisher {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .decode(&wire.bitmap_data, rect.width as u16, rect.height as u16);
-        let Ok(Some(pixels)) = decoded else {
-            state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
-            state
-                .publisher_failure_operation
-                .get_or_insert("clearcodec");
-            Self::disable_locked(&mut state);
-            return;
+        let pixels = match decoded {
+            Ok(Some(pixels)) => pixels,
+            Ok(None) => {
+                Self::record_clearcodec_decode_failure(
+                    &mut state,
+                    &crate::clearcodec::Error::Invalid("missing bitmap"),
+                );
+                return;
+            }
+            Err(error) => {
+                Self::record_clearcodec_decode_failure(&mut state, &error);
+                return;
+            }
         };
         if pixels.len() != rect.width as usize * rect.height as usize * 4 {
             state.failure_reason.get_or_insert(RdpEgfxFailure::Decoder);
@@ -4739,6 +4774,40 @@ mod tests {
         assert!(!adapter.is_failed());
         assert_eq!(adapter.drain_surface_updates().len(), 2);
     }
+
+    #[test]
+    fn clearcodec_decoder_failure_records_non_secret_error_class() {
+        let mut adapter = clear_adapter(2, 2);
+        clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::ClearCodec,
+                pixel_format: EgfxPixelFormat::XRgb,
+                destination_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                // A cache reset carries flags then sequence.  Deliberately
+                // use a stale sequence to exercise the fail-closed path.
+                bitmap_data: vec![4, 9],
+            }),
+        );
+        assert!(adapter.is_failed());
+        assert_eq!(
+            adapter.diagnostics().publisher_failure_detail,
+            Some("clearcodec:sequence")
+        );
+        assert_eq!(
+            adapter.diagnostics().publisher_failure_operation,
+            Some("clearcodec")
+        );
+        assert!(adapter.drain_surface_updates().is_empty());
+    }
+
     #[test]
     fn clearcodec_frame_publication_overflow_disables_instead_of_losing_reference() {
         let mut adapter = clear_adapter(2, 2);
