@@ -10,6 +10,10 @@ RDP 的有界探针已增加非敏感 EGFX 阶段诊断（187 项协议测试通
 
 未支持的 EGFX WireToSurface1 编码现在明确记录 `UnsupportedCodec` 并停用当前 generation、丢弃排队更新（189 项 RDP 测试通过）；此错误处理不等于已实现 ClearCodec，也不保证服务端自动恢复 legacy。Windows ARM64 AAC 的 clang-cl 目标配置修复仍待托管完整编译验证。
 
+## 2026-09-08 Windows ARM64 原生解码通过
+
+Windows run `34182980455` 整体成功，ARM64 native runtime job `101929312094` 在真实 ARM64 Windows 上重新验证下载的同次package，并加载随包DLL通过全部6项fixture。连同Windows x86/x64、Linux三架构及macOS ARM64已有记录，固定FFmpeg plugin构建/目标解码门禁已满足；新ClearCodec及真实RDP AVC仍独立未完成。
+
 ## 2026-09-08 Windows ARM64 包构建成功
 
 Windows run `34182980455` 的 ARM64 package job `101925633226` 已成功完成完整 AAC、GUI release、PE/package verifier 和上传。ARM64 应用 artifact 为 22,664,457 bytes，对应源码为 11,729,109 bytes。该结果证明目标构建和包检查，后续 `Windows ARM64 native decoder runtime` 尚待依赖 job 完成，不能提前宣称实际 ARM64 DLL 解码通过。
