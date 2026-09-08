@@ -29,6 +29,9 @@ objc2-foundation = { version = "=0.2.2", default-features = false, features = ["
 objc2-app-kit = { version = "=0.2.2", default-features = false, features = ["std", "NSView", "NSWindow", "NSScreen"] }
 wgpu = { workspace = true, features = ["metal"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [

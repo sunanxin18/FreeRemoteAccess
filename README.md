@@ -1,6 +1,6 @@
 # FreeRemoteDesk
 
-2026-09-08 当前进度：macOS 仅支持 ARM64。Progressive 失败几何诊断修订的完整工作区测试 1666 passed / 0 failed / 16 ignored；此前 `85324f5` ARM64 release 包验证通过。默认生产 RDP 仍为 LegacyOnly；显式 `--rdp-egfx-experiment avc420|avc444` 用于采集互操作证据。
+2026-09-08 当前进度：macOS 仅支持 ARM64。Linux 基础服务修订的完整工作区测试 1683 passed / 0 failed / 16 ignored；此前 `85324f5` ARM64 release 包验证通过。默认生产 RDP 仍为 LegacyOnly；显式 `--rdp-egfx-experiment avc420|avc444` 用于采集互操作证据。
 
 `707b178` 的1280×720探针取得20秒/70帧 ClearCodec/Progressive混合流，实际AVC计数0。该实验GUI的原生分辨率cache发布失败已由 `64dd9e1` 修复：2560×1440显示器原生模式下真实桌面、开始菜单鼠标、搜索键盘输入、正常断开与退出已受限验证；约三分钟会话最后诊断110帧、失败0。仍不能把混合流归为H.264验收。
 
@@ -104,7 +104,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 |---|---|---|---|---|---|
 | Windows | winit + egui + wgpu | 键盘、鼠标 | x86_64 默认 package；x86/i686 与 arm64/aarch64 使用同一显式架构 profile 生成独立 codec 目录和 manifest；MSI/MSIX 仍开发中 | macOS；Windows RDP 开发中 | **开发中**；固定 Rust 1.96.0 的协议中立 core/video/plugin crates 已通过 MSVC x86_64/i686/arm64 target check；统一视频 decoder 的编译、离线 fixture、DX12 readback、package staging 与 codec present/absent 单实例 GUI 门禁已完成；`.github/workflows/build-windows.yml` 已扩展 Rust MSVC x86_64/i686/arm64、WSL MinGW、NASM/x86asm 与 AArch64/NEON 的分架构 package/verifier gate，verifier 现在还按 `0x8664`/`0x014c`/`0xAA64` 精确检查 EXE 与 codec DLL 的 PE Machine，hosted job 仍待执行。Apple Standard/HP 与 RDP 的当前真机边界见 [`cross-platform-video-decoder-20260901.md`](docs/validation/cross-platform-video-decoder-20260901.md)；RDP 仍等待独立授权的原生 Windows 目标完成登录、首帧与输入门禁。 |
 | macOS | winit + egui + wgpu/Metal | 基本键盘、鼠标已受限验证；完整焦点/滚轮/快捷键仍待验收 | ARM64 ad-hoc signed `.app`；FFmpeg 8.1.2 ARM64 bundle、Info.plist、Mach-O、`--verify-codec-bundle` 和包结构验证通过 | Windows 原生 RDP | **受限验证**；2026-09-07 在一台授权 Windows 目标完成 macOS 原生 GUI 的 TLS/CredSSP/NLA、证书首次记录、完整桌面首帧、断开、Keychain 密码保存和“最近连接”免重新输入密码重连。2026-09-08 ARM64 托管构建、原生 decoder fixture、应用 staging/verifier 与产物上传通过（[run 34180014775](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34180014775)）；macOS Intel 不支持。2026-09-08 `64dd9e1` 实验EGFX混合流完成真实桌面、开始菜单鼠标/搜索键盘输入和约三分钟正常退出；macOS 控制岛自动隐藏与首次窗口按远程比例适配原生工作区已修正，验证范围见 [窗口几何记录](docs/validation/macos-window-chrome-20260908.md)；完整输入、多DPI/主题、长期运行和公证发布仍未覆盖；见 [`macOS RDP GUI 验证`](docs/validation/macos-native-rdp-gui-20260907.md)。 |
-| Linux | 平台 shell 预留 | 计划中 | 计划中 | 尚无 | **开发中**；`.github/workflows/ci.yml` 已配置 Ubuntu 24.04 GUI 依赖、workspace 编译和安全测试托管门禁；尚无窗口管理器、Secret Service、安装包或真机运行验证。 |
+| Linux | Vulkan/GLES 条件后端；完整平台 shell 开发中 | 计划中 | 完整客户端包计划中；已有三架构 FFmpeg bundle | 尚无已验证的产品组合 | **开发中**；2026-09-08 独立平台服务已有实现、17 项合成测试及三架构 check；真实 Secret Service、应用入口与完整包仍未验收，见 [基础服务验证](docs/validation/linux-client-foundation-20260908.md)和 [Linux 计划](docs/superpowers/plans/2026-09-08-linux-client.md)。现有 CI 的解码/编译证据不证明窗口管理器、Secret Service、完整安装包或真实控制；这些门禁独立未完成。 |
 | Android | Rust 核心边界预留 | 触控/软键盘计划中 | 计划中 | 尚无 | **计划中**；桌面三平台完成后启动，需 Android Keystore 与自适应图标 |
 | HarmonyOS NEXT 手机/PC | ArkUI/HUKS 边界设计 | 触控/键鼠计划中 | 计划中 | 尚无 | **计划中**；不是 Android 兼容层，须单独完成 ArkUI、HUKS 和构建 POC |
 

@@ -24,6 +24,7 @@ members = [
     "crates/frd-compositor-wgpu",
     "crates/frd-platform-windows",
     "crates/frd-platform-macos",
+    "crates/frd-platform-linux",
     "crates/frd-ui-egui",
     "crates/frd-shell-desktop",
     "apps/freeremotedesk-windows",

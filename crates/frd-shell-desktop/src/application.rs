@@ -5402,9 +5402,17 @@ fn desktop_gpu_backends() -> wgpu::Backends {
     {
         wgpu::Backends::METAL
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
         wgpu::Backends::DX12
+    }
+    #[cfg(target_os = "linux")]
+    {
+        wgpu::Backends::VULKAN | wgpu::Backends::GL
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        wgpu::Backends::empty()
     }
 }
 
@@ -5983,6 +5991,20 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn macos_gpu_instance_uses_metal() {
         assert_eq!(super::desktop_gpu_backends(), wgpu::Backends::METAL);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_gpu_instance_has_only_native_linux_backends() {
+        let backends = super::desktop_gpu_backends();
+        assert_eq!(backends, wgpu::Backends::VULKAN | wgpu::Backends::GL);
+        assert!(!backends.intersects(wgpu::Backends::DX12 | wgpu::Backends::METAL));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_gpu_instance_keeps_dx12() {
+        assert_eq!(super::desktop_gpu_backends(), wgpu::Backends::DX12);
     }
 
     #[test]

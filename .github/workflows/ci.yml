@@ -62,6 +62,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             build-essential \
+            dbus \
+            gnome-keyring \
+            libglib2.0-bin \
             libasound2-dev \
             libwayland-cursor0 \
             libwayland-dev \
@@ -93,6 +96,7 @@ jobs:
           -p frd-protocol-api
           -p frd-session
           -p frd-ui-model
+          -p frd-platform-linux
           -p frd-app
           -p frd-protocol-apple
           -p frd-protocol-rdp
@@ -117,3 +121,8 @@ jobs:
       - name: Test macOS platform and application
         if: runner.os == 'macOS'
         run: cargo test --locked -p frd-platform-macos -p freeremotedesk-macos
+
+      - name: Verify isolated Linux Secret Service transaction
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash tools/verify-linux-secret-service.sh
