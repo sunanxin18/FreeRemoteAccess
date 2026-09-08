@@ -110,7 +110,14 @@ pub(super) fn decode(data: &[u8]) -> Result<Vec<ProgressiveBlock<'_>>, WireError
         }
         let (kind, body) = block(&mut src)?;
         let item = match kind {
-            0xccc0 => ProgressiveBlock::Sync(exact(body)?),
+            0xccc0 => {
+                // MS-RDPEGFX 2.2.4.2.1.1：应忽略magic/version及重复、乱序SYNC。
+                // 仍要求精确的块长度，不能借此容忍截断。
+                if body.len() != 6 {
+                    return Err(WireError::Length);
+                }
+                ProgressiveBlock::Sync(ProgressiveSyncPdu)
+            }
             0xccc1 => ProgressiveBlock::FrameBegin(exact(body)?),
             0xccc2 => ProgressiveBlock::FrameEnd(exact(body)?),
             0xccc3 => ProgressiveBlock::Context(exact(body)?),
@@ -165,6 +172,41 @@ mod tests {
         let blocks = decode(&data).unwrap();
         assert_eq!(blocks.len(), 3);
         assert!(matches!(&blocks[1], ProgressiveBlock::Context(c) if c.flags == 1));
+    }
+    #[test]
+    fn ignores_sync_magic_version_and_repeated_out_of_sequence_sync() {
+        let mut sync =
+            encode_progressive_stream(&[ProgressiveBlock::Sync(ProgressiveSyncPdu)]).unwrap();
+        sync[6..12].copy_from_slice(&[0, 1, 2, 3, 0xff, 0xff]);
+        assert_eq!(
+            decode(&sync).unwrap(),
+            vec![ProgressiveBlock::Sync(ProgressiveSyncPdu)]
+        );
+        let mut data = encoded();
+        data.extend_from_slice(&sync);
+        data.extend_from_slice(&sync);
+        let blocks = decode(&data).unwrap();
+        assert_eq!(blocks.len(), 5);
+        assert!(matches!(blocks[3], ProgressiveBlock::Sync(_)));
+        assert!(matches!(blocks[4], ProgressiveBlock::Sync(_)));
+    }
+    #[test]
+    fn ignored_sync_fields_do_not_relax_envelope_size_or_truncation() {
+        for length in [6u32, 11, 13] {
+            let mut bytes = vec![0xc0, 0xcc];
+            bytes.extend_from_slice(&length.to_le_bytes());
+            bytes.resize(length as usize, 0);
+            assert_eq!(decode(&bytes), Err(WireError::Length));
+        }
+        let sync =
+            encode_progressive_stream(&[ProgressiveBlock::Sync(ProgressiveSyncPdu)]).unwrap();
+        for length in 0..sync.len() {
+            assert_eq!(decode(&sync[..length]), Err(WireError::Length));
+        }
+        let mut excessive = sync.repeat(MAX_ITEMS + 1);
+        // 非标准magic仍计入块数量预算。
+        excessive[6] = 0;
+        assert_eq!(decode(&excessive), Err(WireError::Budget));
     }
     #[test]
     fn rejects_trailing_partial_header_and_truncated_body() {
