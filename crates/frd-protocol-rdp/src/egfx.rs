@@ -2270,9 +2270,9 @@ impl EgfxSurfacePublisher {
             crate::progressive::Error::BackendUnavailable => "backend unavailable",
         });
         match error {
-            crate::progressive::Error::Backend(
-                "first entropy" | "upgrade entropy" | "upgrade entropy tail",
-            ) => RdpEgfxFailure::ProgressiveEntropy,
+            crate::progressive::Error::Backend(label) if label.starts_with("entropy ") => {
+                RdpEgfxFailure::ProgressiveEntropy
+            }
             crate::progressive::Error::Backend(_)
             | crate::progressive::Error::BackendUnavailable => RdpEgfxFailure::ProgressiveKernel,
             _ => RdpEgfxFailure::ProgressiveState,
@@ -5334,7 +5334,7 @@ mod tests {
         );
         assert_eq!(
             adapter.diagnostics().progressive_failure_detail,
-            Some("first entropy")
+            Some("entropy truncated")
         );
     }
 

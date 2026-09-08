@@ -22,6 +22,17 @@ impl NativeBackend {
         })
     }
 }
+fn entropy_error(error: super::entropy::Error) -> Error {
+    Error::Backend(match error {
+        super::entropy::Error::Truncated => "entropy truncated",
+        super::entropy::Error::TrailingData => "entropy trailing data",
+        super::entropy::Error::InvalidBits => "entropy invalid bit count",
+        super::entropy::Error::InvalidSign => "entropy invalid sign",
+        super::entropy::Error::RunOverrun => "entropy run overrun",
+        super::entropy::Error::CoefficientRange => "entropy coefficient range",
+        super::entropy::Error::TooManyCoefficients => "entropy coefficient budget",
+    })
+}
 fn positions(parameters: &TileParameters, component: usize) -> Result<[u8; 10]> {
     let mut positions = [0; 10];
     for (band, position) in positions.iter_mut().enumerate() {
@@ -116,7 +127,7 @@ impl TileDecoder for NativeBackend {
                                     bits,
                                     band == 9,
                                 )
-                                .map_err(|_| Error::Backend("upgrade entropy"))?;
+                                .map_err(entropy_error)?;
                             // 仅解包协议字段；符号/shift/累加全部由 SIMD leaf 执行。
                             for (index, value) in values.into_iter().enumerate() {
                                 magnitudes[offset + index] = value.magnitude;
@@ -125,9 +136,7 @@ impl TileDecoder for NativeBackend {
                         }
                         offset += len;
                     }
-                    reader
-                        .finish()
-                        .map_err(|_| Error::Backend("upgrade entropy tail"))?;
+                    reader.finish().map_err(entropy_error)?;
                     self.kernels
                         .apply_refinement(
                             &mut current.current[component],
@@ -170,8 +179,7 @@ impl NativeBackend {
         for (component, data) in data.into_iter().enumerate() {
             let shifts = positions(parameters, component)?.map(|p| p - 1);
             let mut coefficients = Box::new([0i16; 4096]);
-            decode_rlgr1(data, &mut coefficients[..])
-                .map_err(|_| Error::Backend("first entropy"))?;
+            decode_rlgr1(data, &mut coefficients[..]).map_err(entropy_error)?;
             self.kernels
                 .capture_sign(&coefficients, &mut next.das[component]);
             self.kernels.prefix_sum_ll3(&mut coefficients, layout);
