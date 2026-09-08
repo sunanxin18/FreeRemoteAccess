@@ -10,6 +10,10 @@ RDP 的有界探针已增加非敏感 EGFX 阶段诊断（187 项协议测试通
 
 未支持的 EGFX WireToSurface1 编码现在明确记录 `UnsupportedCodec` 并停用当前 generation、丢弃排队更新（189 项 RDP 测试通过）；此错误处理不等于已实现 ClearCodec，也不保证服务端自动恢复 legacy。Windows ARM64 AAC 的 clang-cl 目标配置修复仍待托管完整编译验证。
 
+## 2026-09-08 Windows x64 完整包门禁通过
+
+Windows run `34181521241` 已结束：x64 job `101921418412` 通过 6 项解码 fixture、GUI/package gate、30/30 Pester 与产物上传；x86 job 同样成功。x64 应用 artifact 为 23,582,300 bytes。ARM64 AAC 编译失败，后续 ARM64 native runtime job 因依赖失败而 skipped，不能算通过。
+
 ## 2026-09-08 Windows x86 包与原生解码通过
 
 Windows run `34181521241` 的 x86 job `101921418321` 已成功：真实 i686 进程 6 项 decoder fixture、GUI release、staging/package verifier 与产物上传全部通过。应用包 `freeremotedesk-windows-package-x86` 为 22,263,948 bytes，对应源码包 11,729,109 bytes。此结果不是 Windows GUI 真机交互或 RDP AVC 首帧证据；同轮 ARM64 失败和 x64 仍在运行分别保留。
