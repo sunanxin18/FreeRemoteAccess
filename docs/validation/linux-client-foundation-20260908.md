@@ -104,7 +104,7 @@ BatchCandidate 独占借用原状态，私有字段、只读操作、无Clone，
 GTK产品呈现或RDP实机验证已经完成。
 
 
-## 独立 GL 执行器（原生结果待 CI）
+## 独立 GL 执行器（原生结果已取得）
 
 新增 frd-render-gl：真实纹理分配、完整/局部上传、sRGB BGRX shader 绘制、内容矩形
 与目标附件验证、宿主 GL 状态恢复、上下文失效隔离及延迟资源删除。后端仅在 Linux
@@ -249,7 +249,7 @@ GTK最终snapshot颜色和完整产品会话仍待接线验收；7bf失败记录
 显式基准通过。同revision七目标包/解码验证闭合，不涵盖后来GTK/颜色输出改动。
 
 
-## Rust GTK 帧适配器接线（原生运行待验证）
+## Rust GTK 帧适配器接线（原生运行已取得）
 
 新增 `frd-shell-gtk`，以 Linux 专属可选依赖固定 gtk4-rs 0.9.7 / GTK 4.14 API。
 适配层直接接收 FrameTransaction，在 GLArea render 中执行 GL 上传与绘制，
@@ -262,8 +262,9 @@ GTK最终snapshot颜色和完整产品会话仍待接线验收；7bf失败记录
 这不证明 GTK 原生编译。新 linux-gtk-adapter workflow 覆盖 i686/x86_64/ARM64，
 每架构 X11/Wayland 各 1×/2×，严格执行唯一 native fixture，GTK critical 为致命错误。
 fixture 使用真实完整帧、增量像素、unrealize/re-realize 和错误 context 注入，
-测试专用读回检查颜色、方向、alpha 和实际 scale。原生结果待 CI，不称已验证。
-Drawn 只报告 GL 命令提交；完整窗口 snapshot、输入、登录与生产呈现 ACK 尚未接线。
+测试专用读回检查颜色、方向、alpha 和实际 scale。`34244032943` 已在三目标的
+X11/Wayland 1×/2× 运行这些原生 fixture。Drawn 仍只报告 GL 命令提交；完整窗口
+snapshot、物理 Wayland 输入、登录和生产呈现 ACK 仍不由该 fixture 单独证明。
 
 同日 c349a72 Linux 完整包 run34210589009 三目标再次成功：
 aarch64 job102010538524、x86_64 job102010538969、i686 job102010539043。
@@ -328,13 +329,15 @@ ARM64 job102019894884、i686 job102019895043、x86_64 job102019895065，
 统一密码激活/按钮提交、后台凭据加载/保存、取消/迟到启动/cleanup及编译帧泵。
 平台profile服务的同步controller视图改为内存快照，真实list/upsert留在后台。
 每次会话重建画布并重新安装帧泵，避免Stack仅unmap时旧画面跨会话残留；
-选择“新连接”或改变身份会清除已加载凭据。Linux产品main尚未切换至该runner。
+选择“新连接”或改变身份会清除已加载凭据。Linux 产品 main 已切换至该 runner；
+正式入口的三目标 smoke 见下文 `34244032943` 记录。
 
-独立WindowSubmissionObserver接入实际GLArea draw，但尚未接runner的FramePresented
-或生产ACK。固定GTK4.14旧GSK GL/EGL，bootstrap只观察，下一实际paint关联
+独立WindowSubmissionObserver接入实际GLArea draw；它仍不等同于生产 scanout ACK。
+固定GTK4.14旧GSK GL/EGL，bootstrap只观察，下一实际paint关联
 surface/frameclock/counter/renderer receipt与GL/EGL错误作用域；resize/unrealize等
 撤销证明。安全API不能注入任意receipt，只有adapter内部同步移交。
-原生fixture将验证登录/取消、实际窗口提交和故障拒绝；尚无新CI结果。
+原生fixture已在 `34244032943` 验证登录/取消、实际窗口提交和故障拒绝；物理
+Wayland 输入、硬件 GPU 和真实 RDP 控制仍需独立验收。
 
 本机完整 `cargo test --locked --workspace` exit0：75组1735 passed / 0 failed /
 16 ignored，日志`/tmp/frd-gtk-runner-workspace.log`。该轮在macOS执行，包含
@@ -597,3 +600,15 @@ Linux `VULKAN | GL`、Windows `DX12`、macOS `METAL`。这只证明软件渲染/
 fixture 进程。前一轮 `34242813067` 的失败日志和 i686 `cc1plus` 缺失记录保留，未被覆盖。
 Wayland 全局物理输入、任意真实桌面窗口装饰视觉检查、硬件驱动和真实 RDP 登录/控制仍须
 在授权 Linux 桌面与目标服务器上单列验收。
+
+## FFmpeg 与完整 Linux 客户端包三架构收口（2026-09-09）
+
+提交 `7313ee4` 的 Linux FFmpeg run [`34245804941`](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34245804941)
+最终三目标 success：i686、x86_64、AArch64 均通过 ClearCodec/NSCodec/Progressive
+目标测试、FFmpeg 8.1.2 bundle 构建与 ELF/ABI verifier、完整 Linux 客户端
+stage/verifier、随包解码器加载以及客户端/FFmpeg/source 三类 artifact 上传。i686
+额外验证了 32 位 GTK/Pango 交叉编译依赖，x86_64 的一次 artifact 服务 403 在失败
+job 重跑后成功；原失败日志保留，不作为代码失败。
+
+这组结果证明目标构建、包布局、架构标识和随包解码器加载；仍不证明硬件 GPU、物理
+Wayland 输入、任意桌面环境窗口装饰、真实 Windows/macOS RDP 登录或长期控制稳定性。
