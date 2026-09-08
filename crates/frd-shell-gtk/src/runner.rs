@@ -134,6 +134,18 @@ fn label(text: &str) -> gtk4::Label {
     label.set_wrap(true);
     label
 }
+
+fn bind_font_map_tree(widget: &gtk4::Widget, map: &gtk4::pango::FontMap) {
+    // gtk_widget_set_font_map 只保证当前 widget 的 context；逐个绑定已创建的
+    // 子树，避免 HeaderBar、Stack 和其内部控件各自回到宿主默认 map。
+    widget.pango_context().set_font_map(Some(map));
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        bind_font_map_tree(&current, map);
+        child = current.next_sibling();
+    }
+}
+
 fn field(root: &gtk4::Box, title: &str, widget: &impl IsA<gtk4::Widget>) -> gtk4::Label {
     let title = label(title);
     title.set_mnemonic_widget(Some(widget));
@@ -405,6 +417,8 @@ impl GtkRunner {
             // 同一个私有 map，确保标题栏状态与登录表单都能按需回退到随包字体。
             header.set_font_map(Some(map));
             stack.set_font_map(Some(map));
+            bind_font_map_tree(header.upcast_ref(), map);
+            bind_font_map_tree(stack.upcast_ref(), map);
         }
         let state = Rc::new(RefCell::new(State {
             owner: Weak::new(),
