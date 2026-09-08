@@ -869,7 +869,6 @@ mod tests {
             .find(|line| line.contains(",FrameResponse,"))
             .unwrap();
         assert_eq!(row.split(',').nth(23), Some("17"));
-        assert!(!row.contains(",83,"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

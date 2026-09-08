@@ -1269,6 +1269,21 @@ mod tests {
     }
 
     #[test]
+    fn raw_api_rejects_unknown_codec_capability_bits() {
+        let mut api = compatible_raw_api();
+        api.codec_capabilities = FRD_CODEC_CAP_ALL_KNOWN | (1 << 31);
+
+        let result = FfmpegBackend::from_raw_api_for_test(api);
+
+        assert_eq!(
+            result
+                .expect_err("未知 codec capability bit 必须拒绝")
+                .code(),
+            VideoDecodeErrorCode::BackendVersionMismatch
+        );
+    }
+
+    #[test]
     fn relative_application_directory_is_rejected_without_searching_current_directory() {
         let result = FfmpegBackend::load_from_application_dir_for_test(PathBuf::from("codecs"));
 
