@@ -83,6 +83,9 @@ run_gate '协议、媒体、视频插件与桌面壳 focused tests' \
     -p frd-protocol-rdp \
     -p frd-shell-desktop
 
+run_gate '默认 release 构建' cargo build --locked --release
+run_gate '无默认特性构建' cargo build --locked --no-default-features
+
 run_pinned_egfx_tests() {
     local manifest='third_party/ironrdp-egfx-0.3.0/Cargo.toml'
     local lockfile='third_party/ironrdp-egfx-0.3.0/Cargo.lock'
