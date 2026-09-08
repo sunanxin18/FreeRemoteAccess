@@ -99,12 +99,20 @@ jobs:
           -p frd-ui-egui
           -p frd-shell-desktop
 
+      # excluded crate 有独立的锁文件和可选依赖解析图；workspace 的构建缓存
+      # 不能代替它的依赖准备。先按锁文件下载，再离线测试，验证干净 runner。
+      - name: Fetch locked pinned IronRDP EGFX dependencies
+        shell: bash
+        run: >-
+          cargo fetch --locked
+          --manifest-path third_party/ironrdp-egfx-0.3.0/Cargo.toml
+
       - name: Test pinned IronRDP EGFX patch
         shell: bash
         run: >-
           cargo test
           --manifest-path third_party/ironrdp-egfx-0.3.0/Cargo.toml
-          --offline --quiet
+          --frozen --quiet
 
       - name: Test macOS platform and application
         if: runner.os == 'macOS'
