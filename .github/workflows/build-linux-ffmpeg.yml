@@ -89,7 +89,7 @@ jobs:
           test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
           rustc --target "${{ matrix.cargo_target }}" --version --verbose
 
-      - name: Run target ClearCodec and NSCodec parity and bounded benchmark
+      - name: Run target ClearCodec, NSCodec and Progressive parity and bounded benchmark
         shell: bash
         run: |
           set -euo pipefail
@@ -100,6 +100,8 @@ jobs:
           printf 'ClearCodec runtime target=%s host=%s\n' "${{ matrix.cargo_target }}" "$(uname -m)"
           cargo test --locked --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp clearcodec
           cargo test --locked --release --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp bounded_decode_benchmark -- --ignored --nocapture --test-threads=1
+          cargo test --locked --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp progressive
+          cargo test --locked --release --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp benchmark_progressive_native_tile -- --ignored --nocapture --test-threads=1
 
       - name: Build and verify exact FFmpeg bundle
         shell: bash

@@ -82,7 +82,7 @@ jobs:
           -p frd-protocol-rdp
           -p freeremotedesk-macos
 
-      - name: Run ARM64 ClearCodec and NSCodec parity and bounded benchmark
+      - name: Run ARM64 ClearCodec, NSCodec and Progressive parity and bounded benchmark
         shell: bash
         run: |
           set -euo pipefail
@@ -90,6 +90,8 @@ jobs:
           printf 'ClearCodec runtime target=%s host=%s\n' "${{ matrix.rust_target }}" "$(uname -m)"
           cargo test --locked --target "${{ matrix.rust_target }}" -p frd-protocol-rdp clearcodec
           cargo test --locked --release --target "${{ matrix.rust_target }}" -p frd-protocol-rdp bounded_decode_benchmark -- --ignored --nocapture --test-threads=1
+          cargo test --locked --target "${{ matrix.rust_target }}" -p frd-protocol-rdp progressive
+          cargo test --locked --release --target "${{ matrix.rust_target }}" -p frd-protocol-rdp benchmark_progressive_native_tile -- --ignored --nocapture --test-threads=1
 
       - name: Build exact FFmpeg bundle and native fixtures
         shell: bash

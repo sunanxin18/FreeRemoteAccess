@@ -19,3 +19,18 @@ FRD_BENCH arch=aarch64 backend=neon kernel=nscodec-ms-example-15x10 iterations=1
 ```
 
 2 项 benchmark 通过。Windows/Linux i686、x86_64、ARM64 尚需目标执行；本记录不打开生产 gate。
+
+## Linux 三目标原生／32 位进程验证
+
+GitHub run `34185964017`，提交 `9813987`，三job成功。逐job日志确认相同target
+ClearCodec/NSCodec 38测试通过、2默认ignored，随后显式运行2个release benchmark均通过。
+i686在x86_64宿主运行i686目标进程，日志报告 `arch=x86`，不是x64结果替代。
+
+| 目标 | fill MiB/s | copy MiB/s | expand MiB/s | scatter MiB/s | NS 15×10 ns/decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux i686 | 64513.492 | 56372.389 | 31636.742 | 1449.863 | 925.995 |
+| Linux x86_64 | 27500.538 | 15120.264 | 16911.198 | 1952.675 | 952.616 |
+| Linux ARM64 | 51075.738 | 31288.442 | 25516.951 | 4183.868 | 672.216 |
+
+沿用上文固定工作量与单位。不同CI宿主CPU、频率和内存环境不同，不能据此排名架构。
+这些是ClearCodec/NSCodec测试，不含随后新增Progressive，不是GUI或网络性能证据。
