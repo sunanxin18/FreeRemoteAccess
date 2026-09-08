@@ -74,3 +74,19 @@ Normal 23.06 µs/tile，ReduceExtrapolate 28.30 µs/tile。
 计时仍是单分量 DWT + BGRA 的合成内核范围，不是完整 RDP 延迟。
 真实 GUI 的 Progressive region coverage 失败单列于
 [窗口与输入验证](macos-window-chrome-20260908.md)，不能由这些通过项覆盖。
+
+## 4fd7f33 七目标复跑终态
+
+2026-09-08 已核对 Windows run 34195654503、Linux run 34195654622、macOS run 34195654569 全部 success。此修订包含致命 EGFX 失败传播及有界 coverage 诊断，不包含后续 Linux 客户端新增代码。七目标各通过 Progressive/邻近 EGFX 61 项测试，1 项基准默认忽略后单独运行通过。
+
+| 原生目标进程 | Normal 微秒/块 | ReduceExtrapolate 微秒/块 | job |
+|---|---:|---:|---|
+| Linux x86_64 | 23.35 | 26.08 | 101962687956 |
+| Linux i686 | 34.14 | 31.70 | 101962688198 |
+| Linux AArch64 | 22.64 | 24.17 | 101962688142 |
+| macOS ARM64 | 14.07 | 15.22 | 101962687810 |
+| Windows x86_64 | 26.35 | 28.55 | 101962687673 |
+| Windows i686 | 25.29 | 31.28 | 101962687509 |
+| Windows ARM64 | 26.04 | 24.09 | 101969944303 |
+
+计时仍只覆盖单分量 DWT + BGRA tile，不能解释为完整解码耗时、跨机器性能排名或远程交互延迟。实际 Progressive coverage 冻结、AVC420/444 有效载荷、HEVC wire/live 门禁不因本轮 CI 通过而解除。

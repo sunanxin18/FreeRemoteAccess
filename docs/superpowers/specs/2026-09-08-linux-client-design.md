@@ -43,3 +43,15 @@ Secret Service 往返证据。后续 Linux 原生 CI 需独立运行临时 D-Bus
 官方参考：[Secret Service API](https://specifications.freedesktop.org/secret-service/latest-single/)、
 [Secret Service Rust API](https://docs.rs/secret-service/latest/secret_service/)、
 [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/)。
+
+## Linux 窗口壳审查结论
+
+2026-09-08 只读检查固定 winit 0.30.13：X11 的 set_decorations 仅发送 Motif hints，show_window_menu 为空实现；Wayland frame 是私有对象，公开 WindowAttributesExtWayland 只提供 with_name。没有通用接口把产品控件注入 SSD/CSD 标题栏。当前 Linux layouts 让控制岛覆盖 client area；改用 titlebar_layouts 又保留 SSD 会形成第二条工具栏，两者均不满足最终产品边界。
+
+下一步必须独立验证 Linux 原生 toolkit 窗口壳。首选研究 GTK4 Window.set_titlebar + HeaderBar：按 gtk-decoration-layout 保留宿主按钮行为，session 控件相对窗口居中，renderer/input 共同消费 HeaderBar 以下的实际 content allocation。GTK 类型不进入协议、decoder 或 SurfaceUpdate。不能直接把 GtkHeaderBar 附到既有 winit Window，也不能把每帧 GPU→CPU readback 当成最终 GPU 集成。
+
+先完成原生 GPU 内容区域与事件映射的技术验证，再迁移应用组合根。验收需真实 X11 和 Wayland、左右按钮布局、光暗主题、1×/1.25×或1.5×/2×、拖动/缩放/全屏/系统菜单、IME/焦点和远程坐标。当前审查不是 GTK GPU 实现或 GUI 通过证据。M3/Apple 部分页面只返回 JavaScript 占位，正式视觉实施前仍需渲染页面复核。
+
+窗口身份可独立修正：winit ApplicationName 同时映射 Wayland app_id 与 X11 WM_CLASS，统一为 freeremotedesk 并与 desktop entry / StartupWMClass 对应。该 Linux-only 配置不改变标题栏几何，也不宣称解决上述装饰问题。
+
+参考：[GTK set_titlebar](https://docs.gtk.org/gtk4/method.Window.set_titlebar.html)、[HeaderBar title widget](https://docs.gtk.org/gtk4/method.HeaderBar.set_title_widget.html)、[宿主按钮布局](https://docs.gtk.org/gtk4/property.Settings.gtk-decoration-layout.html)、[WindowHandle](https://docs.gtk.org/gtk4/class.WindowHandle.html)、[GNOME Header Bars](https://developer.gnome.org/hig/patterns/containers/header-bars.html)。

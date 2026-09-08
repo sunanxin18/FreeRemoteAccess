@@ -5391,7 +5391,17 @@ fn platform_window_attributes(
             .with_movable_by_window_background(false)
             .with_accepts_first_mouse(false)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        // winit 的 ApplicationName 由 Wayland app_id 与 X11 WM_CLASS 共用，
+        // 必须匹配随包 desktop entry，供窗口管理器关联图标和应用实例。
+        winit::platform::wayland::WindowAttributesExtWayland::with_name(
+            attributes,
+            "freeremotedesk",
+            "freeremotedesk",
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         attributes
     }
