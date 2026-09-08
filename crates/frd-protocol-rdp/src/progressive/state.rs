@@ -531,9 +531,8 @@ fn parameters(
     } else {
         flags & 1 != 0
     };
-    if difference && !subband_diffing {
-        return Err(Error::Invalid("difference subband disabled"));
-    }
+    // CONTEXT可选；§3.3.8.2.1按tile difference位叠加，不能把缺省metadata
+    // 当作禁止差分。只使用真实surface DecDwtQ，绝不构造缺失reference。
     if difference && reference_layout.is_none() {
         return Err(Error::Invalid("difference missing surface reference"));
     }
@@ -574,9 +573,8 @@ fn parameters(
     }
     if upgrade {
         let previous = previous.ok_or(Error::Invalid("upgrade missing context tile"))?;
-        if previous.reduce_extrapolate != parameters.reduce_extrapolate
-            || previous.subband_diffing != subband_diffing
-        {
+        // CONTEXT metadata变化不改变DAS/BitPos；保留真正的layout与quant约束。
+        if previous.reduce_extrapolate != parameters.reduce_extrapolate {
             return Err(Error::Invalid("upgrade layout or context changed"));
         }
         for c in 0..3 {

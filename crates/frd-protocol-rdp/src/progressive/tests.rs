@@ -354,7 +354,7 @@ fn distinct_partially_overlapping_rectangles_are_not_inferred_invalid() {
     assert_eq!(d.decode(1, 1, 64, 64, &f).unwrap().len(), 2);
 }
 #[test]
-fn difference_requires_reference_enabled_context_and_matching_layout() {
+fn difference_requires_reference_and_matching_layout() {
     let mut d = decoder();
     let mut diff = first(0, 0, &[4]);
     if let ProgressiveTile::First(t) = &mut diff {
@@ -363,16 +363,13 @@ fn difference_requires_reference_enabled_context_and_matching_layout() {
     let f = frame(vec![region((0, 0, 64, 64), vec![diff.clone()])]);
     assert_eq!(
         d.decode(1, 1, 64, 64, &f).unwrap_err(),
-        Error::Invalid("difference subband disabled")
+        Error::Invalid("difference missing surface reference")
     );
     let orig = frame(vec![region((0, 0, 64, 64), vec![first(0, 0, &[5])])]);
     d.decode(1, 1, 64, 64, &orig).unwrap();
     d.end_frame(1).unwrap();
     d.begin_frame(2).unwrap();
-    assert_eq!(
-        d.decode(1, 1, 64, 64, &f).unwrap_err(),
-        Error::Invalid("difference subband disabled")
-    );
+
     let context = ProgressiveBlock::Context(ProgressiveContextPdu {
         context_id: 0,
         tile_size: 64,
@@ -541,7 +538,7 @@ fn first_tile_reserved_flags_are_ignored_but_difference_and_simple_stay_strict()
                     &frame(vec![region((0, 0, 64, 64), vec![original.clone()])])
                 )
                 .unwrap_err(),
-            Error::Invalid("difference subband disabled")
+            Error::Invalid("difference missing surface reference")
         );
         d.end_frame(1).unwrap();
         d.begin_frame(2).unwrap();
@@ -581,4 +578,64 @@ fn first_tile_reserved_flags_are_ignored_but_difference_and_simple_stay_strict()
         );
         assert_eq!(d.tile_count(), 0);
     }
+}
+
+#[test]
+fn difference_without_context_reuses_only_real_surface_reference() {
+    let mut d = decoder();
+    d.decode(
+        1,
+        1,
+        64,
+        64,
+        &frame(vec![region((0, 0, 64, 64), vec![first(0, 0, &[5])])]),
+    )
+    .unwrap();
+    d.end_frame(1).unwrap();
+    d.begin_frame(2).unwrap();
+    d.delete_context(1, 1);
+    let mut tile = first(0, 0, &[4]);
+    if let ProgressiveTile::First(t) = &mut tile {
+        t.flags = 1;
+    }
+    let diff = frame(vec![region((0, 0, 64, 64), vec![tile])]);
+    assert_eq!(d.decode(1, 2, 64, 64, &diff).unwrap()[0].bgra[0], 9);
+    d.end_frame(2).unwrap();
+    d.begin_frame(3).unwrap();
+    // Context metadata可稍后出现，不改变系数/DAS布局。
+    d.decode(
+        1,
+        2,
+        64,
+        64,
+        &[ProgressiveBlock::Context(ProgressiveContextPdu {
+            context_id: 0,
+            tile_size: 64,
+            flags: 1,
+        })],
+    )
+    .unwrap();
+    assert_eq!(
+        d.decode(
+            1,
+            2,
+            64,
+            64,
+            &frame(vec![region((0, 0, 64, 64), vec![upgrade()])])
+        )
+        .unwrap()[0]
+            .bgra[0],
+        10
+    );
+    d.delete_surface(1);
+    assert_eq!(
+        d.decode(1, 3, 64, 64, &diff).unwrap_err(),
+        Error::Invalid("difference missing surface reference")
+    );
+    d.reset();
+    d.begin_frame(4).unwrap();
+    assert_eq!(
+        d.decode(1, 4, 64, 64, &diff).unwrap_err(),
+        Error::Invalid("difference missing surface reference")
+    );
 }
