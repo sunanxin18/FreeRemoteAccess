@@ -10,6 +10,10 @@ RDP 的有界探针已增加非敏感 EGFX 阶段诊断（187 项协议测试通
 
 未支持的 EGFX WireToSurface1 编码现在明确记录 `UnsupportedCodec` 并停用当前 generation、丢弃排队更新（189 项 RDP 测试通过）；此错误处理不等于已实现 ClearCodec，也不保证服务端自动恢复 legacy。Windows ARM64 AAC 的 clang-cl 目标配置修复仍待托管完整编译验证。
 
+## 2026-09-08 ClearCodec 基础状态层验证
+
+ClearCodec 严格状态层、会话级序号/缓存事务与 SIMD 像素内核已注册编译：25 项 ClearCodec/kernel 测试、完整 RDP 214 项通过。含 residual 前缀、bands 位域、RLEX、glyph/cache、零子区域与覆盖元数据预算回归。NSCodec 实际后端和 EGFX 接线仍在开发，因此未打开生产门禁。
+
 ## 2026-09-08 Windows x64 完整包门禁通过
 
 Windows run `34181521241` 已结束：x64 job `101921418412` 通过 6 项解码 fixture、GUI/package gate、30/30 Pester 与产物上传；x86 job 同样成功。x64 应用 artifact 为 23,582,300 bytes。ARM64 AAC 编译失败，后续 ARM64 native runtime job 因依赖失败而 skipped，不能算通过。

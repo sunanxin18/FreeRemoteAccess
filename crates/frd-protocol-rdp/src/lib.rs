@@ -5,6 +5,8 @@ mod audio;
 #[allow(dead_code)]
 mod avc444;
 mod baseline;
+#[allow(dead_code)]
+mod clearcodec;
 mod clipboard;
 #[allow(dead_code)]
 mod codec_selection;
