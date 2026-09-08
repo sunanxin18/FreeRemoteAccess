@@ -59,7 +59,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y build-essential \
             "libegl1$suffix" "libegl-mesa0$suffix" "libgl1$suffix" "libgl1-mesa-dri$suffix"
           if [[ "${{ matrix.arch }}" == i686 ]]; then
-            sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu libc6-i386
+            sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386
             echo 'CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc' >> "$GITHUB_ENV"
           fi
       - name: Build target renderer tests

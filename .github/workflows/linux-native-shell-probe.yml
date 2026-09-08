@@ -65,18 +65,16 @@ jobs:
           set -euo pipefail
           mkdir -p target/linux-native-shell-probe/logs
           log_dir="$PWD/target/linux-native-shell-probe/logs"
-          export XDG_RUNTIME_DIR="$(mktemp -d)"
-          chmod 700 "$XDG_RUNTIME_DIR"
+          runtime_root="$(mktemp -d)"
+          chmod 700 "$runtime_root"
+          export XDG_RUNTIME_DIR="$runtime_root"
           weston_pid=""
           cleanup() {
             if [[ -n "$weston_pid" ]]; then
               kill "$weston_pid" 2>/dev/null || true
               wait "$weston_pid" 2>/dev/null || true
             fi
-            if [[ -f "$XDG_RUNTIME_DIR/weston.log" ]]; then
-              cp "$XDG_RUNTIME_DIR/weston.log" "$log_dir/weston.log"
-            fi
-            rm -rf "$XDG_RUNTIME_DIR"
+            rm -rf "$runtime_root"
           }
           trap cleanup EXIT
           # Hosted Mesa software GL validates the native pipeline, not hardware acceleration.
@@ -87,25 +85,39 @@ jobs:
             bash tools/frd-linux-native-shell-probe/run-x11-input.sh "$probe" \
               "target/linux-native-shell-probe/logs/x11-$scale.jsonl" "$scale"
           done
-          weston --backend=headless-backend.so --renderer=pixman \
-            --socket=frd-probe --idle-time=0 --width=2400 --height=1800 \
-            --log="$XDG_RUNTIME_DIR/weston.log" &
-          weston_pid=$!
-          for attempt in {1..100}; do
-            [[ -S "$XDG_RUNTIME_DIR/frd-probe" ]] && break
-            kill -0 "$weston_pid"
-            sleep 0.1
-          done
-          test -S "$XDG_RUNTIME_DIR/frd-probe"
+          # Weston headless --scale configures the actual wl_output, unlike GDK_SCALE.
+          # Upstream: https://cgit.freedesktop.org/wayland/weston/tree/man/weston.man
+          # Retain the installed binary's option evidence; native result remains a CI gate.
+          timeout --kill-after=2s 5s weston --backend=headless-backend.so --help \
+            > "$log_dir/weston-help.log" 2>&1
           for scale in 1 2; do
-            timeout --kill-after=5s 15s env GDK_SCALE="$scale" GDK_BACKEND=wayland \
-              WAYLAND_DISPLAY=frd-probe dbus-run-session -- "$probe" \
-              --expect-backend wayland --seconds 3 \
+            export XDG_RUNTIME_DIR="$runtime_root/wayland-$scale"
+            mkdir -m 700 "$XDG_RUNTIME_DIR"
+            timeout --kill-after=5s 40s env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+              weston --backend=headless-backend.so --renderer=pixman --no-config \
+              --socket=frd-probe --idle-time=0 --width=2400 --height=1800 --scale="$scale" \
+              --log="$log_dir/weston-$scale.log" \
+              > "$log_dir/weston-$scale.stdout.log" 2>&1 &
+            weston_pid=$!
+            for attempt in {1..100}; do
+              [[ -S "$XDG_RUNTIME_DIR/frd-probe" ]] && break
+              kill -0 "$weston_pid"
+              sleep 0.1
+            done
+            test -S "$XDG_RUNTIME_DIR/frd-probe"
+            timeout --kill-after=5s 15s env -u GDK_SCALE -u GDK_DPI_SCALE \
+              -u DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=wayland \
+              WAYLAND_DISPLAY=frd-probe dbus-run-session -- bash -c \
+              'exec "$1" --expect-backend wayland --seconds 3 > "$2"' \
+              bash "$probe" "$log_dir/wayland-$scale.jsonl" \
               2> >(tee "$log_dir/wayland-$scale.stderr.log" >&2) | \
-              tee "target/linux-native-shell-probe/logs/wayland-$scale.jsonl"
+              tee "$log_dir/wayland-$scale.session.stdout.log"
             python3 tools/frd-linux-native-shell-probe/verify_report.py \
               "target/linux-native-shell-probe/logs/wayland-$scale.jsonl" \
               --expect-backend wayland --expect-scale "$scale"
+            kill "$weston_pid" 2>/dev/null || true
+            wait "$weston_pid" 2>/dev/null || true
+            weston_pid=""
           done
       - name: Upload bounded native pipeline diagnostics
         if: always()

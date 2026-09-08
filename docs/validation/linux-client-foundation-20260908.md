@@ -127,3 +127,31 @@ alpha、行方向、stride、黑边清理、错误 viewport、真实 current 解
 拒绝启用多个 draw buffer 的目标，避免清理宿主其他颜色附件。对应原生 fixture 已补充，
 仍待 Linux CI 实际执行。修正后 macOS 3项纯逻辑测试及格式/差异检查通过；这些检查
 不覆盖被 Linux cfg 门控的 GL 实现运行。
+
+
+## 09565d3 原生 CI 首轮结果与待重跑修正
+
+GL run `34206959440` 已结束，整体失败。x86_64 job `101998580384`、AArch64 job
+`101998580745` 均实际执行 native_egl_renderer_roundtrip：各1 passed / 0 failed /
+0 ignored。软件 Mesa EGL 的颜色、上传、绘制和生命周期 fixture 首次取得两架构运行
+证据；不升级为硬件或 GTK 产品呈现证明。i686 job `101998580665` 在链接阶段因
+Scrt1.o、crti.o 和 libdl 开发链接文件缺失而失败，尚未执行 fixture。CI 补充与
+cross GCC 配套的 libc6-dev-i386-cross，修正本身待下一轮运行验证。
+
+窗口探针 run `34206959337` 的 x86_64 job `101998582995`、AArch64 job
+`101998583020` 均失败，但两个架构的 X11 1×/2× 均已通过真实输入和 GL/几何验证。
+主代理下载原始报告并独立用相同严格 verifier 复验这四份结果通过。
+x86_64 Wayland 1× 也通过；2× 实际报告 scale=1，verifier 正确拒绝。
+AArch64 Wayland 1× 的 stdout 混入 AT-SPI Registry daemon 文本，严格 JSON 解析失败；
+不将其原始报告改写为通过。修正方向是 compositor 实际输出缩放和隔离 probe 报告
+与 D-Bus 后台服务日志，保留原有缩放/JSON 验收条件。
+
+原始 artifacts 保留在 target/validation/native-shell-095-x64 与
+native-shell-095-arm64；GL 作业日志为 /tmp/frd-gl-095-{x64,arm64,i686}.log。
+
+
+同轮 i686 窗口 job `101998582705` 最终也通过 X11 1×/2× 及 Wayland 1×，在 Wayland
+2× 实际 scale=1 处失败。整个窗口 run 已结束为失败。后续 workflow 改为每个 scale
+启动独立 Weston，使用实际输出 --scale，分别保留 compositor 日志；probe stdout
+在 D-Bus session 内独立写入 JSONL，服务 stdout 另存。verifier 未放宽。两个修正
+workflow 的 YAML/Bash 语法及 diff 检查通过；尚未推送重跑，等待当前打包 CI 完成。
