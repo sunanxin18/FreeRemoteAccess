@@ -1,3 +1,4 @@
+use crate::presentation::{SubmissionError, WindowSubmission, WindowSubmissionObserver};
 use crate::{drawable_size, PendingBatch, RejectedBatch, SubmitError};
 use frd_core::{ContentViewport, PixelSize};
 use frd_frame::FrameTransaction;
@@ -45,6 +46,7 @@ struct State {
     active: Option<Active>,
     events: Vec<AdapterEvent>,
     faulted: bool,
+    submission: Option<Rc<WindowSubmissionObserver>>,
 }
 impl State {
     fn event(&mut self, event: AdapterEvent) {
@@ -54,6 +56,9 @@ impl State {
         self.events.push(event);
     }
     fn invalidate(&mut self) {
+        if let Some(observer) = &self.submission {
+            observer.invalidate();
+        }
         self.events
             .retain(|event| !matches!(event, AdapterEvent::Drawn { .. }));
         let discarded_transactions = self.pending.invalidate();
@@ -62,6 +67,9 @@ impl State {
         });
     }
     fn retire(&mut self) {
+        if let Some(observer) = self.submission.take() {
+            observer.invalidate();
+        }
         self.invalidate();
         if let Some(mut active) = self.active.take() {
             // detach 即使不 current 也撤销证明；此时不删除 GL 名称。
@@ -149,6 +157,30 @@ impl GtkFrameArea {
     pub fn drain_events(&self) -> Vec<AdapterEvent> {
         std::mem::take(&mut self.state.borrow_mut().events)
     }
+    /// 仅已 realize 且属于该窗口的区域可启用；卸载/重建后必须重新启用。
+    /// 开启后 DrawReceipt 同步交给窗口 observer，不再同时发出 Drawn 事件。
+    pub fn enable_window_submission(&self, window: &gtk4::Window) -> Result<(), SubmissionError> {
+        if self.state.borrow().pending.closed {
+            return Err(SubmissionError::Lifecycle);
+        }
+        let observer = WindowSubmissionObserver::attach(&self.area, window)?;
+        let mut state = self.state.borrow_mut();
+        if let Some(old) = state.submission.replace(observer) {
+            old.invalidate();
+        }
+        state
+            .events
+            .retain(|event| !matches!(event, AdapterEvent::Drawn { .. }));
+        drop(state);
+        self.area.queue_render();
+        Ok(())
+    }
+    pub fn take_window_submission(&self) -> Option<WindowSubmission> {
+        self.state.borrow().submission.as_ref()?.take_submission()
+    }
+    pub fn take_submission_error(&self) -> Option<SubmissionError> {
+        self.state.borrow().submission.as_ref()?.take_error()
+    }
     /// 正常主动卸载；调用后永久拒绝新事务。
     pub fn detach(&self) {
         if self.area.is_realized() && self.area.context().is_some() {
@@ -169,6 +201,9 @@ impl Drop for GtkFrameArea {
         let mut state = self.state.borrow_mut();
         state.pending.closed = true;
         state.invalidate();
+        if let Some(observer) = state.submission.take() {
+            observer.invalidate();
+        }
         // 无法保证 Drop 时 current；仅标记丢失，Active/renderer Drop 不调用 GL。
         state.active.take();
     }
@@ -221,7 +256,12 @@ fn render(
             .draw(&target, viewport)
             .map_err(AdapterError::Gl)?
         {
-            state.event(AdapterEvent::Drawn { receipt, viewport });
+            if let Some(observer) = &state.submission {
+                // 不克隆证明。布局或 bootstrap 导致的关联拒绝由独立 observer 错误出口报告。
+                let _ = observer.record_draw(receipt);
+            } else {
+                state.event(AdapterEvent::Drawn { receipt, viewport });
+            }
         }
     }
     Ok(())

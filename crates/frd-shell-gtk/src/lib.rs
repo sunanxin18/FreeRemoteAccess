@@ -215,3 +215,29 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod runner;
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use runner::{GtkRunner, GtkRunnerStores};
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod presentation;
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use presentation::{SubmissionError, WindowSubmission};

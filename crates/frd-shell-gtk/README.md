@@ -34,3 +34,30 @@ cargo +1.96.0 test --locked -p frd-shell-gtk --features gtk-shell \
 ```
 
 同一命令覆盖 Linux i686 / ARM64 native target，X11 / Wayland 和 scale 1 / 2。测试核对真实 GDK display 类型与 GLArea scale；X11 使用独立 Xvfb/GDK_SCALE，Wayland 必须配置独立 Weston 输出 scale，不能用 GDK_SCALE 假装 compositor scale。要求恰好 1 passed、0 ignored；必须设置外层有界 timeout。fixture 的 GL readback 仅在测试中读取真实事务渲染的中间灰、非端点颜色、原点和不透明 alpha。Mesa llvmpipe 是原生 GL 管线验证，不是硬件加速或远程会话证据。
+
+## GTK runner 当前接线
+
+`GtkRunner::new(AppLaunch, factories, GtkRunnerStores, AudioOutputFactory)` 直接复用 AppController/SessionHost；`present()` 展示真实 GTK 原生 HeaderBar、单列表单和 GLArea。PasswordEntry 激活与 Connect 按钮共享提交路径；平台原生窗口按钮由 GTK 保留，产品状态、详情和取消/断开按钮位于 HeaderBar 的中心 title widget。没有新增自定义功能图标。HeaderBar 以下在连接期间仅有远程内容组件。
+
+产品事件泵使用合并 wake 的异步主线程消息，覆盖启动结果、取消、迟到启动、清理、证书 pending commands、后台加载密码和 deferred profile persistence。controller 读取的 profile store 是只读内存快照；真实目录 list/upsert 在后台 job 中执行，缓存从 AppLaunch 已有目录初始化。选择新连接或修改连接身份会清除已加载的旧密码。不同 session 重建 GLArea 和 frame pump；清理会丢弃旧事务、纹理及事件，防止重连时显示旧会话内容。
+
+当前 runner 尚未消费独立 WindowSubmission，未发布 FramePresented/生产 ACK，也未启用远程输入；界面保持“正在准备远程画面”。Linux 产品入口尚未切换，不能声明完整 GTK 客户端已完成。当前能力继承组合根传入的工厂和策略，不会把尚未接线的视频、音频、剪贴板伪装为支持。
+
+2026-09-08 GUI 实现依据：已读取 Apple 官方 DocC text-fields/windows JSON，采用持久字段标签、安全密码字段、合理 Tab 顺序、原生系统窗口控制。M3 主站仅返回 JavaScript，当前工具无可用浏览器，因此改读 Google 官方 Material Web 的 text-field 文档（label、password、验证行为）；不能把此替代读取记录为完整 M3 交互页面或视觉验收。正式 GUI 验收仍需 scale、主题、键盘/IME 和窄窗检查。
+
+- [Apple Text fields](https://developer.apple.com/design/human-interface-guidelines/text-fields)
+- [Apple Windows](https://developer.apple.com/design/human-interface-guidelines/windows)
+- [Google 官方 Material Web text field](https://github.com/material-components/material-web/blob/main/docs/components/text-field.md)
+
+每个 backend/scale 独立执行三个 fixture，并分别验证恰好 1 passed、0 ignored：
+
+```sh
+cargo +1.96.0 test --locked -p frd-shell-gtk --features gtk-shell --target "$TARGET" \
+  --test native_gtk native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture
+cargo +1.96.0 test --locked -p frd-shell-gtk --features gtk-shell --target "$TARGET" \
+  --test native_runner native_gtk_login_session_cancel -- --exact --ignored --nocapture
+GDK_DEBUG=gl-egl cargo +1.96.0 test --locked -p frd-shell-gtk --features gtk-shell --target "$TARGET" \
+  --test native_submission native_gtk_window_submission_roundtrip -- --exact --ignored --nocapture
+```
+
+统一使用独立 Xvfb/Weston、`FRD_GTK_TEST_BACKEND`、`FRD_GTK_TEST_SCALE`、`G_DEBUG=fatal-criticals` 和外层 timeout。runner fixture 使用真实 GTK 表单激活与 mock ProtocolFactory/ProtocolRuntime，覆盖保存密码加载、新连接清密、修改目标清密、Enter 一次启动、后台保存、取消/清理、重新连接的新画布增量读回及 pending launch cancellation；不连接网络，也不是硬件键盘注入或实际 RDP 服务端互操作证据。WindowSubmission fixture 的窗口提交含义由独立呈现模块定义，仍不等价物理扫描输出或协议 ACK。

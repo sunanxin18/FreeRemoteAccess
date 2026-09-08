@@ -2145,9 +2145,16 @@ dependencies = [
 name = "frd-shell-gtk"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
+ "frd-app",
  "frd-core",
  "frd-frame",
+ "frd-media-api",
+ "frd-platform-api",
+ "frd-protocol-api",
  "frd-render-gl",
+ "frd-shell-desktop",
+ "frd-ui-model",
  "glow",
  "gtk4",
  "libloading",

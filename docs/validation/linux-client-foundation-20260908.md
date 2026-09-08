@@ -322,3 +322,22 @@ frd-platform-linux 21项通过。root日志`/tmp/frd-linux-credential-lock-tests
 07e96d1的新增GL回执current断言已在三目标软件EGL执行通过，run34213548543，
 ARM64 job102019894884、i686 job102019895043、x86_64 job102019895065，
 每目标1 passed/0 ignored。日志`/tmp/frd-gl-07e-{arm64,i686,x64}.log`。
+
+
+## GTK 登录会话与窗口提交实现（原生验收待执行）
+
+新增GtkRunner复用AppLaunch/AppController/SessionHost，提供原生HeaderBar、居中表单、
+统一密码激活/按钮提交、后台凭据加载/保存、取消/迟到启动/cleanup及编译帧泵。
+平台profile服务的同步controller视图改为内存快照，真实list/upsert留在后台。
+每次会话重建画布并重新安装帧泵，避免Stack仅unmap时旧画面跨会话残留；
+选择“新连接”或改变身份会清除已加载凭据。Linux产品main尚未切换至该runner。
+
+独立WindowSubmissionObserver接入实际GLArea draw，但尚未接runner的FramePresented
+或生产ACK。固定GTK4.14旧GSK GL/EGL，bootstrap只观察，下一实际paint关联
+surface/frameclock/counter/renderer receipt与GL/EGL错误作用域；resize/unrealize等
+撤销证明。安全API不能注入任意receipt，只有adapter内部同步移交。
+原生fixture将验证登录/取消、实际窗口提交和故障拒绝；尚无新CI结果。
+
+本机完整 `cargo test --locked --workspace` exit0：75组1735 passed / 0 failed /
+16 ignored，日志`/tmp/frd-gtk-runner-workspace.log`。该轮在macOS执行，包含
+5项observer纯状态回归；不代表Linux GTK运行或新增窗口故障注入通过。

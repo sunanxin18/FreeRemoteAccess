@@ -106,6 +106,12 @@ jobs:
           cargo test --locked -p frd-shell-gtk --features gtk-shell \
             --target "${{ matrix.target }}" --test native_gtk \
             native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture
+          cargo test --locked -p frd-shell-gtk --features gtk-shell \
+            --target "${{ matrix.target }}" --test native_runner \
+            native_gtk_login_session_cancel -- --exact --ignored --nocapture
+          GDK_DEBUG=gl-egl cargo test --locked -p frd-shell-gtk --features gtk-shell \
+            --target "${{ matrix.target }}" --test native_submission \
+            native_gtk_window_submission_roundtrip -- --exact --ignored --nocapture
           SH
           for scale in 1 2; do
             timeout --kill-after=5s 120s env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
@@ -142,8 +148,8 @@ jobs:
               for scale in (1, 2):
                   text = Path(f'target/linux-gtk-adapter-logs/{backend}-{scale}.log').read_text()
                   results = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', text)
-                  if results != [('1', '0', '0')]:
-                      raise SystemExit(f'{backend}/{scale}: expected exactly one executed native test')
+                  if results != [('1', '0', '0')] * 3:
+                      raise SystemExit(f'{backend}/{scale}: expected three executed native fixtures')
           PY
       - name: Upload native adapter diagnostics
         if: always()

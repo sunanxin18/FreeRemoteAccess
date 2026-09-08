@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-gtk-shell = ["dep:gtk4", "dep:libloading", "frd-render-gl/linux-gl"]
+gtk-shell = ["dep:gtk4", "dep:libloading", "frd-render-gl/linux-gl", "dep:async-channel", "dep:frd-app", "dep:frd-platform-api", "dep:frd-protocol-api", "dep:frd-shell-desktop", "dep:frd-ui-model"]
 
 [dependencies]
 frd-core = { path = "../frd-core" }
@@ -17,4 +17,24 @@ gtk4 = { version = "=0.9.7", features = ["v4_14"], optional = true }
 libloading = { version = "=0.8.9", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+frd-media-api = { path = "../frd-media-api" }
 glow = "=0.17.0"
+
+[target.'cfg(target_os = "linux")'.dependencies.async-channel]
+version = "=2.5.0"
+optional = true
+[target.'cfg(target_os = "linux")'.dependencies.frd-app]
+path = "../frd-app"
+optional = true
+[target.'cfg(target_os = "linux")'.dependencies.frd-platform-api]
+path = "../frd-platform-api"
+optional = true
+[target.'cfg(target_os = "linux")'.dependencies.frd-protocol-api]
+path = "../frd-protocol-api"
+optional = true
+[target.'cfg(target_os = "linux")'.dependencies.frd-shell-desktop]
+path = "../frd-shell-desktop"
+optional = true
+[target.'cfg(target_os = "linux")'.dependencies.frd-ui-model]
+path = "../frd-ui-model"
+optional = true
