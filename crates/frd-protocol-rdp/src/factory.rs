@@ -161,11 +161,26 @@ impl ProtocolSession for RdpProtocolSession {
 mod tests {
     use std::sync::Arc;
 
+    use frd_core::{PixelSize, SessionId};
     use frd_protocol_api::{ProtocolFactory, ProtocolId};
+    use ironrdp_egfx::decode::H264Decoder;
 
     use crate::{
-        ParsedUsername, RdpClientPlatformIdentity, RdpGraphicsObserver, RdpProtocolFactory,
+        EgfxDecoderProvider, ParsedUsername, RdpClientPlatformIdentity,
+        RdpGraphicsAdvertisementGate, RdpGraphicsObserver, RdpProtocolFactory,
     };
+
+    struct NoopProvider;
+
+    impl EgfxDecoderProvider for NoopProvider {
+        fn create_decoder(
+            &self,
+            _session_id: SessionId,
+            _coded_size: PixelSize,
+        ) -> Option<Box<dyn H264Decoder>> {
+            None
+        }
+    }
 
     #[test]
     fn factory_exposes_stable_rdp_descriptor() {
@@ -196,5 +211,34 @@ mod tests {
             .with_graphics_observer(observer);
         assert!(factory.graphics_observer.is_some());
         assert!(factory.egfx_decoder_provider.is_none());
+        assert_eq!(
+            factory.graphics_advertisement_gate,
+            RdpGraphicsAdvertisementGate::LegacyOnly
+        );
+    }
+
+    #[test]
+    fn provider_constructor_defaults_to_legacy_advertisement_gate() {
+        let factory = RdpProtocolFactory::with_egfx_decoder_provider(
+            RdpClientPlatformIdentity::Macintosh,
+            Arc::new(NoopProvider),
+        );
+        assert_eq!(
+            factory.graphics_advertisement_gate,
+            RdpGraphicsAdvertisementGate::LegacyOnly
+        );
+    }
+
+    #[test]
+    fn explicit_live_gate_is_retained_by_factory() {
+        let factory = RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
+            RdpClientPlatformIdentity::Macintosh,
+            Arc::new(NoopProvider),
+            RdpGraphicsAdvertisementGate::LiveInteroperable,
+        );
+        assert_eq!(
+            factory.graphics_advertisement_gate,
+            RdpGraphicsAdvertisementGate::LiveInteroperable
+        );
     }
 }
