@@ -21,14 +21,12 @@
 共享接口或文件按依赖顺序整合；协议、codec hot path 和平台窗口代码不混合。
 Progressive coverage、实际 AVC 与 HEVC wire/live 门禁仍由原 RDP 计划独立推进。
 
-2026-09-08 基础服务实现与三 Linux 目标 check 已完成，17 项合成平台测试通过；
-Secret Service 原生脚本已加入 CI，未执行部分和完整客户端门禁见
-[基础服务验证](../../validation/linux-client-foundation-20260908.md)。
+## 当前验证边界（2026-09-08）
 
-Linux 应用组合根已接入 workspace；macOS 宿主的 all-targets check 和 20 项单元/2 项边界测试通过。Linux 原生应用测试已接入 CI，尚未执行，窗口/输入与完整包仍未验收。
+- 平台服务：17 项合成回归和三 Linux 目标 check 通过；`5cd73ea` Ubuntu job `101972000994` 的隔离 Secret Service 真实往返 1 项明确执行通过，原生 Linux 应用 20+2 项测试通过。
+- 完整包：`5cd73ea` i686 job `101971932014` 完成应用测试、release 构建、包校验、实际解码器加载及产物上传；ARM64/x86_64 同轮在 zlib 系统依赖名单处失败。已修正，尚未复跑，不勾选三目标包门禁。
+- 原生窗口：GTK4 HeaderBar/GLArea 独立技术探针和三架构 X11/Wayland 1×/2× CI 已实现；X11 驱动使用独立 Xvfb 实际点击/F8，Wayland只检查 GL/几何。14 项报告回归通过，实际探针编译、绘制和输入尚未执行；不勾选产品 GUI 门禁。
+- 平台隔离：后续 GTK 窗口集成复用 AppController 的登录意图和 SessionHost 的启动/取消/清理。已将无平台依赖的 SessionHost 从 application 模块分离，保留公开 API 和行为，完整工作区1706项通过；不要复制登录流程或把 GTK 类型引入协议、codec、SurfaceUpdate。
+- Windows/macOS：继续保持原有平台入口、渲染后端和会话行为。主机编译或离线目标测试均不替代真实 GUI 控制。
 
-Linux 完整包脚本与三架构 CI 构建/目标加载步骤已实现；9 项合成包拒绝测试和 shell/YAML 检查通过。此时尚未在 Linux 运行新包流程，不勾选三目标 CI 通过门禁。见 packaging/linux/README.md；原生窗口和真实 GPU/输入仍未完成。
-
-2026-09-08 5cd73ea Ubuntu job101972000994 终态成功：隔离 Secret Service 真实往返 1 项明确执行通过，Linux 原生应用20+2通过。其余发行版、真实GUI及远程登录不在此结论范围。
-
-原生窗口技术探针已实现于 tools/frd-linux-native-shell-probe，并新增三架构 X11/Wayland 1×/2× CI；等待真实编译/GL运行，不能勾选原生窗口产品验收。完整包首次 ARM64/x64 校验暴露系统zlib遗漏，修正及失败记录见验证文档。
+完整证据与失败记录见[基础服务与客户端验证](../../validation/linux-client-foundation-20260908.md)。下一执行顺序：原生窗口探针 CI -> 基于通过结果整合 Linux toolkit/renderer/input -> 完整 GUI 与真实服务端验收。包修正 CI 与窗口实现可独立推进；实际 Progressive、AVC、HEVC 的原始门禁继续保留。

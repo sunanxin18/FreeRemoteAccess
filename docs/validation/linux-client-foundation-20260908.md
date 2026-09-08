@@ -63,3 +63,9 @@ Linux 应用入口 baebd80 的宿主测试通过 20 项单元及 2 项边界测�
 已下载上述 tar 产物并独立检查：28,838,880 字节，SHA-256 `253dfa97fb5504bc30f841df799d1593d5c5ac7ac4b466ebec1422ddc86427f8`，44 个归档条目；实际客户端为 ELF32/Intel80386、权限0755。未在 macOS 执行该 Linux ELF。
 
 原生窗口探针新增独立 Xvfb 输入驱动及严格 JSONL 校验：仅操作本次 PID/标题匹配的窗口，用实际焦点上的 XTEST 点击/F8，并要求鼠标、按键配对、内容焦点和坐标比例成立；Wayland 不允许宣称输入通过。14 项合成报告回归及脚本语法检查通过。新输入驱动尚未在 Linux 实际运行，不能把这些合成测试算作 GUI 输入证据。
+
+## 共享会话宿主分离
+
+将 SessionHost/启动 barrier/取消/媒体工作线程/帧事务和清理从 application.rs 提取至 session_host.rs，未引入 GTK 或改变平台窗口。既有根 API 保留，新增 AcceptedLaunchOutcome 根重导出，供后续原生壳匹配后台启动结果。生产状态保持私有；跨模块呈现测试仅用 cfg(test) 窄接口。主代理比对启动、取消、事件发送、清理、回滚及视频/帧方法体，保持原逻辑。
+
+全部既有 shell214项及新增公开API doctest通过；最终完整 cargo test --locked --workspace 终态exit0，62组1706 passed/0 failed/16 ignored。该证据来自macOS ARM64宿主，不代表GTK产品接线或Linux原生GUI完成。

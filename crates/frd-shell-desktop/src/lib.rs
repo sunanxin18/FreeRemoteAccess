@@ -10,6 +10,7 @@ mod lifecycle;
 mod platform;
 mod presentation_timing;
 mod repaint;
+mod session_host;
 mod ui_fonts;
 mod video_decode_worker;
 mod video_rate_fallback;
@@ -17,9 +18,8 @@ mod window_chrome;
 mod window_presentation;
 
 pub use application::{
-    AudioOutputFactory, BackgroundLaunchOutcome, DesktopApplication, DesktopPlatformStores,
-    DesktopUserEvent, DesktopWindowConfiguration, PresentationFailure, SessionHost,
-    SessionHostError, TestTextureOptions, WakeSink,
+    DesktopApplication, DesktopPlatformStores, DesktopUserEvent, DesktopWindowConfiguration,
+    PresentationFailure, TestTextureOptions,
 };
 pub use cleanup::{BackgroundCleanupFailure, BackgroundCleanupOutcome};
 pub use display_geometry::{
@@ -34,6 +34,10 @@ pub use floating_chrome::{
 };
 pub use input::{InputGate, InputOwnership, InputRouter};
 pub use lifecycle::PresentationOperation;
+pub use session_host::{
+    AcceptedLaunchOutcome, AudioOutputFactory, BackgroundLaunchOutcome, SessionHost,
+    SessionHostError, WakeSink,
+};
 pub use video_decode_worker::{
     DecodedVideoFrameHandoff, VideoDecodeLoadSnapshot, VideoDecodeSender, VideoDecoderDiagnostics,
     VideoFrameToken, VideoStreamAdmission, VideoWorkerEvent, VideoWorkerEvents,

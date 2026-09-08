@@ -1,6 +1,6 @@
 # FreeRemoteDesk
 
-2026-09-08 当前进度：macOS 仅支持 ARM64。Linux 应用入口整合后的完整工作区测试 1705 passed / 0 failed / 16 ignored；此前 `85324f5` ARM64 release 包验证通过。默认生产 RDP 仍为 LegacyOnly；显式 `--rdp-egfx-experiment avc420|avc444` 用于采集互操作证据。
+2026-09-08 当前进度：macOS 仅支持 ARM64。共享会话宿主分离后的完整工作区测试 1706 passed / 0 failed / 16 ignored；此前 `85324f5` ARM64 release 包验证通过。默认生产 RDP 仍为 LegacyOnly；显式 `--rdp-egfx-experiment avc420|avc444` 用于采集互操作证据。
 
 `707b178` 的1280×720探针取得20秒/70帧 ClearCodec/Progressive混合流，实际AVC计数0。该实验GUI的原生分辨率cache发布失败已由 `64dd9e1` 修复：2560×1440显示器原生模式下真实桌面、开始菜单鼠标、搜索键盘输入、正常断开与退出已受限验证；约三分钟会话最后诊断110帧、失败0。仍不能把混合流归为H.264验收。
 
