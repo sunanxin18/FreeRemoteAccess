@@ -44,7 +44,7 @@ pub struct BundledFontMap {
     config: *mut FcConfig,
     destroy_config: DestroyConfig,
     _fontconfig: Library,
-    _pango: Library,
+    _pangoft2: Library,
     _pangocairo: Library,
 }
 
@@ -54,7 +54,7 @@ impl BundledFontMap {
         let path = CString::new(font_path.to_str()?).ok()?;
         // Linux 发行版的 soname 由打包目标负责提供；缺少任一 ABI 时保持宿主字体。
         let fontconfig = unsafe { Library::new("libfontconfig.so.1").ok()? };
-        let pango = unsafe { Library::new("libpango-1.0.so.0").ok()? };
+        let pangoft2 = unsafe { Library::new("libpangoft2-1.0.so.0").ok()? };
         let pangocairo = unsafe { Library::new("libpangocairo-1.0.so.0").ok()? };
         let init: InitConfig = unsafe { symbol(&fontconfig, b"FcInitLoadConfigAndFonts\0")? };
         let add_font: AddFont = unsafe { symbol(&fontconfig, b"FcConfigAppFontAddFile\0")? };
@@ -62,7 +62,8 @@ impl BundledFontMap {
         let destroy_config: DestroyConfig = unsafe { symbol(&fontconfig, b"FcConfigDestroy\0")? };
         let new_font_map: NewFontMap =
             unsafe { symbol(&pangocairo, b"pango_cairo_font_map_new\0")? };
-        let set_config: SetConfig = unsafe { symbol(&pango, b"pango_fc_font_map_set_config\0")? };
+        let set_config: SetConfig =
+            unsafe { symbol(&pangoft2, b"pango_fc_font_map_set_config\0")? };
         let config = unsafe { init() };
         if config.is_null()
             || unsafe { add_font(config, path.as_ptr().cast()) } == 0
@@ -86,7 +87,7 @@ impl BundledFontMap {
             config,
             destroy_config,
             _fontconfig: fontconfig,
-            _pango: pango,
+            _pangoft2: pangoft2,
             _pangocairo: pangocairo,
         })
     }
