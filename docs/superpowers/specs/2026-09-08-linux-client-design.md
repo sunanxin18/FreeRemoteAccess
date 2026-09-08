@@ -161,3 +161,28 @@ oracle。此后端能力不等于GTK的组合根、提交确认或远程会话�
 GL_LINEAR枚举本身推断。精确RGBA8保证通道8bit，新契约仅level0和samples0；输出
 alpha1满足premultiplied解释。桌面BGRA内存格式不能成为额外交换输出红蓝的理由。
 此证据不自动覆盖更新GTK的HDR/广色域color-state，也未完成GTK最终显示像素验收。
+
+
+### GTK 4.14 窗口错误观察的实现路径
+
+固定旧 `GSK_RENDERER=gl` 的上游代码有公开 API 路径补齐提交作用域。
+`gsk_gl_renderer_render` 的 end_frame 后，driver_after_frame 只切逻辑 command queue，
+未清除原生 current。after-paint 可读取 `GdkGLContext::current()` 并核对
+`DrawContext::surface()`；不得先 make_current 覆盖实际窗口绑定。
+首帧只发现上下文并请求下一帧；后续 before-paint 对保留上下文建立错误 baseline。
+帧外 make_current 是 surfaceless，只用于 baseline；GTK begin/end_frame 自行重绑窗口。
+
+EGL end_frame 忽略 swap 返回值，但同条返回路径没有调用 eglGetError；Wayland
+notify_committed 只清状态标志。因此同一 observer 可在 after-paint 读取窗口 GL/EGL
+错误，结合原生 current context/draw surface、同一framecounter和真实Surface render
+调用栈内的精确draw receipt建立提交确认。首帧、空damage、离屏snapshot、resize、
+unrealize、context变化或缺失作用域必须拒绝。该路径仍须native故障注入验证。
+GLX后续可用公开X11 display error_trap_push/pop包住paint，pop返回X请求错误；
+不能用pop_ignored或把XSync称为物理显示证明。
+
+源码：[GSK render](https://github.com/GNOME/gtk/blob/4.14.0/gsk/gl/gskglrenderer.c#L345)、
+[driver 收尾](https://github.com/GNOME/gtk/blob/4.14.0/gsk/gl/gskgldriver.c#L629)、
+[GDK EGL end_frame](https://github.com/GNOME/gtk/blob/4.14.0/gdk/gdkglcontext.c#L652)、
+[Wayland end_frame](https://github.com/GNOME/gtk/blob/4.14.0/gdk/wayland/gdkglcontext-wayland.c#L60)、
+[X11 error trap](https://github.com/GNOME/gtk/blob/4.14.0/gdk/x11/gdkdisplay-x11.c#L2673)。
+这关闭了“找不到公开观察接口”的设计不确定性，不代表生产ACK已实现或通过。

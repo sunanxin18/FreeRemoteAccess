@@ -27,7 +27,7 @@ Progressive coverage、实际 AVC 与 HEVC wire/live 门禁仍由原 RDP 计划�
 - 完整包：`5cd73ea` i686 job `101971932014` 完成应用测试、release 构建、包校验、实际解码器加载及产物上传；ARM64/x86_64 同轮在 zlib 系统依赖名单处失败。a60eebd 的 ARM64/x86_64 修正后 jobs 101983147418/101983147612 已通过完整包及目标解码加载，同轮 i686 job 101983147659 随后也完成应用测试、完整包及目标解码加载，run 34202134581 三目标全部通过。
 - 原生窗口：GTK4 HeaderBar/GLArea 独立技术探针和三架构 X11/Wayland 1×/2× CI 已实现；X11 驱动使用独立 Xvfb 实际点击/F8，Wayland只检查 GL/几何。首轮标题栏边界、Wayland 输出 scale 和日志污染失败均保留。347a79e run34209182174 三架构 X11/Wayland 1×/2× 共12份报告已严格复验通过；X11包括真实输入，Wayland只验证绘制与几何，不勾选产品 GUI 门禁。
 - 平台隔离：后续 GTK 窗口集成复用 AppController 的登录意图和 SessionHost 的启动/取消/清理。已将无平台依赖的 SessionHost 从 application 模块分离，保留公开 API 和行为，完整工作区1706项通过；不要复制登录流程或把 GTK 类型引入协议、codec、SurfaceUpdate。
-- 共享帧事务：已迁移至独立 frd-render-state crate，独占候选只允许消费提交一次；旧38项测试全部保留为纯状态10项和Metal后端28项，新增3项候选回归及7项编译拒绝测试通过。独立 Linux GL 执行器已实现纹理上传、绘制和上下文生命周期，三目标编译检查通过；c349a72 run34210588972 三架构软件 EGL 已通过两种颜色输出契约及生命周期 fixture。新的 frd-shell-gtk 适配层正在接入真实 FrameTransaction→GLArea 绘制，原生 GTK fixture 尚待执行；登录、输入和完整产品接线仍未完成。
+- 共享帧事务：已迁移至独立 frd-render-state crate，独占候选只允许消费提交一次；旧38项测试全部保留为纯状态10项和Metal后端28项，新增3项候选回归及7项编译拒绝测试通过。独立 Linux GL 执行器已实现纹理上传、绘制和上下文生命周期，三目标编译检查通过；c349a72 run34210588972 三架构软件 EGL 已通过两种颜色输出契约及生命周期 fixture。frd-shell-gtk 已接入真实 FrameTransaction→GLArea 绘制，96cfeba run34212569009 三架构 X11/Wayland 1×/2× 共12个原生 fixture 通过完整帧、增量与上下文重建；登录、输入和完整产品接线仍未完成。
 - Windows/macOS：继续保持原有平台入口、渲染后端和会话行为。主机编译或离线目标测试均不替代真实 GUI 控制。
 
 完整证据与失败记录见[基础服务与客户端验证](../../validation/linux-client-foundation-20260908.md)。下一执行顺序：真实 Rust GTK 帧适配器三架构 X11/Wayland 1×/2× 验证 -> 复用登录/会话接口并接入原生输入 -> 完整 GUI 与真实服务端验收。包修正 CI 与窗口实现可独立推进；实际 Progressive、AVC、HEVC 的原始门禁继续保留。

@@ -33,7 +33,7 @@ pub use floating_chrome::{
     HIDE_DELAY, REVEAL_DELAY, TOP_SENSOR_POINTS,
 };
 pub use frame_metrics::FrameBatchMetricsSnapshot;
-pub use input::{InputGate, InputOwnership, InputRouter};
+pub use input::{InputGate, InputOwnership, InputRouter, KeyboardDomain, KeyboardPreDispatch};
 pub use lifecycle::PresentationOperation;
 pub use session_host::{
     AcceptedLaunchOutcome, AudioOutputFactory, BackgroundLaunchOutcome, CompiledFrameDrain,

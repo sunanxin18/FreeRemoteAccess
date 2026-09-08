@@ -2010,9 +2010,22 @@ mod tests {
         for _ in 0..5 {
             release_tx.send(()).unwrap();
         }
-        wait_until(|| submits.load(Ordering::Acquire) == 5);
+        // submit计数在返回outcome前递增，不能用它证明最后一帧已发布。
+        // 明确收到第5个AU的输出后，恢复阶段才完成；latest mailbox可合并早期帧。
+        let mut recovered_final_frame = false;
+        for _ in 0..5 {
+            let frame = recv_frame_for(&worker, identity);
+            let tick = frame.frame().as_input().timestamp.ticks;
+            assert!((1..=5).contains(&tick));
+            if tick == 5 {
+                recovered_final_frame = true;
+                break;
+            }
+        }
+        assert!(recovered_final_frame, "恢复阶段应发布最后一个已释放AU");
+        assert_eq!(submits.load(Ordering::Acquire), 5);
         while entered_rx.try_recv().is_ok() {}
-        while worker.events().try_recv().is_some() {}
+        assert!(worker.events().try_recv().is_none());
         let recovered_at = origin + Duration::from_millis(1_201);
         assert_eq!(
             controller.take_due_load_target(recovered_at, true),

@@ -278,3 +278,23 @@ GTK 首轮 e96fbf1 run34212170241：三目标 GTK SDK 编译和链接均成功�
 三目标均以 `run_fixture: command not found` / exit127退出。
 启动器改成显式脚本文件传入D-Bus，不修改测试或验收断言；原生门禁仍待重跑。
 原始日志：`/tmp/frd-gtk-e96-{x64,i686,arm64}.log`。
+
+
+## GTK 帧适配器原生通过（96cfeba）
+
+run34212569009 全部成功：x86_64 job102016744293、ARM64 job102016744596、
+i686 job102016744685。每目标日志严格核对 X11/Wayland × scale1/2 四行真实
+`transaction_draw=3 partial_update=1 context_rebuild=1`，以及四次唯一原生测试
+1 passed / 0 failed / 0 ignored；12组合全部执行。原始日志
+`/tmp/frd-gtk-96cf-{x64,i686,arm64}.log`。
+
+颜色读回、物理viewport、完整/增量事务、unrealize重建与旧receipt失效全部执行，
+GTK critical为致命错误。该证据覆盖GLArea帧适配组件，不包含完整产品登录、输入、
+最终窗口snapshot颜色或生产呈现确认。首轮e96失败记录不被替换。
+
+共享InputRouter现公开KeyboardDomain/KeyboardPreDispatch返回类型，GTK可直接匹配
+现有分发结果，未修改生产输入状态机。外部API测试先因缺少公开类型失败，公开后通过。
+完整shell回归首次214/1失败：模拟decoder提交计数早于帧发布，旧测试清空队列时
+可能漏掉第五帧，后续阻塞阶段读到迟到输出。仅测试同步改为等确切timestamp5帧；
+保留两秒边界和空队列断言。最终215单元+2外部API+1文档测试通过，
+日志`/tmp/frd-keyboard-public-api-green.log`；首败`/tmp/frd-keyboard-public-api-tests.log`。
