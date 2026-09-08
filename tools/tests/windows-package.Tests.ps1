@@ -230,7 +230,14 @@ Describe "Windows package verification security boundaries" {
         $backup = Join-Path $TestDrive "freeremotedesk-windows.original.exe"
         Copy-Item -LiteralPath $application -Destination $backup
         try {
-            Set-Content -LiteralPath $application -Value "old executable bytes" -Encoding UTF8
+            # 保留真实 PE 头和架构，仅改变文件尾部，确保命中 payload 字节哈希校验。
+            $stream = [IO.File]::Open($application, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try {
+                $stream.WriteByte(0xA5)
+            }
+            finally {
+                $stream.Dispose()
+            }
             $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
             $LASTEXITCODE | Should Not Be 0
             ($output -join "`n") | Should Match "payload.*不匹配|实际 staged bytes 不匹配"
