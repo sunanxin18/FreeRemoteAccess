@@ -227,3 +227,73 @@ fn native_raw_upgrade_crosses_every_band_and_preserves_reference_on_truncation()
         .is_err());
     assert!(das.das.iter().flatten().all(|s| *s == 1));
 }
+
+#[test]
+fn missing_native_state_has_precise_static_reason() {
+    use ironrdp::pdu::codecs::rfx::progressive::TileUpgrade;
+    let backend = NativeBackend::new().unwrap();
+    let parameters = TileParameters {
+        base: [quant(6); 3],
+        progressive: [quant(0); 3],
+        subband_diffing: true,
+        reduce_extrapolate: false,
+        difference: true,
+    };
+    let reference = NativeReference {
+        current: Box::new([[0; 4096]; 3]),
+    };
+    let das = NativeTileState {
+        das: Box::new([[0; 4096]; 3]),
+    };
+    let upgrade = ProgressiveTile::Upgrade(TileUpgrade {
+        quant_idx_y: 0,
+        quant_idx_cb: 0,
+        quant_idx_cr: 0,
+        x_idx: 0,
+        y_idx: 0,
+        quality: 255,
+        y_srl_data: &[],
+        y_raw_data: &[],
+        cb_srl_data: &[],
+        cb_raw_data: &[],
+        cr_srl_data: &[],
+        cr_raw_data: &[],
+    });
+    for (reference, das, prior, reason) in [
+        (
+            Some(&reference),
+            Some(&das),
+            None,
+            "upgrade missing prior parameters",
+        ),
+        (
+            Some(&reference),
+            None,
+            Some(&parameters),
+            "upgrade missing DAS",
+        ),
+        (
+            None,
+            Some(&das),
+            Some(&parameters),
+            "upgrade missing surface reference",
+        ),
+    ] {
+        assert!(
+            matches!(backend.decode_tile(reference, das, TileRequest { tile: &upgrade, parameters: &parameters, previous_parameters: prior }), Err(Error::Invalid(label)) if label == reason)
+        );
+    }
+    let simple = tile(&[], 1);
+    assert!(matches!(
+        backend.decode_tile(
+            None,
+            None,
+            TileRequest {
+                tile: &simple,
+                parameters: &parameters,
+                previous_parameters: None
+            }
+        ),
+        Err(Error::Invalid("difference missing surface reference"))
+    ));
+}

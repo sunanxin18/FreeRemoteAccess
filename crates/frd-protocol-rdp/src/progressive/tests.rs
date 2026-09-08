@@ -132,13 +132,22 @@ fn upgrade_requires_exact_surface_and_context_and_lifetimes() {
     let f = frame(vec![region((0, 0, 64, 64), vec![first(0, 0, &[5])])]);
     d.decode(1, 2, 64, 64, &f).unwrap();
     let up = frame(vec![region((0, 0, 64, 64), vec![upgrade()])]);
-    assert_eq!(d.decode(2, 2, 64, 64, &up).unwrap_err(), Error::MissingTile);
-    assert_eq!(d.decode(1, 3, 64, 64, &up).unwrap_err(), Error::MissingTile);
+    assert_eq!(
+        d.decode(2, 2, 64, 64, &up).unwrap_err(),
+        Error::Invalid("upgrade missing context tile")
+    );
+    assert_eq!(
+        d.decode(1, 3, 64, 64, &up).unwrap_err(),
+        Error::Invalid("upgrade missing context tile")
+    );
     d.delete_context(1, 3);
     assert_eq!(d.context_count(), 1);
     d.delete_context(1, 2);
     assert_eq!(d.tile_count(), 1);
-    assert_eq!(d.decode(1, 2, 64, 64, &up).unwrap_err(), Error::MissingTile);
+    assert_eq!(
+        d.decode(1, 2, 64, 64, &up).unwrap_err(),
+        Error::Invalid("upgrade missing context tile")
+    );
     d.decode(3, 2, 64, 64, &f).unwrap();
     d.delete_surface(3);
     assert_eq!(d.context_count(), 0);
@@ -352,12 +361,18 @@ fn difference_requires_reference_enabled_context_and_matching_layout() {
         t.flags = 1;
     }
     let f = frame(vec![region((0, 0, 64, 64), vec![diff.clone()])]);
-    assert_eq!(d.decode(1, 1, 64, 64, &f).unwrap_err(), Error::MissingTile);
+    assert_eq!(
+        d.decode(1, 1, 64, 64, &f).unwrap_err(),
+        Error::Invalid("difference subband disabled")
+    );
     let orig = frame(vec![region((0, 0, 64, 64), vec![first(0, 0, &[5])])]);
     d.decode(1, 1, 64, 64, &orig).unwrap();
     d.end_frame(1).unwrap();
     d.begin_frame(2).unwrap();
-    assert_eq!(d.decode(1, 1, 64, 64, &f).unwrap_err(), Error::MissingTile);
+    assert_eq!(
+        d.decode(1, 1, 64, 64, &f).unwrap_err(),
+        Error::Invalid("difference subband disabled")
+    );
     let context = ProgressiveBlock::Context(ProgressiveContextPdu {
         context_id: 0,
         tile_size: 64,
@@ -407,7 +422,7 @@ fn surface_reference_survives_context_delete_and_new_context_difference() {
     assert_eq!(d.tile_count(), 0);
     assert_eq!(
         d.decode(1, 3, 64, 64, &diff).unwrap_err(),
-        Error::MissingTile
+        Error::Invalid("difference missing surface reference")
     );
 }
 #[test]
@@ -526,7 +541,7 @@ fn first_tile_reserved_flags_are_ignored_but_difference_and_simple_stay_strict()
                     &frame(vec![region((0, 0, 64, 64), vec![original.clone()])])
                 )
                 .unwrap_err(),
-            Error::MissingTile
+            Error::Invalid("difference subband disabled")
         );
         d.end_frame(1).unwrap();
         d.begin_frame(2).unwrap();

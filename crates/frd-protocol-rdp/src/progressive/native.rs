@@ -102,9 +102,14 @@ impl TileDecoder for NativeBackend {
                 )?;
             }
             ProgressiveTile::Upgrade(t) => {
-                let prior = request.previous_parameters.ok_or(Error::MissingTile)?;
-                if previous.is_none() || reference.is_none() {
-                    return Err(Error::MissingTile);
+                let prior = request
+                    .previous_parameters
+                    .ok_or(Error::Invalid("upgrade missing prior parameters"))?;
+                if previous.is_none() {
+                    return Err(Error::Invalid("upgrade missing DAS"));
+                }
+                if reference.is_none() {
+                    return Err(Error::Invalid("upgrade missing surface reference"));
                 }
                 let srl = [t.y_srl_data, t.cb_srl_data, t.cr_srl_data];
                 let raw = [t.y_raw_data, t.cb_raw_data, t.cr_raw_data];
@@ -174,7 +179,7 @@ impl NativeBackend {
         layout: BandLayout,
     ) -> Result<()> {
         if parameters.difference && !has_previous {
-            return Err(Error::MissingTile);
+            return Err(Error::Invalid("difference missing surface reference"));
         }
         for (component, data) in data.into_iter().enumerate() {
             let shifts = positions(parameters, component)?.map(|p| p - 1);

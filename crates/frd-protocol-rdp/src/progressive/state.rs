@@ -525,12 +525,17 @@ fn parameters(
         return Err(Error::Invalid("tile flags"));
     }
     let difference = if upgrade {
-        previous.ok_or(Error::MissingTile)?.difference
+        previous
+            .ok_or(Error::Invalid("upgrade missing context tile"))?
+            .difference
     } else {
         flags & 1 != 0
     };
-    if difference && (!subband_diffing || reference_layout.is_none()) {
-        return Err(Error::MissingTile);
+    if difference && !subband_diffing {
+        return Err(Error::Invalid("difference subband disabled"));
+    }
+    if difference && reference_layout.is_none() {
+        return Err(Error::Invalid("difference missing surface reference"));
     }
     let mut base = [ComponentCodecQuant::LOSSLESS; 3];
     for i in 0..3 {
@@ -568,7 +573,7 @@ fn parameters(
         return Err(Error::Invalid("difference tile layout changed"));
     }
     if upgrade {
-        let previous = previous.ok_or(Error::MissingTile)?;
+        let previous = previous.ok_or(Error::Invalid("upgrade missing context tile"))?;
         if previous.reduce_extrapolate != parameters.reduce_extrapolate
             || previous.subband_diffing != subband_diffing
         {
