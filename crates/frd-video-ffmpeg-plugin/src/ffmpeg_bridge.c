@@ -75,6 +75,82 @@ int32_t frd_native_yuv420p_format(void) {
     return AV_PIX_FMT_YUV420P;
 }
 
+/*
+ * Query the decoder's declared output formats instead of treating the
+ * AVPixelFormat enum value as proof that a codec can produce that format.
+ * FFmpeg documents a NULL list as an explicit "all possible values" contract;
+ * accept that declaration, while treating an API error as unsupported. The
+ * receive path performs the same check against each decoded frame as a second,
+ * runtime guard.
+ */
+static int32_t frd_native_decoder_supports_pixel_format(enum AVCodecID codec_id,
+                                                        enum AVPixelFormat pixel_format) {
+    const AVCodec *decoder = avcodec_find_decoder(codec_id);
+    const void *configs = NULL;
+    int config_count = 0;
+    int result;
+    int index;
+
+    if (decoder == NULL) {
+        return 0;
+    }
+    result = avcodec_get_supported_config(NULL,
+                                          decoder,
+                                          AV_CODEC_CONFIG_PIX_FORMAT,
+                                          0,
+                                          &configs,
+                                          &config_count);
+    if (result < 0) {
+        return 0;
+    }
+    if (configs == NULL) {
+        return 1;
+    }
+    if (config_count <= 0) {
+        return 0;
+    }
+    for (index = 0; index < config_count; ++index) {
+        const enum AVPixelFormat *formats = (const enum AVPixelFormat *)configs;
+        if (formats[index] == pixel_format) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int32_t frd_native_decoder_supports_profile(enum AVCodecID codec_id, int profile_id) {
+    const AVCodec *decoder = avcodec_find_decoder(codec_id);
+    const AVProfile *profile;
+
+    if (decoder == NULL || decoder->profiles == NULL) {
+        return 0;
+    }
+    for (profile = decoder->profiles; profile->profile != AV_PROFILE_UNKNOWN; ++profile) {
+        if (profile->profile == profile_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int32_t frd_native_hevc_yuv444p_decoder_available(void) {
+    return frd_native_decoder_supports_profile(AV_CODEC_ID_HEVC, AV_PROFILE_HEVC_REXT)
+        && frd_native_decoder_supports_pixel_format(AV_CODEC_ID_HEVC, AV_PIX_FMT_YUV444P);
+}
+
+int32_t frd_native_h264_yuv420p_decoder_available(void) {
+    return (frd_native_decoder_supports_profile(AV_CODEC_ID_H264, AV_PROFILE_H264_BASELINE)
+            || frd_native_decoder_supports_profile(AV_CODEC_ID_H264, AV_PROFILE_H264_MAIN)
+            || frd_native_decoder_supports_profile(AV_CODEC_ID_H264, AV_PROFILE_H264_HIGH))
+        && frd_native_decoder_supports_pixel_format(AV_CODEC_ID_H264, AV_PIX_FMT_YUV420P);
+}
+
+int32_t frd_native_h264_yuv444p_decoder_available(void) {
+    return frd_native_decoder_supports_profile(AV_CODEC_ID_H264,
+                                               AV_PROFILE_H264_HIGH_444_PREDICTIVE)
+        && frd_native_decoder_supports_pixel_format(AV_CODEC_ID_H264, AV_PIX_FMT_YUV444P);
+}
+
 static int32_t frd_native_decoder_create_with_codec_thread_policy(
     enum AVCodecID codec_id,
     enum AVPixelFormat output_format,

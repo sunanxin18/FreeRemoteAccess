@@ -169,6 +169,9 @@ mod native {
         fn frd_native_avcodec_major() -> u32;
         fn frd_native_hevc_decoder_available() -> i32;
         fn frd_native_h264_decoder_available() -> i32;
+        fn frd_native_hevc_yuv444p_decoder_available() -> i32;
+        fn frd_native_h264_yuv420p_decoder_available() -> i32;
+        fn frd_native_h264_yuv444p_decoder_available() -> i32;
         fn frd_native_yuv444p_format() -> i32;
         fn frd_native_yuv420p_format() -> i32;
         fn frd_native_decoder_create_with_thread_policy(
@@ -250,15 +253,22 @@ mod native {
             if frd_native_avcodec_major() != FRD_FFMPEG_AVCODEC_MAJOR {
                 0
             } else {
-                (if frd_native_hevc_decoder_available() != 0 {
+                (if frd_native_hevc_decoder_available() != 0
+                    && frd_native_hevc_yuv444p_decoder_available() != 0
+                {
                     FRD_CODEC_CAP_HEVC_MAIN_444_8
                 } else {
                     0
                 }) | (if frd_native_h264_decoder_available() != 0
-                    && frd_native_yuv420p_format() >= 0
-                    && frd_native_yuv444p_format() >= 0
+                    && frd_native_h264_yuv420p_decoder_available() != 0
                 {
-                    FRD_CODEC_CAP_H264_AVC420 | FRD_CODEC_CAP_H264_AVC444
+                    FRD_CODEC_CAP_H264_AVC420
+                } else {
+                    0
+                }) | (if frd_native_h264_decoder_available() != 0
+                    && frd_native_h264_yuv444p_decoder_available() != 0
+                {
+                    FRD_CODEC_CAP_H264_AVC444
                 } else {
                     0
                 })

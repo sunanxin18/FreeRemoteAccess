@@ -13,10 +13,11 @@ use frd_video_ffmpeg::abi::{
     FrdByteSlice, FrdCreateDecoderFn, FrdDecodedFrame, FrdDestroyFn, FrdFlushFn, FrdGetFfmpegApiV1,
     FrdReceiveFn, FrdReclaimFrameFn, FrdStatus, FrdSubmitFn, FrdVideoConfig, RawFrdFfmpegApiV1,
     FRD_API_CONTRACT_REQUIRED, FRD_BITSTREAM_ANNEX_B, FRD_CHROMA_YUV_420, FRD_CHROMA_YUV_444,
-    FRD_CODEC_H264, FRD_CODEC_HEVC, FRD_FFMPEG_ABI_VERSION, FRD_FFMPEG_API_SYMBOL,
-    FRD_FFMPEG_API_V1_ALIGNMENT, FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR,
-    FRD_PIXEL_FORMAT_YUV_420_P8, FRD_PIXEL_FORMAT_YUV_444_P8, FRD_PROFILE_H264_AVC420,
-    FRD_PROFILE_H264_AVC444, FRD_PROFILE_HEVC_MAIN_444_8, FRD_SUBMIT_RANDOM_ACCESS,
+    FRD_CODEC_CAP_ALL_KNOWN, FRD_CODEC_H264, FRD_CODEC_HEVC, FRD_FFMPEG_ABI_VERSION,
+    FRD_FFMPEG_API_SYMBOL, FRD_FFMPEG_API_V1_ALIGNMENT, FRD_FFMPEG_API_V1_SIZE,
+    FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_420_P8, FRD_PIXEL_FORMAT_YUV_444_P8,
+    FRD_PROFILE_H264_AVC420, FRD_PROFILE_H264_AVC444, FRD_PROFILE_HEVC_MAIN_444_8,
+    FRD_SUBMIT_RANDOM_ACCESS,
 };
 #[derive(Debug)]
 struct FixtureMetadata {
@@ -61,6 +62,15 @@ struct Api {
     flush: FrdFlushFn,
     destroy: FrdDestroyFn,
     reclaim: FrdReclaimFrameFn,
+}
+
+#[test]
+fn fixed_ffmpeg_advertises_only_decoder_declared_output_formats() {
+    let loaded = unsafe { load_direct_api(&development_codec_bundle()) };
+    assert_eq!(
+        loaded.codec_capabilities, FRD_CODEC_CAP_ALL_KNOWN,
+        "固定 FFmpeg bundle 必须只在 decoder 声明对应 YUV 输出时设置 capability bit"
+    );
 }
 
 #[test]
@@ -509,6 +519,7 @@ unsafe fn receive_one_frame(api: Api, handle: *mut core::ffi::c_void) -> FrdDeco
 
 struct LoadedApi {
     api: Api,
+    codec_capabilities: u32,
     // Drop order is intentional: unload the plugin before the two libraries it imports.
     _plugin: Module,
     _avcodec: Module,
@@ -609,6 +620,7 @@ unsafe fn load_direct_api(bundle: &Path) -> LoadedApi {
     };
     LoadedApi {
         api,
+        codec_capabilities: raw.codec_capabilities,
         _plugin: plugin,
         _avcodec: avcodec,
         _avutil: avutil,

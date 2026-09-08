@@ -20,7 +20,7 @@ AVC420 provider；这条路径会广告 EGFX，但仍必须等待服务器 `Capa
 
 标准协议复核也保持这一边界：公开的 [MS-RDPEGFX `RDPGFX_WIRE_TO_SURFACE_PDU_1` codec ID 表](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/fb919fce-cc97-4d2b-8cf5-a737a00ef1a6)列出 AVC420、AVC444 和 AVC444V2，但没有 HEVC codec ID；[Azure Virtual Desktop 图形编码说明](https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encoding) 对 HEVC 的描述属于特定 GPU 产品场景，未公开本客户端需要的 RDP wire profile。因此本客户端不从 Azure 文档推导 HEVC 编号或封装，仍等待精确产品协议/授权抓包和 live 首帧、刷新、恢复证据。
 
-## 2026-09-08：提交 `8e4215b` 的本地验证阶梯
+## 2026-09-08：stride 与 capability probe 的本地验证阶梯
 
 本提交把 YUV420/YUV444 带 stride 平面的最小存储长度计算改为 checked arithmetic。
 当远端声明的高度、stride 和行宽会使 `usize` 计算溢出时，转换边界返回
@@ -36,12 +36,20 @@ AVC420 provider；这条路径会广告 EGFX，但仍必须等待服务器 `Capa
 | RDP 协议测试 | `cargo test --locked -p frd-protocol-rdp --quiet`：181 passed、0 failed |
 | workspace 测试 | `cargo test --locked --workspace --quiet`：508 passed、9 ignored、0 failed |
 | pinned EGFX 与目标检查 | pinned `ironrdp-egfx` 19 项、8 个 Windows/Linux/macOS core/video/plugin target check 通过 |
-| native FFmpeg fixture | macOS arm64 与 x86_64 bundle 的 HEVC/AVC420/AVC444 fixture 各 5/5 通过（x86_64 在 Rosetta 下执行），两个架构的 package verifier 均通过 |
+| native FFmpeg fixture | macOS arm64 与 x86_64 bundle 的 HEVC/AVC420/AVC444 fixture 各 6/6 通过（x86_64 在 Rosetta 下执行），两个架构的 package verifier 均通过 |
 
 该阶梯没有读取凭据，也没有发起新的 RDP live 连接；真实 EGFX `CapabilitiesConfirm`、
 AVC420/AVC444 首帧、持续刷新、恢复和 HEVC wire profile 门禁继续保持关闭。上述结果
 证明本次平面长度修复与现有协议、解码器和 legacy 回退回归兼容，不把本地检查表述为
 服务器互操作证据。
+
+随后 capability probe 修复收紧 FFmpeg capability 探针：插件调用固定 FFmpeg 8.1.2 的
+decoder profile 列表和 `avcodec_get_supported_config(AV_CODEC_CONFIG_PIX_FORMAT)`，只有
+decoder 明确声明目标 profile/YUV 输出时才设置对应 capability bit；FFmpeg 返回 NULL
+配置列表按其 API 约定解释为“支持所有可能值”，API 错误或有限列表缺少目标格式则
+fail-closed。实际解码 frame 仍必须通过 YUV420P/YUV444P 格式检查。替换本次提交后的
+arm64 与 x86_64 plugin bundle 并重新签名后，两架构各 6 项 native fixture、`.app`
+staging 和 package verifier 均通过。
 
 2026-09-07 的离线 H.264 门禁覆盖精确 `H264Avc420/Yuv420P8` 能力匹配、四字节
 AVC length-prefixed NAL 到 Annex-B 的一次性转换、YUV420 三平面尺寸校验、FFmpeg
