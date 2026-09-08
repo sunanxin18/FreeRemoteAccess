@@ -259,6 +259,9 @@ pub trait GraphicsPipelineHandler: Send {
     /// surface ID, destination rectangle, and RGBA pixel data.
     fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
 
+    /// 在 StartFrame 建立当前 frame ID 后调用，早于该帧的图形更新。
+    fn on_frame_started(&mut self, _frame_id: u32) {}
+
     /// Called when a logical frame is complete
     ///
     /// All bitmap updates between the corresponding `StartFrame`
@@ -498,6 +501,7 @@ impl GraphicsPipelineClient {
             GfxPdu::StartFrame(start) => {
                 self.current_frame_id = Some(start.frame_id);
                 self.frames_queued = self.frames_queued.saturating_add(1);
+                self.handler.on_frame_started(start.frame_id);
                 trace!(frame_id = start.frame_id, "StartFrame");
                 Ok(vec![])
             }
@@ -1101,6 +1105,71 @@ mod tests {
         fn on_frame_complete(&mut self, _frame_id: u32) {}
         fn on_close(&mut self) {}
         fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+    }
+
+    fn frame_payload(frame_id: u32) -> Vec<u8> {
+        let pdus = [
+            GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+                timestamp: crate::pdu::Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id,
+            }),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id }),
+        ];
+        // 标准未压缩 ZGFX 单段；生产路径仍仅使用既有 decompressor/parser。
+        let mut payload = vec![0xe0, 0x04];
+        for pdu in pdus {
+            let start = payload.len();
+            payload.resize(start + pdu.size(), 0);
+            pdu.encode(&mut WriteCursor::new(&mut payload[start..]))
+                .unwrap();
+        }
+        payload
+    }
+
+    #[test]
+    fn frame_callbacks_follow_validated_pdu_order() {
+        struct Frames(Arc<Mutex<Vec<(bool, u32)>>>);
+        impl GraphicsPipelineHandler for Frames {
+            fn on_frame_started(&mut self, id: u32) {
+                self.0.lock().unwrap().push((true, id));
+            }
+            fn on_frame_complete(&mut self, id: u32) {
+                self.0.lock().unwrap().push((false, id));
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut client = GraphicsPipelineClient::new(Box::new(Frames(events.clone())), None);
+        for id in [42, 43] {
+            let payload = frame_payload(id);
+            // 整段解析失败时，已解析的 StartFrame 也不能触发回调。
+            assert!(client.process(0, &payload[..payload.len() - 1]).is_err());
+            let count = events.lock().unwrap().len();
+            assert_eq!(count, if id == 42 { 0 } else { 2 });
+            assert_eq!(client.process(0, &payload).unwrap().len(), 1);
+            assert_eq!(client.current_frame_id, None);
+        }
+        assert_eq!(
+            *events.lock().unwrap(),
+            [(true, 42), (false, 42), (true, 43), (false, 43)]
+        );
+        client.decoder_failed = true;
+        client.process(0, &frame_payload(44)).unwrap();
+        assert_eq!(events.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn frame_started_default_handler_remains_compatible() {
+        struct DefaultHandler;
+        impl GraphicsPipelineHandler for DefaultHandler {}
+        let mut client = GraphicsPipelineClient::new(Box::new(DefaultHandler), None);
+        assert_eq!(client.process(0, &frame_payload(7)).unwrap().len(), 1);
+        assert_eq!(client.total_frames_decoded(), 1);
+        assert_eq!(client.current_frame_id, None);
     }
 
     #[test]
