@@ -1,5 +1,14 @@
 # FreeRemoteDesk
 
+2026-09-08 当前进度：macOS 仅支持 ARM64。`50bb103` 完整工作区测试 1651 passed / 0 failed / 16 ignored，ARM64 release 包验证通过。默认生产 RDP 仍为 LegacyOnly；显式 `--rdp-egfx-experiment avc420|avc444` 用于采集互操作证据。
+
+`707b178` 的1280×720探针取得20秒/70帧 ClearCodec/Progressive混合流，实际AVC计数0。新实验GUI在“显示器原生”分辨率下确认EGFX后失败、零首帧，正在定位；默认客户端路径已观察到真实Windows桌面。不能把默认画面或混合流归为H.264验收。
+
+`d597212` 的 Windows run `34188365225` 已整体成功，包括三个架构package和ARM64原生runtime；结合Linux三架构、macOS ARM64记录，Progressive七目标旧提交测试/内核基准已通过。后续行为修复仍需七目标复跑，GUI/输入/实际AVC/恢复与HEVC wire门禁仍独立开放。见[验证记录](docs/validation/rdp-egfx-h264-20260907.md)和[目标基准](docs/validation/progressive-benchmark-20260908.md)。
+
+<details>
+<summary>2026-09-08 历史调试与构建记录（各段只描述当时提交，不代表当前状态）</summary>
+
 > 2026-09-08 Windows/macOS 打包规则已加入 Progressive 的 Apache-2.0 与 FreeRDP 归属资源，固定文件集合及hash校验同步更新。macOS合成签名包正例/9项拒绝场景及现有debug包临时副本验证通过；新Windows原生Pester与正式重打包仍待CI。
 
 > 2026-09-08 Linux i686/x86_64/ARM64 ClearCodec/NSCodec 各38项测试及2项release基准通过（run `34185964017`）。这是目标进程验证；Progressive与GUI互操作仍须独立验收。见 [基准记录](docs/validation/clearcodec-benchmark-20260908.md)。
@@ -62,6 +71,9 @@ Windows run `34181521241` 的 x86 job `101921418321` 已成功：真实 i686 进
 
 该运行修复了 YAML 折叠 shell 续行，以及 FFmpeg configuration 嵌入临时 `--prefix` 的真实路径泄露；现使用固定 `/usr` 加 `DESTDIR` staging，未放宽 verifier。Windows ARM64 已改固定 LLVM-MinGW，Windows x86 使用静态 libgcc，实际包结果仍待新 CI。macOS Intel CI 暴露的负色度 SIMD 乘加错误已在 `53d10de` 修复，Rosetta 完整 RDP 186 项通过，ARM64 YUV 回归 7 项通过；此前本机 ARM64 通过不能代表 Intel 正确性。
 
+
+</details>
+
 FreeRemoteDesk 是纯 Rust 远程登录客户端。当前产品优先实现 Windows
 客户端，通过 Apple 原生远程登录服务连接 macOS；后续客户端目标为 macOS、
 Linux、Android 和 HarmonyOS NEXT，后续服务端目标为 Windows 原生 RDP 与
@@ -100,7 +112,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 |---|---|---|
 | Windows native capability probe | **受限验证** | 2026-09-01 在单台 AMD Radeon 780M Windows 主机完成 D3D12 profile 探针；Main/Main10 报告 hardware exact，Main444 明确不可用。证据为 [`windows-video-capabilities-20260901.json`](docs/validation/windows-video-capabilities-20260901.json)，仅证明能力探针，不证明 native decoder 或远端会话首帧；Task 10 复跑结果见 [`统一视频解码器验收记录`](docs/validation/cross-platform-video-decoder-20260901.md)。 |
 | Windows FFmpeg 8.1.2 Main444 software backend | **受限验证** | 固定签名源码构建的 LGPL 动态插件通过离线 Main444 fixture 精确解码；2026-09-04 Windows x86_64 bundle 已启用 NASM/x86asm，并在 2560x1440 及其竖屏方向使用最多两个 frame threads。新 bundle 通过 Main444、PE imports、manifest、LGPL/对应源码、staging、system-owned 安装器与 trusted-install 门禁；macOS arm64/x86_64 已完成对应 C bridge、plugin 和 native fixture 编译验证，Linux 仍待对应主机执行。证据见 [`Apple HP 延迟验证`](docs/validation/apple-hp-latency-20260904.md)。 |
-| RemoteFX Progressive / EGFX `0x0009` | **受限验证** | 2026-09-08 严格wire/entropy、surface reference与codec DAS生命周期、SSE2/NEON内核及EGFX发布已实现，全RDP300项通过。真实macOS ARM64连接完成20秒混合流持续更新，70帧、Progressive实际解码4次；不代表全部帧均由Progressive生成。Linux三架构和macOS ARM64在先前d597212上各50项目标测试及内核基准通过，最新行为修复需复跑；Windows x86/x64 在同一旧提交上的目标测试及内核基准通过；ARM64 runtime、GUI和长期验证仍未完成。见 [验证记录](docs/validation/rdp-egfx-h264-20260907.md)。 |
+| RemoteFX Progressive / EGFX `0x0009` | **受限验证** | 2026-09-08 严格wire/entropy、surface reference与codec DAS生命周期、SSE2/NEON内核及EGFX发布已实现，全RDP300项通过。真实macOS ARM64连接完成20秒混合流持续更新，70帧、Progressive实际解码4次；不代表全部帧均由Progressive生成。Linux三架构和macOS ARM64在先前d597212上各50项目标测试及内核基准通过，最新行为修复需复跑；Windows x86/x64 在同一旧提交上的目标测试及内核基准通过；ARM64 在同一旧提交的原生 runtime 也已通过；最新修订复跑、GUI和长期验证仍未完成。见 [验证记录](docs/validation/rdp-egfx-h264-20260907.md)。 |
 | H.264 AVC420/AVC444 FFmpeg software bridge | **开发中** | 2026-09-08 已实现 AVC420/AVC444 wire 校验、双流重建、FFmpeg decoder bridge、SSE4.1/NEON 像素转换及协议中立 SurfaceUpdate 接线。固定 FFmpeg 的 Windows/Linux i686、x86_64、ARM64 与 macOS ARM64 七目标 package/runtime fixture 门禁已有证据；macOS Intel 不支持。真实 Windows 已确认 AVC 能力并以 ClearCodec 产生首帧，但实际 AVC420/AVC444 解码计数仍为0，最新ClearCodec/Progressive混合流已完成20秒持续更新，AVC数据仍未收到；能力确认和混合编码首帧不代表 H.264 互操作完成。生产仍使用 LegacyOnly，只有显式有界探针或 macOS ARM64 `--rdp-egfx-experiment avc420|avc444` 验证入口启用 EGFX；后者尚待真实窗口验收。详见 [验证记录](docs/validation/rdp-egfx-h264-20260907.md)。 |
 | Apple High Performance 真机首帧与输入 | **受限验证** | 2026-09-04 在一台授权 stock Mac 上完成用户名/密码 HP 会话、认证 RTP、HEVC Main444 软件解码、精确 present、鼠标/键盘输入与持续刷新验证；当前候选以 `0x1d` mode 0 请求并真机确认 2560x1440 pixels / 2560x1440 points / 60Hz（scale 1），初始 Message `0x1c=0x0d`，确认会话内降档时只写一次同几何 30Hz `0x1d`，不重启认证、不发送第二个 `0x1c`。Standard/MVS 保持 `0x1c=0x0c`。当前安装候选 SHA-256 为 `6F3368FE16D05246F54DC6713B0CE7EC3F98B5F508F31AEC2E33305F6DDF8E9A`；20.295 秒受限运动负载记录 246 次呈现，Mac 保持 60Hz；该负载不是持续 60-FPS source，不能作为 decoder 最大吞吐或长期网络结论。证据见 [`Apple HP 延迟验证`](docs/validation/apple-hp-latency-20260904.md)。 |
 | macOS / Linux native video backend | **受限验证** | macOS 仅支持 ARM64：FFmpeg builder、stager、verifier 明确拒绝 Intel/x86_64，CI 仅使用 `aarch64-apple-darwin`。2026-09-08 ARM64 package、原生 decoder fixture 和产物门禁通过（run `34182980384`）。Linux i686、x86_64、ARM64 的固定 FFmpeg plugin 原生/32 位进程 fixture 与 ELF/ABI 门禁通过（run `34181521242`）；Linux GUI 包与真机控制仍未验收。历史 macOS Intel/Rosetta 记录不属于当前支持范围。 |

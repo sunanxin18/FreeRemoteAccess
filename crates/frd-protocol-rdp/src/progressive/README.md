@@ -40,8 +40,12 @@ Hewlett-Packard Development Company, L.P. (2012)。
 逐系数/像素相同；8个 DWT 输入输出指纹已固化到kernel tests。
 
 SSE2/NEON六个Windows/Linux target的kernel编译不等于目标运行；完整七目标runtime、
-端到端 Progressive 首帧/持续刷新、GUI验收仍未完成。不能将这些测试作为生产EGFX开放依据。
+完整客户端 GUI 与恢复验收仍未完成；后续有界混合流证据见下文。不能将这些测试作为生产EGFX开放依据。
 
 EGFX接线回归：285项RDP测试通过（3 ignored），实际PDU覆盖native first/upgrade、
 offscreen映射、DeleteContext保留reference、1080p 510tile精确合并与失败清理。
-此时live仍待执行，默认生产门禁保持关闭。
+上述测试为接线阶段证据。后续 `707b178` 授权探针已取得持续 20 秒/70 帧的
+真实混合流记录，但 AVC 计数为 0，不能据此验收 AVC420/AVC444。当前源码核对
+至 `50bb103`：`WireToSurface2` 已接通实验性 Progressive 路径；默认生产广告仍为
+`LegacyOnly`。最新修订的完整七目标 parity/benchmark、客户端 GUI 与恢复验收
+仍开放，见 [验证记录](../../../../docs/validation/rdp-egfx-h264-20260907.md)。

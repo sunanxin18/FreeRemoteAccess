@@ -38,4 +38,13 @@ macOS仅覆盖ARM64；没有Intel构建或验收。
 
 计时范围仍为单分量 DWT + BGRA；不是完整协议或端到端延迟。两项 package job
 成功不等于 Windows GUI 真机连接验收。ARM64 原生 runtime job `101947137153`
-仍在执行，暂不将其记为成功。上述目标也必须复跑 d597212 之后的行为修复。
+随后成功，结果见下文。上述目标也必须复跑 d597212 之后的行为修复。
+
+## Windows ARM64 与旧提交七目标闭合
+
+run `34188365225` 整体 success；原生 ARM64 job `101947137153` 的
+Progressive/邻近 EGFX 50项通过、1项默认 ignored，显式release基准通过：
+Normal 23.06 µs/tile，ReduceExtrapolate 28.30 µs/tile。
+同job的ClearCodec/NSCodec 38项通过、2项默认ignored，随后2项显式基准通过，
+随包FFmpeg6项fixture通过。结合上文，d597212的Progressive七目标测试/内核基准
+已有全部成功记录；不包含后续协议修复，不证明七平台产品GUI或真实AVC。

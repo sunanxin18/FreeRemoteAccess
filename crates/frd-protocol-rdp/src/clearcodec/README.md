@@ -1,4 +1,4 @@
-# ClearCodec 状态层（尚未生产接线）
+# ClearCodec 状态层与实验性 EGFX 接线
 
 `Decoder<K, N>` 接收像素内核和独立的 NSCodec provider。协议层复用 IronRDP
 0.9.0 顶层、residual、subcodec 公共 parser；对 parser 不消费的短尾显式拒绝。
@@ -28,7 +28,13 @@ IronRDP 公共 PDU 类型和 parser 仍作为现有 Apache-2.0/MIT 依赖使用�
 Limits 同时限制输入、输出像素、像素工作量和覆盖区间数量。后者避免高度重叠的
 合法区域把像素工作量转化为过大的区间元数据分配。
 
-接线要求：同一远程会话全部 ClearCodec 消息共用一个 decoder，不能按 surface
-分别维护序号。解码失败后需要终止或显式重同步图形流，不能跳过失败消息后继续。
-生产使用仍要求完整 NSCodec provider、各目标 SIMD parity/benchmark、EGFX 接线、
-真实服务端首帧与持续更新证据。macOS 仅 ARM64；Windows/Linux 保留 i686、x64、ARM64。
+当前接线（2026-09-08，源码核对至 `50bb103`）：EGFX `WireToSurface1` 已分发
+ClearCodec；同一远程会话共用一个 decoder，序号不按 surface 划分。`SimdNsCodec`
+提供严格 NSCodec 子码流解析和 SSE2/NEON 颜色转换，像素内核缺失时构造失败。
+错误会关闭不可信图形路径并清理待发布状态；这不证明服务器已恢复 legacy 输出。
+
+该路径仅为显式 opt-in 的实验性 EGFX，默认生产广告保持 `LegacyOnly`。
+`707b178` 已有持续 20 秒/70 帧的真实混合流记录，AVC 计数为 0；这不证明
+AVC420/AVC444 互操作。最新修订的七目标 SIMD parity/benchmark、完整客户端
+GUI 与恢复验收仍开放，详见 [验证记录](../../../../docs/validation/rdp-egfx-h264-20260907.md)。
+macOS 仅 ARM64；Windows/Linux 保留 i686、x86_64、ARM64。
