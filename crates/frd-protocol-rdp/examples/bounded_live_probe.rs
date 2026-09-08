@@ -324,8 +324,22 @@ fn run() -> Result<(), &'static str> {
         None,
         Box::new(Wake),
     );
+    // 高频编码计数最多每五秒输出一次；能力、编码类型和失败状态变化立即输出。
+    let last_graphics_log = Mutex::new(None::<(RdpGraphicsCapabilities, Instant)>);
     let graphics_observer: Arc<dyn RdpGraphicsObserver> = Arc::new(
-        |capabilities: RdpGraphicsCapabilities| {
+        move |capabilities: RdpGraphicsCapabilities| {
+            let mut summary = capabilities;
+            summary.egfx_diagnostics.unhandled_codec_count = 0;
+            let mut last = last_graphics_log
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if last.as_ref().is_some_and(|(previous, time)| {
+                *previous == summary && time.elapsed() < Duration::from_secs(5)
+            }) {
+                return;
+            }
+            *last = Some((summary, Instant::now()));
+            drop(last);
             println!(
                 "RDP 图形能力 legacy_bitmap={} remotefx={} egfx_advertised={} egfx_confirmed={} egfx_frame_confirmed={} avc420={} avc444={}",
                 capabilities.legacy_bitmap,
