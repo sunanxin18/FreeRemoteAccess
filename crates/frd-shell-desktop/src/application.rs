@@ -7146,6 +7146,168 @@ mod tests {
     }
 
     #[test]
+    fn hidden_island_real_egui_consumption_restores_remote_input_without_bypassing_guards() {
+        use crate::input::{KeyboardDomain, KeyboardPreDispatch};
+        use crate::{InputGate, InputOwnership, InputRouter};
+        use frd_core::{ButtonState, KeyState, PhysicalKeyCode, PointerButton};
+
+        let context = egui::Context::default();
+        context.set_fonts(super::system_font_definitions());
+        let extent = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 640.0));
+        let render = |visible, events| {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(extent),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    frd_ui_egui::show_control_island(
+                        ui,
+                        frd_ui_egui::ControlIslandRenderInput {
+                            model: &super::TEST_SESSION_CHROME,
+                            window_capabilities: frd_ui_model::IslandWindowCapabilities::NONE,
+                            visible,
+                            maximized: false,
+                            island_rect: egui::Rect::from_min_size(
+                                egui::pos2(240.0, 0.0),
+                                egui::vec2(480.0, 52.0),
+                            ),
+                            reveal_line_rect: egui::Rect::from_min_size(
+                                egui::pos2(460.0, 0.0),
+                                egui::vec2(40.0, 2.0),
+                            ),
+                            focus_first: false,
+                            opaque_material: true,
+                            shell_diagnostic: None,
+                        },
+                    );
+                },
+            );
+            output.textures_delta.clear();
+        };
+        // 先建立真实 Area，逐帧检查隐藏过渡；不伪造 consumed。
+        render(
+            true,
+            vec![egui::Event::PointerMoved(egui::pos2(480.0, 25.0))],
+        );
+        render(true, vec![]);
+        assert!(context.egui_wants_pointer_input());
+        let position = egui::pos2(480.0, 300.0);
+        render(false, vec![egui::Event::PointerMoved(position)]);
+        assert!(
+            !context.egui_wants_pointer_input(),
+            "首个隐藏 pass 不得吞掉内容区点击"
+        );
+        render(false, vec![]);
+        // egui-winit 0.36.1 MouseInput 的 consumed 正是此查询，排队按钮不会先运行新 pass。
+        let consumed = context.egui_wants_pointer_input();
+        assert!(!consumed);
+        render(
+            false,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!context.egui_wants_pointer_input());
+        render(
+            false,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        let rect = PixelRect {
+            x: 0,
+            y: 52,
+            width: 960,
+            height: 588,
+        };
+        let hit_map = crate::ChromeHitMap::candidate(rect, vec![], None, None, vec![]).unwrap();
+        let viewport = ContentViewport::fit_in(
+            PixelSize::new(960, 588).unwrap(),
+            PixelSize::new(960, 640).unwrap(),
+            rect,
+        )
+        .unwrap();
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum InputCase {
+            Ready,
+            Unfocused,
+            LocalKeyHeld,
+            NoInteractiveEpoch,
+        }
+        for guard in [
+            InputCase::Ready,
+            InputCase::Unfocused,
+            InputCase::LocalKeyHeld,
+            InputCase::NoInteractiveEpoch,
+        ] {
+            let mut input = InputRouter::default();
+            input.focus_gained();
+            if guard != InputCase::NoInteractiveEpoch {
+                input.set_gate(InputGate::Interactive {
+                    session_id: SessionId::allocate(),
+                    generation: 1,
+                });
+            }
+            input.enter_local_chrome();
+            if guard == InputCase::Unfocused {
+                input.focus_lost();
+            }
+            if guard == InputCase::LocalKeyHeld {
+                input.key(
+                    PhysicalKeyCode::from_usb_hid_usage(0x05),
+                    KeyState::Pressed,
+                    InputOwnership::Ui,
+                );
+            }
+            let ownership = super::effective_pointer_keyboard_ownership(
+                &hit_map,
+                Some(viewport),
+                (480, 300),
+                consumed,
+                input.interactive_epoch().is_some(),
+            )
+            .unwrap();
+            input.pointer_moved(480.0, 300.0, viewport, ownership);
+            input.pointer_pressed_for_domain(ownership);
+            let pointer = input.pointer_button(
+                PointerButton::Primary,
+                ButtonState::Pressed,
+                viewport,
+                ownership,
+            );
+            let key = input.dispatch_key_event(
+                Some(PhysicalKeyCode::from_usb_hid_usage(0x04)),
+                KeyState::Pressed,
+                false,
+                true,
+                false,
+            );
+            if guard == InputCase::Ready {
+                assert_eq!(input.keyboard_domain(), KeyboardDomain::RemoteSurface);
+                assert!(pointer.is_some());
+                assert!(matches!(key, KeyboardPreDispatch::Remote(Some(_))));
+            } else {
+                assert!(
+                    !matches!(key, KeyboardPreDispatch::Remote(Some(_))),
+                    "guard={guard:?}"
+                );
+                if guard != InputCase::LocalKeyHeld {
+                    assert!(pointer.is_none(), "guard={guard:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hidden_reveal_line_does_not_pin_the_control_island() {
         let now = Instant::now();
         let mut chrome = crate::FloatingChromeController::connected_default(now);

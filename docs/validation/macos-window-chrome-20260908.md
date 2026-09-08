@@ -69,3 +69,23 @@ surface/context ID、失败矩形、缺失 tile 坐标，以及本帧/本 region
 和新 adapter 无旧诊断。完整 `cargo test --locked --workspace` 终态 exit 0：
 58 组、1666 passed / 0 failed / 16 ignored。RDP 单独 309 passed / 3 ignored。
 该诊断版本尚未接管当前用户会话进行真实复现，不能据此声明 coverage 根因已修复。
+
+## 锁屏期间的输入与协议核查
+
+后续 CUA 检查确认本机锁屏且自动解锁失败，因此未接管、重启或断开当前客户端。
+只读代码审查没有发现控制岛隐藏时修改原生窗口焦点或关闭 InputRouter 的动作。
+RemoteSurface 键盘域先于 egui 分发；指针仍受 egui consumed、命中矩形、原生焦点和
+交互 epoch 保护，不能为了绕过未复现故障而移除这些门控。
+
+新增真实 egui Context 回归：先绘制可见控制岛并确认消费指针，移动到远程内容后，
+首个隐藏 pass 即不再消费指针，第二个 pass 及按下/释放继续核验。将实际消费结果
+交给现有归属判定和 InputRouter，验证点击恢复 RemoteSurface 后可发送指针及按键；
+失焦、本地按键未释放及缺失交互 epoch 时仍保留保护。既有及新增 shell 215项
+全部通过。测试没有运行 AppKit/winit 原生事件循环或真实网络发送，不能据此关闭
+用户报告的现场故障。
+
+再次核对微软 [MS-RDPEGFX 2023-09-20 §2.2.4.2.1.5](https://winprotocoldoc.z19.web.core.windows.net/MS-RDPEGFX/%5BMS-RDPEGFX%5D-230920.pdf)：
+region 的覆盖瓦片必须来自该 region 或当前外层帧中先前的 region。当前解码器在
+外层 EGFX Start/End 边界清空 frame_tiles，不在 codec 内层 FrameBegin/End 清空。
+因此没有依据通过读取上一外层帧的像素来消除错误。规范核查支持保留现有校验，
+不证明真实失败是服务端违规；实际失败几何仍须在解锁后采集。
