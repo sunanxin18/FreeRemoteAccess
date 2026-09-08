@@ -245,3 +245,26 @@ invalidate才撤销。无Surface paint的纯tick不等于窗口提交失败，�
 有paint无事务receipt的重绘仍检查关联上下文GL/EGL错误，但不要求最终非空
 drawable；有事务receipt保持全部原提交门禁。原生fixture必须在下一UPDATE
 消费并继续一个纯tick，不能以两帧间的主动轮询或碰巧到来的网络消息验收。
+
+### 原生键盘身份与输入接线边界
+
+物理键使用 GTK 当前有效 XKB 键表的标准键名转换到 USB HID；数字 keycode
+和 keyval/Unicode 都不能决定物理位置。公共键名表供 X11、Wayland 共用，
+显式 LinuxEvdevPlus8 只保留在已确认该编号体系的兼容路径。未知或冲突名称
+返回不可用，不自动借用另一个布局的字符键。
+
+Wayland 使用 GTK 公开
+[get_xkb_keymap](https://github.com/GNOME/gtk/blob/4.14.0/gdk/wayland/gdkwaylanddevice.h)
+获取事件设备的当前借用表；查询直接使用 GTK hardwarecode，不再次加减8。
+X11 使用事件设备的实际设备ID与 XKB names，而不是默认core keyboard。
+这两个原生provider仍待实现；纯键名fixture不等于 compositor 事件验证。
+GTK可在无效Wayland表时保留旧/default表，因此不声称验证了原始compositor FD。
+
+输入接线继续复用 InputRouter、KeyOwnershipState 与 AppController.route_input。
+需要从 controller 公开仅 RemoteSession 有效的 session/generation 查询，以及
+从adapter公开与当前绘制完全一致且可失效的 ContentViewport。失焦、进入chrome、
+关闭或代际切换前，先通过旧路由发送ReleaseAll，再撤销归属epoch与IM回调token。
+成功发送press以后记录hardwarecode对应HID，repeat/release使用该值以抵御键表切换；
+该表不重复InputRouter的修饰键或held-state。发送失败统一停止当前输入epoch。
+同步IM filter在释放宿主可变借用后执行，commit暂存后由归属结果决定发送；
+异步commit必须携带旧context绑定时取得的token，不得现场重新绑定获得授权。
