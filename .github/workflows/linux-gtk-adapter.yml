@@ -1,0 +1,152 @@
+name: Linux GTK frame adapter
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/**", "main"]
+    paths:
+      - "crates/frd-shell-gtk/**"
+      - "crates/frd-render-gl/**"
+      - "crates/frd-render-state/**"
+      - "crates/frd-frame/**"
+      - "crates/frd-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/linux-gtk-adapter.yml"
+  pull_request:
+    paths:
+      - "crates/frd-shell-gtk/**"
+      - "crates/frd-render-gl/**"
+      - "crates/frd-render-state/**"
+      - "crates/frd-frame/**"
+      - "crates/frd-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/linux-gtk-adapter.yml"
+permissions:
+  contents: read
+concurrency:
+  group: linux-gtk-adapter-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-adapter:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: i686
+            target: i686-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install native GTK and isolated display runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            sudo dpkg --add-architecture i386
+            suffix=:i386
+          fi
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config \
+            dbus-x11 xvfb xauth weston "libgtk-4-dev$suffix" "libepoxy-dev$suffix" \
+            "libgl1-mesa-dri$suffix" "libegl-mesa0$suffix" "libglx-mesa0$suffix"
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu libc6-dev-i386-cross libc6-i386
+            echo 'CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc' >> "$GITHUB_ENV"
+            echo 'PKG_CONFIG_ALLOW_CROSS=1' >> "$GITHUB_ENV"
+            echo 'PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig' >> "$GITHUB_ENV"
+          fi
+      - name: Build target adapter and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.96.0 --profile minimal
+          test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
+          rustup target add "${{ matrix.target }}" --toolchain 1.96.0
+          cargo test --locked -p frd-shell-gtk --features gtk-shell \
+            --target "${{ matrix.target }}" --no-run
+          cargo test --locked -p frd-shell-gtk --features gtk-shell \
+            --target "${{ matrix.target }}" --lib
+      - name: Exercise real GTK adapter on X11 and Wayland
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_dir="$PWD/target/linux-gtk-adapter-logs"
+          mkdir -p "$log_dir"
+          runtime_root="$(mktemp -d)"
+          chmod 700 "$runtime_root"
+          export XDG_RUNTIME_DIR="$runtime_root"
+          weston_pid=""
+          cleanup() {
+            if [[ -n "$weston_pid" ]]; then
+              kill "$weston_pid" 2>/dev/null || true
+              wait "$weston_pid" 2>/dev/null || true
+            fi
+            rm -rf "$runtime_root"
+          }
+          trap cleanup EXIT
+          export LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=gl G_DEBUG=fatal-criticals
+          run_fixture() {
+            cargo test --locked -p frd-shell-gtk --features gtk-shell \
+              --target "${{ matrix.target }}" --test native_gtk \
+              native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture
+          }
+          export -f run_fixture
+          for scale in 1 2; do
+            timeout --kill-after=5s 120s env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+              GDK_BACKEND=x11 GDK_SCALE="$scale" FRD_GTK_TEST_BACKEND=x11 FRD_GTK_TEST_SCALE="$scale" \
+              xvfb-run -a -s '-screen 0 2400x1800x24' dbus-run-session -- bash -c run_fixture \
+              2>&1 | tee "$log_dir/x11-$scale.log"
+          done
+          for scale in 1 2; do
+            export XDG_RUNTIME_DIR="$runtime_root/wayland-$scale"
+            mkdir -m 700 "$XDG_RUNTIME_DIR"
+            timeout --kill-after=5s 150s env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+              weston --backend=headless-backend.so --renderer=pixman --no-config \
+              --socket=frd-adapter --idle-time=0 --width=2400 --height=1800 --scale="$scale" \
+              --log="$log_dir/weston-$scale.log" > "$log_dir/weston-$scale.stdout.log" 2>&1 &
+            weston_pid=$!
+            for attempt in {1..100}; do
+              [[ -S "$XDG_RUNTIME_DIR/frd-adapter" ]] && break
+              kill -0 "$weston_pid"
+              sleep 0.1
+            done
+            test -S "$XDG_RUNTIME_DIR/frd-adapter"
+            timeout --kill-after=5s 120s env -u DISPLAY -u GDK_SCALE -u GDK_DPI_SCALE -u WAYLAND_SOCKET \
+              GDK_BACKEND=wayland WAYLAND_DISPLAY=frd-adapter \
+              FRD_GTK_TEST_BACKEND=wayland FRD_GTK_TEST_SCALE="$scale" \
+              dbus-run-session -- bash -c run_fixture 2>&1 | tee "$log_dir/wayland-$scale.log"
+            kill "$weston_pid" 2>/dev/null || true
+            wait "$weston_pid" 2>/dev/null || true
+            weston_pid=""
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          for backend in ('x11', 'wayland'):
+              for scale in (1, 2):
+                  text = Path(f'target/linux-gtk-adapter-logs/{backend}-{scale}.log').read_text()
+                  results = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', text)
+                  if results != [('1', '0', '0')]:
+                      raise SystemExit(f'{backend}/{scale}: expected exactly one executed native test')
+          PY
+      - name: Upload native adapter diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-gtk-adapter-${{ matrix.arch }}
+          path: target/linux-gtk-adapter-logs
+          if-no-files-found: warn

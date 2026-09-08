@@ -29,6 +29,7 @@ members = [
     "crates/frd-platform-linux",
     "crates/frd-ui-egui",
     "crates/frd-shell-desktop",
+    "crates/frd-shell-gtk",
     "apps/freeremotedesk-windows",
     "apps/freeremotedesk-macos",
     "apps/freeremotedesk-linux",

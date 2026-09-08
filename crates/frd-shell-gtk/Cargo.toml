@@ -1,0 +1,20 @@
+[package]
+name = "frd-shell-gtk"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+gtk-shell = ["dep:gtk4", "dep:libloading", "frd-render-gl/linux-gl"]
+
+[dependencies]
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-render-gl = { path = "../frd-render-gl" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "=0.9.7", features = ["v4_14"], optional = true }
+libloading = { version = "=0.8.9", optional = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+glow = "=0.17.0"

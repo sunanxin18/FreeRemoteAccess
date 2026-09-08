@@ -249,3 +249,25 @@ GTK最终snapshot颜色和完整产品会话仍待接线验收；7bf失败记录
 101998579637及ARM64原生job102008224653均完成。原生日志/tmp/frd-windows-arm64-095.log
 明确6项DLL测试、38项ClearCodec/NSCodec与2项显式基准、61项Progressive相关与1项
 显式基准通过。同revision七目标包/解码验证闭合，不涵盖后来GTK/颜色输出改动。
+
+
+## Rust GTK 帧适配器接线（原生运行待验证）
+
+新增 `frd-shell-gtk`，以 Linux 专属可选依赖固定 gtk4-rs 0.9.7 / GTK 4.14 API。
+适配层直接接收 FrameTransaction，在 GLArea render 中执行 GL 上传与绘制，
+每次重新读取当前目标，使用明确的 SrgbEncodedRgba8 输出契约；不复制协议或解码。
+单槽队列有事务数和字节数上限，Busy/上下文不可用时原样退回所有权。
+普通 unrealize 撤销旧回执并要求新的 Startup；Drop 不调用 GL。
+独立审查发现并修复未 realize 时 make_current 和错误 context 接收后挂起两项问题。
+
+本机 macOS 的纯队列/几何测试 4 项通过；Windows 目标依赖树确认未引入 GTK。
+这不证明 GTK 原生编译。新 linux-gtk-adapter workflow 覆盖 i686/x86_64/ARM64，
+每架构 X11/Wayland 各 1×/2×，严格执行唯一 native fixture，GTK critical 为致命错误。
+fixture 使用真实完整帧、增量像素、unrealize/re-realize 和错误 context 注入，
+测试专用读回检查颜色、方向、alpha 和实际 scale。原生结果待 CI，不称已验证。
+Drawn 只报告 GL 命令提交；完整窗口 snapshot、输入、登录与生产呈现 ACK 尚未接线。
+
+同日 c349a72 Linux 完整包 run34210589009 三目标再次成功：
+aarch64 job102010538524、x86_64 job102010538969、i686 job102010539043。
+下载日志核对应用 20+2 项、包校验和目标进程解码器加载；日志保存在
+`/tmp/frd-linux-c349-{aarch64,x64,i686}.log`。此轮不包含新增 GTK 适配器。
