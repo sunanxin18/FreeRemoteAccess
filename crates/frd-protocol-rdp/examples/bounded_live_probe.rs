@@ -533,7 +533,7 @@ fn run() -> Result<(), &'static str> {
         ProtocolExit::Closed if counts.frames == 0 => Err("probe_no_decoded_frames"),
         ProtocolExit::Closed => {
             let latest = final_graphics.lock().map_err(|_| "probe_graphics_failed")?;
-            validate_egfx_result(egfx_mode, latest.as_ref().map(|c| &c.egfx_diagnostics))
+            validate_egfx_result(egfx_mode, latest.as_ref())
         }
     }
 }
@@ -541,14 +541,18 @@ fn run() -> Result<(), &'static str> {
 // AVC opt-in 必须验证真实 codec 使用，不能以 ClearCodec 首帧替代 AVC 验收。
 fn validate_egfx_result(
     mode: Option<ProbeEgfxMode>,
-    diagnostics: Option<&frd_protocol_rdp::RdpEgfxDiagnostics>,
+    capabilities: Option<&RdpGraphicsCapabilities>,
 ) -> Result<(), &'static str> {
     let Some(mode) = mode else {
         return Ok(());
     };
-    let evidence = diagnostics.ok_or("probe_egfx_evidence_missing")?;
+    let capabilities = capabilities.ok_or("probe_egfx_evidence_missing")?;
+    let evidence = &capabilities.egfx_diagnostics;
     if evidence.failure_count != 0 {
         return Err("probe_egfx_pipeline_failed");
+    }
+    if !capabilities.egfx_frame_confirmed {
+        return Err("probe_egfx_no_runtime_egfx_frame");
     }
     let decoded = match mode {
         ProbeEgfxMode::Avc420 => evidence.avc420_decoded_pictures_total,
@@ -581,21 +585,40 @@ mod tests {
             frames_runtime_accepted_total: 2,
             ..Default::default()
         };
+        let mut capabilities = frd_protocol_rdp::RdpGraphicsCapabilities {
+            legacy_bitmap: true,
+            remotefx: true,
+            egfx_advertised: true,
+            egfx_frame_confirmed: true,
+            egfx_diagnostics: evidence,
+            egfx_confirmed: true,
+            avc420: true,
+            avc444: true,
+        };
         assert_eq!(
-            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&evidence)),
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&capabilities)),
             Err("probe_requested_avc_not_decoded")
         );
         evidence.avc444_decoded_updates_total = 1;
+        capabilities.egfx_diagnostics = evidence;
         assert_eq!(
-            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&evidence)),
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&capabilities)),
             Ok(())
         );
         evidence.failure_count = 1;
+        capabilities.egfx_diagnostics = evidence;
         assert_eq!(
-            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&evidence)),
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&capabilities)),
             Err("probe_egfx_pipeline_failed")
         );
         assert_eq!(super::validate_egfx_result(None, None), Ok(()));
+        capabilities.egfx_frame_confirmed = false;
+        evidence.failure_count = 0;
+        capabilities.egfx_diagnostics = evidence;
+        assert_eq!(
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&capabilities)),
+            Err("probe_egfx_no_runtime_egfx_frame")
+        );
     }
 
     #[test]
