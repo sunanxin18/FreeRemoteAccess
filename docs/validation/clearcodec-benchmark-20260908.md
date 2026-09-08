@@ -34,3 +34,15 @@ i686在x86_64宿主运行i686目标进程，日志报告 `arch=x86`，不是x64�
 
 沿用上文固定工作量与单位。不同CI宿主CPU、频率和内存环境不同，不能据此排名架构。
 这些是ClearCodec/NSCodec测试，不含随后新增Progressive，不是GUI或网络性能证据。
+
+## macOS ARM64 托管验证
+
+提交 `9813987` 的 run `34185963989`、job `101934224206` 整体成功。
+日志确认 ClearCodec/NSCodec 38项通过、2项默认ignored，随后2个release benchmark通过；
+固定FFmpeg的6项fixture亦通过。仅ARM64，不包含Intel或后续新增Progressive。
+
+| 目标 | fill MiB/s | copy MiB/s | expand MiB/s | scatter MiB/s | NS 15×10 ns/decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| macOS ARM64 hosted | 48137.590 | 33841.490 | 47067.119 | 3752.859 | 1016.395 |
+
+工作量与上文一致；该离线微基准不是完整三分量解码、网络延迟或GUI性能验证。
