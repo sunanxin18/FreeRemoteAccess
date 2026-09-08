@@ -208,6 +208,19 @@ impl Backings {
         self.cache.clear();
         self.used = 0;
     }
+    // MS-RDPEGFX 3.3.5.14 仅重置输出；Bitmap Cache 由独立 Evict 生命周期管理。
+    pub fn clear_surfaces(&mut self) {
+        self.surfaces.clear();
+        // 已计费的 cache 是 used 的子集，因此重新求和不会溢出或重复扣费。
+        self.used = self
+            .cache
+            .values()
+            .map(|image| Image::byte_cost(image.size).unwrap())
+            .sum();
+    }
+    pub fn contains_cache(&self, slot: u16) -> bool {
+        self.cache.contains_key(&slot)
+    }
     pub fn create(&mut self, id: u16, size: PixelSize) -> Result<()> {
         if self.surfaces.contains_key(&id) {
             return Err(());
@@ -416,6 +429,37 @@ mod tests {
         b.clear();
         assert_eq!(b.used, 0);
         assert!(!b.contains(2));
+    }
+    #[test]
+    fn repeated_surface_reset_preserves_cache_charge_and_eviction_releases_it() {
+        let mut b = Backings::new(48).unwrap();
+        let size = PixelSize::new(2, 2).unwrap();
+        b.create(1, size).unwrap();
+        b.fill(1, &[r(0, 0, 2, 2)], [1, 2, 3, 255]).unwrap();
+        b.cache_surface(1, r(0, 0, 2, 2), 3).unwrap();
+        assert_eq!(b.used, 48);
+        for _ in 0..3 {
+            b.clear_surfaces();
+            assert_eq!(b.used, 24);
+            assert!(b.contains_cache(3));
+            b.create(2, size).unwrap();
+            assert_eq!(b.used, 48);
+            assert!(b.create(4, PixelSize::new(1, 1).unwrap()).is_err());
+            b.copy_cache(3, 2, &[(0, 0)]).unwrap();
+            assert_eq!(b.read(2, r(0, 0, 2, 2)).unwrap(), [1, 2, 3, 255].repeat(4));
+        }
+        b.clear_surfaces();
+        b.clear_surfaces();
+        assert_eq!(b.used, 24);
+        b.evict(3).unwrap();
+        assert_eq!(b.used, 0);
+        assert!(b.copy_cache(3, 2, &[(0, 0)]).is_err());
+        b.create(1, size).unwrap();
+        b.fill(1, &[r(0, 0, 2, 2)], [1, 2, 3, 255]).unwrap();
+        b.cache_surface(1, r(0, 0, 2, 2), 3).unwrap();
+        b.clear();
+        assert_eq!(b.used, 0);
+        assert!(!b.contains_cache(3));
     }
     #[test]
     fn overlapping_copy_uses_snapshot_and_bad_second_destination_is_transactional() {

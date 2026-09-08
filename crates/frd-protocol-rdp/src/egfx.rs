@@ -1709,7 +1709,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         state.output_size = Some(size);
         state.revision = 0;
         state.surfaces.clear();
-        state.backings.clear();
+        state.backings.clear_surfaces();
         state.coverage = Some(coverage);
         state.baseline_established = false;
         state.baseline_published = false;
@@ -1915,6 +1915,10 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
             return;
         }
         let result = (|| {
+            if !state.backings.contains_cache(pdu.cache_slot) {
+                Self::publisher_error(&mut state, "cache_to_surface:missing slot");
+                return Err(());
+            }
             Self::ensure_backing(&mut state, pdu.surface_id)?;
             let points: Vec<_> = pdu.destination_points.iter().map(|p| (p.x, p.y)).collect();
             let rects = state
@@ -4994,6 +4998,66 @@ mod tests {
         );
     }
     #[test]
+    fn bitmap_cache_survives_reset_and_recreate_until_explicit_eviction() {
+        use ironrdp_egfx::pdu::{CacheToSurfacePdu, EvictCacheEntryPdu, Point, SurfaceToCachePdu};
+        let mut adapter = clear_adapter(2, 2);
+        let rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 2,
+        };
+        clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+        process_gfx_pdu(
+            &mut adapter,
+            clear_wire(1, 0, rect.clone(), [9, 8, 7], false),
+        );
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::SurfaceToCache(SurfaceToCachePdu {
+                surface_id: 1,
+                cache_key: 55,
+                cache_slot: 3,
+                source_rectangle: rect,
+            }),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }));
+        adapter.drain_surface_updates();
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width: 2,
+                height: 2,
+                monitors: Vec::new(),
+            }),
+        );
+        clear_surface(&mut adapter, 2, 2, 2, 0, 0);
+        let copy = CacheToSurfacePdu {
+            cache_slot: 3,
+            surface_id: 2,
+            destination_points: vec![Point { x: 0, y: 0 }],
+        };
+        process_gfx_pdu(&mut adapter, GfxPdu::CacheToSurface(copy.clone()));
+        process_gfx_pdu(&mut adapter, GfxPdu::EndFrame(EndFramePdu { frame_id: 2 }));
+        assert!(!adapter.is_failed(), "{:?}", adapter.diagnostics());
+        let updates = adapter.drain_surface_updates();
+        assert!(updates
+            .iter()
+            .any(|u| matches!(u, SurfaceUpdate::Damage { patches, .. }
+            if patches.len() == 1 && patches[0].pixels.as_bytes() == [9,8,7,255].repeat(4))));
+        process_gfx_pdu(
+            &mut adapter,
+            GfxPdu::EvictCacheEntry(EvictCacheEntryPdu { cache_slot: 3 }),
+        );
+        process_gfx_pdu(&mut adapter, GfxPdu::CacheToSurface(copy));
+        assert!(adapter.is_failed());
+        assert_eq!(
+            adapter.diagnostics().publisher_failure_detail,
+            Some("cache_to_surface:missing slot")
+        );
+    }
+
+    #[test]
     fn publication_rejects_aggregate_bytes_before_backing_reads() {
         let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
         let mut state = super::lock_state(&publisher.state);
@@ -5469,7 +5533,7 @@ mod tests {
         assert!(adapter.is_failed());
         assert_eq!(
             adapter.diagnostics().publisher_failure_detail,
-            Some("cache_to_surface:copy cache")
+            Some("cache_to_surface:missing slot")
         );
         assert_eq!(
             adapter.diagnostics().publisher_failure_operation,
