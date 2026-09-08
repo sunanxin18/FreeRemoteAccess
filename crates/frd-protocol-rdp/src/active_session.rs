@@ -384,6 +384,7 @@ fn observe_egfx_confirmation(
         return;
     };
 
+    graphics_capability.egfx_diagnostics = adapter.diagnostics();
     apply_egfx_confirmation(
         graphics_capability,
         adapter.is_active(),

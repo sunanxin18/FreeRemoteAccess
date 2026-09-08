@@ -27,7 +27,7 @@ use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
     RDP_NLA_FAILED, RDP_TCP_FAILED, RDP_TLS_FAILED,
 };
-use crate::factory::{RdpGraphicsAdvertisementGate, RdpGraphicsCapabilities};
+use crate::factory::{RdpEgfxDiagnostics, RdpGraphicsAdvertisementGate, RdpGraphicsCapabilities};
 use crate::runtime::{
     wait_for_blocking, wait_for_network_future, CancellationCheckedIo, StageCancellation,
 };
@@ -59,6 +59,7 @@ pub(crate) struct RdpGraphicsCapability {
     pub(crate) legacy_bitmap: bool,
     pub(crate) remotefx: bool,
     pub(crate) egfx_advertised: bool,
+    pub(crate) egfx_diagnostics: RdpEgfxDiagnostics,
     pub(crate) egfx_confirmed: bool,
     pub(crate) egfx_frame_confirmed: bool,
     pub(crate) avc420: bool,
@@ -71,6 +72,7 @@ impl RdpGraphicsCapability {
             legacy_bitmap: self.legacy_bitmap,
             remotefx: self.remotefx,
             egfx_advertised: self.egfx_advertised,
+            egfx_diagnostics: self.egfx_diagnostics,
             egfx_confirmed: self.egfx_confirmed,
             egfx_frame_confirmed: self.egfx_frame_confirmed,
             avc420: self.avc420,
@@ -91,6 +93,13 @@ pub(crate) const fn baseline_graphics_capabilities() -> RdpGraphicsCapability {
         legacy_bitmap: true,
         remotefx: true,
         egfx_advertised: false,
+        egfx_diagnostics: RdpEgfxDiagnostics {
+            start_calls: 0,
+            capability_messages_queued: 0,
+            typed_confirmation_ever: false,
+            failure_count: 0,
+            first_failure: None,
+        },
         egfx_confirmed: false,
         egfx_frame_confirmed: false,
         avc420: false,
@@ -541,6 +550,7 @@ fn baseline_connector(
             legacy_bitmap: true,
             remotefx: true,
             egfx_advertised: true,
+            egfx_diagnostics: RdpEgfxDiagnostics::default(),
             egfx_confirmed: false,
             egfx_frame_confirmed: false,
             // The provider proves that the client can advertise AVC420.  The

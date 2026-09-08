@@ -38,6 +38,7 @@ use crate::avc444::{
     Avc444ChromaLayout, Avc444ReconstructionMode, Yuv420Frame, Yuv420Plane, Yuv444Frame,
     Yuv444Reconstructor,
 };
+use crate::factory::{RdpEgfxDiagnostics, RdpEgfxFailure};
 use crate::pixel_convert::convert_rgba_to_bgrx;
 use crate::surface::validate_surface_size;
 use crate::yuv_convert::{convert_yuv420_to_rgba, convert_yuv444_to_rgba};
@@ -2027,6 +2028,7 @@ pub(crate) struct EgfxAdapter {
     /// `CapabilitiesConfirm`；即使调用方没有传入解码器，它仍可能报告 AVC 能力。
     /// 在 adapter 边界保留此事实，避免诊断信息把服务器证据误当成本地能力。
     h264_decoder_configured: bool,
+    diagnostics: Mutex<RdpEgfxDiagnostics>,
     failed: Arc<AtomicBool>,
 }
 
@@ -2041,6 +2043,7 @@ impl EgfxAdapter {
             inner: GraphicsPipelineClient::new(handler, decoder),
             surface_publisher: None,
             h264_decoder_configured,
+            diagnostics: Mutex::new(RdpEgfxDiagnostics::default()),
             failed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -2054,8 +2057,25 @@ impl EgfxAdapter {
             inner: GraphicsPipelineClient::new(Box::new(publisher.clone()), decoder),
             surface_publisher: Some(publisher),
             h264_decoder_configured,
+            diagnostics: Mutex::new(RdpEgfxDiagnostics::default()),
             failed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn diagnostics(&self) -> RdpEgfxDiagnostics {
+        *self
+            .diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record_failure(&self, reason: RdpEgfxFailure) {
+        let mut diagnostics = self
+            .diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        diagnostics.failure_count = diagnostics.failure_count.saturating_add(1);
+        diagnostics.first_failure.get_or_insert(reason);
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -2092,6 +2112,7 @@ impl EgfxAdapter {
     /// the next EGFX frame generation-stale. Disable this optional stream at
     /// the boundary; legacy Bitmap/RemoteFX continues on the new generation.
     pub(crate) fn disable_for_reactivation(&self) {
+        self.record_failure(RdpEgfxFailure::Reactivation);
         self.failed.store(true, Ordering::Release);
         if let Some(publisher) = &self.surface_publisher {
             publisher.disable();
@@ -2107,16 +2128,42 @@ impl DvcProcessor for EgfxAdapter {
     }
 
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        self.inner.start(channel_id)
+        let diagnostics = self
+            .diagnostics
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        diagnostics.start_calls = diagnostics.start_calls.saturating_add(1);
+        let result = self.inner.start(channel_id);
+        match &result {
+            Ok(messages) => {
+                let diagnostics = self
+                    .diagnostics
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                diagnostics.capability_messages_queued = diagnostics
+                    .capability_messages_queued
+                    .saturating_add(u64::try_from(messages.len()).unwrap_or(u64::MAX));
+            }
+            Err(_) => self.record_failure(RdpEgfxFailure::Start),
+        }
+        result
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
         if self.failed.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        match self.inner.process(channel_id, payload) {
+        let result = self.inner.process(channel_id, payload);
+        if self.inner.negotiated_capabilities().is_some() {
+            self.diagnostics
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .typed_confirmation_ever = true;
+        }
+        match result {
             Ok(messages) => {
                 if self.inner.decoder_failed() {
+                    self.record_failure(RdpEgfxFailure::Decoder);
                     self.failed.store(true, Ordering::Release);
                     if let Some(publisher) = &self.surface_publisher {
                         publisher.disable();
@@ -2126,11 +2173,13 @@ impl DvcProcessor for EgfxAdapter {
                     .as_ref()
                     .is_some_and(EgfxSurfacePublisher::is_disabled)
                 {
+                    self.record_failure(RdpEgfxFailure::Publisher);
                     self.failed.store(true, Ordering::Release);
                 }
                 Ok(messages)
             }
             Err(error) => {
+                self.record_failure(RdpEgfxFailure::PayloadProcessing);
                 self.failed.store(true, Ordering::Release);
                 if let Some(publisher) = &self.surface_publisher {
                     publisher.disable();
@@ -2181,6 +2230,43 @@ mod tests {
         ResetGraphicsPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn diagnostics_distinguish_unconfirmed_from_confirmed_then_failed() {
+        for confirm_first in [false, true] {
+            let mut adapter = EgfxAdapter::new(None, Box::new(TestHandler));
+            assert_eq!(adapter.diagnostics(), super::RdpEgfxDiagnostics::default());
+            let messages = adapter.start(7).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(adapter.diagnostics().start_calls, 1);
+            assert_eq!(adapter.diagnostics().capability_messages_queued, 1);
+            assert!(!adapter.diagnostics().typed_confirmation_ever);
+            if confirm_first {
+                process_gfx_pdu(
+                    &mut adapter,
+                    GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(
+                        &CapabilitySet::V8 {
+                            flags: super::CapabilitiesV8Flags::SMALL_CACHE,
+                        },
+                    )),
+                );
+                assert!(adapter.is_active());
+            }
+            // 非法 ZGFX 描述符；仅检查固定分类，不向诊断复制输入。
+            assert!(adapter.process(7, &[0]).unwrap().is_empty());
+            assert!(adapter.is_failed());
+            assert!(!adapter.is_active());
+            let diagnostics = adapter.diagnostics();
+            assert_eq!(diagnostics.typed_confirmation_ever, confirm_first);
+            assert_eq!(diagnostics.failure_count, 1);
+            assert_eq!(
+                diagnostics.first_failure,
+                Some(super::RdpEgfxFailure::PayloadProcessing)
+            );
+            assert!(adapter.process(7, &[0]).unwrap().is_empty());
+            assert_eq!(adapter.diagnostics(), diagnostics);
+        }
+    }
 
     #[test]
     fn egfx_adapter_is_disabled_without_a_decoder() {
@@ -2234,6 +2320,11 @@ mod tests {
         assert!(!adapter.is_active());
         assert!(publisher.is_disabled());
         assert!(publisher.drain().is_empty());
+        assert_eq!(
+            adapter.diagnostics().first_failure,
+            Some(super::RdpEgfxFailure::Reactivation)
+        );
+        assert_eq!(adapter.diagnostics().failure_count, 1);
     }
 
     #[test]

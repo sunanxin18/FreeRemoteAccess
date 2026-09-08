@@ -30,8 +30,8 @@ pub use egfx::{
     ValidatedAvc444Bitmap, ValidatedAvc444Encoding,
 };
 pub use factory::{
-    RdpGraphicsAdvertisementGate, RdpGraphicsCapabilities, RdpGraphicsObserver, RdpProtocolFactory,
-    RdpProtocolSession,
+    RdpEgfxDiagnostics, RdpEgfxFailure, RdpGraphicsAdvertisementGate, RdpGraphicsCapabilities,
+    RdpGraphicsObserver, RdpProtocolFactory, RdpProtocolSession,
 };
 
 /// Compile-time seam consumed by Task 3's connector without exposing RDP TLS

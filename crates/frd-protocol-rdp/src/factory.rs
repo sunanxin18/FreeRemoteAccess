@@ -23,11 +23,34 @@ pub enum RdpGraphicsAdvertisementGate {
     LiveInteroperable,
 }
 
+/// 非敏感的 EGFX 停止原因；不保存载荷或上游错误原文。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RdpEgfxFailure {
+    Start,
+    PayloadProcessing,
+    Decoder,
+    Publisher,
+    Reactivation,
+}
+
+/// 本地阶段证据；排队不等于网络写入成功。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RdpEgfxDiagnostics {
+    pub start_calls: u64,
+    pub capability_messages_queued: u64,
+    /// 曾观察到能够解析的服务器 CapabilitiesConfirm，失败后仍保留。
+    pub typed_confirmation_ever: bool,
+    pub failure_count: u64,
+    pub first_failure: Option<RdpEgfxFailure>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RdpGraphicsCapabilities {
     pub legacy_bitmap: bool,
     pub remotefx: bool,
+    /// 本地已配置通道和 early capability，不能证明 EGFX 能力报文已发送。
     pub egfx_advertised: bool,
+    pub egfx_diagnostics: RdpEgfxDiagnostics,
     pub egfx_confirmed: bool,
     /// At least one generation-bound EGFX frame boundary reached the runtime.
     /// This is separate from `egfx_confirmed`: a capability response alone does
