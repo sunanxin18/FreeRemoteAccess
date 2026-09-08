@@ -228,3 +228,20 @@ renderer 中精确消费 pending receipt；确认不切换 context、不调用 G
 将错误设为成功，[current查询](https://github.com/NVIDIA/libglvnd/blob/v1.7.0/src/EGL/libegl.c#L519)
 会经过该入口。新增原生负例明确要求捕获 EGL_BAD_SURFACE（0x300d），不能只检查
 没有确认或任意错误。纯闭包顺序测试只是辅助，实际驱动故障注入仍为必须门禁。
+
+### 首帧控制器接线与GTK帧阶段
+
+runner每次创建GLArea后，必须等待实际realized并启用窗口observer再提交首批
+事务。tick与后台Wake统一先处理当前session的终止/新generation事件，再取
+已确认提交交给controller，最后上传新事务；不能用普通Drawn升级状态或重复
+发送协议ACK。controller仍唯一决定匹配完整首帧后的RemoteSession。上下文丢失
+结束会话并退休帧编译状态，不能把后续Revision改造成Startup；正常resize沿用
+现有桌面壳的几何更新/重绘策略，不额外永久关闭输入或伪造新帧确认。
+
+固定 [GTK帧阶段](https://github.com/GNOME/gtk/blob/4.14.0/gdk/gdkframeclockidle.c#L573)
+先BEFORE_PAINT再UPDATE，widget的 [tick挂在UPDATE](https://github.com/GNOME/gtk/blob/4.14.0/gtk/gtkwidget.c#L3059)。
+因此after-paint已签发的ready单槽必须跨下一次before保留到消费；新draw或真实
+invalidate才撤销。无Surface paint的纯tick不等于窗口提交失败，不签新证明；
+有paint无事务receipt的重绘仍检查关联上下文GL/EGL错误，但不要求最终非空
+drawable；有事务receipt保持全部原提交门禁。原生fixture必须在下一UPDATE
+消费并继续一个纯tick，不能以两帧间的主动轮询或碰巧到来的网络消息验收。

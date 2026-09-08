@@ -11,7 +11,7 @@ use frd_frame::{
 use frd_shell_gtk::{AdapterEvent, GtkFrameArea, SubmissionError, WindowSubmission};
 use gtk4::{gdk, glib, prelude::*};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     rc::Rc,
     time::{Duration, Instant},
@@ -92,7 +92,7 @@ fn native_gtk_window_submission_roundtrip() {
             "GdkWaylandDisplay"
         }
     );
-    let adapter = GtkFrameArea::new();
+    let adapter = Rc::new(GtkFrameArea::new());
     let window = gtk4::Window::builder()
         .title("FreeRemoteDesk EGL 窗口提交测试")
         .default_width(128)
@@ -154,12 +154,60 @@ fn native_gtk_window_submission_roundtrip() {
     adapter
         .enable_window_submission(&window)
         .expect("只接受固定旧 GL renderer");
-    let first = wait_submission(&adapter);
-    let diagnostics = adapter.submission_diagnostics().unwrap();
+    // 真实 GtkWidget tick 在下一帧 UPDATE 才消费前一 AFTER_PAINT 的证明。
+    // 不依赖协议新消息或在两帧之间主动轮询 take。
+    let tick_result = Rc::new(RefCell::new(None));
+    let pure_tick_checked = Rc::new(Cell::new(false));
+    let callback_checked = pure_tick_checked.clone();
+    let weak_adapter = Rc::downgrade(&adapter);
+    let callback_result = tick_result.clone();
+    adapter.widget().add_tick_callback(move |_, clock| {
+        let Some(adapter) = weak_adapter.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if callback_result.borrow().is_some() {
+            assert!(
+                adapter.take_submission_error().is_none(),
+                "消费后的纯tick不能成为呈现错误"
+            );
+            assert!(
+                adapter.take_window_submission().is_none(),
+                "纯tick不能产生新证明"
+            );
+            callback_checked.set(true);
+            return glib::ControlFlow::Break;
+        }
+        if let Some(submission) = adapter.take_window_submission() {
+            let produced = submission.frame_counter();
+            assert!(clock.frame_counter() > produced, "必须跨到下一 UPDATE 消费");
+            let draw = submission.consume().expect("下一UPDATE时证明仍须有效");
+            *callback_result.borrow_mut() =
+                Some((produced, draw, adapter.submission_diagnostics().unwrap()));
+            return glib::ControlFlow::Continue;
+        }
+        if let Some(error) = adapter.take_submission_error() {
+            assert_eq!(
+                error,
+                SubmissionError::Association,
+                "bootstrap之外的原生错误"
+            );
+        }
+        glib::ControlFlow::Continue
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pure_tick_checked.get() {
+        pump();
+        assert!(
+            Instant::now() < deadline,
+            "下一UPDATE未得到提交: {:?}",
+            adapter.submission_diagnostics()
+        );
+    }
+    let (first_counter, drawn, diagnostics) = tick_result.borrow_mut().take().unwrap();
+    assert!(adapter.take_submission_error().is_none());
     assert!(diagnostics.bootstrap_count >= 1 && diagnostics.confirmed_count >= 1);
     assert!(diagnostics.draw_surfaceless && diagnostics.window_context_transition,
         "必须观察本次 GLArea surfaceless → GSK 窗口 context 转换，不能只看 expose 是否非空: {diagnostics:?}");
-    let first_counter = first.frame_counter();
     assert!(
         first_counter
             > first_window_frame
@@ -171,7 +219,6 @@ fn native_gtk_window_submission_roundtrip() {
         adapter.take_window_submission().is_none(),
         "take 必须消费槽位一次"
     );
-    let drawn = first.consume().expect("同生命周期提交可消费");
     assert!(drawn.is_valid());
     assert_eq!(drawn.frame().session_id, session_id);
     assert_eq!(drawn.frame().generation, 1);
@@ -184,6 +231,29 @@ fn native_gtk_window_submission_roundtrip() {
             .all(|e| !matches!(e, AdapterEvent::Drawn { .. })),
         "enabled 时不能复制 draw receipt 到事件通道"
     );
+
+    // 留一份ready不取，再用新draw替代；旧serial失效不得误报为消费错误。
+    let mut confirmed_count = adapter.submission_diagnostics().unwrap().confirmed_count;
+    let mut replacement_frames = Vec::new();
+    for _ in 0..2 {
+        adapter.widget().queue_render();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while adapter.submission_diagnostics().unwrap().confirmed_count == confirmed_count {
+            pump();
+            assert!(
+                adapter.take_submission_error().is_none(),
+                "新draw替代未消费ready不能报错"
+            );
+            assert!(Instant::now() < deadline, "替代ready重绘超时");
+        }
+        let observed = adapter.submission_diagnostics().unwrap();
+        confirmed_count = observed.confirmed_count;
+        replacement_frames.push(observed.frame_counter);
+    }
+    let replacement = adapter.take_window_submission().unwrap();
+    assert_eq!(replacement.frame_counter(), replacement_frames[1]);
+    assert!(replacement_frames[1] > replacement_frames[0]);
+    assert!(replacement.consume().is_ok());
 
     // 在已完成 bootstrap 的下一帧，真实窗口 GL context 上注入错误。
     while adapter.take_submission_error().is_some() {}
@@ -334,7 +404,7 @@ fn native_gtk_window_submission_roundtrip() {
     adapter.detach();
     clock.disconnect(hook);
     window.close();
-    println!("native GTK window submission backend={backend} scale={scale} actual_egl=1 bootstrap_rejected=1 consume_once=1 gl_fault_rejected=1 egl_fault_rejected=1 wrong_window_rejected=1 resize_revoked=1 recovery=1 unrealize_revoked=1 reenabled=1 confirmed_once=1");
+    println!("native GTK window submission backend={backend} scale={scale} actual_egl=1 bootstrap_rejected=1 consume_once=1 next_update_consumed=1 gl_fault_rejected=1 egl_fault_rejected=1 wrong_window_rejected=1 resize_revoked=1 recovery=1 unrealize_revoked=1 reenabled=1 confirmed_once=1");
 }
 
 fn pump() {

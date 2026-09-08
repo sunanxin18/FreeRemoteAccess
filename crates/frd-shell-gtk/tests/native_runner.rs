@@ -363,7 +363,7 @@ fn native_gtk_login_session_cancel() {
     // 原生PasswordEntry激活信号与按钮同一路径；不是XTEST硬件按键注入证明。
     password.emit_by_name::<()>("activate", &[]);
     password.emit_by_name::<()>("activate", &[]);
-    until(|| starts.load(Ordering::SeqCst) == 1 && status.text().contains("准备远程画面"));
+    until(|| starts.load(Ordering::SeqCst) == 1 && status.text() == "已连接");
     // 检查真正交给协议工厂的请求，不能以转换函数单测代替 runner 接线。
     let requested = display_intents.lock().unwrap()[0];
     assert_eq!(requested.mode, ResolutionMode::NativeDisplay);
@@ -392,6 +392,7 @@ fn native_gtk_login_session_cancel() {
         ((f64::from(content.height()) * surface.scale()).round() as u32)
             .min(geometry.physical_size.height)
     );
+    assert_eq!(action.label().as_deref(), Some("断开连接"));
     assert!(password.text().is_empty());
     let first_area = find(&root, "frd-remote")
         .downcast::<gtk4::GLArea>()
@@ -399,7 +400,7 @@ fn native_gtk_login_session_cancel() {
     until(|| first_area.context().is_some());
     until(|| read_increment(&first_area));
     if let Some(artifacts) = &artifacts {
-        artifacts.capture(&window, "connected-preparing");
+        artifacts.capture(&window, "connected");
     }
     assert_eq!(first_area.scale_factor(), scale);
     until(|| stores.saves.load(Ordering::SeqCst) == 1);
@@ -426,7 +427,7 @@ fn native_gtk_login_session_cancel() {
     assert_eq!(password.text().as_str(), PASSWORD, "尺寸编辑不能清除密码");
     width.set_text("8192");
     password.emit_by_name::<()>("activate", &[]);
-    until(|| starts.load(Ordering::SeqCst) == 2 && status.text().contains("准备远程画面"));
+    until(|| starts.load(Ordering::SeqCst) == 2 && status.text() == "已连接");
     assert_eq!(
         display_intents.lock().unwrap()[1].mode,
         ResolutionMode::Fixed(PixelSize::new(8192, 4608).unwrap())
@@ -437,7 +438,12 @@ fn native_gtk_login_session_cancel() {
     assert_ne!(first_area, second_area, "新会话必须替换旧画面对象");
     until(|| second_area.context().is_some());
     until(|| read_increment(&second_area));
-    action.emit_clicked();
+    // 已连接后上下文失效也必须退出，不得让旧提交重新升级状态。
+    second_area.set_error(Some(&glib::Error::new(
+        gtk4::gdk::GLError::NotAvailable,
+        "fixture context loss",
+    )));
+    second_area.queue_render();
     until(|| closed.load(Ordering::SeqCst) == 2 && status.text() == "未连接");
     assert_eq!(resolution.selected(), 8, "返回表单必须保留自定义模式");
     assert_eq!(width.text().as_str(), "8192");
@@ -449,7 +455,7 @@ fn native_gtk_login_session_cancel() {
     until(|| status.text() == "未连接");
     window.close();
     until(|| !window.is_visible());
-    println!("native GTK login saved_secret=1 identity_invalidation=1 enter_single_launch=1 deferred_save=1 cancel_cleanup=1 pending_launch_cancel=1");
+    println!("native GTK login saved_secret=1 identity_invalidation=1 enter_single_launch=1 deferred_save=1 cancel_cleanup=1 pending_launch_cancel=1 confirmed_connected=1 context_loss_cleanup=1");
 }
 
 // 仅测试读回：真实mock增量须经过host mailbox→compiler→新画布GL上传/绘制。

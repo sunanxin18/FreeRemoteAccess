@@ -434,6 +434,8 @@ mod native {
 
         /// 必须在 GLArea::render 回调的成功 draw 后同步交出所有权，延迟事件不被接受。
         pub(crate) fn record_draw(&self, receipt: DrawReceipt) -> Result<(), SubmissionError> {
+            // 新 draw 的 serial 已使旧证明失效；无论随后关联成功与否都清除旧槽。
+            self.state.borrow_mut().ready = None;
             let area = self.area.upgrade().ok_or(SubmissionError::Lifecycle)?;
             let draw_identity = self.api.identity();
             let draw_surfaceless = draw_identity.is_some_and(|id| id.2.is_null());
@@ -490,7 +492,8 @@ mod native {
             state.diagnostics.frame_counter = self.clock.frame_counter();
             state.diagnostics.epoch = state.gate.epoch.get();
             state.diagnostics.live = self.live();
-            state.ready = None;
+            // GTK 4.14 BEFORE_PAINT 早于 UPDATE/tick；已签发 ready 必须活到消费。
+            // 仅新 draw 或真实 invalidate 撤销它，不在开启下一帧时删除。
             state.draw = None;
             state.draw_egl_context = None;
             if !self.live() {
@@ -545,6 +548,33 @@ mod native {
                 return;
             }
             // 不调用 make_current；只检查 GSK window end_frame 留下的实际 current。
+            // 纯 UPDATE/tick 也有 AFTER_PAINT；帧前的 surfaceless baseline
+            // 不是提交失败。有 Surface paint 却无事务 receipt 时仍检查 GL/EGL，
+            // 包括已消费帧的合法重绘和 UI-only paint，不签发新的远程证明。
+            if !state.gate.draw {
+                let no_receipt_fault = if !state.gate.paint {
+                    (egl_after != 0x3000).then_some(SubmissionError::EglFault)
+                } else if current
+                    .as_ref()
+                    .is_some_and(|c| DrawContextExt::surface(c).as_ref() == Some(&self.surface))
+                    && identity.is_some()
+                {
+                    // 空最终clip可能留下本surface的surfaceless context，不要求drawable。
+                    self.api.clean(egl_after).err()
+                } else {
+                    Some(if egl_after != 0x3000 {
+                        SubmissionError::EglFault
+                    } else {
+                        SubmissionError::Association
+                    })
+                };
+                let _ = state.gate.finish(self.clock.frame_counter(), false, false);
+                if let Some(error) = no_receipt_fault {
+                    state.error = Some(error);
+                    state.invalidate();
+                }
+                return;
+            }
             let valid = current.as_ref().is_some_and(|c| {
                 DrawContextExt::surface(c).as_ref() == Some(&self.surface)
                     && !c.is_in_frame()

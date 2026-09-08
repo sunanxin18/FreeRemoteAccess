@@ -1,4 +1,4 @@
-//! 实际 GTK 产品事件泵；此阶段不发布 FramePresented，也不放宽 controller 输入门禁。
+//! GTK 产品事件泵；仅消费实际窗口提交证明后发布首帧，输入仍由 controller 门控。
 use crate::{AdapterEvent, GtkFrameArea, SubmitError};
 use frd_app::{persist_profile_job, AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
 use frd_core::{DisplayIntent, PixelSize, ResolutionMode, SecretBuffer, SessionId, TargetSystem};
@@ -8,7 +8,8 @@ use frd_platform_api::{
     SecureCredentialStore, ServerIdentityStore,
 };
 use frd_protocol_api::{
-    ConnectionStage, ProtocolCatalog, ProtocolError, ProtocolFactory, SessionCommand, SessionEvent,
+    ConnectionStage, PresentationEvent, ProtocolCatalog, ProtocolError, ProtocolFactory,
+    SessionCommand, SessionEvent,
 };
 use frd_shell_desktop::{
     AcceptedLaunchOutcome, AudioOutputFactory, BackgroundCleanupOutcome, BackgroundLaunchOutcome,
@@ -252,6 +253,8 @@ struct State {
     form: Form,
     frames: GtkFrameArea,
     pending_frames: Option<Vec<FrameTransaction>>,
+    submission_enabled: bool,
+    active_session: Option<SessionId>,
     cleanup_pending: bool,
     cancel_pending: bool,
     closing: bool,
@@ -341,6 +344,8 @@ impl GtkRunner {
             form,
             frames,
             pending_frames: None,
+            submission_enabled: false,
+            active_session: None,
             cleanup_pending: false,
             cancel_pending: false,
             closing: false,
@@ -499,7 +504,7 @@ fn install_frame_pump(area: &gtk4::GLArea, weak: Weak<RefCell<State>>) {
             return glib::ControlFlow::Break;
         };
         let mut s = s.borrow_mut();
-        s.drain_frames();
+        s.drain();
         s.refresh();
         glib::ControlFlow::Continue
     });
@@ -507,6 +512,7 @@ fn install_frame_pump(area: &gtk4::GLArea, weak: Weak<RefCell<State>>) {
 
 impl State {
     fn reset_canvas(&mut self) {
+        self.submission_enabled = false;
         self.pending_frames = None;
         self.frames.detach();
         self.remote_container.remove(self.frames.widget());
@@ -621,6 +627,7 @@ impl State {
         match action {
             Ok(Some(AppAction::StartSession(mut request, permit))) => {
                 self.reset_canvas();
+                self.active_session = Some(request.session_id);
                 // Stack 是标题栏下方的同一个内容矩形；连接前远程 GLArea 尚未分配尺寸。
                 if let Some(geometry) =
                     crate::display_geometry::from_window(&self.window, &self.stack)
@@ -673,6 +680,9 @@ impl State {
     fn cleanup(&mut self) {
         if self.cleanup_pending {
             return;
+        }
+        if let Some(session) = self.active_session.take() {
+            self.sessions.retire_frame_presentation(session);
         }
         self.reset_canvas();
         let sender = self.sender.clone();
@@ -830,6 +840,9 @@ impl State {
     fn drain(&mut self) {
         let mut cleanup = false;
         for (session, event) in self.sessions.drain_session_events() {
+            if Some(session) != self.active_session {
+                continue;
+            }
             cleanup |= matches!(event, SessionEvent::Error(_) | SessionEvent::Closed(_));
             let persist = matches!(
                 event,
@@ -866,7 +879,7 @@ impl State {
     fn drain_frames(&mut self) {
         for event in self.frames.drain_events() {
             match event {
-                AdapterEvent::Drawn { .. } => {} // 保留AwaitingFirstFrame，等待独立提交证明接线。
+                AdapterEvent::Drawn { .. } => {} // 无窗口证明的 draw 永远不能升级 controller。
                 AdapterEvent::Failed(_) => {
                     self.failure = Some("远程画面渲染失败，已停止会话");
                     self.intent(AppIntent::CancelConnect);
@@ -876,7 +889,7 @@ impl State {
                 AdapterEvent::Invalidated {
                     discarded_transactions,
                 } => {
-                    if discarded_transactions > 0
+                    if (self.submission_enabled || discarded_transactions > 0)
                         && self.sessions.is_active()
                         && !self.cleanup_pending
                     {
@@ -888,8 +901,47 @@ impl State {
                 }
             }
         }
-        if !self.sessions.is_active() || self.cleanup_pending {
+        if !self.sessions.is_active() || self.cleanup_pending || self.cancel_pending {
             return;
+        }
+        if !matches!(
+            self.launch.controller().page(),
+            AppPage::Connecting { .. }
+                | AppPage::AwaitingFirstFrame { .. }
+                | AppPage::RemoteSession { .. }
+        ) {
+            return;
+        }
+        if self.submission_enabled {
+            if !self.frames.widget().is_realized() || self.frames.widget().error().is_some() {
+                self.fail_presentation("画面上下文已失效，请重新连接");
+                return;
+            }
+            if self.frames.take_submission_error().is_some() {
+                self.fail_presentation("窗口画面提交失败，请重新连接");
+                return;
+            }
+            // 先消费上一轮 after-paint 的精确证明，再允许新上传/draw 撤销 serial。
+            match self.frames.take_confirmed_presentation() {
+                Ok(Some(confirmed)) => {
+                    let receipt = confirmed.into_receipt();
+                    if Some(receipt.session_id) == self.active_session {
+                        self.launch.controller_mut().handle_presentation(
+                            PresentationEvent::FramePresented {
+                                session_id: receipt.session_id,
+                                generation: receipt.generation,
+                                revision: receipt.revision,
+                                completeness: receipt.completeness,
+                            },
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.fail_presentation("窗口画面确认失效，请重新连接");
+                    return;
+                }
+            }
         }
         if self.pending_frames.is_none() {
             match self.sessions.drain_frame_transactions() {
@@ -907,8 +959,21 @@ impl State {
                 }
             }
         }
-        if let Some(batch) = self.pending_frames.take() {
+        if self.pending_frames.is_some() {
             self.frames.widget().set_visible(true);
+            // 显示可能只排队 realize；等待实际 realized 后再绑定，绝不先上传。
+            if !self.frames.widget().is_realized() {
+                return;
+            }
+            if !self.submission_enabled {
+                if self.frames.enable_window_submission(&self.window).is_err() {
+                    self.fail_presentation("此窗口暂不支持画面提交确认，请重新连接");
+                    return;
+                }
+                self.submission_enabled = true;
+            }
+        }
+        if let Some(batch) = self.pending_frames.take() {
             if let Err(rejected) = self.frames.submit_batch(batch) {
                 if rejected.reason == SubmitError::Busy {
                     self.pending_frames = Some(rejected.transactions);
@@ -919,6 +984,11 @@ impl State {
                 }
             }
         }
+    }
+    fn fail_presentation(&mut self, message: &'static str) {
+        self.failure = Some(message);
+        self.intent(AppIntent::Disconnect);
+        self.cleanup();
     }
     fn refresh_form(&mut self) {
         let Some(form) = self.launch.controller_mut().connection_form_mut() else {

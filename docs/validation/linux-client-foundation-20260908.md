@@ -419,3 +419,39 @@ EGL_BAD_SURFACE=0x300d，旧“没有getError就不会清除EGL错误”的推�
 ARM64宿主结果；GL与GTK新增原生代码只在Linux feature/目标类型检查中编译，
 原生fixture仍须由后续CI运行。独立审查确认adapter先消费窗口证明再确认renderer，
 分辨率非法提交保留密码；RemoteSession按钮文案与Disconnect意图统一为“断开连接”。
+
+## f8d3ca8 原生窗口提交与GL消费通过
+
+GTK run34218500195三架构SUCCESS：ARM64 job102035829475、x86_64 job102035829753、
+i686 job102035829777。主代理下载日志 `/tmp/frd-gtk-f8d-{x64,i686,arm64}.log`
+并逐架构核验4组X11/Wayland1×/2×的完整window-submission标记与12个唯一
+原生测试通过结果。覆盖首次bootstrap不确认、实际EGL提交、GL/EGL故障拒绝、
+错误窗口绑定拒绝、尺寸改变/上下文失效撤销、恢复、重启observer与renderer
+精确消费后不重复确认。原生runner仍是mock协议，包含实际8192×4608请求、
+非法尺寸阻断/密码保留/返回恢复；它还没有通过呈现事件进入RemoteSession。
+
+GL run34218500164三架构SUCCESS：x86_64 job102035829995、i686 job102035830272、
+ARM64 job102035830294。主代理复验 `/tmp/frd-gl-f8d-{x64,i686,arm64}.log` 每目标
+唯一native_egl_renderer_roundtrip实际1passed/0failed/0ignored。新消费/身份/
+无current且不清GL错误的断言均执行。软件Mesa证据不等于硬件GPU/真实RDP控制。
+
+下一轮启用已有WidgetPaintable→GSK PNG helper，输出明暗主题、已保存密码掩码
+和会话画面以供视觉检查。PNG是离屏部件渲染，不作为真实桌面截图或窗口提交证明。
+原生runner接入EGL observer后，测试显式选择GDK_DEBUG=gl-egl；GLX仍独立待实现。
+
+## runner消费确认接入（新增原生时序待验证）
+
+每个GLArea实际realized并绑定observer以后才允许上传，消费式FramePresented
+交给现有controller核对完整首帧；原生runner fixture改为等待“已连接”及
+“断开连接”，并新增已连接后context error清理测试。tick/Wake统一session
+events优先，终止时退休匹配session的帧编译器；不新增像素协议ACK。
+
+独立审查发现before-paint在UPDATE tick前清ready导致静态首帧丢失，已修正
+为保留单槽直到消费/新draw/真实失效。纯tick不误报Unavailable，有paint但
+无事务receipt仍检查GL/EGL错误。新增真实GTK tick消费及纯tick/新draw替代
+回归尚未在Linux运行；此前f8d组件通过不能替代此次runner时序验收。
+
+本轮本地完整 `cargo test --locked --workspace` 终态 exit 0：78组、1765 passed /
+0 failed / 16 ignored，日志 `/tmp/frd-gtk-runner-connected-workspace.log`。
+`cargo fmt --all -- --check` 通过。该macOS宿主测试不执行Linux原生GTK分支；
+新增runner确认、下一UPDATE消费和PNG视觉产物仍等待新CI，不能据此声明已验收。
