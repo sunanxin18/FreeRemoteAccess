@@ -23,7 +23,7 @@
 共享接口或文件按依赖顺序整合；协议、codec hot path 和平台窗口代码不混合。
 Progressive coverage、实际 AVC 与 HEVC wire/live 门禁仍由原 RDP 计划独立推进。
 
-## 当前验证边界（2026-09-08）
+## 当前验证边界（2026-09-09）
 
 - 平台服务：17 项合成回归和三 Linux 目标 check 通过；`5cd73ea` Ubuntu job `101972000994` 的隔离 Secret Service 真实往返 1 项明确执行通过，原生 Linux 应用 20+2 项测试通过。
 - 完整包：`5cd73ea` i686 job `101971932014` 完成应用测试、release 构建、包校验、实际解码器加载及产物上传；ARM64/x86_64 同轮在 zlib 系统依赖名单处失败。a60eebd 的 ARM64/x86_64 修正后 jobs 101983147418/101983147612 已通过完整包及目标解码加载，同轮 i686 job 101983147659 随后也完成应用测试、完整包及目标解码加载，run 34202134581 三目标全部通过。提交 `7313ee4` 的 run `34245804941` 在依赖修正后再次完成三目标完整包、目标解码器加载及 artifact 上传。
@@ -32,4 +32,4 @@ Progressive coverage、实际 AVC 与 HEVC wire/live 门禁仍由原 RDP 计划�
 - 共享帧事务：已迁移至独立 frd-render-state crate，独占候选只允许消费提交一次；旧38项测试全部保留为纯状态10项和Metal后端28项，新增3项候选回归及7项编译拒绝测试通过。独立 Linux GL 执行器已实现纹理上传、绘制和上下文生命周期，三目标编译检查通过；c349a72 run34210588972 三架构软件 EGL 已通过两种颜色输出契约及生命周期 fixture。frd-shell-gtk 已接入真实 FrameTransaction→GLArea 绘制，`34233406400` 三架构 X11/Wayland 1×/2× 共12个原生 fixture 通过完整帧、增量、上下文重建、登录/取消、窗口提交和字体 family 门禁；`34244032943` 又验证了正式 GTK Application/ApplicationWindow 入口及产品窗口 smoke。Wayland 物理输入和完整产品 RDP 接线仍未完成。
 - Windows/macOS：继续保持原有平台入口、渲染后端和会话行为。主机编译或离线目标测试均不替代真实 GUI 控制。
 
-完整证据与失败记录见[基础服务与客户端验证](../../validation/linux-client-foundation-20260908.md)。下一执行顺序：X11/Wayland 物理输入与窗口装饰验收 -> Linux 产品真实 RDP 控制。包修正 CI 与窗口实现可独立推进；实际 Progressive、AVC、HEVC 的原始门禁继续保留。
+完整证据与失败记录见[基础服务与客户端验证](../../validation/linux-client-foundation-20260908.md)。下一执行顺序：在授权真实 Linux 宿主执行 X11/Wayland 物理输入、硬件 GPU 和窗口装饰验收，再进行 Linux 产品真实 RDP 控制。三架构包、目标解码器加载、GTK/GL fixture 与 CI 门禁已完成；实际 Progressive、AVC、HEVC 的原始门禁继续保留。
