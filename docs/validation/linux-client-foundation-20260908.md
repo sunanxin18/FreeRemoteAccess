@@ -271,3 +271,10 @@ Drawn 只报告 GL 命令提交；完整窗口 snapshot、输入、登录与生�
 aarch64 job102010538524、x86_64 job102010538969、i686 job102010539043。
 下载日志核对应用 20+2 项、包校验和目标进程解码器加载；日志保存在
 `/tmp/frd-linux-c349-{aarch64,x64,i686}.log`。此轮不包含新增 GTK 适配器。
+
+
+GTK 首轮 e96fbf1 run34212170241：三目标 GTK SDK 编译和链接均成功，
+各4项纯测试通过。原生fixture未执行：D-Bus子会话未保留export的Bash函数，
+三目标均以 `run_fixture: command not found` / exit127退出。
+启动器改成显式脚本文件传入D-Bus，不修改测试或验收断言；原生门禁仍待重跑。
+原始日志：`/tmp/frd-gtk-e96-{x64,i686,arm64}.log`。

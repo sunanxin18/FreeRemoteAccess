@@ -99,16 +99,18 @@ jobs:
           }
           trap cleanup EXIT
           export LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=gl G_DEBUG=fatal-criticals
-          run_fixture() {
-            cargo test --locked -p frd-shell-gtk --features gtk-shell \
-              --target "${{ matrix.target }}" --test native_gtk \
-              native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture
-          }
-          export -f run_fixture
+          fixture_script="$log_dir/run-fixture.sh"
+          cat > "$fixture_script" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cargo test --locked -p frd-shell-gtk --features gtk-shell \
+            --target "${{ matrix.target }}" --test native_gtk \
+            native_gtk_frame_adapter_roundtrip -- --exact --ignored --nocapture
+          SH
           for scale in 1 2; do
             timeout --kill-after=5s 120s env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
               GDK_BACKEND=x11 GDK_SCALE="$scale" FRD_GTK_TEST_BACKEND=x11 FRD_GTK_TEST_SCALE="$scale" \
-              xvfb-run -a -s '-screen 0 2400x1800x24' dbus-run-session -- bash -c run_fixture \
+              xvfb-run -a -s '-screen 0 2400x1800x24' dbus-run-session -- bash "$fixture_script" \
               2>&1 | tee "$log_dir/x11-$scale.log"
           done
           for scale in 1 2; do
@@ -128,7 +130,7 @@ jobs:
             timeout --kill-after=5s 120s env -u DISPLAY -u GDK_SCALE -u GDK_DPI_SCALE -u WAYLAND_SOCKET \
               GDK_BACKEND=wayland WAYLAND_DISPLAY=frd-adapter \
               FRD_GTK_TEST_BACKEND=wayland FRD_GTK_TEST_SCALE="$scale" \
-              dbus-run-session -- bash -c run_fixture 2>&1 | tee "$log_dir/wayland-$scale.log"
+              dbus-run-session -- bash "$fixture_script" 2>&1 | tee "$log_dir/wayland-$scale.log"
             kill "$weston_pid" 2>/dev/null || true
             wait "$weston_pid" 2>/dev/null || true
             weston_pid=""
