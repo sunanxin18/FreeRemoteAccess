@@ -89,3 +89,18 @@ Linux run `34202134581` 的 ARM64 job `101983147418` 与 x86_64 job `10198314761
 | i686 | 10046637877 | 28847515 | `93ed27b643d64ed2c413a6725a446068ad1ce9a5ec0e9ccffe7ba21c2c58031c` |
 | x86_64 | 10046581491 | 28474112 | `7a18da90250b02e9fe8be27fdb709c3fcceb5e7c5383b81b09488e6bbb81bf91` |
 | ARM64 | 10046569301 | 28075993 | `1944b2aeb764adb6936bb9bb35b9821858493c0d80ab00cf4a7a3ae0e3d05160` |
+
+## 共享帧事务状态的完整迁移
+
+新增 frd-render-state，依赖树仅 frd-core/frd-frame。原公开回执/身份类型在
+frd-render-wgpu 根路径继续重导出，纯 TransactionError 穷尽映射到既有 RendererError。
+BatchCandidate 独占借用原状态，私有字段、只读操作、无Clone，commit(self)只消费一次；
+丢弃候选保持原状态。GPU clean gate和ConfirmedPresentation继续由后端负责。
+
+原38项渲染测试保留为28项后端测试及10项迁移状态测试；新增3项候选生命周期测试、
+7项编译拒绝测试全部通过。根代理逐一比对9个规划/提交/校验方法体，除错误类型名称
+替换外逻辑不变。Metal后端28项及既有doctest通过，Windows x64渲染crate目标check通过。
+纯状态crate另通过Windows i686/ARM64及Linux i686/x86_64/ARM64目标check；这些是编译证据。
+完整工作区终态exit0：64组、1717 passed / 0 failed / 16 ignored，日志
+`/tmp/frd-render-state-workspace.log`；fmt与diff检查通过。该迁移不代表Linux GL执行器、
+GTK产品呈现或RDP实机验证已经完成。

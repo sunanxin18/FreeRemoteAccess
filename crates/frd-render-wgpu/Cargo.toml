@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+frd-render-state = { path = "../frd-render-state" }
 frd-core = { path = "../frd-core" }
 frd-frame = { path = "../frd-frame" }
 frd-media-api = { path = "../frd-media-api" }

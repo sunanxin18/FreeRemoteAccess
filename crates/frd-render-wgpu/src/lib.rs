@@ -4,6 +4,10 @@ mod remote_texture;
 mod transaction_state;
 mod video_texture;
 
+pub use frd_render_state::{
+    BatchApplyOutcome, FrameBatchIdentity, InstalledSurface, PresentationReceipt,
+    RecoveryRequirement,
+};
 pub use gpu_fault::{
     complete_scope_before_resuming_unwind, GpuCleanToken, GpuFaultClass, GpuFaultScope,
     GpuScopeObservation,
@@ -11,10 +15,6 @@ pub use gpu_fault::{
 pub use remote_texture::{
     BatchApplyFailure, BatchApplySuccess, BatchScopeDiagnostics, ConfirmedPresentation,
     RemoteRenderer, RendererError,
-};
-pub use transaction_state::{
-    BatchApplyOutcome, FrameBatchIdentity, InstalledSurface, PresentationReceipt,
-    RecoveryRequirement,
 };
 pub use video_texture::{
     ConfirmedVideoPresentation, VideoColorSelection, VideoFrameLayout, VideoPresentationReceipt,

@@ -2030,12 +2030,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-render-state"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-frame",
+]
+
+[[package]]
 name = "frd-render-wgpu"
 version = "0.1.0"
 dependencies = [
  "frd-core",
  "frd-frame",
  "frd-media-api",
+ "frd-render-state",
  "pollster",
  "wgpu",
 ]
