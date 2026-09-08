@@ -54,8 +54,8 @@ Normal 23.06 µs/tile，ReduceExtrapolate 28.30 µs/tile。
 
 同一源码 SHA `5c0093529165e72e051a07ea1fdc81df5a0bdbb7` 的 Linux run
 `34192818977` 与 macOS run `34192818985` 已整体 success。Windows run
-`34192818981` 的三个 package job 已 success；原生 ARM64 runtime
-`101960797520` 仍在执行，不能用 ARM64 包成功代替目标运行。
+`34192818981` 已整体 success；原生 ARM64 runtime `101960797520` 已完成
+59 项 Progressive 回归与显式基准、38 项 ClearCodec/NSCodec 回归及 6 项随包解码 fixture。
 
 下列已完成 job 各通过 Progressive/邻近 EGFX 59 项回归、1 项默认 ignored，
 随后单独执行 release 基准通过。包括 d597212 后的生命周期与缓存发布修正，
@@ -69,6 +69,7 @@ Normal 23.06 µs/tile，ReduceExtrapolate 28.30 µs/tile。
 | macOS ARM64 | 101954189458 | 12.89 | 14.24 |
 | Windows x86_64 | 101954190024 | 30.01 | 32.25 |
 | Windows i686 | 101954189953 | 25.16 | 29.10 |
+| Windows ARM64 | 101960797520 | 23.10 | 24.75 |
 
 计时仍是单分量 DWT + BGRA 的合成内核范围，不是完整 RDP 延迟。
 真实 GUI 的 Progressive region coverage 失败单列于
