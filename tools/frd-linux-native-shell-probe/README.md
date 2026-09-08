@@ -38,6 +38,10 @@ X11 CI 可用 Xvfb；Wayland CI 需要独立运行的 Weston 等 compositor，�
 探针不自行启动 compositor，不安装或修改桌面设置，不连接服务器。外层 CI 应再设置
 进程超时，防止图形驱动/事件循环异常阻塞定时退出。
 
+CI 的 Wayland 进程另受15秒外层超时约束，5秒后强制结束；stderr逐个scale保存，
+Weston日志在回收私有runtime目录前复制到artifact目录。X11继续使用独立驱动的
+30秒外层限制。内部定时退出不替代外部进程超时。
+
 ## 输出与成功边界
 
 stdout 为 JSON 行：有界、ASCII 清理后的 `GL_VENDOR` / `GL_RENDERER` / GL version；
