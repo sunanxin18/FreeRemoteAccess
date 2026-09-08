@@ -4,7 +4,9 @@ use crate::input_ownership::{FilterResult, KeyDecision, KeyOwner, KeyOwnershipSt
 use crate::native_keymap::NativeKeymap;
 use crate::{AdapterError, AdapterEvent, GtkFrameArea, SubmissionError, SubmitError};
 use frd_app::{persist_profile_job, AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
-use frd_core::{ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton};
+use frd_core::{
+    ButtonState, InputEvent, KeyState, Modifiers, PhysicalKeyCode, PointerButton, SessionInput,
+};
 use frd_core::{DisplayIntent, PixelSize, ResolutionMode, SecretBuffer, SessionId, TargetSystem};
 use frd_frame::FrameTransaction;
 use frd_platform_api::{
@@ -13,7 +15,7 @@ use frd_platform_api::{
 };
 use frd_protocol_api::{
     ConnectionStage, PresentationEvent, ProtocolCatalog, ProtocolError, ProtocolFactory,
-    SessionCommand, SessionEvent, SessionInput,
+    SessionCommand, SessionEvent,
 };
 use frd_shell_desktop::{
     AcceptedLaunchOutcome, AudioOutputFactory, BackgroundCleanupOutcome, BackgroundLaunchOutcome,
@@ -639,9 +641,11 @@ fn install_input_controllers(area: &gtk4::GLArea, weak: Weak<RefCell<State>>) {
         let Some(state) = key_weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
-        state
-            .borrow_mut()
-            .handle_key(controller, hardware, modifiers, KeyState::Pressed)
+        let result =
+            state
+                .borrow_mut()
+                .handle_key(controller, hardware, modifiers, KeyState::Pressed);
+        result
     });
     let key_weak = weak.clone();
     key.connect_key_released(move |controller, _keyval, hardware, modifiers| {
@@ -921,7 +925,12 @@ impl State {
                     true,
                     false,
                 );
-                let forwarded = event.is_some_and(|event| self.send_routed_input(event));
+                let forwarded = match event {
+                    frd_shell_desktop::KeyboardPreDispatch::Remote(Some(event)) => {
+                        self.send_routed_input(event)
+                    }
+                    _ => false,
+                };
                 if forwarded {
                     self.sent_hid_by_hardware.insert(hardware, code);
                 } else if let Some(release) = self.input.keyboard_capability_lost() {
@@ -935,7 +944,7 @@ impl State {
                 let event =
                     self.input
                         .dispatch_key_event(code, KeyState::Released, false, true, false);
-                if let Some(event) = event {
+                if let frd_shell_desktop::KeyboardPreDispatch::Remote(Some(event)) = event {
                     let _ = self.send_routed_input(event);
                 }
                 glib::Propagation::Stop
