@@ -28,7 +28,7 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
                 Architecture = "x86_64"; PlatformDirectory = "windows-x86_64"; FfmpegArch = "x86_64";
                 CrossPrefix = "x86_64-w64-mingw32-"; AssemblyKind = "x86asm";
                 AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
-                RequiresX86Asm = $true
+                RequiresX86Asm = $true; PeMachine = [uint16]0x8664
             }
         }
         "x86" {
@@ -36,7 +36,7 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
                 Architecture = "x86"; PlatformDirectory = "windows-x86"; FfmpegArch = "x86";
                 CrossPrefix = "i686-w64-mingw32-"; AssemblyKind = "x86asm";
                 AssemblyProvenance = "nasm=NASM version 2.16.01"; AssemblyGate = "have_x86asm=1";
-                RequiresX86Asm = $true
+                RequiresX86Asm = $true; PeMachine = [uint16]0x014c
             }
         }
         "arm64" {
@@ -44,7 +44,7 @@ function Get-WindowsFfmpegArchitectureProfile([string]$Name) {
                 Architecture = "arm64"; PlatformDirectory = "windows-aarch64"; FfmpegArch = "aarch64";
                 CrossPrefix = "aarch64-w64-mingw32-"; AssemblyKind = "aarch64-neon";
                 AssemblyProvenance = "aarch64-neon=FFmpeg AArch64/NEON"; AssemblyGate = "have_neon=1";
-                RequiresX86Asm = $false
+                RequiresX86Asm = $false; PeMachine = [uint16]0xAA64
             }
         }
         default { throw "不支持的 Windows package 架构: $Name" }
@@ -57,6 +57,50 @@ function Get-WindowsArchitectureFromPlatform([string]$Platform) {
         "windows-x86" { return "x86" }
         "windows-aarch64" { return "arm64" }
         default { throw "staged manifest 平台不受支持: $Platform" }
+    }
+}
+
+function Get-PeMachine([string]$File) {
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [IO.File]::OpenRead($File)
+        if ($stream.Length -lt 0x40) {
+            throw "PE 文件过短"
+        }
+        $reader = [IO.BinaryReader]::new($stream)
+        if ($reader.ReadUInt16() -ne [uint16]0x5A4D) {
+            throw "DOS 签名不匹配"
+        }
+        $stream.Position = 0x3C
+        [int64]$peOffset = $reader.ReadUInt32()
+        if ($peOffset -lt 0 -or $peOffset -gt ($stream.Length - 6)) {
+            throw "PE 头偏移无效"
+        }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne [uint32]0x00004550) {
+            throw "PE 签名不匹配"
+        }
+        return [uint16]$reader.ReadUInt16()
+    }
+    catch {
+        throw "无法读取 PE Machine: $File ($($_.Exception.Message))"
+    }
+    finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+        elseif ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Assert-PeMachine([string]$File, [uint16]$ExpectedMachine, [string]$Description) {
+    [uint16]$actualMachine = Get-PeMachine $File
+    if ($actualMachine -ne $ExpectedMachine) {
+        throw ("PE Machine 架构不匹配: {0} (实际 0x{1:X4}; 要求 0x{2:X4})" -f
+            $Description, $actualMachine, $ExpectedMachine)
     }
 }
 
@@ -339,6 +383,11 @@ Assert-True (Test-Path -LiteralPath $codecDirectory -PathType Container) "版本
 $codecChildren = @(Get-ChildItem -LiteralPath $codecDirectory -Force)
 Assert-True (@($codecChildren | Where-Object { $_.PSIsContainer }).Count -eq 0) "codec 目录不得包含子目录"
 Assert-ExactStringSet @($codecChildren | Select-Object -ExpandProperty Name) $ApprovedDllNames "codec 目录文件集合"
+
+Assert-PeMachine $application $ArchitectureProfile.PeMachine "freeremotedesk-windows.exe"
+foreach ($dll in $ApprovedDllNames) {
+    Assert-PeMachine (Join-Path $codecDirectory $dll) $ArchitectureProfile.PeMachine $dll
+}
 
 $manifestFiles = @(Get-RequiredProperty $manifest "files" "staged manifest")
 $manifestPaths = @($manifestFiles | ForEach-Object { Get-NormalizedRelativePath ([string](Get-RequiredProperty $_ "path" "staged manifest file")) })

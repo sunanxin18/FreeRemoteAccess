@@ -4,13 +4,44 @@
 # 在当前可执行架构上额外通过 ctypes 调用版本化 ABI 入口。
 set -euo pipefail
 
-bundle="${1:?需要 Linux FFmpeg bundle 路径}"
+bundle_input="${1:?需要 Linux FFmpeg bundle 路径}"
 profile="${2:?需要 linux-x86_64、linux-x86 或 linux-aarch64 profile}"
+
+# 保留词法路径，避免通过 realpath/readlink 规范化隐藏符号链接祖先。CI 从仓库
+# 根目录调用 verifier，但保留相对路径支持便于本地检查。
+case "$bundle_input" in
+  /*) bundle="$bundle_input" ;;
+  *) bundle="$PWD/$bundle_input" ;;
+esac
+if [[ "$bundle" != / ]]; then
+  bundle="${bundle%/}"
+fi
 
 [[ -d "$bundle" ]] || { echo "Linux FFmpeg bundle 目录不存在: $bundle" >&2; exit 1; }
 command -v file >/dev/null || { echo "verifier 需要 file" >&2; exit 2; }
 command -v readelf >/dev/null || { echo "verifier 需要 readelf" >&2; exit 2; }
 command -v nm >/dev/null || { echo "verifier 需要 nm" >&2; exit 2; }
+
+assert_no_symlink_components() {
+  local path="$1"
+  local current="/"
+  local relative="${path#/}"
+  local component
+  local -a components
+  IFS='/' read -r -a components <<< "$relative"
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    [[ "$component" != . && "$component" != .. ]] || {
+      echo "Linux FFmpeg bundle 路径不得包含 . 或 ..: $path" >&2
+      exit 1
+    }
+    current="${current%/}/$component"
+    [[ ! -L "$current" ]] || {
+      echo "Linux FFmpeg bundle 路径组件不得为 symlink: $current" >&2
+      exit 1
+    }
+  done
+}
 
 case "$profile" in
   linux-x86_64)
@@ -42,6 +73,8 @@ expected_files=(
   libfreeremotedesk_ffmpeg.so
 )
 
+assert_no_symlink_components "$bundle"
+
 for name in "${expected_files[@]}"; do
   path="$bundle/$name"
   [[ -f "$path" && ! -L "$path" ]] || {
@@ -62,6 +95,39 @@ actual_set="$(find "$bundle" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' 2>/d
   echo "Linux FFmpeg bundle 只能包含五个顶层文件: $bundle" >&2
   exit 1
 }
+
+assert_bundle_file_security() {
+  local expected_owner=""
+  local name path owner mode mode_value
+  for name in "${expected_files[@]}"; do
+    path="$bundle/$name"
+    owner="$(stat -c '%u' -- "$path")" || {
+      echo "无法读取 Linux FFmpeg bundle owner: $path" >&2
+      exit 1
+    }
+    mode="$(stat -c '%a' -- "$path")" || {
+      echo "无法读取 Linux FFmpeg bundle mode: $path" >&2
+      exit 1
+    }
+    [[ "$mode" =~ ^[0-7]+$ ]] || {
+      echo "Linux FFmpeg bundle mode 无效: $path ($mode)" >&2
+      exit 1
+    }
+    mode_value=$((8#$mode))
+    (( (mode_value & 18) == 0 )) || {
+      echo "Linux FFmpeg bundle 文件不得 group/other writable: $path ($mode)" >&2
+      exit 1
+    }
+    if [[ -z "$expected_owner" ]]; then
+      expected_owner="$owner"
+    elif [[ "$owner" != "$expected_owner" ]]; then
+      echo "Linux FFmpeg bundle 顶层文件必须属于同一 owner UID: $path ($owner != $expected_owner)" >&2
+      exit 1
+    fi
+  done
+}
+
+assert_bundle_file_security
 
 assert_elf() {
   local path="$1"

@@ -15,7 +15,7 @@ $expectedLicenseHashes = @{
     "FFmpeg-LGPL-2.1-or-later.txt" = "246041B6ECF9BC32D718A62C57877C78B5EB397B6467E74ED7AE2626AB189C30"
     "FFmpeg-NOTICE.txt" = "481FC2D37D80C9C2567F940CE3B5A79C28C301920E947D4880BB85DD70B86AD6"
 }
-$expectedVerifierHash = "AD92F7213086251698DC86DEF71A4A1E653048AE67827E05F8C11E32686B58ED"
+$expectedVerifierHash = "47CE8BB31BAD6DAEA1BFAF6B55D4077275B1FC2960AC3CDEEF2F0262D3F773A4"
 
 function Copy-Utf8ScriptForWindowsPowerShell([string]$Source, [string]$Destination) {
     $bom = [Text.Encoding]::UTF8.GetPreamble()
@@ -237,6 +237,43 @@ Describe "Windows package verification security boundaries" {
         }
         finally {
             Copy-Item -LiteralPath $backup -Destination $application -Force
+        }
+    }
+
+    It "rejects every PE whose machine does not match the declared x86_64 package" {
+        $peFiles = @(
+            "freeremotedesk-windows.exe",
+            "codecs\ffmpeg-8.1.2\windows-x86_64\avcodec-62.dll",
+            "codecs\ffmpeg-8.1.2\windows-x86_64\avutil-60.dll",
+            "codecs\ffmpeg-8.1.2\windows-x86_64\freeremotedesk_ffmpeg.dll"
+        )
+        foreach ($relativePath in $peFiles) {
+            $file = Join-Path $packageRoot $relativePath
+            $backup = Join-Path $TestDrive ("machine-mismatch-" + [IO.Path]::GetFileName($file))
+            Copy-Item -LiteralPath $file -Destination $backup
+            try {
+                $bytes = [IO.File]::ReadAllBytes($file)
+                if ($bytes.Length -lt 0x40 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+                    throw "package fixture 不是有效 DOS/PE 文件: $relativePath"
+                }
+                $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+                if ($peOffset -lt 0 -or $peOffset -gt ($bytes.Length - 6) -or
+                    $bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or
+                    $bytes[$peOffset + 2] -ne 0 -or $bytes[$peOffset + 3] -ne 0) {
+                    throw "package fixture PE 头无效: $relativePath"
+                }
+                # 将 COFF Machine 改成 i686，保持其余内容不变；架构 gate 应先于 hash gate 拒绝。
+                $bytes[$peOffset + 4] = 0x4C
+                $bytes[$peOffset + 5] = 0x01
+                [IO.File]::WriteAllBytes($file, $bytes)
+
+                $output = & pwsh -NoProfile -File $verifier -PackageRoot $packageRoot 2>&1
+                $LASTEXITCODE | Should Not Be 0
+                ($output -join "`n") | Should Match "PE Machine.*架构不匹配"
+            }
+            finally {
+                Copy-Item -LiteralPath $backup -Destination $file -Force
+            }
         }
     }
 
