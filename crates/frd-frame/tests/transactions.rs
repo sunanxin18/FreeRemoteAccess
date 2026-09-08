@@ -95,6 +95,87 @@ fn start(compiler: &mut FrameTransactionCompiler, session_id: SessionId, at: Ins
 }
 
 #[test]
+fn one_damage_with_many_disjoint_patches_commits_only_at_its_boundary() {
+    use frd_frame::{FrameMailbox, PushOutcome};
+
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(3, 4096);
+    let mut compiler = FrameTransactionCompiler::new(session_id);
+    let surface_size = PixelSize::new(600, 1).unwrap();
+    let baseline = PixelPatch {
+        rect: PixelRect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 1,
+        },
+        stride_bytes: 2400,
+        pixels: PixelBuffer::new(vec![0; 2400]),
+    };
+    for update in [
+        SurfaceUpdate::Reset {
+            session_id,
+            generation: 1,
+            size: surface_size,
+            format: PixelFormat::Bgra8UnormSrgb,
+        },
+        damage(session_id, 1, 1, vec![baseline]),
+        boundary(session_id, 1, 1, FrameCompleteness::FullBaseline),
+    ] {
+        assert_eq!(mailbox.push(update), PushOutcome::Queued);
+    }
+    assert_eq!(
+        compiler
+            .compile(std::iter::from_fn(|| mailbox.pop_enqueued()))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 消息数与像素区域数是不同的预算单位；300 个区域仍属于一个 revision。
+    let patches = (0..300)
+        .map(|i| PixelPatch {
+            rect: PixelRect {
+                x: i * 2,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            stride_bytes: 4,
+            pixels: PixelBuffer::new(vec![(i % 251) as u8, 2, 3, 255]),
+        })
+        .collect();
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, patches)),
+        PushOutcome::Queued
+    );
+    assert_eq!(mailbox.len(), 1);
+    assert_eq!(mailbox.queued_pixel_bytes(), 1200);
+    assert!(compiler
+        .compile(std::iter::from_fn(|| mailbox.pop_enqueued()))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        mailbox.push(boundary(session_id, 1, 2, FrameCompleteness::Incremental)),
+        PushOutcome::Queued
+    );
+    let result = compiler
+        .compile(std::iter::from_fn(|| mailbox.pop_enqueued()))
+        .unwrap();
+    let [FrameTransaction::Revision { revision, .. }] = result.as_slice() else {
+        panic!("完整边界只提交一次修订")
+    };
+    assert_eq!(revision.revision, 2);
+    assert_eq!(revision.patches.len(), 300);
+    for (i, patch) in revision.patches.iter().enumerate() {
+        assert_eq!(patch.rect.x, i as u32 * 2);
+        assert_eq!(patch.rect.width, 1);
+        assert_eq!(patch.pixels.as_bytes(), &[(i % 251) as u8, 2, 3, 255]);
+    }
+    assert!(!compiler.has_buffered_input());
+}
+
+#[test]
 fn reset_and_damage_without_full_boundary_emit_nothing() {
     let session_id = session();
     let at = Instant::now();

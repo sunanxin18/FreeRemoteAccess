@@ -212,6 +212,9 @@ pub(crate) struct NoopEgfxHandler;
 impl GraphicsPipelineHandler for NoopEgfxHandler {}
 
 const MAX_PENDING_SURFACE_UPDATES: usize = 256;
+// CacheToSurface 的目标计数是 u16；像素 patch 与队列消息分别计费。
+// pending 与已排队 Damage 共用此上限，存活元素字节不超过 size_of::<PixelPatch>() * 65535。
+const MAX_PENDING_PATCHES: usize = u16::MAX as usize;
 const MAX_PENDING_PIXEL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AVC444_BITMAP_DATA: usize = 64 * 1024 * 1024;
 const BYTES_PER_PIXEL: usize = 4;
@@ -1803,7 +1806,7 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
         if state.backings.contains(surface_id) {
             let result = state
                 .backings
-                .valid_rectangles(surface_id, MAX_PENDING_SURFACE_UPDATES)
+                .valid_rectangles(surface_id, MAX_PENDING_PATCHES)
                 .and_then(|rects| Self::publish_backing(&mut state, surface_id, &rects));
             if result.is_err() {
                 Self::publisher_error(&mut state, "map_surface:valid rectangles");
@@ -2242,7 +2245,7 @@ impl EgfxSurfacePublisher {
             return RdpEgfxFailure::PublisherRevisionOverflow;
         }
         if state.pending_overflowed
-            || state.pending_patches.len() >= MAX_PENDING_SURFACE_UPDATES
+            || Self::check_publication_patches(state, 1).is_err()
             || state.updates.len() + 2 > MAX_PENDING_SURFACE_UPDATES
         {
             return RdpEgfxFailure::PublisherQueueLimit;
@@ -2523,6 +2526,36 @@ impl EgfxSurfacePublisher {
         }
         Ok(())
     }
+    fn check_publication_patches(
+        state: &EgfxSurfaceState,
+        additional: usize,
+    ) -> backing::Result<()> {
+        state
+            .updates
+            .iter()
+            .try_fold(
+                state
+                    .pending_patches
+                    .len()
+                    .checked_add(additional)
+                    .ok_or(())?,
+                |count, update| {
+                    count
+                        .checked_add(match update {
+                            SurfaceUpdate::Damage { patches, .. } => patches.len(),
+                            _ => 0,
+                        })
+                        .ok_or(())
+                },
+            )
+            .and_then(|count| {
+                if count <= MAX_PENDING_PATCHES {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            })
+    }
     fn check_publication_bytes(
         state: &EgfxSurfaceState,
         new_bytes: usize,
@@ -2595,13 +2628,8 @@ impl EgfxSurfacePublisher {
         if !clipped.is_empty() {
             let failure = if state.pending_overflowed {
                 Some("publish:pending overflow")
-            } else if state
-                .pending_patches
-                .len()
-                .checked_add(clipped.len())
-                .is_none_or(|n| n > MAX_PENDING_SURFACE_UPDATES)
-            {
-                Some("publish:patch count")
+            } else if Self::check_publication_patches(state, clipped.len()).is_err() {
+                Some("publish:patch metadata budget")
             } else if state
                 .updates
                 .len()
@@ -2627,7 +2655,7 @@ impl EgfxSurfacePublisher {
         rects: &[PixelRect],
     ) -> backing::Result<()> {
         // backing 已保存本次操作的最终像素；先精确合并损伤，再检查发布预算。
-        // 合并不填补洞，无法合并的离散区域仍受 256 patch / 64 MiB 限制。
+        // 合并不填补洞；离散区域共用 65535 patch 元数据与 64 MiB 像素预算。
         let rects = Self::coalesce_backing_rectangles(rects.to_vec());
         let clipped = Self::publication_rectangles(state, id, &rects)?;
         let surface = *state.surfaces.get(&id).ok_or(())?;
@@ -2749,6 +2777,12 @@ impl EgfxSurfacePublisher {
     }
 
     fn queue_patch(state: &mut EgfxSurfaceState, patch: PixelPatch) {
+        if Self::check_publication_patches(state, 1).is_err() {
+            Self::publisher_error(state, "publish:patch metadata budget");
+            Self::reject(state);
+            state.pending_overflowed = true;
+            return;
+        }
         if state.pending_revision.is_none() {
             let Some(revision) = state.revision.checked_add(1) else {
                 Self::reject(state);
@@ -2761,11 +2795,6 @@ impl EgfxSurfacePublisher {
             if coverage.record(patch.rect) {
                 state.baseline_established = true;
             }
-        }
-        if state.pending_patches.len() >= MAX_PENDING_SURFACE_UPDATES {
-            Self::reject(state);
-            state.pending_overflowed = true;
-            return;
         }
         state.pending_patches.push(patch);
     }
@@ -4915,7 +4944,7 @@ mod tests {
         );
     }
     #[test]
-    fn disjoint_cache_destinations_still_fail_closed_without_partial_publication() {
+    fn disjoint_cache_destinations_preserve_exact_pixels_and_holes() {
         use ironrdp_egfx::pdu::{CacheToSurfacePdu, Point};
         let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
         publisher.on_reset_graphics(600, 1);
@@ -4944,18 +4973,94 @@ mod tests {
             state.backings.write(2, r, &[1, 2, 3, 255]).unwrap();
             state.backings.cache_surface(2, r, 3).unwrap();
         }
-        publisher.drain();
+        let reset = publisher.drain();
         publisher.on_cache_to_surface(&CacheToSurfacePdu {
             cache_slot: 3,
             surface_id: 1,
             destination_points: (0..300).map(|i| Point { x: i * 2, y: 0 }).collect(),
         });
-        assert!(publisher.is_disabled());
-        assert!(publisher.drain().is_empty());
+        assert!(!publisher.is_disabled());
         let state = super::lock_state(&publisher.state);
-        assert_eq!(state.publisher_failure_detail, Some("publish:patch count"));
-        assert_eq!(state.publisher_failure_operation, Some("cache_to_surface"));
-        assert!(state.pending_patches.is_empty());
+        assert_eq!(state.pending_patches.len(), 300);
+        for (i, patch) in state.pending_patches.iter().enumerate() {
+            assert_eq!(
+                patch.rect,
+                PixelRect {
+                    x: i as u32 * 2,
+                    y: 0,
+                    width: 1,
+                    height: 1
+                }
+            );
+            assert_eq!(patch.pixels.as_bytes(), &[1, 2, 3, 255]);
+            assert!(state
+                .backings
+                .read(
+                    1,
+                    PixelRect {
+                        x: i as u32 * 2 + 1,
+                        y: 0,
+                        width: 1,
+                        height: 1
+                    }
+                )
+                .is_err());
+        }
+        assert!(!state.baseline_established);
+        drop(state);
+        // 先以真实 backing 填满基线，再验证下一帧的 300 个离散 patch 穿过消费者。
+        {
+            let mut state = super::lock_state(&publisher.state);
+            let full = PixelRect {
+                x: 0,
+                y: 0,
+                width: 600,
+                height: 1,
+            };
+            state.backings.fill(1, &[full], [9, 8, 7, 255]).unwrap();
+            EgfxSurfacePublisher::publish_backing(&mut state, 1, &[full]).unwrap();
+        }
+        publisher.on_frame_complete(1);
+        let session_id = super::lock_state(&publisher.state).session_id;
+        let mut mailbox = frd_frame::FrameMailbox::new(256, 64 * 1024 * 1024);
+        let mut compiler = frd_frame::FrameTransactionCompiler::new(session_id);
+        for update in reset.into_iter().chain(publisher.drain()) {
+            assert_eq!(mailbox.push(update), frd_frame::PushOutcome::Queued);
+        }
+        assert_eq!(
+            compiler
+                .compile(std::iter::from_fn(|| mailbox.pop_enqueued()))
+                .unwrap()
+                .len(),
+            1
+        );
+        publisher.on_cache_to_surface(&CacheToSurfacePdu {
+            cache_slot: 3,
+            surface_id: 1,
+            destination_points: (0..300).map(|i| Point { x: i * 2, y: 0 }).collect(),
+        });
+        publisher.on_frame_complete(2);
+        let updates = publisher.drain();
+        assert_eq!(updates.len(), 2);
+        assert!(
+            matches!(&updates[0], SurfaceUpdate::Damage { patches, .. } if patches.len() == 300)
+        );
+        assert!(matches!(&updates[1], SurfaceUpdate::FrameBoundary { .. }));
+        for update in updates {
+            assert_eq!(mailbox.push(update), frd_frame::PushOutcome::Queued);
+        }
+        let transactions = compiler
+            .compile(std::iter::from_fn(|| mailbox.pop_enqueued()))
+            .unwrap();
+        let [frd_frame::FrameTransaction::Revision { revision, .. }] = transactions.as_slice()
+        else {
+            panic!("missing revision")
+        };
+        assert_eq!(revision.patches.len(), 300);
+        for (i, patch) in revision.patches.iter().enumerate() {
+            assert_eq!(patch.rect.x, i as u32 * 2);
+            assert_eq!(patch.pixels.as_bytes(), &[1, 2, 3, 255]);
+        }
     }
 
     #[test]
@@ -5207,6 +5312,52 @@ mod tests {
         );
         assert!(!state.backings.contains(1));
         assert_eq!(state.publisher_failure_detail, Some("publish:pixel budget"));
+    }
+
+    #[test]
+    fn patch_metadata_budget_counts_pending_and_queued_before_any_append() {
+        let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
+        let mut state = super::lock_state(&publisher.state);
+        let patch = || frd_frame::PixelPatch {
+            rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            stride_bytes: 4,
+            pixels: frd_frame::PixelBuffer::new(vec![1, 2, 3, 255]),
+        };
+        state.pending_patches.push(patch());
+        let session_id = state.session_id;
+        state.updates.push_back(SurfaceUpdate::Damage {
+            session_id,
+            generation: 1,
+            revision: 1,
+            patches: (1..super::MAX_PENDING_PATCHES).map(|_| patch()).collect(),
+        });
+        assert!(EgfxSurfacePublisher::check_publication_patches(&state, 0).is_ok());
+        assert!(EgfxSurfacePublisher::check_publication_patches(&state, 1).is_err());
+        state.output_size = PixelSize::new(1, 1);
+        state.surfaces.insert(
+            1,
+            super::EgfxSurface {
+                width: 1,
+                height: 1,
+                origin_x: 0,
+                origin_y: 0,
+                mapped: true,
+            },
+        );
+        assert!(EgfxSurfacePublisher::publish_backing(&mut state, 1, &[patch().rect]).is_err());
+        assert_eq!(
+            state.publisher_failure_detail,
+            Some("publish:patch metadata budget")
+        );
+        assert_eq!(state.pending_patches.len(), 1);
+        assert_eq!(state.updates.len(), 1);
+        assert!(state.pending_revision.is_none());
+        assert!(!state.backings.contains(1));
     }
 
     #[test]
