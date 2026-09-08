@@ -55,3 +55,13 @@ Secret Service 往返证据。后续 Linux 原生 CI 需独立运行临时 D-Bus
 窗口身份可独立修正：winit ApplicationName 同时映射 Wayland app_id 与 X11 WM_CLASS，统一为 freeremotedesk 并与 desktop entry / StartupWMClass 对应。该 Linux-only 配置不改变标题栏几何，也不宣称解决上述装饰问题。
 
 参考：[GTK set_titlebar](https://docs.gtk.org/gtk4/method.Window.set_titlebar.html)、[HeaderBar title widget](https://docs.gtk.org/gtk4/method.HeaderBar.set_title_widget.html)、[宿主按钮布局](https://docs.gtk.org/gtk4/property.Settings.gtk-decoration-layout.html)、[WindowHandle](https://docs.gtk.org/gtk4/class.WindowHandle.html)、[GNOME Header Bars](https://developer.gnome.org/hig/patterns/containers/header-bars.html)。
+
+## GTK 与当前 GPU 后端的接线边界
+
+固定 wgpu/wgpu-hal 30.0.1 审查：GLES Adapter::new_external 允许使用当前外部上下文，但要求创建、使用及销毁所有派生对象时上下文保持 current。高层 Instance::create_adapter_from_hal 另要求 adapter 来自该 instance 的内部 handle，独立 GTK 上下文没有已验证的构造路径满足此前提；不得用任意新 Instance 或 unsafe Send/Sync 伪装解决。
+
+RemoteRenderer::record_in 已能接收离屏 TextureView，但当前 compositor 的 acquire/present 持有 SurfaceTexture，当前 pass 要求 sRGB 目标。GtkGLArea 的实际 FBO 编码与完成强度均须实测，不能把未知目标标为 sRGB，也不能把上传、queue_render 或 callback 到达当作实际呈现确认。
+
+下一实现方向：先分离现有 RemoteUpdateState、计划与 receipt 状态机，保留 wgpu 行为与测试；Linux GL 执行器再消费同一事务计划。在 GTK current-context 生命周期内管理 texture/FBO，禁止每帧读回CPU。BGRX/BGRA方向与色阶用四角fixture验证，视频后续按原 VideoFrameLayout/VideoColorSelection 采样平面。unrealize/context丢失必须撤销未确认 receipt，并在释放GL资源后请求新完整基线；不能确认旧代帧。
+
+该结论来自固定依赖源码与[GtkGLArea官方文档](https://docs.gtk.org/gtk4/class.GLArea.html)审查，不是GTK/wgpu互操作已实现。独立原生窗口探针仍需CI运行，完整GL执行器及产品接线尚未实现。
