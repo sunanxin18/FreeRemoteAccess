@@ -375,6 +375,22 @@ fn run() -> Result<(), &'static str> {
                 capabilities.egfx_diagnostics.confirmed_flags,
                 capabilities.egfx_diagnostics.unhandled_codec_count,
                 capabilities.egfx_diagnostics.last_unhandled_codec);
+            if let Some(failure) = capabilities.egfx_diagnostics.progressive_coverage_failure {
+                println!(
+                    "RDP Progressive 覆盖失败 outer_frame_id={} surface_id={} codec_context_id={} rectangle=({}, {}, {}, {}) missing_tile=({}, {}) frame_tile_count={} region_tile_count={}",
+                    failure.outer_frame_id,
+                    failure.surface_id,
+                    failure.codec_context_id,
+                    failure.rectangle.0,
+                    failure.rectangle.1,
+                    failure.rectangle.2,
+                    failure.rectangle.3,
+                    failure.missing_tile.0,
+                    failure.missing_tile.1,
+                    failure.frame_tile_count,
+                    failure.region_tile_count,
+                );
+            }
             println!("RDP EGFX 实际计数 avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={}",
                 capabilities.egfx_diagnostics.avc420_decoded_pictures_total,
                 capabilities.egfx_diagnostics.avc444_decoded_updates_total,
