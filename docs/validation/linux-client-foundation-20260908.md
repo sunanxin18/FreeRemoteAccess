@@ -362,3 +362,33 @@ monitor geometry×浮点monitor scale的DisplayGeometry转换，窗口content另
 两模块已注册为公共接口，但尚未接runner输入或显示请求，也没有原生键鼠证明。
 本机GTK focused共20项纯测试通过，日志`/tmp/frd-gtk-diagnostics-unit.log`。
 窗口提交诊断只增加有界计数/布尔/framecounter，未改变确认逻辑；原生超时根因待日志。
+
+
+## 7712d24 全部显示后端诊断与输入归属修正
+
+run34215556358 三架构终态失败：i686 job102026352008、ARM64 job102026352394、
+x86_64 job102026352434。全部 X11/Wayland 1×/2× 的帧适配及登录/取消 fixture
+通过；12 个窗口提交 fixture 均在首次等待超时。固定计数显示 before/paint/draw/after
+均已执行，而 nonempty_damage=false、bootstrap=0，不能将整轮记为通过。
+日志 `/tmp/frd-gtk-771-{i686,arm64,x64}.log` 保留失败证据。
+
+runner 显示请求现在复用公开 DisplayGeometry 采集，替换旧的 monitor 整数缩放；
+连接前使用标题栏下方 Stack 的真实内容尺寸，不读取尚未分配的远程 GLArea。
+新增原生 fixture 核对真正送入协议工厂的显示意图，此新增断言仍待 Linux 执行。
+
+新增公开输入归属账本，physical press 仅在路由/发送接受后确认归属，IM commit
+绑定 context/epoch。独立审查发现 consumed release 会重新授权已消费或撤销的
+异步文字，先以两条序列复现失败再修正；release 只能继承尚未消费授权。
+模块不存文本，保留共享 InputRouter 的 focus/ReleaseAll 职责，尚未接入 GTK
+原生事件和 IMContext，不能据纯状态测试声明真实键盘/输入法通过。
+
+本轮集成验证：完整 `cargo test --locked --workspace` exit0，78组1764 passed /
+0 failed / 16 ignored，日志 `/tmp/frd-gtk-input-geometry-workspace.log`。GTK focused
+38项通过；三架构 gtk-shell 全 tests 使用非链接 SDK 占位配置的类型检查通过。
+`cargo fmt --all -- --check` 和 `git diff --check` 通过。此证据不替代 Linux SDK
+实际链接、窗口提交负例注入和原生 IM 验收。
+
+窗口超时修正依据固定 GTK 源码：空 expose 可经 GSK 节点 diff 变为非空 damage；
+新增实际 GLArea surfaceless context 到窗口 EGL context/drawable 的转换门禁，
+保留同帧/receipt/错误/lifecycle 约束，最终空帧仍拒绝。新原生矩阵待执行，
+详见设计文档的源码依据。

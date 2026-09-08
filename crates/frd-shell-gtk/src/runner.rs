@@ -1,10 +1,7 @@
 //! 实际 GTK 产品事件泵；此阶段不发布 FramePresented，也不放宽 controller 输入门禁。
 use crate::{AdapterEvent, GtkFrameArea, SubmitError};
 use frd_app::{persist_profile_job, AppAction, AppIntent, AppLaunch, AppPage, AppPlatformStores};
-use frd_core::{
-    DisplayGeometry, DisplayIntent, PixelRect, ResolutionMode, SecretBuffer, SessionId,
-    TargetSystem,
-};
+use frd_core::{DisplayIntent, ResolutionMode, SecretBuffer, SessionId, TargetSystem};
 use frd_frame::FrameTransaction;
 use frd_platform_api::{
     ConnectionProfileKey, ConnectionProfileStore, PlatformError, SavedConnectionProfile,
@@ -540,7 +537,10 @@ impl State {
         match action {
             Ok(Some(AppAction::StartSession(mut request, permit))) => {
                 self.reset_canvas();
-                if let Some(geometry) = window_geometry(&self.window, &self.stack) {
+                // Stack 是标题栏下方的同一个内容矩形；连接前远程 GLArea 尚未分配尺寸。
+                if let Some(geometry) =
+                    crate::display_geometry::from_window(&self.window, &self.stack)
+                {
                     request.display_intent = match request.display_intent.mode {
                         ResolutionMode::NativeDisplay => DisplayIntent::native_display(geometry),
                         ResolutionMode::DisplayWorkArea => {
@@ -969,38 +969,4 @@ impl State {
             });
         }
     }
-}
-
-// GDK monitor geometry 是逻辑坐标；工作区不可查询时保守使用完整显示器。
-fn window_geometry(window: &gtk4::Window, content_widget: &gtk4::Stack) -> Option<DisplayGeometry> {
-    let surface = window.surface()?;
-    let monitor = gtk4::prelude::WidgetExt::display(window).monitor_at_surface(&surface)?;
-    let rect = monitor.geometry();
-    let scale = monitor.scale_factor();
-    let size = crate::drawable_size(rect.width(), rect.height(), scale)?;
-    let full = PixelRect {
-        x: 0,
-        y: 0,
-        width: size.width,
-        height: size.height,
-    };
-    let content = crate::drawable_size(
-        content_widget.width(),
-        content_widget.height(),
-        content_widget.scale_factor(),
-    )?;
-    DisplayGeometry::new(
-        f64::from(rect.width()),
-        f64::from(rect.height()),
-        size,
-        full,
-        PixelRect {
-            x: 0,
-            y: 0,
-            width: content.width.min(size.width),
-            height: content.height.min(size.height),
-        },
-        u32::try_from(scale).ok()?.checked_mul(1000)?,
-        window.is_fullscreen(),
-    )
 }

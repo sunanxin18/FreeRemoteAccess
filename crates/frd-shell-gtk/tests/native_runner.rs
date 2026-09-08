@@ -5,8 +5,8 @@
 ))]
 use frd_app::AppLaunch;
 use frd_core::{
-    CredentialProviderId, Endpoint, PixelRect, PixelSize, ProtocolId, SecretBuffer, SessionId,
-    TargetSystem,
+    CredentialProviderId, DisplayIntent, Endpoint, PixelRect, PixelSize, ProtocolId,
+    ResolutionMode, SecretBuffer, SessionId, TargetSystem,
 };
 use frd_frame::{FrameCompleteness, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate};
 use frd_media_api::{AudioOutput, AudioOutputError};
@@ -19,7 +19,7 @@ use gtk4::{glib, prelude::*};
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -105,6 +105,7 @@ impl AudioOutputFactory for Audio {
 struct Factory {
     starts: Arc<AtomicUsize>,
     closed: Arc<AtomicUsize>,
+    display_intents: Arc<Mutex<Vec<DisplayIntent>>>,
 }
 impl ProtocolFactory for Factory {
     fn descriptor(&self) -> ProtocolDescriptor {
@@ -115,6 +116,10 @@ impl ProtocolFactory for Factory {
         request: ConnectRequest,
         runtime: ProtocolRuntime,
     ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
+        self.display_intents
+            .lock()
+            .unwrap()
+            .push(request.display_intent);
         let credentials = request.credentials.as_ref().unwrap();
         assert!(
             credentials.password.expose() == PASSWORD.as_bytes(),
@@ -289,6 +294,7 @@ fn native_gtk_login_session_cancel() {
     });
     let starts = Arc::new(AtomicUsize::new(0));
     let closed = Arc::new(AtomicUsize::new(0));
+    let display_intents = Arc::new(Mutex::new(Vec::new()));
     let catalog = ProtocolCatalog::new([ProtocolId::rdp()]);
     let launch = AppLaunch::new_with_stores(
         LaunchOptions::default(),
@@ -305,6 +311,7 @@ fn native_gtk_login_session_cancel() {
         vec![Arc::new(Factory {
             starts: starts.clone(),
             closed: closed.clone(),
+            display_intents: display_intents.clone(),
         })],
         GtkRunnerStores::new(stores.clone(), stores.clone(), stores.clone()),
         Arc::new(Audio),
@@ -357,6 +364,34 @@ fn native_gtk_login_session_cancel() {
     password.emit_by_name::<()>("activate", &[]);
     password.emit_by_name::<()>("activate", &[]);
     until(|| starts.load(Ordering::SeqCst) == 1 && status.text().contains("准备远程画面"));
+    // 检查真正交给协议工厂的请求，不能以转换函数单测代替 runner 接线。
+    let requested = display_intents.lock().unwrap()[0];
+    assert_eq!(requested.mode, ResolutionMode::NativeDisplay);
+    let geometry = requested.geometry.expect("连接请求必须携带当前显示器几何");
+    let surface = window.surface().unwrap();
+    let monitor = WidgetExt::display(&window)
+        .monitor_at_surface(&surface)
+        .unwrap();
+    let monitor_rect = monitor.geometry();
+    assert_eq!(
+        geometry.physical_size,
+        PixelSize::new(
+            (f64::from(monitor_rect.width()) * monitor.scale()).round() as u32,
+            (f64::from(monitor_rect.height()) * monitor.scale()).round() as u32,
+        )
+        .unwrap()
+    );
+    let content = window.child().unwrap();
+    assert_eq!(
+        geometry.content_area.width,
+        ((f64::from(content.width()) * surface.scale()).round() as u32)
+            .min(geometry.physical_size.width)
+    );
+    assert_eq!(
+        geometry.content_area.height,
+        ((f64::from(content.height()) * surface.scale()).round() as u32)
+            .min(geometry.physical_size.height)
+    );
     assert!(password.text().is_empty());
     let first_area = find(&root, "frd-remote")
         .downcast::<gtk4::GLArea>()

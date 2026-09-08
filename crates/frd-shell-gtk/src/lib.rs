@@ -1,6 +1,7 @@
 //! GTK 4.14 GLArea 帧事务适配器；命令提交事件不是窗口呈现 ACK。
 pub mod display_geometry;
 pub mod input_keymap;
+pub mod input_ownership;
 use frd_core::PixelSize;
 use frd_frame::FrameTransaction;
 

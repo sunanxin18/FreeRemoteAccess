@@ -175,7 +175,7 @@ alpha1满足premultiplied解释。桌面BGRA内存格式不能成为额外交换
 EGL end_frame 忽略 swap 返回值，但同条返回路径没有调用 eglGetError；Wayland
 notify_committed 只清状态标志。因此同一 observer 可在 after-paint 读取窗口 GL/EGL
 错误，结合原生 current context/draw surface、同一framecounter和真实Surface render
-调用栈内的精确draw receipt建立提交确认。首帧、空damage、离屏snapshot、resize、
+调用栈内的精确draw receipt建立提交确认。首帧、最终空damage、离屏snapshot、resize、
 unrealize、context变化或缺失作用域必须拒绝。该路径仍须native故障注入验证。
 GLX后续可用公开X11 display error_trap_push/pop包住paint，pop返回X请求错误；
 不能用pop_ignored或把XSync称为物理显示证明。
@@ -186,3 +186,18 @@ GLX后续可用公开X11 display error_trap_push/pop包住paint，pop返回X请�
 [Wayland end_frame](https://github.com/GNOME/gtk/blob/4.14.0/gdk/wayland/gdkglcontext-wayland.c#L60)、
 [X11 error trap](https://github.com/GNOME/gtk/blob/4.14.0/gdk/x11/gdkdisplay-x11.c#L2673)。
 这关闭了“找不到公开观察接口”的设计不确定性，不代表生产ACK已实现或通过。
+
+7712d24 原生诊断纠正了 expose 的语义：Surface::render 参数是 GDK expose，
+`queue_render` 可以合法传空 region；GSK 随后为首帧或新节点 diff 加入实际 damage。
+因此不能以 expose 非空判定窗口绘制。关联仍要求同一 surface/frame/render 调用，
+并新增 GLArea draw 时实际 EGL surfaceless context 到 after-paint 不同的实际
+GSK window context/非空 drawable 的转换证据。旧 GL 的最终空 clip 分支在
+begin-frame 前返回；X11 empty-frame 不执行 GL 操作，Wayland 仅提交 Wayland 状态，
+均不能产生该转换。原来的错误作用域、精确 receipt 和生命周期门禁保持不变。
+本修正仍待原生矩阵验收，不能先发布生产 ACK。
+
+固定源码：[queue_render](https://github.com/GNOME/gtk/blob/4.14.0/gdk/gdksurface.c#L1439)、
+[最终 damage](https://github.com/GNOME/gtk/blob/4.14.0/gsk/gskrenderer.c#L489)、
+[空 clip 分支](https://github.com/GNOME/gtk/blob/4.14.0/gsk/gl/gskglrenderer.c#L363)、
+[X11 empty-frame](https://github.com/GNOME/gtk/blob/4.14.0/gdk/x11/gdkglcontext-x11.c#L43)、
+[Wayland empty-frame](https://github.com/GNOME/gtk/blob/4.14.0/gdk/wayland/gdkglcontext-wayland.c#L87)。

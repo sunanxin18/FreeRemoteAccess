@@ -155,6 +155,10 @@ fn native_gtk_window_submission_roundtrip() {
         .enable_window_submission(&window)
         .expect("只接受固定旧 GL renderer");
     let first = wait_submission(&adapter);
+    let diagnostics = adapter.submission_diagnostics().unwrap();
+    assert!(diagnostics.bootstrap_count >= 1 && diagnostics.confirmed_count >= 1);
+    assert!(diagnostics.draw_surfaceless && diagnostics.window_context_transition,
+        "必须观察本次 GLArea surfaceless → GSK 窗口 context 转换，不能只看 expose 是否非空: {diagnostics:?}");
     let first_counter = first.frame_counter();
     assert!(
         first_counter

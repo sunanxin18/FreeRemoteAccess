@@ -6,7 +6,7 @@ fn bootstrap_and_missing_baseline_never_confirm() {
     gate.begin(1, false);
     gate.paint(1, true);
     assert!(gate.draw(1, true));
-    assert!(!gate.finish(1, true));
+    assert!(!gate.finish(1, true, true));
 }
 
 #[test]
@@ -15,12 +15,12 @@ fn exact_clean_frame_is_consumed_once() {
     gate.begin(2, true);
     gate.paint(2, true);
     assert!(gate.draw(2, true));
-    assert!(gate.finish(2, true));
-    assert!(!gate.finish(2, true));
+    assert!(gate.finish(2, true, true));
+    assert!(!gate.finish(2, true, true));
 }
 
 #[test]
-fn wrong_counter_offscreen_empty_duplicate_and_fault_reject() {
+fn wrong_counter_offscreen_missing_region_duplicate_and_fault_reject() {
     for scenario in 0..7 {
         let mut gate = FrameGate::default();
         gate.begin(4, true);
@@ -32,7 +32,7 @@ fn wrong_counter_offscreen_empty_duplicate_and_fault_reject() {
         if scenario == 4 {
             gate.paint(4, true);
         }
-        assert!(!gate.finish(if scenario == 5 { 5 } else { 4 }, scenario != 6));
+        assert!(!gate.finish(if scenario == 5 { 5 } else { 4 }, scenario != 6, true));
     }
 }
 
@@ -46,11 +46,11 @@ fn resize_unrealize_invalidates_inflight_and_issued_epoch() {
     let retained_epoch = gate.epoch.clone();
     gate.invalidate();
     assert_ne!(retained_epoch.get(), token_epoch);
-    assert!(!gate.finish(7, true));
+    assert!(!gate.finish(7, true, true));
     gate.begin(8, true);
     gate.paint(8, true);
     gate.draw(8, true);
-    assert!(gate.finish(8, true));
+    assert!(gate.finish(8, true, true));
 }
 
 #[test]
@@ -62,5 +62,19 @@ fn exhausted_epoch_permanently_rejects_new_frames() {
     gate.begin(9, true);
     gate.paint(9, true);
     gate.draw(9, true);
-    assert!(!gate.finish(9, true));
+    assert!(!gate.finish(9, true, true));
+}
+
+#[test]
+fn clean_after_paint_without_window_context_transition_cannot_confirm() {
+    let mut gate = FrameGate::default();
+    gate.begin(10, true);
+    // Surface::render的region存在即可关联，是否为空不是最终GSK damage。
+    gate.paint(10, true);
+    gate.draw(10, true);
+    assert!(!gate.finish(10, true, false));
+    gate.begin(11, true);
+    gate.paint(11, true);
+    gate.draw(11, true);
+    assert!(gate.finish(11, true, true));
 }

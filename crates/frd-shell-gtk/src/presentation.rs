@@ -34,6 +34,8 @@ pub struct SubmissionDiagnostics {
     pub exact_draw: bool,
     pub observed_paint: bool,
     pub clean_after: bool,
+    pub draw_surfaceless: bool,
+    pub window_context_transition: bool,
 }
 
 #[derive(Default)]
@@ -56,8 +58,8 @@ impl FrameGate {
         self.draw = false;
         self.rejected = false;
     }
-    fn paint(&mut self, frame: i64, nonempty: bool) {
-        if self.frame.is_none_or(|f| f.0 != frame) || self.paint || !nonempty {
+    fn paint(&mut self, frame: i64, region_present: bool) {
+        if self.frame.is_none_or(|f| f.0 != frame) || self.paint || !region_present {
             self.rejected = true;
         }
         self.paint = true;
@@ -73,7 +75,7 @@ impl FrameGate {
         self.draw = true;
         !self.rejected
     }
-    fn finish(&mut self, frame: i64, clean_after: bool) -> bool {
+    fn finish(&mut self, frame: i64, clean_after: bool, window_context_transition: bool) -> bool {
         self.frame.take().is_some_and(|(f, epoch, baseline)| {
             f == frame
                 && epoch == self.epoch.get()
@@ -82,6 +84,7 @@ impl FrameGate {
                 && self.draw
                 && !self.rejected
                 && clean_after
+                && window_context_transition
         })
     }
     fn invalidate(&mut self) {
@@ -196,6 +199,7 @@ mod native {
         gate: FrameGate,
         known: Option<Known>,
         draw: Option<DrawReceipt>,
+        draw_egl_context: Option<EglContext>,
         ready: Option<WindowSubmission>,
         error: Option<SubmissionError>,
         retry_after_layout: bool,
@@ -208,6 +212,7 @@ mod native {
             self.gate.invalidate();
             self.known = None;
             self.draw = None;
+            self.draw_egl_context = None;
             self.ready = None;
         }
     }
@@ -290,6 +295,7 @@ mod native {
                     gate: FrameGate::default(),
                     known: None,
                     draw: None,
+                    draw_egl_context: None,
                     ready: None,
                     error: None,
                     retry_after_layout: false,
@@ -379,7 +385,8 @@ mod native {
             this.connections
                 .borrow_mut()
                 .push((area.clone().upcast(), id));
-            // emission hook 在 true-handled 累加器前读取真实 Surface::render 的 damage。
+            // emission hook 在 true-handled 累加器前关联真实 Surface::render。
+            // expose region 非最终 GSK damage；空 region 仍可能由新节点 diff 产生绘制。
             // weak 数据由 GObject destroy notifier 释放，Drop 先移除 hook。
             let data = Box::into_raw(Box::new(Rc::downgrade(&this)));
             let hook = unsafe {
@@ -418,7 +425,10 @@ mod native {
         /// 必须在 GLArea::render 回调的成功 draw 后同步交出所有权，延迟事件不被接受。
         pub(crate) fn record_draw(&self, receipt: DrawReceipt) -> Result<(), SubmissionError> {
             let area = self.area.upgrade().ok_or(SubmissionError::Lifecycle)?;
-            let matches = self.in_signal(&self.surface, self.render_signal)
+            let draw_identity = self.api.identity();
+            let draw_surfaceless = draw_identity.is_some_and(|id| id.2.is_null());
+            let matches = draw_surfaceless
+                && self.in_signal(&self.surface, self.render_signal)
                 && self.in_signal(&area, unsafe {
                     glib::gobject_ffi::g_signal_lookup(
                         c"render".as_ptr(),
@@ -433,11 +443,13 @@ mod native {
             state.diagnostics.draw_count = state.diagnostics.draw_count.saturating_add(1);
             state.diagnostics.draw_frame = self.clock.frame_counter();
             state.diagnostics.invocation_matches = matches;
+            state.diagnostics.draw_surfaceless = draw_surfaceless;
             if !state.gate.draw(self.clock.frame_counter(), matches) {
                 state.draw = None;
                 state.error = Some(SubmissionError::Association);
                 return Err(SubmissionError::Association);
             }
+            state.draw_egl_context = draw_identity.map(|id| id.0);
             state.draw = Some(receipt);
             Ok(())
         }
@@ -469,6 +481,7 @@ mod native {
             state.diagnostics.live = self.live();
             state.ready = None;
             state.draw = None;
+            state.draw_egl_context = None;
             if !self.live() {
                 state.invalidate();
                 return;
@@ -527,6 +540,17 @@ mod native {
             };
             let exact_draw = state.draw.as_ref().is_some_and(DrawReceipt::is_valid);
             let observed_paint = state.gate.paint && state.gate.draw && !state.gate.rejected;
+            // Surface expose 可为空，GSK 随后根据新 GLTexture 节点计算真正 damage。
+            // 固定旧 gl 的 empty_frame 在 make_current 前返回，不能把本次 GLArea 的
+            // surfaceless context 转换为这里的窗口 context/drawable。以实际转换证明
+            // 经过非空渲染分支，不能把空 expose 或 after-paint 本身当成提交证据。
+            let window_context_transition = valid
+                && identity.is_some_and(|id| {
+                    state
+                        .draw_egl_context
+                        .is_some_and(|draw_context| draw_context != id.0)
+                });
+            state.diagnostics.window_context_transition = window_context_transition;
             state.diagnostics.current_window = valid;
             state.diagnostics.same_known = same;
             state.diagnostics.exact_draw = exact_draw;
@@ -535,6 +559,7 @@ mod native {
             let confirmed = state.gate.finish(
                 self.clock.frame_counter(),
                 same && clean.is_ok() && exact_draw,
+                window_context_transition,
             );
             if confirmed {
                 state.diagnostics.confirmed_count =
@@ -555,7 +580,7 @@ mod native {
                 if let Err(error) = clean {
                     state.error = Some(error);
                     state.invalidate();
-                } else if observed_paint && exact_draw && !same {
+                } else if observed_paint && exact_draw && window_context_transition && !same {
                     state.diagnostics.bootstrap_count =
                         state.diagnostics.bootstrap_count.saturating_add(1);
                     state.invalidate();
@@ -624,7 +649,9 @@ mod native {
                     state.diagnostics.paint_count = state.diagnostics.paint_count.saturating_add(1);
                     state.diagnostics.paint_frame = this.clock.frame_counter();
                     state.diagnostics.nonempty_damage = nonempty;
-                    state.gate.paint(this.clock.frame_counter(), nonempty);
+                    state
+                        .gate
+                        .paint(this.clock.frame_counter(), !region.is_null());
                 }
             }
         }
