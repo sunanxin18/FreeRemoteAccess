@@ -78,4 +78,4 @@ Linux run `34202134581` 的 ARM64 job `101983147418` 与 x86_64 job `10198314761
 
 新增实测fixture先触发旧规则失败；修正规则只允许固定探针主题中最多1逻辑点的对称标题栏外扩，内容保持窗口左边对齐，并保留接缝、DPI、焦点、配对及无标题栏误点击条件。16项回归通过，下载的三份 `x11-1.jsonl` 均通过 `--require-input` 离线复验。原 run 仍是失败；此复验不补充未执行的2×、Wayland、任意主题或完整产品GUI验收。GL renderer实际是软件llvmpipe，不是硬件GPU证明。
 
-基础 CI run `34202134493` Ubuntu成功；macOS完成编译与安全测试后，在获取 pinned EGFX 的 arbitrary 依赖时因 `index.crates.io` DNS超时失败。确认终态后仅重跑失败job，attempt2仍在运行；没有修改锁文件或跳过测试。
+基础 CI run `34202134493` Ubuntu成功；macOS完成编译与安全测试后，在获取 pinned EGFX 的 arbitrary 依赖时因 `index.crates.io` DNS超时失败。确认终态后仅重跑失败job；attempt2 的 macOS job `101986081337` 已终态成功，原来未执行的 pinned EGFX 与 macOS 平台/应用测试均实际通过。整个基础 CI 已成功，没有修改锁文件或跳过测试。

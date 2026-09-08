@@ -67,3 +67,17 @@ RemoteRenderer::record_in 已能接收离屏 TextureView，但当前 compositor 
 下一实现方向：Linux GL 执行器消费同一事务计划。在 GTK current-context 生命周期内管理 texture/FBO，禁止每帧读回CPU。BGRX/BGRA方向与色阶用四角fixture验证，视频后续按原 VideoFrameLayout/VideoColorSelection 采样平面。unrealize/context丢失必须撤销未确认 receipt，并在释放GL资源后请求新完整基线；不能确认旧代帧。
 
 该结论来自固定依赖源码与[GtkGLArea官方文档](https://docs.gtk.org/gtk4/class.GLArea.html)审查，不是GTK/wgpu互操作已实现。独立原生窗口探针仍需CI运行，完整GL执行器及产品接线尚未实现。
+
+### 共享状态 crate 的提交边界
+
+接下来将纯状态迁移到 frd-render-state，只依赖 frd-core/frd-frame。纯 TransactionError
+明确映射至原 RendererError；GPU 错误、设备尺寸上限和目标色彩格式留在后端。
+不能把现有 PlannedBatch 的 staged_state 直接公开：新 BatchCandidate 独占借用原
+RemoteUpdateState，字段私有、不实现 Clone，只暴露只读操作，commit(self) 消费一次，
+丢弃候选不修改已安装状态。候选存活期间不可 clear、恢复、再规划或确认回执。
+
+Wgpu 在既有 GpuCleanToken 的 commit_if_unchanged 内消费候选并安装资源；GL 后端
+将来必须提供自己的 context/错误代际检查。纯状态 crate 无法证明实际 GPU 执行成功，
+不引入可伪造的公共成功 token。ConfirmedPresentation 构造仍由后端控制，禁止用
+上传完成或 GTK queue_render 代替真实呈现确认。迁移必须保留全部 GPU 故障与回执
+回归，并加入候选丢弃、不可重复/跨实例提交、不可修改操作的运行及编译拒绝测试。
