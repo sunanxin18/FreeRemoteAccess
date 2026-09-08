@@ -702,9 +702,17 @@ fn development_codec_bundle() -> PathBuf {
     }
     #[cfg(windows)]
     {
+        #[cfg(target_arch = "x86")]
+        const PLATFORM: &str = "windows-x86";
+        #[cfg(target_arch = "x86_64")]
+        const PLATFORM: &str = "windows-x86_64";
+        #[cfg(target_arch = "aarch64")]
+        const PLATFORM: &str = "windows-aarch64";
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join(".codex-target/ffmpeg-8.1.2/windows-x86_64/Release/codec")
+            .join(".codex-target/ffmpeg-8.1.2")
+            .join(PLATFORM)
+            .join("Release/codec")
             .canonicalize()
             .expect("请先运行 tools/build-ffmpeg-windows.ps1 生成测试 bundle")
     }

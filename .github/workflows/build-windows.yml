@@ -126,7 +126,7 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File tools/build-ffmpeg-windows.ps1 -Configuration Release -Architecture ${{ matrix.architecture }} -WslDistribution Ubuntu-24.04
 
-      - name: Run safe Rust tests
+      - name: Run host Rust tests (not target runtime evidence)
         shell: pwsh
         run: >-
           cargo test --locked
@@ -143,9 +143,19 @@ jobs:
           -p frd-ui-egui
           -p frd-shell-desktop
           -p frd-video-ffmpeg
-          -p frd-video-ffmpeg-plugin
           -p frd-platform-windows
           -p freeremotedesk-windows
+
+      - name: Run host plugin unit tests
+        shell: pwsh
+        run: cargo test --locked -p frd-video-ffmpeg-plugin --lib
+
+      - name: Run x86 decoder fixtures in a 32-bit process
+        if: matrix.architecture == 'x86'
+        shell: pwsh
+        run: |
+          $env:FRD_FFMPEG_TEST_BUNDLE = (Resolve-Path '.codex-target/ffmpeg-8.1.2/windows-x86/Release/codec').Path
+          cargo test --locked --target i686-pc-windows-msvc -p frd-video-ffmpeg-plugin --test main444_decode -- --nocapture
 
       - name: Build Windows GUI release without implicit codec copying
         shell: pwsh
@@ -196,3 +206,39 @@ jobs:
           name: freeremotedesk-ffmpeg-8.1.2-corresponding-source-${{ matrix.artifact_suffix }}
           path: target/release-assets/FreeRemoteDesk-ffmpeg-8.1.2-corresponding-source.zip
           if-no-files-found: error
+
+  arm64-decoder-runtime:
+    name: Windows ARM64 native decoder runtime
+    needs: package
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - name: Check out matching source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Download this run's ARM64 package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: freeremotedesk-windows-package-arm64
+          path: target/package-test
+
+      - name: Verify native host and pinned Rust target
+        shell: pwsh
+        run: |
+          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::Arm64) {
+            throw "ARM64 decoder runtime evidence requires an ARM64 Windows host"
+          }
+          rustup toolchain install 1.96.0 --profile minimal --target aarch64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "ARM64 Rust toolchain installation failed" }
+          $rustcVersion = (rustc --version).Split(' ')[1]
+          if ($rustcVersion -cne '1.96.0') { throw "Pinned Rust 1.96.0 required" }
+
+      - name: Verify downloaded ARM64 package
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/verify-windows-package.ps1 -Architecture arm64 -PackageRoot target/package-test
+
+      - name: Decode fixtures with the packaged ARM64 DLLs
+        shell: pwsh
+        run: |
+          $env:FRD_FFMPEG_TEST_BUNDLE = (Resolve-Path 'target/package-test/codecs/ffmpeg-8.1.2/windows-aarch64').Path
+          cargo test --locked --target aarch64-pc-windows-msvc -p frd-video-ffmpeg-plugin --test main444_decode -- --nocapture
