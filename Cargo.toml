@@ -42,7 +42,11 @@ exclude = ["third_party/ironrdp-egfx-0.3.0"]
 
 [workspace.dependencies]
 winit = "=0.30.13"
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "wgsl"] }
+# Compile every shipped desktop backend once, then select the native subset at
+# the platform composition root (DX12 on Windows, Metal on macOS, Vulkan/GL on
+# Linux).  Keeping this as a dependency feature set avoids leaking backend
+# conditionals into protocol, frame, or renderer contracts.
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "metal", "vulkan", "gles", "wgsl"] }
 egui = "=0.36.1"
 egui-winit = { version = "=0.36.1", default-features = false, features = ["accesskit"] }
 egui-wgpu = { version = "=0.36.1", default-features = false }
