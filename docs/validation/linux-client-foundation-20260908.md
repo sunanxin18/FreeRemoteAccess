@@ -155,3 +155,23 @@ native-shell-095-arm64；GL 作业日志为 /tmp/frd-gl-095-{x64,arm64,i686}.log
 启动独立 Weston，使用实际输出 --scale，分别保留 compositor 日志；probe stdout
 在 D-Bus session 内独立写入 JSONL，服务 stdout 另存。verifier 未放宽。两个修正
 workflow 的 YAML/Bash 语法及 diff 检查通过；尚未推送重跑，等待当前打包 CI 完成。
+
+
+09565d3 基础 run `34206959364` 已成功结束：格式 job101998579977、Ubuntu
+job101998659618、macOS job101998659780 通过。已下载两宿主日志到
+/tmp/frd-base-095-linux.log 与 /tmp/frd-base-095-mac.log；macOS pinned EGFX 21项、
+平台24项（2ignored）、应用18项和依赖边界2项均明确执行通过。该 run 不包含后续
+未推送的 GTK 目标诊断，也不改变前述原生 GL/窗口失败边界。
+
+
+### 下一版 GTK 目标观察的验收范围
+
+新增 render 入口观察只记录固定枚举、尺寸和计数，不包含对象名称、地址、像素或输入
+文本。确认上下文身份，再按真实附件类型查询；GL4.5+ 使用 DSA 取得纹理 target，
+旧版无法安全确认的纹理保留未知哨兵。严格 verifier 独立重算 compatible，线性附件
+或 renderbuffer 可成为成功的“不兼容”观察，不能因此宣称可直接接入 GL renderer。
+查询失败、字段矛盾或伪造兼容声明仍拒绝。
+
+该 schema 新增必需的 target_observation，旧 a60/095 原始报告只能用其对应版本
+verifier 复验，不具备目标格式证据。新的 C 查询尚未在 Linux 编译/执行，待后续 CI。
+OpenGL 查询版本依据 [Khronos 官方参考源码](https://github.com/KhronosGroup/OpenGL-Refpages/blob/main/gl4/glGetTexParameter.xml)：GL_TEXTURE_TARGET 仅4.5及以后可用。

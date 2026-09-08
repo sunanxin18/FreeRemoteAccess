@@ -55,7 +55,7 @@ stdout 为 JSON 行：有界、ASCII 清理后的 `GL_VENDOR` / `GL_RENDERER` / 
 
 - 1：GLArea 上下文不可用；2：shader 编译失败；3：program 链接失败。
 - 4：framebuffer 不完整；5：绘制 GL 错误；6：实际显示后端不匹配。
-- 7：实际 GL/GLES API 不匹配。
+- 7：实际 GL/GLES API 不匹配；8：render入口目标查询或实际current校验失败。
 
 `summary` 输出 frame/error、窗口映射、标题栏/内容 allocation、中心偏差和 viewport。
 `geometry_detail` 输出 resize、focus、按当前内容 allocation 与 GL viewport 比例计算的
@@ -89,3 +89,29 @@ stdout 为 JSON 行：有界、ASCII 清理后的 `GL_VENDOR` / `GL_RENDERER` / 
 [Apple Windows](https://developer.apple.com/design/human-interface-guidelines/windows) 的正文抓取
 只返回 JavaScript required。本轮尝试 CUA 浏览器渲染，iab 不可用且浏览器清单为空。
 **完整官方页面视觉审阅仍未完成，这份探针不是 GUI 设计批准或产品迁移验收。**
+
+## 实际 GTK 目标数字诊断
+
+每次 render 入口（GTK已经绑定FBO、尚未改动GL状态）采集目标，并在结束时输出
+精确一条 `target_observation`。字段只包括实际current匹配、GL/ES版本/core、FBO是否
+非默认、完整性、draw-buffer0及额外draw-buffer计数、附件类型/颜色编码、尺寸是否
+已知、实际texture target、尺寸/内部格式/samples、viewport、查询错误、兼容判定，
+以及观察次数和变化次数。FBO/附件名称仅供进程内检测变化，不输出名称或指针。
+
+renderbuffer用正确类型查询并恢复绑定。纹理仅在desktop GL4.5+通过DSA读取真实
+`GL_TEXTURE_TARGET`，确认2D才查询对应level尺寸/格式；其他target或缺少DSA时用
+零尺寸哨兵并标记不兼容，不试探绑定未知纹理。此保守探针不会把GL3.3可工作直接
+等同于已测得GTK目标兼容。查询依据为Khronos官方
+[glGetTexParameter参考源](https://github.com/KhronosGroup/OpenGL-Refpages/blob/main/gl4/glGetTexParameter.xml)。
+
+strict verifier要求新记录唯一、字段精确、观察次数匹配frame，并独立重算兼容：
+Linux后端所需desktop core、sRGB、实际2D纹理、单一draw-buffer0、无MSAA、附件像素
+尺寸和viewport匹配才可为1。LINEAR或renderbuffer测量可通过数字报告验收但必须
+compatible=0；不代表查询失败。未知枚举/格式、矛盾哨兵、查询错误或伪造compatible
+均拒绝。旧报告缺少目标记录，不能作为新目标门禁的通过证据。095/a60等历史报告须使用
+对应revision的verifier复验，只能保持当时的GL/几何/输入范围；不得用新verifier
+宣称这些旧报告已经通过目标查询门禁。
+
+20项Python合成测试包含新记录完整性、合法不兼容目标、旧GL无DSA哨兵及伪造拒绝。
+本机macOS不运行原生C探针；新增GL查询仍待Linux CI运行。此次仅增加诊断，没有
+GTK产品接线、真实呈现ACK或硬件GPU证明。

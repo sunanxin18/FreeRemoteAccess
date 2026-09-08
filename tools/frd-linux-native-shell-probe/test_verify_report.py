@@ -21,8 +21,14 @@ def fixture(scale=1, backend=1, with_input=False):
                        focus_enters=1, pointer_x=480, pointer_y=400)
         detail.update(content_focus=1, window_active=1, pointer_pixel_x=480 * scale,
                       pointer_pixel_y=400 * scale)
+    target = {name: 0 for name in v.TARGET_INTS}
+    target.update(target_observation=1, observations=29, current_matches=1, major=4, minor=5,
+                  core=1, fbo_nonzero=1, status=0x8CD5, draw_buffer0=0x8CE0,
+                  object_type=0x1702, encoding=0x8C40, dimensions_known=1,
+                  texture_target=0x0DE1, width=960*scale, height=640*scale,
+                  internal_format=0x8C43, viewport_w=960*scale, viewport_h=640*scale, compatible=1)
     return [{"gl_vendor": "Mesa"}, {"gl_renderer": "llvmpipe (LLVM)"},
-            {"gl_version": "4.5 (Core Profile) Mesa"}, summary, detail]
+            {"gl_version": "4.5 (Core Profile) Mesa"}, target, summary, detail]
 
 
 def observed_border_fixture(scale=1):
@@ -35,6 +41,8 @@ def observed_border_fixture(scale=1):
                     viewport_w=950 * scale, viewport_h=584 * scale,
                     pointer_x=475, pointer_y=429)
     rows[-1].update(pointer_pixel_x=475 * scale, pointer_pixel_y=429 * scale)
+    rows[-3].update(observations=89, width=950*scale, height=584*scale,
+                    viewport_w=950*scale, viewport_h=584*scale)
     return rows
 
 
@@ -70,6 +78,39 @@ class ReportValidation(unittest.TestCase):
             rows[-2].update(mutation)
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 v.verify_text(text(rows), "x11", 1, True)
+
+    def test_measured_linear_and_renderbuffer_are_incompatible_not_query_failures(self):
+        for mutation in ({"encoding":0x2601,"internal_format":0x8058},
+                         {"object_type":0x8D41,"texture_target":0}):
+            rows=fixture()
+            rows[-3].update(mutation, compatible=0)
+            v.verify_text(text(rows), "x11", 1)
+
+    def test_unqueried_texture_on_older_gl_stays_explicitly_incompatible(self):
+        rows=fixture()
+        rows[-3].update(major=3, minor=3, dimensions_known=0, texture_target=0,
+                        width=0,height=0,internal_format=0,compatible=0)
+        v.verify_text(text(rows), "x11", 1)
+
+    def test_target_diagnostics_reject_forgery_unknowns_and_bad_geometry(self):
+        for mutation in ({"compatible":0}, {"encoding":0x2601,"compatible":1},
+                         {"object_type":123}, {"texture_target":123}, {"internal_format":123},
+                         {"query_errors":1}, {"current_matches":0}, {"observations":28}, {"observations":0},
+                         {"changes":29}, {"viewport_w":2}, {"width":0},
+                         {"is_es":1}, {"dimensions_known":0}, {"dimensions_known":1,"texture_target":0}, {"fbo_nonzero":0},
+                         {"object_type":0,"compatible":0}):
+            rows=fixture(); rows[-3].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                v.verify_text(text(rows), "x11", 1)
+
+    def test_target_record_is_mandatory_unique_and_exact(self):
+        for change in ("missing","duplicate","extra"):
+            rows=fixture()
+            if change=="missing": del rows[-3]
+            elif change=="duplicate": rows.append(rows[-3].copy())
+            else: rows[-3]["object_name"]=7
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                v.verify_text(text(rows), "x11", 1)
 
     def test_wayland_input_claim_rejected(self):
         with self.assertRaisesRegex(ValueError, "Wayland 输入"):

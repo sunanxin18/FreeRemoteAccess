@@ -11,6 +11,15 @@
 #endif
 
 typedef struct {
+    GLint current_matches, is_es, major, minor;
+    GLint core, fbo_nonzero, status, draw_buffer0;
+    GLint extra_draw_buffers, object_type, encoding, dimensions_known;
+    GLint texture_target, width, height, internal_format;
+    GLint samples, viewport_x, viewport_y, viewport_w;
+    GLint viewport_h, query_errors, compatible;
+} TargetObservation;
+
+typedef struct {
     GtkApplication *app;
     GtkWidget *window, *header, *controls, *area;
     GLuint program, vao;
@@ -18,6 +27,9 @@ typedef struct {
     guint64 frames, resizes, motions, presses, releases, key_presses, key_releases;
     guint64 focus_enters, focus_leaves, header_actions;
     GLint viewport[4];
+    TargetObservation target;
+    GLint observed_fbo, observed_attachment;
+    guint64 target_observations, target_changes;
     double pointer_x, pointer_y;
     guint errors;
     int backend, expected_backend;
@@ -40,9 +52,33 @@ static void print_gl_string(const char *key, GLenum name) {
     printf("{\"gl_%s\":\"%s\"}\n", key, safe);
 }
 
+static void print_target(const Probe *probe) {
+    printf("{\"target_observation\":1,\"observations\":%" G_GUINT64_FORMAT
+           ",\"changes\":%" G_GUINT64_FORMAT
+           ",\"current_matches\":%d,\"is_es\":%d,\"major\":%d"
+           ",\"minor\":%d,\"core\":%d,\"fbo_nonzero\":%d"
+           ",\"status\":%d,\"draw_buffer0\":%d,\"extra_draw_buffers\":%d"
+           ",\"object_type\":%d,\"encoding\":%d,\"dimensions_known\":%d"
+           ",\"texture_target\":%d,\"width\":%d,\"height\":%d"
+           ",\"internal_format\":%d,\"samples\":%d,\"viewport_x\":%d"
+           ",\"viewport_y\":%d,\"viewport_w\":%d,\"viewport_h\":%d"
+           ",\"query_errors\":%d,\"compatible\":%d"
+           "}\n",
+           probe->target_observations, probe->target_changes,
+           probe->target.current_matches, probe->target.is_es, probe->target.major,
+           probe->target.minor, probe->target.core, probe->target.fbo_nonzero,
+           probe->target.status, probe->target.draw_buffer0, probe->target.extra_draw_buffers,
+           probe->target.object_type, probe->target.encoding, probe->target.dimensions_known,
+           probe->target.texture_target, probe->target.width, probe->target.height,
+           probe->target.internal_format, probe->target.samples, probe->target.viewport_x,
+           probe->target.viewport_y, probe->target.viewport_w, probe->target.viewport_h,
+           probe->target.query_errors, probe->target.compatible);
+}
+
 static void fail(Probe *probe, guint code) {
     ++probe->errors;
     printf("{\"error_code\":%u}\n", code);
+    print_target(probe);
     fflush(stdout);
 }
 
@@ -119,10 +155,71 @@ static void unrealized(GtkGLArea *area, gpointer data) {
     probe->vao = probe->program = 0;
 }
 
+// 只在render入口查询GTK实际绑定的FBO，不输出对象名称或指针。
+static void observe_target(Probe *probe, GtkGLArea *area, GdkGLContext *context) {
+    TargetObservation t = {0};
+    t.current_matches = gdk_gl_context_get_current() == context && context == gtk_gl_area_get_context(area);
+    if (!t.current_matches) { probe->target = t; ++probe->target_observations; return; }
+    t.is_es = gdk_gl_context_get_use_es(context);
+    glGetIntegerv(GL_MAJOR_VERSION, &t.major); glGetIntegerv(GL_MINOR_VERSION, &t.minor);
+    if (!t.is_es && (t.major > 3 || (t.major == 3 && t.minor >= 2))) {
+        GLint profile = 0; glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &profile);
+        t.core = (profile & GL_CONTEXT_CORE_PROFILE_BIT) != 0;
+    }
+    GLint attachment = 0;
+    GLint fbo = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+    t.fbo_nonzero = fbo != 0;
+    t.status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+    t.viewport_x=vp[0]; t.viewport_y=vp[1]; t.viewport_w=vp[2]; t.viewport_h=vp[3];
+    glGetIntegerv(GL_SAMPLES, &t.samples);
+    glGetIntegerv(GL_DRAW_BUFFER0, &t.draw_buffer0);
+    GLint count = 0; glGetIntegerv(GL_MAX_DRAW_BUFFERS, &count);
+    for (GLint i=1; i<count; ++i) { GLint buffer=0; glGetIntegerv(GL_DRAW_BUFFER0+i,&buffer); t.extra_draw_buffers += buffer != GL_NONE; }
+    if (t.fbo_nonzero) {
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,&t.object_type);
+        if (t.object_type == GL_TEXTURE || t.object_type == GL_RENDERBUFFER) {
+            GLint name=0;
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,&name);
+            attachment=name;
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING,&t.encoding);
+            if (t.object_type == GL_RENDERBUFFER) {
+                GLint previous=0; glGetIntegerv(GL_RENDERBUFFER_BINDING,&previous);
+                glBindRenderbuffer(GL_RENDERBUFFER,(GLuint)name);
+                glGetRenderbufferParameteriv(GL_RENDERBUFFER,GL_RENDERBUFFER_WIDTH,&t.width);
+                glGetRenderbufferParameteriv(GL_RENDERBUFFER,GL_RENDERBUFFER_HEIGHT,&t.height);
+                glGetRenderbufferParameteriv(GL_RENDERBUFFER,GL_RENDERBUFFER_INTERNAL_FORMAT,&t.internal_format);
+                glBindRenderbuffer(GL_RENDERBUFFER,(GLuint)previous);
+                t.dimensions_known=1;
+            } else if (!t.is_es && (t.major>4 || (t.major==4 && t.minor>=5))) {
+                // GL4.5 DSA可先获知真实target；绝不尝试把未知纹理绑定为2D。
+                glGetTextureParameteriv((GLuint)name,GL_TEXTURE_TARGET,&t.texture_target);
+                if (t.texture_target == GL_TEXTURE_2D) {
+                    GLint level=0;
+                    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL,&level);
+                    glGetTextureLevelParameteriv((GLuint)name,level,GL_TEXTURE_WIDTH,&t.width);
+                    glGetTextureLevelParameteriv((GLuint)name,level,GL_TEXTURE_HEIGHT,&t.height);
+                    glGetTextureLevelParameteriv((GLuint)name,level,GL_TEXTURE_INTERNAL_FORMAT,&t.internal_format);
+                    t.dimensions_known=1;
+                }
+            }
+        }
+    }
+    for (guint i=0; i<32 && glGetError()!=GL_NO_ERROR; ++i) ++t.query_errors;
+    t.compatible = t.current_matches && !t.is_es && t.core && (t.major>3 || (t.major==3 && t.minor>=3)) &&
+        t.fbo_nonzero && t.status==GL_FRAMEBUFFER_COMPLETE && t.draw_buffer0==GL_COLOR_ATTACHMENT0 && !t.extra_draw_buffers &&
+        t.object_type==GL_TEXTURE && t.encoding==GL_SRGB && t.dimensions_known && t.texture_target==GL_TEXTURE_2D &&
+        !t.samples && t.viewport_x==0 && t.viewport_y==0 && t.width==t.viewport_w && t.height==t.viewport_h && t.width>0 && t.height>0 && !t.query_errors;
+    if (probe->target_observations && (probe->observed_fbo != fbo || probe->observed_attachment != attachment || memcmp(&probe->target,&t,sizeof(t)))) ++probe->target_changes;
+    probe->observed_fbo=fbo; probe->observed_attachment=attachment;
+    probe->target=t; ++probe->target_observations;
+}
+
 static gboolean rendered(GtkGLArea *area, GdkGLContext *context, gpointer data) {
-    (void)context;
     Probe *probe = data;
     if (!probe->program || !probe->vao || gtk_gl_area_get_error(area)) return FALSE;
+    observe_target(probe, area, context);
+    if (!probe->target.current_matches || probe->target.query_errors) { fail(probe, 8); return FALSE; }
     // GTK 已设置 GLArea framebuffer 和实际像素 viewport；不绑定窗口 framebuffer 0。
     glGetIntegerv(GL_VIEWPORT, probe->viewport);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
@@ -253,6 +350,7 @@ static void report(Probe *probe, gboolean timed) {
            gtk_window_is_active(GTK_WINDOW(probe->window)),
            width > 0 ? probe->pointer_x * probe->viewport[2] / width : 0,
            height > 0 ? probe->pointer_y * probe->viewport[3] / height : 0);
+    print_target(probe);
     fflush(stdout);
     probe->finished = TRUE;
 }

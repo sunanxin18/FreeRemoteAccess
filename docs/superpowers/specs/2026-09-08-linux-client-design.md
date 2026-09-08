@@ -94,3 +94,19 @@ FBO、viewport 和远端尺寸。默认 FBO、GLES 和 renderbuffer 不在当前
 实际目标格式必须另行核对和接入，不因技术探针能绘图而假设满足该契约。
 DrawReceipt 仅描述可撤销的绘制记录，不产生生产 ACK。真实 GTK 呈现时序、窗口登录
 流程、输入与会话接线仍是下一阶段，不能由 EGL pbuffer 测试代替。
+
+
+### GTK 会话接线的具体接口缺口
+
+当前 Linux main 仍创建 winit EventLoop 和 DesktopApplication；现有 SessionHost
+虽已从 application.rs 分离，却仍位于 frd-shell-desktop crate。启动、取消、事件与
+清理 API 可复用；帧事务的 drain_frame_transactions、CompiledFrameDrain、
+FrameCompileFailure 和 retire_frame_presentation 仍是 pub(crate)，不是新 GTK 壳
+可直接使用的公开接口。公开 drain_frame_updates 会丢弃入队时间，不能在 GTK 壳
+重新编译帧来绕过这些边界，否则会复制 generation/revision 和呈现退休逻辑。
+
+完成目标观察后，按依赖顺序提供窄的、平台无关的已编译帧提取与退休接口，并保留
+BatchMetricContext 的时间/数量信息及旧测试。不要将 GTK 类型加入 SessionHost，
+也不要复制 AppLaunch、后台凭据提交、取消或清理逻辑。GL DrawReceipt 尚不具备
+生产呈现确认能力；GTK 回调只可驱动上传绘制，真实呈现与会话确认的接线须另行
+建立证据，不能直接将该回执转换成 FramePresented。

@@ -19,6 +19,15 @@ SUMMARY_FLOATS = {
 }
 DETAIL_INTS = {"geometry_detail", "resizes", "content_focus", "window_active", "hardware_verified"}
 DETAIL_FLOATS = {"pointer_pixel_x", "pointer_pixel_y"}
+TARGET_INTS = {
+    "changes", "compatible", "core", "current_matches",
+    "dimensions_known", "draw_buffer0", "encoding", "extra_draw_buffers",
+    "fbo_nonzero", "height", "internal_format", "is_es",
+    "major", "minor", "object_type", "observations",
+    "query_errors", "samples", "status", "target_observation",
+    "texture_target", "viewport_h", "viewport_w", "viewport_x",
+    "viewport_y", "width",
+}
 GL_KEYS = {"gl_vendor", "gl_renderer", "gl_version"}
 
 
@@ -50,6 +59,46 @@ def numeric_record(record, integers, decimals):
                 f"字段 {name} 必须为有限数字")
 
 
+def verify_target(t, summary):
+    require(t["target_observation"] == 1 and t["observations"] == summary["frames"] and
+            0 <= t["changes"] < t["observations"], "目标观察次数不一致")
+    for field in ("current_matches", "is_es", "core", "fbo_nonzero", "dimensions_known", "compatible"):
+        require(t[field] in (0, 1), "目标布尔字段无效")
+    require(t["current_matches"] == 1 and t["query_errors"] == 0, "目标上下文或查询失败")
+    require(3 <= t["major"] <= 4 and 0 <= t["minor"] <= 6 and not (t["is_es"] and t["core"]), "目标GL版本无效")
+    require(t["status"] == 0x8CD5 and t["samples"] <= 64 and t["extra_draw_buffers"] <= 32, "目标FBO状态无效")
+    require(t["draw_buffer0"] in (0, 0x0405, 0x8CE0), "未知draw buffer")
+    require(t["object_type"] in (0, 0x1702, 0x8D41), "未知附件类型")
+    require(t["encoding"] in (0, 0x2601, 0x8C40), "未知颜色编码")
+    require(t["texture_target"] in (0, 0x0DE0, 0x0DE1, 0x806F, 0x8513, 0x84F5, 0x8C18, 0x8C1A, 0x9009, 0x9100, 0x9102), "未知纹理target")
+    require(t["viewport_x"] == 0 and t["viewport_y"] == 0 and
+            t["viewport_w"] == summary["viewport_w"] and t["viewport_h"] == summary["viewport_h"], "目标viewport不一致")
+    if t["object_type"] == 0:
+        require(not t["dimensions_known"] and t["encoding"] == 0 and t["texture_target"] == 0, "空附件数据矛盾")
+    else:
+        require(t["fbo_nonzero"] == 1 and t["encoding"] != 0, "附件缺少FBO或编码")
+    if t["object_type"] == 0x8D41:
+        require(t["dimensions_known"] == 1 and t["texture_target"] == 0, "renderbuffer数据矛盾")
+    if t["texture_target"]:
+        require(t["object_type"] == 0x1702 and not t["is_es"] and (t["major"],t["minor"]) >= (4,5), "纹理target缺少安全DSA查询支持")
+    if t["object_type"] == 0x1702:
+        dsa = not t["is_es"] and (t["major"],t["minor"]) >= (4,5)
+        require(bool(t["texture_target"]) == dsa, "纹理target查询哨兵与GL版本矛盾")
+        require(t["dimensions_known"] == int(t["texture_target"] == 0x0DE1), "纹理尺寸查询与target矛盾")
+    if t["dimensions_known"]:
+        require(0 < t["width"] <= 65536 and 0 < t["height"] <= 65536 and
+                t["internal_format"] in (0x8051,0x8058,0x8059,0x8C41,0x8C43,0x881A,0x8814), "目标尺寸或格式未知")
+        require((t["internal_format"] in (0x8C41,0x8C43)) == (t["encoding"] == 0x8C40), "格式与颜色编码矛盾")
+    else:
+        require(t["width"] == t["height"] == t["internal_format"] == 0, "未查询尺寸必须使用零哨兵")
+    compatible = (not t["is_es"] and t["core"] and (t["major"],t["minor"]) >= (3,3) and
+                  t["fbo_nonzero"] and t["draw_buffer0"] == 0x8CE0 and not t["extra_draw_buffers"] and
+                  t["object_type"] == 0x1702 and t["encoding"] == 0x8C40 and t["dimensions_known"] and
+                  t["texture_target"] == 0x0DE1 and not t["samples"] and
+                  t["width"] == t["viewport_w"] and t["height"] == t["viewport_h"])
+    require(t["compatible"] == int(bool(compatible)), "目标兼容判定伪造或不一致")
+
+
 def verify_text(text, expected_backend, expected_scale, require_input=False):
     require(expected_backend in ("x11", "wayland"), "不支持的预期 backend")
     require(type(expected_scale) is int and 1 <= expected_scale <= 8, "预期 scale 必须为 1..8")
@@ -57,7 +106,7 @@ def verify_text(text, expected_backend, expected_scale, require_input=False):
     require(len(text.encode("utf-8")) <= 65536, "报告超过大小限制")
     lines = text.splitlines()
     require(1 <= len(lines) <= 16 and all(0 < len(line) <= 8192 for line in lines), "报告行数或长度无效")
-    summary = detail = None
+    summary = detail = target = None
     gl_records = set()
     for line in lines:
         record = json.loads(line, object_pairs_hook=unique_object, parse_constant=reject_constant)
@@ -66,6 +115,10 @@ def verify_text(text, expected_backend, expected_scale, require_input=False):
             require(summary is None, "必须只有一条 summary")
             numeric_record(record, SUMMARY_INTS, SUMMARY_FLOATS)
             summary = record
+        elif "target_observation" in record:
+            require(target is None, "必须只有一条 target_observation")
+            numeric_record(record, TARGET_INTS, set())
+            target = record
         elif "geometry_detail" in record:
             require(detail is None, "必须只有一条 geometry_detail")
             numeric_record(record, DETAIL_INTS, DETAIL_FLOATS)
@@ -78,7 +131,8 @@ def verify_text(text, expected_backend, expected_scale, require_input=False):
             gl_records.add(name)
         else:
             raise ValueError("报告包含错误或未知记录")
-    require(summary is not None and detail is not None and gl_records == GL_KEYS, "报告不完整")
+    require(summary is not None and detail is not None and target is not None and gl_records == GL_KEYS, "报告不完整")
+    verify_target(target, summary)
     for name in ("summary", "passed", "timed", "mapped", "separated"):
         require(summary[name] == 1, f"字段 {name} 未通过")
     require(detail["geometry_detail"] == 1 and detail["hardware_verified"] == 0,
