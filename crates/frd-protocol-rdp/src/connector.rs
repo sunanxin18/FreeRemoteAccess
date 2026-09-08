@@ -27,7 +27,7 @@ use crate::error::{
     rdp_error, RDP_ACTIVATION_FAILED, RDP_DNS_FAILED, RDP_LICENSE_FAILED, RDP_LOGON_FAILED,
     RDP_NLA_FAILED, RDP_TCP_FAILED, RDP_TLS_FAILED,
 };
-use crate::factory::RdpGraphicsCapabilities;
+use crate::factory::{RdpGraphicsAdvertisementGate, RdpGraphicsCapabilities};
 use crate::runtime::{
     wait_for_blocking, wait_for_network_future, CancellationCheckedIo, StageCancellation,
 };
@@ -133,6 +133,7 @@ pub(crate) async fn connect_and_activate(
     config: &mut RdpConnectionConfig,
     runtime: &mut ProtocolRuntime,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
+    graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
 ) -> Result<ActivatedRdpSession, ProtocolError> {
     runtime.publish_event(SessionEvent::StageChanged(ConnectionStage::Connecting))?;
 
@@ -153,6 +154,7 @@ pub(crate) async fn connect_and_activate(
         desktop_size,
         config.request.session_id,
         egfx_decoder_provider.clone(),
+        graphics_advertisement_gate,
         runtime,
     )
     .await?;
@@ -180,6 +182,7 @@ pub(crate) async fn connect_and_activate(
         desktop_size,
         config.request.session_id,
         egfx_decoder_provider,
+        graphics_advertisement_gate,
         runtime,
     )
     .await?;
@@ -320,6 +323,7 @@ async fn negotiate_enhanced_security(
     desktop_size: DesktopSize,
     session_id: SessionId,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
+    graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
     runtime: &mut ProtocolRuntime,
 ) -> Result<NegotiatedTcp, ProtocolError> {
     let mut last_error = rdp_error(RDP_TCP_FAILED);
@@ -360,6 +364,7 @@ async fn negotiate_enhanced_security(
                     client_platform,
                     session_id,
                     egfx_decoder_provider.as_ref(),
+                    graphics_advertisement_gate,
                 );
             let upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)?;
             Ok::<_, ConnectorError>(NegotiatedTcp {
@@ -496,6 +501,7 @@ fn baseline_connector(
     client_platform: RdpClientPlatformIdentity,
     session_id: SessionId,
     egfx_decoder_provider: Option<&Arc<dyn EgfxDecoderProvider>>,
+    graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
 ) -> (
     ClientConnector,
     RdpAudioAdapter,
@@ -505,23 +511,30 @@ fn baseline_connector(
     let audio = RdpAudioAdapter::new();
     let display_capabilities = DisplayControlCapabilityState::default();
     let observed_display_capabilities = display_capabilities.clone();
-    let egfx = egfx_decoder_provider.and_then(|provider| {
-        let coded_size = PixelSize::new(
-            u32::from(desktop_size.width),
-            u32::from(desktop_size.height),
-        )?;
-        let decoder = provider.create_decoder(session_id, coded_size)?;
-        let publisher =
-            EgfxSurfacePublisher::try_new(session_id, 1)?.with_expected_coded_size(coded_size);
-        let publisher = match provider.create_avc444_decoder(session_id, coded_size) {
-            Some(decoder) => publisher.with_avc444_decoder(decoder),
-            None => publisher,
-        };
-        Some(EgfxAdapter::with_surface_publisher(
-            Some(decoder),
-            publisher,
-        ))
-    });
+    let egfx = egfx_decoder_provider
+        .filter(|_| {
+            matches!(
+                graphics_advertisement_gate,
+                RdpGraphicsAdvertisementGate::LiveInteroperable
+            )
+        })
+        .and_then(|provider| {
+            let coded_size = PixelSize::new(
+                u32::from(desktop_size.width),
+                u32::from(desktop_size.height),
+            )?;
+            let decoder = provider.create_decoder(session_id, coded_size)?;
+            let publisher =
+                EgfxSurfacePublisher::try_new(session_id, 1)?.with_expected_coded_size(coded_size);
+            let publisher = match provider.create_avc444_decoder(session_id, coded_size) {
+                Some(decoder) => publisher.with_avc444_decoder(decoder),
+                None => publisher,
+            };
+            Some(EgfxAdapter::with_surface_publisher(
+                Some(decoder),
+                publisher,
+            ))
+        });
     let egfx_advertised = egfx.is_some();
     let graphics_capability = if egfx_advertised {
         RdpGraphicsCapability {
@@ -632,6 +645,7 @@ mod tests {
     use crate::config::RdpClientPlatformIdentity;
     use crate::display::DisplayControlCapabilityState;
     use crate::egfx::EgfxDecoderProvider;
+    use crate::factory::RdpGraphicsAdvertisementGate;
     use crate::upstream::client_platform_type;
     use frd_core::{DisplayIntent, PixelSize, SessionId};
     use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder};
@@ -724,6 +738,7 @@ mod tests {
             RdpClientPlatformIdentity::Windows,
             session_id,
             Some(&provider),
+            RdpGraphicsAdvertisementGate::LiveInteroperable,
         );
 
         assert!(graphics.egfx_advertised);
@@ -750,6 +765,32 @@ mod tests {
     }
 
     #[test]
+    fn decoder_provider_without_live_gate_keeps_legacy_wire_advertisement() {
+        let provider: std::sync::Arc<dyn EgfxDecoderProvider> =
+            std::sync::Arc::new(StubEgfxDecoderProvider);
+        let session_id = SessionId::allocate();
+        let (connector, _audio, _display, graphics) = baseline_connector(
+            Credentials::UsernamePassword {
+                username: "alice".to_owned(),
+                password: String::new(),
+            },
+            None,
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            },
+            "127.0.0.1:49152".parse().expect("valid client address"),
+            RdpClientPlatformIdentity::Windows,
+            session_id,
+            Some(&provider),
+            RdpGraphicsAdvertisementGate::LegacyOnly,
+        );
+
+        assert_eq!(graphics, baseline_graphics_capabilities());
+        assert!(!connector.config.support_dynvc_gfx_protocol);
+    }
+
+    #[test]
     fn egfx_provider_emits_the_graphics_channel_capability_on_the_wire() {
         let provider: std::sync::Arc<dyn EgfxDecoderProvider> =
             std::sync::Arc::new(StubEgfxDecoderProvider);
@@ -768,6 +809,7 @@ mod tests {
             RdpClientPlatformIdentity::Windows,
             session_id,
             Some(&provider),
+            RdpGraphicsAdvertisementGate::LiveInteroperable,
         );
 
         let flags = emitted_early_capability_flags(connector);
@@ -792,6 +834,7 @@ mod tests {
             RdpClientPlatformIdentity::Windows,
             session_id,
             None,
+            RdpGraphicsAdvertisementGate::LegacyOnly,
         );
 
         let flags = emitted_early_capability_flags(connector);
@@ -895,6 +938,7 @@ mod tests {
             RdpClientPlatformIdentity::Windows,
             SessionId::allocate(),
             None,
+            RdpGraphicsAdvertisementGate::LegacyOnly,
         );
 
         assert!(!connector.config.enable_tls);
@@ -919,6 +963,7 @@ mod tests {
                 RdpClientPlatformIdentity::Windows,
                 SessionId::allocate(),
                 None,
+                RdpGraphicsAdvertisementGate::LegacyOnly,
             );
         let bitmap = connector
             .config

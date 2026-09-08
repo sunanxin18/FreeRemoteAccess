@@ -9,6 +9,20 @@ use crate::config::{RdpClientPlatformIdentity, RdpConnectionConfig};
 use crate::egfx::EgfxDecoderProvider;
 use crate::runtime::run_protocol_session;
 
+/// Controls whether a decoder provider may advertise the EGFX graphics channel.
+///
+/// A local decoder or package probe is not sufficient for production
+/// advertisement. `LiveInteroperable` is reserved for a platform/server pair
+/// whose exact wire profile, first frame, sustained refresh and recovery gates
+/// were recorded separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RdpGraphicsAdvertisementGate {
+    /// Keep the legacy Bitmap/RemoteFX advertisement.
+    LegacyOnly,
+    /// Permit EGFX capability advertisement after an exact live gate passed.
+    LiveInteroperable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RdpGraphicsCapabilities {
     pub legacy_bitmap: bool,
@@ -39,6 +53,7 @@ where
 pub struct RdpProtocolFactory {
     client_platform: RdpClientPlatformIdentity,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
+    graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
     graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
 }
 
@@ -47,22 +62,43 @@ impl RdpProtocolFactory {
         Self {
             client_platform,
             egfx_decoder_provider: None,
+            graphics_advertisement_gate: RdpGraphicsAdvertisementGate::LegacyOnly,
             graphics_observer: None,
         }
     }
 
-    /// Opt into the EGFX AVC420 transport seam with an application-owned
-    /// decoder provider.  The default constructor remains legacy-only.  The
-    /// provider is deliberately an IronRDP decoder boundary rather than an
-    /// FFmpeg dependency, so each client platform can supply its own exact
-    /// backend without leaking platform APIs into this protocol crate.
+    /// Stage an application-owned EGFX decoder provider without advertising it.
+    ///
+    /// The default remains legacy-only until the caller supplies an explicit
+    /// [`RdpGraphicsAdvertisementGate::LiveInteroperable`] through
+    /// [`Self::with_egfx_decoder_provider_and_gate`]. The provider is
+    /// deliberately an IronRDP decoder boundary rather than an FFmpeg
+    /// dependency, so each client platform can supply its own exact backend
+    /// without leaking platform APIs into this protocol crate.
     pub fn with_egfx_decoder_provider(
         client_platform: RdpClientPlatformIdentity,
         provider: Arc<dyn EgfxDecoderProvider>,
     ) -> Self {
+        Self::with_egfx_decoder_provider_and_gate(
+            client_platform,
+            provider,
+            RdpGraphicsAdvertisementGate::LegacyOnly,
+        )
+    }
+
+    /// Construct a factory with an explicit graphics advertisement gate.
+    /// Production callers may use `LiveInteroperable` only after the exact
+    /// platform/server evidence has passed; bounded probes use the same
+    /// explicit path and do not alter the default factory.
+    pub fn with_egfx_decoder_provider_and_gate(
+        client_platform: RdpClientPlatformIdentity,
+        provider: Arc<dyn EgfxDecoderProvider>,
+        graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
+    ) -> Self {
         Self {
             client_platform,
             egfx_decoder_provider: Some(provider),
+            graphics_advertisement_gate,
             graphics_observer: None,
         }
     }
@@ -88,6 +124,7 @@ impl ProtocolFactory for RdpProtocolFactory {
             config,
             runtime,
             egfx_decoder_provider: self.egfx_decoder_provider.clone(),
+            graphics_advertisement_gate: self.graphics_advertisement_gate,
             graphics_observer: self.graphics_observer.clone(),
         }))
     }
@@ -97,6 +134,7 @@ pub struct RdpProtocolSession {
     config: RdpConnectionConfig,
     runtime: ProtocolRuntime,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
+    graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
     graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
 }
 
@@ -106,9 +144,16 @@ impl ProtocolSession for RdpProtocolSession {
             config,
             runtime,
             egfx_decoder_provider,
+            graphics_advertisement_gate,
             graphics_observer,
         } = *self;
-        run_protocol_session(config, runtime, egfx_decoder_provider, graphics_observer)
+        run_protocol_session(
+            config,
+            runtime,
+            egfx_decoder_provider,
+            graphics_advertisement_gate,
+            graphics_observer,
+        )
     }
 }
 

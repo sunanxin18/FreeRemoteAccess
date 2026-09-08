@@ -343,9 +343,10 @@ fn run() -> Result<(), &'static str> {
             ProbeEgfxMode::Avc420 => Arc::new(Avc420DecoderProvider::from_factory(egfx_factory)),
             ProbeEgfxMode::Avc444 => Arc::new(Avc444DecoderProvider::new(egfx_factory)),
         };
-        RdpProtocolFactory::with_egfx_decoder_provider(
+        RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
             RdpClientPlatformIdentity::Macintosh,
             provider,
+            frd_protocol_rdp::RdpGraphicsAdvertisementGate::LiveInteroperable,
         )
     } else {
         RdpProtocolFactory::new(RdpClientPlatformIdentity::Macintosh)
