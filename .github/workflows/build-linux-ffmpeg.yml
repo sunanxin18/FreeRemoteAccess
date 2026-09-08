@@ -107,6 +107,24 @@ jobs:
         run: bash tools/verify-linux-ffmpeg-bundle.sh \
           "target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}" "${{ matrix.bundle_dir }}"
 
+      - name: Stage corresponding FFmpeg source evidence
+        shell: bash
+        run: |
+          source_root="target/ffmpeg-linux"
+          release_root="target/release-assets/ffmpeg-8.1.2-${{ matrix.arch }}"
+          test -f "$source_root/ffmpeg-8.1.2.tar.xz"
+          actual_hash="$(sha256sum "$source_root/ffmpeg-8.1.2.tar.xz" | awk '{print $1}')"
+          test "$actual_hash" = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+          mkdir -p "$release_root"
+          cp "$source_root/ffmpeg-8.1.2.tar.xz" "$release_root/"
+          cp third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1 third_party/ffmpeg/8.1.2/changes.diff "$release_root/"
+          {
+            printf 'architecture=%s\n' "${{ matrix.arch }}"
+            printf 'archive_sha256=%s\n' "$actual_hash"
+            printf 'source_sha256_expected=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c\n'
+            printf 'local_changes=changes.diff\n'
+          } > "$release_root/SOURCE-MANIFEST.txt"
+
       - name: Run host-side FFmpeg ABI tests
         shell: bash
         run: cargo test --locked -p frd-video-ffmpeg -p frd-video-ffmpeg-plugin
@@ -116,4 +134,11 @@ jobs:
         with:
           name: freeremotedesk-ffmpeg-linux-${{ matrix.arch }}
           path: target/ffmpeg-linux/bundle/${{ matrix.bundle_dir }}
+          if-no-files-found: error
+
+      - name: Upload corresponding FFmpeg source evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-ffmpeg-8.1.2-source-linux-${{ matrix.arch }}
+          path: target/release-assets/ffmpeg-8.1.2-${{ matrix.arch }}
           if-no-files-found: error
