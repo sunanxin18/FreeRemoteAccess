@@ -2158,6 +2158,7 @@ dependencies = [
  "glow",
  "gtk4",
  "libloading",
+ "x11-dl",
 ]
 
 [[package]]

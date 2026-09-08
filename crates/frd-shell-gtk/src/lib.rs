@@ -2,6 +2,12 @@
 pub mod display_geometry;
 pub mod input_keymap;
 pub mod input_ownership;
+#[cfg(all(
+    target_os = "linux",
+    feature = "gtk-shell",
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod native_keymap;
 use frd_core::PixelSize;
 use frd_frame::FrameTransaction;
 

@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-gtk-shell = ["dep:gtk4", "dep:libloading", "frd-render-gl/linux-gl", "dep:async-channel", "dep:frd-app", "dep:frd-platform-api", "dep:frd-protocol-api", "dep:frd-shell-desktop", "dep:frd-ui-model"]
+gtk-shell = ["dep:x11-dl", "dep:gtk4", "dep:libloading", "frd-render-gl/linux-gl", "dep:async-channel", "dep:frd-app", "dep:frd-platform-api", "dep:frd-protocol-api", "dep:frd-shell-desktop", "dep:frd-ui-model"]
 
 [dependencies]
 frd-core = { path = "../frd-core" }
@@ -15,6 +15,7 @@ frd-render-gl = { path = "../frd-render-gl" }
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk4 = { version = "=0.9.7", features = ["v4_14"], optional = true }
 libloading = { version = "=0.8.9", optional = true }
+x11-dl = { version = "=2.21.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 frd-media-api = { path = "../frd-media-api" }
