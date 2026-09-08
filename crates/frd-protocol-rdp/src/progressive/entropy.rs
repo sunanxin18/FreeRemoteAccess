@@ -83,7 +83,7 @@ fn signed(magnitude: u32, negative: bool) -> Result<i16> {
 }
 
 /// 初始/SIMPLE 每分量 RLGR1；先解入临时结果，截断/越界不部分修改调用方输出。
-/// 零尾 run 必须包含终止位与剩余长度；不能把短码流隐式扩展至4096。
+/// 零尾run需明确覆盖输出；允许exact escape覆盖后的byte零对齐，不隐式补系数。
 pub fn decode_rlgr1(data: &[u8], output: &mut [i16]) -> Result<()> {
     if output.is_empty() || output.len() > MAX_COEFFICIENTS {
         return Err(Error::TooManyCoefficients);
@@ -93,7 +93,7 @@ pub fn decode_rlgr1(data: &[u8], output: &mut [i16]) -> Result<()> {
     let mut kp = 8u32;
     let mut krp = 8u32;
     let mut pos = 0usize;
-    while pos < result.len() {
+    'coefficients: while pos < result.len() {
         let mut k = kp / 8;
         if k > 0 {
             let mut run = 0usize;
@@ -104,6 +104,11 @@ pub fn decode_rlgr1(data: &[u8], output: &mut [i16]) -> Result<()> {
                 }
                 kp = (kp + 4).min(80);
                 k = kp / 8;
+                // escape本身已明确编码全部剩余零时，可直接以当前byte零对齐结束。
+                // 不读padding为下一escape，不裁剪overshoot、不补缺失系数。
+                if run == result.len() - pos && reader.clone().finish_zero_padding().is_ok() {
+                    break 'coefficients;
+                }
             }
             run = run
                 .checked_add(reader.read(k as u8)? as usize)

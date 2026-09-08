@@ -310,3 +310,23 @@ fn terminal_full_zero_run_consumes_one_complete_symbol_then_exact_padding() {
     );
     assert_eq!(output, [17; 4096]);
 }
+
+#[test]
+fn terminal_escape_exact_coverage_stops_before_byte_padding() {
+    // 初始k=1：两条escape各表达2零，已覆盖4项；余下6位是零对齐。
+    let mut out = [17; 4];
+    assert_eq!(decode_rlgr1(&[0], &mut out), Ok(()));
+    assert_eq!(out, [0; 4]);
+    // 同样2+2零后显式terminator=1、k=2 remainder=0仍走完整语法。
+    assert_eq!(decode_rlgr1(&pack_bits(&[0, 0, 1, 0, 0]), &mut out), Ok(()));
+    // 一个已编码的2零escape并不足以覆盖4096，EOF不得补输出。
+    assert!(decode_rlgr1(&[0], &mut [17; 4096]).is_err());
+    // 三项无法用两个2零escape精确覆盖，仍拒绝超出，不隐式裁剪。
+    assert_eq!(decode_rlgr1(&[0], &mut [17; 3]), Err(Error::RunOverrun));
+    // 不接受额外完整零字节或非零尾部，失败不修改输出。
+    for data in [&[0, 0][..], &[1][..]] {
+        out.fill(17);
+        assert!(decode_rlgr1(data, &mut out).is_err());
+        assert_eq!(out, [17; 4]);
+    }
+}
