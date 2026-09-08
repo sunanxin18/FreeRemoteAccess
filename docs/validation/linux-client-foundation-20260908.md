@@ -6,9 +6,9 @@
 provider 与 Secret Service 凭据事务。不引用 Windows/macOS 平台 crate，密码不写
 普通元数据，缺少或锁定的 Secret Service 明确失败。
 
-Linux 桌面 GPU 选择改为 Vulkan/GLES，相关 wgpu feature 仅在 Linux 目标开启；
-Windows 仍选择 DX12，macOS ARM64 仍选择 Metal。此选择没有证明任何 Linux
-窗口、GPU 设备或显示服务器已经运行成功。
+Linux 桌面 GPU 选择改为 Vulkan/GLES，工作区 wgpu 编译 Vulkan、GLES、Metal
+后端并由平台组合根选择；Windows 仍选择 DX12，macOS ARM64 仍选择 Metal。
+此选择没有证明任何 Linux 窗口、GPU 设备或显示服务器已经运行成功。
 
 ## 已执行证据
 
@@ -24,13 +24,11 @@ Windows 仍选择 DX12，macOS ARM64 仍选择 Metal。此选择没有证明任�
 
 ## 尚待执行
 
-`tools/verify-linux-secret-service.sh` 在独立 dbus-run-session 与临时 XDG 目录中
-运行唯一合成凭据的真实往返，前台 daemon 生命周期由脚本回收，不改 HOME，也不
-接入用户已有 keyring。等待服务名最多 10 秒，测试过滤后必须恰有 1 项通过；零测试
-不能算通过。脚本已接入 Ubuntu CI，但本次尚未取得运行结果。
-
-新增 Linux 应用入口、原生窗口/输入、完整客户端 staging/verifier、三架构完整包、
-真实 RDP 连接与 GUI 尚未完成。此前七目标 FFmpeg/Progressive 记录不能替代这些门禁。
+`tools/verify-linux-secret-service.sh` 已在独立 dbus-run-session 与临时 XDG 目录中
+完成唯一合成凭据的真实往返，前台 daemon 生命周期由脚本回收，不改 HOME，也不接入
+用户已有 keyring。后续尚待授权桌面设备上的物理 Wayland 输入、硬件 GPU、窗口装饰视觉
+检查和真实 RDP 控制；软件 Mesa、XTEST 和合成 GTK 事件不能替代这些门禁。此前七目标
+FFmpeg/Progressive 记录也不能替代真实客户端控制证明。
 
 最终完整工作区 `cargo test --locked --workspace`：exit 0，60 组，
 1683 passed / 0 failed / 16 ignored。该数量来自 macOS ARM64 运行，不包含 ignored
@@ -40,7 +38,7 @@ Linux 原生 Secret Service 测试。
 
 Linux 应用入口 baebd80 的宿主测试通过 20 项单元及 2 项边界测试。完整工作区首次回归在旧的双平台组合根名单处失败；增加 Linux 的明确许可项，同时把 macOS/Linux 平台服务加入禁止依赖具体协议的检查后，Windows 两项架构回归通过。最终完整工作区 cargo test --locked --workspace 终态 exit 0，62 组、1705 passed / 0 failed / 16 ignored。宿主为 macOS ARM64，不能据此认定 Linux GUI 或 Secret Service 已运行。
 
-完整 Linux stage/verifier 与三架构 CI 已接入实际应用构建、目标测试、ELF 校验、随包 decoder 加载和 tar 产物上传；9 项合成拒绝路径测试、shell 语法、YAML 三目标结构及格式检查通过。新流程尚未在 Linux 执行；完整包、窗口、GPU、输入及真实 RDP 门禁继续保持未验收。
+完整 Linux stage/verifier 与三架构 CI 已接入实际应用构建、目标测试、ELF 校验、随包 decoder 加载和 tar 产物上传；9 项合成拒绝路径测试、shell 语法、YAML 三目标结构及格式检查通过。`34244032943` 已在三目标执行正式 GTK 入口与 X11/Wayland 原生 smoke；完整包、物理输入、硬件 GPU 及真实 RDP 门禁仍保持独立验收。
 
 ## Linux 原生 Secret Service 与应用测试
 
@@ -574,6 +572,28 @@ ARM64 run `34233406424` 成功。顶层 CI `34234194817`（文档提交
 `5c7639e`）的格式、核心/协议/桌面测试也成功。
 
 这些结果证明构建、包布局、架构标识、随包解码器加载和指定离线目标 fixture；
-它们不提升 Linux 的产品入口、物理 X11/Wayland 键鼠、硬件 GPU 或真实 RDP
-控制状态。`GtkRunner` 仍是独立 GTK 壳技术路径，Linux 入口当前继续使用
-winit/egui/wgpu，下一门禁仍是产品入口切换及真实桌面控制验收。
+它们不提升 Linux 的物理 Wayland 键鼠、硬件 GPU 或真实 RDP 控制状态。Linux
+正式入口已经切换为 GTK `Application`/`ApplicationWindow`；winit/egui/wgpu
+保留为无默认特性离线 fixture 和其他平台路径。
+
+## 2026-09-08 GTK 正式 Linux 入口三架构 smoke
+
+提交 `f76a44e` 后的 Linux GTK run [`34244032943`](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34244032943)
+在 i686、x86_64 和 AArch64 三个目标均终态 success。每个目标都先以固定 Rust 1.96.0
+编译 `frd-shell-gtk` 与完整 `freeremotedesk-linux` 组合根，再执行正式 GTK
+`Application`/`ApplicationWindow` 入口。产品 X11 smoke 核对窗口标题、PID、`WM_CLASS`、
+窗口几何、焦点，并通过 XTEST 发送 Tab/F8、鼠标点击和 Alt+F4，要求干净退出；三个目标
+均通过。随后每个目标在 X11 和私有 Weston Wayland 下以 1×/2× 运行 frame、runner、
+submission 三个原生 fixture，均为 1 passed / 0 failed / 0 ignored，覆盖完整帧、增量、
+上下文重建、登录/取消、窗口提交、故障拒绝、字体回退和实际 GDK scale。
+
+同一提交的 Linux GL renderer run [`34244032991`](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/34244032991)
+三目标全部通过；工作区 wgpu 依赖现在编译 Vulkan、GLES、Metal，平台选择器仍分别为
+Linux `VULKAN | GL`、Windows `DX12`、macOS `METAL`。这只证明软件渲染/条件后端已进入
+目标构建，不能宣称硬件 GPU 或窗口 scan-out。
+
+本轮修复了两项仅限 CI 环境的问题：i686 GTK 构建补充 `g++-i686-linux-gnu` 与 C/C++
+交叉环境；Wayland compositor 不再继承 `G_DEBUG=fatal-criticals`，fatal 诊断只作用于
+fixture 进程。前一轮 `34242813067` 的失败日志和 i686 `cc1plus` 缺失记录保留，未被覆盖。
+Wayland 全局物理输入、任意真实桌面窗口装饰视觉检查、硬件驱动和真实 RDP 登录/控制仍须
+在授权 Linux 桌面与目标服务器上单列验收。

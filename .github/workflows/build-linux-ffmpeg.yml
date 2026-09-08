@@ -89,7 +89,11 @@ jobs:
             build-essential \
             nasm \
             xz-utils \
-            pkg-config libepoxy-dev libgtk-4-dev libwayland-dev libxkbcommon-dev libasound2-dev desktop-file-utils
+            pkg-config desktop-file-utils
+          if [[ "${{ matrix.arch }}" != i686 ]]; then
+            sudo apt-get install --no-install-recommends -y \
+              libepoxy-dev libgtk-4-dev libwayland-dev libxkbcommon-dev libasound2-dev
+          fi
           if [[ "${{ matrix.arch }}" == i686 ]]; then
             sudo apt-get install --no-install-recommends -y \
               gcc-i686-linux-gnu g++-i686-linux-gnu libc6-dev-i386-cross libc6-i386 lib32gcc-s1 libstdc++6:i386 \

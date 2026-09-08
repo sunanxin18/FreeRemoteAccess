@@ -41,7 +41,7 @@ cargo +1.96.0 test --locked -p frd-shell-gtk --features gtk-shell \
 
 产品事件泵使用合并 wake 的异步主线程消息，覆盖启动结果、取消、迟到启动、清理、证书 pending commands、后台加载密码和 deferred profile persistence。controller 读取的 profile store 是只读内存快照；真实目录 list/upsert 在后台 job 中执行，缓存从 AppLaunch 已有目录初始化。选择新连接或修改连接身份会清除已加载的旧密码。不同 session 重建 GLArea 和 frame pump；清理会丢弃旧事务、纹理及事件，防止重连时显示旧会话内容。
 
-runner 在确认独立 WindowSubmission 后发布 `FramePresented`，仅在当前完整首帧建立 `InputGate::Interactive`。GLArea 的键盘控制器通过当前 GDK 设备和 XKB 映射解析 USB HID 物理键，释放沿用成功按下时的映射；指针使用同一 `ContentViewport`，窗口失焦、代际变化、画布失效或拖出内容区会发送一次 `ReleaseAll`。输入仍由 `AppController::route_input` 和 `SessionHost` 发送，GTK 不直接依赖 RDP wire 类型。Linux 产品入口尚未切换，不能声明完整 GTK 客户端已完成。当前能力继承组合根传入的工厂和策略，不会把尚未接线的视频、音频、剪贴板伪装为支持。
+runner 在确认独立 WindowSubmission 后发布 `FramePresented`，仅在当前完整首帧建立 `InputGate::Interactive`。GLArea 的键盘控制器通过当前 GDK 设备和 XKB 映射解析 USB HID 物理键，释放沿用成功按下时的映射；指针使用同一 `ContentViewport`，窗口失焦、代际变化、画布失效或拖出内容区会发送一次 `ReleaseAll`。输入仍由 `AppController::route_input` 和 `SessionHost` 发送，GTK 不直接依赖 RDP wire 类型。Linux 正式组合根现在使用 GTK `Application`/`ApplicationWindow`，但合成输入与软件 Mesa smoke 不构成物理 Wayland 输入、硬件 GPU 或真实 RDP 控制证明。当前能力继承组合根传入的工厂和策略，不会把尚未接线的视频、音频、剪贴板伪装为支持。
 
 随 Linux 包提供 Noto Sans SC 变量字体到私有 `share/fonts/freeremotedesk` 目录。runner 通过 fontconfig/PangoCairo 公开 ABI 建立窗口树私有 font map，不修改全局或用户字体配置；缺少该 ABI 时保留宿主字体并让包验证失败，避免用系统安装状态掩盖缺失资源。
 
