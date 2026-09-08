@@ -1,4 +1,6 @@
 //! GTK 4.14 GLArea 帧事务适配器；命令提交事件不是窗口呈现 ACK。
+pub mod display_geometry;
+pub mod input_keymap;
 use frd_core::PixelSize;
 use frd_frame::FrameTransaction;
 
@@ -240,4 +242,4 @@ mod presentation;
     feature = "gtk-shell",
     any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use presentation::{SubmissionError, WindowSubmission};
+pub use presentation::{SubmissionDiagnostics, SubmissionError, WindowSubmission};

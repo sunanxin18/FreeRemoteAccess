@@ -181,6 +181,9 @@ impl GtkFrameArea {
     pub fn take_submission_error(&self) -> Option<SubmissionError> {
         self.state.borrow().submission.as_ref()?.take_error()
     }
+    pub fn submission_diagnostics(&self) -> Option<crate::presentation::SubmissionDiagnostics> {
+        Some(self.state.borrow().submission.as_ref()?.diagnostics())
+    }
     /// 正常主动卸载；调用后永久拒绝新事务。
     pub fn detach(&self) {
         if self.area.is_realized() && self.area.context().is_some() {

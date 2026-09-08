@@ -24,6 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 const PASSWORD: &str = "fixture-only-secret";
+#[path = "support/gtk_snapshot.rs"]
+mod gtk_snapshot;
 struct Stores {
     saves: AtomicUsize,
     runner_started: AtomicBool,
@@ -279,6 +281,7 @@ fn native_gtk_login_session_cancel() {
         .parse()
         .unwrap();
     assert!(matches!(scale, 1 | 2));
+    let artifacts = gtk_snapshot::Artifacts::from_env(&backend, scale);
     let stores = Arc::new(Stores {
         saves: AtomicUsize::new(0),
         runner_started: AtomicBool::new(false),
@@ -326,10 +329,16 @@ fn native_gtk_login_session_cancel() {
         .downcast::<gtk4::Button>()
         .unwrap();
     let status = find(&root, "frd-status").downcast::<gtk4::Label>().unwrap();
+    if let Some(artifacts) = &artifacts {
+        artifacts.login_themes(&window);
+    }
     connect.emit_clicked();
     assert_eq!(starts.load(Ordering::SeqCst), 0, "无效表单不能启动");
     profiles.set_selected(1);
     until(|| password.text().as_str() == PASSWORD);
+    if let Some(artifacts) = &artifacts {
+        artifacts.masked_credentials(&window, &password);
+    }
     profiles.set_selected(0);
     assert!(password.text().is_empty(), "新连接不能携带旧profile密码");
     connect.emit_clicked();
@@ -354,6 +363,9 @@ fn native_gtk_login_session_cancel() {
         .unwrap();
     until(|| first_area.context().is_some());
     until(|| read_increment(&first_area));
+    if let Some(artifacts) = &artifacts {
+        artifacts.capture(&window, "connected-preparing");
+    }
     assert_eq!(first_area.scale_factor(), scale);
     until(|| stores.saves.load(Ordering::SeqCst) == 1);
     action.emit_clicked();

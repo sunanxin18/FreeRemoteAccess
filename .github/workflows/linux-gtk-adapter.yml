@@ -113,11 +113,15 @@ jobs:
             --target "${{ matrix.target }}" --test native_submission \
             native_gtk_window_submission_roundtrip -- --exact --ignored --nocapture
           SH
+          case_failures=0
           for scale in 1 2; do
-            timeout --kill-after=5s 120s env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+            if ! timeout --kill-after=5s 120s env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
               GDK_BACKEND=x11 GDK_SCALE="$scale" FRD_GTK_TEST_BACKEND=x11 FRD_GTK_TEST_SCALE="$scale" \
               xvfb-run -a -s '-screen 0 2400x1800x24' dbus-run-session -- bash "$fixture_script" \
-              2>&1 | tee "$log_dir/x11-$scale.log"
+              2>&1 | tee "$log_dir/x11-$scale.log"; then
+              echo "::error::X11 scale $scale failed; retaining diagnostics and testing remaining cases"
+              case_failures=1
+            fi
           done
           for scale in 1 2; do
             export XDG_RUNTIME_DIR="$runtime_root/wayland-$scale"
@@ -133,10 +137,13 @@ jobs:
               sleep 0.1
             done
             test -S "$XDG_RUNTIME_DIR/frd-adapter"
-            timeout --kill-after=5s 120s env -u DISPLAY -u GDK_SCALE -u GDK_DPI_SCALE -u WAYLAND_SOCKET \
+            if ! timeout --kill-after=5s 120s env -u DISPLAY -u GDK_SCALE -u GDK_DPI_SCALE -u WAYLAND_SOCKET \
               GDK_BACKEND=wayland WAYLAND_DISPLAY=frd-adapter \
               FRD_GTK_TEST_BACKEND=wayland FRD_GTK_TEST_SCALE="$scale" \
-              dbus-run-session -- bash "$fixture_script" 2>&1 | tee "$log_dir/wayland-$scale.log"
+              dbus-run-session -- bash "$fixture_script" 2>&1 | tee "$log_dir/wayland-$scale.log"; then
+              echo "::error::Wayland scale $scale failed; retaining diagnostics and testing remaining cases"
+              case_failures=1
+            fi
             kill "$weston_pid" 2>/dev/null || true
             wait "$weston_pid" 2>/dev/null || true
             weston_pid=""
@@ -151,6 +158,7 @@ jobs:
                   if results != [('1', '0', '0')] * 3:
                       raise SystemExit(f'{backend}/{scale}: expected three executed native fixtures')
           PY
+          test "$case_failures" = 0
       - name: Upload native adapter diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

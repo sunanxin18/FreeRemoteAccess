@@ -10,6 +10,32 @@ pub enum SubmissionError {
     EglFault,
 }
 
+/// 有界诊断：仅阶段计数与关联布尔，不暴露对象地址、像素或用户内容。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SubmissionDiagnostics {
+    pub before_count: u64,
+    pub paint_count: u64,
+    pub draw_count: u64,
+    pub after_count: u64,
+    pub bootstrap_count: u64,
+    pub confirmed_count: u64,
+    pub invalidation_count: u64,
+    pub before_frame: i64,
+    pub paint_frame: i64,
+    pub draw_frame: i64,
+    pub frame_counter: i64,
+    pub epoch: u64,
+    pub live: bool,
+    pub baseline_clean: bool,
+    pub nonempty_damage: bool,
+    pub invocation_matches: bool,
+    pub current_window: bool,
+    pub same_known: bool,
+    pub exact_draw: bool,
+    pub observed_paint: bool,
+    pub clean_after: bool,
+}
+
 #[derive(Default)]
 struct FrameGate {
     epoch: Rc<Cell<u64>>,
@@ -173,9 +199,12 @@ mod native {
         ready: Option<WindowSubmission>,
         error: Option<SubmissionError>,
         retry_after_layout: bool,
+        diagnostics: SubmissionDiagnostics,
     }
     impl State {
         fn invalidate(&mut self) {
+            self.diagnostics.invalidation_count =
+                self.diagnostics.invalidation_count.saturating_add(1);
             self.gate.invalidate();
             self.known = None;
             self.draw = None;
@@ -264,6 +293,7 @@ mod native {
                     ready: None,
                     error: None,
                     retry_after_layout: false,
+                    diagnostics: SubmissionDiagnostics::default(),
                 }),
                 area: area.downgrade(),
                 surface,
@@ -378,6 +408,9 @@ mod native {
         pub fn take_error(&self) -> Option<SubmissionError> {
             self.state.borrow_mut().error.take()
         }
+        pub fn diagnostics(&self) -> SubmissionDiagnostics {
+            self.state.borrow().diagnostics
+        }
         pub fn take_submission(&self) -> Option<WindowSubmission> {
             self.state.borrow_mut().ready.take()
         }
@@ -397,6 +430,9 @@ mod native {
                 && gdk::GLContext::current() == area.context()
                 && receipt.is_current();
             let mut state = self.state.borrow_mut();
+            state.diagnostics.draw_count = state.diagnostics.draw_count.saturating_add(1);
+            state.diagnostics.draw_frame = self.clock.frame_counter();
+            state.diagnostics.invocation_matches = matches;
             if !state.gate.draw(self.clock.frame_counter(), matches) {
                 state.draw = None;
                 state.error = Some(SubmissionError::Association);
@@ -426,6 +462,11 @@ mod native {
         }
         fn before(&self) {
             let mut state = self.state.borrow_mut();
+            state.diagnostics.before_count = state.diagnostics.before_count.saturating_add(1);
+            state.diagnostics.before_frame = self.clock.frame_counter();
+            state.diagnostics.frame_counter = self.clock.frame_counter();
+            state.diagnostics.epoch = state.gate.epoch.get();
+            state.diagnostics.live = self.live();
             state.ready = None;
             state.draw = None;
             if !self.live() {
@@ -453,9 +494,14 @@ mod native {
             state
                 .gate
                 .begin(self.clock.frame_counter(), baseline == Some(Ok(())));
+            state.diagnostics.baseline_clean = baseline == Some(Ok(()));
         }
         fn after(&self) {
             let mut state = self.state.borrow_mut();
+            state.diagnostics.after_count = state.diagnostics.after_count.saturating_add(1);
+            state.diagnostics.frame_counter = self.clock.frame_counter();
+            state.diagnostics.epoch = state.gate.epoch.get();
+            state.diagnostics.live = self.live();
             if !self.live() {
                 state.invalidate();
                 return;
@@ -481,11 +527,18 @@ mod native {
             };
             let exact_draw = state.draw.as_ref().is_some_and(DrawReceipt::is_valid);
             let observed_paint = state.gate.paint && state.gate.draw && !state.gate.rejected;
+            state.diagnostics.current_window = valid;
+            state.diagnostics.same_known = same;
+            state.diagnostics.exact_draw = exact_draw;
+            state.diagnostics.observed_paint = observed_paint;
+            state.diagnostics.clean_after = clean.is_ok();
             let confirmed = state.gate.finish(
                 self.clock.frame_counter(),
                 same && clean.is_ok() && exact_draw,
             );
             if confirmed {
+                state.diagnostics.confirmed_count =
+                    state.diagnostics.confirmed_count.saturating_add(1);
                 if let Some(draw) = state.draw.take() {
                     state.ready = Some(WindowSubmission {
                         draw,
@@ -503,6 +556,8 @@ mod native {
                     state.error = Some(error);
                     state.invalidate();
                 } else if observed_paint && exact_draw && !same {
+                    state.diagnostics.bootstrap_count =
+                        state.diagnostics.bootstrap_count.saturating_add(1);
                     state.invalidate();
                     if let (Some(context), Some((egl_context, display, drawable))) =
                         (current, identity)
@@ -566,6 +621,9 @@ mod native {
                 let nonempty =
                     !region.is_null() && !gtk4::cairo::ffi::cairo_region_is_empty(region).as_bool();
                 if let Ok(mut state) = this.state.try_borrow_mut() {
+                    state.diagnostics.paint_count = state.diagnostics.paint_count.saturating_add(1);
+                    state.diagnostics.paint_frame = this.clock.frame_counter();
+                    state.diagnostics.nonempty_damage = nonempty;
                     state.gate.paint(this.clock.frame_counter(), nonempty);
                 }
             }

@@ -330,7 +330,8 @@ fn wait_submission(adapter: &GtkFrameArea) -> WindowSubmission {
         }
         assert!(
             Instant::now() < deadline,
-            "10 秒内没有经实际 EGL 窗口提交的证明"
+            "10 秒内没有经实际 EGL 窗口提交的证明: {:?}",
+            adapter.submission_diagnostics()
         );
     }
 }

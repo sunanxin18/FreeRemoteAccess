@@ -341,3 +341,24 @@ surface/frameclock/counter/renderer receipt与GL/EGL错误作用域；resize/unr
 本机完整 `cargo test --locked --workspace` exit0：75组1735 passed / 0 failed /
 16 ignored，日志`/tmp/frd-gtk-runner-workspace.log`。该轮在macOS执行，包含
 5项observer纯状态回归；不代表Linux GTK运行或新增窗口故障注入通过。
+
+
+## ac118cb 原生登录通过、窗口提交超时
+
+run34214636059三架构终态失败：i686 job102023395684、ARM64 job102023395956、
+x86_64 job102023395979。均完成真实GTK编译链接、9项纯测试和X11 1×的帧适配
+及登录/取消fixture；native_runner明确执行保存密码/身份失效/一次激活/deferred保存/
+取消清理。窗口提交fixture在首次等待证明处10秒超时，无已接受提交；2×与Wayland
+未执行。日志`/tmp/frd-gtk-ac1-{i686,arm64,x64}.log`。
+
+下一轮仅增加有界阶段诊断并继续执行其余backend/scale；任何case失败仍使workflow
+失败，3次唯一原生测试通过的严格计数门禁保留。不用登录通过替代窗口提交验收。
+
+
+独立GTK输入/几何基础：新增显式LinuxEvdevPlus8→USB HID键码策略（无默认策略，
+未知键拒绝，非单射Backslash明确选择0x31）；6项外部接口测试通过。新增
+monitor geometry×浮点monitor scale的DisplayGeometry转换，窗口content另用surface
+浮点scale，不与GLArea整数drawable混淆；5项测试覆盖分数缩放、8K和边界。
+两模块已注册为公共接口，但尚未接runner输入或显示请求，也没有原生键鼠证明。
+本机GTK focused共20项纯测试通过，日志`/tmp/frd-gtk-diagnostics-unit.log`。
+窗口提交诊断只增加有界计数/布尔/framecounter，未改变确认逻辑；原生超时根因待日志。
