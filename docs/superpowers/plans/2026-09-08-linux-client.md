@@ -5,7 +5,7 @@
 
 - [x] 实现独立 Linux 平台服务 crate：XDG 路径、原子 profile/pin、TOFU、单实例锁、
   非回显环境 provider、Secret Service stage/commit/discard 与失败关闭。
-- [ ] 用合成目录和注入 keyring 完成平台服务回归；Linux 原生临时 D-Bus/keyring
+- [x] 用合成目录和注入 keyring 完成平台服务回归；Linux 原生临时 D-Bus/keyring
   往返单列，不把 macOS 上的 mock/Unix 文件测试称为 Secret Service 运行证明。
 - [x] 新增 Linux 应用组合根与依赖边界检查，默认 LegacyOnly，只有精确 bundle
   和 decoder 通过才允许显式 ValidationOnly 实验。
@@ -28,3 +28,5 @@ Secret Service 原生脚本已加入 CI，未执行部分和完整客户端门�
 Linux 应用组合根已接入 workspace；macOS 宿主的 all-targets check 和 20 项单元/2 项边界测试通过。Linux 原生应用测试已接入 CI，尚未执行，窗口/输入与完整包仍未验收。
 
 Linux 完整包脚本与三架构 CI 构建/目标加载步骤已实现；9 项合成包拒绝测试和 shell/YAML 检查通过。此时尚未在 Linux 运行新包流程，不勾选三目标 CI 通过门禁。见 packaging/linux/README.md；原生窗口和真实 GPU/输入仍未完成。
+
+2026-09-08 5cd73ea Ubuntu job101972000994 终态成功：隔离 Secret Service 真实往返 1 项明确执行通过，Linux 原生应用20+2通过。其余发行版、真实GUI及远程登录不在此结论范围。

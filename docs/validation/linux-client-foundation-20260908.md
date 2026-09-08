@@ -41,3 +41,9 @@ Linux 原生 Secret Service 测试。
 Linux 应用入口 baebd80 的宿主测试通过 20 项单元及 2 项边界测试。完整工作区首次回归在旧的双平台组合根名单处失败；增加 Linux 的明确许可项，同时把 macOS/Linux 平台服务加入禁止依赖具体协议的检查后，Windows 两项架构回归通过。最终完整工作区 cargo test --locked --workspace 终态 exit 0，62 组、1705 passed / 0 failed / 16 ignored。宿主为 macOS ARM64，不能据此认定 Linux GUI 或 Secret Service 已运行。
 
 完整 Linux stage/verifier 与三架构 CI 已接入实际应用构建、目标测试、ELF 校验、随包 decoder 加载和 tar 产物上传；9 项合成拒绝路径测试、shell 语法、YAML 三目标结构及格式检查通过。新流程尚未在 Linux 执行；完整包、窗口、GPU、输入及真实 RDP 门禁继续保持未验收。
+
+## Linux 原生 Secret Service 与应用测试
+
+2026-09-08 提交 `5cd73ea`，CI run `34198594600` 的 Ubuntu job `101972000994` 已终态 success。日志确认隔离 D-Bus / 临时 GNOME keyring 中 `secure_credentials::native_tests::native_secret_service_authenticated_commit_roundtrip` 实际执行并通过：1 passed / 0 failed / 0 ignored（不是默认忽略项）。该测试覆盖认证前仅暂存、认证提交后的新 store 读取及删除；使用固定合成密码，未访问用户真实凭据。运行日志保存在本机 `/tmp/frd-linux-native-services-5cd.log`。
+
+同一 Ubuntu 原生 job 中 Linux 应用 20 项单元和 2 项依赖边界测试通过，完整工作区编译及安全核心测试通过。范围为 Ubuntu x86_64 的临时 keyring，不是全部 Linux 发行版、锁定 keyring 的交互解锁体验或实际远程登录证明。三架构完整客户端包和原生窗口仍独立待验收。
