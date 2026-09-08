@@ -359,6 +359,20 @@ fn run_gtk(cli: Cli) -> RunnerOutcome {
     });
     let present_runner = runner.clone();
     application.connect_activate(move |_| present_runner.present());
+    // 仅供隔离 Wayland 产品 smoke 使用；正常产品环境未设置该变量，
+    // 关闭仍完全由用户的原生窗口操作驱动。定时器调用 window.close()
+    // 以复用 GtkRunner 的异步 cleanup 与 close-request 顺序。
+    if let Some(milliseconds) = std::env::var("FRD_LINUX_PRODUCT_SMOKE_MILLIS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=60_000).contains(value))
+    {
+        let smoke_window = runner.window();
+        gtk4::glib::timeout_add_local_once(
+            std::time::Duration::from_millis(milliseconds),
+            move || smoke_window.close(),
+        );
+    }
     let application_exit = application.run();
     if application_exit != gtk4::glib::ExitCode::SUCCESS {
         return RunnerOutcome::from_failure(RunnerFailure::EventLoopRun);

@@ -11,6 +11,7 @@ on:
       - "crates/frd-core/**"
       - "apps/freeremotedesk-linux/**"
       - "tools/verify-linux-product-x11.sh"
+      - "tools/verify-linux-product-wayland.sh"
       - "crates/frd-app/**"
       - "crates/frd-platform-linux/**"
       - "crates/frd-protocol-api/**"
@@ -28,6 +29,7 @@ on:
       - "crates/frd-core/**"
       - "apps/freeremotedesk-linux/**"
       - "tools/verify-linux-product-x11.sh"
+      - "tools/verify-linux-product-wayland.sh"
       - "crates/frd-app/**"
       - "crates/frd-platform-linux/**"
       - "crates/frd-protocol-api/**"
@@ -179,6 +181,10 @@ jobs:
               sleep 0.1
             done
             test -S "$XDG_RUNTIME_DIR/frd-adapter"
+            FRD_LINUX_PRODUCT_SMOKE_LOG_DIR="$log_dir/product-wayland-$scale" \
+              WAYLAND_DISPLAY=frd-adapter \
+              tools/verify-linux-product-wayland.sh \
+              "$PWD/target/${{ matrix.target }}/debug/freeremotedesk-linux"
             if ! timeout --kill-after=5s 120s env -u DISPLAY -u GDK_SCALE -u GDK_DPI_SCALE -u WAYLAND_SOCKET \
               GDK_BACKEND=wayland WAYLAND_DISPLAY=frd-adapter \
               FRD_GTK_TEST_BACKEND=wayland FRD_GTK_TEST_SCALE="$scale" \

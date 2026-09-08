@@ -24,5 +24,7 @@ Linux 原生音频输出尚未接线，因此能力、产品策略和音频工�
 桌面图标由 desktop entry/hicolor 包资源提供。CI 的 Linux GTK adapter 会在三种
 目标架构编译正式组合根，并在隔离 X11 中通过 `tools/verify-linux-product-x11.sh`
 核验窗口映射、WM_CLASS、焦点、XTEST 鼠标/键盘事件和干净关闭；同一轮的 X11/Wayland
-GLArea fixture 核验真实 GL 上下文与帧事务。Mesa 软件驱动和合成事件不等于硬件 GPU
-或真实 RDP 控制证据；Wayland 物理输入和真实服务器连接仍需单列验收。
+GLArea fixture 核验真实 GL 上下文与帧事务。Wayland 产品 smoke 通过
+`tools/verify-linux-product-wayland.sh` 解析 `xdg_toplevel` 的 app-id，并沿用正常
+close-request 清理。Mesa 软件驱动和合成事件不等于硬件 GPU 或真实 RDP 控制证据；
+Wayland 物理输入和真实服务器连接仍需单列验收。

@@ -18,7 +18,10 @@ SONAME 由包验证器逐项检查。窗口运行需要 X11 或 Wayland 会话�
 装饰由宿主 compositor 管理，产品控件保持在原生 HeaderBar，远程内容只占据标题栏下方
 的 GLArea。隔离 X11 产品 smoke 可运行：
 `tools/verify-linux-product-x11.sh /绝对路径/freeremotedesk-linux`。
-该 smoke 只验证窗口生命周期、WM_CLASS、焦点和 XTEST 事件，不连接远程服务器。
+Wayland compositor 已提供私有 `WAYLAND_DISPLAY` 时可运行
+`tools/verify-linux-product-wayland.sh /绝对路径/freeremotedesk-linux`。
+这些 smoke 只验证窗口生命周期、WM_CLASS/app-id、焦点和 XTEST（仅 X11）事件，
+不连接远程服务器；Wayland 全局物理输入不能由客户端脚本注入。
 字体只在当前窗口树的私有
 Pango 配置中注册，不写入系统或用户字体目录。Linux 音频尚未接入。
 
