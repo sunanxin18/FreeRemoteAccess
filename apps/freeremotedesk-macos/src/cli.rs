@@ -25,6 +25,12 @@ pub(crate) struct Cli {
     password_provider: Option<String>,
     #[arg(long)]
     connect: bool,
+    #[arg(
+        long,
+        value_enum,
+        help = "启用默认关闭的 RDP EGFX 验证实验（需要签名 FFmpeg 后端）"
+    )]
+    pub(crate) rdp_egfx_experiment: Option<RdpEgfxExperiment>,
     #[arg(long, hide = true)]
     test_texture: bool,
     #[arg(long, hide = true)]
@@ -33,6 +39,12 @@ pub(crate) struct Cli {
     test_texture_exit_after_ms: Option<u64>,
     #[arg(long, hide = true, requires = "test_texture")]
     test_texture_resize_after_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum RdpEgfxExperiment {
+    Avc420,
+    Avc444,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -227,6 +239,32 @@ mod tests {
             .expect("offline mode options exist");
         assert_eq!(options.resize_after, Some(Duration::from_millis(20)));
         assert_eq!(options.exit_after, Some(Duration::from_millis(80)));
+    }
+
+    #[test]
+    fn egfx_experiment_is_default_off_and_accepts_only_exact_modes() {
+        assert!(Cli::try_parse_from(["app"])
+            .unwrap()
+            .rdp_egfx_experiment
+            .is_none());
+        for (argument, mode) in [
+            ("avc420", super::RdpEgfxExperiment::Avc420),
+            ("avc444", super::RdpEgfxExperiment::Avc444),
+        ] {
+            let cli = Cli::try_parse_from(["app", "--rdp-egfx-experiment", argument]).unwrap();
+            assert_eq!(cli.rdp_egfx_experiment, Some(mode));
+            assert_eq!(
+                cli.launch_options().unwrap(),
+                Cli::try_parse_from(["app"])
+                    .unwrap()
+                    .launch_options()
+                    .unwrap()
+            );
+        }
+        for argument in ["hevc", "auto", "legacy"] {
+            assert!(Cli::try_parse_from(["app", "--rdp-egfx-experiment", argument]).is_err());
+        }
+        assert!(Cli::try_parse_from(["app", "--rdp-egfx-experiment"]).is_err());
     }
 
     fn complete_cli(connect: bool) -> Cli {

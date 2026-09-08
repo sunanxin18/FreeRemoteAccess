@@ -30,8 +30,8 @@ fn macos_production_composition_keeps_egfx_live_gate_closed() {
         "macOS composition must retain an explicit legacy factory boundary"
     );
     assert!(
-        !entry.contains("with_egfx_decoder_provider_and_gate"),
-        "macOS production composition must not opt into the live EGFX gate"
+        entry.contains("RdpGraphicsAdvertisementGate::ValidationOnly"),
+        "macOS opt-in experiment must use validation-only gate"
     );
     assert!(
         !entry.contains("RdpGraphicsAdvertisementGate::LiveInteroperable"),

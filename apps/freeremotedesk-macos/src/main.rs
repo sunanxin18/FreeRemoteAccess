@@ -23,7 +23,7 @@ use frd_shell_desktop::{
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, RdpEgfxExperiment};
 
 struct MacAudioFactory;
 
@@ -37,6 +37,7 @@ impl AudioOutputFactory for MacAudioFactory {
 enum RunnerOutcome {
     Success,
     Fatal(FatalReport),
+    ExperimentUnavailable(&'static str),
 }
 
 impl RunnerOutcome {
@@ -152,6 +153,10 @@ fn run(cli: Cli) -> RunnerOutcome {
                 return RunnerOutcome::from_failure(RunnerFailure::SingleInstanceUnavailable)
             }
         };
+    let rdp_factory = match rdp_factory(cli.rdp_egfx_experiment) {
+        Ok(factory) => factory,
+        Err(code) => return RunnerOutcome::ExperimentUnavailable(code),
+    };
     let event_loop = match EventLoop::<DesktopUserEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(_) => return RunnerOutcome::from_failure(RunnerFailure::EventLoopCreate),
@@ -173,7 +178,6 @@ fn run(cli: Cli) -> RunnerOutcome {
     let apple_factory = Arc::new(AppleProtocolFactory) as Arc<dyn ProtocolFactory>;
     let apple_high_performance_factory =
         Arc::new(AppleHighPerformanceProtocolFactory) as Arc<dyn ProtocolFactory>;
-    let rdp_factory = rdp_factory();
     let factories = [apple_high_performance_factory, apple_factory, rdp_factory];
     let catalog = ProtocolCatalog::new(factories.iter().map(|factory| factory.descriptor().id));
     let provider = EnvironmentCredentialProvider;
@@ -229,17 +233,75 @@ fn run(cli: Cli) -> RunnerOutcome {
     finish_event_loop(run_result, application.runner_result())
 }
 
-fn rdp_factory() -> Arc<dyn ProtocolFactory> {
+fn rdp_factory(
+    experiment: Option<RdpEgfxExperiment>,
+) -> Result<Arc<dyn ProtocolFactory>, &'static str> {
+    rdp_factory_with_backend(experiment, frd_video_ffmpeg::FfmpegBackend::load().ok())
+}
+
+fn rdp_factory_with_backend(
+    experiment: Option<RdpEgfxExperiment>,
+    backend: Option<frd_video_ffmpeg::FfmpegBackend>,
+) -> Result<Arc<dyn ProtocolFactory>, &'static str> {
     let platform = RdpClientPlatformIdentity::Macintosh;
-    match frd_video_ffmpeg::FfmpegBackend::load() {
-        Ok(backend) if backend.supports_avc420() => {
+    if let Some(mode) = experiment {
+        let backend = backend.ok_or("macos_rdp_egfx_experiment_signed_backend_unavailable")?;
+        validate_experiment_support(mode, backend.supports_avc420(), backend.supports_avc444())?;
+        let backend = Arc::new(backend);
+        let provider: Arc<dyn frd_protocol_rdp::EgfxDecoderProvider> = match mode {
+            RdpEgfxExperiment::Avc420 => Arc::new(Avc420DecoderProvider::from_factory(backend)),
+            RdpEgfxExperiment::Avc444 => {
+                Arc::new(frd_protocol_rdp::Avc444DecoderProvider::new(backend))
+            }
+        };
+        let factory = RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
+            platform,
+            provider,
+            frd_protocol_rdp::RdpGraphicsAdvertisementGate::ValidationOnly,
+        )
+        .with_graphics_observer(Arc::new(emit_experiment_diagnostics));
+        return Ok(Arc::new(factory));
+    }
+    Ok(match backend {
+        Some(backend) if backend.supports_avc420() => {
             Arc::new(RdpProtocolFactory::with_egfx_decoder_provider(
                 platform,
                 Arc::new(Avc420DecoderProvider::from_factory(Arc::new(backend))),
             ))
         }
-        Err(_) | Ok(_) => legacy_rdp_factory(platform),
+        None | Some(_) => legacy_rdp_factory(platform),
+    })
+}
+
+fn emit_experiment_diagnostics(caps: frd_protocol_rdp::RdpGraphicsCapabilities) {
+    let d = caps.egfx_diagnostics;
+    // 仅输出类型化计数；runtime 接受帧不代表窗口已经呈现该帧。
+    let line = format!(
+        "RDP EGFX 验证 egfx_confirmed={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} frames_runtime_accepted_total={} failure_count={}\n",
+        caps.egfx_confirmed,
+        d.avc420_decoded_pictures_total,
+        d.avc444_decoded_updates_total,
+        d.frames_runtime_accepted_total,
+        d.failure_count,
+    );
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
+fn validate_experiment_support(
+    mode: RdpEgfxExperiment,
+    avc420: bool,
+    avc444: bool,
+) -> Result<(), &'static str> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err("macos_rdp_egfx_experiment_architecture_unsupported");
     }
+    if !avc420 {
+        return Err("macos_rdp_egfx_experiment_avc420_unavailable");
+    }
+    if mode == RdpEgfxExperiment::Avc444 && !avc444 {
+        return Err("macos_rdp_egfx_experiment_avc444_unavailable");
+    }
+    Ok(())
 }
 
 fn legacy_rdp_factory(platform: RdpClientPlatformIdentity) -> Arc<dyn ProtocolFactory> {
@@ -268,6 +330,10 @@ fn runner_decision(outcome: RunnerOutcome) -> RunnerDecision {
         RunnerOutcome::Success => RunnerDecision {
             exit_code: ExitCode::SUCCESS,
             stderr: None,
+        },
+        RunnerOutcome::ExperimentUnavailable(code) => RunnerDecision {
+            exit_code: ExitCode::FAILURE,
+            stderr: Some(format!("{code}\n")),
         },
         RunnerOutcome::Fatal(report) => RunnerDecision {
             exit_code: ExitCode::FAILURE,
@@ -300,6 +366,47 @@ mod tests {
         finish_event_loop, product_window_configuration, purge_pending_credentials,
         runner_decision, RunnerFailure, RunnerOutcome,
     };
+
+    #[test]
+    fn missing_backend_falls_back_only_when_experiment_is_disabled() {
+        assert!(super::rdp_factory_with_backend(None, None).is_ok());
+        for mode in [
+            super::RdpEgfxExperiment::Avc420,
+            super::RdpEgfxExperiment::Avc444,
+        ] {
+            assert_eq!(
+                super::rdp_factory_with_backend(Some(mode), None).err(),
+                Some("macos_rdp_egfx_experiment_signed_backend_unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn experiment_requires_exact_backend_profiles_and_visible_error() {
+        use super::{validate_experiment_support, RdpEgfxExperiment};
+        for mode in [RdpEgfxExperiment::Avc420, RdpEgfxExperiment::Avc444] {
+            assert!(validate_experiment_support(mode, false, true).is_err());
+            assert!(validate_experiment_support(mode, false, false).is_err());
+        }
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert!(validate_experiment_support(RdpEgfxExperiment::Avc420, true, false).is_ok());
+            assert!(validate_experiment_support(RdpEgfxExperiment::Avc444, true, false).is_err());
+            assert!(validate_experiment_support(RdpEgfxExperiment::Avc444, true, true).is_ok());
+        } else {
+            assert_eq!(
+                validate_experiment_support(RdpEgfxExperiment::Avc420, true, true),
+                Err("macos_rdp_egfx_experiment_architecture_unsupported")
+            );
+        }
+        let decision = runner_decision(RunnerOutcome::ExperimentUnavailable(
+            "macos_rdp_egfx_experiment_signed_backend_unavailable",
+        ));
+        assert_eq!(decision.exit_code, ExitCode::FAILURE);
+        assert_eq!(
+            decision.stderr.as_deref(),
+            Some("macos_rdp_egfx_experiment_signed_backend_unavailable\n")
+        );
+    }
 
     struct TestCredentialStore {
         fail_purge: bool,

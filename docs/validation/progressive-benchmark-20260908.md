@@ -24,3 +24,18 @@ Progressive50项通过、1项默认ignored，release benchmark显式执行通过
 Normal15.41 µs/tile，ReduceExtrapolate16.14 µs/tile（计时范围同上）。
 固定FFmpeg6项fixture，以及macOS合成签名包正例和9项拒绝场景均通过。
 macOS仅覆盖ARM64；没有Intel构建或验收。
+
+## Windows x86 / x86_64
+
+同提交 run `34188365225` 的 x86_64 job `101941170330` 和 x86 job
+`101941170762` 均成功；分别运行 Progressive/邻近 EGFX 50项通过、1项默认 ignored，
+随后显式 release benchmark 通过。x86 使用 i686 MSVC 目标进程。
+
+| 目标 | Normal µs/tile | ReduceExtrapolate µs/tile |
+| --- | ---: | ---: |
+| Windows x86_64 | 27.11 | 28.80 |
+| Windows i686 | 25.68 | 28.97 |
+
+计时范围仍为单分量 DWT + BGRA；不是完整协议或端到端延迟。两项 package job
+成功不等于 Windows GUI 真机连接验收。ARM64 原生 runtime job `101947137153`
+仍在执行，暂不将其记为成功。上述目标也必须复跑 d597212 之后的行为修复。
