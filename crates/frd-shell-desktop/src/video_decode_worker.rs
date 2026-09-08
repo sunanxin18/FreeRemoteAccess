@@ -3157,51 +3157,81 @@ mod tests {
             DecoderScript::TwoFramesThenFail,
             Arc::new(AtomicUsize::new(0)),
         );
-        worker
-            .sender()
-            .try_send_config(test_config_for(identity, 7))
-            .unwrap();
-        recv_backend_selected_for(&worker, identity, 7);
-        worker
-            .sender()
-            .try_send_access_unit(test_au_for(identity, 7, 1, true, 1))
-            .unwrap();
-        let first = recv_frame_for(&worker, identity);
-        worker.events().confirm_presented(first.token()).unwrap();
-        assert!(worker.events().is_ready(identity, 7));
+        let (finish_entered_tx, finish_entered_rx) = std::sync::mpsc::channel();
+        let (release_finish_tx, release_finish_rx) = std::sync::mpsc::channel();
+        let release_finish_rx = Arc::new(Mutex::new(release_finish_rx));
+        worker.sender.router.set_before_stream_finish(Arc::new({
+            let release_finish_rx = release_finish_rx.clone();
+            move |actual_identity| {
+                if actual_identity == identity {
+                    let _ = finish_entered_tx.send(());
+                    let _ = release_finish_rx.lock().unwrap().recv();
+                }
+            }
+        }));
+        let mut release_finish_tx = Some(release_finish_tx);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker
+                .sender()
+                .try_send_config(test_config_for(identity, 7))
+                .unwrap();
+            recv_backend_selected_for(&worker, identity, 7);
+            worker
+                .sender()
+                .try_send_access_unit(test_au_for(identity, 7, 1, true, 1))
+                .unwrap();
+            let first = recv_frame_for(&worker, identity);
+            worker.events().confirm_presented(first.token()).unwrap();
+            assert!(worker.events().is_ready(identity, 7));
 
-        worker
-            .sender()
-            .try_send_access_unit(test_au_for(identity, 7, 2, false, 1))
-            .unwrap();
-        wait_for_latest_frame(&worker, identity);
-        worker
-            .sender()
-            .try_send_access_unit(test_au_for(identity, 7, 3, false, 1))
-            .unwrap();
-        wait_for_output_terminal(&worker, identity);
+            worker
+                .sender()
+                .try_send_access_unit(test_au_for(identity, 7, 2, false, 1))
+                .unwrap();
+            wait_for_latest_frame(&worker, identity);
+            worker
+                .sender()
+                .try_send_access_unit(test_au_for(identity, 7, 3, false, 1))
+                .unwrap();
+            wait_for_output_terminal(&worker, identity);
 
-        let second = recv_frame_for(&worker, identity);
-        assert_eq!(second.frame().as_input().timestamp.ticks, 2);
-        recv_decode_failed_for(&worker, identity, 7);
-        let token = *second.token();
-        let forged = super::VideoFrameToken {
-            publication_id: token.publication_id + 1,
-            ..token
-        };
-        worker.events().confirm_presented(&token).unwrap();
-        assert!(!worker.events().is_ready(identity, 7));
-        assert_eq!(
-            worker.events().confirm_presented(&token),
-            Err(VideoDecodeErrorCode::StaleStreamOrGeneration)
-        );
-        assert_eq!(
-            worker.events().confirm_presented(&forged),
-            Err(VideoDecodeErrorCode::StaleStreamOrGeneration)
-        );
-        wait_for_supervisor_revisions(&worker, 2);
-        assert_eq!(retained_identity_counts(&worker), (0, 0));
+            let second = recv_frame_for(&worker, identity);
+            assert_eq!(second.frame().as_input().timestamp.ticks, 2);
+            recv_decode_failed_for(&worker, identity, 7);
+            let token = *second.token();
+            let forged = super::VideoFrameToken {
+                publication_id: token.publication_id + 1,
+                ..token
+            };
+            worker.events().confirm_presented(&token).unwrap();
+            assert!(!worker.events().is_ready(identity, 7));
+            assert_eq!(
+                worker.events().confirm_presented(&token),
+                Err(VideoDecodeErrorCode::StaleStreamOrGeneration)
+            );
+            assert_eq!(
+                worker.events().confirm_presented(&forged),
+                Err(VideoDecodeErrorCode::StaleStreamOrGeneration)
+            );
+            finish_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("fatal stream 应在 finish 前同步停住");
+            // supervisor 调度轮次不代表 stream finish 已完成。
+            // 在明确暂停 finish 时仍必须保留身份，解除后等待实际清理条件。
+            wait_for_supervisor_revisions(&worker, 2);
+            assert_eq!(retained_identity_counts(&worker), (1, 1));
+            release_finish_tx.take().unwrap().send(()).unwrap();
+            wait_for_retained_identity_counts(&worker, (0, 0));
+            assert_eq!(retained_identity_counts(&worker), (0, 0));
+            assert!(!worker.events().is_ready(identity, 7));
+        }));
+        if let Some(release_finish_tx) = release_finish_tx.take() {
+            let _ = release_finish_tx.send(());
+        }
         stop(worker);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[derive(Clone, Copy)]
