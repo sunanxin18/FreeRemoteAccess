@@ -1,0 +1,19 @@
+[package]
+name = "frd-render-gl"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+linux-gl = ["dep:glow"]
+
+[dependencies]
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-render-state = { path = "../frd-render-state" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+glow = { version = "=0.17.0", optional = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+khronos-egl = { version = "=6.0.0", features = ["dynamic"] }

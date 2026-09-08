@@ -1,0 +1,98 @@
+name: Linux GL renderer
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/**", "main"]
+    paths:
+      - "crates/frd-render-gl/**"
+      - "crates/frd-render-state/**"
+      - "crates/frd-core/**"
+      - "crates/frd-frame/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/linux-render-gl.yml"
+  pull_request:
+    paths:
+      - "crates/frd-render-gl/**"
+      - "crates/frd-render-state/**"
+      - "crates/frd-core/**"
+      - "crates/frd-frame/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/linux-render-gl.yml"
+permissions:
+  contents: read
+concurrency:
+  group: linux-render-gl-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-egl:
+    name: GL renderer (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: i686
+            target: i686-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install target software GL runtime
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            sudo dpkg --add-architecture i386
+            suffix=:i386
+          fi
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential \
+            "libegl1$suffix" "libegl-mesa0$suffix" "libgl1$suffix" "libgl1-mesa-dri$suffix"
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            sudo apt-get install --no-install-recommends -y gcc-i686-linux-gnu libc6-i386
+            echo 'CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc' >> "$GITHUB_ENV"
+          fi
+      - name: Build target renderer tests
+        shell: bash
+        run: |
+          test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
+          rustup target add "${{ matrix.target }}" --toolchain 1.96.0
+          cargo test --locked -p frd-render-gl --features linux-gl \
+            --target "${{ matrix.target }}" --no-run
+      - name: Run isolated EGL texture and lifecycle fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/linux-render-gl-logs
+          # EGL pbuffer and software Mesa validate GL execution, not GTK presentation or hardware.
+          timeout --kill-after=5s 120s env -u DISPLAY -u WAYLAND_DISPLAY \
+            LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless \
+            cargo test --locked -p frd-render-gl --features linux-gl \
+            --target "${{ matrix.target }}" --test native_egl \
+            native_egl_renderer_roundtrip -- --exact --ignored --nocapture \
+            2>&1 | tee target/linux-render-gl-logs/native-egl.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('target/linux-render-gl-logs/native-egl.log').read_text()
+          results = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', text)
+          if results != [('1', '0', '0')]:
+              raise SystemExit('native EGL fixture must execute exactly one passing test')
+          PY
+      - name: Upload GL fixture diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-render-gl-${{ matrix.arch }}
+          path: target/linux-render-gl-logs
+          if-no-files-found: warn

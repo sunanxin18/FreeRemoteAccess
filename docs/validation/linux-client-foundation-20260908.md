@@ -104,3 +104,26 @@ BatchCandidate 独占借用原状态，私有字段、只读操作、无Clone，
 完整工作区终态exit0：64组、1717 passed / 0 failed / 16 ignored，日志
 `/tmp/frd-render-state-workspace.log`；fmt与diff检查通过。该迁移不代表Linux GL执行器、
 GTK产品呈现或RDP实机验证已经完成。
+
+
+## 独立 GL 执行器（原生结果待 CI）
+
+新增 frd-render-gl：真实纹理分配、完整/局部上传、sRGB BGRX shader 绘制、内容矩形
+与目标附件验证、宿主 GL 状态恢复、上下文失效隔离及延迟资源删除。后端仅在 Linux
+三种目标架构启用；Windows 和 macOS 保持原有后端。生产路径没有像素读回或 CPU 转色。
+
+首次集成完整工作区测试在 macOS ARM64 上通过：1720 passed / 0 failed / 16 ignored，
+日志 `/tmp/frd-gl-workspace.log`。其中新 crate 的3项为纯逻辑测试；Linux 原生测试在
+该宿主为0项，不能据此宣称 GL 执行通过。Linux 三目标编译检查由实现代理执行通过。
+
+新增独立三架构软件 Mesa EGL CI，要求明确执行且仅执行1项原生 fixture；覆盖颜色、
+alpha、行方向、stride、黑边清理、错误 viewport、真实 current 解绑、恢复和资源释放。
+该测试仅为离屏 GL 执行验证，不代表硬件 GPU、GTK 窗口呈现或实际 RDP 控制。审查后
+生命周期修正的最终验证及 CI 结果另行记录。
+
+
+最终审查修正：非 current detach 也先撤销旧回执、退休资源，再决定是否可删除；绘制
+只修改/恢复 draw-buffer 0 的混合和颜色掩码，scissor 按上下文能力隔离 index 0，
+拒绝启用多个 draw buffer 的目标，避免清理宿主其他颜色附件。对应原生 fixture 已补充，
+仍待 Linux CI 实际执行。修正后 macOS 3项纯逻辑测试及格式/差异检查通过；这些检查
+不覆盖被 Linux cfg 门控的 GL 实现运行。

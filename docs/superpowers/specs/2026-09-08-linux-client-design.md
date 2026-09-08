@@ -66,7 +66,7 @@ RemoteRenderer::record_in 已能接收离屏 TextureView，但当前 compositor 
 
 下一实现方向：Linux GL 执行器消费同一事务计划。在 GTK current-context 生命周期内管理 texture/FBO，禁止每帧读回CPU。BGRX/BGRA方向与色阶用四角fixture验证，视频后续按原 VideoFrameLayout/VideoColorSelection 采样平面。unrealize/context丢失必须撤销未确认 receipt，并在释放GL资源后请求新完整基线；不能确认旧代帧。
 
-该结论来自固定依赖源码与[GtkGLArea官方文档](https://docs.gtk.org/gtk4/class.GLArea.html)审查，不是GTK/wgpu互操作已实现。独立原生窗口探针已有三架构 X11 1× 运行报告，边框校验修正后离线复验通过；2×/Wayland 待复跑，完整GL执行器及产品接线尚未实现。
+该结论来自固定依赖源码与[GtkGLArea官方文档](https://docs.gtk.org/gtk4/class.GLArea.html)审查，不是GTK/wgpu互操作已实现。独立原生窗口探针已有三架构 X11 1× 运行报告，边框校验修正后离线复验通过；2×/Wayland 待复跑，GL 执行器第一阶段见下节；GTK 产品接线尚未实现。
 
 ### 共享状态 crate 的提交边界
 
@@ -77,6 +77,20 @@ RemoteUpdateState，字段私有、不实现 Clone，只暴露只读操作，com
 丢弃候选不修改已安装状态。候选存活期间不可 clear、恢复、再规划或确认回执。
 
 Wgpu 在既有 GpuCleanToken 的 commit_if_unchanged 内消费候选并安装资源；GL 后端
-将来必须提供自己的 context/错误代际检查。纯状态 crate 无法证明实际 GPU 执行成功，
+提供自己的 context/错误代际检查。纯状态 crate 无法证明实际 GPU 执行成功，
 不引入可伪造的公共成功 token。ConfirmedPresentation 构造仍由后端控制，禁止用
 上传完成或 GTK queue_render 代替真实呈现确认。原有38项测试全部保留为纯状态10项和后端28项；新增3项候选运行时回归及7项编译拒绝测试通过。后端Metal 28项及原有文档测试通过，覆盖候选丢弃、不可重复/跨实例提交及不可修改操作。
+
+
+### 独立 GL 执行器第一阶段
+
+frd-render-gl 将 GL 对象限制在 Linux i686/x86_64/AArch64 当前线程，使用宿主提供的
+真实上下文身份检查和生命周期 epoch。共享候选只在 GL 操作及宿主状态恢复检查成功后
+提交；执行失败隔离旧纹理并要求精确完整恢复。BGRX sRGB 数据直接上传，由 shader
+调整通道、顶部行方向和不透明 alpha，不增加 CPU 转色或生产像素读回。
+
+第一阶段仅接受 desktop GL 3.3+ core 和 sRGB 二维纹理颜色附件，验证真实附件尺寸、
+FBO、viewport 和远端尺寸。默认 FBO、GLES 和 renderbuffer 不在当前契约内；GTK
+实际目标格式必须另行核对和接入，不因技术探针能绘图而假设满足该契约。
+DrawReceipt 仅描述可撤销的绘制记录，不产生生产 ACK。真实 GTK 呈现时序、窗口登录
+流程、输入与会话接线仍是下一阶段，不能由 EGL pbuffer 测试代替。

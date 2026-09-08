@@ -2030,6 +2030,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-render-gl"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-frame",
+ "frd-render-state",
+ "glow",
+ "khronos-egl",
+]
+
+[[package]]
 name = "frd-render-state"
 version = "0.1.0"
 dependencies = [
