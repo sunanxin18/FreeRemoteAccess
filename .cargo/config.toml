@@ -4,4 +4,5 @@
 # 仅影响 aarch64-pc-windows-msvc；Windows x86/x64 和其他平台不变。
 [env]
 CC_aarch64_pc_windows_msvc = "clang-cl"
-CFLAGS_aarch64_pc_windows_msvc = "/clang:-fgnuc-version=4.2.1"
+# ring 的 ARM64 build.rs 会改用 clang GNU driver；-Xclang 两种驱动均接受。
+CFLAGS_aarch64_pc_windows_msvc = "-Xclang -fgnuc-version=4.2.1"
