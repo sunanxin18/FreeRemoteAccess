@@ -104,10 +104,12 @@ pub(super) fn decode(data: &[u8]) -> Result<Vec<ProgressiveBlock<'_>>, WireError
     let mut src = ReadCursor::new(data);
     let mut blocks = Vec::new();
     let mut total_tiles = 0usize;
+    let mut total_blocks = 0usize;
     while !src.is_empty() {
-        if blocks.len() >= MAX_ITEMS {
+        if total_blocks >= MAX_ITEMS {
             return Err(WireError::Budget);
         }
+        total_blocks += 1;
         let (kind, body) = block(&mut src)?;
         let item = match kind {
             0xccc0 => {
@@ -131,8 +133,11 @@ pub(super) fn decode(data: &[u8]) -> Result<Vec<ProgressiveBlock<'_>>, WireError
                 }
                 ProgressiveBlock::Region(region)
             }
-            // 未识别扩展明确不可用，禁止跳过后把缺失图像当作成功。
-            _ => return Err(WireError::Structure),
+            // 已知 tile 类型只允许位于 REGION 的精确子容器中。
+            0xccc5..=0xccc7 => return Err(WireError::Structure),
+            // MS-RDPEGFX 2.2.4.2.1: 未知类型 SHOULD ignore。
+            // 仅跳过已验证边界的 body，仍计入实际块预算，不生成图像事件。
+            _ => continue,
         };
         blocks.push(item);
     }
@@ -268,8 +273,39 @@ mod tests {
         assert_eq!(decode(&data), Err(WireError::Budget));
     }
     #[test]
-    fn rejects_unknown_block_and_empty_input() {
+    fn ignores_bounded_unknown_blocks_without_fabricating_known_blocks() {
+        let unknown = [0xaa, 0xaa, 9, 0, 0, 0, 0xff, 0x80, 0x01];
+        assert_eq!(decode(&unknown).unwrap(), vec![]);
+        let known = encoded();
+        let mut mixed = known[..12].to_vec();
+        mixed.extend_from_slice(&unknown);
+        mixed.extend_from_slice(&known[12..]);
+        mixed.extend_from_slice(&unknown);
+        assert_eq!(decode(&mixed).unwrap(), decode(&known).unwrap());
+    }
+    #[test]
+    fn ignored_unknown_blocks_still_obey_all_framing_and_count_budgets() {
         assert_eq!(decode(&[]), Err(WireError::Length));
-        assert_eq!(decode(&[0, 0, 6, 0, 0, 0]), Err(WireError::Structure));
+        let unknown = [0xaa, 0xaa, 6, 0, 0, 0];
+        assert_eq!(decode(&unknown.repeat(MAX_ITEMS)).unwrap(), vec![]);
+        assert_eq!(
+            decode(&unknown.repeat(MAX_ITEMS + 1)),
+            Err(WireError::Budget)
+        );
+        for length in [0u32, 5, 7, u32::MAX] {
+            let mut bytes = vec![0xaa, 0xaa];
+            bytes.extend_from_slice(&length.to_le_bytes());
+            assert_eq!(decode(&bytes), Err(WireError::Length));
+        }
+        assert_eq!(decode(&unknown[..5]), Err(WireError::Length));
+        // 已知但放错层的 tile 不能冒充未知扩展被忽略。
+        for kind in [0xccc5u16, 0xccc6, 0xccc7] {
+            let mut bytes = kind.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&6u32.to_le_bytes());
+            assert_eq!(decode(&bytes), Err(WireError::Structure));
+        }
+        let mut over_bytes = vec![0; MAX_BYTES + 1];
+        over_bytes[..6].copy_from_slice(&unknown);
+        assert_eq!(decode(&over_bytes), Err(WireError::Budget));
     }
 }
