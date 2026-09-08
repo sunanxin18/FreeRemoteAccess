@@ -92,15 +92,20 @@ frd-render-gl 将 GL 对象限制在 Linux i686/x86_64/AArch64 当前线程，�
 第一阶段仅接受 desktop GL 3.3+ core 和 sRGB 二维纹理颜色附件，验证真实附件尺寸、
 FBO、viewport 和远端尺寸。默认 FBO、GLES 和 renderbuffer 不在当前契约内；GTK
 实际目标格式必须另行核对和接入，不因技术探针能绘图而假设满足该契约。
-DrawReceipt 仅描述可撤销的绘制记录，不产生生产 ACK。真实 GTK 呈现时序、窗口登录
-流程、输入与会话接线仍是下一阶段，不能由 EGL pbuffer 测试代替。
+DrawReceipt 仅描述可撤销的绘制记录，不产生生产 ACK。GTK runner 已在 GLArea
+realized 后接入帧事务、登录流程、输入门控和异步会话清理；X11/Wayland 产品 smoke
+只验证窗口生命周期和身份，仍不能由此替代真实服务器控制或硬件 GPU 证据。
 
 
 ### GTK 会话接线的具体接口缺口
 
-当前 Linux main 仍创建 winit EventLoop 和 DesktopApplication；现有 SessionHost
-虽已从 application.rs 分离，却仍位于 frd-shell-desktop crate。启动、取消、事件与
-清理 API 可复用；帧事务的 drain_frame_transactions、CompiledFrameDrain、
+当前 Linux main 的正式默认路径使用 GTK Application/ApplicationWindow，application id
+为 `com.sunanxin18.freeremotedesk`；`--no-default-features` 或离线纹理 fixture 才创建
+winit EventLoop 和 DesktopApplication。GTK runner 的 close-request 先完成异步
+SessionHost cleanup，再由 application quit；runner_result 会把渲染/生命周期失败
+传回组合根，不把退出一律视为成功。现有 SessionHost 虽已从 application.rs 分离，
+却仍位于 frd-shell-desktop crate。启动、取消、事件与清理 API 可复用；帧事务的
+drain_frame_transactions、CompiledFrameDrain、
 FrameCompileFailure 和 retire_frame_presentation 此前为 pub(crate)，现已通过下述窄 API 公开。公开 drain_frame_updates 会丢弃入队时间，不能在 GTK 壳
 重新编译帧来绕过这些边界，否则会复制 generation/revision 和呈现退休逻辑。
 
@@ -116,6 +121,13 @@ CompiledFrameDrain、FrameCompileFailure、FrameBatchMetricsSnapshot。外部壳
 查看事务、消费取出原事务、读取原错误与四项指标；构造与字段仍受限。原方法体未改，
 没有复制编译器或增加 GTK 类型。retire 是当前会话的永久呈现退休，不能被当作临时
 隐藏或可恢复 GPU 上下文丢失的暂停操作。
+
+正式 Linux 入口的三架构 GTK workflow 在隔离 X11 中运行
+`tools/verify-linux-product-x11.sh`，使用 XTEST 核验窗口 WM_CLASS、焦点、键鼠事件
+接收与 close-request 清理；在私有 Weston/Wayland 中运行
+`tools/verify-linux-product-wayland.sh`，从 `WAYLAND_DEBUG` 日志核对
+`xdg_toplevel` app-id 并沿用同一关闭路径。X11/Wayland smoke 不连接 RDP，Wayland
+全局物理输入不能由客户端脚本注入，真实服务器控制和授权桌面设备输入仍是独立门禁。
 
 
 ### GTK 呈现语义与现有后端对齐
