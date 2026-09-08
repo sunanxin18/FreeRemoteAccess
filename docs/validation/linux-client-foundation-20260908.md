@@ -304,3 +304,21 @@ GTK critical为致命错误。该证据覆盖GLArea帧适配组件，不包含�
 所属上下文，不切换context，也不读取或消费GL错误。它不证明当前FBO或窗口提交。
 原生EGL fixture增加解绑时false但回执仍有效、重新绑定true、绘制失败撤销后false。
 三Linux目标包含fixture的编译检查通过；新增原生断言尚待CI执行。
+
+
+## Linux 凭据保存与界面内存操作隔离
+
+GTK runner审计发现后台commit持pending map锁跨Secret Service写入，新的Connect
+同步stage因此可能阻塞GTK线程。LinuxCredentialStore改为Arc不可变pending条目和
+独立backend mutation锁；stage/discard/purge只访问短内存锁，commit/delete串行外部IO。
+成功commit仅删除同一条目，失败不复活已discard/purge/替换条目，既有重试语义保留。
+discard只清pending/retry，不能撤销已经开始的已授权OS写入。
+
+阻塞backend的channel测试先确定性复现旧锁等待，修复后7项凭据测试及完整
+frd-platform-linux 21项通过。root日志`/tmp/frd-linux-credential-lock-tests.log`。
+这是合成backend并发验证，不是新一轮Secret Service真实运行结果；Windows/macOS
+实现未修改。
+
+07e96d1的新增GL回执current断言已在三目标软件EGL执行通过，run34213548543，
+ARM64 job102019894884、i686 job102019895043、x86_64 job102019895065，
+每目标1 passed/0 ignored。日志`/tmp/frd-gl-07e-{arm64,i686,x64}.log`。

@@ -2,7 +2,7 @@ use frd_core::{SecretBuffer, SessionId};
 use frd_platform_api::{ConnectionProfileKey, PlatformError, SecureCredentialStore};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const MAX_CREDENTIAL_BYTES: usize = 65_536;
 struct PendingCredential {
@@ -11,13 +11,15 @@ struct PendingCredential {
 }
 /// 尚未认证的密码只保留在可清零内存中；进程退出不会留下待提交文件或钥匙串条目。
 pub struct LinuxCredentialStore {
-    pending: Mutex<HashMap<u64, PendingCredential>>,
+    pending: Mutex<HashMap<u64, Arc<PendingCredential>>>,
+    backend_mutation: Mutex<()>,
     backend: Box<dyn CredentialBackend>,
 }
 impl LinuxCredentialStore {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            backend_mutation: Mutex::new(()),
             backend: Box::new(NativeBackend),
         }
     }
@@ -43,34 +45,48 @@ impl SecureCredentialStore for LinuxCredentialStore {
         if text.len() > MAX_CREDENTIAL_BYTES {
             return Err(PlatformError::CredentialTooLarge);
         }
+        let credential = Arc::new(PendingCredential {
+            key: key.clone(),
+            password: SecretBuffer::new(text.as_bytes().to_vec()),
+        });
         let mut pending = self
             .pending
             .lock()
             .map_err(|_| PlatformError::StorageFailed)?;
-        pending.insert(
-            session.get(),
-            PendingCredential {
-                key: key.clone(),
-                password: SecretBuffer::new(text.as_bytes().to_vec()),
-            },
-        );
+        pending.insert(session.get(), credential);
         Ok(())
     }
     fn commit(&self, session: SessionId, key: &ConnectionProfileKey) -> Result<(), PlatformError> {
-        let mut pending = self
-            .pending
+        // 外部写入串行；pending锁只保护条目所有权，不能跨Secret Service调用。
+        let _mutation = self
+            .backend_mutation
             .lock()
             .map_err(|_| PlatformError::StorageFailed)?;
-        let credential = pending
+        let credential = self
+            .pending
+            .lock()
+            .map_err(|_| PlatformError::StorageFailed)?
             .get(&session.get())
+            .cloned()
             .ok_or(PlatformError::CredentialNotFound)?;
         if credential.key != *key {
             return Err(PlatformError::InvalidProfile);
         }
+        // 失败保留仍存在的原条目供重试，绝不重新插入已discard/purge/替换的条目。
         self.backend.write(&account(key), &credential.password)?;
-        pending.remove(&session.get());
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| PlatformError::StorageFailed)?;
+        if pending
+            .get(&session.get())
+            .is_some_and(|current| Arc::ptr_eq(current, &credential))
+        {
+            pending.remove(&session.get());
+        }
         Ok(())
     }
+    /// 清除pending/retry所有权；不能撤销已经开始且已授权的OS凭据写入。
     fn discard(&self, session: SessionId) -> Result<(), PlatformError> {
         self.pending
             .lock()
@@ -79,12 +95,16 @@ impl SecureCredentialStore for LinuxCredentialStore {
         Ok(())
     }
     fn delete(&self, key: &ConnectionProfileKey) -> Result<(), PlatformError> {
-        let mut pending = self
-            .pending
+        let _mutation = self
+            .backend_mutation
             .lock()
             .map_err(|_| PlatformError::StorageFailed)?;
         self.backend.delete(&account(key))?;
-        pending.retain(|_, credential| credential.key != *key);
+        // 保持原合同：只有外部删除成功后才清除该key当前的pending条目。
+        self.pending
+            .lock()
+            .map_err(|_| PlatformError::StorageFailed)?
+            .retain(|_, credential| credential.key != *key);
         Ok(())
     }
     fn purge_pending(&self) -> Result<(), PlatformError> {
@@ -274,6 +294,7 @@ mod tests {
         let fake = std::sync::Arc::new(Fake::default());
         let store = LinuxCredentialStore {
             pending: Mutex::new(HashMap::new()),
+            backend_mutation: Mutex::new(()),
             backend: Box::new(fake.clone()),
         };
         (
@@ -347,6 +368,273 @@ mod tests {
                 Err(PlatformError::CredentialNotFound)
             );
         }
+        assert!(store.load(&key).unwrap().is_none());
+    }
+    struct BlockingBackend {
+        entered: std::sync::mpsc::Sender<&'static str>,
+        release: Mutex<std::sync::mpsc::Receiver<bool>>,
+        fake: std::sync::Arc<Fake>,
+    }
+    impl CredentialBackend for BlockingBackend {
+        fn read(&self, account: &str) -> Result<Option<SecretBuffer>, PlatformError> {
+            self.fake.read(account)
+        }
+        fn write(&self, account: &str, value: &SecretBuffer) -> Result<(), PlatformError> {
+            self.entered.send("write").unwrap();
+            if !self.release.lock().unwrap().recv().unwrap() {
+                return Err(PlatformError::Unavailable);
+            }
+            self.fake.write(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<(), PlatformError> {
+            self.entered.send("delete").unwrap();
+            if !self.release.lock().unwrap().recv().unwrap() {
+                return Err(PlatformError::Unavailable);
+            }
+            self.fake.delete(account)
+        }
+    }
+    fn blocked_fixture() -> (
+        std::sync::Arc<LinuxCredentialStore>,
+        ConnectionProfileKey,
+        std::sync::mpsc::Receiver<&'static str>,
+        std::sync::mpsc::Sender<bool>,
+    ) {
+        let (_, fake, key) = fixture();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store = LinuxCredentialStore {
+            pending: Mutex::new(HashMap::new()),
+            backend_mutation: Mutex::new(()),
+            backend: Box::new(BlockingBackend {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                fake,
+            }),
+        };
+        (std::sync::Arc::new(store), key, entered_rx, release_tx)
+    }
+    #[test]
+    fn pending_memory_operations_complete_while_secret_service_commit_is_blocked() {
+        let (store, key, entered, release) = blocked_fixture();
+        let session = SessionId::allocate();
+        store
+            .stage(
+                session,
+                &key,
+                &SecretBuffer::from_text("synthetic-old".into()),
+            )
+            .unwrap();
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            let key = key.clone();
+            move || store.commit(session, &key)
+        });
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "write"
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let edits = std::thread::spawn({
+            let store = store.clone();
+            let key = key.clone();
+            move || {
+                store
+                    .stage(
+                        session,
+                        &key,
+                        &SecretBuffer::from_text("synthetic-new".into()),
+                    )
+                    .unwrap();
+                store.discard(session).unwrap();
+                store.purge_pending().unwrap();
+                done_tx.send(()).unwrap();
+            }
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+        release.send(true).unwrap();
+        writer.join().unwrap().unwrap();
+        edits.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "stage/discard/purge不得等待外部commit完成"
+        );
+        assert!(store.pending.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn completed_old_commit_does_not_remove_same_session_replacement() {
+        let (store, key, entered, release) = blocked_fixture();
+        let session = SessionId::allocate();
+        store
+            .stage(
+                session,
+                &key,
+                &SecretBuffer::from_text("synthetic-old".into()),
+            )
+            .unwrap();
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            let key = key.clone();
+            move || store.commit(session, &key)
+        });
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "write"
+        );
+        store
+            .stage(
+                session,
+                &key,
+                &SecretBuffer::from_text("synthetic-new".into()),
+            )
+            .unwrap();
+        release.send(true).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            store
+                .pending
+                .lock()
+                .unwrap()
+                .get(&session.get())
+                .unwrap()
+                .password
+                .expose_text(),
+            Some("synthetic-new")
+        );
+        // 已授权且已开始的旧写入仍可完成；替换条目必须保留供下一次commit。
+        assert_eq!(
+            store.load(&key).unwrap().unwrap().expose_text(),
+            Some("synthetic-old")
+        );
+        release.send(true).unwrap();
+        store.commit(session, &key).unwrap();
+        assert_eq!(
+            store.load(&key).unwrap().unwrap().expose_text(),
+            Some("synthetic-new")
+        );
+        assert!(store.pending.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn failed_commit_never_resurrects_discarded_purged_or_replaced_entries() {
+        for operation in 0..3 {
+            let (store, key, entered, release) = blocked_fixture();
+            let session = SessionId::allocate();
+            store
+                .stage(
+                    session,
+                    &key,
+                    &SecretBuffer::from_text("synthetic-old".into()),
+                )
+                .unwrap();
+            let writer = std::thread::spawn({
+                let store = store.clone();
+                let key = key.clone();
+                move || store.commit(session, &key)
+            });
+            assert_eq!(
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap(),
+                "write"
+            );
+            match operation {
+                0 => store.discard(session).unwrap(),
+                1 => store.purge_pending().unwrap(),
+                _ => store
+                    .stage(
+                        session,
+                        &key,
+                        &SecretBuffer::from_text("synthetic-new".into()),
+                    )
+                    .unwrap(),
+            }
+            release.send(false).unwrap();
+            assert_eq!(writer.join().unwrap(), Err(PlatformError::Unavailable));
+            let pending = store.pending.lock().unwrap();
+            if operation < 2 {
+                assert!(pending.is_empty());
+            } else {
+                assert_eq!(
+                    pending.get(&session.get()).unwrap().password.expose_text(),
+                    Some("synthetic-new")
+                );
+            }
+            assert!(store.load(&key).unwrap().is_none());
+        }
+    }
+    #[test]
+    fn delete_and_commit_external_mutations_are_serialized_and_delete_failure_preserves_pending() {
+        let (store, key, entered, release) = blocked_fixture();
+        let session = SessionId::allocate();
+        store
+            .stage(session, &key, &SecretBuffer::from_text("synthetic".into()))
+            .unwrap();
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            let key = key.clone();
+            move || store.commit(session, &key)
+        });
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "write"
+        );
+        assert!(store.backend_mutation.try_lock().is_err());
+        let deleter = std::thread::spawn({
+            let store = store.clone();
+            let key = key.clone();
+            move || store.delete(&key)
+        });
+        release.send(true).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "delete"
+        );
+        assert!(store.backend_mutation.try_lock().is_err());
+        store
+            .stage(
+                session,
+                &key,
+                &SecretBuffer::from_text("synthetic-new".into()),
+            )
+            .unwrap();
+        assert!(store.load(&key).unwrap().is_some());
+        release.send(false).unwrap();
+        assert_eq!(deleter.join().unwrap(), Err(PlatformError::Unavailable));
+        assert!(store.pending.lock().unwrap().contains_key(&session.get()));
+        // 删除先进入后，排队的commit必须在删除完成后重新查pending，不能复活旧值。
+        let deleter = std::thread::spawn({
+            let store = store.clone();
+            let key = key.clone();
+            move || store.delete(&key)
+        });
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "delete"
+        );
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            let key = key.clone();
+            move || store.commit(session, &key)
+        });
+        release.send(true).unwrap();
+        deleter.join().unwrap().unwrap();
+        assert_eq!(
+            writer.join().unwrap(),
+            Err(PlatformError::CredentialNotFound)
+        );
+        assert!(entered.try_recv().is_err());
+        assert!(store.pending.lock().unwrap().is_empty());
         assert!(store.load(&key).unwrap().is_none());
     }
     #[test]
