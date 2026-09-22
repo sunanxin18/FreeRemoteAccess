@@ -17,6 +17,7 @@ mod egfx;
 mod error;
 mod factory;
 mod input;
+mod network_diagnostics;
 mod pixel_convert;
 mod runtime;
 mod server_identity;

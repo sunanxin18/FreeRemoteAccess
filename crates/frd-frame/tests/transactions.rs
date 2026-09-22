@@ -95,6 +95,82 @@ fn start(compiler: &mut FrameTransactionCompiler, session_id: SessionId, at: Ins
 }
 
 #[test]
+fn committed_drain_keeps_unclosed_damage_out_of_compiler_during_overflow() {
+    use frd_frame::{FrameMailbox, PushOutcome};
+    for (raw, established) in [(true, false), (false, false), (true, true), (false, true)] {
+        let id = session();
+        let mut mailbox = FrameMailbox::new(3, 48);
+        let mut compiler = FrameTransactionCompiler::new(id);
+        mailbox.push(reset(id, 1));
+        compiler.compile(mailbox.drain_committed_updates()).unwrap();
+        if established {
+            mailbox.push(damage(id, 1, 1, vec![one_pixel_patch(0)]));
+            mailbox.push(boundary(id, 1, 1, FrameCompleteness::FullBaseline));
+            assert_eq!(
+                compiler
+                    .compile(mailbox.drain_committed_updates())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let offset = u64::from(established);
+        mailbox.push(damage(id, 1, 1 + offset, vec![one_pixel_patch(1)]));
+        let updates = if raw {
+            std::iter::from_fn(|| mailbox.pop_enqueued()).collect()
+        } else {
+            mailbox.drain_committed_updates()
+        };
+        assert!(compiler.compile(updates).unwrap().is_empty());
+        assert_eq!(
+            mailbox.push(boundary(id, 1, 1 + offset, FrameCompleteness::FullBaseline)),
+            PushOutcome::Queued
+        );
+        mailbox.push(damage(id, 1, 2 + offset, vec![one_pixel_patch(2)]));
+        let _ = mailbox.push(boundary(id, 1, 2 + offset, FrameCompleteness::Incremental));
+        // 原始 drain 留下编译器中的 r1；两种消费模式都让后续积压清队列。
+        if raw {
+            assert_eq!(
+                mailbox.push(damage(id, 1, 3 + offset, vec![one_pixel_patch(3)])),
+                PushOutcome::NeedsFullSnapshot
+            );
+        } else {
+            assert!(mailbox.is_empty());
+        }
+        let patch = PixelPatch {
+            rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 3,
+            },
+            stride_bytes: 16,
+            pixels: PixelBuffer::new(vec![7; 48]),
+        };
+        assert_eq!(
+            mailbox.push(damage(id, 1, 4 + offset, vec![patch])),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            mailbox.push(boundary(id, 1, 4 + offset, FrameCompleteness::FullBaseline)),
+            PushOutcome::Queued
+        );
+        let result = compiler.compile(mailbox.drain_committed_updates());
+        if raw {
+            assert_error!(result, FrameTransactionError::RevisionWhilePending);
+        } else {
+            let transactions = result.expect("恢复快照不得遇到已丢失边界的旧 Damage");
+            assert_eq!(transactions.len(), 1);
+            assert_eq!(
+                matches!(transactions[0], FrameTransaction::Startup { .. }),
+                !established
+            );
+            assert!(!compiler.has_buffered_input());
+        }
+    }
+}
+
+#[test]
 fn one_damage_with_many_disjoint_patches_commits_only_at_its_boundary() {
     use frd_frame::{FrameMailbox, PushOutcome};
 

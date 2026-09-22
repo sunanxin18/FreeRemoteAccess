@@ -433,9 +433,13 @@ fn format_experiment_diagnostics(
 ) -> String {
     // 仅输出类型化计数和静态失败标签；runtime 接受帧不代表窗口已经呈现该帧。
     format!(
-        "RDP EGFX 验证 egfx_confirmed={} egfx_frame_confirmed={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={} failure_count={} first_failure={:?} progressive_failure_detail={:?} progressive_coverage_failure={:?} publisher_failure_detail={:?} publisher_failure_operation={:?}\n",
+        "RDP EGFX 验证 egfx_confirmed={} egfx_frame_confirmed={} avc420_received_pdus_total={} avc444_received_pdus_total={} avc420_decode_attempts_total={} avc444_decode_attempts_total={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={} failure_count={} first_failure={:?} progressive_failure_detail={:?} progressive_coverage_failure={:?} publisher_failure_detail={:?} publisher_failure_operation={:?}\n",
         egfx_confirmed,
         egfx_frame_confirmed,
+        d.avc420_received_pdus_total,
+        d.avc444_received_pdus_total,
+        d.avc420_decode_attempts_total,
+        d.avc444_decode_attempts_total,
         d.avc420_decoded_pictures_total,
         d.avc444_decoded_updates_total,
         d.clearcodec_decoded_bitmaps_total,
@@ -555,7 +559,7 @@ mod tests {
         };
         assert_eq!(
             format_experiment_diagnostics(true, true, diagnostics),
-            "RDP EGFX 验证 egfx_confirmed=true egfx_frame_confirmed=true avc420_decoded_pictures_total=0 avc444_decoded_updates_total=0 clearcodec_decoded_bitmaps_total=2 progressive_decoded_updates_total=3 frames_queued_total=0 frames_runtime_accepted_total=0 failure_count=1 first_failure=Some(PublisherOutputBounds) progressive_failure_detail=None progressive_coverage_failure=None publisher_failure_detail=Some(\"output bounds\") publisher_failure_operation=Some(\"clearcodec\")\n"
+            "RDP EGFX 验证 egfx_confirmed=true egfx_frame_confirmed=true avc420_received_pdus_total=0 avc444_received_pdus_total=0 avc420_decode_attempts_total=0 avc444_decode_attempts_total=0 avc420_decoded_pictures_total=0 avc444_decoded_updates_total=0 clearcodec_decoded_bitmaps_total=2 progressive_decoded_updates_total=3 frames_queued_total=0 frames_runtime_accepted_total=0 failure_count=1 first_failure=Some(PublisherOutputBounds) progressive_failure_detail=None progressive_coverage_failure=None publisher_failure_detail=Some(\"output bounds\") publisher_failure_operation=Some(\"clearcodec\")\n"
         );
     }
 

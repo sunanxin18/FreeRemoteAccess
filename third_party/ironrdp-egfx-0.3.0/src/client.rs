@@ -399,6 +399,8 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
+    avc420_received_pdus_total: u64,
+    avc444_received_pdus_total: u64,
 }
 
 impl GraphicsPipelineClient {
@@ -419,12 +421,26 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
+            avc420_received_pdus_total: 0,
+            avc444_received_pdus_total: 0,
         }
     }
 
     // ========================================================================
     // State Queries
     // ========================================================================
+
+    /// 当前客户端生命周期收到的 typed AVC420 WTS1 数，包含后续校验失败。
+    #[must_use]
+    pub fn avc420_received_pdus_total(&self) -> u64 {
+        self.avc420_received_pdus_total
+    }
+
+    /// 当前客户端生命周期收到的 typed AVC444/v2 WTS1 数，不按内部子流计数。
+    #[must_use]
+    pub fn avc444_received_pdus_total(&self) -> u64 {
+        self.avc444_received_pdus_total
+    }
 
     /// Check if the client has completed capability negotiation
     #[must_use]
@@ -707,6 +723,15 @@ impl GraphicsPipelineClient {
     }
 
     fn handle_wire_to_surface1(&mut self, pdu: crate::pdu::WireToSurface1Pdu) -> PduResult<()> {
+        match pdu.codec_id {
+            Codec1Type::Avc420 => {
+                self.avc420_received_pdus_total = self.avc420_received_pdus_total.saturating_add(1);
+            }
+            Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
+                self.avc444_received_pdus_total = self.avc444_received_pdus_total.saturating_add(1);
+            }
+            _ => {}
+        }
         let surface = self
             .surfaces
             .get(&pdu.surface_id)
@@ -1060,6 +1085,40 @@ mod tests {
     use crate::pdu::{Avc420Region, encode_avc420_bitmap_stream};
     use ironrdp_core::{Encode, WriteCursor};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn typed_avc_received_counters_saturate_and_survive_graphics_reset() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client.avc420_received_pdus_total = u64::MAX - 1;
+        client.avc444_received_pdus_total = u64::MAX - 1;
+        for codec_id in [
+            Codec1Type::Avc420,
+            Codec1Type::Avc420,
+            Codec1Type::Avc444,
+            Codec1Type::Avc444v2,
+        ] {
+            // 未知 surface 仍属于已收到 typed PDU，不能计成解码成功。
+            assert!(
+                client
+                    .handle_wire_to_surface1(crate::pdu::WireToSurface1Pdu {
+                        surface_id: 1,
+                        codec_id,
+                        pixel_format: PixelFormat::XRgb,
+                        destination_rectangle: ExclusiveRectangle {
+                            left: 0,
+                            top: 0,
+                            right: 2,
+                            bottom: 2
+                        },
+                        bitmap_data: vec![],
+                    })
+                    .is_err()
+            );
+        }
+        client.handle_reset_graphics(2, 2);
+        assert_eq!(client.avc420_received_pdus_total(), u64::MAX);
+        assert_eq!(client.avc444_received_pdus_total(), u64::MAX);
+    }
 
     struct TestDecoder;
     impl H264Decoder for TestDecoder {

@@ -252,6 +252,7 @@ struct EgfxSurfaceState {
     rejected_updates: u64,
     unhandled_codec_count: u64,
     last_unhandled_codec: Option<u16>,
+    avc444_decode_attempts_total: u64,
     avc444_decoded_updates_total: u64,
     clearcodec_decoded_bitmaps_total: u64,
     progressive_decoded_updates_total: u64,
@@ -1443,6 +1444,7 @@ impl EgfxSurfacePublisher {
                 rejected_updates: 0,
                 unhandled_codec_count: 0,
                 last_unhandled_codec: None,
+                avc444_decode_attempts_total: 0,
                 avc444_decoded_updates_total: 0,
                 clearcodec_decoded_bitmaps_total: 0,
                 progressive_decoded_updates_total: 0,
@@ -2120,6 +2122,11 @@ impl GraphicsPipelineHandler for EgfxSurfacePublisher {
                 return;
             }
         };
+        {
+            let mut state = lock_state(&self.state);
+            state.avc444_decode_attempts_total =
+                state.avc444_decode_attempts_total.saturating_add(1);
+        }
         let decoded = {
             let mut decoder = decoder
                 .lock()
@@ -2842,9 +2849,15 @@ impl EgfxSurfacePublisher {
 struct CountedH264Decoder {
     inner: Box<dyn H264Decoder>,
     successes: Arc<AtomicU64>,
+    attempts: Arc<AtomicU64>,
 }
 impl H264Decoder for CountedH264Decoder {
     fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
+        let _ = self
+            .attempts
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            });
         let frame = self.inner.decode(data)?;
         let _ = self
             .successes
@@ -2877,6 +2890,7 @@ pub(crate) struct EgfxAdapter {
     /// 在 adapter 边界保留此事实，避免诊断信息把服务器证据误当成本地能力。
     h264_decoder_configured: bool,
     avc420_decoded_pictures_total: Arc<AtomicU64>,
+    avc420_decode_attempts_total: Arc<AtomicU64>,
     diagnostics: Mutex<RdpEgfxDiagnostics>,
     failed: Arc<AtomicBool>,
 }
@@ -2889,10 +2903,12 @@ impl EgfxAdapter {
     ) -> Self {
         let h264_decoder_configured = decoder.is_some();
         let avc420_decoded_pictures_total = Arc::new(AtomicU64::new(0));
+        let avc420_decode_attempts_total = Arc::new(AtomicU64::new(0));
         let decoder = decoder.map(|inner| {
             Box::new(CountedH264Decoder {
                 inner,
                 successes: avc420_decoded_pictures_total.clone(),
+                attempts: avc420_decode_attempts_total.clone(),
             }) as Box<dyn H264Decoder>
         });
         Self {
@@ -2900,6 +2916,7 @@ impl EgfxAdapter {
             surface_publisher: None,
             h264_decoder_configured,
             avc420_decoded_pictures_total,
+            avc420_decode_attempts_total,
             diagnostics: Mutex::new(RdpEgfxDiagnostics::default()),
             failed: Arc::new(AtomicBool::new(false)),
         }
@@ -2911,10 +2928,12 @@ impl EgfxAdapter {
     ) -> Self {
         let h264_decoder_configured = decoder.is_some();
         let avc420_decoded_pictures_total = Arc::new(AtomicU64::new(0));
+        let avc420_decode_attempts_total = Arc::new(AtomicU64::new(0));
         let decoder = decoder.map(|inner| {
             Box::new(CountedH264Decoder {
                 inner,
                 successes: avc420_decoded_pictures_total.clone(),
+                attempts: avc420_decode_attempts_total.clone(),
             }) as Box<dyn H264Decoder>
         });
         Self {
@@ -2922,6 +2941,7 @@ impl EgfxAdapter {
             surface_publisher: Some(publisher),
             h264_decoder_configured,
             avc420_decoded_pictures_total,
+            avc420_decode_attempts_total,
             diagnostics: Mutex::new(RdpEgfxDiagnostics::default()),
             failed: Arc::new(AtomicBool::new(false)),
         }
@@ -2936,6 +2956,7 @@ impl EgfxAdapter {
             let state = lock_state(&publisher.state);
             diagnostics.unhandled_codec_count = state.unhandled_codec_count;
             diagnostics.last_unhandled_codec = state.last_unhandled_codec;
+            diagnostics.avc444_decode_attempts_total = state.avc444_decode_attempts_total;
             diagnostics.avc444_decoded_updates_total = state.avc444_decoded_updates_total;
             diagnostics.clearcodec_decoded_bitmaps_total = state.clearcodec_decoded_bitmaps_total;
             diagnostics.progressive_decoded_updates_total = state.progressive_decoded_updates_total;
@@ -2945,6 +2966,10 @@ impl EgfxAdapter {
             diagnostics.publisher_failure_operation = state.publisher_failure_operation;
             diagnostics.frames_queued_total = state.frames_queued_total;
         }
+        diagnostics.avc420_received_pdus_total = self.inner.avc420_received_pdus_total();
+        diagnostics.avc444_received_pdus_total = self.inner.avc444_received_pdus_total();
+        diagnostics.avc420_decode_attempts_total =
+            self.avc420_decode_attempts_total.load(Ordering::Relaxed);
         diagnostics.avc420_decoded_pictures_total =
             self.avc420_decoded_pictures_total.load(Ordering::Relaxed);
         diagnostics
@@ -3537,6 +3562,12 @@ mod tests {
             )
             .expect("EndFrame produces a frame acknowledgement");
         assert_eq!(responses.len(), 1);
+        let diagnostics = adapter.diagnostics();
+        assert_eq!(diagnostics.avc444_received_pdus_total, 1);
+        assert_eq!(diagnostics.avc444_decode_attempts_total, 1);
+        assert_eq!(diagnostics.avc444_decoded_updates_total, 1);
+        assert_eq!(diagnostics.avc420_received_pdus_total, 0);
+        assert_eq!(diagnostics.avc420_decode_attempts_total, 0);
 
         let updates = adapter.drain_surface_updates();
         assert_eq!(updates.len(), 3);
@@ -4407,6 +4438,12 @@ mod tests {
             )
             .expect("EndFrame produces a frame acknowledgement");
         assert_eq!(responses.len(), 1);
+        let diagnostics = adapter.diagnostics();
+        assert_eq!(diagnostics.avc420_received_pdus_total, 1);
+        assert_eq!(diagnostics.avc420_decode_attempts_total, 1);
+        assert_eq!(diagnostics.avc420_decoded_pictures_total, 1);
+        assert_eq!(diagnostics.avc444_received_pdus_total, 0);
+        assert_eq!(diagnostics.avc444_decode_attempts_total, 0);
 
         let updates = adapter.drain_surface_updates();
         assert_eq!(updates.len(), 3);
@@ -5464,6 +5501,134 @@ mod tests {
     }
 
     #[test]
+    fn typed_avc_pdus_survive_envelope_failures_without_decoder_attempts() {
+        for codec_id in [Codec1Type::Avc420, Codec1Type::Avc444, Codec1Type::Avc444v2] {
+            let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1)
+                .unwrap()
+                .with_avc444_decoder(Box::new(SolidAvc444Decoder));
+            let mut adapter =
+                EgfxAdapter::with_surface_publisher(Some(Box::new(FailingH264Decoder)), publisher);
+            adapter.start(7).unwrap();
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(
+                    &CapabilitySet::V10_7 {
+                        flags: CapabilitiesV107Flags::SMALL_CACHE,
+                    },
+                )),
+            );
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                    width: 2,
+                    height: 2,
+                    monitors: Vec::new(),
+                }),
+            );
+            clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+            let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id,
+                pixel_format: EgfxPixelFormat::XRgb,
+                destination_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+                bitmap_data: vec![0],
+            });
+            let _ = adapter.process(7, &wrap_uncompressed(&encode_vec(&pdu).unwrap()));
+            let diagnostics = adapter.diagnostics();
+            assert_eq!(
+                diagnostics.avc420_received_pdus_total,
+                u64::from(codec_id == Codec1Type::Avc420)
+            );
+            assert_eq!(
+                diagnostics.avc444_received_pdus_total,
+                u64::from(codec_id != Codec1Type::Avc420)
+            );
+            assert_eq!(diagnostics.avc420_decode_attempts_total, 0);
+            assert_eq!(diagnostics.avc444_decode_attempts_total, 0);
+            assert_eq!(diagnostics.avc420_decoded_pictures_total, 0);
+            assert_eq!(diagnostics.avc444_decoded_updates_total, 0);
+        }
+    }
+
+    #[test]
+    fn typed_avc_decoder_failures_count_attempts_but_not_successes() {
+        struct Failing444;
+        impl Avc444Decoder for Failing444 {
+            fn reset(&mut self, _: u32, _: u32) -> DecoderResult<()> {
+                Ok(())
+            }
+            fn decode(
+                &mut self,
+                _: Codec1Type,
+                _: u16,
+                _: &super::ValidatedAvc444Bitmap<'_>,
+                _: &ExclusiveRectangle,
+            ) -> DecoderResult<DecodedFrame> {
+                Err(super::DecoderError::msg("test decoder failure"))
+            }
+        }
+        for codec_id in [Codec1Type::Avc420, Codec1Type::Avc444, Codec1Type::Avc444v2] {
+            let publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1)
+                .unwrap()
+                .with_avc444_decoder(Box::new(Failing444));
+            let mut adapter =
+                EgfxAdapter::with_surface_publisher(Some(Box::new(FailingH264Decoder)), publisher);
+            adapter.start(7).unwrap();
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(
+                    &CapabilitySet::V10_7 {
+                        flags: CapabilitiesV107Flags::SMALL_CACHE,
+                    },
+                )),
+            );
+            process_gfx_pdu(
+                &mut adapter,
+                GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                    width: 2,
+                    height: 2,
+                    monitors: Vec::new(),
+                }),
+            );
+            clear_surface(&mut adapter, 1, 2, 2, 0, 0);
+            let bitmap_data = if codec_id == Codec1Type::Avc420 {
+                ironrdp_egfx::pdu::encode_avc420_bitmap_stream(
+                    &[Avc420Region::full_frame(2, 2, 22)],
+                    &[0, 0, 0, 1, 0x65],
+                )
+            } else {
+                encode_avc444_fixture(ironrdp_egfx::pdu::Encoding::LUMA_AND_CHROMA, true)
+            };
+            let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id,
+                pixel_format: EgfxPixelFormat::XRgb,
+                destination_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 2,
+                    bottom: 2,
+                },
+                bitmap_data,
+            });
+            let _ = adapter.process(7, &wrap_uncompressed(&encode_vec(&pdu).unwrap()));
+            let diagnostics = adapter.diagnostics();
+            let is420 = u64::from(codec_id == Codec1Type::Avc420);
+            assert_eq!(diagnostics.avc420_received_pdus_total, is420);
+            assert_eq!(diagnostics.avc444_received_pdus_total, 1 - is420);
+            assert_eq!(diagnostics.avc420_decode_attempts_total, is420);
+            assert_eq!(diagnostics.avc444_decode_attempts_total, 1 - is420);
+            assert_eq!(diagnostics.avc420_decoded_pictures_total, 0);
+            assert_eq!(diagnostics.avc444_decoded_updates_total, 0);
+        }
+    }
+
+    #[test]
     fn avc420_counter_counts_pictures_not_region_callbacks_or_reset() {
         struct Picture;
         impl H264Decoder for Picture {
@@ -5473,9 +5638,11 @@ mod tests {
             fn reset(&mut self) {}
         }
         let count = std::sync::Arc::new(super::AtomicU64::new(0));
+        let attempts = std::sync::Arc::new(super::AtomicU64::new(0));
         let mut decoder = super::CountedH264Decoder {
             inner: Box::new(Picture),
             successes: count.clone(),
+            attempts: attempts.clone(),
         };
         decoder.decode(&[1]).unwrap();
         let mut publisher = EgfxSurfacePublisher::try_new(SessionId::allocate(), 1).unwrap();
@@ -5512,9 +5679,11 @@ mod tests {
         let mut failed = super::CountedH264Decoder {
             inner: Box::new(FailingH264Decoder),
             successes: count.clone(),
+            attempts: attempts.clone(),
         };
         assert!(failed.decode(&[1]).is_err());
         assert_eq!(count.load(super::Ordering::Relaxed), 1);
+        assert_eq!(attempts.load(super::Ordering::Relaxed), 2);
     }
 
     #[test]

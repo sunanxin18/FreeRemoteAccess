@@ -3,6 +3,21 @@ set -euo pipefail
 # 本地 macOS 应用包；默认 debug 便于 GUI 验收，release 用于分发前检查。
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 profile="${1:-debug}"
+signing_identity=-
+if [[ "${FRD_MACOS_SIGNING_IDENTITY+x}" == x ]]; then
+    signing_identity="$FRD_MACOS_SIGNING_IDENTITY"
+else
+    signing_config="${FRD_MACOS_SIGNING_CONFIG:-$HOME/Library/Application Support/FreeRemoteDesk/development-signing-identity}"
+    if [[ -e "$signing_config" || -L "$signing_config" ]]; then
+        [[ -f "$signing_config" && -r "$signing_config" ]] || { echo '开发签名配置必须是可读普通文件' >&2; exit 2; }
+        # 仅接受一个40位SHA-1指纹，可带单个末尾换行；额外空行也拒绝。
+        signing_identity="$(cat "$signing_config")"
+        if [[ ! "$signing_identity" =~ ^[[:xdigit:]]{40}$ ]] || { ! cmp -s "$signing_config" <(printf '%s' "$signing_identity") && ! cmp -s "$signing_config" <(printf '%s\n' "$signing_identity"); }; then
+            echo '开发签名配置必须仅含单行40位十六进制证书指纹' >&2; exit 2
+        fi
+    fi
+fi
+[[ -n "$signing_identity" ]] || { echo 'FRD_MACOS_SIGNING_IDENTITY 不能为空；本地临时签名请使用 -' >&2; exit 2; }
 case "$profile" in debug|release) ;; *) echo '用法：stage-macos-package.sh [debug|release]' >&2; exit 2;; esac
 if [[ "$(uname -s)" != Darwin ]]; then echo '需要 macOS 原生工具链' >&2; exit 1; fi
 export MACOSX_DEPLOYMENT_TARGET=12.0
@@ -92,9 +107,9 @@ if [[ -d "$codec_bundle" ]]; then
     for resource in "$codec_bundle"/*; do
         case "$resource" in *.dylib) cp "$resource" "$codec_dest/" ;; *) cp -R "$resource" "$codec_notices/" ;; esac
     done
-    while IFS= read -r -d '' library; do codesign --force --sign - "$library"; done < <(find "$codec_dest" -type f -name '*.dylib' -print0)
+    while IFS= read -r -d '' library; do codesign --force --sign "$signing_identity" "$library"; done < <(find "$codec_dest" -type f -name '*.dylib' -print0)
 fi
-# 仅本机 ad-hoc 签名；不声称 Developer ID 签名、公证或通用二进制。
-codesign --force --sign - "$app"
-FRD_MACOS_ARCH="$requested_arch" "$repo_root/tools/verify-macos-package.sh" "$app"
+# 默认仅本机 ad-hoc 签名；显式指定的证书不可降级为 ad-hoc，不声称已公证。
+codesign --force --sign "$signing_identity" "$app"
+FRD_MACOS_ARCH="$requested_arch" FRD_MACOS_SIGNING_IDENTITY="$signing_identity" "$repo_root/tools/verify-macos-package.sh" "$app"
 printf '%s\n' "$app"

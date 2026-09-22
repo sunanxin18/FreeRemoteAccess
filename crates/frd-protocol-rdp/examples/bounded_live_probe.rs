@@ -336,6 +336,10 @@ fn run() -> Result<(), &'static str> {
                 .unwrap_or_else(|error| error.into_inner()) = Some(capabilities);
             let mut summary = capabilities;
             summary.egfx_diagnostics.unhandled_codec_count = 0;
+            summary.egfx_diagnostics.avc420_received_pdus_total = 0;
+            summary.egfx_diagnostics.avc444_received_pdus_total = 0;
+            summary.egfx_diagnostics.avc420_decode_attempts_total = 0;
+            summary.egfx_diagnostics.avc444_decode_attempts_total = 0;
             summary.egfx_diagnostics.avc420_decoded_pictures_total = 0;
             summary.egfx_diagnostics.avc444_decoded_updates_total = 0;
             summary.egfx_diagnostics.clearcodec_decoded_bitmaps_total = 0;
@@ -391,7 +395,11 @@ fn run() -> Result<(), &'static str> {
                     failure.region_tile_count,
                 );
             }
-            println!("RDP EGFX 实际计数 avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={}",
+            println!("RDP EGFX 实际计数 avc420_received_pdus_total={} avc444_received_pdus_total={} avc420_decode_attempts_total={} avc444_decode_attempts_total={} avc420_decoded_pictures_total={} avc444_decoded_updates_total={} clearcodec_decoded_bitmaps_total={} progressive_decoded_updates_total={} frames_queued_total={} frames_runtime_accepted_total={}",
+                capabilities.egfx_diagnostics.avc420_received_pdus_total,
+                capabilities.egfx_diagnostics.avc444_received_pdus_total,
+                capabilities.egfx_diagnostics.avc420_decode_attempts_total,
+                capabilities.egfx_diagnostics.avc444_decode_attempts_total,
                 capabilities.egfx_diagnostics.avc420_decoded_pictures_total,
                 capabilities.egfx_diagnostics.avc444_decoded_updates_total,
                 capabilities.egfx_diagnostics.clearcodec_decoded_bitmaps_total,
@@ -559,6 +567,22 @@ fn validate_egfx_result(
         ProbeEgfxMode::Avc444 => evidence.avc444_decoded_updates_total,
     };
     if decoded == 0 {
+        let (received, attempted) = match mode {
+            ProbeEgfxMode::Avc420 => (
+                evidence.avc420_received_pdus_total,
+                evidence.avc420_decode_attempts_total,
+            ),
+            ProbeEgfxMode::Avc444 => (
+                evidence.avc444_received_pdus_total,
+                evidence.avc444_decode_attempts_total,
+            ),
+        };
+        if received == 0 {
+            return Err("probe_requested_avc_not_received");
+        }
+        if attempted == 0 {
+            return Err("probe_requested_avc_not_attempted");
+        }
         return Err("probe_requested_avc_not_decoded");
     }
     if evidence.frames_runtime_accepted_total == 0 {
@@ -595,6 +619,18 @@ mod tests {
             avc420: true,
             avc444: true,
         };
+        assert_eq!(
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&capabilities)),
+            Err("probe_requested_avc_not_received")
+        );
+        evidence.avc444_received_pdus_total = 1;
+        capabilities.egfx_diagnostics = evidence;
+        assert_eq!(
+            super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&capabilities)),
+            Err("probe_requested_avc_not_attempted")
+        );
+        evidence.avc444_decode_attempts_total = 1;
+        capabilities.egfx_diagnostics = evidence;
         assert_eq!(
             super::validate_egfx_result(Some(ProbeEgfxMode::Avc444), Some(&capabilities)),
             Err("probe_requested_avc_not_decoded")

@@ -141,6 +141,31 @@ impl FrameMailbox {
         Some(entry)
     }
 
+    /// 在持有邮箱锁时提取已闭合的提交前缀。尾部单个 Damage 留在邮箱中，
+    /// 使背压清理不会删除已经交给事务编译器的 Damage 所对应的边界。
+    /// 原始 pop 接口仍用于丢弃和诊断，不应用于有背压的呈现消费。
+    pub fn drain_committed_updates(&mut self) -> Vec<EnqueuedSurfaceUpdate> {
+        let committed = self
+            .queue
+            .iter()
+            .rposition(|entry| {
+                matches!(
+                    entry.update,
+                    SurfaceUpdate::Reset { .. } | SurfaceUpdate::FrameBoundary { .. }
+                )
+            })
+            .map_or(0, |index| index + 1);
+        // 多个未闭合 Damage 属于非法序列，交给编译器明确拒绝，不能无限等待。
+        let count = if self.queue.len() - committed > 1 {
+            self.queue.len()
+        } else {
+            committed
+        };
+        (0..count)
+            .map(|_| self.pop_enqueued().expect("已计算可提交前缀"))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.queue.len()
     }

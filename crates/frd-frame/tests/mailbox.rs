@@ -1,7 +1,7 @@
 use frd_core::{PixelRect, PixelSize, SessionId};
 use frd_frame::{
-    FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch, PushOutcome,
-    SurfaceUpdate,
+    FrameCompleteness, FrameMailbox, FrameTransactionCompiler, FrameTransactionError, PixelBuffer,
+    PixelFormat, PixelPatch, PushOutcome, SurfaceUpdate,
 };
 use std::time::Instant;
 
@@ -55,6 +55,140 @@ fn one_pixel_patch() -> PixelPatch {
         4,
         4,
     )
+}
+
+#[test]
+fn committed_drain_retains_unclosed_damage_accounting_and_raw_cleanup() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(4, 64);
+    assert_eq!(mailbox.push(reset(session_id, 1)), PushOutcome::Queued);
+    assert!(matches!(mailbox.pop(), Some(SurfaceUpdate::Reset { .. })));
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 1, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+    let enqueued_at = mailbox.oldest_enqueued_at().expect("损伤保留入队时间");
+
+    assert!(mailbox.drain_committed_updates().is_empty());
+    assert!(mailbox.drain_committed_updates().is_empty());
+    assert_eq!((mailbox.len(), mailbox.queued_pixel_bytes()), (1, 4));
+    assert_eq!(mailbox.oldest_enqueued_at(), Some(enqueued_at));
+
+    let retained = mailbox.pop_enqueued().expect("原始接口仍可清理未闭合损伤");
+    assert_eq!(retained.enqueued_at, enqueued_at);
+    assert!(matches!(
+        retained.update,
+        SurfaceUpdate::Damage { revision: 1, .. }
+    ));
+    assert!(mailbox.is_empty());
+    assert_eq!(mailbox.queued_pixel_bytes(), 0);
+    assert!(mailbox.oldest_enqueued_at().is_none());
+}
+
+#[test]
+fn committed_drain_releases_complete_pair_but_retains_trailing_damage() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(4, 64);
+    assert_eq!(mailbox.push(reset(session_id, 1)), PushOutcome::Queued);
+    mailbox.pop();
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 1, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+    let first_at = mailbox.oldest_enqueued_at().unwrap();
+    assert_eq!(
+        mailbox.push(SurfaceUpdate::FrameBoundary {
+            session_id,
+            generation: 1,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        }),
+        PushOutcome::Queued
+    );
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 2, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+
+    let drained = mailbox.drain_committed_updates();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].enqueued_at, first_at);
+    assert!(matches!(
+        drained[0].update,
+        SurfaceUpdate::Damage { revision: 1, .. }
+    ));
+    assert!(matches!(
+        drained[1].update,
+        SurfaceUpdate::FrameBoundary { revision: 1, .. }
+    ));
+    assert_eq!((mailbox.len(), mailbox.queued_pixel_bytes()), (1, 4));
+    assert!(mailbox.drain_committed_updates().is_empty());
+    assert!(matches!(
+        mailbox.pop(),
+        Some(SurfaceUpdate::Damage { revision: 2, .. })
+    ));
+    assert_eq!(mailbox.queued_pixel_bytes(), 0);
+}
+
+#[test]
+fn committed_drain_releases_reset_before_first_boundary() {
+    let session_id = session();
+    let mut mailbox = FrameMailbox::new(4, 64);
+    assert_eq!(mailbox.push(reset(session_id, 1)), PushOutcome::Queued);
+    let reset_at = mailbox.oldest_enqueued_at().unwrap();
+    assert_eq!(
+        mailbox.push(damage(session_id, 1, 1, vec![one_pixel_patch()])),
+        PushOutcome::Queued
+    );
+
+    let drained = mailbox.drain_committed_updates();
+    assert_eq!(drained.len(), 1);
+    assert!(matches!(drained[0].update, SurfaceUpdate::Reset { .. }));
+    assert_eq!(drained[0].enqueued_at, reset_at);
+    assert_eq!((mailbox.len(), mailbox.queued_pixel_bytes()), (1, 4));
+    assert!(mailbox.drain_committed_updates().is_empty());
+}
+
+#[test]
+fn committed_drain_does_not_hide_malformed_multiple_damage_with_or_without_boundary() {
+    for include_boundary in [false, true] {
+        let session_id = session();
+        let mut mailbox = FrameMailbox::new(4, 64);
+        let mut compiler = FrameTransactionCompiler::new(session_id);
+        assert_eq!(mailbox.push(reset(session_id, 1)), PushOutcome::Queued);
+        assert!(compiler
+            .compile(mailbox.drain_committed_updates())
+            .unwrap()
+            .is_empty());
+        for revision in [1, 2] {
+            assert_eq!(
+                mailbox.push(damage(session_id, 1, revision, vec![one_pixel_patch()])),
+                PushOutcome::Queued
+            );
+        }
+        if include_boundary {
+            assert_eq!(
+                mailbox.push(SurfaceUpdate::FrameBoundary {
+                    session_id,
+                    generation: 1,
+                    revision: 2,
+                    completeness: FrameCompleteness::FullBaseline,
+                }),
+                PushOutcome::Queued
+            );
+        }
+
+        let drained = mailbox.drain_committed_updates();
+        assert_eq!(drained.len(), if include_boundary { 3 } else { 2 });
+        assert_eq!(
+            compiler
+                .compile(drained)
+                .expect_err("非法修订序列必须明确拒绝"),
+            FrameTransactionError::RevisionWhilePending
+        );
+        assert!(mailbox.is_empty());
+        assert_eq!(mailbox.queued_pixel_bytes(), 0);
+    }
 }
 
 #[test]

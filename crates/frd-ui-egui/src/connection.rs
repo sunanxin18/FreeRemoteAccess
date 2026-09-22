@@ -662,11 +662,18 @@ fn show_password_field(ui: &mut Ui, form: &mut ConnectionForm, width: f32) -> Pa
             .inner
         },
     );
+    if response.changed() {
+        form.mark_password_edited();
+    }
     if visibility_clicked {
         form.password_visible = !visible;
         response.request_focus();
     }
     show_error(ui, error.as_deref());
+
+    if let Some(status) = form.password_load_status() {
+        ui.label(status);
+    }
 
     password_input(ui, &response, had_focus || response.has_focus())
 }
@@ -864,6 +871,7 @@ fn connection_error_message(error: &str) -> &'static str {
         "invalid_profile" => "保存的连接信息无效",
         "saved_profile_not_found" => "保存的连接已不存在",
         "credential_storage_failed" => "无法安全保存密码，请重试或取消保存",
+        "credential_load_failed" => "无法读取保存的密码，请手动输入",
         "saved_credential_unavailable" => "无法读取保存的密码，请重新输入",
         "unsupported_target_protocol" => "目标系统与协议不匹配",
         "unregistered_protocol" => "所选协议未在本产品中注册",

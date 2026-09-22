@@ -762,11 +762,7 @@ impl SessionHost {
                     },
                 });
             };
-            let mut updates = Vec::with_capacity(mailbox.len());
-            while let Some(update) = mailbox.pop_enqueued() {
-                updates.push(update);
-            }
-            updates
+            mailbox.drain_committed_updates()
         };
         if updates.is_empty() {
             return Ok(CompiledFrameDrain {

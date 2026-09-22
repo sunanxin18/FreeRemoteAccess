@@ -76,6 +76,24 @@ impl ConnectionFormErrors {
     }
 }
 
+/// 异步凭据结果只能写回发起查询时的同一表单身份。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedPasswordLoadTicket {
+    pub id: u64,
+    draft: ConnectionDraft,
+    key: ConnectionProfileKey,
+}
+
+fn next_password_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+struct PasswordLoadState {
+    revision: u64,
+    status: Option<&'static str>,
+}
+
 /// 可编辑的连接页状态。密码与可复制草稿分离，且本结构不能 Clone 或 Debug。
 pub struct ConnectionForm {
     pub draft: ConnectionDraft,
@@ -84,6 +102,7 @@ pub struct ConnectionForm {
     pub remember_on_this_device: bool,
     pub password_visible: bool,
     password: SecretBuffer,
+    password_load: Box<PasswordLoadState>,
     errors: Box<ConnectionFormErrors>,
 }
 
@@ -96,11 +115,16 @@ impl ConnectionForm {
             remember_on_this_device: false,
             password_visible: false,
             password: SecretBuffer::new(Vec::new()),
+            password_load: Box::new(PasswordLoadState {
+                revision: next_password_revision(),
+                status: None,
+            }),
             errors: Box::default(),
         }
     }
 
     pub fn set_password(&mut self, password: SecretBuffer) {
+        self.mark_password_edited();
         self.password = password;
     }
 
@@ -109,6 +133,7 @@ impl ConnectionForm {
     }
 
     pub fn select_profile_metadata(&mut self, profile: &SavedConnectionProfile) {
+        self.mark_password_edited();
         self.draft = ConnectionDraft {
             target_system: Some(profile.target_system),
             address: profile.key.address().to_owned(),
@@ -125,7 +150,41 @@ impl ConnectionForm {
         self.errors.profile = None;
     }
 
+    pub fn password_load_status(&self) -> Option<&'static str> {
+        self.password_load.status
+    }
+
+    pub fn set_password_load_status(&mut self, status: Option<&'static str>) {
+        self.password_load.status = status;
+    }
+
+    pub fn mark_password_edited(&mut self) {
+        self.password_load.revision = next_password_revision();
+        self.password_load.status = None;
+    }
+
+    pub fn password_load_ticket(&mut self) -> SavedPasswordLoadTicket {
+        self.password_load.status = Some("正在读取保存的密码；也可直接输入密码");
+        SavedPasswordLoadTicket {
+            id: self.password_load.revision,
+            draft: self.draft.clone(),
+            key: self.selected_profile.clone().expect("已选择连接元数据"),
+        }
+    }
+
+    pub fn accepts_password_load(&self, ticket: &SavedPasswordLoadTicket) -> bool {
+        self.password_load.revision == ticket.id
+            && self.draft.target_system == ticket.draft.target_system
+            && self.draft.address == ticket.draft.address
+            && self.draft.port == ticket.draft.port
+            && self.draft.protocol == ticket.draft.protocol
+            && self.draft.username == ticket.draft.username
+            && self.selected_profile.as_ref() == Some(&ticket.key)
+            && self.password.is_empty()
+    }
+
     pub fn set_loaded_password(&mut self, password: SecretBuffer) {
+        self.mark_password_edited();
         self.password = password;
         self.errors.password = None;
     }
@@ -142,6 +201,7 @@ impl ConnectionForm {
         if identity_unchanged {
             return false;
         }
+        self.mark_password_edited();
         self.selected_profile = None;
         self.password = SecretBuffer::new(Vec::new());
         self.password_visible = false;
@@ -376,6 +436,46 @@ mod tests {
             target_system: TargetSystem::MacOs,
             last_success_order: 7,
         }
+    }
+
+    #[test]
+    fn delayed_password_requires_same_identity_and_unedited_password() {
+        let profile = saved_profile();
+        let mut form = ConnectionForm::new(ConnectionDraft::default());
+        form.select_profile_metadata(&profile);
+        let ticket = form.password_load_ticket();
+        assert!(form.accepts_password_load(&ticket));
+        form.draft.resolution_mode = ResolutionMode::Fixed(frd_core::PixelSize {
+            width: 1920,
+            height: 1080,
+        });
+        assert!(form.accepts_password_load(&ticket));
+        form.draft.username.push_str("-edited");
+        assert!(!form.accepts_password_load(&ticket));
+        form.select_profile_metadata(&profile);
+        let ticket = form.password_load_ticket();
+        form.set_password(SecretBuffer::new(b"manual".to_vec()));
+        assert!(!form.accepts_password_load(&ticket));
+        form.set_password(SecretBuffer::new(Vec::new()));
+        assert!(!form.accepts_password_load(&ticket));
+        assert!(form.password_load_status().is_none());
+    }
+
+    #[test]
+    fn reselecting_profile_and_recreated_forms_reject_old_password_ticket() {
+        let profile = saved_profile();
+        let mut form = ConnectionForm::new(ConnectionDraft::default());
+        form.select_profile_metadata(&profile);
+        let old = form.password_load_ticket();
+        let mut other = profile.clone();
+        other.key =
+            ConnectionProfileKey::new(ProtocolId::rdp(), "other.invalid", 3389, "other").unwrap();
+        form.select_profile_metadata(&other);
+        form.select_profile_metadata(&profile);
+        assert!(!form.accepts_password_load(&old));
+        let mut replacement = ConnectionForm::new(ConnectionDraft::default());
+        replacement.select_profile_metadata(&profile);
+        assert!(!replacement.accepts_password_load(&old));
     }
 
     #[test]

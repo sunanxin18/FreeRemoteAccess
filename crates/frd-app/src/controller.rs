@@ -684,6 +684,56 @@ impl AppController {
         self.apply_saved_profile_load(key.clone(), credentials.load(&key));
     }
 
+    pub fn begin_saved_profile_load(
+        &mut self,
+        key: &ConnectionProfileKey,
+    ) -> Option<frd_ui_model::SavedPasswordLoadTicket> {
+        let form = self.connection_form_mut()?;
+        let Some(profile) = form
+            .profiles
+            .iter()
+            .find(|profile| &profile.key == key)
+            .cloned()
+        else {
+            form.set_profile_storage_error("saved_profile_not_found");
+            return None;
+        };
+        form.select_profile_metadata(&profile);
+        Some(form.password_load_ticket())
+    }
+
+    pub fn finish_saved_profile_load(
+        &mut self,
+        ticket: &frd_ui_model::SavedPasswordLoadTicket,
+        result: Result<Option<SecretBuffer>, PlatformError>,
+    ) {
+        let Some(form) = self
+            .connection_form_mut()
+            .filter(|form| form.accepts_password_load(ticket))
+        else {
+            return;
+        };
+        form.set_password_load_status(None);
+        match result {
+            Ok(Some(password)) => form.set_loaded_password(password),
+            Ok(None) => form.set_password_error("saved_credential_unavailable"),
+            Err(_) => form.set_password_error("credential_load_failed"),
+        }
+    }
+
+    pub fn saved_profile_load_notice(
+        &mut self,
+        ticket: &frd_ui_model::SavedPasswordLoadTicket,
+        message: &'static str,
+    ) {
+        if let Some(form) = self
+            .connection_form_mut()
+            .filter(|form| form.accepts_password_load(ticket))
+        {
+            form.set_password_load_status(Some(message));
+        }
+    }
+
     /// Apply a credential lookup that may have completed on a worker thread.
     /// The profile metadata is selected before the result is interpreted so a
     /// locked Keychain leaves the user on the same profile with an actionable
@@ -1517,5 +1567,79 @@ impl ActiveSessionSlot {
             }
             _ => Err(ActiveSessionError::InvalidTransition),
         }
+    }
+}
+
+#[cfg(test)]
+mod saved_password_load_tests {
+    use super::*;
+
+    fn controller() -> (AppController, ConnectionProfileKey) {
+        let key =
+            ConnectionProfileKey::new(frd_core::ProtocolId::rdp(), "fixture.invalid", 3389, "user")
+                .unwrap();
+        let profile = SavedConnectionProfile {
+            key: key.clone(),
+            target_system: frd_core::TargetSystem::Windows,
+            last_success_order: 0,
+        };
+        let mut form = ConnectionForm::new(ConnectionDraft::default());
+        form.set_profiles(vec![profile]);
+        (AppController::connection_form(form), key)
+    }
+
+    #[test]
+    fn metadata_is_visible_before_delayed_password_completes() {
+        let (mut controller, key) = controller();
+        let ticket = controller.begin_saved_profile_load(&key).unwrap();
+        let form = controller.connection_form_mut().unwrap();
+        assert_eq!(form.draft.address, "fixture.invalid");
+        assert_eq!(form.draft.username, "user");
+        assert!(form.password_is_empty());
+        assert!(form.password_load_status().is_some());
+        assert!(form.errors().password.is_none());
+        controller
+            .finish_saved_profile_load(&ticket, Ok(Some(SecretBuffer::from_text("stored".into()))));
+        let form = controller.connection_form_mut().unwrap();
+        assert!(!form.password_is_empty());
+        assert!(form.password_load_status().is_none());
+    }
+
+    #[test]
+    fn delayed_password_and_timeout_notice_do_not_override_manual_input() {
+        let (mut controller, key) = controller();
+        let ticket = controller.begin_saved_profile_load(&key).unwrap();
+        controller
+            .connection_form_mut()
+            .unwrap()
+            .set_password(SecretBuffer::from_text("manual".into()));
+        controller
+            .finish_saved_profile_load(&ticket, Ok(Some(SecretBuffer::from_text("stored".into()))));
+        controller.saved_profile_load_notice(&ticket, "timeout");
+        let form = controller.connection_form_mut().unwrap();
+        assert_eq!(form.password_mut().expose_text(), Some("manual"));
+        assert!(form.password_load_status().is_none());
+    }
+
+    #[test]
+    fn old_result_does_not_apply_after_same_profile_reselection() {
+        let (mut controller, key) = controller();
+        let old = controller.begin_saved_profile_load(&key).unwrap();
+        let current = controller.begin_saved_profile_load(&key).unwrap();
+        controller.finish_saved_profile_load(&old, Ok(Some(SecretBuffer::from_text("old".into()))));
+        assert!(controller
+            .connection_form_mut()
+            .unwrap()
+            .password_is_empty());
+        controller.finish_saved_profile_load(&current, Err(PlatformError::StorageFailed));
+        assert_eq!(
+            controller
+                .connection_form_mut()
+                .unwrap()
+                .errors()
+                .password
+                .as_deref(),
+            Some("credential_load_failed")
+        );
     }
 }

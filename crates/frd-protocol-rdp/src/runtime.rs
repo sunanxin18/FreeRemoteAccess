@@ -277,10 +277,19 @@ pub(crate) fn run_protocol_session(
     result
 }
 
+pub(crate) enum NetworkFailure<E> {
+    Io(E),
+    RuntimeCreation(io::Error),
+    WorkerUnavailable,
+    WorkerDisconnected,
+    Timeout,
+}
+
 pub(crate) async fn wait_for_network_future<T, E, F>(
     runtime: &mut ProtocolRuntime,
     future: F,
     failure_code: &'static str,
+    report: impl Fn(NetworkFailure<E>),
 ) -> Result<T, ProtocolError>
 where
     T: Send + 'static,
@@ -299,7 +308,10 @@ where
                 .map(|executor| executor.block_on(future));
             result
         })
-        .map_err(|()| rdp_error(failure_code))?;
+        .map_err(|()| {
+            report(NetworkFailure::WorkerUnavailable);
+            rdp_error(failure_code)
+        })?;
     let deadline = Instant::now() + NETWORK_STAGE_TIMEOUT;
 
     loop {
@@ -312,7 +324,18 @@ where
                 finish_tracked_worker(network_stage_worker());
                 return Ok(value);
             }
-            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+            Ok(Ok(Err(error))) => {
+                report(NetworkFailure::Io(error));
+                finish_tracked_worker(network_stage_worker());
+                return Err(rdp_error(failure_code));
+            }
+            Ok(Err(error)) => {
+                report(NetworkFailure::RuntimeCreation(error));
+                finish_tracked_worker(network_stage_worker());
+                return Err(rdp_error(failure_code));
+            }
+            Err(TryRecvError::Disconnected) => {
+                report(NetworkFailure::WorkerDisconnected);
                 finish_tracked_worker(network_stage_worker());
                 return Err(rdp_error(failure_code));
             }
@@ -320,6 +343,7 @@ where
         }
         let now = Instant::now();
         if now >= deadline {
+            report(NetworkFailure::Timeout);
             cancel_tracked_worker(network_stage_worker());
             return Err(rdp_error(failure_code));
         }
@@ -509,6 +533,41 @@ mod tests {
         finish_tracked_worker(network_stage_worker());
         finish_tracked_worker(blocking_stage_worker());
         serial
+    }
+
+    #[test]
+    fn network_io_failure_reports_errno_without_changing_public_code() {
+        let _serial = worker_test_guard();
+        let (_commands, command_rx) = mpsc::channel();
+        let (events, _event_rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            SessionId::allocate(),
+            command_rx,
+            Box::new(RecordingEvents(events)),
+            Box::new(AcceptingFrames),
+            None,
+            Box::new(NoopWake),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let captured = std::cell::RefCell::new(Vec::new());
+        let result = executor.block_on(wait_for_network_future(
+            &mut runtime,
+            async { Err::<(), _>(std::io::Error::from_raw_os_error(13)) },
+            crate::error::RDP_TCP_FAILED,
+            |failure| match failure {
+                super::NetworkFailure::Io(error) => captured
+                    .borrow_mut()
+                    .push((error.kind(), error.raw_os_error())),
+                _ => panic!("错误分类不应改变"),
+            },
+        ));
+        assert_eq!(result.unwrap_err().code(), crate::error::RDP_TCP_FAILED);
+        assert_eq!(captured.borrow().len(), 1);
+        assert_eq!(captured.borrow()[0].1, Some(13));
+        assert!(network_stage_worker().lock().unwrap().is_none());
     }
 
     #[test]
@@ -1395,6 +1454,7 @@ mod tests {
             &mut runtime,
             lookup,
             RDP_DNS_FAILED,
+            |_| {},
         ));
         controller.join().expect("test controller exits");
         let mut repeated = Vec::new();
@@ -1407,6 +1467,7 @@ mod tests {
                     Ok::<_, ()>(())
                 },
                 RDP_DNS_FAILED,
+                |_| {},
             )));
         }
         release_tx
@@ -1477,6 +1538,7 @@ mod tests {
             &mut runtime,
             lookup,
             RDP_DNS_FAILED,
+            |_| {},
         ));
         drop(executor);
         let return_bound = started_at.elapsed();

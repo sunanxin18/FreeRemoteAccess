@@ -19,7 +19,7 @@ restore_licenses() {
     cp "$repo_root/packaging/windows/licenses/FreeRDP-NOTICE.txt" "$licenses/"
     (cd "$licenses"; shasum -a 256 FreeRDP-APACHE-2.0.txt FreeRDP-NOTICE.txt > FreeRDP-SHA256SUMS.txt)
 }
-verify() { FRD_MACOS_ARCH=arm64 bash "$repo_root/tools/verify-macos-package.sh" "$app" > "$work/verify.log" 2>&1; }
+verify() { FRD_MACOS_ARCH=arm64 FRD_MACOS_SIGNING_IDENTITY=- bash "$repo_root/tools/verify-macos-package.sh" "$app" > "$work/verify.log" 2>&1; }
 expect_rejection() {
     local pattern="$1"
     codesign --force --sign - "$app" >/dev/null 2>&1
@@ -29,6 +29,56 @@ expect_rejection() {
 restore_licenses
 codesign --force --sign - "$app" >/dev/null 2>&1
 verify || { cat "$work/verify.log" >&2; exit 1; }
+# 不访问或创建系统证书，只证明显式稳定身份请求不能接受临时签名包。
+if FRD_MACOS_ARCH=arm64 FRD_MACOS_SIGNING_IDENTITY='Synthetic requested identity' bash "$repo_root/tools/verify-macos-package.sh" "$app" > "$work/verify.log" 2>&1; then
+    echo '显式证书签名请求意外接受 ad-hoc 包' >&2; exit 1
+fi
+grep -F '已请求证书签名，但产物不是证书签名' "$work/verify.log" >/dev/null || { cat "$work/verify.log" >&2; exit 1; }
+if FRD_MACOS_SIGNING_IDENTITY='' bash "$repo_root/tools/stage-macos-package.sh" > "$work/verify.log" 2>&1; then
+    echo '空签名身份意外通过' >&2; exit 1
+fi
+grep -F 'FRD_MACOS_SIGNING_IDENTITY 不能为空' "$work/verify.log" >/dev/null || { cat "$work/verify.log" >&2; exit 1; }
+# 隔离codesign输出，确定性验证证书身份比较，不读取Keychain或创建证书。
+mkdir -p "$work/bin"
+cat > "$work/bin/codesign" <<'SH'
+#!/bin/bash
+set -euo pipefail
+if [[ "$1" == --verify ]]; then exit 0; fi
+if [[ "$2" == --extract-certificates=* ]]; then
+    [[ "$#" == 3 ]]
+    prefix="${2#--extract-certificates=}"
+    if [[ "${FRD_TEST_NESTED_MISMATCH:-0}" == 1 && "$3" == *.dylib ]]; then
+        printf 'synthetic leaf C' > "${prefix}0"
+    else
+        printf 'synthetic leaf B' > "${prefix}0"
+    fi
+else
+    [[ "$#" == 3 && "$2" == --verbose=2 ]]
+    printf 'Authority=Synthetic Leaf B\n' >&2
+fi
+SH
+chmod +x "$work/bin/codesign"
+synthetic_sha1="$(printf 'synthetic leaf B' | shasum -a 1 | awk '{print $1}')"
+for requested_identity in "$synthetic_sha1" 'Synthetic Leaf B'; do
+    PATH="$work/bin:$PATH" FRD_MACOS_SIGNING_IDENTITY="$requested_identity" bash "$repo_root/tools/verify-macos-package.sh" "$app" > "$work/verify.log" 2>&1 || { cat "$work/verify.log" >&2; exit 1; }
+done
+for wrong_identity in 0000000000000000000000000000000000000000 'Synthetic Leaf A'; do
+    if PATH="$work/bin:$PATH" FRD_MACOS_SIGNING_IDENTITY="$wrong_identity" bash "$repo_root/tools/verify-macos-package.sh" "$app" > "$work/verify.log" 2>&1; then
+        echo '配置A意外接受证书B' >&2; exit 1
+    fi
+    grep -F '与请求身份不匹配' "$work/verify.log" >/dev/null || { cat "$work/verify.log" >&2; exit 1; }
+done
+codec_fixture="$app/Contents/MacOS/codecs/ffmpeg-8-1-2/macos-aarch64"
+mkdir -p "$codec_fixture"
+for library in libavcodec.62.dylib libavutil.60.dylib libfreeremotedesk_ffmpeg.dylib; do
+    clang -arch arm64 -mmacosx-version-min=12.0 -dynamiclib "$work/main.c" -Wl,-install_name,"@loader_path/$library" -o "$codec_fixture/$library"
+done
+PATH="$work/bin:$PATH" FRD_MACOS_SIGNING_IDENTITY="$synthetic_sha1" bash "$repo_root/tools/verify-macos-package.sh" "$app" > "$work/verify.log" 2>&1 || { cat "$work/verify.log" >&2; exit 1; }
+if PATH="$work/bin:$PATH" FRD_TEST_NESTED_MISMATCH=1 FRD_MACOS_SIGNING_IDENTITY="$synthetic_sha1" bash "$repo_root/tools/verify-macos-package.sh" "$app" > "$work/verify.log" 2>&1; then
+    echo '嵌套库证书变化意外通过' >&2; exit 1
+fi
+grep -F '签名leaf证书指纹与请求身份不匹配' "$work/verify.log" >/dev/null || { cat "$work/verify.log" >&2; exit 1; }
+rm -rf "$app/Contents/MacOS/codecs"
 for name in FreeRDP-APACHE-2.0.txt FreeRDP-NOTICE.txt FreeRDP-SHA256SUMS.txt; do
     restore_licenses
     rm "$licenses/$name"
@@ -48,4 +98,4 @@ restore_licenses
 mv "$licenses/FreeRDP-NOTICE.txt" "$work/linked-notice.txt"
 ln -s "$work/linked-notice.txt" "$licenses/FreeRDP-NOTICE.txt"
 expect_rejection 'Progressive 许可必须是普通文件'
-printf 'macOS ARM64 synthetic package: positive fixture and 9 rejection cases passed\n'
+printf 'macOS ARM64 synthetic package: license gates and signing identity gates (ad-hoc, leaf hash/name, nested mismatch) passed\n'

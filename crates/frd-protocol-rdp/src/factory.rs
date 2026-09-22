@@ -55,6 +55,12 @@ pub enum RdpEgfxFailure {
 pub struct RdpEgfxDiagnostics {
     /// 当前 adapter 生命周期累计值，跨 ResetGraphics 保留；新会话/adapter 从零开始。
     /// 解码次数不代表可见帧，帧次数也不对 codec 归因。
+    /// typed WTS1 收到数，包含后续 envelope 或解码失败；AVC444 包含 v2。
+    pub avc420_received_pdus_total: u64,
+    pub avc444_received_pdus_total: u64,
+    /// envelope 校验后的解码器调用数；AVC444 双子流只算一次调用。
+    pub avc420_decode_attempts_total: u64,
+    pub avc444_decode_attempts_total: u64,
     pub avc420_decoded_pictures_total: u64,
     pub avc444_decoded_updates_total: u64,
     pub clearcodec_decoded_bitmaps_total: u64,

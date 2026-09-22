@@ -28,6 +28,7 @@ use crate::error::{
     RDP_NLA_FAILED, RDP_TCP_FAILED, RDP_TLS_FAILED,
 };
 use crate::factory::{RdpEgfxDiagnostics, RdpGraphicsAdvertisementGate, RdpGraphicsCapabilities};
+use crate::network_diagnostics::{NetworkOperation, NetworkStage};
 use crate::runtime::{
     wait_for_blocking, wait_for_network_future, CancellationCheckedIo, StageCancellation,
 };
@@ -94,6 +95,10 @@ pub(crate) const fn baseline_graphics_capabilities() -> RdpGraphicsCapability {
         remotefx: true,
         egfx_advertised: false,
         egfx_diagnostics: RdpEgfxDiagnostics {
+            avc420_received_pdus_total: 0,
+            avc444_received_pdus_total: 0,
+            avc420_decode_attempts_total: 0,
+            avc444_decode_attempts_total: 0,
             avc420_decoded_pictures_total: 0,
             avc444_decoded_updates_total: 0,
             clearcodec_decoded_bitmaps_total: 0,
@@ -172,6 +177,7 @@ pub(crate) async fn connect_and_activate(
         display_capabilities: _,
         graphics_capability: _,
     } = negotiate_enhanced_security(
+        NetworkStage::Preflight,
         &addresses,
         config.client_platform,
         desktop_size,
@@ -183,7 +189,7 @@ pub(crate) async fn connect_and_activate(
     .await?;
     let preflight_shutdown = preflight_transport
         .try_clone()
-        .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
+        .map_err(|error| NetworkStage::Preflight.io_error(NetworkOperation::CloneSocket, error))?;
     let preflight_endpoint = endpoint.clone();
     let observed = wait_for_blocking(runtime, preflight_shutdown, RDP_TLS_FAILED, move |_| {
         credential_free_preflight(preflight_transport, &preflight_endpoint)
@@ -200,6 +206,7 @@ pub(crate) async fn connect_and_activate(
     .ok_or_else(|| rdp_error(crate::error::RDP_CANCELLED))?;
 
     let mut negotiated = negotiate_enhanced_security(
+        NetworkStage::Authentication,
         &addresses,
         config.client_platform,
         desktop_size,
@@ -212,10 +219,9 @@ pub(crate) async fn connect_and_activate(
     let audio = negotiated.audio.clone();
     let display_capabilities = negotiated.display_capabilities.clone();
     let graphics_capability = negotiated.graphics_capability;
-    let verified_shutdown = negotiated
-        .transport
-        .try_clone()
-        .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
+    let verified_shutdown = negotiated.transport.try_clone().map_err(|error| {
+        NetworkStage::Authentication.io_error(NetworkOperation::CloneSocket, error)
+    })?;
     let verified_endpoint = endpoint.clone();
     let verified = wait_for_blocking(runtime, verified_shutdown, RDP_TLS_FAILED, move |_| {
         establish_verified_tls(negotiated.transport, &verified_endpoint, &accepted_identity)
@@ -232,12 +238,10 @@ pub(crate) async fn connect_and_activate(
         ironrdp_blocking::mark_as_upgraded(negotiated.upgrade, &mut negotiated.connector);
 
     let (mut framed, server_public_key) = verified.into_parts();
-    let credssp_shutdown = framed
-        .get_inner()
-        .0
-        .sock
-        .try_clone()
-        .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
+    let credssp_shutdown =
+        framed.get_inner().0.sock.try_clone().map_err(|error| {
+            NetworkStage::Credssp.io_error(NetworkOperation::CloneSocket, error)
+        })?;
     let server_name = ServerName::new(endpoint.host().to_owned());
     let credssp_key = server_public_key.clone();
     let (next_connector, next_framed, credssp_result) = wait_for_blocking(
@@ -277,12 +281,9 @@ pub(crate) async fn connect_and_activate(
         }
 
         let failure_code = connector_state_failure_code(&connector.state);
-        let shutdown = framed
-            .get_inner()
-            .0
-            .sock
-            .try_clone()
-            .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
+        let shutdown = framed.get_inner().0.sock.try_clone().map_err(|error| {
+            NetworkStage::Activation.io_error(NetworkOperation::CloneSocket, error)
+        })?;
         let (next_connector, next_framed, step_result) =
             wait_for_blocking(runtime, shutdown, failure_code, move |cancellation| {
                 let mut connector = connector;
@@ -330,6 +331,7 @@ async fn resolve_addresses(
         runtime,
         tokio::net::lookup_host((endpoint.host().to_owned(), endpoint.port())),
         RDP_DNS_FAILED,
+        |failure| NetworkStage::Resolve.report(NetworkOperation::Lookup, failure),
     )
     .await?
     .collect::<Vec<_>>();
@@ -341,6 +343,7 @@ async fn resolve_addresses(
 }
 
 async fn negotiate_enhanced_security(
+    network_stage: NetworkStage,
     addresses: &[SocketAddr],
     client_platform: RdpClientPlatformIdentity,
     desktop_size: DesktopSize,
@@ -355,6 +358,7 @@ async fn negotiate_enhanced_security(
             runtime,
             tokio::net::TcpStream::connect(address),
             RDP_TCP_FAILED,
+            |failure| network_stage.report(NetworkOperation::Connect, failure),
         )
         .await
         {
@@ -366,12 +370,18 @@ async fn negotiate_enhanced_security(
             }
         };
         let _ = stream.set_nodelay(true);
-        let stream = stream.into_std().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
+        let stream = stream
+            .into_std()
+            .map_err(|error| network_stage.io_error(NetworkOperation::IntoStd, error))?;
         stream
             .set_nonblocking(false)
-            .map_err(|_| rdp_error(RDP_TCP_FAILED))?;
-        let client_addr = stream.local_addr().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
-        let shutdown = stream.try_clone().map_err(|_| rdp_error(RDP_TCP_FAILED))?;
+            .map_err(|error| network_stage.io_error(NetworkOperation::SetBlocking, error))?;
+        let client_addr = stream
+            .local_addr()
+            .map_err(|error| network_stage.io_error(NetworkOperation::LocalAddress, error))?;
+        let shutdown = stream
+            .try_clone()
+            .map_err(|error| network_stage.io_error(NetworkOperation::CloneSocket, error))?;
         let egfx_decoder_provider = egfx_decoder_provider.clone();
         let negotiated = wait_for_blocking(runtime, shutdown, RDP_TLS_FAILED, move |_| {
             let mut framed = Framed::new(stream);

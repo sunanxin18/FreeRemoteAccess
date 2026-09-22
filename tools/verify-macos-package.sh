@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+signing_identity="${FRD_MACOS_SIGNING_IDENTITY--}"
+[[ -n "$signing_identity" ]] || { echo 'FRD_MACOS_SIGNING_IDENTITY 不能为空；本地临时签名请使用 -' >&2; exit 2; }
 requested_arch="${FRD_MACOS_ARCH:-$(uname -m)}"
 case "$requested_arch" in
     arm64|aarch64) requested_arch=arm64; expected_arch=arm64; codec_arch=aarch64 ;;
@@ -39,7 +41,38 @@ for name in "${expected_license_files[@]}"; do
 done
 
 
-codesign --verify --strict "$app"
+expected_leaf_sha1=''
+signature_work="$(mktemp -d "${TMPDIR:-/tmp}/frd-signature-verification.XXXXXX")"
+trap 'rm -rf "$signature_work"' EXIT
+verify_signature() {
+    local object="$1"
+    local details leaf_sha1 leaf_authority
+    codesign --verify --strict "$object"
+    if [[ "$signing_identity" != - ]]; then
+        details="$(codesign --display --verbose=2 "$object" 2>&1)"
+        if [[ "$details" == *'Signature=adhoc'* ]] || ! printf '%s\n' "$details" | grep -q '^Authority='; then
+            echo "已请求证书签名，但产物不是证书签名: $object" >&2
+            exit 1
+        fi
+        rm -f "$signature_work/leaf"*
+        codesign --display --extract-certificates="$signature_work/leaf" "$object" 2>/dev/null
+        [[ -s "$signature_work/leaf0" ]] || { echo '签名缺少leaf证书' >&2; exit 1; }
+        leaf_sha1="$(shasum -a 1 "$signature_work/leaf0" | awk '{print toupper($1)}')"
+        if [[ -z "$expected_leaf_sha1" ]]; then
+            if [[ "$signing_identity" =~ ^[[:xdigit:]]{40}$ ]]; then
+                expected_leaf_sha1="$(printf '%s' "$signing_identity" | tr '[:lower:]' '[:upper:]')"
+            else
+                # 名称模式仅接受完整leaf Authority名称，再固定此证书检查所有嵌套库。
+                leaf_authority="$(printf '%s\n' "$details" | sed -n 's/^Authority=//p' | head -n 1)"
+                [[ "$leaf_authority" == "$signing_identity" ]] || { echo '签名证书名称与请求身份不匹配；请使用完整名称或40位指纹' >&2; exit 1; }
+                expected_leaf_sha1="$leaf_sha1"
+            fi
+        fi
+        [[ "$leaf_sha1" == "$expected_leaf_sha1" ]] || { echo "签名leaf证书指纹与请求身份不匹配: $object" >&2; exit 1; }
+    fi
+}
+
+verify_signature "$app"
 
 assert_macho_arch() {
     local object="$1"
@@ -96,6 +129,7 @@ if [[ -d "$codec_root" ]]; then
     for library in "${expected_codec_files[@]}"; do
         path="$codec_dir/$library"
         [[ -f "$path" && ! -L "$path" ]] || { echo "FFmpeg codec 必须是普通文件: $path" >&2; exit 1; }
+        verify_signature "$path"
         assert_macho_arch "$path"
         install_name="$(otool -D "$path" | tail -n +2 | sed '/^[[:space:]]*$/d' | head -n 1)"
         [[ "$install_name" == "@loader_path/$library" ]] || {

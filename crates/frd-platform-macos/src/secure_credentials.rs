@@ -109,10 +109,8 @@ fn account(key: &ConnectionProfileKey) -> String {
 }
 #[cfg(target_os = "macos")]
 fn read_password(account: &str) -> Result<Option<SecretBuffer>, PlatformError> {
-    // Profile selection runs on the UI thread. Avoid allowing a locked or
-    // re-signed Keychain item to open an interactive authorization prompt and
-    // leave the connection form unresponsive; the caller can report the
-    // credential as unavailable and ask for the password again.
+    // 不主动弹出解锁或重新签名授权窗口；异步调用方负责等待提示与超时。
+    // 此选项不保证系统服务立即返回，不能据此在 UI 线程同步读取密码。
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
 
     let mut options = ItemSearchOptions::new();

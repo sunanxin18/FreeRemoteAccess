@@ -485,11 +485,40 @@ fn schedule_egui_repaint(event: &WindowEvent, repaint: bool, request_redraw: imp
     }
 }
 
+const SAVED_PASSWORD_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct PendingSavedProfile {
+    ticket: frd_ui_model::SavedPasswordLoadTicket,
+    deadline: Option<std::time::Instant>,
+}
+
+impl PendingSavedProfile {
+    fn new(ticket: frd_ui_model::SavedPasswordLoadTicket, now: std::time::Instant) -> Self {
+        Self {
+            ticket,
+            deadline: Some(now + SAVED_PASSWORD_LOAD_TIMEOUT),
+        }
+    }
+
+    fn expire(&mut self, now: std::time::Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn accepts_result(&self, request_id: u64, now: std::time::Instant) -> bool {
+        self.ticket.id == request_id && self.deadline.is_some_and(|deadline| now < deadline)
+    }
+}
+
 pub enum DesktopUserEvent {
     Wake,
     Repaint,
     SavedProfileLoaded {
-        key: frd_platform_api::ConnectionProfileKey,
+        request_id: u64,
         result: Result<Option<frd_core::SecretBuffer>, frd_platform_api::PlatformError>,
     },
     ProfilePersistenceFinished {
@@ -1474,7 +1503,7 @@ pub struct DesktopApplication {
     mode: DesktopMode,
     exit_state: ApplicationExitState,
     return_to_form_after_cancelled_launch: bool,
-    pending_saved_profile: Option<frd_platform_api::ConnectionProfileKey>,
+    pending_saved_profile: Option<PendingSavedProfile>,
     repaint_scheduler: RepaintScheduler,
     armed_repaint: Option<RepaintPlan>,
     window_configuration: DesktopWindowConfiguration,
@@ -1950,28 +1979,37 @@ impl DesktopApplication {
     fn dispatch_intent(&mut self, intent: AppIntent) {
         if let AppIntent::SelectSavedProfile(selected_key) = &intent {
             let key = selected_key.clone();
+            let Some(ticket) = self.launch.controller_mut().begin_saved_profile_load(&key) else {
+                self.request_redraw();
+                return;
+            };
             if self.pending_saved_profile.is_some() {
+                self.launch.controller_mut().saved_profile_load_notice(
+                    &ticket,
+                    "当前连接暂不能自动读取密码；请手动输入密码",
+                );
+                self.request_redraw();
                 return;
             }
-            self.pending_saved_profile = Some(key.clone());
+            let request_id = ticket.id;
+            self.pending_saved_profile = Some(PendingSavedProfile::new(
+                ticket.clone(),
+                std::time::Instant::now(),
+            ));
             let credentials = self.stores.credentials.clone();
             let proxy = self.proxy.clone();
-            let worker_key = key.clone();
-            let event_key = key.clone();
             if std::thread::Builder::new()
                 .name("frd-profile-credential-load".to_owned())
                 .spawn(move || {
-                    let result = credentials.load(&worker_key);
-                    let _ = proxy.send_event(DesktopUserEvent::SavedProfileLoaded {
-                        key: event_key,
-                        result,
-                    });
+                    let result = credentials.load(&key);
+                    let _ = proxy
+                        .send_event(DesktopUserEvent::SavedProfileLoaded { request_id, result });
                 })
                 .is_err()
             {
                 self.pending_saved_profile = None;
-                self.launch.controller_mut().apply_saved_profile_load(
-                    key,
+                self.launch.controller_mut().finish_saved_profile_load(
+                    &ticket,
                     Err(frd_platform_api::PlatformError::StorageFailed),
                 );
             }
@@ -3784,12 +3822,23 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
                 self.maybe_finish_exit(event_loop);
             }
             DesktopUserEvent::Repaint => self.synchronize_repaint_deadline(),
-            DesktopUserEvent::SavedProfileLoaded { key, result } => {
-                if self.pending_saved_profile.as_ref() == Some(&key) {
-                    self.pending_saved_profile = None;
-                    self.launch
-                        .controller_mut()
-                        .apply_saved_profile_load(key, result);
+            DesktopUserEvent::SavedProfileLoaded { request_id, result } => {
+                if self
+                    .pending_saved_profile
+                    .as_ref()
+                    .is_some_and(|pending| pending.ticket.id == request_id)
+                {
+                    let pending = self.pending_saved_profile.take().expect("请求标识已匹配");
+                    if pending.accepts_result(request_id, std::time::Instant::now()) {
+                        self.launch
+                            .controller_mut()
+                            .finish_saved_profile_load(&pending.ticket, result);
+                    } else {
+                        self.launch.controller_mut().saved_profile_load_notice(
+                            &pending.ticket,
+                            "读取保存的密码超时；请手动输入密码",
+                        );
+                    }
                     self.request_redraw();
                 }
             }
@@ -4117,6 +4166,16 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             return;
         }
         let now = std::time::Instant::now();
+        if let Some(pending) = self.pending_saved_profile.as_mut() {
+            if pending.expire(now) {
+                let ticket = pending.ticket.clone();
+                self.launch
+                    .controller_mut()
+                    .saved_profile_load_notice(&ticket, "读取保存的密码超时；请手动输入密码");
+                self.request_redraw();
+            }
+        }
+
         self.sample_video_rate_fallback(now);
         self.metrics.advance_phase(now);
         self.publish_metrics_failure();
@@ -4205,6 +4264,11 @@ impl ApplicationHandler<DesktopUserEvent> for DesktopApplication {
             .chain(self.video_rate_fallback.next_load_observation_deadline(
                 protocol_supports_video_rate_fallback(self.sessions.active_protocol_id().as_ref()),
             ))
+            .chain(
+                self.pending_saved_profile
+                    .as_ref()
+                    .and_then(|pending| pending.deadline),
+            )
             .chain(self.exit_state.pending_launch_deadline())
             .chain(self.metrics.next_deadline(now))
             .chain(
@@ -4867,6 +4931,35 @@ mod tests {
     };
     use crate::frame_metrics_sink::MetricSinkError;
     use crate::session_host::test_support::{WorkerKind, WorkerSpawner};
+
+    #[test]
+    fn saved_password_timeout_rejects_late_result_without_releasing_worker_slot() {
+        let profile = frd_platform_api::SavedConnectionProfile {
+            key: frd_platform_api::ConnectionProfileKey::new(
+                frd_core::ProtocolId::rdp(),
+                "fixture.invalid",
+                3389,
+                "test",
+            )
+            .unwrap(),
+            target_system: frd_core::TargetSystem::Windows,
+            last_success_order: 0,
+        };
+        let mut form = frd_ui_model::ConnectionForm::new(frd_ui_model::ConnectionDraft::default());
+        form.select_profile_metadata(&profile);
+        let ticket = form.password_load_ticket();
+        let now = std::time::Instant::now();
+        let mut slot = Some(super::PendingSavedProfile::new(ticket.clone(), now));
+        let pending = slot.as_mut().unwrap();
+        assert!(pending.accepts_result(ticket.id, now));
+        assert!(!pending.accepts_result(ticket.id + 1, now));
+        assert!(!pending.expire(now + std::time::Duration::from_secs(4)));
+        assert!(pending.expire(now + super::SAVED_PASSWORD_LOAD_TIMEOUT));
+        assert_eq!(pending.deadline, None);
+        assert!(!pending.accepts_result(ticket.id, now + super::SAVED_PASSWORD_LOAD_TIMEOUT));
+        assert!(!pending.expire(now + std::time::Duration::from_secs(10)));
+        assert!(slot.is_some(), "超时不能释放仍被阻塞的系统调用槽");
+    }
 
     #[test]
     #[cfg(target_os = "macos")]
