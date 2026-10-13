@@ -121,6 +121,66 @@ class ProductionInventoryTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_production_copy(self.base, 'ironrdp-graphics-0.9.0')
 
+    def test_pdu_precise_source_and_original_inventory_are_pinned(self):
+        name = 'ironrdp-pdu-0.9.0'
+        base = Path(self.temp.name) / name
+        shutil.copytree(ROOT / 'third_party' / name, base)
+        validate_production_copy(base, name)
+        path = base / 'FRD-MODIFICATIONS.json'
+        original = path.read_text()
+        target = 'src/basic_output/surface_commands/mod.rs'
+        source = base / target
+        source_original = source.read_bytes()
+        for key in ['upstream_sha256', 'post_sha256']:
+            data = json.loads(original)
+            data['modified_originals'][target][key] = '0' * 64
+            path.write_text(json.dumps(data))
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                validate_production_copy(base, name)
+        path.write_text(original)
+        for relative in [target, 'src/basic_output/fast_path/mod.rs', 'Cargo.toml']:
+            changed = base / relative
+            before = changed.read_bytes()
+            changed.write_bytes(before + b'\n// unrecorded mutation\n')
+            with self.subTest(relative=relative), self.assertRaises(AssertionError):
+                validate_production_copy(base, name)
+            changed.write_bytes(before)
+        # 即便修改allowance来匹配新的错误源hash，也不得扩大已审批源码补丁。
+        source.write_bytes(source_original.replace(b'.checked_add(BitmapDataHeader::ENCODED_SIZE)', b'.wrapping_add(BitmapDataHeader::ENCODED_SIZE)'))
+        data = json.loads(original)
+        data['modified_originals'][target]['post_sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+        path.write_text(json.dumps(data))
+        with self.assertRaises(AssertionError):
+            validate_production_copy(base, name)
+        source.write_bytes(source_original)
+        data = json.loads(original)
+        relative = 'src/basic_output/fast_path/mod.rs'
+        checksum = hashlib.sha256((base / relative).read_bytes()).hexdigest()
+        data['modified_originals'][relative] = {'upstream_sha256': checksum, 'post_sha256': checksum}
+        path.write_text(json.dumps(data))
+        with self.assertRaises(AssertionError):
+            validate_production_copy(base, name)
+        path.write_text(original)
+        extra = base / 'src/unapproved.rs'
+        extra.write_text('// unapproved original-source expansion\n')
+        with self.assertRaises(AssertionError):
+            validate_production_copy(base, name)
+        extra.unlink()
+        fixture = base / 'tests/fixtures/surface-original-64.txt'
+        fixture_before = fixture.read_bytes()
+        fixture.write_bytes(fixture_before + b'production-derived expected\n')
+        data = json.loads(original)
+        data['added_files']['tests/fixtures/surface-original-64.txt'] = hashlib.sha256(fixture.read_bytes()).hexdigest()
+        path.write_text(json.dumps(data))
+        with self.assertRaises(AssertionError):
+            validate_production_copy(base, name)
+        fixture.write_bytes(fixture_before)
+        path.write_text(original)
+        sums = base / 'UPSTREAM-SHA256SUMS'
+        sums.write_text('\n'.join(sums.read_text().splitlines()[1:]) + '\n')
+        with self.assertRaises(AssertionError):
+            validate_production_copy(base, name)
+
 
 if __name__ == '__main__':
     unittest.main()

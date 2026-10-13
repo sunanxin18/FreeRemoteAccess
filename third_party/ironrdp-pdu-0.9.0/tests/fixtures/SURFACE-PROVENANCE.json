@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "upstream_archive_sha256": "4ccd1179a4d106df1930347701388b5c79bc3725fa7dab4438d57db0d9d19347",
+  "original_source_sha256": "59256d76744b40885a338f09785950be18f74aa682130848a4114aaa54ae1e4d",
+  "records": 860,
+  "fixture_sha256": "32aa7d326240ed7bf8ba9b897b8ee5bee5163a4bb180f132ca30b9948ecd84e6",
+  "pointer_width": 64,
+  "toolchain": "1.96.0",
+  "graph": "independent tests/legacy-oracle registry-only",
+  "panic": "unwind",
+  "overflow_checks": [
+    "on",
+    "off"
+  ],
+  "observer_sha256": "2fd22df39414639d2976a0227e239b4055ae7d2e30a35976ae1438eaecaa958f"
+}

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "upstream_archive_sha256": "4ccd1179a4d106df1930347701388b5c79bc3725fa7dab4438d57db0d9d19347",
+  "modified_originals": {
+    "src/basic_output/surface_commands/mod.rs": {
+      "upstream_sha256": "59256d76744b40885a338f09785950be18f74aa682130848a4114aaa54ae1e4d",
+      "post_sha256": "f4a8760276195eef7cff2ced8f6558e6450553ea24c4bf92fb2d8d49e9eb2220",
+      "reason": "A2.7P portable optional-header checked length addition; same nonoverflow checks and borrowed public decoder; existing Other error propagates through FastPath"
+    }
+  },
+  "added_files": {
+    "tests/README.md": "1e1b4b14c2768f8b82798268d5307d18ab04d9a595518cc1981ca48fb3ffeed6",
+    "tests/fixtures/SURFACE-PROVENANCE.json": "904b4ad932de9b5cef98da088bdbdade142009dc4c0e9aeab5746c5af3a17311",
+    "tests/fixtures/surface-original-64.txt": "32aa7d326240ed7bf8ba9b897b8ee5bee5163a4bb180f132ca30b9948ecd84e6",
+    "tests/freeze_surface.py": "931ca6d3629f4b99baf3ca8565505fc49a3e0d8408727c4bcb4dc50feac3282e",
+    "tests/run_surface_tests.py": "2a473240af9aadc4321f233f365a1510c0b825ed535dd0a1fdc6e490c5e69340",
+    "tests/surface_public.rs": "2fd22df39414639d2976a0227e239b4055ae7d2e30a35976ae1438eaecaa958f",
+    "tests/surface_session.rs": "d036c4c0dcacff724ac0e2669012f049ac79a9279c42571590e1e4a8d03037b2",
+    "tests/surface_support.py": "933fce8a8ade78acca4e1e8d9a1b62e22b64b730b513da0a1bee9921ca3f856c",
+    "tests/test_surface_mutations.py": "d571dc7573421239c5514324212bc191545ad52542f7af8a782eb076305cb66e"
+  },
+  "oracle_surface_sha256": "32aa7d326240ed7bf8ba9b897b8ee5bee5163a4bb180f132ca30b9948ecd84e6"
+}

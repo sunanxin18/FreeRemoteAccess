@@ -1,0 +1,860 @@
+flags=0 declared=0 actual=0 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=0 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=0 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=0 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=0 actual=0 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=0 actual=3 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=3 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=3 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=3 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=0 actual=3 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=0 actual=4 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=4 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=4 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=4 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=0 actual=4 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=0 actual=23 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=23 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=23 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=23 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=0 actual=23 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=0 actual=24 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=24 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=24 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=24 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=0 actual=24 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=0 actual=27 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=27 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=27 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=27 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=0 actual=27 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=0 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=28 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=0 actual=28 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=0 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=0 declared=0 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=0 declared=0 actual=29 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=0 actual=29 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4 } consumed=12
+flags=0 declared=4 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4 } consumed=22
+flags=0 declared=4 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4 } consumed=22
+flags=0 declared=4 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4 } consumed=12
+flags=0 declared=4 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4 } consumed=22
+flags=0 declared=4 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4 } consumed=22
+flags=0 declared=4 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4 actual=4 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=0 declared=4 actual=4 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=4 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=4 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4 actual=4 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4 actual=23 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=0 declared=4 actual=23 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=23 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=23 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4 actual=23 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4 actual=24 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=0 declared=4 actual=24 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=24 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=24 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4 actual=24 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4 actual=27 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=0 declared=4 actual=27 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=27 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=27 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4 actual=27 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=0 declared=4 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=28 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4 actual=28 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=0 declared=4 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=0 declared=4 actual=29 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4 actual=29 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4294967271 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4294967271 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4294967271 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4294967271 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4294967271 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4294967271 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4294967271 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4294967271 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4294967271 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4294967271 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4294967271 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4294967271 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4294967271 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4294967271 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4294967271 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967271 } consumed=12
+flags=0 declared=4294967271 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967271 } consumed=22
+flags=0 declared=4294967271 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4294967271 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4294967272 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4294967272 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4294967272 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4294967272 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4294967272 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4294967272 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4294967272 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4294967272 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4294967272 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4294967272 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4294967272 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4294967272 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4294967272 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4294967272 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4294967272 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967272 } consumed=12
+flags=0 declared=4294967272 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967272 } consumed=22
+flags=0 declared=4294967272 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4294967272 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4294967295 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4294967295 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=0 declared=4294967295 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4294967295 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=0 declared=4294967295 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4294967295 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=0 declared=4294967295 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4294967295 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=0 declared=4294967295 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4294967295 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=0 declared=4294967295 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4294967295 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=0 declared=4294967295 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4294967295 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=0 declared=4294967295 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=12
+flags=0 declared=4294967295 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=0 declared=4294967295 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=0 declared=4294967295 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=0 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 24 } consumed=12
+flags=1 declared=0 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 24 } consumed=22
+flags=1 declared=0 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 24 } consumed=22
+flags=1 declared=0 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=0 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=0 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 24 } consumed=12
+flags=1 declared=0 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 24 } consumed=22
+flags=1 declared=0 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 24 } consumed=22
+flags=1 declared=0 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=0 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=0 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 24 } consumed=12
+flags=1 declared=0 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 24 } consumed=22
+flags=1 declared=0 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 24 } consumed=22
+flags=1 declared=0 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=0 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=0 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 24 } consumed=12
+flags=1 declared=0 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 24 } consumed=22
+flags=1 declared=0 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 24 } consumed=22
+flags=1 declared=0 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=0 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=0 actual=24 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=1 declared=0 actual=24 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=24 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=24 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=0 actual=24 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=0 actual=27 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=1 declared=0 actual=27 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=27 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=27 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=0 actual=27 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=0 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=1 declared=0 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=28 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=0 actual=28 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=0 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=1 declared=0 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=1 declared=0 actual=29 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=0 actual=29 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 28 } consumed=12
+flags=1 declared=4 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 28 } consumed=22
+flags=1 declared=4 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 28 } consumed=22
+flags=1 declared=4 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 28 } consumed=12
+flags=1 declared=4 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 28 } consumed=22
+flags=1 declared=4 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 28 } consumed=22
+flags=1 declared=4 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 28 } consumed=12
+flags=1 declared=4 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 28 } consumed=22
+flags=1 declared=4 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 28 } consumed=22
+flags=1 declared=4 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 28 } consumed=12
+flags=1 declared=4 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 28 } consumed=22
+flags=1 declared=4 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 28 } consumed=22
+flags=1 declared=4 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 28 } consumed=12
+flags=1 declared=4 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 28 } consumed=22
+flags=1 declared=4 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 28 } consumed=22
+flags=1 declared=4 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 28 } consumed=12
+flags=1 declared=4 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 28 } consumed=22
+flags=1 declared=4 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 28 } consumed=22
+flags=1 declared=4 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=36 consumed=40
+flags=1 declared=4 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=1 declared=4 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=1 declared=4 actual=28 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4 actual=28 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=36 consumed=40
+flags=1 declared=4 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=1 declared=4 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=1 declared=4 actual=29 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4 actual=29 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4294967271 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4294967271 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4294967271 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4294967271 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4294967271 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4294967271 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4294967271 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4294967271 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4294967271 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4294967271 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4294967271 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4294967271 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4294967271 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4294967271 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4294967271 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=12
+flags=1 declared=4294967271 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=1 declared=4294967271 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4294967271 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4294967272 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4294967272 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4294967272 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4294967272 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4294967272 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4294967272 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4294967272 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4294967272 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4294967272 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4294967272 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4294967272 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4294967272 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4294967272 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4294967272 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4294967272 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967296 } consumed=12
+flags=1 declared=4294967272 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967296 } consumed=22
+flags=1 declared=4294967272 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4294967272 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4294967295 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4294967295 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=1 declared=4294967295 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4294967295 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=1 declared=4294967295 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4294967295 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=1 declared=4294967295 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4294967295 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=1 declared=4294967295 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4294967295 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=1 declared=4294967295 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4294967295 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=1 declared=4294967295 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4294967295 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=1 declared=4294967295 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967319 } consumed=12
+flags=1 declared=4294967295 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967319 } consumed=22
+flags=1 declared=4294967295 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=1 declared=4294967295 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=0 actual=0 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=0 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=0 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=0 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=0 actual=0 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=0 actual=3 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=3 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=3 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=3 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=0 actual=3 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=0 actual=4 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=4 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=4 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=4 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=0 actual=4 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=0 actual=23 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=23 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=23 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=23 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=0 actual=23 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=0 actual=24 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=24 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=24 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=24 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=0 actual=24 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=0 actual=27 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=27 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=27 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=27 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=0 actual=27 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=0 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=28 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=0 actual=28 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=0 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=12 consumed=12
+flags=128 declared=0 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[] borrowed_offset=22 consumed=22
+flags=128 declared=0 actual=29 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=0 actual=29 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4 } consumed=12
+flags=128 declared=4 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4 } consumed=22
+flags=128 declared=4 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4 } consumed=22
+flags=128 declared=4 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4 } consumed=12
+flags=128 declared=4 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4 } consumed=22
+flags=128 declared=4 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4 } consumed=22
+flags=128 declared=4 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4 actual=4 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=128 declared=4 actual=4 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=4 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=4 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4 actual=4 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=27 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4 actual=23 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=128 declared=4 actual=23 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=23 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=23 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4 actual=23 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4 actual=24 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=128 declared=4 actual=24 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=24 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=24 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4 actual=24 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4 actual=27 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=128 declared=4 actual=27 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=27 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=27 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4 actual=27 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=128 declared=4 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=28 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4 actual=28 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=12 consumed=16
+flags=128 declared=4 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=None data=[0, 1, 2, 3] borrowed_offset=22 consumed=26
+flags=128 declared=4 actual=29 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4 actual=29 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4294967271 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4294967271 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4294967271 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4294967271 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4294967271 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4294967271 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4294967271 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4294967271 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4294967271 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4294967271 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4294967271 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4294967271 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4294967271 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4294967271 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4294967271 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967271 } consumed=12
+flags=128 declared=4294967271 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967271 } consumed=22
+flags=128 declared=4294967271 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4294967271 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967271 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4294967272 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4294967272 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4294967272 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4294967272 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4294967272 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4294967272 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4294967272 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4294967272 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4294967272 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4294967272 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4294967272 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4294967272 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4294967272 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4294967272 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4294967272 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967272 } consumed=12
+flags=128 declared=4294967272 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967272 } consumed=22
+flags=128 declared=4294967272 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4294967272 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967272 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4294967295 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4294967295 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=128 declared=4294967295 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4294967295 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=128 declared=4294967295 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4294967295 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=128 declared=4294967295 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4294967295 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=128 declared=4294967295 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4294967295 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=128 declared=4294967295 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4294967295 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=128 declared=4294967295 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4294967295 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=128 declared=4294967295 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=12
+flags=128 declared=4294967295 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=128 declared=4294967295 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=128 declared=4294967295 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=0 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 24 } consumed=12
+flags=129 declared=0 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 24 } consumed=22
+flags=129 declared=0 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 24 } consumed=22
+flags=129 declared=0 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=0 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=0 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 24 } consumed=12
+flags=129 declared=0 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 24 } consumed=22
+flags=129 declared=0 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 24 } consumed=22
+flags=129 declared=0 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=0 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=0 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 24 } consumed=12
+flags=129 declared=0 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 24 } consumed=22
+flags=129 declared=0 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 24 } consumed=22
+flags=129 declared=0 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=0 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=0 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 24 } consumed=12
+flags=129 declared=0 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 24 } consumed=22
+flags=129 declared=0 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 24 } consumed=22
+flags=129 declared=0 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=0 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 24 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=0 actual=24 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=129 declared=0 actual=24 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=24 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=24 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=0 actual=24 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=0 actual=27 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=129 declared=0 actual=27 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=27 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=27 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=0 actual=27 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=0 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=129 declared=0 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=28 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=0 actual=28 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=0 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=36 consumed=36
+flags=129 declared=0 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[] borrowed_offset=46 consumed=46
+flags=129 declared=0 actual=29 route=3	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=0 actual=29 route=4	Err InvalidField { field: "cmdType", reason: "invalid surface command" } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 28 } consumed=12
+flags=129 declared=4 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 28 } consumed=22
+flags=129 declared=4 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 28 } consumed=22
+flags=129 declared=4 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 28 } consumed=12
+flags=129 declared=4 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 28 } consumed=22
+flags=129 declared=4 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 28 } consumed=22
+flags=129 declared=4 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 28 } consumed=12
+flags=129 declared=4 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 28 } consumed=22
+flags=129 declared=4 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 28 } consumed=22
+flags=129 declared=4 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 28 } consumed=12
+flags=129 declared=4 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 28 } consumed=22
+flags=129 declared=4 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 28 } consumed=22
+flags=129 declared=4 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 28 } consumed=12
+flags=129 declared=4 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 28 } consumed=22
+flags=129 declared=4 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 28 } consumed=22
+flags=129 declared=4 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 28 } consumed=12
+flags=129 declared=4 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 28 } consumed=22
+flags=129 declared=4 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 28 } consumed=22
+flags=129 declared=4 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 28 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4 actual=28 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=36 consumed=40
+flags=129 declared=4 actual=28 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=129 declared=4 actual=28 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=129 declared=4 actual=28 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4 actual=28 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4 actual=29 route=0	Ok bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=36 consumed=40
+flags=129 declared=4 actual=29 route=1	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=129 declared=4 actual=29 route=2	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=46 consumed=50
+flags=129 declared=4 actual=29 route=3	Ok Set bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4 actual=29 route=4	Ok Stream bpp=32 codec=0 width=1 height=1 header=Some(BitmapDataHeader { high_unique_id: 50462976, low_unique_id: 117835012, tm_milliseconds: 1084818905618843912, tm_seconds: 1663540288323457296 }) data=[24, 25, 26, 27] borrowed_offset=51 outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4294967271 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4294967271 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4294967271 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4294967271 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4294967271 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4294967271 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4294967271 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4294967271 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4294967271 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4294967271 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4294967271 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4294967271 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4294967271 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4294967271 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4294967271 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=12
+flags=129 declared=4294967271 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967295 } consumed=22
+flags=129 declared=4294967271 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4294967271 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967295 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4294967272 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4294967272 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4294967272 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4294967272 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4294967272 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4294967272 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4294967272 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4294967272 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4294967272 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4294967272 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4294967272 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4294967272 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4294967272 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4294967272 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4294967272 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967296 } consumed=12
+flags=129 declared=4294967272 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967296 } consumed=22
+flags=129 declared=4294967272 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4294967272 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967296 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4294967295 actual=0 route=0	Err NotEnoughBytes { received: 0, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=0 route=1	Err NotEnoughBytes { received: 0, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=0 route=2	Err NotEnoughBytes { received: 0, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=0 route=3	Err NotEnoughBytes { received: 0, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4294967295 actual=0 route=4	Err NotEnoughBytes { received: 0, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 25, forced_long_length: false } consumed=27
+flags=129 declared=4294967295 actual=3 route=0	Err NotEnoughBytes { received: 3, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=3 route=1	Err NotEnoughBytes { received: 3, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=3 route=2	Err NotEnoughBytes { received: 3, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=3 route=3	Err NotEnoughBytes { received: 3, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4294967295 actual=3 route=4	Err NotEnoughBytes { received: 3, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 28, forced_long_length: false } consumed=30
+flags=129 declared=4294967295 actual=4 route=0	Err NotEnoughBytes { received: 4, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=4 route=1	Err NotEnoughBytes { received: 4, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=4 route=2	Err NotEnoughBytes { received: 4, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=4 route=3	Err NotEnoughBytes { received: 4, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4294967295 actual=4 route=4	Err NotEnoughBytes { received: 4, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 29, forced_long_length: false } consumed=31
+flags=129 declared=4294967295 actual=23 route=0	Err NotEnoughBytes { received: 23, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=23 route=1	Err NotEnoughBytes { received: 23, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=23 route=2	Err NotEnoughBytes { received: 23, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=23 route=3	Err NotEnoughBytes { received: 23, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4294967295 actual=23 route=4	Err NotEnoughBytes { received: 23, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 48, forced_long_length: false } consumed=50
+flags=129 declared=4294967295 actual=24 route=0	Err NotEnoughBytes { received: 24, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=24 route=1	Err NotEnoughBytes { received: 24, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=24 route=2	Err NotEnoughBytes { received: 24, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=24 route=3	Err NotEnoughBytes { received: 24, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4294967295 actual=24 route=4	Err NotEnoughBytes { received: 24, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 49, forced_long_length: false } consumed=51
+flags=129 declared=4294967295 actual=27 route=0	Err NotEnoughBytes { received: 27, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=27 route=1	Err NotEnoughBytes { received: 27, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=27 route=2	Err NotEnoughBytes { received: 27, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=27 route=3	Err NotEnoughBytes { received: 27, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4294967295 actual=27 route=4	Err NotEnoughBytes { received: 27, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 52, forced_long_length: false } consumed=54
+flags=129 declared=4294967295 actual=28 route=0	Err NotEnoughBytes { received: 28, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=28 route=1	Err NotEnoughBytes { received: 28, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=28 route=2	Err NotEnoughBytes { received: 28, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=28 route=3	Err NotEnoughBytes { received: 28, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4294967295 actual=28 route=4	Err NotEnoughBytes { received: 28, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 53, forced_long_length: false } consumed=55
+flags=129 declared=4294967295 actual=29 route=0	Err NotEnoughBytes { received: 29, expected: 4294967319 } consumed=12
+flags=129 declared=4294967295 actual=29 route=1	Err NotEnoughBytes { received: 29, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=29 route=2	Err NotEnoughBytes { received: 29, expected: 4294967319 } consumed=22
+flags=129 declared=4294967295 actual=29 route=3	Err NotEnoughBytes { received: 29, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+flags=129 declared=4294967295 actual=29 route=4	Err NotEnoughBytes { received: 29, expected: 4294967319 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 54, forced_long_length: false } consumed=56
+fixed-short=0 route=0	Err NotEnoughBytes { received: 0, expected: 12 } consumed=0
+fixed-short=0 route=1	Err NotEnoughBytes { received: 0, expected: 12 } consumed=10
+fixed-short=0 route=2	Err NotEnoughBytes { received: 0, expected: 12 } consumed=10
+fixed-short=0 route=3	Err NotEnoughBytes { received: 0, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 13, forced_long_length: false } consumed=15
+fixed-short=0 route=4	Err NotEnoughBytes { received: 0, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 13, forced_long_length: false } consumed=15
+fixed-short=1 route=0	Err NotEnoughBytes { received: 1, expected: 12 } consumed=0
+fixed-short=1 route=1	Err NotEnoughBytes { received: 1, expected: 12 } consumed=10
+fixed-short=1 route=2	Err NotEnoughBytes { received: 1, expected: 12 } consumed=10
+fixed-short=1 route=3	Err NotEnoughBytes { received: 1, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 14, forced_long_length: false } consumed=16
+fixed-short=1 route=4	Err NotEnoughBytes { received: 1, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 14, forced_long_length: false } consumed=16
+fixed-short=2 route=0	Err NotEnoughBytes { received: 2, expected: 12 } consumed=0
+fixed-short=2 route=1	Err NotEnoughBytes { received: 2, expected: 12 } consumed=10
+fixed-short=2 route=2	Err NotEnoughBytes { received: 2, expected: 12 } consumed=10
+fixed-short=2 route=3	Err NotEnoughBytes { received: 2, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 15, forced_long_length: false } consumed=17
+fixed-short=2 route=4	Err NotEnoughBytes { received: 2, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 15, forced_long_length: false } consumed=17
+fixed-short=3 route=0	Err NotEnoughBytes { received: 3, expected: 12 } consumed=0
+fixed-short=3 route=1	Err NotEnoughBytes { received: 3, expected: 12 } consumed=10
+fixed-short=3 route=2	Err NotEnoughBytes { received: 3, expected: 12 } consumed=10
+fixed-short=3 route=3	Err NotEnoughBytes { received: 3, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 16, forced_long_length: false } consumed=18
+fixed-short=3 route=4	Err NotEnoughBytes { received: 3, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 16, forced_long_length: false } consumed=18
+fixed-short=4 route=0	Err NotEnoughBytes { received: 4, expected: 12 } consumed=0
+fixed-short=4 route=1	Err NotEnoughBytes { received: 4, expected: 12 } consumed=10
+fixed-short=4 route=2	Err NotEnoughBytes { received: 4, expected: 12 } consumed=10
+fixed-short=4 route=3	Err NotEnoughBytes { received: 4, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 17, forced_long_length: false } consumed=19
+fixed-short=4 route=4	Err NotEnoughBytes { received: 4, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 17, forced_long_length: false } consumed=19
+fixed-short=5 route=0	Err NotEnoughBytes { received: 5, expected: 12 } consumed=0
+fixed-short=5 route=1	Err NotEnoughBytes { received: 5, expected: 12 } consumed=10
+fixed-short=5 route=2	Err NotEnoughBytes { received: 5, expected: 12 } consumed=10
+fixed-short=5 route=3	Err NotEnoughBytes { received: 5, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 18, forced_long_length: false } consumed=20
+fixed-short=5 route=4	Err NotEnoughBytes { received: 5, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 18, forced_long_length: false } consumed=20
+fixed-short=6 route=0	Err NotEnoughBytes { received: 6, expected: 12 } consumed=0
+fixed-short=6 route=1	Err NotEnoughBytes { received: 6, expected: 12 } consumed=10
+fixed-short=6 route=2	Err NotEnoughBytes { received: 6, expected: 12 } consumed=10
+fixed-short=6 route=3	Err NotEnoughBytes { received: 6, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 19, forced_long_length: false } consumed=21
+fixed-short=6 route=4	Err NotEnoughBytes { received: 6, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 19, forced_long_length: false } consumed=21
+fixed-short=7 route=0	Err NotEnoughBytes { received: 7, expected: 12 } consumed=0
+fixed-short=7 route=1	Err NotEnoughBytes { received: 7, expected: 12 } consumed=10
+fixed-short=7 route=2	Err NotEnoughBytes { received: 7, expected: 12 } consumed=10
+fixed-short=7 route=3	Err NotEnoughBytes { received: 7, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 20, forced_long_length: false } consumed=22
+fixed-short=7 route=4	Err NotEnoughBytes { received: 7, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 20, forced_long_length: false } consumed=22
+fixed-short=8 route=0	Err NotEnoughBytes { received: 8, expected: 12 } consumed=0
+fixed-short=8 route=1	Err NotEnoughBytes { received: 8, expected: 12 } consumed=10
+fixed-short=8 route=2	Err NotEnoughBytes { received: 8, expected: 12 } consumed=10
+fixed-short=8 route=3	Err NotEnoughBytes { received: 8, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 21, forced_long_length: false } consumed=23
+fixed-short=8 route=4	Err NotEnoughBytes { received: 8, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 21, forced_long_length: false } consumed=23
+fixed-short=9 route=0	Err NotEnoughBytes { received: 9, expected: 12 } consumed=0
+fixed-short=9 route=1	Err NotEnoughBytes { received: 9, expected: 12 } consumed=10
+fixed-short=9 route=2	Err NotEnoughBytes { received: 9, expected: 12 } consumed=10
+fixed-short=9 route=3	Err NotEnoughBytes { received: 9, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 22, forced_long_length: false } consumed=24
+fixed-short=9 route=4	Err NotEnoughBytes { received: 9, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 22, forced_long_length: false } consumed=24
+fixed-short=10 route=0	Err NotEnoughBytes { received: 10, expected: 12 } consumed=0
+fixed-short=10 route=1	Err NotEnoughBytes { received: 10, expected: 12 } consumed=10
+fixed-short=10 route=2	Err NotEnoughBytes { received: 10, expected: 12 } consumed=10
+fixed-short=10 route=3	Err NotEnoughBytes { received: 10, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 23, forced_long_length: false } consumed=25
+fixed-short=10 route=4	Err NotEnoughBytes { received: 10, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 23, forced_long_length: false } consumed=25
+fixed-short=11 route=0	Err NotEnoughBytes { received: 11, expected: 12 } consumed=0
+fixed-short=11 route=1	Err NotEnoughBytes { received: 11, expected: 12 } consumed=10
+fixed-short=11 route=2	Err NotEnoughBytes { received: 11, expected: 12 } consumed=10
+fixed-short=11 route=3	Err NotEnoughBytes { received: 11, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 24, forced_long_length: false } consumed=26
+fixed-short=11 route=4	Err NotEnoughBytes { received: 11, expected: 12 } outer=FastPathHeader { flags: EncryptionFlags(0x0), data_length: 24, forced_long_length: false } consumed=26

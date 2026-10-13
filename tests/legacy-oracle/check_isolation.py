@@ -33,17 +33,20 @@ def check_kernel(graph):
         pending.extend(nodes[ident]['dependencies'])
 
 def check_production(graph):
+    assert len([p for p in graph['packages'] if p['name'] == 'ironrdp-pdu']) == 1, 'expected exactly one production PDU node'
     packages = {p['name']: p for p in graph['packages']}
     nodes = {n['id']: n for n in graph['resolve']['nodes']}
     graphics = packages['ironrdp-graphics']
     session = packages['ironrdp-session']
+    pdu = packages['ironrdp-pdu']
     kernel = packages['frd-rdp-legacy-kernels']
-    for package, version in [(graphics, '0.9.0'), (session, '0.11.0')]:
+    for package, version in [(graphics, '0.9.0'), (session, '0.11.0'), (pdu, '0.9.0')]:
         expected = ROOT / 'third_party' / (package['name'] + '-' + version) / 'Cargo.toml'
         assert pathlib.Path(package['manifest_path']) == expected
         assert package['source'] is None
         assert package['version'] == version
     assert graphics['id'] in nodes[session['id']]['dependencies']
+    assert pdu['id'] in nodes[session['id']]['dependencies']
     assert kernel['id'] in nodes[graphics['id']]['dependencies']
 
 def metadata(manifest):

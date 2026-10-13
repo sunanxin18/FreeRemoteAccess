@@ -42,7 +42,7 @@ members = [
     "tools/frd-icon-assets",
     "tools/frd-video-capabilities",
 ]
-exclude = ["third_party/ironrdp-egfx-0.3.0", "tests/legacy-oracle", "third_party/ironrdp-graphics-0.9.0", "third_party/ironrdp-session-0.11.0"]
+exclude = ["third_party/ironrdp-egfx-0.3.0", "tests/legacy-oracle", "third_party/ironrdp-graphics-0.9.0", "third_party/ironrdp-session-0.11.0", "third_party/ironrdp-pdu-0.9.0"]
 
 [workspace.dependencies]
 winit = "=0.30.13"
@@ -60,6 +60,7 @@ raw-window-handle = "=0.6.2"
 # 固定原版副本；独立 oracle workspace 不继承此 patch。
 ironrdp-graphics = { path = "third_party/ironrdp-graphics-0.9.0" }
 ironrdp-session = { path = "third_party/ironrdp-session-0.11.0" }
+ironrdp-pdu = { path = "third_party/ironrdp-pdu-0.9.0" }
 # IronRDP 0.10.0 accepts an EGFX DVC processor but does not expose the
 # mandatory early capability bit that tells a server to open the graphics
 # channel. Keep the patch local and minimal: the RDP adapter opts in only when
