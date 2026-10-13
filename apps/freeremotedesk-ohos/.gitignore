@@ -1,0 +1,6 @@
+oh_modules/
+.hvigor/
+local.properties
+entry/build/
+entry/.cxx/
+signing/

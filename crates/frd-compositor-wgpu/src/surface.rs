@@ -52,6 +52,15 @@ impl PresentationSurface {
         GpuContext::request(instance, self.surface()).await
     }
 
+    /// 显式设备 limits 策略由 composition root 提供；adapter 仍兼容本 surface。
+    pub async fn request_gpu_context_with_limits(
+        &self,
+        instance: wgpu::Instance,
+        limits: impl FnOnce(wgpu::Limits) -> wgpu::Limits,
+    ) -> Result<GpuContext, frd_render_wgpu::GpuContextRequestError> {
+        GpuContext::request_with_limits(instance, self.surface(), limits).await
+    }
+
     pub(crate) fn surface(&self) -> Option<&wgpu::Surface<'static>> {
         self.owned.surface()
     }

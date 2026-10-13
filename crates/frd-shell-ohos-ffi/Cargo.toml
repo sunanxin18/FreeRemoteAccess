@@ -1,0 +1,18 @@
+[package]
+name = "frd-shell-ohos-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+frd-core = { path = "../frd-core" }
+frd-render-wgpu = { path = "../frd-render-wgpu" }
+frd-compositor-wgpu = { path = "../frd-compositor-wgpu" }
+raw-window-handle.workspace = true
+wgpu.workspace = true
+pollster = "0.4"
+
+[dev-dependencies]
+wgpu.workspace = true

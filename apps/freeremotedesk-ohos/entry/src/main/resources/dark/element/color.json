@@ -1,0 +1,20 @@
+{
+  "color": [
+    {
+      "name": "page_background",
+      "value": "#101820"
+    },
+    {
+      "name": "text_primary",
+      "value": "#F1F5FA"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#BECBDD"
+    },
+    {
+      "name": "surface",
+      "value": "#1D2935"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "modelVersion": "26.0.0",
+  "name": "freeremotedesk-ohos",
+  "version": "0.1.0",
+  "description": "FreeRemoteDesk HarmonyOS 原生客户端",
+  "dependencies": {}
+}

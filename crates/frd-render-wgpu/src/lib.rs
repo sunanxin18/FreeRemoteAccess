@@ -50,11 +50,33 @@ pub enum GpuContextError {
     DeviceUnavailable,
 }
 
+/// 设备创建的诊断仅供 composition root 使用；原 request 仍返回稳定错误分类。
+#[derive(Debug)]
+pub enum GpuContextRequestError {
+    Adapter(wgpu::RequestAdapterError),
+    Device(wgpu::RequestDeviceError),
+}
+
 impl GpuContext {
     pub async fn request(
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self, GpuContextError> {
+        Self::request_with_limits(instance, compatible_surface, |_| wgpu::Limits::default())
+            .await
+            .map_err(|error| match error {
+                GpuContextRequestError::Adapter(_) => GpuContextError::AdapterUnavailable,
+                GpuContextRequestError::Device(_) => GpuContextError::DeviceUnavailable,
+            })
+    }
+
+    /// 调用方显式选择设备 limits，仍用真实 surface 选择 adapter，且沿用同一
+    /// GPU fault/device-lost 观察路径。策略不改变桌面默认 request 的行为。
+    pub async fn request_with_limits(
+        instance: wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'_>>,
+        limits: impl FnOnce(wgpu::Limits) -> wgpu::Limits,
+    ) -> Result<Self, GpuContextRequestError> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -63,14 +85,16 @@ impl GpuContext {
                 ..Default::default()
             })
             .await
-            .map_err(|_| GpuContextError::AdapterUnavailable)?;
+            .map_err(GpuContextRequestError::Adapter)?;
+        let required_limits = limits(adapter.limits());
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("FreeRemoteDesk wgpu device"),
+                required_limits,
                 ..Default::default()
             })
             .await
-            .map_err(|_| GpuContextError::DeviceUnavailable)?;
+            .map_err(GpuContextRequestError::Device)?;
         Ok(Self::from_parts(instance, adapter, device, queue))
     }
 
@@ -363,5 +387,45 @@ mod dx12_scope_smoke_tests {
                 .commit_if_unchanged(token, || ())
                 .expect("clean token must commit against its original context");
         });
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod limits_request_tests {
+    use super::GpuContext;
+    fn instance() -> wgpu::Instance {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::METAL;
+        wgpu::Instance::new(descriptor)
+    }
+    #[test]
+    fn limits_policy_rejects_impossible_texture_size_before_renderer_creation() {
+        let result = pollster::block_on(GpuContext::request_with_limits(
+            instance(),
+            None,
+            |available| {
+                let mut requested =
+                    wgpu::Limits::downlevel_webgl2_defaults().using_resolution(available);
+                requested.max_texture_dimension_2d = u32::MAX;
+                requested
+            },
+        ));
+        assert!(result.is_err(), "设备必须执行调用方指定的 limits");
+    }
+    #[test]
+    fn downlevel_device_keeps_existing_renderer_and_fault_observers() {
+        let context = pollster::block_on(GpuContext::request_with_limits(
+            instance(),
+            None,
+            |available| {
+                wgpu::Limits::downlevel_webgl2_defaults()
+                    .using_resolution(available.clone())
+                    .using_alignment(available)
+            },
+        ))
+        .expect("Metal 测试 adapter 必须提供 downlevel renderer limits");
+        assert!(super::RemoteRenderer::new(context.clone()).is_ok());
+        assert!(context.observed_fault().is_none());
+        assert!(context.begin_fault_scope().unwrap().finish().is_ok());
     }
 }

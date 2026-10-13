@@ -2163,6 +2163,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-shell-ohos-ffi"
+version = "0.1.0"
+dependencies = [
+ "frd-compositor-wgpu",
+ "frd-core",
+ "frd-render-wgpu",
+ "pollster",
+ "raw-window-handle",
+ "wgpu",
+]
+
+[[package]]
 name = "frd-shell-runtime"
 version = "0.1.0"
 dependencies = [
