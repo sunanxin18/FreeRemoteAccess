@@ -54,6 +54,25 @@
 
 测试结束后已在两台重新安装、启动原 `7452954a…` Task3 签名客户端，官方 Emulator CLI 确认登录表单恢复；临时 shell 探针目录已清理。原产品仍明确显示没有已注册的远程协议，本轮没有真实远程登录。
 
+## 单帧等待的安装实现证据
+
+同日只读检查宿主安装的官方原始 `system.img`，手机包版本 7.0.0.106、PC 包版本 7.0.0.107。使用已有 debugfs 的只读 dump 提取相关三项库，没有挂载、写镜像或修改系统。服务库的 factory → `libfcodec.z.so` → `libohosffmpeg.z.so` 依赖及精确 AVC 名称，把正常应用查询到的候选与基础镜像中的软件实现对应起来。该检查没有读取运行进程加载映射；先前 guest 版本记录为 7.0.0.105，不能把包版本或基础镜像静态证据冒充当前进程的 Build ID 证明。
+
+两份包装层 `FCodec::ConfigureThread` 均将 FFmpeg `thread_count` 设为 2；字段身份由安装库 AVOption 表交叉核对，`thread_type` 默认值为 frame|slice。底层 receive 路径在 frame threading 生效后，需要填充线程管线才收集结果；没有下一 packet 且未 drain 时继续等待。EOS 排空绕过此门。所测 decoding-order 只设置 H.264 私有输出顺序选项，没有修改线程配置。结合三组实际 fixture，这构成单帧等待的高置信度解释，但不证明所有码流固定延迟一帧，也不排除其他延迟因素。
+
+API26 公开头文件未找到受支持的 thread-count、thread-type 或 force-drain 配置；low-latency feature 在当前两台为 false。重复 Query、改为 callback 或增加中立 poll 接口都无法解除这条需要后续输入的管线门。每帧 EOS 会终止流，Flush 会丢弃状态，均不作为产品修复。
+
+官方固定提交 [`1d4db308` 的 pthread_frame.c](https://github.com/openharmony/third_party_ffmpeg/blob/1d4db308659e235b9fe6f9a3944ecef6ec85b0a9/libavcodec/pthread_frame.c) 已有 `OHOS_H264_ONE_IN_ONE_OUT` 宏保护的强制收取补丁。安装库没有相关符号或日志字符串，实际分支仍保留等待新输入的行为；不能据上游 master 宣称当前设备已修复，也不采用私有入口或替换系统库的办法。
+
+| 基础镜像 | libfcodec.z.so SHA-256 | libohosffmpeg.z.so SHA-256 |
+| --- | --- | --- |
+| 手机 | `802158fc9291befb79e673dfa07306db332ee8e0e2cab8e7a0940d7cd67fef46` | `ef7754986862a2bcd7d18ae863b236862d3c92996073a5fd715949f1d1fc5160` |
+| PC | `d8682c2bef3686c7066d92e5324bdeda3b7c18de43ade411b9f658d0e5dd4b75` | `3891ba92223451a4173bdc78ee11927fffc261b9474d64e2eacf5f075e6d3d00` |
+
+两份安装 ELF 还包含 H.264 8-bit 的运行时 NEON 标志检查、DSP callback 分派及实际向量载入热路径，与[官方 AArch64 dispatcher](https://github.com/openharmony/third_party_ffmpeg/blob/1d4db308659e235b9fe6f9a3944ecef6ec85b0a9/libavcodec/aarch64/h264dsp_init_aarch64.c) 对应。这证明安装代码具有具体 SIMD 实现，尚不是当前 guest 调用该分支、全部热路径合规或性能足够的证明。
+
+因此当前两台的系统 AVC 软件候选保持不可生产选择，继续验证 FFmpeg 后备。系统优先策略保留；不同真实设备或具有公开低延迟修复的新官方实现应独立验收。源文件固定版本、库 Build ID、哈希及有界反汇编保存在忽略目录 `target/harmony-system-codec-source-audit/` 的 `binary-evidence.json`、`extracted.json` 和两个设备子目录。
+
 ## 尚待通过的门
 
 两个 AVC420 合成样本已通过实际输出比较；更多裁剪/stride、连续流与低延迟、reset/取消、软件 SIMD 运行证据、平台 backend 接线及真实远程会话仍未完成。H.264 High 不代表 High 4:4:4；AVC444 wire 组合也不能由普通 AVC 查询通过替代。HEVC 在当前两台模拟器不可作为系统候选，后备仍需独立验证。

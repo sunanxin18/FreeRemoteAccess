@@ -26,6 +26,8 @@
 
 优先验证系统 ByteBuffer 输出及其裁剪、stride、slice height、缓存和回收生命周期，再接入统一帧契约。Surface 路径若采用，必须与现有呈现、完整基线和 generation 门保持一致。硬件资源不足或精确格式不支持时，只能选择已经验证的后备；切换需要清空旧解码状态并重新建立完整基线，不能复用旧帧。
 
+当前 API26 两台模拟器的三组实际测试均不能在单帧后、无需新输入或 EOS 的条件下及时输出；官方基础镜像静态审计找到固定双帧线程的管线等待路径。该候选维持不可生产选择，推进 FFmpeg 后备的独立验收；不能调用私有强制排空入口或修改系统库，也不把此限制推广到其他设备。具体证据与版本边界见[系统解码验证](../validation/harmony-system-codec-20261013.md)。
+
 官方资料：[AVCodec 支持格式](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/media/avcodec/avcodec-support-formats.md)、[视频解码](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/media/avcodec/video-decoding.md)。H.264/HEVC 能力不能替代 RemoteFX、Bitmap/RLE 或 Apple MVS 解码；RDP AVC444 组合与 H.264 High 4:4:4 码流需分别验证。HEVC 系统解码存在也不解除 RDP HEVC wire 门。Windows、macOS 和 Linux 保持各自平台组合根策略。 当前 registry 默认拒绝 Native + SoftwareExact；新增顺序必须通过显式、中立的选择策略由 OHOS 组合根启用，保留现有 `VideoDecoderRegistry::new` 默认行为及桌面回归，不能全局改变软件后端优先级。
 
 ## 交互与安全
