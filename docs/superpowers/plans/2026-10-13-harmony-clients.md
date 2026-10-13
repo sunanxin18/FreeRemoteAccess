@@ -31,24 +31,26 @@
 - 官方 PC ARM64 镜像已下载，独立 phone/2in1 模拟器均启动且 HDC Connected；Rust 1.96 OHOS std 已安装。
 - 源码未改动的 desktop/session 基线共 228 项测试通过；现有 core/frame/app 的 OHOS target check 通过。
 - [环境证据](../../validation/harmony-environment-20261013.md)与[鸿蒙手机原生服务调查](../../validation/harmony-native-service-20261013.md)已记录。
-- 下列产品实现任务尚未开始；这些准备结果不将任何 HAP、图形、协议互操作任务标为完成。
+- 当前已进入 Task 1 实施；这些准备结果不将任何 HAP、图形、协议互操作任务标为完成，各步骤在实现及审查后单独勾选。
 
 ### Task 1: OHOS 工具链与共享执行器边界
 
 **Files:** 新增 `tools/build-harmony.sh`、`crates/frd-shell-runtime/Cargo.toml` / `src/lib.rs`；移动 desktop 的 `session_host.rs`、`cleanup.rs`、`video_decode_worker.rs` 及必要 metrics 模块；修改 workspace、desktop manifest/re-exports。
 
-**Interfaces:** 保留 `SessionHost`、`WakeSink`、`AcceptedLaunchOutcome` 的既有签名；正式提供 video registry 注入，desktop composition root 保留原 FFmpeg 选择。
+**Interfaces:** desktop 薄 wrapper 保留 `SessionHost` 三参数构造与既有公共行为；新 runtime 的 `SessionHost::new` 显式接收第四个 decoder registry loader 参数。`WakeSink`、`AcceptedLaunchOutcome` 等契约保持。中立 worker 不自行加载 decoder，desktop composition root 保留原 FFmpeg 选择；中立的 `video_rate_fallback` 随 worker 迁移以保留原交叉测试。
 
-- [ ] 在迁移前记录 desktop/session 测试基线，依赖检查验证新 runtime 无 winit、egui、GTK。
-- [ ] 无语义变更提取原实现；先跑迁移后的原测试，再检查 OHOS target 的核心/runtime 构建。
-- [ ] 配置 SDK OHOS Clang/sysroot，不硬编码本机路径进源码；依赖构建失败按具体库处理。
-- [ ] 运行 `cargo test --locked -p frd-shell-runtime -p frd-shell-desktop` 与 OHOS target check，记录 host/target 层级。
+- [x] 在迁移前记录 desktop/session 测试基线，依赖检查验证新 runtime 无 winit、egui、GTK。
+- [x] 无语义变更提取原实现；先跑迁移后的原测试，再检查 OHOS target 的核心/runtime 构建。
+- [x] 配置 SDK OHOS Clang/sysroot，不硬编码本机路径进源码；依赖构建失败按具体库处理。
+- [x] 运行 `cargo test --locked -p frd-shell-runtime -p frd-shell-desktop` 与 OHOS target check，记录 host/target 层级。
+
+Task 1 于 `655785d` 完成并经独立审查通过；各架构验证范围见[环境与运行时验证](../../validation/harmony-environment-20261013.md)。
 
 ### Task 2: 原生 HAP、C ABI 与 XComponent 呈现
 
 **Files:** 新增 `apps/freeremotedesk-ohos/` ArkUI/Hvigor/entry/native 工程，`crates/frd-shell-ohos-ffi/` 与 `include/frd_ohos.h`。
 
-**Interfaces:** `frd_ohos_abi_version() -> u32`，`frd_ohos_create() -> u64`，`frd_ohos_destroy(engine: u64) -> i32`；`frd_ohos_attach(engine, window, width, height) -> i32`、`frd_ohos_resize(engine,width,height) -> i32`、`frd_ohos_detach(engine) -> i32`。engine 是 Rust registry 分配的不复用整数句柄，0 为无效值；不把已释放的 Rust 对象指针解引用来判断有效性。只有 `window` 是调用方保证生命周期的 native 指针，attach 成功前取得独立引用。native bridge 不解析协议。
+**Interfaces:** `frd_ohos_abi_version() -> u32`，`frd_ohos_create() -> u64`，`frd_ohos_destroy(engine: u64) -> i32`；`frd_ohos_attach(engine, window, width, height, out_surface_generation: *mut u64) -> i32`、`frd_ohos_resize(engine, surface_generation, width, height) -> i32`、`frd_ohos_detach(engine, surface_generation) -> i32`。engine 是 Rust registry 分配的不复用整数句柄，0 为无效值；surface generation 同样单调递增，迟到回调不可拆除或改变新 surface。不得解引用已释放的 Rust 对象指针来判断有效性。只有 `window` 是调用方保证生命周期的 native 指针，attach 成功前取得独立引用。native bridge 不解析协议。
 
 - [ ] 测试空/失效句柄、重复 detach、零尺寸、迟到回调和销毁顺序；错误均可识别且不得 unwind。
 - [ ] 实现 owned OHNativeWindow lease 与 compositor，呈现确定性图案仅作为图形 POC，产品登录页不伪装网络连接。
@@ -89,7 +91,7 @@
 
 **Files:** 新增 `docs/validation/harmony-native-service-20261013.md`；更新 `README.md` 客户端/服务端两轴矩阵。
 
-- [ ] 核对官方API、系统原生服务入口及模拟器实际可用服务；不采集其他应用秘密、不使用调试注入实现产品功能。
-- [ ] 有可验证协议才新增独立 adapter，先确定性fixture再真实互操作；无服务/权限证据则明确具体缺口，不造假可用目标。
+- [x] 核对官方API、系统原生服务入口及模拟器实际可用服务；不采集其他应用秘密、不使用调试注入实现产品功能。
+- [x] 有可验证协议才新增独立 adapter，先确定性fixture再真实互操作；无服务/权限证据则明确具体缺口，不造假可用目标。
 - [ ] 记录每个HAP/架构/模拟器/协议的版本和验证范围；保留真实未完成项。
 - [ ] 完成独立最终审查、格式、共享测试和受影响平台构建；commit/push按用户交付授权执行。
