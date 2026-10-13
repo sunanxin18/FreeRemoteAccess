@@ -29,6 +29,7 @@ use crate::egfx::EgfxAdapter;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_EGFX_FAILED};
 use crate::factory::{RdpEgfxFailure, RdpGraphicsCapabilities, RdpGraphicsObserver};
 use crate::input::RdpInputState;
+use crate::legacy_decode::ResolvedLegacyDecode;
 use crate::runtime::{
     drain_active_commands, drain_reactivation_commands, ActiveCommandBatch, ActiveCommandDrain,
     ActiveOptionalCommand, ReactivationCommand,
@@ -45,9 +46,16 @@ pub(crate) fn run_active_session(
     session: ActivatedRdpSession,
     session_id: SessionId,
     runtime: &mut ProtocolRuntime,
+    legacy_decode: ResolvedLegacyDecode,
     graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
 ) -> ProtocolExit {
-    match run_active_session_inner(session, session_id, runtime, graphics_observer) {
+    match run_active_session_inner(
+        session,
+        session_id,
+        runtime,
+        legacy_decode,
+        graphics_observer,
+    ) {
         Ok(()) => ProtocolExit::Closed,
         Err(error) => ProtocolExit::Failed(error),
     }
@@ -57,6 +65,7 @@ fn run_active_session_inner(
     session: ActivatedRdpSession,
     session_id: SessionId,
     runtime: &mut ProtocolRuntime,
+    legacy_decode: ResolvedLegacyDecode,
     graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
 ) -> Result<(), ProtocolError> {
     let ActivatedRdpSession {
@@ -117,17 +126,19 @@ fn run_active_session_inner(
         desktop_size.width,
         desktop_size.height,
     );
-    let mut active_stage = ActiveStageBuilder {
-        static_channels,
-        user_channel_id,
-        io_channel_id,
-        message_channel_id,
-        share_id,
-        compression_type,
-        enable_server_pointer,
-        pointer_software_rendering,
-    }
-    .build();
+    let mut active_stage = build_active_stage(
+        ActiveStageBuilder {
+            static_channels,
+            user_channel_id,
+            io_channel_id,
+            message_channel_id,
+            share_id,
+            compression_type,
+            enable_server_pointer,
+            pointer_software_rendering,
+        },
+        legacy_decode,
+    );
     let mut input = RdpInputState::new();
     if let Err(error) = publish_active_input_capabilities(runtime) {
         writer.shutdown();
@@ -172,6 +183,18 @@ fn run_active_session_inner(
     );
     writer.shutdown();
     result.and(audio_cleanup)
+}
+
+/// 初始生产 Stage 和编码流测试共用此构造路径；处理任何输入前完成绑定。
+pub(crate) fn build_active_stage(
+    builder: ActiveStageBuilder,
+    legacy_decode: ResolvedLegacyDecode,
+) -> ActiveStage {
+    let mut stage = builder.build();
+    if let ResolvedLegacyDecode::CheckedNative(kernels) = legacy_decode {
+        stage.set_native_legacy_kernels(kernels);
+    }
+    stage
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1223,23 +1246,24 @@ mod tests {
     }
 
     fn stage(native: bool, pointer: bool) -> ironrdp::session::ActiveStage {
-        let mut stage = ironrdp::session::ActiveStageBuilder {
-            static_channels: ironrdp::svc::StaticChannelSet::new(),
-            user_channel_id: 1001,
-            io_channel_id: 1003,
-            message_channel_id: None,
-            share_id: 1,
-            compression_type: None,
-            enable_server_pointer: pointer,
-            pointer_software_rendering: pointer,
-        }
-        .build();
-        if native {
-            stage.set_native_legacy_kernels(
-                ironrdp::graphics::legacy_native::NativeKernels::detect().unwrap(),
-            );
-        }
-        stage
+        let selection = crate::factory::tests::resolved_session_selection(if native {
+            crate::RdpLegacyDecodePolicy::RequiredNative
+        } else {
+            crate::RdpLegacyDecodePolicy::Compatibility
+        });
+        super::build_active_stage(
+            ironrdp::session::ActiveStageBuilder {
+                static_channels: ironrdp::svc::StaticChannelSet::new(),
+                user_channel_id: 1001,
+                io_channel_id: 1003,
+                message_channel_id: None,
+                share_id: 1,
+                compression_type: None,
+                enable_server_pointer: pointer,
+                pointer_software_rendering: pointer,
+            },
+            selection,
+        )
     }
 
     fn bitmap(
@@ -1434,6 +1458,164 @@ mod tests {
             }
         }
         pixels
+    }
+
+    #[test]
+    fn legacy_native_factory_stage_binding_preserves_pending_pointer_on_real_failure() {
+        use ironrdp::core::encode_vec;
+        use ironrdp::pdu::fast_path::UpdateCode;
+        use ironrdp::pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute};
+        for native in [false, true] {
+            for replacement in [false, true] {
+                for invalid_header in [false, true] {
+                    let mut h = CoverageHarness::new(4, 2, native, true);
+                    if replacement {
+                        // 与真实再激活路径相同的 replacement setter；新的 processor 默认 None。
+                        h.stage.set_fastpath_processor(
+                            ironrdp::session::fast_path::ProcessorBuilder {
+                                io_channel_id: 1003,
+                                user_channel_id: 1001,
+                                share_id: 2,
+                                enable_server_pointer: true,
+                                pointer_software_rendering: true,
+                                bulk_decompressor: None,
+                            }
+                            .build(),
+                        );
+                    }
+                    let shape = encode_vec(&PointerAttribute {
+                        xor_bpp: 32,
+                        color_pointer: ColorPointerAttribute {
+                            cache_index: 1,
+                            hot_spot: Point16 { x: 0, y: 0 },
+                            width: 1,
+                            height: 1,
+                            xor_mask: &[255, 255, 255, 255],
+                            and_mask: &[0, 0],
+                        },
+                    })
+                    .unwrap();
+                    h.route(
+                        &fast_packet(&[(UpdateCode::NewPointer, shape)]),
+                        false,
+                        1,
+                        true,
+                    )
+                    .unwrap();
+                    h.route(
+                        &fast_packet(&[(UpdateCode::CachedPointer, 1u16.to_le_bytes().to_vec())]),
+                        false,
+                        1,
+                        true,
+                    )
+                    .unwrap();
+                    let before = h.image.data().to_vec();
+                    assert!(
+                        before[..3].iter().any(|&value| value != 0),
+                        "先证明实际软件指针可见"
+                    );
+                    h.stage.update_mouse_pos(2, 0);
+                    let failure = if invalid_header {
+                        vec![0]
+                    } else {
+                        bitmap_packet(vec![bitmap(&[], 24, 2, 1, rect(0, 0, 1, 0), true)], false)
+                    };
+                    assert!(h.route(&failure, false, 1, true).is_err());
+                    assert_eq!(h.baseline.known_pixels(), 0);
+                    assert!(h.compile().is_empty());
+                    if native {
+                        assert_eq!(
+                            h.image.data(),
+                            before,
+                            "native 失败前不得消费 pending pointer"
+                        );
+                    } else {
+                        assert_ne!(
+                            h.image.data(),
+                            before,
+                            "默认路径应保留原有先移动 pointer 的行为"
+                        );
+                    }
+                    // 无 scalar 重试：成功空包才消费 native 保留的 pending pointer。
+                    let batch = super::process_server_batch(
+                        &mut h.stage,
+                        &mut h.image,
+                        1,
+                        ironrdp::pdu::Action::FastPath,
+                        &fast_packet(&[]),
+                    )
+                    .unwrap();
+                    assert_eq!(batch.result.decoded_coverage.len(), usize::from(native));
+                    assert!(batch
+                        .result
+                        .decoded_coverage
+                        .iter()
+                        .all(|r| r.rectangles.is_empty()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_native_factory_reactivation_starts_empty_and_requires_real_full_content() {
+        let mut h = CoverageHarness::new(3, 1, true, false);
+        let endpoints = bitmap_packet(
+            vec![
+                bitmap(&[0x61, 1, 2, 3], 24, 1, 1, rect(0, 0, 0, 0), true),
+                bitmap(&[0x61, 4, 5, 6], 24, 1, 1, rect(2, 0, 2, 0), true),
+            ],
+            false,
+        );
+        let middle = bitmap_packet(
+            vec![bitmap(&[0x61, 7, 8, 9], 24, 1, 1, rect(1, 0, 1, 0), true)],
+            false,
+        );
+        for generation in [1, 2] {
+            if generation == 2 {
+                assert_eq!(
+                    commit_reactivated_surface(
+                        &mut h.runtime,
+                        &mut h.baseline,
+                        &mut h.image,
+                        1,
+                        DesktopSize {
+                            width: 3,
+                            height: 1
+                        }
+                    )
+                    .unwrap(),
+                    2
+                );
+                h.stage.set_fastpath_processor(
+                    ironrdp::session::fast_path::ProcessorBuilder {
+                        io_channel_id: 1003,
+                        user_channel_id: 1001,
+                        share_id: 2,
+                        enable_server_pointer: false,
+                        pointer_software_rendering: false,
+                        bulk_decompressor: None,
+                    }
+                    .build(),
+                );
+                assert_eq!(h.image.data(), [0; 12]);
+                assert_eq!(h.baseline.known_pixels(), 0);
+                assert!(!h.baseline.baseline_established());
+            }
+            h.route(&endpoints, false, generation, true).unwrap();
+            assert_eq!(h.baseline.known_pixels(), 2);
+            assert!(!h.baseline.baseline_established());
+            assert!(h.compile().is_empty());
+            h.route(&middle, false, generation, true).unwrap();
+            let transactions = h.compile();
+            assert!(matches!(
+                &transactions[..],
+                [frd_frame::FrameTransaction::Startup { .. }]
+            ));
+            assert_eq!(
+                transaction_pixels(&transactions[0], 3, 1),
+                [1, 2, 3, 255, 7, 8, 9, 255, 4, 5, 6, 255]
+            );
+        }
     }
 
     #[test]

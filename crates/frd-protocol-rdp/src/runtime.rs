@@ -21,6 +21,7 @@ use crate::egfx::EgfxDecoderProvider;
 use crate::error::{rdp_error, RDP_ACTIVATION_FAILED, RDP_CANCELLED};
 use crate::factory::{RdpGraphicsAdvertisementGate, RdpGraphicsObserver};
 use crate::input::{RdpInputError, RdpInputState};
+use crate::legacy_decode::ResolvedLegacyDecode;
 
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const NETWORK_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -249,6 +250,7 @@ static NETWORK_STAGE_WORKER: OnceLock<Mutex<Option<TrackedWorker>>> = OnceLock::
 pub(crate) fn run_protocol_session(
     mut config: RdpConnectionConfig,
     mut runtime: ProtocolRuntime,
+    legacy_decode: ResolvedLegacyDecode,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
     graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
     graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
@@ -268,7 +270,13 @@ pub(crate) fn run_protocol_session(
         egfx_decoder_provider,
         graphics_advertisement_gate,
     )) {
-        Ok(session) => run_active_session(session, session_id, &mut runtime, graphics_observer),
+        Ok(session) => run_active_session(
+            session,
+            session_id,
+            &mut runtime,
+            legacy_decode,
+            graphics_observer,
+        ),
         Err(error) if error.code() == RDP_CANCELLED => ProtocolExit::Closed,
         Err(error) => ProtocolExit::Failed(error),
     };
@@ -1717,6 +1725,7 @@ mod tests {
             run_protocol_session(
                 config,
                 runtime,
+                crate::legacy_decode::ResolvedLegacyDecode::Compatibility,
                 None,
                 RdpGraphicsAdvertisementGate::LegacyOnly,
                 None,

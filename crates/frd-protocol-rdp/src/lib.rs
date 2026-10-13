@@ -17,6 +17,7 @@ mod egfx;
 mod error;
 mod factory;
 mod input;
+mod legacy_decode;
 mod network_diagnostics;
 mod pixel_convert;
 mod runtime;
@@ -32,6 +33,7 @@ pub use egfx::{
     Avc420DecoderProvider, Avc444Decoder, Avc444DecoderProvider, EgfxDecoderProvider,
     ValidatedAvc444Bitmap, ValidatedAvc444Encoding,
 };
+pub use legacy_decode::RdpLegacyDecodePolicy;
 pub use progressive::CoverageFailure as RdpProgressiveCoverageFailure;
 
 pub use factory::{

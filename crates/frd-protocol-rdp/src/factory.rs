@@ -7,6 +7,7 @@ use frd_protocol_api::{
 
 use crate::config::{RdpClientPlatformIdentity, RdpConnectionConfig};
 use crate::egfx::EgfxDecoderProvider;
+use crate::legacy_decode::{RdpLegacyDecodePolicy, ResolvedLegacyDecode};
 use crate::runtime::run_protocol_session;
 
 /// Controls whether a decoder provider may advertise the EGFX graphics channel.
@@ -116,6 +117,14 @@ where
 
 pub struct RdpProtocolFactory {
     client_platform: RdpClientPlatformIdentity,
+    legacy_decode_policy: RdpLegacyDecodePolicy,
+    #[cfg(test)]
+    native_probe: Option<
+        fn() -> Result<
+            ironrdp::graphics::legacy_native::NativeKernels,
+            ironrdp::graphics::legacy_native::KernelError,
+        >,
+    >,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
     graphics_advertisement_gate: RdpGraphicsAdvertisementGate,
     graphics_observer: Option<Arc<dyn RdpGraphicsObserver>>,
@@ -125,6 +134,9 @@ impl RdpProtocolFactory {
     pub const fn new(client_platform: RdpClientPlatformIdentity) -> Self {
         Self {
             client_platform,
+            legacy_decode_policy: RdpLegacyDecodePolicy::Compatibility,
+            #[cfg(test)]
+            native_probe: None,
             egfx_decoder_provider: None,
             graphics_advertisement_gate: RdpGraphicsAdvertisementGate::LegacyOnly,
             graphics_observer: None,
@@ -162,10 +174,46 @@ impl RdpProtocolFactory {
     ) -> Self {
         Self {
             client_platform,
+            legacy_decode_policy: RdpLegacyDecodePolicy::Compatibility,
+            #[cfg(test)]
+            native_probe: None,
             egfx_decoder_provider: Some(provider),
             graphics_advertisement_gate,
             graphics_observer: None,
         }
+    }
+
+    /// 显式要求 checked native legacy 解码；调用方另行负责完整目标资格。
+    /// 不改变 EGFX 广告或 wire 平台身份；不可用时 create 返回静态错误。
+    pub fn with_legacy_decode_policy(mut self, policy: RdpLegacyDecodePolicy) -> Self {
+        self.legacy_decode_policy = policy;
+        self
+    }
+
+    fn create_session(
+        &self,
+        request: ConnectRequest,
+        runtime: ProtocolRuntime,
+    ) -> Result<RdpProtocolSession, ProtocolError> {
+        // 在 config/session、执行器和任何网络阶段之前解析一次实际 CPU 后端。
+        #[cfg(test)]
+        let legacy_decode = match self.native_probe {
+            Some(probe) => {
+                ResolvedLegacyDecode::resolve_with_probe(self.legacy_decode_policy, probe)
+            }
+            None => ResolvedLegacyDecode::resolve(self.legacy_decode_policy),
+        }?;
+        #[cfg(not(test))]
+        let legacy_decode = ResolvedLegacyDecode::resolve(self.legacy_decode_policy)?;
+        let config = RdpConnectionConfig::try_new(request, self.client_platform)?;
+        Ok(RdpProtocolSession {
+            config,
+            runtime,
+            legacy_decode,
+            egfx_decoder_provider: self.egfx_decoder_provider.clone(),
+            graphics_advertisement_gate: self.graphics_advertisement_gate,
+            graphics_observer: self.graphics_observer.clone(),
+        })
     }
 
     pub fn with_graphics_observer(mut self, observer: Arc<dyn RdpGraphicsObserver>) -> Self {
@@ -184,18 +232,12 @@ impl ProtocolFactory for RdpProtocolFactory {
         request: ConnectRequest,
         runtime: ProtocolRuntime,
     ) -> Result<Box<dyn ProtocolSession>, ProtocolError> {
-        let config = RdpConnectionConfig::try_new(request, self.client_platform)?;
-        Ok(Box::new(RdpProtocolSession {
-            config,
-            runtime,
-            egfx_decoder_provider: self.egfx_decoder_provider.clone(),
-            graphics_advertisement_gate: self.graphics_advertisement_gate,
-            graphics_observer: self.graphics_observer.clone(),
-        }))
+        Ok(Box::new(self.create_session(request, runtime)?))
     }
 }
 
 pub struct RdpProtocolSession {
+    legacy_decode: ResolvedLegacyDecode,
     config: RdpConnectionConfig,
     runtime: ProtocolRuntime,
     egfx_decoder_provider: Option<Arc<dyn EgfxDecoderProvider>>,
@@ -208,6 +250,7 @@ impl ProtocolSession for RdpProtocolSession {
         let Self {
             config,
             runtime,
+            legacy_decode,
             egfx_decoder_provider,
             graphics_advertisement_gate,
             graphics_observer,
@@ -215,6 +258,7 @@ impl ProtocolSession for RdpProtocolSession {
         run_protocol_session(
             config,
             runtime,
+            legacy_decode,
             egfx_decoder_provider,
             graphics_advertisement_gate,
             graphics_observer,
@@ -223,11 +267,19 @@ impl ProtocolSession for RdpProtocolSession {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::cell::Cell;
+    use std::sync::mpsc;
     use std::sync::Arc;
 
-    use frd_core::{PixelSize, SessionId};
-    use frd_protocol_api::{ProtocolFactory, ProtocolId};
+    use crate::legacy_decode::ResolvedLegacyDecode;
+    use crate::RdpLegacyDecodePolicy;
+    use frd_core::{PixelSize, SecretBuffer, SessionId};
+    use frd_protocol_api::{
+        ConnectRequest, Credentials, Endpoint, ProtocolError, ProtocolFactory, ProtocolId,
+        ProtocolRuntime, RuntimeEventSink, RuntimeWake, SessionEvent, SurfacePublisher,
+    };
+    use ironrdp::graphics::legacy_native::{KernelError, NativeKernels};
     use ironrdp_egfx::decode::H264Decoder;
 
     use crate::{
@@ -245,6 +297,189 @@ mod tests {
         ) -> Option<Box<dyn H264Decoder>> {
             None
         }
+    }
+
+    thread_local! {
+        static PROBE_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn deny_features() -> Result<NativeKernels, KernelError> {
+        PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        NativeKernels::detect_if(false)
+    }
+
+    fn count_actual_probe() -> Result<NativeKernels, KernelError> {
+        PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        NativeKernels::detect()
+    }
+
+    struct NoEffects;
+    impl RuntimeEventSink for NoEffects {
+        fn publish(&self, _: SessionEvent) -> Result<(), ProtocolError> {
+            panic!("factory create 不得发布会话事件");
+        }
+    }
+    impl SurfacePublisher for NoEffects {
+        fn publish(&self, _: frd_frame::SurfaceUpdate) -> Result<(), ProtocolError> {
+            panic!("factory create 不得发布图像");
+        }
+    }
+    impl RuntimeWake for NoEffects {
+        fn wake(&self) -> Result<(), ProtocolError> {
+            panic!("factory create 不得唤醒运行时");
+        }
+    }
+
+    fn request_runtime() -> (ConnectRequest, ProtocolRuntime) {
+        let session_id = SessionId::allocate();
+        let (_, command_rx) = mpsc::channel();
+        let request = ConnectRequest {
+            session_id,
+            endpoint: Endpoint::new("no-network.invalid", 3389).unwrap(),
+            protocol_id: ProtocolId::rdp(),
+            credentials: Some(Credentials {
+                username: "fixture".to_owned(),
+                password: SecretBuffer::new(vec![1]).take(),
+            }),
+            saved_server_pin: None,
+            display_intent: frd_core::DisplayIntent::default(),
+        };
+        let runtime = ProtocolRuntime::new(
+            session_id,
+            command_rx,
+            Box::new(NoEffects),
+            Box::new(NoEffects),
+            None,
+            Box::new(NoEffects),
+        );
+        (request, runtime)
+    }
+
+    /// 编码流测试取自真实工厂创建的 session，而非测试手工拼接 NativeK 表。
+    pub(crate) fn resolved_session_selection(
+        policy: RdpLegacyDecodePolicy,
+    ) -> ResolvedLegacyDecode {
+        let (request, runtime) = request_runtime();
+        RdpProtocolFactory::new(RdpClientPlatformIdentity::Windows)
+            .with_legacy_decode_policy(policy)
+            .create_session(request, runtime)
+            .unwrap()
+            .legacy_decode
+    }
+
+    #[test]
+    fn legacy_native_default_constructors_never_probe_and_keep_all_gates() {
+        let provider: Arc<dyn EgfxDecoderProvider> = Arc::new(NoopProvider);
+        let observer: Arc<dyn RdpGraphicsObserver> = Arc::new(|_| panic!("create 不观察图形"));
+        let factories = [
+            RdpProtocolFactory::new(RdpClientPlatformIdentity::Unix),
+            RdpProtocolFactory::with_egfx_decoder_provider(
+                RdpClientPlatformIdentity::Unix,
+                provider.clone(),
+            ),
+            RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
+                RdpClientPlatformIdentity::Unix,
+                provider.clone(),
+                RdpGraphicsAdvertisementGate::ValidationOnly,
+            ),
+            RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
+                RdpClientPlatformIdentity::Unix,
+                provider,
+                RdpGraphicsAdvertisementGate::LiveInteroperable,
+            ),
+        ];
+        PROBE_CALLS.with(|calls| calls.set(0));
+        for mut factory in factories {
+            let gate = factory.graphics_advertisement_gate;
+            factory.native_probe = Some(deny_features);
+            let factory = factory.with_graphics_observer(observer.clone());
+            let (request, runtime) = request_runtime();
+            let session = factory.create_session(request, runtime).unwrap();
+            assert!(matches!(
+                session.legacy_decode,
+                ResolvedLegacyDecode::Compatibility
+            ));
+            assert_eq!(session.graphics_advertisement_gate, gate);
+            assert!(session.graphics_observer.is_some());
+        }
+        assert_eq!(PROBE_CALLS.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn legacy_native_unavailable_fails_before_config_session_and_runtime_effects() {
+        PROBE_CALLS.with(|calls| calls.set(0));
+        let mut factory = RdpProtocolFactory::new(RdpClientPlatformIdentity::Unix)
+            .with_legacy_decode_policy(RdpLegacyDecodePolicy::RequiredNative);
+        factory.native_probe = Some(deny_features);
+        for valid_config in [true, false] {
+            let (mut request, runtime) = request_runtime();
+            if !valid_config {
+                request.credentials = None;
+            }
+            let error = factory
+                .create(request, runtime)
+                .err()
+                .expect("必须拒绝，不能回落兼容 session");
+            assert_eq!(error.code(), "rdp_legacy_native_unavailable");
+            assert_eq!(error.protocol_id(), Some(&ProtocolId::rdp()));
+        }
+        assert_eq!(PROBE_CALLS.with(Cell::get), 2);
+    }
+
+    #[test]
+    fn legacy_native_resolves_once_independent_of_wire_identity_and_builder_order() {
+        let actual_backend = NativeKernels::detect().unwrap().backend();
+        let provider: Arc<dyn EgfxDecoderProvider> = Arc::new(NoopProvider);
+        let observer: Arc<dyn RdpGraphicsObserver> = Arc::new(|_| {});
+        for platform in [
+            RdpClientPlatformIdentity::Windows,
+            RdpClientPlatformIdentity::Macintosh,
+            RdpClientPlatformIdentity::Ios,
+            RdpClientPlatformIdentity::Unix,
+            RdpClientPlatformIdentity::Android,
+        ] {
+            for policy_first in [false, true] {
+                PROBE_CALLS.with(|calls| calls.set(0));
+                let factory = RdpProtocolFactory::with_egfx_decoder_provider_and_gate(
+                    platform,
+                    provider.clone(),
+                    RdpGraphicsAdvertisementGate::ValidationOnly,
+                );
+                let mut factory = if policy_first {
+                    factory
+                        .with_legacy_decode_policy(RdpLegacyDecodePolicy::RequiredNative)
+                        .with_graphics_observer(observer.clone())
+                } else {
+                    factory
+                        .with_graphics_observer(observer.clone())
+                        .with_legacy_decode_policy(RdpLegacyDecodePolicy::RequiredNative)
+                };
+                factory.native_probe = Some(count_actual_probe);
+                let (request, runtime) = request_runtime();
+                let session = factory.create_session(request, runtime).unwrap();
+                let ResolvedLegacyDecode::CheckedNative(kernels) = session.legacy_decode else {
+                    panic!("session 丢失原生选择");
+                };
+                assert_eq!(kernels.backend(), actual_backend);
+                assert_eq!(session.config.client_platform, platform);
+                assert_eq!(
+                    session.graphics_advertisement_gate,
+                    RdpGraphicsAdvertisementGate::ValidationOnly
+                );
+                assert!(session.graphics_observer.is_some());
+                assert_eq!(PROBE_CALLS.with(Cell::get), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_native_policy_can_be_explicitly_restored_to_compatibility() {
+        let mut factory = RdpProtocolFactory::new(RdpClientPlatformIdentity::Unix)
+            .with_legacy_decode_policy(RdpLegacyDecodePolicy::RequiredNative)
+            .with_legacy_decode_policy(RdpLegacyDecodePolicy::Compatibility);
+        factory.native_probe = Some(deny_features);
+        let (request, runtime) = request_runtime();
+        assert!(factory.create(request, runtime).is_ok());
     }
 
     #[test]
