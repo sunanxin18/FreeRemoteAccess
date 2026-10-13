@@ -32,8 +32,6 @@ struct Index {
   @State private protocol: string = 'auto';
   @State private remember: boolean = false;
   @State private compact: boolean = false;
-  @State private showingDiagnostics: boolean = false;
-  @State private loginHeight: number = 700;
   @State private windowWidth: number = 500;
   @State private passwordEpoch: number = 0;
   @State private bridgeNotice: string = '';
@@ -124,7 +122,7 @@ struct Index {
     }, 100);
   }
   aboutToDisappear(): void { clearInterval(this.timer); this.release(); }
-  onBackPress(): boolean { if (this.showingDiagnostics) { this.showingDiagnostics = false; return true; } if (this.model.page !== 0) { native.appAction(2, '0', 0, 0); return true; } return false; }
+  onBackPress(): boolean { if (this.model.page !== 0) { native.appAction(2, '0', 0, 0); return true; } return false; }
   @Builder
   passwordInput() {
     TextInput({ placeholder: this.model.credentialLoaded ? '已从安全存储载入；输入可替换' : '请输入密码' })
@@ -149,42 +147,14 @@ struct Index {
     Text(label).fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
   }
   @Builder
-  diagnosticsSheet() {
-    Scroll() {
-      Column({ space: 12 }) {
-        Text('仅用于开发验证，不会连接远程计算机').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%')
-        Button(this.showingPoc ? '停止离线图形验证' : '离线图形验证').fontSize(16).constraintSize({ minHeight: 48 }).width('100%').focusable(true)
-          .onClick(() => { this.showingDiagnostics = false; this.showingPoc = !this.showingPoc; })
-        Button('验证系统安全存储').fontSize(16).constraintSize({ minHeight: 48 }).width('100%').focusable(true).enabled(this.model.probe !== 1)
-          .onClick(() => { this.check(native.huksProbe()); })
-        if (this.model.probe !== 0 && this.model.probe !== undefined) {
-          Text(this.model.probe === 7 ? '安全存储加密、重载与篡改拒绝已验证' : this.model.probe === 1 ? '正在验证系统安全存储' : `系统安全存储验证失败（${this.model.probe}）`)
-            .fontSize(14).fontColor($r('app.color.text_secondary')).width('100%')
-        }
-        Button('关闭', { type: ButtonType.Normal }).buttonStyle(ButtonStyleMode.TEXTUAL).fontSize(16)
-          .constraintSize({ minHeight: 48 }).width('100%').focusable(true).onClick(() => { this.showingDiagnostics = false; })
-      }.width('100%').padding({ left: 24, right: 24, top: 12, bottom: 24 })
-    }.width('100%').constraintSize({ maxHeight: this.loginHeight * 0.7 }).scrollBar(BarState.Auto)
-  }
-  @Builder
   connectionForm() {
     Scroll() {
       Column() {
-        Row({ space: 12 }) {
-          Column({ space: 4 }) {
-            Text('连接远程桌面').fontSize(this.compact ? 24 : 28).fontWeight(FontWeight.Bold)
-              .fontColor($r('app.color.text_primary')).width('100%').textAlign(TextAlign.Start)
-            Text('FreeRemoteDesk').fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
-          }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-          if (native.pocAvailable()) {
-            Button('开发验证', { type: ButtonType.Normal }).buttonStyle(ButtonStyleMode.TEXTUAL).fontSize(14)
-              .fontColor($r('app.color.text_secondary')).constraintSize({ minHeight: 48, minWidth: 80 }).focusable(true)
-              .accessibilityText('打开仅用于开发的验证工具').onClick(() => { this.showingDiagnostics = true; })
-              .bindSheet($$this.showingDiagnostics, this.diagnosticsSheet(), {
-                height: SheetSize.FIT_CONTENT, showClose: true, title: { title: '开发验证' }
-              })
-          }
-        }.width('100%').constraintSize({ minHeight: 48 }).margin({ bottom: this.compact ? 16 : 24 })
+        Column({ space: 4 }) {
+          Text('连接远程桌面').fontSize(this.compact ? 24 : 28).fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_primary')).width('100%').textAlign(TextAlign.Start)
+          Text('FreeRemoteDesk').fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
+        }.width('100%').constraintSize({ minHeight: 48 }).alignItems(HorizontalAlign.Start).margin({ bottom: this.compact ? 16 : 24 })
         if ((this.model.profiles?.length ?? 0) > 0) {
           Select(this.profileOptions()).selected(this.model.selectedIndex ?? -1).value('最近连接')
             .font({ size: 14 }).optionFont({ size: 16 }).optionWidth(OptionWidthMode.FIT_TRIGGER)
@@ -242,7 +212,6 @@ struct Index {
           .accessibilityText('连接远程桌面').onClick(() => this.submit()).margin({ top: 8 })
       }.width('100%').constraintSize({ maxWidth: 440 }).padding({ top: this.compact ? 16 : 24, bottom: this.compact ? 16 : 24 }).alignItems(HorizontalAlign.Center)
     }.width('100%').layoutWeight(1).clip(true).scrollBar(BarState.Auto).padding({ left: this.compact ? 16 : 24, right: this.compact ? 16 : 24 })
-      .onAreaChange((_, area) => { this.loginHeight = Number(area.height); })
   }
   @Builder
   remoteSurface() {
