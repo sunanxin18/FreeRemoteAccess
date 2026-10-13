@@ -54,6 +54,17 @@ impl DecodingContext {
         destination: &InclusiveRectangle,
         input: &mut ReadCursor<'_>,
     ) -> SessionResult<(FrameId, InclusiveRectangle)> {
+        let (frame, region) = self.decode_region(image, destination, input)?;
+        Ok((frame, region.unwrap_or_else(InclusiveRectangle::empty)))
+    }
+
+    /// Native no-op 保留 None；既有公开 decode 的默认返回约定保持。
+    pub(crate) fn decode_region(
+        &mut self,
+        image: &mut DecodedImage,
+        destination: &InclusiveRectangle,
+        input: &mut ReadCursor<'_>,
+    ) -> SessionResult<(FrameId, Option<InclusiveRectangle>)> {
         loop {
             let block = rfx::Block::decode(input).map_err(|e| custom_err!("decode block", e))?;
 
@@ -115,7 +126,7 @@ impl DecodingContext {
         input: &mut ReadCursor<'_>,
         image: &mut DecodedImage,
         destination: &InclusiveRectangle,
-    ) -> SessionResult<(FrameId, InclusiveRectangle)> {
+    ) -> SessionResult<(FrameId, Option<InclusiveRectangle>)> {
         let channel = self
             .channels
             .0
@@ -156,11 +167,32 @@ impl DecodingContext {
         trace!(channels = ?self.channels);
         trace!(?region);
 
-        let clipping_rectangles = clipping_rectangles(region.rectangles.as_slice(), destination, width, height);
+        let clipping_rectangles = if self.native_legacy_kernels.is_some() {
+            native_clipping_rectangles(region.rectangles.as_slice(), destination, width, height)?
+        } else {
+            clipping_rectangles(region.rectangles.as_slice(), destination, width, height)
+        };
         trace!("Clipping rectangles: {:?}", clipping_rectangles);
-
-        let mut final_update_rectangle = clipping_rectangles.extents.clone();
-
+        let mut final_update_rectangle = if self.native_legacy_kernels.is_some() {
+            None
+        } else {
+            Some(clipping_rectangles.extents.clone())
+        };
+        // Native 几何与 quant 索引先于 tile publication 验证；默认保留原惰性迭代次序。
+        if self.native_legacy_kernels.is_some() {
+            for tile in &tile_set.tiles {
+                native_tile_rectangle(tile, destination)?;
+                for index in [tile.y_quant_index, tile.cb_quant_index, tile.cr_quant_index] {
+                    if tile_set.quants.get(usize::from(index)).is_none() {
+                        return Err(custom_err!(
+                            "native RFX quant index",
+                            legacy_native::KernelError::Length
+                        ));
+                    }
+                }
+            }
+        }
+        // Native 已预先证明原 tile 算术不溢出；原 iterator 不新增 allocation/default 错误优先序。
         for (update_rectangle, tile_data) in tiles_to_rectangles(tile_set.tiles.as_slice(), destination)
             .zip(map_tiles_data(tile_set.tiles.as_slice(), tile_set.quants.as_slice()))
         {
@@ -173,14 +205,26 @@ impl DecodingContext {
                 self.native_legacy_kernels.as_ref(),
             )?;
 
-            let current_update_rectangle = image.apply_tile(
-                &self.decoding_tiles.tile_output,
-                PixelFormat::RgbA32,
-                &clipping_rectangles,
-                &update_rectangle,
-            )?;
-
-            final_update_rectangle = final_update_rectangle.union(&current_update_rectangle);
+            let current_update_rectangle = if let Some(kernels) = self.native_legacy_kernels.as_ref() {
+                image.apply_tile_native(
+                    &self.decoding_tiles.tile_output,
+                    PixelFormat::RgbA32,
+                    &clipping_rectangles,
+                    &update_rectangle,
+                    kernels,
+                )?
+            } else {
+                Some(image.apply_tile(
+                    &self.decoding_tiles.tile_output,
+                    PixelFormat::RgbA32,
+                    &clipping_rectangles,
+                    &update_rectangle,
+                )?)
+            };
+            if let Some(current) = current_update_rectangle {
+                final_update_rectangle =
+                    Some(final_update_rectangle.map_or_else(|| current.clone(), |prior| prior.union(&current)));
+            }
         }
 
         Ok((frame_begin.index, final_update_rectangle))
@@ -259,6 +303,83 @@ fn decode_component(
     dwt::decode(output, temp);
 
     Ok(())
+}
+
+fn native_clipping_rectangles(
+    rectangles: &[RfxRectangle],
+    destination: &InclusiveRectangle,
+    width: u16,
+    height: u16,
+) -> SessionResult<Region> {
+    if width == 0 || height == 0 {
+        return Err(custom_err!(
+            "native RFX geometry",
+            legacy_native::KernelError::InvalidDimensions
+        ));
+    }
+    let mut region = Region::new();
+    for rect in rectangles {
+        if rect.width == 0 || rect.height == 0 {
+            return Err(custom_err!(
+                "native RFX geometry",
+                legacy_native::KernelError::InvalidDimensions
+            ));
+        }
+        let left = u32::from(destination.left) + u32::from(rect.x);
+        let top = u32::from(destination.top) + u32::from(rect.y);
+        let right = left + u32::from(rect.width) - 1;
+        let bottom = top + u32::from(rect.height) - 1;
+        // 不把空交集夹成画面边缘的一个像素。
+        if left >= u32::from(width) || top >= u32::from(height) {
+            continue;
+        }
+        region.union_rectangle(InclusiveRectangle {
+            left: u16::try_from(left).map_err(|e| custom_err!("native RFX geometry", e))?,
+            top: u16::try_from(top).map_err(|e| custom_err!("native RFX geometry", e))?,
+            right: u16::try_from(right.min(u32::from(width) - 1)).map_err(|e| custom_err!("native RFX geometry", e))?,
+            bottom: u16::try_from(bottom.min(u32::from(height) - 1))
+                .map_err(|e| custom_err!("native RFX geometry", e))?,
+        });
+    }
+    Ok(region)
+}
+fn native_tile_rectangle(tile: &Tile<'_>, destination: &InclusiveRectangle) -> SessionResult<InclusiveRectangle> {
+    let left = tile
+        .x
+        .checked_mul(TILE_SIZE)
+        .and_then(|n| destination.left.checked_add(n))
+        .ok_or_else(|| {
+            custom_err!(
+                "native RFX tile geometry",
+                legacy_native::KernelError::InvalidDimensions
+            )
+        })?;
+    let top = tile
+        .y
+        .checked_mul(TILE_SIZE)
+        .and_then(|n| destination.top.checked_add(n))
+        .ok_or_else(|| {
+            custom_err!(
+                "native RFX tile geometry",
+                legacy_native::KernelError::InvalidDimensions
+            )
+        })?;
+    Ok(InclusiveRectangle {
+        left,
+        top,
+        right: left.checked_add(TILE_SIZE - 1).ok_or_else(|| {
+            custom_err!(
+                "native RFX tile geometry",
+                legacy_native::KernelError::InvalidDimensions
+            )
+        })?,
+        bottom: top.checked_add(TILE_SIZE - 1).ok_or_else(|| {
+            custom_err!(
+                "native RFX tile geometry",
+                legacy_native::KernelError::InvalidDimensions
+            )
+        })?,
+    })
 }
 
 fn clipping_rectangles(

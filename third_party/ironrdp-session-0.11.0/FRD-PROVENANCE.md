@@ -10,3 +10,49 @@ A2.6 的精确 `FRD-MODIFICATIONS.json` 只允许 `src/rfx.rs`、`src/fast_path.
 RFX 三组件和 checked color 全部成功后才 apply 当前 tile，失败返回 custom SessionError with source；已经发布的前一 tile 保留。Bitmap 原生错误在 apply/Region 前返回 custom SessionError with source；默认 None 分支保留旧 warn+rectangle。实际 FastPath、slow path 共用 Processor。该路径仍使用旧 image scalar 像素输出，A2.7 前不代表 whole-codec/生产能力就绪。
 
 来源全清单和独立原版 graph、完整 wire、image/partial publication、原版 panic/native checked error 区分与限制见 `tests/README.md`。没有 device/network/signing/GUI、协议广告或 live 互操作声明。
+
+## A2.7B explicit complete native image consumers
+
+Explicit selected capabilities now connect Bitmap/RDP6/RFX to the reviewed K row
+API through graphics' neutral reexports. Default builders/None policy and legacy
+image helpers preserve their previous semantics. Full source SW/SH, exact row
+stride, bottom-up indexing by SH, logical upper-left crop, target rectangles and
+256 MiB resource preflight belong to portable session adapters; K receives only
+exact tight rows. Raw Bitmap includes every align4 row pad, including the last;
+CODEC_ID_NONE retains the explicit baseline bottom-up tight BGR/BgrX convention.
+SetSurfaceBits uses extended dimensions and ignores incoming right/bottom;
+StreamSurfaceBits checks exclusive bounds and crops from the explicit source.
+These source-layout choices are not new wire/live qualification evidence.
+
+Native bitmap/tile methods return Option regions. No-op/outside/empty clips,
+marker-only and no-tile RFX frames cannot manufacture an origin pixel update;
+real (0,0) one-pixel updates still publish. Region32 preserves stock tile alpha
+semantics, region order and 64-pixel source stride. All predictable row/geometry/
+palette/capability checks precede pointer begin. A later rectangle/tile failure
+retains earlier successful work and reports a typed source; this is not whole-PDU
+rollback. Current K constructed capabilities have no remaining predictable row
+errors after this preflight; a future unknown row/pointer failure after begin
+can still retain prior rows/pointer side effects and is not promised atomic.
+
+Native pending local mouse movement is retained across first header/Bitmap
+failure, applied after a successful frame, or before a successfully decoded
+pointer shape/hide/default event to preserve event order. A successful server
+Position consumes/overrides pending local position. Cache misses and pointer
+decode failures do not consume it; earlier successful events remain per-update
+side effects. Cursor compositing and its legacy non-RGBA assumptions remain
+unchanged and do not qualify all-format cursor SIMD/visual correctness.
+
+`tests/fixtures/image-consumers-original.bin` contains 2,624 records frozen by a
+separate registry-only original process after complete source/archive/graph
+checks. Complete-source crop expectations copy pixels from stock-decoded full
+images; there is no production-derived color oracle. The fixture includes all
+64 Raw32 and Region32 source/target alpha combinations, multi-region tile output,
+stock cursor bytes/background and public pointer-event order, and separate old
+malformed behavior. Tests compile actual shipping sources and real public
+Processor/Stage APIs; native call traces and mutations discriminate missing
+completeness, geometry, alpha, native consumption and preflight publication.
+The separate QOI helper test uses the reviewed independent stock 192-byte alpha
+anchor. QOI/QOIZ wire feature branches are not enabled in the product cache graph
+and remain uncompiled/unexecuted here; no QOI codec SIMD/production claim follows.
+No production factory, advertisement, active-stage interface, UI, device,
+package, protocol manifest/lock or server component is changed.

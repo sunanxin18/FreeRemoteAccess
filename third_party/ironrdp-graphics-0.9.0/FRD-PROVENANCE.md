@@ -31,3 +31,23 @@ public bitmap无bytes-consumed字段；测量只来自private plane原版成功�
 仅 `src/rlgr.rs` shared zero materializer、`src/lib.rs` module 声明和新增 `src/legacy_native.rs`。原版 encoder 保留，RLGR default 保留原标量 zero；显式 native 在真正 run 和终端 pad 两处调用已有能力 zero 叶子。component 检查两个 4096 长度，映射明确十个 Quant 字段，依次 RLGR→LL3[4032..4096] differential→dequant→DWT，并返回有 source 的 typed error。没有 ISA 分支或重新选择 CPU，没有 K/数值/Cargo 修改。
 
 独立原版 RLGR/session/component fixtures 及 generator 来源、hash、命令和 checked/default 差别记录于 session vendor `tests/README.md`。`FRD-MODIFICATIONS.json` 扩展的两个原始路径均固定 upstream/post SHA；A2.3/A2.4/A2.5 四个既有记录不变。新消费者没有生产启用，image.rs/A2.7 仍是剩余 whole-codec 门。
+
+## A2.7B explicit complete Bitmap consumer
+
+The same shared RLE parser now reports actual `written` and `consumed` counters.
+Existing scalar and native parity wrappers discard those counters and retain their
+previous behavior; `decompress_native_complete` requires exact full-source output
+before the private buffer can be applied. Its separate typed error retains the
+native decoder or allocation error as a source and names incomplete progress.
+It validates checked full source sizes and enforces the named 256 MiB private
+Bitmap resource limit before reserve/resize. This resource limit is independent
+of destination cropping and does not impose a 2560×1440 resolution limit; 4K/8K
+geometry remains representable. Defaults and previous compatibility entrypoints
+do not acquire the strict completeness/resource gate.
+
+The architecture-neutral bridge reexports only the already reviewed closed
+pixel source/format/depth types. Session consumes the RLE resource constant from
+the portable graphics RLE module. There is no new ISA
+selection, dependency or scalar production fallback. Focused original image
+fixtures, public session tests and mutations are owned by the session vendor;
+A2.4 Bitmap parity remains an independent unchanged-behavior regression gate.

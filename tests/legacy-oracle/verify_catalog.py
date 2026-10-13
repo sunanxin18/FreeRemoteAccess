@@ -30,7 +30,11 @@ def validate_production_copy(base, name):
         assert inventory['schema'] == 1
         assert inventory['upstream_archive_sha256'] == '3f1a5a20c24d8ebf47477f9f513201aeb894e7c7f779ea633ece65e42a9f0652'
         modifications = inventory['modified_originals']
-        assert set(modifications) == {'src/rfx.rs', 'src/fast_path.rs', 'src/active_stage.rs'}, set(modifications)
+        assert set(modifications) == {'src/rfx.rs', 'src/fast_path.rs', 'src/active_stage.rs', 'src/image.rs'}, set(modifications)
+        assert inventory['image_consumer_fixture_sha256'] == 'c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80'
+        assert digest((base / 'tests/fixtures/image-consumers-original.bin').read_bytes()) == inventory['image_consumer_fixture_sha256']
+        for relative, expected in inventory['added_files'].items():
+            assert digest((base / relative).read_bytes()) == expected, relative
     elif name == 'ironrdp-pdu-0.9.0':
         inventory = json.loads((base / 'FRD-MODIFICATIONS.json').read_text())
         assert inventory['schema'] == 1

@@ -3,8 +3,10 @@ use std::sync::Arc;
 use ironrdp_core::assert_impl;
 use ironrdp_graphics::color_conversion::{rdp_15bit_to_rgb, rdp_16bit_to_rgb};
 use ironrdp_graphics::image_processing::{ImageRegion, ImageRegionMut, PixelFormat};
+use ironrdp_graphics::legacy_native::{KernelError, NativeKernels, PackedDepth, Pixel32Format, PixelRowSource};
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_graphics::rectangle_processing::Region;
+use ironrdp_graphics::rle::MAX_NATIVE_BITMAP_BYTES;
 use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use tracing::{debug, trace};
 
@@ -140,6 +142,41 @@ fn copy_cursor_data(
                 .copy_from_slice(&from[from_start..from_start + width * PIXEL_SIZE]);
         }
     }
+}
+
+// 封闭八格式映射；协议适配器不能传任意 channel offsets。
+pub(crate) fn native_pixel_format(format: PixelFormat) -> Pixel32Format {
+    match format {
+        PixelFormat::ARgb32 => Pixel32Format::ARgb,
+        PixelFormat::XRgb32 => Pixel32Format::XRgb,
+        PixelFormat::ABgr32 => Pixel32Format::ABgr,
+        PixelFormat::XBgr32 => Pixel32Format::XBgr,
+        PixelFormat::BgrA32 => Pixel32Format::BgrA,
+        PixelFormat::BgrX32 => Pixel32Format::BgrX,
+        PixelFormat::RgbA32 => Pixel32Format::RgbA,
+        PixelFormat::RgbX32 => Pixel32Format::RgbX,
+    }
+}
+fn native_source_bytes(format: PixelRowSource) -> usize {
+    match format {
+        PixelRowSource::Packed(PackedDepth::Index8) => 1,
+        PixelRowSource::Packed(PackedDepth::Rgb555 | PackedDepth::Rgb565) => 2,
+        PixelRowSource::Packed(PackedDepth::Bgr24) | PixelRowSource::Rgb24 => 3,
+        PixelRowSource::Raw32(_) | PixelRowSource::Region32(_) => 4,
+    }
+}
+fn native_rect_size(rect: &InclusiveRectangle) -> Result<(usize, usize), KernelError> {
+    if rect.left > rect.right || rect.top > rect.bottom {
+        return Err(KernelError::InvalidDimensions);
+    }
+    Ok((
+        usize::from(rect.right) - usize::from(rect.left) + 1,
+        usize::from(rect.bottom) - usize::from(rect.top) + 1,
+    ))
+}
+#[cfg(test)]
+std::thread_local! {
+    static NATIVE_IMAGE_CALLS: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl DecodedImage {
@@ -491,6 +528,184 @@ impl DecodedImage {
 
     // To apply the buffer, we need to un-apply previously drawn cursor, and then apply it again
     // in other position.
+
+    /// 先检查完整源形状、资源上限和目标几何；供 portable adapter 在分配前使用。
+    pub(crate) fn native_bitmap_size(
+        &self,
+        format: PixelRowSource,
+        source_width: usize,
+        source_height: usize,
+        row_stride: usize,
+        rectangle: &InclusiveRectangle,
+    ) -> SessionResult<usize> {
+        let (width, height) = native_rect_size(rectangle).map_err(|e| custom_err!("native bitmap geometry", e))?;
+        let pixel_bytes = native_source_bytes(format);
+        let row_bytes = source_width
+            .checked_mul(pixel_bytes)
+            .ok_or_else(|| custom_err!("native bitmap geometry", KernelError::InvalidDimensions))?;
+        if source_width == 0
+            || source_height == 0
+            || source_width < width
+            || source_height < height
+            || row_stride < row_bytes
+        {
+            return Err(custom_err!("native bitmap geometry", KernelError::InvalidDimensions));
+        }
+        row_stride
+            .checked_mul(source_height)
+            .filter(|&n| n <= isize::MAX as usize && n <= MAX_NATIVE_BITMAP_BYTES)
+            .ok_or_else(|| custom_err!("native bitmap resource limit", KernelError::InvalidDimensions))
+    }
+
+    /// 原生 Bitmap 的精确行接线；SW/SH 保持完整源布局，逻辑左上裁剪目标大小。
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn apply_bitmap_native(
+        &mut self,
+        source: &[u8],
+        source_format: PixelRowSource,
+        source_width: usize,
+        source_height: usize,
+        row_stride: usize,
+        bottom_up: bool,
+        rectangle: &InclusiveRectangle,
+        palette: Option<&[[u8; 3]; 256]>,
+        kernels: &NativeKernels,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        let expected = self.native_bitmap_size(source_format, source_width, source_height, row_stride, rectangle)?;
+        if source.len() != expected {
+            return Err(custom_err!("native bitmap source", KernelError::Length));
+        }
+        let (width, height) = native_rect_size(rectangle).map_err(|e| custom_err!("native bitmap geometry", e))?;
+        let source_row_bytes = width
+            .checked_mul(native_source_bytes(source_format))
+            .ok_or_else(|| custom_err!("native bitmap geometry", KernelError::InvalidDimensions))?;
+        let destination_row_bytes = width
+            .checked_mul(4)
+            .ok_or_else(|| custom_err!("native bitmap geometry", KernelError::InvalidDimensions))?;
+        let destination_format = native_pixel_format(self.pixel_format);
+        // 已构造能力不会猜 ISA；空行检查格式/能力/palette，所有可预测错误先于 cursor begin。
+        kernels
+            .convert_pixel_row(source_format, destination_format, &[], palette, &mut [])
+            .map_err(|e| custom_err!("native bitmap capability", e))?;
+        if !self.rect_fits(rectangle) {
+            return Ok(None);
+        }
+        let destination_start = usize::from(rectangle.top) * self.stride() + usize::from(rectangle.left) * 4;
+        for y in 0..height {
+            let source_y = if bottom_up { source_height - 1 - y } else { y };
+            let source_start = source_y * row_stride;
+            let destination_start = destination_start + y * self.stride();
+            if source.get(source_start..source_start + source_row_bytes).is_none()
+                || self
+                    .data
+                    .get(destination_start..destination_start + destination_row_bytes)
+                    .is_none()
+            {
+                return Err(custom_err!("native bitmap row", KernelError::Length));
+            }
+        }
+        #[cfg(test)]
+        NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("begin", 0)));
+        let state = self.pointer_rendering_begin(rectangle)?;
+        let stride = self.stride();
+        for y in 0..height {
+            let source_y = if bottom_up { source_height - 1 - y } else { y };
+            let start = source_y * row_stride;
+            let destination_start = destination_start + y * stride;
+            #[cfg(test)]
+            NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("row", destination_row_bytes)));
+            kernels
+                .convert_pixel_row(
+                    source_format,
+                    destination_format,
+                    &source[start..start + source_row_bytes],
+                    palette,
+                    &mut self.data[destination_start..destination_start + destination_row_bytes],
+                )
+                .map_err(|e| custom_err!("native bitmap row", e))?;
+        }
+        #[cfg(test)]
+        NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("end", 0)));
+        self.pointer_rendering_end(state).map(Some)
+    }
+
+    /// 完整 tile 已解码后，保持 Region32 alpha、region 顺序与固定 64 像素源 stride。
+    pub(crate) fn apply_tile_native(
+        &mut self,
+        source: &[u8],
+        source_format: PixelFormat,
+        clips: &Region,
+        update: &InclusiveRectangle,
+        kernels: &NativeKernels,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        let (width, height) = native_rect_size(update).map_err(|e| custom_err!("native tile geometry", e))?;
+        if width > 64 || height > 64 || source.len() != 64 * 64 * 4 {
+            return Err(custom_err!("native tile source", KernelError::Length));
+        }
+        if clips.rectangles.is_empty() {
+            return Ok(None);
+        }
+        native_rect_size(&clips.extents).map_err(|e| custom_err!("native tile clips", e))?;
+        for rect in &clips.rectangles {
+            native_rect_size(rect).map_err(|e| custom_err!("native tile clips", e))?;
+        }
+        let format = PixelRowSource::Region32(native_pixel_format(source_format));
+        let destination_format = native_pixel_format(self.pixel_format);
+        kernels
+            .convert_pixel_row(format, destination_format, &[], None, &mut [])
+            .map_err(|e| custom_err!("native tile capability", e))?;
+        if !self.rect_fits(&clips.extents) {
+            return Ok(None);
+        }
+        let region = clips.intersect_rectangle(update);
+        if region.rectangles.is_empty() {
+            return Ok(None);
+        }
+        // 全部 source/destination row 先验证，不让第二 region 几何错误发生在 pointer begin 后。
+        for rect in &region.rectangles {
+            let (width, height) = native_rect_size(rect).map_err(|e| custom_err!("native tile clips", e))?;
+            let x = usize::from(rect.left - update.left);
+            let y = usize::from(rect.top - update.top);
+            if x + width > 64 || y + height > 64 {
+                return Err(custom_err!("native tile source", KernelError::Length));
+            }
+            for row in 0..height {
+                let start = (y + row) * 64 * 4 + x * 4;
+                let to = (usize::from(rect.top) + row) * self.stride() + usize::from(rect.left) * 4;
+                if source.get(start..start + width * 4).is_none() || self.data.get(to..to + width * 4).is_none() {
+                    return Err(custom_err!("native tile row", KernelError::Length));
+                }
+            }
+        }
+        #[cfg(test)]
+        NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("begin", 0)));
+        let state = self.pointer_rendering_begin(&region.extents)?;
+        let stride = self.stride();
+        for rect in &region.rectangles {
+            let x = usize::from(rect.left - update.left);
+            let y = usize::from(rect.top - update.top);
+            let width = usize::from(rect.right) - usize::from(rect.left) + 1;
+            let height = usize::from(rect.bottom) - usize::from(rect.top) + 1;
+            for row in 0..height {
+                let start = (y + row) * 64 * 4 + x * 4;
+                let to = (usize::from(rect.top) + row) * stride + usize::from(rect.left) * 4;
+                #[cfg(test)]
+                NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("row", width * 4)));
+                kernels
+                    .convert_pixel_row(
+                        format,
+                        destination_format,
+                        &source[start..start + width * 4],
+                        None,
+                        &mut self.data[to..to + width * 4],
+                    )
+                    .map_err(|e| custom_err!("native tile row", e))?;
+            }
+        }
+        #[cfg(test)]
+        NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("end", 0)));
+        self.pointer_rendering_end(state).map(Some)
+    }
 
     pub(crate) fn apply_tile(
         &mut self,

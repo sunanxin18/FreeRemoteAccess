@@ -1,7 +1,7 @@
 //! 显式受检查的 legacy 消费者；调用方传入已验证 ISA 的能力，默认路径保持原版。
 use crate::rlgr::{self, RlgrError};
 use frd_rdp_legacy_kernels::Quantization;
-pub use frd_rdp_legacy_kernels::{KernelError, NativeKernels};
+pub use frd_rdp_legacy_kernels::{KernelError, NativeKernels, PackedDepth, Pixel32Format, PixelRowSource};
 use ironrdp_pdu::codecs::rfx::{EntropyAlgorithm, Quant};
 
 #[derive(Debug)]

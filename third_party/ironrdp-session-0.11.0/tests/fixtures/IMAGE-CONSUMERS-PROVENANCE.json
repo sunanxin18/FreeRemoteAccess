@@ -1,0 +1,61 @@
+{
+  "fixture_sha256": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80",
+  "original_image_sha256": "61cb9451695daa51e4e9bfe05ee7fae3faf746ae5275cb178b8a1f09c5cb5499",
+  "generator_sha256": "31908b83e6c3d1a9ab3eb2311d0110e3dee1f1cbe6392491256d4ba4976b4959",
+  "wrapper_sha256": "5781e9d019e99195f5ca794c82330874f11cefff8d08d4c979b45c3de1f9c0cc",
+  "profile": "debug",
+  "direct_artifacts": {
+    "ironrdp_error": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_error-ecf525555b8efbe1.rlib",
+      "sha256": "3d281be56cea526dcdb76f0865c7c451a5f29de5551b6eee7a5ad8c7ade081e1"
+    },
+    "ironrdp_core": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_core-71183368b15dcf84.rlib",
+      "sha256": "761bd589b9920ed8577a2190177a880196c5e15ab502d2a0dc14700e29423302"
+    },
+    "byteorder": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libbyteorder-e074dc42cd287f96.rlib",
+      "sha256": "2b45e5439431a4c16eb68770c0f399e54ddc37f984031572a2f9e90e67544198"
+    },
+    "tracing": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libtracing-40d7d6449d1fdab6.rlib",
+      "sha256": "41272391cdf991042e369c777f60569cd7f21e1574c7a5726958f218f1ec8960"
+    },
+    "yuv": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libyuv-7a4b5cc1511dc429.rlib",
+      "sha256": "e2f39db2e76f69afd91d432ae07d398a98d6ad62bf31c71b2cf35bd2c39a9e5f"
+    },
+    "bitvec": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libbitvec-253ed03589d63684.rlib",
+      "sha256": "9e163b2ec8598c48494b555ceca56efb01591623d024aed3ec473f1bf2a746fc"
+    },
+    "ironrdp_pdu": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_pdu-8fc33204e4179dd7.rlib",
+      "sha256": "7f3423043cfe0e59515947ecfc8cc8ed3d4caa40f4f7aa47b9bc03a07719ed0c"
+    },
+    "ironrdp_bulk": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_bulk-f8d11f8a30fe8fed.rlib",
+      "sha256": "808a23e58f5ccf70fed1e60a5c71333eb30aa1cb63ab646d77e5e52fb775886f"
+    },
+    "ironrdp_svc": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_svc-dda9c9fd47c95af7.rlib",
+      "sha256": "ea581aca1edd194b485d781717be5880d8fe663d65499be48feca89a669ce389"
+    },
+    "ironrdp_graphics": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_graphics-1bd84b9c85f66d6a.rlib",
+      "sha256": "5ef6d1e48a2b9760414ecbd617ad1c29d5cde627952e5d07108e3d50dc9c9c03"
+    },
+    "ironrdp_dvc": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_dvc-833a6c420c41dc54.rlib",
+      "sha256": "4df842a569718ad0b0df5f0b69b48f7822ece982c08bd004ed028fb8379e3a18"
+    },
+    "ironrdp_displaycontrol": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_displaycontrol-3312e5df82cf5611.rlib",
+      "sha256": "40806e3b2589a10d4ac48c0a900c263c2f8b3f4330f87b09344de884a8df7675"
+    },
+    "ironrdp_session": {
+      "path": "/Users/sun/FreeRemoteAccess/tests/legacy-oracle/target/debug/deps/libironrdp_session-bdcc08cdbd2d7f09.rlib",
+      "sha256": "14b9828a532be3a6f4fe35fdc432feb8f660095ee3b8ed4db838d2349c817045"
+    }
+  }
+}

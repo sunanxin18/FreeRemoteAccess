@@ -92,7 +92,7 @@ class ProductionInventoryTests(unittest.TestCase):
         validate_production_copy(base, 'ironrdp-session-0.11.0')
         inventory = base / 'FRD-MODIFICATIONS.json'
         original = inventory.read_text()
-        for relative in ['src/rfx.rs', 'src/fast_path.rs', 'src/active_stage.rs']:
+        for relative in ['src/rfx.rs', 'src/fast_path.rs', 'src/active_stage.rs', 'src/image.rs']:
             path = base / relative
             old = path.read_bytes()
             path.write_bytes(old + b'\n// unrecorded mutation\n')
@@ -107,8 +107,22 @@ class ProductionInventoryTests(unittest.TestCase):
                     validate_production_copy(base, 'ironrdp-session-0.11.0')
                 inventory.write_text(original)
         data = json.loads(original)
-        checksum = hashlib.sha256((base / 'src/image.rs').read_bytes()).hexdigest()
-        data['modified_originals']['src/image.rs'] = {'upstream_sha256': checksum, 'post_sha256': checksum}
+        checksum = hashlib.sha256((base / 'src/pointer.rs').read_bytes()).hexdigest()
+        data['modified_originals']['src/pointer.rs'] = {'upstream_sha256': checksum, 'post_sha256': checksum}
+        inventory.write_text(json.dumps(data))
+        with self.assertRaises(AssertionError):
+            validate_production_copy(base, 'ironrdp-session-0.11.0')
+
+    def test_image_consumer_fixture_rehash_cannot_replace_original_expected(self):
+        base = Path(self.temp.name) / 'ironrdp-session-0.11.0'
+        shutil.copytree(ROOT / 'third_party' / 'ironrdp-session-0.11.0', base)
+        fixture = base / 'tests/fixtures/image-consumers-original.bin'
+        fixture.write_bytes(fixture.read_bytes() + b'production-derived expected')
+        inventory = base / 'FRD-MODIFICATIONS.json'
+        data = json.loads(inventory.read_text())
+        digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+        data['added_files']['tests/fixtures/image-consumers-original.bin'] = digest
+        data['image_consumer_fixture_sha256'] = digest
         inventory.write_text(json.dumps(data))
         with self.assertRaises(AssertionError):
             validate_production_copy(base, 'ironrdp-session-0.11.0')

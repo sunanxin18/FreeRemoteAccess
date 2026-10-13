@@ -117,6 +117,104 @@ fn decompress_native_helper<Mode: DepthMode>(
     Ok(Mode::PIXEL_FORMAT)
 }
 
+/// 原生私有位图解码资源上限；完整源尺寸受限，裁剪不能绕过。
+pub const MAX_NATIVE_BITMAP_BYTES: usize = 256 * 1024 * 1024;
+
+/// 严格完整消费错误；不足写入发生在私有解码缓冲区，不能发布为图像区域。
+#[derive(Debug)]
+pub enum CompleteRleError {
+    Native(NativeRleError),
+    Incomplete {
+        expected: usize,
+        written: usize,
+        consumed: usize,
+    },
+    Allocation(std::collections::TryReserveError),
+}
+impl fmt::Display for CompleteRleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Native(e) => e.fmt(f),
+            Self::Incomplete {
+                expected,
+                written,
+                consumed,
+            } => write!(
+                f,
+                "RLE 解码不完整：写入 {written}/{expected} 字节，消费 {consumed} 字节"
+            ),
+            Self::Allocation(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for CompleteRleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Native(e) => Some(e),
+            Self::Allocation(e) => Some(e),
+            Self::Incomplete { .. } => None,
+        }
+    }
+}
+impl From<NativeRleError> for CompleteRleError {
+    fn from(e: NativeRleError) -> Self {
+        Self::Native(e)
+    }
+}
+
+/// 同一 wire parser 的实际写入计数；长度不等于完整解码证据。不重试 scalar。
+pub fn decompress_native_complete(
+    src: &[u8],
+    dst: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    kernels: &NativeKernels,
+) -> Result<RlePixelFormat, CompleteRleError> {
+    match bpp {
+        24 => decompress_native_complete_helper::<Mode24Bpp>(src, dst, width, height, kernels),
+        16 => decompress_native_complete_helper::<Mode16Bpp>(src, dst, width, height, kernels),
+        15 => decompress_native_complete_helper::<Mode15Bpp>(src, dst, width, height, kernels),
+        8 => decompress_native_complete_helper::<Mode8Bpp>(src, dst, width, height, kernels),
+        bpp => Err(NativeRleError::Rle(RleError::InvalidBpp { bpp }).into()),
+    }
+}
+fn decompress_native_complete_helper<Mode: DepthMode>(
+    src: &[u8],
+    dst: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+    kernels: &NativeKernels,
+) -> Result<RlePixelFormat, CompleteRleError> {
+    if width == 0 || height == 0 {
+        return Err(NativeRleError::Rle(RleError::EmptyImage).into());
+    }
+    let row_delta = Mode::COLOR_DEPTH
+        .checked_mul(width)
+        .ok_or(NativeRleError::Kernel(KernelError::InvalidDimensions))?;
+    let size = row_delta
+        .checked_mul(height)
+        .filter(|&n| n <= isize::MAX as usize && n <= MAX_NATIVE_BITMAP_BYTES)
+        .ok_or(NativeRleError::Kernel(KernelError::InvalidDimensions))?;
+    dst.try_reserve(size.saturating_sub(dst.len()))
+        .map_err(CompleteRleError::Allocation)?;
+    dst.resize(size, 0);
+    let progress = decompress_with_progress::<Mode, _>(
+        src,
+        dst,
+        row_delta,
+        &mut NativeMaterializer::new(kernels),
+    )?;
+    if progress.written != size {
+        return Err(CompleteRleError::Incomplete {
+            expected: size,
+            written: progress.written,
+            consumed: progress.consumed,
+        });
+    }
+    Ok(Mode::PIXEL_FORMAT)
+}
+
 /// Decompresses a 24-bpp RLE compressed bitmap.
 ///
 /// `src`: source buffer containing compressed bitmap
@@ -198,7 +296,9 @@ pub enum RleError {
 impl fmt::Display for RleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RleError::InvalidBpp { bpp } => write!(f, "invalid bytes per pixel: {bpp}"),
+            RleError::InvalidBpp { bpp } => {
+                write!(f, "invalid bytes per pixel: {bpp}")
+            }
             RleError::BadOrderCode => write!(f, "bad RLE order code"),
             RleError::NotEnoughBytes { expected, actual } => {
                 write!(
@@ -216,7 +316,9 @@ impl fmt::Display for RleError {
                 )
             }
             RleError::EmptyImage => write!(f, "height or width is zero"),
-            RleError::UnexpectedZeroLength => write!(f, "unexpected zero-length"),
+            RleError::UnexpectedZeroLength => {
+                write!(f, "unexpected zero-length")
+            }
         }
     }
 }
@@ -279,6 +381,21 @@ fn decompress_with<Mode: DepthMode, M: Materializer<Mode>>(
     row_delta: usize,
     materializer: &mut M,
 ) -> Result<(), M::Error> {
+    decompress_with_progress::<Mode, M>(src, dst, row_delta, materializer).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecodeProgress {
+    written: usize,
+    consumed: usize,
+}
+
+fn decompress_with_progress<Mode: DepthMode, M: Materializer<Mode>>(
+    src: &[u8],
+    dst: &mut [u8],
+    row_delta: usize,
+    materializer: &mut M,
+) -> Result<DecodeProgress, M::Error> {
     let mut src = Buf::new(src);
     let mut dst = BufMut::new(dst);
 
@@ -451,7 +568,10 @@ fn decompress_with<Mode: DepthMode, M: Materializer<Mode>>(
         }
     }
 
-    Ok(())
+    Ok(DecodeProgress {
+        written: dst.pos,
+        consumed: src.pos,
+    })
 }
 
 // Materializer 不决定 wire 检查或命令状态；调用前由共享 parser 保证 dst 空间。

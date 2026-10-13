@@ -4,18 +4,23 @@
   "modified_originals": {
     "src/rfx.rs": {
       "upstream_sha256": "aa49df5cd1cac0a5c23af97e48565f6402888afd58ce4fbd808e5f7db40b4c5b",
-      "post_sha256": "c39fcce342941ea8dbe42ef536cfaecbb1745156e8992a5fbddcb5926ee107e8",
-      "reason": "A2.6 explicit checked native RLGR/component/session policy consumers; old builders and defaults preserved"
+      "post_sha256": "a92f8425c9ac274dfdf8f65189bb56792de0e2cd22fe38d1600739d69e3b20db",
+      "reason": "A2.7B explicit native complete-source Bitmap/image/Surface/RFX row consumers; old default wrappers preserved, typed completeness/resource/geometry gates and Option publication"
     },
     "src/fast_path.rs": {
       "upstream_sha256": "6f617adab8e20101c93226b649ab90ba927f54305f741635412975211bade8d3",
-      "post_sha256": "56dfa2d0226380c2395e4bb59610b95683bd703bfc78edd56a86950c9452cc17",
-      "reason": "A2.6 explicit checked native RLGR/component/session policy consumers; old builders and defaults preserved"
+      "post_sha256": "5ee7b9451b83771320b3b5d0764aa4cf8e5568be9324276b1b6a457edd3088e2",
+      "reason": "A2.7B explicit native complete-source Bitmap/image/Surface/RFX row consumers; old default wrappers preserved, typed completeness/resource/geometry gates and Option publication"
     },
     "src/active_stage.rs": {
       "upstream_sha256": "e16cf3d0eadf92c9803fadca39efad540e0d6eb8a19902ed0143175b7e24b97a",
       "post_sha256": "09687dac04ad956d619fcd6edfb06c7bbd861b4bd94b8117b360e7a0f4fd63aa",
       "reason": "A2.6 explicit checked native RLGR/component/session policy consumers; old builders and defaults preserved"
+    },
+    "src/image.rs": {
+      "upstream_sha256": "61cb9451695daa51e4e9bfe05ee7fae3faf746ae5275cb178b8a1f09c5cb5499",
+      "post_sha256": "a48c8b5e425125c3e8af101cd02d32f141f6b866196a54f54573fc8b30dad165",
+      "reason": "A2.7B explicit native complete-source Bitmap/image/Surface/RFX row consumers; old default wrappers preserved, typed completeness/resource/geometry gates and Option publication"
     }
   },
   "added_files": {
@@ -29,6 +34,15 @@
     "tests/freeze_rfx.py": "294dee6af7d3e9e4f395db66163912b3b32c9fde48057dd7b0956d0123dfec87",
     "tests/fixtures/rfx-original-quant-order.bin": "635252cf344eb283f9328296c8602d37ef2dc68a2bfbbd4ea29f3b7f922bcbf2",
     "tests/fixtures/rfx-original-supplemental.bin": "9fbccd33f4d3de61ea170805077d6b41f66f2dd305adb0b15d1851956aed1bfe",
-    "tests/fixtures/rfx-original-catalog.bin": "9c03b62a6d53dcfe01ea4add02371f7d7aa338299330e4889f406f5e99d540b3"
-  }
+    "tests/fixtures/rfx-original-catalog.bin": "9c03b62a6d53dcfe01ea4add02371f7d7aa338299330e4889f406f5e99d540b3",
+    "tests/image_consumers_original_generator.rs": "31908b83e6c3d1a9ab3eb2311d0110e3dee1f1cbe6392491256d4ba4976b4959",
+    "tests/freeze_image_consumers.py": "fc5928f5e73aaf5c469d73b9a160a32b6a76ae184946cdd5b1ae6ff7e2829104",
+    "tests/image_consumers_native.rs": "42cda4ce6acca93087d9a7a51be750bfde2bf66fecc25fcc8bd2cb6dba4f3a1b",
+    "tests/run_image_consumers_tests.py": "910657b1758bf5742fb57f28c47c0faa526620fe2ff5376bb48f1a7277d77a05",
+    "tests/test_image_consumers_mutations.py": "fe7c5a4be44d1e3cb1413db7ba06c95fe25b146ca0d8764ea4eeee817cd06958",
+    "tests/image_qoi_helper_native.rs": "01ff42a9f4a37d02251580765108ace27881e4ffb9e93f78be690fc72167e021",
+    "tests/fixtures/image-consumers-original.bin": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80",
+    "tests/fixtures/IMAGE-CONSUMERS-PROVENANCE.json": "219f32ccb5211d5c2ad5128e7e1b511cf8d2d794fa04701c1476426338e6c25a"
+  },
+  "image_consumer_fixture_sha256": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80"
 }
