@@ -1,0 +1,4 @@
+*.h264 binary
+*.hevc binary
+*.yuv420p binary
+*.yuv444p binary

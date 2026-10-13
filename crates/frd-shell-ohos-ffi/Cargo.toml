@@ -8,8 +8,11 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 native-presentation-fixture = []
+normal-hap-codec-fixture = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
 
 [dependencies]
+frd-video-ffmpeg = { path = "../frd-video-ffmpeg", optional = true }
+sha2 = { version = "0.10", optional = true }
 frd-core = { path = "../frd-core" }
 frd-frame = { path = "../frd-frame" }
 frd-app = { path = "../frd-app" }

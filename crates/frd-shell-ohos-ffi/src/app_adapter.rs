@@ -215,7 +215,19 @@ impl AppEngine {
                         repeat: false,
                     });
                 }
+                #[cfg(all(
+                    debug_assertions,
+                    feature = "normal-hap-codec-fixture",
+                    target_env = "ohos"
+                ))]
+                let mut codec_fixture = crate::codec_fixture::Worker::start();
                 loop {
+                    #[cfg(all(
+                        debug_assertions,
+                        feature = "normal-hap-codec-fixture",
+                        target_env = "ohos"
+                    ))]
+                    codec_fixture.reap();
                     owner.apply_control();
                     // 关键 control 先于任何已排队成功事件；取消前认证 job 从未 admitted。
                     match receiver.recv_timeout(Duration::from_millis(15)) {

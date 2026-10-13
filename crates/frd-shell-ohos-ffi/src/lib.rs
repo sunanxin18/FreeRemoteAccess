@@ -4,8 +4,20 @@
 //! 阻塞前释放。attach 的借用窗口仅在调用期间跨线程移交，必须等待独立
 //! 引用取得和初始化结果；没有超时后仍访问借用窗口的路径。
 
+#[cfg(all(
+    debug_assertions,
+    feature = "normal-hap-codec-fixture",
+    feature = "native-presentation-fixture"
+))]
+compile_error!("两个合成夹具必须分别构建");
 mod app_abi;
 pub mod app_adapter;
+#[cfg(all(
+    debug_assertions,
+    feature = "normal-hap-codec-fixture",
+    any(test, target_env = "ohos")
+))]
+mod codec_fixture;
 #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
 mod fixture;
 pub mod input_adapter;

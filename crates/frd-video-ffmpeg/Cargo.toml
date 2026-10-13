@@ -3,6 +3,9 @@ name = "frd-video-ffmpeg"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+ohos-loader-diagnostics = []
+
 [dependencies]
 frd-core = { path = "../frd-core" }
 frd-media-api = { path = "../frd-media-api" }

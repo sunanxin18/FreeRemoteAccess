@@ -2203,10 +2203,12 @@ dependencies = [
  "frd-render-wgpu",
  "frd-shell-runtime",
  "frd-ui-model",
+ "frd-video-ffmpeg",
  "pollster",
  "raw-window-handle",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "wgpu",
 ]
 

@@ -12,6 +12,45 @@ use libloading::Library;
 
 use crate::abi::{FrdGetFfmpegApiV1, FrdStatus, RawFrdFfmpegApiV1, FRD_FFMPEG_API_SYMBOL};
 
+// 宏在非显式 OHOS debug 诊断构建中完全消失，包括参数求值。
+macro_rules! trace_stage {
+    ($($arg:tt)*) => {
+        #[cfg(all(target_env = "ohos", debug_assertions, feature = "ohos-loader-diagnostics"))]
+        diagnostic_stage(format!($($arg)*));
+    };
+}
+#[cfg(all(
+    target_env = "ohos",
+    debug_assertions,
+    feature = "ohos-loader-diagnostics"
+))]
+fn diagnostic_stage(message: String) {
+    #[link(name = "hilog_ndk.z")]
+    extern "C" {
+        fn OH_LOG_Print(
+            t: u32,
+            l: u32,
+            d: u32,
+            tag: *const libc::c_char,
+            fmt: *const libc::c_char,
+            ...
+        ) -> i32;
+    }
+    if let Ok(message) = CString::new(message) {
+        // 调用点只传固定阶段名、布尔值、权限位和 errno，不传路径或 UID。
+        unsafe {
+            OH_LOG_Print(
+                0,
+                4,
+                0xFF00,
+                c"FrdCodecProbe".as_ptr(),
+                c"fixture=4c3e %{public}s".as_ptr(),
+                message.as_ptr(),
+            );
+        }
+    }
+}
+
 const ANCHOR_NAME: &str = "libfrd_shell_ohos_ffi.so";
 const NAMES: [&str; 3] = [
     "libavutil.so.60",
@@ -141,7 +180,10 @@ fn image_at(address: usize) -> Result<Image> {
     // 安全：成功的 dladdr 返回映射持有期间有效的 NUL 结尾名称。
     let path = unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes();
     let path = PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
-    clean_absolute(&path)?;
+    clean_absolute(&path).map_err(|error| {
+        trace_stage!("stage=image_at_clean");
+        error
+    })?;
     Ok(Image {
         path,
         base: info.dli_fbase as usize,
@@ -157,6 +199,7 @@ fn clean_absolute(path: &Path) -> Result<()> {
             .split(|b| *b == b'/')
             .any(|part| part.is_empty() || part == b"." || part == b".." || part.ends_with(b".hap"))
     {
+        trace_stage!("stage=clean_absolute absolute={} bang={} hap_component={} empty_or_dot_component={} basename_match={}", path.is_absolute(), bytes.contains(&b'!'), bytes.split(|b| *b == b'/').any(|p| p.ends_with(b".hap")), bytes.get(1..).unwrap_or_default().split(|b| *b == b'/').any(|p| p.is_empty() || p == b"." || p == b".."), path.file_name() == Some(std::ffi::OsStr::new(ANCHOR_NAME)));
         return Err(Failure::Path);
     }
     Ok(())
@@ -193,6 +236,16 @@ fn application_code_dir() -> Result<PathBuf> {
             &mut length,
         )
     };
+    trace_stage!(
+        "stage=context_reply status={} length_positive={} length_in_buffer={} end_nul={}",
+        status,
+        length > 0,
+        usize::try_from(length).is_ok_and(|n| n < buffer.len()),
+        usize::try_from(length)
+            .ok()
+            .and_then(|n| buffer.get(n))
+            .is_some_and(|b| *b == 0)
+    );
     code_path_from_reply(status, length, &buffer)
 }
 
@@ -205,6 +258,13 @@ fn neighbor_paths(code: &Path, anchor: &Path) -> Result<[PathBuf; 3]> {
         || !parent.starts_with(code)
         || parent == code
     {
+        trace_stage!(
+            "stage=neighbor root_is_slash={} basename_match={} under_code={} parent_is_code={}",
+            code == Path::new("/"),
+            anchor.file_name() == Some(std::ffi::OsStr::new(ANCHOR_NAME)),
+            parent.starts_with(code),
+            parent == code
+        );
         return Err(Failure::Origin);
     }
     Ok(NAMES.map(|name| parent.join(name)))
@@ -229,33 +289,89 @@ fn verify_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     } else {
         match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::EACCES | libc::EROFS) => false,
-            _ => return Err(Failure::Permission),
+            _other => {
+                trace_stage!("stage=effective_access errno={}", _other.unwrap_or(0));
+                return Err(Failure::Permission);
+            }
         }
     };
     // 安全：geteuid 没有参数或内存前提。
-    permission_facts(
-        metadata.mode(),
-        metadata.uid(),
-        unsafe { libc::geteuid() },
-        writable,
-    )
+    let effective_uid = unsafe { libc::geteuid() };
+    permission_facts(metadata.mode(), metadata.uid(), effective_uid, writable).map_err(|error| {
+        trace_stage!(
+            "stage=permission mode={} owner_is_app={} effective_writable={}",
+            metadata.mode() & 0o7777,
+            metadata.uid() == effective_uid,
+            writable
+        );
+        error
+    })
+}
+
+fn lease_flags(directory: bool) -> i32 {
+    let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if !directory {
+        return flags;
+    }
+    let flags = flags | libc::O_DIRECTORY;
+    // 应用沙箱根可搜索但不允许列目录；身份租约只需要 fstat，不读取目录内容。
+    // O_PATH 仅用于 OHOS 目录，保留原有 lstat/type/nofollow/权限及 inode 复核。
+    #[cfg(target_env = "ohos")]
+    let flags = flags | libc::O_PATH;
+    flags
+}
+
+fn open_lease_handle(path: &Path, directory: bool) -> std::io::Result<File> {
+    let flags = lease_flags(directory);
+    #[cfg(target_env = "ohos")]
+    if directory {
+        use std::os::fd::FromRawFd;
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        // OHOS/musl 的 O_ACCMODE 包含 O_PATH，std OpenOptions 会清除该位。
+        // 直接调用公开 open 保留完整目录标志；无降级重试，成功 fd 只移交一次。
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // 安全：成功 open 返回本调用独占且尚未转交的 fd，File 负责关闭。
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    OpenOptions::new().read(true).custom_flags(flags).open(path)
 }
 
 fn open_lease(path: &Path, directory: bool) -> Result<Lease> {
-    let before = fs::symlink_metadata(path).map_err(|_| Failure::Path)?;
+    let before = fs::symlink_metadata(path).map_err(|_error| {
+        trace_stage!(
+            "stage=lease_metadata directory={} errno={}",
+            directory,
+            _error.raw_os_error().unwrap_or(0)
+        );
+        Failure::Path
+    })?;
     if before.file_type().is_symlink()
         || before.is_dir() != directory
         || (!directory && !before.is_file())
     {
+        trace_stage!(
+            "stage=lease_type expected_directory={} directory={} file={} symlink={}",
+            directory,
+            before.is_dir(),
+            before.is_file(),
+            before.file_type().is_symlink()
+        );
         return Err(Failure::Path);
     }
     verify_permissions(path, &before)?;
-    let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | if directory { libc::O_DIRECTORY } else { 0 };
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)
-        .map_err(|_| Failure::Path)?;
+    let file = open_lease_handle(path, directory).map_err(|_error| {
+        trace_stage!(
+            "stage=lease_open directory={} flags={} errno={}",
+            directory,
+            lease_flags(directory),
+            _error.raw_os_error().unwrap_or(0)
+        );
+        Failure::Path
+    })?;
     let lease = Lease {
         path: path.to_owned(),
         file,
@@ -276,11 +392,28 @@ fn prepare(code: &Path, anchor: &Path) -> Result<(Resources, [PathBuf; 3])> {
     // 从根到 native 目录逐级先核验再打开；已验证的父目录不可由应用替换。
     let mut ancestors = parent.ancestors().collect::<Vec<_>>();
     ancestors.reverse();
-    for directory in ancestors {
-        resources.leases.push(open_lease(directory, true)?);
+    for (_depth, directory) in ancestors.into_iter().enumerate() {
+        resources
+            .leases
+            .push(open_lease(directory, true).map_err(|error| {
+                trace_stage!("stage=lease_directory depth={} failure={:?}", _depth, error);
+                error
+            })?);
     }
-    for path in std::iter::once(anchor).chain(paths.iter().map(PathBuf::as_path)) {
-        resources.leases.push(open_lease(path, false)?);
+    for (_index, path) in std::iter::once(anchor)
+        .chain(paths.iter().map(PathBuf::as_path))
+        .enumerate()
+    {
+        resources
+            .leases
+            .push(open_lease(path, false).map_err(|error| {
+                trace_stage!(
+                    "stage=lease_file role={} failure={:?}",
+                    ["anchor", "util", "codec", "plugin"][_index],
+                    error
+                );
+                error
+            })?);
     }
     resources.verify()?;
     Ok((resources, paths))
@@ -348,7 +481,52 @@ fn load_in_order<T>(
 
 #[cfg(target_env = "ohos")]
 pub(crate) fn load() -> std::result::Result<(RawFrdFfmpegApiV1, Resources), VideoDecodeError> {
-    load_from_context(application_code_dir()?).map_err(Into::into)
+    application_code_dir()
+        .and_then(load_from_context)
+        .map_err(|failure| {
+            #[cfg(all(debug_assertions, feature = "ohos-loader-diagnostics"))]
+            diagnostic(failure);
+            failure.into()
+        })
+}
+
+#[cfg(all(
+    target_env = "ohos",
+    debug_assertions,
+    feature = "ohos-loader-diagnostics"
+))]
+fn diagnostic(failure: Failure) {
+    #[link(name = "hilog_ndk.z")]
+    extern "C" {
+        fn OH_LOG_Print(
+            t: u32,
+            l: u32,
+            d: u32,
+            tag: *const libc::c_char,
+            fmt: *const libc::c_char,
+            ...
+        ) -> i32;
+    }
+    let category = match failure {
+        Failure::Origin => c"Origin",
+        Failure::Path => c"Path",
+        Failure::Permission => c"Permission",
+        Failure::Identity => c"Identity",
+        Failure::Symbol => c"Symbol",
+        Failure::Library => c"Library",
+        Failure::Abi => c"ABI",
+    };
+    // 仅固定类别，不记录路径、系统原始错误或应用身份。
+    unsafe {
+        OH_LOG_Print(
+            0,
+            4,
+            0xFF00,
+            c"FrdCodecProbe".as_ptr(),
+            c"fixture=4c3e load_failure=%{public}s".as_ptr(),
+            category.as_ptr(),
+        );
+    }
 }
 
 fn load_from_context(code: PathBuf) -> Result<(RawFrdFfmpegApiV1, Resources)> {
@@ -625,6 +803,40 @@ mod tests {
     }
 
     #[test]
+    fn lease_flags_keep_file_reads_and_guard_ohos_directory_path_handles() {
+        assert_eq!(lease_flags(false), libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let required = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY;
+        #[cfg(target_env = "ohos")]
+        assert_eq!(lease_flags(true), required | libc::O_PATH);
+        #[cfg(not(target_env = "ohos"))]
+        assert_eq!(lease_flags(true), required);
+    }
+
+    #[test]
+    fn retained_directory_replacement_and_symlink_fail_exact_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "frd-ohos-directory-identity-{}",
+            std::process::id()
+        ));
+        let path = root.join("node");
+        fs::create_dir_all(&path).unwrap();
+        let file = open_lease_handle(&path, true).unwrap();
+        let lease = Lease {
+            path: path.clone(),
+            identity: Identity::of(&file.metadata().unwrap()),
+            file,
+            directory: true,
+        };
+        fs::rename(&path, root.join("old")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(lease.verify(), Err(Failure::Identity));
+        fs::remove_dir(&path).unwrap();
+        std::os::unix::fs::symlink(root.join("old"), &path).unwrap();
+        assert_eq!(lease.verify(), Err(Failure::Identity));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn replaced_inode_and_symlink_cannot_satisfy_retained_lease() {
         // 此夹具只验证负例身份，绝不将用户临时目录当作受信安装目录。
         let root = std::env::temp_dir().join(format!("frd-ohos-identity-{}", std::process::id()));
@@ -641,10 +853,10 @@ mod tests {
         };
         fs::rename(&path, root.join("old.so")).unwrap();
         fs::write(&path, b"replacement").unwrap();
-        assert!(lease.verify().is_err());
+        assert_eq!(lease.verify(), Err(Failure::Identity));
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(root.join("old.so"), &path).unwrap();
-        assert!(lease.verify().is_err());
+        assert_eq!(lease.verify(), Err(Failure::Identity));
         assert!(open_lease(&path, false).is_err());
         assert!(open_lease(&root, true).is_err());
         fs::remove_dir_all(root).unwrap();
