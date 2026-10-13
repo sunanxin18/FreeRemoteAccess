@@ -32,6 +32,8 @@ struct Index {
   @State private protocol: string = 'auto';
   @State private remember: boolean = false;
   @State private compact: boolean = false;
+  @State private showingDiagnostics: boolean = false;
+  @State private loginHeight: number = 700;
   @State private windowWidth: number = 500;
   @State private passwordEpoch: number = 0;
   @State private bridgeNotice: string = '';
@@ -122,11 +124,11 @@ struct Index {
     }, 100);
   }
   aboutToDisappear(): void { clearInterval(this.timer); this.release(); }
-  onBackPress(): boolean { if (this.model.page !== 0) { native.appAction(2, '0', 0, 0); return true; } return false; }
+  onBackPress(): boolean { if (this.showingDiagnostics) { this.showingDiagnostics = false; return true; } if (this.model.page !== 0) { native.appAction(2, '0', 0, 0); return true; } return false; }
   @Builder
   passwordInput() {
     TextInput({ placeholder: this.model.credentialLoaded ? '已从安全存储载入；输入可替换' : '请输入密码' })
-      .type(InputType.Password).constraintSize({ minHeight: 48 }).width('100%').enterKeyType(EnterKeyType.Go).accessibilityText('密码')
+      .type(InputType.Password).fontSize(16).constraintSize({ minHeight: 48 }).width('100%').enterKeyType(EnterKeyType.Go).accessibilityText('密码')
       .showError(this.error(this.model.errors?.password)).enabled(this.model.page === 0)
       .onChange((value: string, preview?: PreviewText) => {
         const composing = (preview?.value.length ?? 0) > 0;
@@ -137,54 +139,110 @@ struct Index {
       .onKeyEvent((event: KeyEvent) => { if (event.keyCode === 2054) { if (event.type === KeyType.Up) { this.enterHeld = false; this.enterSubmitted = false; } else { this.enterHeld = true; } } })
       .onSubmit(() => { if (this.enterHeld && this.enterSubmitted) { return; } if (!this.composing && !this.compositionBatch) { this.enterSubmitted = this.enterHeld; this.submit(); } })
   }
+  private profileOptions(): SelectOption[] {
+    return (this.model.profiles ?? []).map((profile: ProfileSummary): SelectOption => {
+      return { value: `${profile.address}:${profile.port} · ${profile.username}` };
+    });
+  }
+  @Builder
+  fieldLabel(label: string) {
+    Text(label).fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
+  }
+  @Builder
+  diagnosticsSheet() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Text('仅用于开发验证，不会连接远程计算机').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%')
+        Button(this.showingPoc ? '停止离线图形验证' : '离线图形验证').fontSize(16).constraintSize({ minHeight: 48 }).width('100%').focusable(true)
+          .onClick(() => { this.showingDiagnostics = false; this.showingPoc = !this.showingPoc; })
+        Button('验证系统安全存储').fontSize(16).constraintSize({ minHeight: 48 }).width('100%').focusable(true).enabled(this.model.probe !== 1)
+          .onClick(() => { this.check(native.huksProbe()); })
+        if (this.model.probe !== 0 && this.model.probe !== undefined) {
+          Text(this.model.probe === 7 ? '安全存储加密、重载与篡改拒绝已验证' : this.model.probe === 1 ? '正在验证系统安全存储' : `系统安全存储验证失败（${this.model.probe}）`)
+            .fontSize(14).fontColor($r('app.color.text_secondary')).width('100%')
+        }
+        Button('关闭', { type: ButtonType.Normal }).buttonStyle(ButtonStyleMode.TEXTUAL).fontSize(16)
+          .constraintSize({ minHeight: 48 }).width('100%').focusable(true).onClick(() => { this.showingDiagnostics = false; })
+      }.width('100%').padding({ left: 24, right: 24, top: 12, bottom: 24 })
+    }.width('100%').constraintSize({ maxHeight: this.loginHeight * 0.7 }).scrollBar(BarState.Auto)
+  }
   @Builder
   connectionForm() {
     Scroll() {
-      Column({ space: this.compact ? 10 : 16 }) {
-        Text('FreeRemoteDesk').fontSize(this.compact ? 24 : 32).fontWeight(FontWeight.Bold).fontColor($r('app.color.text_primary'))
-        Text('连接远程桌面').fontSize(18).fontColor($r('app.color.text_secondary'))
-        if ((this.model.profiles?.length ?? 0) > 0) {
-          Text('最近连接').fontSize(14).width('100%').textAlign(TextAlign.Start)
-          ForEach(this.model.profiles ?? [], (profile: ProfileSummary, index: number) => {
-            Button(`${profile.address} · ${profile.username}`).constraintSize({ minHeight: 48 }).width('100%').focusable(true)
-              .onClick(() => { this.selectedIndex = index; this.selectPending = true; this.check(native.appAction(4, '0', 0, index)); })
-          })
-        }
-        Text('目标系统').fontSize(14).width('100%').textAlign(TextAlign.Start)
-        Select([{ value: 'Windows' }, { value: 'macOS' }, { value: 'Linux' }]).selected(this.target - 1).value(this.target === 1 ? 'Windows' : this.target === 2 ? 'macOS' : 'Linux')
-          .width('100%').constraintSize({ minHeight: 48 }).accessibilityText('目标系统').onSelect((index: number) => { this.target = index + 1; this.port = index === 1 ? '5900' : '3389'; this.edit(); })
-        Text('主机地址').fontSize(14).width('100%').textAlign(TextAlign.Start)
-        TextInput({ text: this.address, placeholder: '主机名或 IP 地址' }).constraintSize({ minHeight: 48 }).accessibilityText('主机地址')
-          .showError(this.error(this.model.errors?.address)).onChange((v: string) => { this.address = v; this.edit(); })
-        Text('端口').fontSize(14).width('100%').textAlign(TextAlign.Start)
-        TextInput({ text: this.port, placeholder: '端口' }).type(InputType.Number).constraintSize({ minHeight: 48 }).accessibilityText('端口')
-          .showError(this.error(this.model.errors?.port)).onChange((v: string) => { this.port = v; this.edit(); })
-        Text('用户名').fontSize(14).width('100%').textAlign(TextAlign.Start)
-        TextInput({ text: this.username, placeholder: '远程计算机账户' }).constraintSize({ minHeight: 48 }).accessibilityText('用户名')
-          .showError(this.error(this.model.errors?.username)).onChange((v: string) => { this.username = v; this.edit(); })
-        Text('密码').fontSize(14).width('100%').textAlign(TextAlign.Start)
-        ForEach([this.passwordEpoch], (_epoch: number) => { this.passwordInput() }, (epoch: number) => `${epoch}`)
-        if (this.model.loading) { Text(this.model.loading).fontSize(14).width('100%').fontColor($r('app.color.text_secondary')) }
-        if (this.model.credentialLoaded) { Text('已从系统安全存储载入密码').fontSize(14).width('100%') }
-        Row({ space: 8 }) {
-          Checkbox().select(this.remember).width(48).constraintSize({ minHeight: 48 }).accessibilityText('在此设备安全保存登录信息')
-            .onChange((value: boolean) => { this.remember = value; this.edit(); })
-          Text('在此设备安全保存登录信息').fontSize(14).layoutWeight(1)
-        }.width('100%')
-        if (!this.model.available) { Text('此设备尚无可用的远程连接协议').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%') }
-        if (this.model.notice || this.bridgeNotice) { Text(this.bridgeNotice || this.model.notice || '').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')) }
-        Button('连接').constraintSize({ minHeight: 48 }).width('100%').enabled(this.model.canConnect ?? false).focusable(true).accessibilityText('连接远程桌面').onClick(() => this.submit())
-        if (native.pocAvailable()) {
-          Button(this.showingPoc ? '停止离线图形验证' : '离线图形验证').constraintSize({ minHeight: 48 }).width('100%').focusable(true)
-            .onClick(() => { this.showingPoc = !this.showingPoc; })
-          Button('验证系统安全存储').constraintSize({ minHeight: 48 }).width('100%').focusable(true).enabled(this.model.probe !== 1)
-            .onClick(() => { this.check(native.huksProbe()); })
-          if (this.model.probe !== 0 && this.model.probe !== undefined) {
-            Text(this.model.probe === 7 ? '安全存储加密、重载与篡改拒绝已验证' : this.model.probe === 1 ? '正在验证系统安全存储' : `系统安全存储验证失败（${this.model.probe}）`).fontSize(14).width('100%')
+      Column() {
+        Row({ space: 12 }) {
+          Column({ space: 4 }) {
+            Text('连接远程桌面').fontSize(this.compact ? 24 : 28).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary')).width('100%').textAlign(TextAlign.Start)
+            Text('FreeRemoteDesk').fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
+          }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+          if (native.pocAvailable()) {
+            Button('开发验证', { type: ButtonType.Normal }).buttonStyle(ButtonStyleMode.TEXTUAL).fontSize(14)
+              .fontColor($r('app.color.text_secondary')).constraintSize({ minHeight: 48, minWidth: 80 }).focusable(true)
+              .accessibilityText('打开仅用于开发的验证工具').onClick(() => { this.showingDiagnostics = true; })
+              .bindSheet($$this.showingDiagnostics, this.diagnosticsSheet(), {
+                height: SheetSize.FIT_CONTENT, showClose: true, title: { title: '开发验证' }
+              })
           }
+        }.width('100%').constraintSize({ minHeight: 48 }).margin({ bottom: this.compact ? 16 : 24 })
+        if ((this.model.profiles?.length ?? 0) > 0) {
+          Select(this.profileOptions()).selected(this.model.selectedIndex ?? -1).value('最近连接')
+            .font({ size: 14 }).optionFont({ size: 16 }).optionWidth(OptionWidthMode.FIT_TRIGGER)
+            .width('100%').constraintSize({ minHeight: 48 }).accessibilityText('选择最近连接')
+            .onSelect((index: number) => { this.selectedIndex = index; this.selectPending = true; this.check(native.appAction(4, '0', 0, index)); })
+            .margin({ bottom: 12 })
+          if (this.model.errors?.profile) { Text(this.error(this.model.errors.profile)).fontSize(14).width('100%').margin({ bottom: 8 }) }
         }
-      }.width('100%').constraintSize({ maxWidth: 440 }).padding({ top: 24, bottom: 24 }).alignItems(HorizontalAlign.Center)
-    }.width('100%').layoutWeight(1).clip(true).scrollBar(BarState.Auto).padding({ left: 24, right: 24 })
+        Column({ space: 12 }) {
+          Row({ space: 12 }) {
+            Column({ space: 6 }) {
+              this.fieldLabel('目标系统')
+              Select([{ value: 'Windows' }, { value: 'macOS' }, { value: 'Linux' }]).selected(this.target - 1).value(this.target === 1 ? 'Windows' : this.target === 2 ? 'macOS' : 'Linux')
+                .font({ size: 16 }).optionFont({ size: 16 }).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('目标系统')
+                .onSelect((index: number) => { this.target = index + 1; this.port = index === 1 ? '5900' : '3389'; this.edit(); })
+              if (this.model.errors?.target) { Text(this.error(this.model.errors.target)).fontSize(14).width('100%') }
+            }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+            Column({ space: 6 }) {
+              this.fieldLabel('端口')
+              TextInput({ text: this.port, placeholder: '端口' }).type(InputType.Number).fontSize(16).width('100%')
+                .constraintSize({ minHeight: 48 }).accessibilityText('端口').showError(this.error(this.model.errors?.port))
+                .onChange((v: string) => { this.port = v; this.edit(); })
+            }.width(96).alignItems(HorizontalAlign.Start)
+          }.width('100%').alignItems(VerticalAlign.Top)
+          Column({ space: 6 }) {
+            this.fieldLabel('主机地址')
+            TextInput({ text: this.address, placeholder: '主机名或 IP 地址' }).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('主机地址')
+              .showError(this.error(this.model.errors?.address)).onChange((v: string) => { this.address = v; this.edit(); })
+          }.width('100%')
+          Column({ space: 6 }) {
+            this.fieldLabel('用户名')
+            TextInput({ text: this.username, placeholder: '远程计算机账户' }).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('用户名')
+              .showError(this.error(this.model.errors?.username)).onChange((v: string) => { this.username = v; this.edit(); })
+          }.width('100%')
+          Column({ space: 6 }) {
+            this.fieldLabel('密码')
+            ForEach([this.passwordEpoch], (_epoch: number) => { this.passwordInput() }, (epoch: number) => `${epoch}`)
+          }.width('100%')
+        }.width('100%')
+        if (this.model.loading) { Text(this.model.loading).fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 8 }) }
+        if (this.model.credentialLoaded) { Text('已从系统安全存储载入密码').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 8 }) }
+        // 整行只由一个原生按钮接收点击；复选框仅绘制状态，避免父子重复切换。
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 12 }) {
+            Checkbox().select(this.remember).width(24).height(24).hitTestBehavior(HitTestMode.None).focusable(false).accessibilityLevel('no')
+            Text('在此设备安全保存登录信息').fontSize(14).fontColor($r('app.color.text_primary')).layoutWeight(1).textAlign(TextAlign.Start)
+          }.width('100%')
+        }.buttonStyle(ButtonStyleMode.TEXTUAL).padding({ left: 0, right: 0, top: 8, bottom: 8 }).width('100%').constraintSize({ minHeight: 48 })
+          .focusable(true).accessibilityText('在此设备安全保存登录信息').accessibilityRole(AccessibilityRoleType.CHECKBOX).accessibilityChecked(this.remember)
+          .onClick(() => { this.remember = !this.remember; this.edit(); }).margin({ top: 8 })
+        if (!this.model.available) { Text('此设备尚无可用的远程连接协议').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').margin({ top: 4 }) }
+        if (this.model.errors?.protocol) { Text(this.error(this.model.errors.protocol)).fontSize(14).width('100%').margin({ top: 4 }) }
+        if (this.model.notice || this.bridgeNotice) { Text(this.bridgeNotice || this.model.notice || '').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 4 }) }
+        Button('连接').fontSize(16).constraintSize({ minHeight: 48 }).width('100%').enabled(this.model.canConnect ?? false).focusable(true)
+          .accessibilityText('连接远程桌面').onClick(() => this.submit()).margin({ top: 8 })
+      }.width('100%').constraintSize({ maxWidth: 440 }).padding({ top: this.compact ? 16 : 24, bottom: this.compact ? 16 : 24 }).alignItems(HorizontalAlign.Center)
+    }.width('100%').layoutWeight(1).clip(true).scrollBar(BarState.Auto).padding({ left: this.compact ? 16 : 24, right: this.compact ? 16 : 24 })
+      .onAreaChange((_, area) => { this.loginHeight = Number(area.height); })
   }
   @Builder
   remoteSurface() {
@@ -259,6 +317,6 @@ struct Index {
       .padding({ left: this.getUIContext().px2vp(this.cutoutLeft), right: this.getUIContext().px2vp(this.cutoutRight), top: this.getUIContext().px2vp(this.cutoutTop), bottom: this.getUIContext().px2vp(this.cutoutBottom) })
       .backgroundColor($r('app.color.page_background'))
       .onKeyEvent((event: KeyEvent) => this.remoteKey(event))
-      .onAreaChange((_, area) => { this.compact = Number(area.height) < 500; this.windowWidth = Number(area.width); })
+      .onAreaChange((_, area) => { this.compact = Number(area.width) < 600 || Number(area.height) < 500; this.windowWidth = Number(area.width); })
   }
 }
