@@ -88,3 +88,16 @@ Windows/Linux 各 i686、x86_64、ARM64，macOS ARM64 与 OHOS ARM64 共八个�
 子采样 YCoCg 对此对照约快 4.62 倍，其余三类较慢。在 packed BGR24/1024 中，native fill/XOR/dither 相比对照约快 13–16 倍，copy 仍较慢；短尾原语固定调用与 checked 边界有开销。这些差异完整保留，不能把“已使用 SIMD”写成“整体更快”。宿主数据在 `target/frd-planar-evidence/`，OHOS 构建日志、产物/哈希、两台全部测试和基准在 `target/frd-planar-runtime/`。
 
 `9fe010b` 独立任务审查为 Spec compliant / Approved，未发现 Critical/Important/Minor。审查逐项核对源合同、原版 fixture、宿主测试和指令证据；上述 OHOS 执行为主代理另行补充，不冒称审查者操作设备。后续必须先隔离 oracle 依赖，再接入生产 parser、状态和 publication，不能以叶子通过跳过这一层。
+
+
+## A2.3 原版对照隔离与固定生产副本
+
+`1455c2d` 将原版 decoder 运算移至 `tests/legacy-oracle` 独立 workspace/process：graphics0.9.0、session0.11.0、PDU0.9.0、yuv0.8.17 使用精确 registry pins 和自有锁。主代理在添加全局 patch 前后核对完整依赖图：生产 session → 固定 graphics 副本 → kernel；kernel 包括 dev 边也不再依赖原版 decoder，独立 oracle 仍只使用 registry 原版。两个生产副本的 decoder 源码保持原字节，只有 graphics manifest 增加私有 kernel 依赖；当前尚未调用新内核。
+
+独立进程冻结25,962个叶子输入键，保留全部4096个DWT脉冲及原极值/随机覆盖；原planar64输出哈希保持不变。另固定22,337条完整wire记录（Bitmap16,721、Planar4,972、RLGR634、Session10），记录公开API实际结果、完整输出或错误后的部分输出；没有猜测不可观测的内部消费数。全部546个成功RLGR输出另存为5,839bytes压缩夹具，恢复原有数值zero重放覆盖。该重放仍不是parser内的SIMD调用。再生成和来源核验方法见[独立原版对照说明](../../tests/legacy-oracle/README.md)。
+
+宿主kernel debug/release各23项通过：原25项中的两个原版parser/session测试迁到独立runner，未删除语义覆盖。独立runner debug/release各6项通过，最终debug/release重新计算全部原版输出并逐字节比较通过；补齐zero重放后的受影响测试另行通过。RDP回归321 passed /3 ignored，根locked check通过。新加入的graphics→kernel依赖当前尚未消费，因此协议构建有一项新增unused-crate-dependencies警告；现有dead-code警告另行保留，未宣称构建无警告。excluded依赖的upstream套件不能直接从根workspace执行，Cargo拒绝该尝试，未将其计为通过。原样vendor三处文本的空白告警保留以维持源哈希。
+
+基准拆为独立进程后，双方新增相同“系数复制起点”的component/tile计时。一次本机安静窗口中，中位数component为native8145ns/原版4828ns，tile为31830ns/15898ns；原版包含RLGR的完整wire指标另行保留，不能跨范围相除。此处是测试拓扑和计时范围的验证，不是新的优化收益或OHOS性能证据。此前手机/PC25项结果属于A2.2旧测试产物，本轮未重新执行目标程序。
+
+独立任务审查为 Spec compliant / Approved，无 Critical/Important；两项 Minor 分别是过时的 patch 说明和警告披露，均由文档修正处理。完整Bitmap、RDP6、RLGR/RFX parser与会话publication、像素转换和目标包/实时连接仍是后续工作。
