@@ -96,6 +96,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4C3E 正常应用内真实 FFmpeg 解码夹具完成（`6a2c91c`），手机/PC 同一签名包各 13/13；无 EOS 首/末帧、独立像素、1440p/4K 合成帧与生命周期通过，OHOS 目录句柄修正保留检查，38 项 FFI/49 项 loader 测试及独立审查通过。未注册生产 codec，运行时 SIMD、持续吞吐与真实远程会话仍待验证。
 - [x] Task 4C4 原三库优化应用测量及分格式运行审计完成（`f70b381`），两台基准各 10/10、AVC444/HEVC444 指令级正向证据，独立代码审查通过；夹具再生成脚本小项由 `c9f5217` 修正并通过临时目录完整比较。实际仍存在计算标量分支，不代表生产资格。
 - [x] Task 4C5A 单个 AArch64 8-bit H264 luma DC 内核完成（`93e0a6b`），原 C/数值/内存对照 5,974,518 组、30 种 dispatch、checkasm 30 项及本机有界微基准通过，独立审查无问题；后续 `894d5cf` 固定配方与 OHOS 包通过审查，手机/PC各5974518数值用例和新包AVC444真实向量PC、像素/无EOS出帧、10/10基准门禁通过；桌面包与完整codec资格仍待完成，见[内核验证](../../validation/h264-luma-dc-neon-20261013.md)。
+- [x] Task 4C5C1 `57d3b4a`/`f6bdda0`显式macOS ARM64来源配方与bundle/app/源码材料整链接通且复审通过；root冻结实际三库六项fixture、同shipping对象5974518数值/30分派、固定开发签名.app门与三个有界基准通过。默认与广告未切，Windows/Linux、HEVC余项及完整资格未完成，见[Mac配方验证](../../validation/macos-h264-recipe-20261014.md)。
 - [ ] Task 4C5 优先补 AArch64 8-bit H264 luma DC 变换/反量化；维护显式补丁来源、C oracle、逐核 parity、目标基准和普通 HAP 同流验证。HEVC 16×16 planar/angular 与已识别的 32×32 angular 标量分支随后处理，避免重写已向量化分支。
 - [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。
