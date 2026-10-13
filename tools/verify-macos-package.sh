@@ -98,6 +98,9 @@ if [[ -e "$codec_root" && ! -d "$codec_root" ]]; then
     exit 1
 fi
 if [[ -d "$codec_root" ]]; then
+    repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+    python3 "$repo_root/tools/macos-ffmpeg-bundle.py" verify-app --path "$app" \
+        --source-recipe "${FRD_FFMPEG_SOURCE_RECIPE:-upstream}"
     codec_dir="$codec_root/macos-$codec_arch"
     [[ -d "$codec_dir" ]] || { echo "FFmpeg codec 架构目录缺失: $codec_dir" >&2; exit 1; }
 
@@ -143,5 +146,8 @@ if [[ -d "$codec_root" ]]; then
     done
 
     "$app/Contents/MacOS/freeremotedesk-macos" --verify-codec-bundle
+fi
+if [[ "${FRD_FFMPEG_SOURCE_RECIPE:-upstream}" != upstream && ! -d "$codec_root" ]]; then
+    echo '修改 recipe 应用包缺少 FFmpeg codec' >&2; exit 1
 fi
 printf '%s\n' 'macOS 应用包结构、签名和 CLI 验证通过；GUI 和实机互操作需独立验收。'

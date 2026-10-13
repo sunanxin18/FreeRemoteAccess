@@ -1,0 +1,13 @@
+{
+  "schema": "freeremotedesk.macos.kernel-fixture.v1",
+  "boundary": "276 math-code bytes extracted from actual Apple ARM64 Mach-O object, not a codec or dispatch/runtime proof; test linker wraps these bytes, no new arithmetic implementation",
+  "origin": "target/task4c5a/run-20261013/ffmpeg-8.1.2/libavcodec/aarch64/h264idct_neon.o",
+  "origin_sha256": "af2fbb601abdbe25b5cd95e9a33691bd93d484f34ee0b1b94a1d360a3fa8ded4",
+  "source_post_sha256": "b0debd265560c16110a0bfa0c2d92ceb283cf1fe967776ea00fad4274eb06cc4",
+  "evidence": "docs/validation/h264-luma-dc-neon-20261013.md; FreeRemoteDesk commit 93e0a6b260cabb8cb4094b54e33a2fd8d64af2d6",
+  "macho_symbol": "_ff_h264_luma_dc_dequant_idct_neon",
+  "origin_symbol_address": 1600,
+  "origin_file_offset": 2392,
+  "size": 276,
+  "sha256": "1e70d378b34fb196afd0942b9bd0c31c1715b4042c6c3e8f032dad5e76b42476"
+}

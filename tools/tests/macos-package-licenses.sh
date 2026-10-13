@@ -70,6 +70,14 @@ for wrong_identity in 0000000000000000000000000000000000000000 'Synthetic Leaf A
 done
 codec_fixture="$app/Contents/MacOS/codecs/ffmpeg-8-1-2/macos-aarch64"
 mkdir -p "$codec_fixture"
+codec_materials="$app/Contents/Resources/codecs/ffmpeg-8-1-2"
+mkdir -p "$codec_materials"
+cp "$repo_root/third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1" "$codec_materials/FFmpeg-LGPL-2.1-or-later.txt"
+cat > "$codec_materials/FFmpeg-NOTICE.txt" <<'NOTICE'
+source is unmodified
+464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+Architecture: macos-aarch64
+NOTICE
 for library in libavcodec.62.dylib libavutil.60.dylib libfreeremotedesk_ffmpeg.dylib; do
     clang -arch arm64 -mmacosx-version-min=12.0 -dynamiclib "$work/main.c" -Wl,-install_name,"@loader_path/$library" -o "$codec_fixture/$library"
 done
@@ -79,6 +87,7 @@ if PATH="$work/bin:$PATH" FRD_TEST_NESTED_MISMATCH=1 FRD_MACOS_SIGNING_IDENTITY=
 fi
 grep -F '签名leaf证书指纹与请求身份不匹配' "$work/verify.log" >/dev/null || { cat "$work/verify.log" >&2; exit 1; }
 rm -rf "$app/Contents/MacOS/codecs"
+rm -rf "$app/Contents/Resources/codecs"
 for name in FreeRDP-APACHE-2.0.txt FreeRDP-NOTICE.txt FreeRDP-SHA256SUMS.txt; do
     restore_licenses
     rm "$licenses/$name"

@@ -26,21 +26,29 @@ case "$frd_arch" in
     exit 2
     ;;
 esac
+frd_recipe="${FRD_FFMPEG_SOURCE_RECIPE:-upstream}"
+# 在下载、build root 或源码创建前，按明确 desktop profile 检查固定来源。
+python3 "$frd_root/tools/desktop-ffmpeg-source.py" metadata \
+  --profile "$frd_platform" --source-recipe "$frd_recipe" > /dev/null
 frd_build="${FRD_FFMPEG_BUILD_ROOT:-$frd_root/target/ffmpeg-macos}"
+if [[ "$frd_build" != /* ]]; then frd_build="$frd_root/$frd_build"; fi
 frd_cross_build=0
 if [[ "$frd_host_arch" != "$frd_arch" ]]; then
   frd_cross_build=1
 fi
 mkdir -p "$frd_build"
-frd_archive="$frd_build/ffmpeg-8.1.2.tar.xz"
+frd_archive="${FRD_FFMPEG_ARCHIVE:-$frd_build/ffmpeg-8.1.2.tar.xz}"
+if [[ "$frd_archive" != /* ]]; then frd_archive="$frd_root/$frd_archive"; fi
 if [[ ! -f "$frd_archive" ]]; then
   curl --fail --location --max-time 120 https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz -o "$frd_archive"
 fi
 [[ "$(shasum -a 256 "$frd_archive" | cut -d ' ' -f 1)" == "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c" ]]
 frd_attempt=$(mktemp -d "$frd_build/build.XXXXXX")
-tar -xf "$frd_archive" -C "$frd_attempt"
+frd_source="$(python3 "$frd_root/tools/desktop-ffmpeg-source.py" prepare \
+  --archive "$frd_archive" --destination "$frd_attempt/source" \
+  --profile "$frd_platform" --source-recipe "$frd_recipe")"
 frd_prefix="$frd_attempt/dist"
-cd "$frd_attempt/ffmpeg-8.1.2"
+cd "$frd_source"
 frd_configure_args=(
   "--prefix=$frd_prefix"
   "--arch=$frd_ffmpeg_arch"
@@ -60,12 +68,24 @@ if [[ "$frd_cross_build" -eq 1 ]]; then
   )
 fi
 frd_configure_args+=(--disable-x86asm)
+python3 - "$frd_attempt/configuration.json" "$MACOSX_DEPLOYMENT_TARGET" "$(clang --version | head -n 1)" "${frd_configure_args[@]}" <<'PY'
+import json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({'deployment_target': sys.argv[2], 'compiler': sys.argv[3], 'args': sys.argv[4:]}, indent=2) + '\n')
+PY
 ./configure "${frd_configure_args[@]}"
 make -j "$(sysctl -n hw.ncpu)"
 grep -q '^#define HAVE_NEON 1$' config.h || {
   echo "FFmpeg arm64 build did not enable HAVE_NEON" >&2
   exit 1
 }
+if [[ "$frd_recipe" != upstream ]]; then
+  # make install 的 stripping 之前，从同源未剥离动态库解析真实 leading-underscore 符号。
+  python3 "$frd_root/tools/macos-ffmpeg-bundle.py" kernel \
+    --library "$frd_source/libavcodec/libavcodec.62.dylib" --output "$frd_attempt/kernel.json"
+  python3 "$frd_root/tools/macos-ffmpeg-bundle.py" kernel \
+    --library "$frd_source/libavcodec/aarch64/h264idct_neon.o" > "$frd_attempt/object-kernel.json"
+fi
 make install
 cd "$frd_root"
 if [[ "$frd_cross_build" -eq 1 ]]; then
@@ -114,6 +134,13 @@ Assembly: $frd_assembly_kind ($frd_assembly_gate)
 Corresponding source is distributed beside the application as ffmpeg-8.1.2.tar.xz.
 Rebuild with tools/build-ffmpeg-macos.sh; LGPL libraries remain dynamically replaceable.
 NOTICE
+if [[ "$frd_recipe" != upstream ]]; then
+  python3 "$frd_root/tools/macos-ffmpeg-bundle.py" complete \
+    --bundle "$frd_bundle" --archive "$frd_archive" --source-tree "$frd_source" \
+    --configuration-file "$frd_attempt/configuration.json" --kernel-file "$frd_attempt/kernel.json" \
+    --object-file "$frd_source/libavcodec/aarch64/h264idct_neon.o"
+fi
+python3 "$frd_root/tools/macos-ffmpeg-bundle.py" verify-bundle --path "$frd_bundle" --source-recipe "$frd_recipe"
 if [[ -e "$frd_build/bundle" ]]; then
   mv "$frd_build/bundle" "$frd_build/bundle.previous.$(date +%s).$$"
 fi

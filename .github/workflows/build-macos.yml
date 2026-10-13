@@ -2,6 +2,14 @@ name: macOS package
 
 on:
   workflow_dispatch:
+    inputs:
+      source_recipe:
+        description: "显式选择固定 FFmpeg 来源（默认 upstream）"
+        type: choice
+        default: upstream
+        options:
+          - upstream
+          - frd-h264dc-aarch64-v1
   pull_request:
     paths:
       - "Cargo.toml"
@@ -13,6 +21,10 @@ on:
       - "packaging/macos/**"
       - "third_party/ffmpeg/8.1.2/**"
       - "tools/build-ffmpeg-macos.sh"
+      - "tools/desktop-ffmpeg-source.py"
+      - "tools/macos-ffmpeg-bundle.py"
+      - "tools/ffmpeg-source-recipe.py"
+      - "tools/tests/*macos*"
       - "tools/stage-macos-package.sh"
       - "tools/verify-macos-package.sh"
       - "tools/create-macos-icon.swift"
@@ -32,6 +44,10 @@ on:
       - "packaging/macos/**"
       - "third_party/ffmpeg/8.1.2/**"
       - "tools/build-ffmpeg-macos.sh"
+      - "tools/desktop-ffmpeg-source.py"
+      - "tools/macos-ffmpeg-bundle.py"
+      - "tools/ffmpeg-source-recipe.py"
+      - "tools/tests/*macos*"
       - "tools/stage-macos-package.sh"
       - "tools/verify-macos-package.sh"
       - "tools/create-macos-icon.swift"
@@ -53,6 +69,7 @@ jobs:
     timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      FRD_FFMPEG_SOURCE_RECIPE: ${{ inputs.source_recipe || 'upstream' }}
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +119,14 @@ jobs:
           FRD_FFMPEG_RUN_NATIVE_TESTS: "1"
         run: bash tools/build-ffmpeg-macos.sh
 
+      - name: Verify fixed recipe, Mach-O and corresponding source gates
+        shell: bash
+        env:
+          FRD_FFMPEG_TEST_ARCHIVE: ${{ github.workspace }}/target/ffmpeg-macos-${{ matrix.architecture }}/ffmpeg-8.1.2.tar.xz
+        run: |
+          python3 -m unittest discover -s tools/tests -p test_macos_ffmpeg_recipe.py -v
+          bash tools/tests/macos-signing-config.sh
+
       - name: Verify macOS package license rejection fixtures
         shell: bash
         run: bash tools/tests/macos-package-licenses.sh
@@ -122,14 +147,17 @@ jobs:
           actual_hash="$(shasum -a 256 "$source_root/ffmpeg-8.1.2.tar.xz" | awk '{print $1}')"
           test "$actual_hash" = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
           mkdir -p "$release_root"
-          cp "$source_root/ffmpeg-8.1.2.tar.xz" "$release_root/"
-          cp third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1 third_party/ffmpeg/8.1.2/changes.diff "$release_root/"
-          {
-            printf 'architecture=%s\n' "${{ matrix.architecture }}"
-            printf 'archive_sha256=%s\n' "$actual_hash"
-            printf 'source_sha256_expected=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c\n'
-            printf 'local_changes=changes.diff\n'
-          } > "$release_root/SOURCE-MANIFEST.txt"
+          source_asset="$(python3 tools/desktop-ffmpeg-source.py asset-name --source-recipe "$FRD_FFMPEG_SOURCE_RECIPE")"
+          if [[ "$FRD_FFMPEG_SOURCE_RECIPE" == upstream ]]; then
+            python3 tools/desktop-ffmpeg-source.py asset --archive "$source_root/ffmpeg-8.1.2.tar.xz" \
+              --output "$release_root/$source_asset" --source-recipe upstream
+            # 原五文件 bundle NOTICE 中的原 archive 下载入口仍保留。
+            cp "$source_root/ffmpeg-8.1.2.tar.xz" "$release_root/"
+          else
+            cp "$source_root/bundle/$source_asset" "$release_root/"
+          fi
+          python3 tools/desktop-ffmpeg-source.py verify-asset --archive "$source_root/ffmpeg-8.1.2.tar.xz" \
+            --output "$release_root/$source_asset" --source-recipe "$FRD_FFMPEG_SOURCE_RECIPE"
 
       - name: Upload exact macOS application package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

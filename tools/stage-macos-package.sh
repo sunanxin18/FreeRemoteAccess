@@ -28,6 +28,15 @@ case "$requested_arch" in
     x86_64) echo "macOS 仅构建 ARM64，不再构建 Intel/x86_64" >&2; exit 2 ;;
     *) echo "不支持的 macOS package 架构: $requested_arch" >&2; exit 2 ;;
 esac
+source_recipe="${FRD_FFMPEG_SOURCE_RECIPE:-upstream}"
+python3 "$repo_root/tools/desktop-ffmpeg-source.py" metadata --source-recipe "$source_recipe" > /dev/null
+codec_build_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-macos}"
+codec_bundle="$codec_build_root/bundle"
+if [[ -d "$codec_bundle" ]]; then
+    python3 "$repo_root/tools/macos-ffmpeg-bundle.py" verify-bundle --path "$codec_bundle" --source-recipe "$source_recipe"
+elif [[ "$source_recipe" != upstream ]]; then
+    echo '修改 recipe 要求已有同源 FFmpeg bundle，不能静默生成无 codec 应用包' >&2; exit 2
+fi
 cross_build=0
 if [[ "$host_arch" != "$requested_arch" ]]; then cross_build=1; fi
 cd "$repo_root"
@@ -76,30 +85,7 @@ done
 )
 
 # 同架构的固定版本 FFmpeg bundle 可由 build-ffmpeg-macos.sh 生成。
-codec_build_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-macos}"
-codec_bundle="$codec_build_root/bundle"
 if [[ -d "$codec_bundle" ]]; then
-    expected_bundle_files=(
-        "FFmpeg-LGPL-2.1-or-later.txt"
-        "FFmpeg-NOTICE.txt"
-        "libavcodec.62.dylib"
-        "libavutil.60.dylib"
-        "libfreeremotedesk_ffmpeg.dylib"
-    )
-    bundle_files=()
-    while IFS= read -r -d '' resource; do
-        [[ -f "$resource" && ! -L "$resource" ]] || {
-            echo "FFmpeg bundle 只能包含普通文件: $resource" >&2
-            exit 1
-        }
-        bundle_files+=("$(basename "$resource")")
-    done < <(find "$codec_bundle" -mindepth 1 -maxdepth 1 -print0)
-    actual_bundle_set="$(printf '%s\n' "${bundle_files[@]}" | LC_ALL=C sort)"
-    expected_bundle_set="$(printf '%s\n' "${expected_bundle_files[@]}" | LC_ALL=C sort)"
-    [[ "$actual_bundle_set" == "$expected_bundle_set" ]] || {
-        echo "FFmpeg bundle 文件集合不匹配: $codec_bundle" >&2
-        exit 1
-    }
     codec_dest="$app/Contents/MacOS/codecs/ffmpeg-8-1-2/macos-$codec_arch"
     mkdir -p "$codec_dest"
     codec_notices="$app/Contents/Resources/codecs/ffmpeg-8-1-2"
@@ -108,6 +94,8 @@ if [[ -d "$codec_bundle" ]]; then
         case "$resource" in *.dylib) cp "$resource" "$codec_dest/" ;; *) cp -R "$resource" "$codec_notices/" ;; esac
     done
     while IFS= read -r -d '' library; do codesign --force --sign "$signing_identity" "$library"; done < <(find "$codec_dest" -type f -name '*.dylib' -print0)
+    # 重签可能改变签名 blob；固定数学代码和其余 dylib payload 都必须仍对应 bundle。
+    python3 "$repo_root/tools/macos-ffmpeg-bundle.py" verify-app --path "$app" --source-recipe "$source_recipe"
 fi
 # 默认仅本机 ad-hoc 签名；显式指定的证书不可降级为 ad-hoc，不声称已公证。
 codesign --force --sign "$signing_identity" "$app"

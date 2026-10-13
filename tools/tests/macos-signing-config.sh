@@ -7,12 +7,24 @@ trap 'rm -rf "$work"' EXIT
 fixture="$work/repo"
 mkdir -p "$fixture/tools" "$fixture/packaging/macos" "$fixture/packaging/windows/licenses" "$fixture/assets/app-icon" "$work/bin" "$work/target/debug" "$work/codec/bundle"
 cp "$repo_root/tools/stage-macos-package.sh" "$fixture/tools/"
+for helper in desktop-ffmpeg-source.py macos-ffmpeg-bundle.py ffmpeg-source-recipe.py; do
+    cp "$repo_root/tools/$helper" "$fixture/tools/"
+done
+mkdir -p "$fixture/third_party/ffmpeg/8.1.2/patches"
+cp "$repo_root/third_party/ffmpeg/8.1.2/"{LICENSE.LGPLv2.1,h264-luma-dc-aarch64-recipe.json} "$fixture/third_party/ffmpeg/8.1.2/"
+cp "$repo_root/third_party/ffmpeg/8.1.2/patches/0001-aarch64-h264-luma-dc-neon.patch" "$fixture/third_party/ffmpeg/8.1.2/patches/"
 cp "$repo_root/packaging/macos/Info.plist" "$fixture/packaging/macos/"
 cp "$repo_root/packaging/windows/licenses/FreeRDP-APACHE-2.0.txt" "$repo_root/packaging/windows/licenses/FreeRDP-NOTICE.txt" "$fixture/packaging/windows/licenses/"
 touch "$fixture/assets/app-icon/README.md" "$work/target/debug/freeremotedesk-macos"
 for name in FFmpeg-LGPL-2.1-or-later.txt FFmpeg-NOTICE.txt libavcodec.62.dylib libavutil.60.dylib libfreeremotedesk_ffmpeg.dylib; do
     touch "$work/codec/bundle/$name"
 done
+cp "$repo_root/third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1" "$work/codec/bundle/FFmpeg-LGPL-2.1-or-later.txt"
+cat > "$work/codec/bundle/FFmpeg-NOTICE.txt" <<'NOTICE'
+source is unmodified
+464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+Architecture: macos-aarch64
+NOTICE
 cat > "$work/bin/uname" <<'SH'
 #!/bin/bash
 case "$1" in -s) echo Darwin;; -m) echo arm64;; *) exit 1;; esac
