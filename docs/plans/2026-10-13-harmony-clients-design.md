@@ -20,6 +20,14 @@
 5. 沿用 pinned wgpu GLES + `frd-render-wgpu`/`frd-compositor-wgpu`。生命周期固定为停止呈现、销毁 Surface、清除窗口访问、释放 native window 引用。渲染与输入共用同一物理内容矩形；旋转、缩放、键盘避让更新同一 geometry generation。
 6. OHOS Rust target 的 `target_os=linux,target_env=ohos` 必须显式与桌面 Linux 区分，不能误加载 Linux FFmpeg/GTK/Secret Service。协议 wire 层不增加平台窗口分支。
 
+## 鸿蒙系统编解码优先（2026-10-13 用户决定）
+
+鸿蒙使用 AVCodec Kit 原生能力，在既有 `VideoDecoderRegistry`/解码器契约下独立接入。选择顺序为满足精确码流与生命周期要求的系统硬解、满足同样要求及软件 SIMD 规则的系统软解、最后为随包 FFmpeg。逐设备查询并试解码；库存在、Create 成功或 MIME 匹配均不等于精确 profile、位深、色度、输出格式、分辨率与低延迟可用。系统软解实现的汇编/SIMD 证据仍需核验，不能仅凭名称推定。
+
+优先验证系统 ByteBuffer 输出及其裁剪、stride、slice height、缓存和回收生命周期，再接入统一帧契约。Surface 路径若采用，必须与现有呈现、完整基线和 generation 门保持一致。硬件资源不足或精确格式不支持时，只能选择已经验证的后备；切换需要清空旧解码状态并重新建立完整基线，不能复用旧帧。
+
+官方资料：[AVCodec 支持格式](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/media/avcodec/avcodec-support-formats.md)、[视频解码](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/media/avcodec/video-decoding.md)。H.264/HEVC 能力不能替代 RemoteFX、Bitmap/RLE 或 Apple MVS 解码；RDP AVC444 组合与 H.264 High 4:4:4 码流需分别验证。HEVC 系统解码存在也不解除 RDP HEVC wire 门。Windows、macOS 和 Linux 保持各自平台组合根策略。 当前 registry 默认拒绝 Native + SoftwareExact；新增顺序必须通过显式、中立的选择策略由 OHOS 组合根启用，保留现有 `VideoDecoderRegistry::new` 默认行为及桌面回归，不能全局改变软件后端优先级。
+
 ## 交互与安全
 
 手机为触控优先，登录表单自适应，远程视图支持平移/缩放与明确的输入模式；PC 保留系统标题栏及居中的会话操作。首次证书记录并连接，相同指纹继续，变化停止自动连接。输入只在前台、焦点归远程内容且当前 generation 完整基线已呈现时发送；失焦/后台/断开 ReleaseAll。
@@ -36,7 +44,7 @@ PC 标题栏采用[华为官方自由多窗沉浸式方案](https://developer.hu
 
 本机 DevEco Studio 26.0.0，SDK API 26 / 26.0.0.105，Hvigor 6.26.4，ohpm 26.0.0.630，Node 24.14.1。PATH 的 deveco 0.2.1 是 AI agent CLI；构建实际调用 Studio 的 Hvigor、OHPM、CMake/Clang 和 HDC。
 
-已有的 Pura 90 Pro ARM64 实例保留不变。已通过官方 CLI 下载 2in1 ARM64 7.0.0.107 镜像，并创建、启动独立的手机/PC API 26 实例；两者 HDC Connected、boot complete、arm64-v8a。手机镜像包 7.0.0.106，PC 包 7.0.0.107，两个 guest 均自报 OpenHarmony-7.0.0.105。Rust 1.96 OHOS std 已安装，现有 core/frame/app 的 OHOS target check 通过；尚无 HAP 或协议互操作证据。详见[环境验证](../validation/harmony-environment-20261013.md)。
+已有的 Pura 90 Pro ARM64 实例保留不变。已通过官方 CLI 下载 2in1 ARM64 7.0.0.107 镜像，并创建、启动独立的手机/PC API 26 实例；两者 HDC Connected、boot complete、arm64-v8a。手机镜像包 7.0.0.106，PC 包 7.0.0.107，两个 guest 均自报 OpenHarmony-7.0.0.105。Rust 1.96 OHOS std 已安装，设计预检时现有 core/frame/app 的 OHOS target check 通过。后续 Tasks 1–3 已完成 HAP、图形、应用状态及 HUKS 的受限验证，见[应用与安全存储验证](../validation/harmony-app-services-20261013.md)；真实协议互操作仍未完成。详见[环境验证](../validation/harmony-environment-20261013.md)。
 
 ## 保留的未决门
 

@@ -71,3 +71,21 @@ tools/build-harmony.sh --check -p frd-protocol-rdp -p frd-protocol-apple
 显式选择已安装 OHOS 标准库的 Rust 1.96.0 ARM64 cargo/rustc，结果 exit 0，用时 1 分 10 秒。`aws-lc-sys 0.44.0` 和 `fdk-aac-sys 0.5.0` 实际完成原生依赖构建，两个协议 crate 检查通过。RDP 有四条既存 scalar reference 未使用警告，无编译错误；日志保存在本地忽略目录 `target/harmony-protocol-preflight-check.log`。
 
 这只补齐当前 macOS ARM64 宿主到 OHOS ARM64 的依赖编译证据：尚未证明最终 cdylib 链接、HAP 加载、guest AAC/视频 fixture、解码 SIMD 合规或远程认证。fdk-aac 上游 build script 按宿主选择 C++ runtime 的跨宿主风险仍须在后续构建适配中处理，不能从本机编译成功推断所有宿主都支持。
+
+## 后续媒体工具链预检（2026-10-13）
+
+隔离目录中用官方 OHOS Clang/sysroot 对固定 FFmpeg 8.1.2 源码完成 configure、make、install。源码 SHA-256 为 `464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`；启用 H.264/HEVC decoder/parser 和 AArch64 NEON，仅生成 avcodec/avutil，未启用网络或 GPL/nonfree。FFmpeg 内部选择 Linux ELF 配置，但编译器和 sysroot 明确为 OHOS；没有重命名 GNU/Linux 库作为目标库。
+
+两库 ELF Machine 为 AArch64，SONAME 分别为 `libavcodec.so.62` / `libavutil.so.60`；前者依赖后者及 `libc.so`，后者仅依赖 `libc.so`。候选构建未接入产品插件、HAP 或能力广告。原始参数、日志、ELF 报告和 SHA 在本地 `target/harmony-ffmpeg-preflight/`。
+
+两台专用模拟器均实际运行未经修改的 FFmpeg 上游 `libavutil/tests/cpu`，报告 ARMv8、NEON、DOTPROD、SVE2、CRC 与 4 CPU。该程序静态链接 libavutil，仅证明目标测试执行和能力查询，不证明共享插件加载、扩展指令安全执行或任何解码输出。特别是报告含 SVE2 而无 SVE，不能凭此开放相应运行路径；后续必须以实际 codec fixture 验证。产品 builder、加载命名空间、C/Rust ABI、像素一致性及生命周期测试仍未完成。
+
+## AVCodec Kit 系统库优先验证（2026-10-13）
+
+用户要求支持时优先使用鸿蒙系统库。本机 API 26 SDK 提供 `native_avcapability.h`、`native_avcodec_videodecoder.h` 及 `libnative_media_vdec.so`、`libnative_media_codecbase.so`、`libnative_media_core.so`。官方支持表列出 H.264/H.265，实际设备的硬件/软件、profile、尺寸及输出能力仍须查询和解码验证；参见[官方格式说明](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/media/avcodec/avcodec-support-formats.md)。SDK 链接库的存在不是安装设备的运行能力证明。
+
+首个能力探针 SHA-256 `5aec712efce6710333df5bdf70b636681773ca71ad5123197a9c6e55fe75586f` 使用官方 SDK 编译；两台专用模拟器从 HDC shell 启动均在进入 main 前加载失败，提示间接依赖缺少 `libark_jsruntime.so`，随后出现 Ark 符号无法解析。HDC 返回 0 不能算探针通过，日志没有 capability/complete 成功记录。系统目录枚举也被拒绝，没有修改系统权限或尝试提权；下一步改在正常权限 HAP 应用上下文验证。原始结果 `target/harmony-system-codec-probe/capabilities-phone.log` 与 `capabilities-pc.log`。此结果不能证明模拟器不支持 H.264/HEVC。
+
+生产选择设计已更新为合格系统硬解 → 合格系统软解 → 已验证 FFmpeg 后备；每项仍需精确格式、生命周期、软件 SIMD 及协议互操作门。当前尚未接入系统 decoder，也未改变既有平台选择策略或 RDP codec 广告。
+
+同日 16:48 改用正常权限 HAP 后，两台查询均成功；都报告系统 H.264 软件解码，未报告 H.264 硬解/HEVC，详见[系统 AVCodec 验证](harmony-system-codec-20261013.md)。先前 shell 加载失败不是设备能力结论。

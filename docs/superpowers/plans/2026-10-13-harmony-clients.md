@@ -77,7 +77,11 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 
 **Interfaces:** 注册 `RdpProtocolFactory`（wire identity Unix），沿用 TOFU；FrameMailbox/FrameTransactionCompiler → renderer。UI 只有真实完整基线呈现后进入交互状态。
 
-- [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换满足现有 SIMD gate；FFmpeg OHOS 原生构建及 ABI/parity 独立验证。
+- [x] Task 4A1 独立 RemoteFX checked NEON/SSE2 数值叶子及审查完成（`c3ae798`）；尚未接入生产，模拟器基准未证明提速。
+- [x] Task 4C0 手机/PC 正常权限系统能力与三个接口路线完成受限验证；AVC420 像素通过、EOS 前出帧未通过、精确444失败、HEVC 未报告，见[系统验证](../../validation/harmony-system-codec-20261013.md)。
+- [x] Task 4C1 中立 NativeFirst 显式策略 `e1fb9fa` 已实现并通过独立审查；默认桌面顺序保持，尚未接入系统 backend。
+- [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
+- [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。
 - [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、远程软键盘入口与 IME 提交、断开/重连与恢复。
 - [ ] AVC/HEVC广告继续受原精确门禁控制；未通过的 codec 不由新平台构建自动开放。
 
@@ -87,7 +91,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 
 **Interfaces:** 注册现有 Apple factory；平台 codec 注入既有 `VideoDecoderRegistry`，不修改Apple wire或在Mac安装程序。
 
-- [ ] OHOS fdk-aac/native依赖真实交叉构建，H.264/HEVC backend在既有media契约下验证生命周期/格式。
+- [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
 - [ ] 授权Mac完成真实认证、首帧、持续更新、输入、重连；音频/剪贴板只报告已实现并验证的能力。
 - [ ] 跑Windows/macOS/Linux相关回归及包检查，记录本轮没有真机的平台。
 
