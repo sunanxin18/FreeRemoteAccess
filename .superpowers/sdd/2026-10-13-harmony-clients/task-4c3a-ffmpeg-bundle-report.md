@@ -121,3 +121,25 @@ exit0。未用任何目标执行 helper，未用 receive_one_frame 自动 flush 
 后续仍须普通签名 HAP 的安装 native-lib 命名/namespace、dladdr锚点/不可写代码根、ABI实际调用/全部callback归属、phone/PC分别真实fixture（首尾帧、大尺寸不依赖EOS、重排、flush/reclaim/destroy）、NEON逐像素/性能和授权live远程验收。当前没有注册任何 codec、没有将系统候选失败转换成运行可用声明。
 
 跨平台影响：Windows x86/x64/ARM64、Linux x86/x64/ARM64、macOS ARM64 的默认解码策略和构建分支保持原合同；这里只新增 OHOS ARM64 的静态后备构建输入及固定线程政策。macOS Intel 不新增支持。原 README 矩阵及普通包后续集成由主代理按明确分工更新，本提交不扩大范围。
+
+## Fix1：独立审查 I1 精确链接入口（BASE 9c2cd42）
+
+2026-10-13，按根代理正式 follow-up 只修 Important I1。OHOS native 分支改为 Rust `dylib:+verbatim=libavcodec.so.62` / `dylib:+verbatim=libavutil.so.60`；官方 OHOS clang/lld 实际接受这种精确版本文件名链接。它使用 verify_inputs 已验证的两个版本库，无版本 libavcodec.so/libavutil.so 已不作为 OHOS 链接输入。桌面仍使用原 `dylib=avcodec` / `dylib=avutil`；helper、loader、ABI、线程政策和其他产品文件未修改。Minor M1 按根代理裁决明确延后 4C3B，没有压制 warning。
+
+新增实际目标回归 `ActualOhosExactLinkRegression.test_wrong_unversioned_aliases_do_not_redirect_actual_target_link`：临时复制正确 prefix 且保留安装 symlink，改 libavcodec.so → libavutil.so.60，同时删除 libavutil.so；验证版本库来源后，用独立临时 Cargo target 和 coherent Rust1.96.0 实际编译 ARM64 plugin。要求构建成功、实际 build 输出包含两条精确版本 directives、无旧 avcodec directive、输出 DT_NEEDED 闭包正确，并且输出 plugin SHA256 与正常包完全相同。临时目录自动清理，不运行 ELF。该回归直接覆盖审查复现的错向 alias 和缺失无版本入口。
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 tools/build-ffmpeg-ohos.sh \
+  --archive target/ffmpeg-macos-architecture-test-1788805845/ffmpeg-8.1.2.tar.xz \
+  > target/harmony-ffmpeg-preflight/task-4c3a-fix1-build.log 2>&1
+
+PYTHONDONTWRITEBYTECODE=1 \
+FRD_OHOS_FFMPEG_TEST_BUNDLE="$PWD/target/ffmpeg-ohos/bundle-attempt-qjsezbh7" \
+FRD_OHOS_FFMPEG_TEST_PREFIX="$PWD/target/ffmpeg-ohos/attempt-qjsezbh7/dest/usr" \
+python3 tools/tests/test_ohos_ffmpeg_bundle.py -v \
+  > target/harmony-ffmpeg-preflight/task-4c3a-fix1-tests.log 2>&1
+```
+
+两者 exit0；本轮一次 final clean build 完整通过，变异集及新增实际链接回归 **22/22 passed**。新最终发布目录 `/Users/sun/FreeRemoteAccess/target/ffmpeg-ohos/bundle-attempt-qjsezbh7`；新的 manifest SHA256 为 `c9515bdaa88c062c231d72ebb22db7d19d4ecabca6463d2da1ac8eb030e973bc`，记录本轮 build.rs 输入 digest。三库 sizes/SHA256/SONAME/DT_NEEDED 与前文表格相同；actual regression 的错向/缺失 alias 构建所得 plugin SHA256 也为 `4e0f435d4e1fd3a85e53711ec15d30048bdf1c64d310a37d28932336d916cd05`。
+
+固定1.96.0 的 cargo fmt --all -- --check（同前文命令，日志 `task-4c3a-fix1-fmt.log`）与 git diff --check 均 exit0。此前不受此次链接输入修改影响的 5 个政策/native-off默认测试和 OHOS native-off 编译没有重复执行。没有新增 guest/runtime 证据，仍不声称 DecoderReady 或同 recipe 两次 bit-identical。自审本轮仅包含 OHOS 分支、实际 alias 回归和本报告追加；提交后停止写入，交由根代理窄复审。

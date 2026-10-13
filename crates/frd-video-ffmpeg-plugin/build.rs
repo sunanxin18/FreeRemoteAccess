@@ -93,8 +93,14 @@ fn main() {
     bridge.compile("frd_ffmpeg_bridge");
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=avcodec");
-    println!("cargo:rustc-link-lib=dylib=avutil");
+    if ohos_sdk.is_some() {
+        // OHOS 按已验证版本文件名链接，忽略未验证的无版本 alias。
+        println!("cargo:rustc-link-lib=dylib:+verbatim=libavcodec.so.62");
+        println!("cargo:rustc-link-lib=dylib:+verbatim=libavutil.so.60");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=avcodec");
+        println!("cargo:rustc-link-lib=dylib=avutil");
+    }
 }
 
 fn require_file(path: &Path) {

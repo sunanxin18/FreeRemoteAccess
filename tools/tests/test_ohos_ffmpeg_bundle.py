@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -212,6 +213,46 @@ class ActualPluginInputMutations(unittest.TestCase):
         path.write_bytes(data)
         self.manifest["libraries"][path.name] = bundle.sha(path)
         self.rejected("AArch64")
+
+
+class ActualOhosExactLinkRegression(unittest.TestCase):
+    def test_wrong_unversioned_aliases_do_not_redirect_actual_target_link(self):
+        prefix = Path(os.environ["FRD_OHOS_FFMPEG_TEST_PREFIX"])
+        good_bundle = Path(os.environ["FRD_OHOS_FFMPEG_TEST_BUNDLE"])
+        sdk = Path(os.environ.get("OHOS_SDK_ROOT", bundle.DEFAULT_SDK)).resolve()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "prefix"
+            shutil.copytree(prefix, candidate, symlinks=True)
+            codec_alias = candidate / "lib/libavcodec.so"
+            util_alias = candidate / "lib/libavutil.so"
+            codec_alias.unlink()
+            codec_alias.symlink_to("libavutil.so.60")
+            util_alias.unlink()
+            # 版本库保持已验证字节；无版本 codec 错向，util 缺失。
+            bundle.verify_inputs(candidate, sdk, bundle.REPO)
+            tools = bundle.rust_identity()
+            environment = os.environ.copy()
+            environment.update({
+                "FFMPEG_DIR": str(candidate), "OHOS_SDK_ROOT": str(sdk),
+                "CARGO_TARGET_DIR": str(root / "cargo"),
+                "RUSTC": tools["rustc"]["path"], "RUSTDOC": tools["rustdoc"]["path"],
+                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER": str(bundle.tool_paths(sdk)["cc"]),
+            })
+            command = [tools["cargo"]["path"], "build", "--locked", "--release", "--target", bundle.TARGET,
+                       "-p", "frd-video-ffmpeg-plugin", "--features", "native-ffmpeg"]
+            log = subprocess.run(command, cwd=bundle.REPO, env=environment, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(log.returncode, 0, log.stdout)
+            plugin = root / "cargo" / bundle.TARGET / "release" / bundle.LIBS[2]
+            self.assertEqual(bundle.elf(plugin)["needed"], sorted(bundle.DEPS[bundle.LIBS[2]]))
+            self.assertEqual(bundle.sha(plugin), bundle.sha(good_bundle / bundle.LIBS[2]))
+            build_outputs = list((root / "cargo" / bundle.TARGET / "release/build").glob("frd-video-ffmpeg-plugin-*/output"))
+            self.assertEqual(len(build_outputs), 1)
+            directives = build_outputs[0].read_text()
+            self.assertIn("cargo:rustc-link-lib=dylib:+verbatim=libavcodec.so.62", directives)
+            self.assertIn("cargo:rustc-link-lib=dylib:+verbatim=libavutil.so.60", directives)
+            self.assertNotIn("cargo:rustc-link-lib=dylib=avcodec\n", directives)
 
 
 if __name__ == "__main__":
