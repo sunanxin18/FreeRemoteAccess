@@ -6,6 +6,10 @@ set -euo pipefail
 
 bundle_input="${1:?需要 Linux FFmpeg bundle 路径}"
 profile="${2:?需要 linux-x86_64、linux-x86 或 linux-aarch64 profile}"
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+command -v python3 >/dev/null || { echo 'Linux来源门需要python3' >&2; exit 2; }
+recipe_args=()
+[[ -z "${FRD_FFMPEG_SOURCE_RECIPE:-}" ]] || recipe_args=(--source-recipe "$FRD_FFMPEG_SOURCE_RECIPE")
 
 # 保留词法路径，避免通过 realpath/readlink 规范化隐藏符号链接祖先。CI 从仓库
 # 根目录调用 verifier，但保留相对路径支持便于本地检查。
@@ -65,13 +69,12 @@ case "$profile" in
   *) echo "不支持的 Linux FFmpeg verifier 架构: $profile" >&2; exit 1 ;;
 esac
 
-expected_files=(
-  FFmpeg-LGPL-2.1-or-later.txt
-  FFmpeg-NOTICE.txt
-  libavcodec.so.62
-  libavutil.so.60
-  libfreeremotedesk_ffmpeg.so
-)
+expected_files=()
+# 先从固定recipe验证完整来源，再取受信成员集合；不采用manifest任意file list。
+python3 "$repo_root/tools/linux-ffmpeg-bundle.py" verify --path "$bundle" --profile "$profile" "${recipe_args[@]}" >/dev/null
+while IFS= read -r name; do
+  expected_files+=("$name")
+done < <(python3 "$repo_root/tools/linux-ffmpeg-bundle.py" files --path "$bundle" --profile "$profile")
 
 assert_no_symlink_components "$bundle"
 
@@ -91,8 +94,8 @@ actual_set="$(find "$bundle" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' 2>/d
   exit 1
 }
 # 上面的精确集合不能允许目录、FIFO 或其他未列出的目录项混入 bundle。
-[[ "$(find "$bundle" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" == "5" ]] || {
-  echo "Linux FFmpeg bundle 只能包含五个顶层文件: $bundle" >&2
+[[ "$(find "$bundle" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" == "${#expected_files[@]}" ]] || {
+  echo "Linux FFmpeg bundle 顶层成员数量不匹配: $bundle" >&2
   exit 1
 }
 
@@ -209,6 +212,7 @@ nm -D --defined-only "$bundle/libfreeremotedesk_ffmpeg.so" \
   }
 
 if [[ "${FRD_LINUX_FFMPEG_RUNTIME_SMOKE:-0}" == 1 ]]; then
+  [[ "$(uname -s)" == Linux ]] || { echo 'Linux runtime smoke需要Linux宿主' >&2; exit 2; }
   host_arch="$(uname -m)"
   case "$host_arch" in
     x86_64) host_profile='linux-x86_64' ;;

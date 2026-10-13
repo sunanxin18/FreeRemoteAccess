@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """静态包门禁；不执行被检查的 ELF，也不把静态检查称为运行证明。"""
 import os
+import importlib.util
 import hashlib
 from pathlib import Path
 import re
@@ -65,7 +66,16 @@ def verify(package, platform, repo):
         relative = f"hicolor/{size}x{size}/apps/freeremotedesk.png"
         fixed[f"share/icons/{relative}"] = repo / "assets/app-icon/linux" / relative
     codec_prefix = f"codecs/ffmpeg-8.1.2/{platform}"
-    files = set(fixed) | {"freeremotedesk-linux"} | {f"{codec_prefix}/{name}" for name in CODECS}
+    # 平台adapter固定集合，不信任provenance内任意材料清单。
+    spec = importlib.util.spec_from_file_location('linux_bundle', repo / 'tools/linux-ffmpeg-bundle.py')
+    bundle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bundle)
+    codec_root = root / codec_prefix
+    recipe = bundle.recipe_for_materials(codec_root)
+    codec_files = bundle.files_for_recipe(recipe, platform)
+    expected_recipe = os.environ.get('FRD_FFMPEG_SOURCE_RECIPE')
+    require(expected_recipe is None or recipe == expected_recipe, '所选recipe与包来源不匹配')
+    files = set(fixed) | {"freeremotedesk-linux"} | {f"{codec_prefix}/{name}" for name in codec_files}
     dirs = {"."}
     for name in files:
         dirs.update(str(p) for p in Path(name).parents)
@@ -100,6 +110,7 @@ def verify(package, platform, repo):
             "FFmpeg 来源摘要不匹配")
     require((root / codec_prefix / "FFmpeg-LGPL-2.1-or-later.txt").read_bytes() ==
             (repo / "third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1").read_bytes(), "FFmpeg 许可证不匹配")
+    bundle.verify_materials(codec_root, recipe, platform)
     binary = root / "freeremotedesk-linux"
     require(binary.stat().st_mode & 0o111 != 0, "客户端没有执行权限")
     with binary.open("rb") as stream:

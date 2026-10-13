@@ -19,7 +19,10 @@ fi
 frd_version="8.1.2"
 frd_sha256="464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
 frd_build="${FRD_FFMPEG_BUILD_ROOT:-$frd_root/target/ffmpeg-linux}"
-frd_archive="$frd_build/ffmpeg-$frd_version.tar.xz"
+[[ "$frd_build" == /* ]] || frd_build="$frd_root/$frd_build"
+frd_archive="${FRD_FFMPEG_ARCHIVE:-$frd_build/ffmpeg-$frd_version.tar.xz}"
+[[ "$frd_archive" == /* ]] || frd_archive="$frd_root/$frd_archive"
+frd_recipe="${FRD_FFMPEG_SOURCE_RECIPE:-upstream}"
 frd_arch="${FRD_FFMPEG_ARCH:-$(uname -m)}"
 frd_host_arch="$(uname -m)"
 frd_cross_build=0
@@ -28,15 +31,20 @@ case "$frd_arch" in
   x86|i686)
     frd_platform="linux-x86"
     frd_arch="x86"
-    command -v nasm >/dev/null || { echo "Linux x86 FFmpeg build requires NASM/x86asm" >&2; exit 2; }
     ;;
   x86_64)
     frd_platform="linux-x86_64"
-    command -v nasm >/dev/null || { echo "Linux x86_64 FFmpeg build requires NASM/x86asm" >&2; exit 2; }
     ;;
   aarch64|arm64) frd_platform="linux-aarch64"; frd_arch="aarch64" ;;
   *) echo "不支持的 Linux FFmpeg 架构: $frd_arch" >&2; exit 2 ;;
 esac
+
+# recipe/target trust 在创建目录、下载或源码重放前执行；未知或modified+x86立即拒绝。
+python3 "$frd_root/tools/desktop-ffmpeg-source.py" metadata \
+  --profile "$frd_platform" --source-recipe "$frd_recipe" >/dev/null
+if [[ "$frd_arch" == x86 || "$frd_arch" == x86_64 ]]; then
+  command -v nasm >/dev/null || { echo 'Linux x86/AMD64 FFmpeg build requires NASM/x86asm' >&2; exit 2; }
+fi
 
 case "$frd_host_arch" in
   x86|i686) frd_host_platform="linux-x86" ;;
@@ -51,7 +59,7 @@ if [[ "$frd_platform" != "$frd_host_platform" ]]; then
   : "${FRD_FFMPEG_CROSS_PREFIX:?跨架构 Linux 构建必须显式提供 FRD_FFMPEG_CROSS_PREFIX}"
   : "${FRD_CARGO_TARGET:?跨架构 Linux 构建必须显式提供 FRD_CARGO_TARGET}"
   frd_cargo_target_env="${FRD_CARGO_TARGET//-/_}"
-  frd_cargo_target_env="${frd_cargo_target_env^^}"
+  frd_cargo_target_env="$(printf '%s' "$frd_cargo_target_env" | LC_ALL=C tr '[:lower:]' '[:upper:]')"
   export "CC_${frd_cargo_target_env}=$FRD_FFMPEG_CC"
   export "CARGO_TARGET_${frd_cargo_target_env}_LINKER=$FRD_FFMPEG_CC"
   if command -v "${FRD_FFMPEG_CROSS_PREFIX}ar" >/dev/null; then
@@ -88,10 +96,12 @@ fi
 
 frd_attempt=$(mktemp -d "$frd_build/build.XXXXXX")
 trap 'rm -rf "$frd_attempt"' EXIT
-tar -xf "$frd_archive" -C "$frd_attempt"
+frd_source=$(python3 "$frd_root/tools/desktop-ffmpeg-source.py" prepare \
+  --profile "$frd_platform" --source-recipe "$frd_recipe" \
+  --archive "$frd_archive" --destination "$frd_attempt/source")
 frd_stage="$frd_attempt/dist"
 frd_prefix="$frd_stage/usr"
-cd "$frd_attempt/ffmpeg-$frd_version"
+cd "$frd_source"
 frd_configure_args=(
   # configure 参数会原样进入 avcodec_configuration() 的运行时字符串。
   # 使用固定逻辑安装前缀，临时构建目录仅通过 make 的 DESTDIR 传入，
@@ -115,7 +125,24 @@ if [[ "$frd_cross_build" -eq 1 ]]; then
   )
 fi
 ./configure "${frd_configure_args[@]}"
+if [[ "$frd_recipe" != upstream ]]; then
+  python3 - "$frd_attempt/configuration.json" "${frd_configure_args[@]}" <<'CONFIG'
+import json
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+settings = dict(line.split('=', 1) for line in Path('ffbuild/config.mak').read_text().splitlines() if '=' in line)
+compiler = subprocess.check_output(shlex.split(settings['CC']) + ['--version'], text=True).splitlines()[0]
+Path(sys.argv[1]).write_text(json.dumps({'args': sys.argv[2:], 'compiler': compiler}))
+CONFIG
+fi
 make -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+if [[ "$frd_recipe" != upstream ]]; then
+  # install会剥离安装副本；先从本次未strip库取得真实symbol/size/file-backed代码record。
+  python3 "$frd_root/tools/linux-ffmpeg-bundle.py" kernel \
+    --library "$frd_source/libavcodec/libavcodec.so.62" --output "$frd_attempt/kernel.json"
+fi
 make DESTDIR="$frd_stage" install
 
 if [[ "$frd_arch" == "x86" || "$frd_arch" == "x86_64" ]]; then
@@ -145,8 +172,8 @@ if [[ "$frd_run_tests" == 1 ]]; then
     LD_LIBRARY_PATH="$frd_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     cargo test --locked "${frd_test_target[@]}" -p frd-video-ffmpeg-plugin --features native-ffmpeg --lib -- --nocapture
 fi
-frd_bundle="$frd_build/bundle/$frd_platform"
-rm -rf "$frd_bundle"
+# 只有所有来源/ELF/包门通过后才替换旧bundle。
+frd_bundle="$frd_attempt/bundle"
 mkdir -p "$frd_bundle"
 cp -L "$frd_prefix/lib/libavcodec.so.62" "$frd_prefix/lib/libavutil.so.60" \
   "$frd_plugin" "$frd_bundle/"
@@ -172,18 +199,14 @@ for frd_library in "$frd_bundle"/libavcodec.so.62 "$frd_bundle"/libavutil.so.60 
     exit 1
   }
 done
-frd_bundle_files=()
-while IFS= read -r -d '' frd_entry; do
-  frd_bundle_files+=("$(basename "$frd_entry")")
-done < <(find "$frd_bundle" -mindepth 1 -maxdepth 1 -type f -print0)
-frd_actual_files="$(printf '%s\n' "${frd_bundle_files[@]}" | LC_ALL=C sort)"
-frd_expected_files="$(printf '%s\n' \
-  FFmpeg-LGPL-2.1-or-later.txt FFmpeg-NOTICE.txt libavcodec.so.62 \
-  libavutil.so.60 libfreeremotedesk_ffmpeg.so | LC_ALL=C sort)"
-[[ "$frd_actual_files" == "$frd_expected_files" ]] || {
-  echo "Linux FFmpeg bundle 文件集合不匹配: $frd_bundle" >&2
-  exit 1
-}
+if [[ "$frd_recipe" != upstream ]]; then
+  python3 "$frd_root/tools/linux-ffmpeg-bundle.py" complete \
+    --bundle "$frd_bundle" --archive "$frd_archive" --source-tree "$frd_source" \
+    --configuration-file "$frd_attempt/configuration.json" \
+    --unstripped-library "$frd_source/libavcodec/libavcodec.so.62" --kernel-file "$frd_attempt/kernel.json"
+fi
+FRD_FFMPEG_SOURCE_RECIPE="$frd_recipe" \
+  bash "$frd_root/tools/verify-linux-ffmpeg-bundle.sh" "$frd_bundle" "$frd_platform"
 if [[ "$frd_run_tests" == 1 ]]; then
   # fixture 通过实际目标进程加载本次随包插件，并核验 ABI 和解码像素。
   FFMPEG_DIR="$frd_prefix" \
@@ -192,4 +215,17 @@ if [[ "$frd_run_tests" == 1 ]]; then
     cargo test --locked "${frd_test_target[@]}" -p frd-video-ffmpeg-plugin --features native-ffmpeg \
       --test main444_decode -- --nocapture
 fi
-echo "Linux FFmpeg bundle: $frd_bundle"
+frd_output="$frd_build/bundle/$frd_platform"
+mkdir -p "$frd_build/bundle"
+[[ ! -L "$frd_output" && ( ! -e "$frd_output" || -d "$frd_output" ) ]] || {
+  echo 'Linux bundle 输出必须为普通目录' >&2; exit 1;
+}
+rm -rf "$frd_output"
+mv "$frd_bundle" "$frd_output"
+echo "Linux FFmpeg bundle: $frd_output"
+if [[ "${FRD_FFMPEG_KEEP_BUILD:-0}" == 1 ]]; then
+  # 仅成功发布后显式保留同源实际对象/config/prefix供root数值与基准；失败仍清理。
+  trap - EXIT
+  printf 'Linux FFmpeg retained configured attempt: %s\n' "$frd_attempt"
+  printf 'Linux FFmpeg retained shipping source: %s\n' "$frd_source"
+fi

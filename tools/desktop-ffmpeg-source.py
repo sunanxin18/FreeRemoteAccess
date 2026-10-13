@@ -11,16 +11,18 @@ spec = importlib.util.spec_from_file_location('desktop_fixed_recipe', REPO / 'to
 recipes = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recipes)
 PROFILE = 'macos-aarch64'
+PROFILES = {'macos-aarch64': 'aarch64', 'linux-aarch64': 'aarch64',
+            'linux-x86': 'x86', 'linux-x86_64': 'x86_64'}
 
 
 def metadata(recipe, profile=PROFILE, repo=REPO):
-    recipes.require(profile == PROFILE, '未知或不支持的 desktop source profile；macOS 仅 ARM64')
-    return recipes.metadata(recipe, 'aarch64', repo)
+    recipes.require(profile in PROFILES, '未知或不支持的 desktop source profile；macOS 仅 ARM64')
+    return recipes.metadata(recipe, PROFILES[profile], repo)
 
 
 def prepare(archive, destination, recipe, profile=PROFILE, repo=REPO):
     metadata(recipe, profile, repo)  # 下载/创建源码目录前验证。
-    return recipes.prepare(archive, destination, recipe, 'aarch64', repo)
+    return recipes.prepare(archive, destination, recipe, PROFILES[profile], repo)
 
 
 def asset_name(recipe, profile=PROFILE):
@@ -36,6 +38,10 @@ def asset_files(archive, recipe, profile=PROFILE, repo=REPO):
                'LICENSE.LGPLv2.1': recipes.regular(repo / recipes.BASE / 'LICENSE.LGPLv2.1')}
     paths = [Path('tools/ffmpeg-source-recipe.py'), Path('tools/desktop-ffmpeg-source.py'),
              Path('tools/macos-ffmpeg-bundle.py'), Path('tools/build-ffmpeg-macos.sh')]
+    if profile.startswith('linux-'):
+        paths = [Path('tools/ffmpeg-source-recipe.py'), Path('tools/desktop-ffmpeg-source.py'),
+                 Path('tools/linux-ffmpeg-bundle.py'), Path('tools/build-ffmpeg-linux.sh'),
+                 Path('tools/verify-linux-ffmpeg-bundle.sh')]
     if recipe == recipes.MODIFIED:
         paths += [recipes.PIN, recipes.PATCH]
     for path in paths:
@@ -50,6 +56,20 @@ def asset_files(archive, recipe, profile=PROFILE, repo=REPO):
                     'FRD_FFMPEG_ARCHIVE="$PWD/ffmpeg-8.1.2.tar.xz" '
                     'bash tools/build-ffmpeg-macos.sh\n'
                     'Fresh replay validates all pre/post hashes and leaves the C oracle unchanged.\n')
+    if profile.startswith('linux-'):
+        instructions = (f'Profile: {profile}\nRecipe: {recipe}\n'
+                        'Base archive SHA256 authenticates the pinned upstream archive only.\n'
+                        'The local patch is not an upstream-signed release.\n'
+                        'Publish this ZIP beside the matching binary on the same download page.\n'
+                        'Extract into the matching FreeRemoteDesk checkout (Cargo.lock/rust-toolchain.toml).\n'
+                        'Use a Linux toolchain for the exact target and Rust 1.96.0; run:\n'
+                        f'FRD_FFMPEG_ARCH={PROFILES[profile]} FRD_FFMPEG_SOURCE_RECIPE={recipe} '
+                        'FRD_FFMPEG_ARCHIVE="$PWD/ffmpeg-8.1.2.tar.xz" '
+                        'bash tools/build-ffmpeg-linux.sh\n'
+                        'Cross builds require FRD_FFMPEG_CC, FRD_FFMPEG_CROSS_PREFIX and FRD_CARGO_TARGET.\n'
+                        'x86/i686 and AMD64 require NASM; ARM64 requires HAVE_NEON.\n'
+                        'Fresh replay validates all pre/post hashes and leaves the C oracle unchanged.\n'
+                        'Static cross checks do not execute the target.\n')
     members['REBUILD.txt'] = instructions.encode()
     manifest = {'schema': 'freeremotedesk.desktop.ffmpeg-source.v1', 'profile': profile,
                 'source': info, 'recipe': recipe,

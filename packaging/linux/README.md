@@ -28,3 +28,12 @@ Pango 配置中注册，不写入系统或用户字体目录。Linux 音频尚�
 运行 `./freeremotedesk-linux --verify-codec-bundle` 验证实际解码器加载；该命令不连接
 远程服务器，不代表 GUI、远程输入、AVC 协商或 HEVC 互操作验收已通过。
 默认 RDP 图形模式为 LegacyOnly，现代图形仍须显式选择实验模式。
+
+Linux FFmpeg 默认来源配方为 `upstream`，三个目标各自保留原版源码；只有显式
+`FRD_FFMPEG_SOURCE_RECIPE=frd-h264dc-aarch64-v1` 与 AArch64 目标组合允许本地固定
+H264 luma DC NEON 修改。未知配方或修改配方与 x86/AMD64 组合会在下载/创建源码前拒绝。
+修改包 codec 目录包含固定 patch、recipe、Linux provenance 和完整对应源码 ZIP；
+必须与匹配二进制一起发布。原归档摘要只认证原版源码，不认证本地修改。
+构建器可用 `FRD_FFMPEG_ARCHIVE` 选择已缓存的固定归档；成功构建时显式
+`FRD_FFMPEG_KEEP_BUILD=1` 保留实际配置树与同源对象，供数值、分派和基准验证。
+交叉构建的 ELF/来源检查不代表 Linux ARM64 执行、完整 codec 资格或远程互操作通过。

@@ -15,6 +15,7 @@ esac
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 [[ "$target_dir" == /* ]] || target_dir="$repo_root/$target_dir"
 codec_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-linux}"
+[[ "$codec_root" == /* ]] || codec_root="$repo_root/$codec_root"
 codec_bundle="$codec_root/bundle/$platform"
 # 缺少 native codec 时立即失败，不生成只有图标或宿主可执行文件的假包。
 "$repo_root/tools/verify-linux-ffmpeg-bundle.sh" "$codec_bundle" "$platform"
@@ -32,7 +33,11 @@ umask 022
 mkdir -p "$package/codecs/ffmpeg-8.1.2/$platform" "$package/share/applications" "$package/share/licenses/FreeRemoteDesk"
 mkdir -p "$package/share/fonts/freeremotedesk"
 install -m 755 "$binary" "$package/freeremotedesk-linux"
-install -m 644 "$codec_bundle"/* "$package/codecs/ffmpeg-8.1.2/$platform/"
+# verifier已通过；逐项复制受信recipe集合，拒绝临时加入的任意材料。
+codec_files=$(python3 "$repo_root/tools/linux-ffmpeg-bundle.py" files --path "$codec_bundle" --profile "$platform")
+while IFS= read -r name; do
+  install -m 644 "$codec_bundle/$name" "$package/codecs/ffmpeg-8.1.2/$platform/"
+done <<< "$codec_files"
 install -m 644 assets/fonts/noto-sans-sc/NotoSansSC-VariableFont_wght.ttf \
   "$package/share/fonts/freeremotedesk/NotoSansSC-VariableFont_wght.ttf"
 install -m 644 packaging/linux/freeremotedesk.desktop "$package/share/applications/"

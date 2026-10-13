@@ -1,5 +1,7 @@
 """合成包门禁回归；readelf/desktop 工具注入仅用于检查拒绝路径，不是 Linux 运行证明。"""
 import importlib.util
+import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -34,6 +36,7 @@ class PackageValidation(unittest.TestCase):
         for size in (16, 32, 48, 64, 128, 256, 512):
             name = f"hicolor/{size}x{size}/apps/freeremotedesk.png"
             self.add("share/icons/" + name, REPO / "assets/app-icon/linux" / name)
+        self.platform = "linux-x86_64"
         self.codec = self.root / "codecs/ffmpeg-8.1.2/linux-x86_64"
         self.codec.mkdir(parents=True)
         for name in v.CODECS:
@@ -56,9 +59,35 @@ class PackageValidation(unittest.TestCase):
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, dest)
 
+    def switch_profile(self, platform):
+        destination = self.codec.with_name(platform)
+        self.codec.rename(destination)
+        self.codec = destination
+        self.platform = platform
+        (self.codec / "FFmpeg-NOTICE.txt").write_text(
+            f"FFmpeg 8.1.2,\nArchitecture: {platform}\n"
+            "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c\n")
+        header = bytearray(64)
+        elf_class, machine, _ = v.PROFILES[platform]
+        header[:7] = b"\x7fELF" + bytes((elf_class, 1, 1))
+        struct.pack_into("<HH", header, 16, 3, machine)
+        (self.root / "freeremotedesk-linux").write_bytes(header)
+
     def verify(self, dynamic="(NEEDED) [libc.so.6]"):
-        with patch.object(v.subprocess, "check_output", side_effect=[dynamic, "[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]", "(NEEDED) [libavutil.so.60]", "(NEEDED) [libc.so.6]", "(NEEDED) [libavcodec.so.62]"]), patch.object(v.subprocess, "run"):
-            v.verify(str(self.root), "linux-x86_64", str(REPO))
+        with patch.dict(os.environ, {k: val for k, val in os.environ.items() if k != "FRD_FFMPEG_SOURCE_RECIPE"}, clear=True), patch.object(v.subprocess, "check_output", side_effect=[dynamic, f"[Requesting program interpreter: {v.PROFILES[self.platform][2]}]", "(NEEDED) [libavutil.so.60]", "(NEEDED) [libc.so.6]", "(NEEDED) [libavcodec.so.62]"]), patch.object(v.subprocess, "run"):
+            v.verify(str(self.root), self.platform, str(REPO))
+
+    def test_all_three_upstream_profile_contracts(self):
+        for platform in v.PROFILES:
+            with self.subTest(platform=platform):
+                if self.platform != platform:
+                    self.switch_profile(platform)
+                self.verify()
+
+    def test_modified_recipe_on_x86_cannot_authorize_extra_materials(self):
+        (self.codec / "FFmpeg-PROVENANCE.json").write_text(json.dumps({'recipe': 'frd-h264dc-aarch64-v1'}))
+        with self.assertRaisesRegex(ValueError, "AArch64"):
+            self.verify()
 
     def test_expected_static_contract(self):
         self.verify()
@@ -126,6 +155,68 @@ class PackageValidation(unittest.TestCase):
         (self.root / "share/applications/freeremotedesk.desktop").write_text("Exec=other")
         with self.assertRaisesRegex(ValueError, "固定源"):
             self.verify()
+
+
+
+class ModifiedPackageValidation(PackageValidation):
+    # 继承完整synthetic package资源构造；只新增真实ELF/完整来源材料路径。
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location('linux_recipe_tests', REPO / 'tools/tests/test_linux_ffmpeg_recipe.py')
+        tests = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tests)
+        cls.fixtures = tests.ELFAndMaterials
+        cls.fixtures.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixtures.tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        self.switch_profile('linux-aarch64')
+        for path in self.codec.iterdir():
+            path.unlink()
+        for path in self.fixtures.good.iterdir():
+            shutil.copyfile(path, self.codec / path.name)
+
+    def test_all_three_upstream_profile_contracts(self):
+        # modified不能被重命名为其他architecture，任何profile改写都拒绝。
+        for platform in ('linux-x86', 'linux-x86_64'):
+            with self.subTest(platform=platform):
+                self.switch_profile(platform)
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+    def test_modified_recipe_on_x86_cannot_authorize_extra_materials(self):
+        self.switch_profile('linux-x86_64')
+        with self.assertRaises(ValueError):
+            self.verify()
+
+    def test_wrong_elf_architecture_rejected(self):
+        header = bytearray((self.root / 'freeremotedesk-linux').read_bytes())
+        struct.pack_into('<H', header, 18, 62)
+        (self.root / 'freeremotedesk-linux').write_bytes(header)
+        with self.assertRaisesRegex(ValueError, '架构'):
+            self.verify()
+
+    def test_modified_package_exact_material_collection(self):
+        self.verify()
+        for name in ('FFmpeg-CHANGES.diff', 'FFmpeg-SOURCE-RECIPE.json', 'FFmpeg-PROVENANCE.json',
+                     self.fixtures.bundle.source.asset_name('frd-h264dc-aarch64-v1', 'linux-aarch64')):
+            path = self.codec / name
+            original = path.read_bytes()
+            path.unlink()
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.verify()
+            path.write_bytes(original + b'changed')
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.verify()
+            path.write_bytes(original)
+        (self.codec / 'arbitrary.zip').write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError, '文件集合'):
+            self.verify()
+
 
 if __name__ == "__main__":
     unittest.main()
