@@ -24,3 +24,19 @@ Mac/GTK/GL/Linux每条成功范围以对应工作流的实际步骤为边界；h
 2026-10-14重新观察同一批实际运行，全部成功结束：Windows `38467005504` 三架构包、macOS ARM64 `38467005270`、默认 upstream Linux 三架构 `38467005318`、GTK 三架构 `38467005498` 与通用 CI `38467005418`。各 run 的 head 均为 `6e075c48b5f47965af7c38123b95324e53196daf`；本轮没有新触发 GL workflow，不将历史 GL 证据记作该 head 的回归。
 
 Windows ARM64 原生 job `115550527102` 完整149,424-byte日志保存于 `target/ci-h264-linux-gcc-20261014/windows-native-job.log`：原生 Rust 1.96 / `aarch64-pc-windows-msvc` 加载同 run 下载的 upstream 包，Main444 fixture 6项、ClearCodec/NSCodec 39项与独立运行的2项基准、Progressive 61项与独立运行的1项基准全部通过。该 head 尚不含 `2015400` 的 native factory 策略或 Windows 新 kernel helper；不能作为后续源码的验证。Linux 显式修改配方 `38467007932` 的独立成功范围见[专项记录](linux-h264-recipe-20261014.md)。
+
+## 后续冻结 ccd4ad5 托管回归
+
+2026-10-14，匹配 `ccd4ad5aeb10cee8c47fe8acfe0a4c47982640c0` 的五条实际工作流均成功结束：
+
+| 工作流 | 本轮实际完成范围 |
+|---|---|
+| [Windows38477613709](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38477613709) | i686、x86_64、ARM64 包及独立 Windows ARM64 原生解码运行 |
+| [Mac38477613802](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38477613802) | macOS ARM64 包；无 Intel job |
+| [Linux38477613812](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38477613812) | upstream i686、x86_64、AArch64 三架构客户端与 FFmpeg 包 |
+| [GTK38477613904](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38477613904) | i686、x86_64、AArch64 adapter |
+| [CI38477613902](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38477613902) | 格式及 Ubuntu/macOS 安全构建测试 |
+
+Windows ARM64 原生 job `115584007364` 使用原生 Rust 1.96 / `aarch64-pc-windows-msvc` 和同 run 下载的默认 upstream 包。实际日志确认 Main444 6项、ClearCodec/NSCodec 39项及随后单独运行的2项基准、Progressive 61项及随后单独运行的1项基准均通过。完整日志221,697 bytes，SHA256 `4ee6c8bdb60567c5fde7a78f2e947c5d2e1911c49122a291311257d9d867c321`。
+
+全部 run/head/jobs 状态、完整原生日志和摘要保存在 `target/ci-native-factory-and-windows-identity-20261014/`。此 head 含 `2015400` 显式 native factory 和已审查 Windows 核身份接口；本轮仍使用默认 upstream Windows 包，未执行 Windows 修改配方的私有 ABI/数值资格，不证明 RequiredNative 所有热路径、待提交整管线测试或普通鸿蒙 HAP 的生产注册与真实登录。本轮没有重新触发 GL，也没有重复已通过且来源链未变的 Linux 显式修改配方资格。日志保留 CI 的 Node.js 20 action 被托管环境转为 Node.js 24 执行的弃用警告，未将成功状态描述为无警告。
