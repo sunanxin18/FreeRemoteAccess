@@ -4,6 +4,7 @@
 #include "hilog/log.h"
 #include "frd_ohos.h"
 #include "bridge_state.h"
+#include "app_bridge.h"
 #include <limits>
 #include <cstddef>
 #include <memory>
@@ -95,7 +96,7 @@ napi_value Foreground(napi_env env, napi_callback_info info) {
     if (napi_get_cb_info(env, info, &argc, &argument, nullptr, nullptr) != napi_ok || argc != 1 || napi_get_value_bool(env, argument, &value) != napi_ok) {
         napi_throw_type_error(env, nullptr, "前台状态必须是布尔值"); return nullptr;
     }
-    foreground=value; int32_t code=0;
+    foreground=value; FrdAppForeground(value); int32_t code=0;
     for (const auto &item : components) if (item.second->engine) {
         const auto result=frd_ohos_set_foreground(item.second->engine, value ? 1 : 0); if (result != 0) code=result;
     }
@@ -128,12 +129,14 @@ napi_value Status(napi_env env, napi_callback_info) {
     return result;
 }
 void Cleanup(void *environment) {
+    FrdAppCleanup();
     cleanupEnvironments.erase(static_cast<napi_env>(environment));
     // env 清理时不访问可能已失效的 XComponent，只 join native worker。
     for (auto &item : components) if (item.second->engine) frd_ohos_destroy(item.second->engine);
     components.clear();
 }
 napi_value Init(napi_env env, napi_value exports) {
+    RegisterFrdApp(env,exports);
     if (cleanupEnvironments.insert(env).second) napi_add_env_cleanup_hook(env,Cleanup,env);
     napi_property_descriptor descriptors[]={{"abiVersion",nullptr,Abi,nullptr,nullptr,nullptr,napi_default,nullptr},
         {"pocAvailable",nullptr,PocAvailable,nullptr,nullptr,nullptr,napi_default,nullptr},

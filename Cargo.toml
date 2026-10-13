@@ -27,6 +27,7 @@ members = [
     "crates/frd-platform-windows",
     "crates/frd-platform-macos",
     "crates/frd-platform-linux",
+    "crates/frd-platform-ohos",
     "crates/frd-ui-egui",
     "crates/frd-shell-runtime",
     "crates/frd-shell-ohos-ffi",

@@ -1999,6 +1999,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-platform-ohos"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "frd-core",
+ "frd-platform-api",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "frd-platform-windows"
 version = "0.1.0"
 dependencies = [
@@ -2166,11 +2180,21 @@ dependencies = [
 name = "frd-shell-ohos-ffi"
 version = "0.1.0"
 dependencies = [
+ "frd-app",
  "frd-compositor-wgpu",
  "frd-core",
+ "frd-frame",
+ "frd-media-api",
+ "frd-platform-api",
+ "frd-platform-ohos",
+ "frd-protocol-api",
  "frd-render-wgpu",
+ "frd-shell-runtime",
+ "frd-ui-model",
  "pollster",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "wgpu",
 ]
 

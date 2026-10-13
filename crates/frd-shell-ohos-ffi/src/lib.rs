@@ -4,6 +4,9 @@
 //! 阻塞前释放。attach 的借用窗口仅在调用期间跨线程移交，必须等待独立
 //! 引用取得和初始化结果；没有超时后仍访问借用窗口的路径。
 
+mod app_abi;
+pub mod app_adapter;
+pub mod input_adapter;
 #[cfg(any(test, target_env = "ohos"))]
 mod limits;
 #[cfg(target_env = "ohos")]
@@ -32,6 +35,7 @@ pub const WORKER_STOPPED: i32 = -7;
 pub const PANIC: i32 = -8;
 pub const EXHAUSTED: i32 = -9;
 pub const NOT_ATTACHED: i32 = -10;
+pub const QUEUE_FULL: i32 = -11;
 
 /// 固定宽度、无秘密的图形 POC 诊断，绝不代表网络会话成功。
 #[repr(C)]

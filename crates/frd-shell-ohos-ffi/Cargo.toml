@@ -6,8 +6,19 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[target.'cfg(target_env = "ohos")'.dependencies]
+[dependencies]
 frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-app = { path = "../frd-app" }
+frd-ui-model = { path = "../frd-ui-model" }
+frd-platform-api = { path = "../frd-platform-api" }
+frd-platform-ohos = { path = "../frd-platform-ohos" }
+frd-protocol-api = { path = "../frd-protocol-api" }
+frd-media-api = { path = "../frd-media-api" }
+frd-shell-runtime = { path = "../frd-shell-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+[target.'cfg(target_env = "ohos")'.dependencies]
 frd-render-wgpu = { path = "../frd-render-wgpu" }
 frd-compositor-wgpu = { path = "../frd-compositor-wgpu" }
 raw-window-handle.workspace = true
