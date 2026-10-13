@@ -51,3 +51,11 @@ cargo check --locked --target aarch64-unknown-linux-ohos \
 - `setup-20261013.md`：下载、创建、启动和 Rust target 安装命令及结果。
 
 SDK 镜像位于本机配置的 `Library/Huawei/Sdk/system-image/HarmonyOS-7.0.0/`，未纳入 Git。HDC 端口属于这次启动记录，重新启动后需重新列出设备，不能硬编码进构建或产品。
+
+## 镜像复核与重新启动
+
+同日复核官方 `Emulator -imageList -downloaded true`，PC/2in1 镜像仍为 7.0.0.107；手机本地镜像 metadata 为 7.0.0.106。两个 FreeRemoteDesk 专用实例此前均关闭，本轮已重新启动，HDC 5555/5557 均为 Connected，`bootevent.boot.completed=true`，架构仍为 arm64-v8a。原始记录：`target/harmony-validation/restart-20261013.json`。这一步不重复下载已有镜像，也不升级或改动原 Pura 90 Pro 实例。
+
+宿主 Mac 最初锁屏，用户随后已手动解锁。CUA 已能读取 DevEco 的设备管理器，但不能按名称或完整路径选中 SDK 裸 Mach-O `Emulator` 进程；IDE 设备投屏列表也没有可选设备。已请求用户明确指定官方 Emulator CLI 作为替代界面验证通道。在该通道获准并实际检查以前，不能用 guest 启动参数或原生呈现日志替代视觉验收。
+
+2026-10-13 用户随后明确授权官方 Emulator CLI 进行两个专用实例的截图、旋转、点击及前后台验证。已实际完成初步图形与生命周期检查，结果和未通过的手机方向项见 [HAP 图形验证](harmony-hap-20261013.md)。该替代只用于本地测试界面，不改变产品的客户端边界。

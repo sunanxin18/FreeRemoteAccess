@@ -31,7 +31,7 @@
 - 官方 PC ARM64 镜像已下载，独立 phone/2in1 模拟器均启动且 HDC Connected；Rust 1.96 OHOS std 已安装。
 - 源码未改动的 desktop/session 基线共 228 项测试通过；现有 core/frame/app 的 OHOS target check 通过。
 - [环境证据](../../validation/harmony-environment-20261013.md)与[鸿蒙手机原生服务调查](../../validation/harmony-native-service-20261013.md)已记录。
-- 当前已进入 Task 1 实施；这些准备结果不将任何 HAP、图形、协议互操作任务标为完成，各步骤在实现及审查后单独勾选。
+- Task 1–2 已完成并通过独立审查，当前进入 Task 3；准备结果不将任何 HAP、图形、协议互操作任务标为完成，各步骤在实现及审查后单独勾选。
 
 ### Task 1: OHOS 工具链与共享执行器边界
 
@@ -52,10 +52,12 @@ Task 1 于 `655785d` 完成并经独立审查通过；各架构验证范围见[�
 
 **Interfaces:** `frd_ohos_abi_version() -> u32`，`frd_ohos_create() -> u64`，`frd_ohos_destroy(engine: u64) -> i32`；`frd_ohos_attach(engine, window, width, height, out_surface_generation: *mut u64) -> i32`、`frd_ohos_resize(engine, surface_generation, width, height) -> i32`、`frd_ohos_detach(engine, surface_generation) -> i32`。engine 是 Rust registry 分配的不复用整数句柄，0 为无效值；surface generation 同样单调递增，迟到回调不可拆除或改变新 surface。不得解引用已释放的 Rust 对象指针来判断有效性。只有 `window` 是调用方保证生命周期的 native 指针，attach 成功前取得独立引用。native bridge 不解析协议。
 
-- [ ] 测试空/失效句柄、重复 detach、零尺寸、迟到回调和销毁顺序；错误均可识别且不得 unwind。
-- [ ] 实现 owned OHNativeWindow lease 与 compositor，呈现确定性图案仅作为图形 POC，产品登录页不伪装网络连接。
-- [ ] 构建 phone/2in1 HAP，核验 lib 架构、资源、权限与签名；通过 HDC 安装到独立实例。
-- [ ] 在两个模拟器验证 attach/resize/detach、前后台和画面呈现；PC 缺镜像自动下载后验证，不用手机布局冒充 PC。
+- [x] 测试空/失效句柄、重复 detach、零尺寸、迟到回调和销毁顺序；错误均可识别且不得 unwind。
+- [x] 实现 owned OHNativeWindow lease 与 compositor，呈现确定性图案仅作为图形 POC，产品登录页不伪装网络连接。
+- [x] 构建 phone/2in1 HAP，核验 lib 架构、资源、权限与签名；通过 HDC 安装到独立实例。
+- [x] 在两个模拟器验证 attach/resize/detach、前后台和画面呈现；PC 缺镜像自动下载后验证，不用手机布局冒充 PC。
+
+Task 2 于 `822c359` 实现、`2636a6c` 修复并通过独立复审。两台图形、手机横竖屏、PC 最大化/缩放与前后台通过，完整产品安全区等仍属 Task 3；见[图形验证](../../validation/harmony-hap-20261013.md)。
 
 ### Task 3: ArkUI 行为与鸿蒙平台服务
 
