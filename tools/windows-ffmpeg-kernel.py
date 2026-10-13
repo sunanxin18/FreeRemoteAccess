@@ -440,7 +440,8 @@ def reject_external_assembler_input(text):
         elif text[index] in ('"', "'"):
             quote = text[index]
             index += 1
-            clean.append(' ')
+            # literal 的位置不能消失；opcode/label位置的 quoted token 不支持。
+            clean.append(' @QUOTED@ ')
             closed = False
             while index < len(text):
                 char = text[index]
@@ -470,6 +471,72 @@ def reject_external_assembler_input(text):
         require(re.fullmatch(r'(?:\.[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_.]*)', opcode) is not None,
                 'assembler 动态 opcode/未知 statement 不支持')
         require(opcode.lower() not in ('.include', '.incbin'), 'assembler 外部文件读取不支持')
+
+
+def validate_physical_config(data):
+    """物理 config 域只允许 generated CPP配置；不信可伪造的逻辑#line owner。"""
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise ValueError('config.h 不是受支持的 UTF-8 CPP configuration') from error
+    require('\x00' not in text and '??/' not in text, 'config.h NUL/trigraph control 不支持')
+    # C phase2先拼接 escaped-newline，然后phase3移除comments；顺序不可交换。
+    text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\\\n', '')
+    clean, index = [], 0
+    while index < len(text):
+        if text.startswith('//', index):
+            end = text.find('\n', index)
+            index = len(text) if end < 0 else end
+            clean.append(' ')
+        elif text.startswith('/*', index):
+            end = text.find('*/', index + 2)
+            require(end >= 0, 'config.h comment 截断')
+            clean.append(' ')
+            index = end + 2
+        elif text[index] in ('"', "'"):
+            start, quote = index, text[index]
+            index += 1
+            closed = False
+            while index < len(text):
+                char = text[index]
+                index += 1
+                if char == '\\':
+                    require(index < len(text), 'config.h string escape 截断')
+                    index += 1
+                elif char == quote:
+                    closed = True
+                    break
+                else:
+                    require(char != '\n', 'config.h multiline string 不支持')
+            require(closed, 'config.h string 截断')
+            clean.append(text[start:index])
+        else:
+            clean.append(text[index])
+            index += 1
+    allowed = {'define', 'undef', 'if', 'ifdef', 'ifndef', 'elif', 'else', 'endif', 'error'}
+    for line in ''.join(clean).splitlines():
+        if not line.strip():
+            continue
+        directive = re.fullmatch(r'\s*#\s*([A-Za-z_][A-Za-z0-9_]*)?(.*)', line)
+        require(directive is not None, 'config.h 不能发出 raw assembler statement/未知 CPP control')
+        name, body = directive.groups()
+        require((name is None and not body.strip()) or name in allowed,
+                'config.h #line/numeric/include/pragma/未知 CPP control 不支持')
+        require(not re.search(r'\b(?:_Pragma|__pragma|__has_include|__has_include_next)\b', body),
+                'config.h 副作用 CPP builtin 不支持')
+
+
+def cpp_physical_includes(trace):
+    """只解析成功受控Clang该次-H stderr；未知诊断不当作依赖授权。"""
+    inputs = []
+    for line in trace.splitlines():
+        if not line.strip():
+            continue
+        match = re.fullmatch(r'\.+ (.+)', line)
+        require(match is not None, 'config/source CPP physical include trace 含未知诊断/格式')
+        inputs.append(match[1])
+    require(inputs, 'config/source CPP physical include trace 缺失')
+    return inputs
 
 
 def replay_source_endpoint(tree, archive, object_path, compiler, flags, evidence_dir):
@@ -504,28 +571,19 @@ def replay_source_endpoint(tree, archive, object_path, compiler, flags, evidence
     require(digest(regular(archive)) == recipes.ARCHIVE_SHA, 'endpoint 原归档 pin 不匹配')
     require(digest(regular(tree / SOURCE)) == pin['files'][SOURCE]['post'], 'endpoint source postimage 不匹配')
     configs = {p: artifact(tree / p) for p in ('config.h', 'ffbuild/config.mak')}
+    validate_physical_config(regular(tree / 'config.h'))
     compiler_record = artifact(compiler)
     compiler_record['version'] = _run([str(compiler), '--version'], tree, logs).decode().strip()
     prefix = [str(compiler), *flags, '-I', str(tree)]
-    preprocess = [*prefix, '-E', '-x', 'assembler-with-cpp', str(tree / SOURCE)]
+    preprocess = [*prefix, '-H', '-E', '-x', 'assembler-with-cpp', str(tree / SOURCE)]
     preprocessed = _run(preprocess, tree, logs)
     text = preprocessed.decode('utf-8')
     reject_external_assembler_input(text)
-    owner = None
-    for line in text.splitlines():
-        marker = re.match(r'^#\s+\d+\s+"([^"\n]+)"', line)
-        if marker:
-            path = Path(marker[1])
-            owner = (tree / path).resolve() if not path.is_absolute() else path.resolve()
-        elif owner == tree / 'config.h':
-            require(not line.strip() or line.lstrip().startswith('#'),
-                    'endpoint config.h 只能提供 CPP 配置，不能发出 raw assembler statement')
-    dependencies = set(re.findall(r'^#\s+\d+\s+"([^"\n]+)"', text, re.M))
+    # 主source是受控argv本身；include物理路径来自这次真实-H，不能由#line伪造。
+    dependencies = set([str(tree / SOURCE), *cpp_physical_includes(logs[-1]['stderr'])])
     inputs = {}
     with tarfile.open(archive) as package:
         for dependency in sorted(dependencies):
-            if dependency in ('<built-in>', '<command line>'):
-                continue
             path = Path(dependency)
             path = (tree / path).resolve() if not path.is_absolute() else path.resolve()
             require(path.is_relative_to(tree), 'endpoint 包含树外输入')

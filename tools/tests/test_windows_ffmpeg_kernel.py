@@ -584,6 +584,86 @@ class WindowsKernelContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'config.h'):
             self.k.coff_kernel_identity(obj, endpoint)
 
+    def test_real_quoted_reader_opcode_is_not_erased_as_an_operand(self):
+        fixture = TOOLS / 'tests/fixtures/macos-h264dc-kernel.bin'
+        body = f'.section .rdata,"dr"\n".incbin" "{fixture}"\n'
+        result = subprocess.run([shutil.which('clang'), '--target=aarch64-w64-mingw32', '-c',
+                                 '-x', 'assembler', '-', '-o', '-'], input=body.encode(),
+                                check=True, capture_output=True)
+        self.assertEqual(result.stdout[:2], b'\x64\xaa')
+        self.assertEqual(result.stderr, b'')
+        with self.assertRaisesRegex(ValueError, 'assembler'):
+            self.k.reject_external_assembler_input(body)
+
+    def test_real_quoted_config_readers_cannot_redirect_physical_owner(self):
+        archive = TOOLS.parent / 'target/ffmpeg-macos/ffmpeg-8.1.2.tar.xz'
+        fixture = TOOLS / 'tests/fixtures/macos-h264dc-kernel.bin'
+        controls = ('#line 1', '#/**/line 1', '#li\\\nne 1', '# 1', '#\\\n/**/ 1')
+        for index, control in enumerate(controls):
+            tree = (self.directory / f'quoted-owner-{index}').resolve()
+            body = (f'{control} "{tree / "libavcodec/aarch64/h264idct_neon.S"}"\n'
+                    f'.section .rdata,"dr"\n".incbin" "{fixture}"\n.text\n'
+                    f'#line 1 "{tree / "config.h"}"\n')
+            # CPP+ASM 都必须真实成功，随后只因独立输入来源门而拒绝。
+            obj, endpoint = self.g.generate_source(tree, archive, config_append=body)
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, 'assembler|config'):
+                self.k.coff_kernel_identity(obj, endpoint)
+
+    def test_generated_config_definitions_conditionals_comments_and_literals_remain_supported(self):
+        config = ('/* generated config */\n#ifndef FRD_GUARD\n#define FRD_GUARD 1\n'
+                  '#define FRD_LITERAL "// /* #line ; \\".incbin\\""\n'
+                  '#if defined(FRD_GUARD)\n#define FRD_VALUE \\\n 1\n#else\n'
+                  '#error inactive configuration branch\n#endif\n#undef FRD_VALUE\n#endif\n#\n')
+        archive = TOOLS.parent / 'target/ffmpeg-macos/ffmpeg-8.1.2.tar.xz'
+        obj, endpoint = self.g.generate_source(self.directory / 'generated-cpp-config', archive, config_append=config)
+        record = self.k.coff_kernel_identity(obj, endpoint)
+        self.assertEqual(record['extent_kind'], 'fixed_recipe_with_source_endpoint')
+        self.assertEqual(set(record['endpoint']['inputs']), {'config.h', 'libavcodec/aarch64/h264idct_neon.S',
+                                                           'libavutil/aarch64/asm.S', 'libavcodec/aarch64/neon.S'})
+
+    def test_physical_config_domain_rejects_controls_even_when_inactive_or_obfuscated(self):
+        for body in ('#line 1 "fake"', '#/**/line 1 "fake"', '#li\\\nne 1 "fake"',
+                     '# 1 "fake"', '#\\\n/**/ 1 "fake"', '%:line 1 "fake"',
+                     '??=line 1 "fake"', '#include "outside.h"', '#include_next "outside.h"',
+                     '#pragma message("diagnostic")', '#define X _Pragma("message")',
+                     '#if __has_include("outside.h")\n#endif',
+                     '#if 0\n#line 1 "fake"\n#endif', '#define A 1\n.byte 123'):
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, 'config.h'):
+                self.k.validate_physical_config(body.encode())
+
+    def test_real_physical_cpp_trace_keeps_duplicate_guarded_inputs_and_ignores_logical_owner(self):
+        for guarded in (False, True):
+            header = self.save('windows-h264dc-physical-header.h',
+                               (('#ifndef FRD_HEADER_GUARD\n#define FRD_HEADER_GUARD\n' if guarded else '') +
+                                '#line 99 "logical-owner-is-not-a-dependency.h"\n#define FRD_HEADER_VALUE 1\n' +
+                                ('#endif\n' if guarded else '')).encode())
+            source = f'#include "{header}"\n#include "{header}"\n'
+            result = subprocess.run([shutil.which('clang'), '--target=aarch64-w64-mingw32', '-H', '-E',
+                                     '-x', 'assembler-with-cpp', '-'], input=source.encode(),
+                                    check=True, capture_output=True)
+            traced = self.k.cpp_physical_includes(result.stderr.decode())
+            with self.subTest(guarded=guarded):
+                self.assertEqual([Path(p).resolve() for p in traced], [header.resolve()] * (1 if guarded else 2))
+                self.assertIn(b'logical-owner-is-not-a-dependency.h', result.stdout)
+        for trace in ('', 'error: . /fake/header.h\n', '. /real/header.h\n1 error generated.\n'):
+            with self.subTest(trace=trace), self.assertRaises(ValueError):
+                self.k.cpp_physical_includes(trace)
+
+    def test_actual_config_cpp_include_is_explicitly_unsupported(self):
+        external = self.save('windows-h264dc-extra-config.h', b'#define FRD_EXTRA 1\n')
+        archive = TOOLS.parent / 'target/ffmpeg-macos/ffmpeg-8.1.2.tar.xz'
+        obj, endpoint = self.g.generate_source(self.directory / 'cpp-include-config', archive,
+                                               config_append=f'#include "{external}"\n')
+        with self.assertRaisesRegex(ValueError, 'config.h.*include'):
+            self.k.coff_kernel_identity(obj, endpoint)
+
+    def test_failed_cpp_with_actual_include_trace_cannot_produce_endpoint_record(self):
+        obj, endpoint = self.source_fixture()
+        config = Path(endpoint['tree']) / 'config.h'
+        config.write_bytes(config.read_bytes() + b'#error controlled CPP failure\n')
+        with self.assertRaisesRegex(ValueError, 'compiler.*失败'):
+            self.k.coff_kernel_identity(obj, endpoint)
+
     def test_source_proof_output_link_cannot_modify_shipping_source(self):
         obj, endpoint = self.source_fixture()
         proof = Path(endpoint['evidence_dir'])
