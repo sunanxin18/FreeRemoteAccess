@@ -73,6 +73,8 @@ impl Engine {
         let join = thread::Builder::new()
             .name("frd-ohos-render".into())
             .spawn(move || {
+                // 受控范围覆盖 factory、所有命令和最终 native/GPU 清理，先于 catch。
+                let _panic_scope = crate::panic_scope::Scope::enter();
                 // 含 GPU/native 所有权的状态在此线程创建并销毁；panic 也不会移到 UI。
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let mut state = Some(State {

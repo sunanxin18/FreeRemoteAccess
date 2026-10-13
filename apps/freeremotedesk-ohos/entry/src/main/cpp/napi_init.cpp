@@ -3,6 +3,7 @@
 #include "ace/xcomponent/native_interface_xcomponent.h"
 #include "hilog/log.h"
 #include "frd_ohos.h"
+#include "bridge_state.h"
 #include <limits>
 #include <cstddef>
 #include <memory>
@@ -14,12 +15,6 @@ static_assert(sizeof(FrdOhosPocStatus) == 64, "ABI 1 的状态 POD 必须为 64 
 static_assert(offsetof(FrdOhosPocStatus, last_error) == 56, "ABI 1 字段偏移必须匹配 Rust");
 
 namespace {
-struct ComponentState {
-    uint64_t engine = 0;
-    uint64_t generation = 0;
-    void *borrowedWindow = nullptr; // 仅比较回调身份，不在 UI 解引用/操作窗口。
-    bool ticks = false;
-};
 // 所有入口由 ArkUI/NAPI 的 UI 线程调用，worker 不访问此表。
 std::unordered_map<OH_NativeXComponent *, std::unique_ptr<ComponentState>> components;
 std::unordered_set<napi_env> cleanupEnvironments;
@@ -46,19 +41,22 @@ void Frame(OH_NativeXComponent *component, uint64_t, uint64_t) {
 }
 void Created(OH_NativeXComponent *component, void *window) {
     auto *state=Find(component); if (!state) return;
-    if (!FRD_GRAPHICS_POC_ENABLED) { lastCode=FRD_OHOS_UNSUPPORTED_PLATFORM; return; }
+    state->BeginAttach();
+    if (!FRD_GRAPHICS_POC_ENABLED) { state->bridgeError=lastCode=FRD_OHOS_UNSUPPORTED_PLATFORM; return; }
     uint32_t width=0, height=0;
-    if (!Extent(component, window, width, height)) { lastCode=FRD_OHOS_INVALID_ARGUMENT; return; }
+    if (!Extent(component, window, width, height)) { state->bridgeError=lastCode=FRD_OHOS_INVALID_ARGUMENT; return; }
     if (state->engine == 0) state->engine=frd_ohos_create();
-    frd_ohos_set_foreground(state->engine, foreground ? 1 : 0);
+    if (state->engine == 0) { state->bridgeError=lastCode=FRD_OHOS_WORKER_STOPPED; return; }
+    const auto foregroundCode=frd_ohos_set_foreground(state->engine, foreground ? 1 : 0);
+    if (foregroundCode != FRD_OHOS_OK) { state->bridgeError=lastCode=foregroundCode; return; }
     // 同步等待，没有超时；callback 返回前取得 own ref 或完成全部失败清理。
     uint64_t generation=0;
     const auto code=frd_ohos_attach(state->engine, window, width, height, &generation);
     lastCode=code; state->generation=generation;
     if (code == FRD_OHOS_OK) {
         state->borrowedWindow=window;
-        state->ticks=OH_NativeXComponent_RegisterOnFrameCallback(component, Frame) == OH_NATIVEXCOMPONENT_RESULT_SUCCESS;
-        if (!state->ticks) lastCode=FRD_OHOS_GPU_FAILED;
+        state->FrameRegistrationCompleted(OH_NativeXComponent_RegisterOnFrameCallback(component, Frame) == OH_NATIVEXCOMPONENT_RESULT_SUCCESS);
+        lastCode=state->StatusCode(FRD_OHOS_OK, FrdOhosPocStatus{});
     }
     Log("attach", lastCode, *state);
 }
@@ -74,12 +72,14 @@ void Destroyed(OH_NativeXComponent *component, void *window) {
     state->ticks=false;
     OH_NativeXComponent_UnregisterOnFrameCallback(component);
     lastCode=state->generation ? frd_ohos_detach(state->engine, state->generation) : FRD_OHOS_OK;
-    frd_ohos_poc_status(state->engine, &lastStatus);
+    const auto statusCode=frd_ohos_poc_status(state->engine, &lastStatus);
+    lastCode=state->StatusCode(lastCode == FRD_OHOS_OK ? statusCode : lastCode, lastStatus);
     // detach 返回前已暂停/释放 Surface/清空访问/unref，然后 join worker。
     Log("detach", lastCode, *state);
     const auto destroyCode=frd_ohos_destroy(state->engine);
     Log("destroy", destroyCode, *state);
     state->engine=0; state->generation=0; state->borrowedWindow=nullptr;
+    state->bridgeError=FRD_OHOS_OK;
     // 同一 XComponent 在系统重建 Surface 时仍可再次 Created，保留已清零 POD。
 }
 void Touch(OH_NativeXComponent *, void *) { /* 图形 POC 不发送远程输入。 */ }
@@ -112,7 +112,14 @@ void Bool(napi_env env, napi_value object, const char *key, bool value) {
 }
 napi_value Status(napi_env env, napi_callback_info) {
     auto snapshot=lastStatus; auto code=lastCode;
-    for (const auto &item : components) if (item.second->engine) { code=frd_ohos_poc_status(item.second->engine, &snapshot); if (code == 0) code=snapshot.last_error; break; }
+    const ComponentState *selected=nullptr;
+    for (const auto &item : components) if (item.second->engine) { selected=item.second.get(); break; }
+    // 生命周期注册失败可发生在创建 engine 之前，仍需提供持久的可辨识错误。
+    if (!selected) for (const auto &item : components) if (item.second->bridgeError != FRD_OHOS_OK) { selected=item.second.get(); break; }
+    if (selected) {
+        const auto queryCode=selected->engine ? frd_ohos_poc_status(selected->engine, &snapshot) : FRD_OHOS_OK;
+        code=selected->StatusCode(queryCode, snapshot);
+    }
     napi_value result=nullptr; napi_create_object(env, &result);
     Number(env,result,"code",code); Number(env,result,"width",snapshot.width); Number(env,result,"height",snapshot.height);
     Counter(env,result,"generation",snapshot.surface_generation); Counter(env,result,"frames",snapshot.presented_frames);
@@ -139,7 +146,11 @@ napi_value Init(napi_env env, napi_value exports) {
         napi_get_named_property(env,exports,OH_NATIVE_XCOMPONENT_OBJ,&object) == napi_ok &&
         napi_unwrap(env,object,reinterpret_cast<void **>(&component)) == napi_ok && component) {
         if (components.find(component) == components.end()) components.emplace(component,std::make_unique<ComponentState>());
-        OH_NativeXComponent_RegisterCallback(component,&callbacks);
+        auto *state=Find(component);
+        if (OH_NativeXComponent_RegisterCallback(component,&callbacks) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
+            state->bridgeError=lastCode=FRD_OHOS_GPU_FAILED;
+            Log("register-lifecycle", lastCode, *state);
+        }
     }
     return exports;
 }

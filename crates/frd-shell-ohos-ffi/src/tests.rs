@@ -310,3 +310,91 @@ fn release_abi_rejects_graphical_poc_ticks() {
     assert_eq!(frd_ohos_poc_tick(engine, 1), UNSUPPORTED_PLATFORM);
     assert_eq!(frd_ohos_destroy(engine), OK);
 }
+
+#[test]
+fn controlled_panics_are_redacted_in_an_independent_process() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "tests::panic_redaction_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FRD_OHOS_PANIC_PROBE", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "子进程失败：stdout={stdout} stderr={stderr}"
+    );
+    assert!(!stdout.contains("FRD_PANIC_SECRET_SENTINEL"));
+    assert!(
+        !stderr.contains("FRD_PANIC_SECRET_SENTINEL"),
+        "受控 panic 不得输出原始 payload"
+    );
+    assert!(stdout.contains("abi=-8 worker=-8 cleanup=true"));
+    assert!(
+        stderr.contains("FRD_UNSCOPED_PANIC_SENTINEL"),
+        "非桥范围仍须使用先前 hook"
+    );
+}
+
+#[test]
+#[ignore = "仅由 panic 脱敏回归的独立子进程执行"]
+fn panic_redaction_child() {
+    assert_eq!(std::env::var("FRD_OHOS_PANIC_PROBE").as_deref(), Ok("1"));
+    std::panic::set_hook(Box::new(|info| {
+        if let Some(payload) = info.payload().downcast_ref::<&str>() {
+            eprintln!("previous-hook: {payload}");
+        }
+    }));
+    let abi = boundary(|| {
+        assert_eq!(
+            boundary(|| panic!("FRD_PANIC_SECRET_SENTINEL_NESTED")),
+            PANIC
+        );
+        panic!("FRD_PANIC_SECRET_SENTINEL_ABI")
+    });
+    struct PayloadProbe(Arc<std::sync::atomic::AtomicBool>);
+    impl Backend for PayloadProbe {
+        fn attach(&mut self, _: usize, _: u32, _: u32) -> Result<(), i32> {
+            panic!("FRD_PANIC_SECRET_SENTINEL_WORKER");
+        }
+        fn resize(&mut self, _: u32, _: u32) -> Result<(), i32> {
+            Ok(())
+        }
+        fn pause(&mut self) {}
+        fn render_poc(&mut self) -> Result<bool, i32> {
+            Ok(false)
+        }
+        fn detach(&mut self) {}
+    }
+    impl Drop for PayloadProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let cleanup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = cleanup.clone();
+    let engine = Arc::new(Engine::spawn(move || Box::new(PayloadProbe(observed))).unwrap());
+    let id = {
+        let mut registry = registry().lock().unwrap();
+        registry.next += 1;
+        let id = registry.next;
+        registry.engines.insert(id, engine);
+        id
+    };
+    let mut generation = 42;
+    let worker = unsafe { frd_ohos_attach(id, std::ptr::dangling_mut(), 10, 10, &mut generation) };
+    assert_eq!(generation, 0);
+    let cleaned = cleanup.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!((abi, worker, cleaned), (PANIC, PANIC, true));
+    assert_eq!(frd_ohos_destroy(id), WORKER_STOPPED);
+    let factory = Engine::spawn(|| panic!("FRD_PANIC_SECRET_SENTINEL_FACTORY")).unwrap();
+    assert_eq!(factory.call(Command::Foreground(true)), Err(WORKER_STOPPED));
+    println!("abi={abi} worker={worker} cleanup={cleaned}");
+    let _ = std::panic::catch_unwind(|| panic!("FRD_UNSCOPED_PANIC_SENTINEL"));
+}

@@ -8,6 +8,7 @@
 mod limits;
 #[cfg(target_env = "ohos")]
 mod ohos;
+mod panic_scope;
 #[cfg(test)]
 mod tests;
 mod worker;
@@ -68,6 +69,11 @@ fn lookup(id: u64) -> Result<Arc<Engine>, i32> {
         .ok_or(INVALID_HANDLE)
 }
 fn boundary(f: impl FnOnce() -> Result<(), i32>) -> i32 {
+    // std 禁止在已经 panicking 的线程修改 hook；不让初始化错误越过 ABI。
+    if std::thread::panicking() {
+        return PANIC;
+    }
+    let _scope = panic_scope::Scope::enter();
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => OK,
         Ok(Err(code)) => code,
@@ -81,6 +87,10 @@ pub extern "C" fn frd_ohos_abi_version() -> u32 {
 }
 #[no_mangle]
 pub extern "C" fn frd_ohos_create() -> u64 {
+    if std::thread::panicking() {
+        return 0;
+    }
+    let _scope = panic_scope::Scope::enter();
     catch_unwind(AssertUnwindSafe(|| {
         let id = {
             let mut registry = registry().lock().map_err(|_| PANIC)?;
