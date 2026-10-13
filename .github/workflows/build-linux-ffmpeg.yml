@@ -3,6 +3,14 @@ name: Linux client and FFmpeg packages
 on:
   workflow_dispatch:
     inputs:
+      target_architecture:
+        description: "手动运行目标；all 保留三个 profile，aarch64 仅运行固定原生 ARM64 行"
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - aarch64
       arm64_source_recipe:
         description: "仅 Linux ARM64 的固定来源配方；x86/i686、AMD64 始终 upstream"
         type: choice
@@ -32,6 +40,8 @@ on:
       - "tools/tests/generate_linux_kernel_fixture.py"
       - "tools/tests/fixtures/macos-h264dc-kernel*"
       - "tools/verify-linux-ffmpeg-bundle.sh"
+      - "tools/qualify-linux-h264-recipe.*"
+      - "tools/tests/test_linux_h264_qualification.py"
       - ".github/workflows/build-linux-ffmpeg.yml"
   push:
     branches:
@@ -57,6 +67,8 @@ on:
       - "tools/tests/generate_linux_kernel_fixture.py"
       - "tools/tests/fixtures/macos-h264dc-kernel*"
       - "tools/verify-linux-ffmpeg-bundle.sh"
+      - "tools/qualify-linux-h264-recipe.*"
+      - "tools/tests/test_linux_h264_qualification.py"
       - ".github/workflows/build-linux-ffmpeg.yml"
 
 permissions:
@@ -75,25 +87,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-            bundle_dir: linux-x86_64
-            cargo_target: x86_64-unknown-linux-gnu
-            cc: ""
-            cross_prefix: ""
-          - arch: i686
-            runner: ubuntu-24.04
-            bundle_dir: linux-x86
-            cargo_target: i686-unknown-linux-gnu
-            cc: i686-linux-gnu-gcc
-            cross_prefix: i686-linux-gnu-
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            bundle_dir: linux-aarch64
-            cargo_target: aarch64-unknown-linux-gnu
-            cc: ""
-            cross_prefix: ""
+        # 只有手动明确 aarch64 选择固定单行；push/PR/default 继续原三个目标。
+        # 用户字符串不会组成 runner、target 或 shell 命令。
+        include: >-
+          ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.target_architecture == 'aarch64'
+          && '[{"arch":"aarch64","runner":"ubuntu-24.04-arm","bundle_dir":"linux-aarch64","cargo_target":"aarch64-unknown-linux-gnu","cc":"","cross_prefix":""}]'
+          || '[{"arch":"x86_64","runner":"ubuntu-24.04","bundle_dir":"linux-x86_64","cargo_target":"x86_64-unknown-linux-gnu","cc":"","cross_prefix":""},{"arch":"i686","runner":"ubuntu-24.04","bundle_dir":"linux-x86","cargo_target":"i686-unknown-linux-gnu","cc":"i686-linux-gnu-gcc","cross_prefix":"i686-linux-gnu-"},{"arch":"aarch64","runner":"ubuntu-24.04-arm","bundle_dir":"linux-aarch64","cargo_target":"aarch64-unknown-linux-gnu","cc":"","cross_prefix":""}]') }}
     env:
       FRD_FFMPEG_SOURCE_RECIPE: ${{ matrix.arch == 'aarch64' && inputs.arm64_source_recipe || 'upstream' }}
     steps:
@@ -153,7 +152,32 @@ jobs:
           FRD_FFMPEG_CROSS_PREFIX: ${{ matrix.cross_prefix }}
           FRD_CARGO_TARGET: ${{ matrix.cargo_target }}
           FRD_FFMPEG_RUN_TARGET_TESTS: "1"
-        run: bash tools/build-ffmpeg-linux.sh
+        run: |
+          if [[ "${{ matrix.arch }}" == aarch64 && "$FRD_FFMPEG_SOURCE_RECIPE" == frd-h264dc-aarch64-v1 ]]; then
+            # 新门只接受不存在的 target/ffmpeg-linux；一次构建使用私有 Cargo 输出。
+            bash tools/qualify-linux-h264-recipe.sh
+          else
+            bash tools/build-ffmpeg-linux.sh
+          fi
+
+      - name: Retain modified ARM64 runtime evidence even on failure
+        if: always() && matrix.arch == 'aarch64' && env.FRD_FFMPEG_SOURCE_RECIPE == 'frd-h264dc-aarch64-v1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-linux-aarch64-frd-h264dc-aarch64-v1-runtime-evidence
+          # 保留数值 executable/私有对象、全部窗口、实际 shipping 对象与独立原版源码。
+          # 构建失败仍保留 terminal log；缺失证据不能抵消前一步失败。
+          path: |
+            target/ffmpeg-linux/runtime-evidence
+            target/ffmpeg-linux/build.*/configuration.json
+            target/ffmpeg-linux/build.*/kernel.json
+            target/ffmpeg-linux/build.*/source
+            target/ffmpeg-linux/build.*/dist
+            target/ffmpeg-linux/upstream
+            target/ffmpeg-linux/bundle/linux-aarch64
+            target/ffmpeg-linux/ffmpeg-8.1.2.tar.xz
+          if-no-files-found: error
+          include-hidden-files: true
 
       - name: Verify Linux bundle ELF and plugin ABI
         shell: bash

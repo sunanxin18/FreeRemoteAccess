@@ -37,3 +37,20 @@ H264 luma DC NEON 修改。未知配方或修改配方与 x86/AMD64 组合会在
 构建器可用 `FRD_FFMPEG_ARCHIVE` 选择已缓存的固定归档；成功构建时显式
 `FRD_FFMPEG_KEEP_BUILD=1` 保留实际配置树与同源对象，供数值、分派和基准验证。
 交叉构建的 ELF/来源检查不代表 Linux ARM64 执行、完整 codec 资格或远程互操作通过。
+
+显式修改配方的原生 Linux ARM64 数值资格检查使用
+`FRD_FFMPEG_SOURCE_RECIPE=frd-h264dc-aarch64-v1 bash tools/qualify-linux-h264-recipe.sh`。
+默认要求 `target/ffmpeg-linux` 尚不存在；也可用 `--build-root /绝对路径/新的隔离目录`
+和 `--archive /绝对路径/固定归档`。该门只调用一次既有 builder，开启其目标插件夹具，
+保留实际配置树、对象及安装 prefix，并使用私有 Cargo 输出；失败不会回退 upstream。
+它复用既有 C oracle/数值 harness 检查同 shipping 对象的数值、30 种分派、内存保护与
+ARM64 ABI，再以同一 executable 在编译结束后执行三个独立有界基准窗口。
+`runtime-evidence/qualification.json`、原数值 `numeric/results.json`、全部命令日志、
+三个基准 JSON/日志和前后输入摘要属于运行证据；CI 会在失败时保留诊断产物。
+须检查资格步骤及最终包 smoke 均成功，上传本身不代表成功。这只覆盖单个 H264
+luma DC 核及该 CI 主机测量；本地模拟契约、小型 ELF、完整 codec、GUI 与远程互操作
+属于不同验证层级。
+工作流的手动 `target_architecture=aarch64` 与
+`arm64_source_recipe=frd-h264dc-aarch64-v1` 只运行固定原生 ARM64 行；默认 `all`、
+push 和 PR 继续三个原有 profile。使用自选隔离根后，后续 package staging 必须显式
+设置相同 `FRD_FFMPEG_BUILD_ROOT`，从已资格检查的 bundle 取材。
