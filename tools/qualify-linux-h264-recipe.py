@@ -151,6 +151,54 @@ def validate_numeric_inputs(result, paths, before):
             '原数值 runner 实际输入不是本次 shipping 对象/库')
 
 
+def _configured_fixture_compiler(path, expected_sha256):
+    """只识别已绑定配置中的固定赋值，不解释 make 或配置中的命令。"""
+    path = safe_path(path)
+    data = path.read_bytes()
+    require(hashlib.sha256(data).hexdigest() == expected_sha256, '实际配置 hash 不匹配')
+    text = data.decode('utf-8')
+    # configure 的固定原生输出不需要续行；拒绝把下一行赋值当作独立有效 CC。
+    require('\r' not in text and '\\\n' not in text, '配置要求唯一精确 CC=gcc，无续行')
+    active = [line for line in text.split('\n') if not line.lstrip().startswith('#')]
+    require(not any(re.match(r'\s*(?:define|endef)(?:\s|$)', line) for line in active),
+            '配置要求独立 CC=gcc，拒绝 make define 块')
+    lines = [line for line in active if re.search(r'(?<![A-Za-z0-9_])CC(?![A-Za-z0-9_])', line)]
+    require(lines == ['CC=gcc'], '配置要求唯一精确 CC=gcc，拒绝替代赋值/命令/flags')
+    require(digest(path) == expected_sha256, '实际配置读取期间 hash 改变')
+    return {'command': ['gcc'], 'configuration_path': str(path),
+            'configuration_sha256': expected_sha256}
+
+
+def _validate_numeric_compiler(result, src, original, numeric, paths, prefix, configured_version):
+    """核对原 runner 的版本、两次 C 编译、ABI 编译、链接和实际执行记录。"""
+    compiler = result.get('compiler')
+    require(isinstance(compiler, str) and bool(compiler.strip()) and
+            compiler.splitlines()[0] == configured_version and configured_version.startswith('gcc '),
+            '原数值 runner compiler 版本与实际配置不匹配')
+    common = ['gcc', '-O3', '-std=c11', '-D_GNU_SOURCE', '-I', str(src)]
+    fixtures = REPO / 'third_party/ffmpeg/8.1.2/tests'
+    exe = numeric / 'h264-luma-dc-parity'
+    expected = [
+        ['gcc', '--version'],
+        common + ['-Dff_h264dsp_init_aarch64=ff_h264dsp_init_aarch64_baseline', '-c',
+                  str(original / 'libavcodec/aarch64/h264dsp_init_aarch64.c'), '-o', str(numeric / 'baseline-init.o')],
+        common + ['-Wall', '-Wextra', '-Werror', '-c', str(fixtures / 'h264-luma-dc-parity.c'),
+                  '-o', str(numeric / 'parity.o')],
+        ['gcc', '-I', str(src), '-c', str(fixtures / 'h264-luma-dc-abi.S'), '-o', str(numeric / 'abi.o')],
+        ['gcc', str(numeric / 'parity.o'), str(numeric / 'abi.o'), str(numeric / 'baseline-init.o')]
+        + [str(path) for path in paths] + ['-lm', '-pthread', '-Wl,-rpath,' + str(prefix / 'lib'), '-o', str(exe)],
+        [str(exe)],
+    ]
+    commands = result.get('commands')
+    require(isinstance(commands, list) and len(commands) == len(expected), '原数值 runner gcc 命令记录不完整')
+    for item, argv in zip(commands, expected):
+        require(isinstance(item, dict) and item.get('argv') == argv and item.get('cwd') == str(src)
+                and type(item.get('returncode')) is int and item['returncode'] == 0
+                and isinstance(item.get('output'), str), '原数值 runner gcc 编译/链接/执行记录不匹配')
+    require(commands[0]['output'] == compiler, '原数值 runner compiler 输出与版本命令不匹配')
+    return compiler
+
+
 def ldd_binding(output, installed, attempt, root):
     lines = re.findall(r'^\s*libavutil\.so\.60(?:\s|$).*$', output, re.M)
     entries = re.findall(r'^\s*libavutil\.so\.60 => (\S+) \([^\n]*\)\s*$', output, re.M)
@@ -373,6 +421,12 @@ def qualify(root, archive, source_api):
                 '实际 source kernel 与 shipping 不匹配')
         for name in ('config.h', 'ffbuild/config.mak'):
             require(digest(safe_path(src / name, root)) == record['inputs'][name], '实际配置 hash 不匹配')
+        configuration_before = {str(src / name): record['inputs'][name]
+                                for name in ('config.h', 'ffbuild/config.mak')}
+        before = dict(configuration_before)
+        evidence.record['inputs_before'] = before
+        evidence.record['fixture_compiler'] = _configured_fixture_compiler(
+            src / 'ffbuild/config.mak', record['inputs']['ffbuild/config.mak'])
         require(digest(src / 'libavcodec/libavcodec.so.62') == record['inputs']['unstripped_libavcodec'],
                 '未 strip 库身份不匹配')
         for name in ('libavcodec.so.62', 'libavutil.so.60'):
@@ -410,6 +464,8 @@ def qualify(root, archive, source_api):
                    REPO / 'third_party/ffmpeg/8.1.2/tests/h264-luma-dc-parity.c',
                    REPO / 'third_party/ffmpeg/8.1.2/tests/h264-luma-dc-abi.S']
         before = snapshot(inputs)
+        # 上游 prepare 后仍绑定最初验证的配置，不允许重新 snapshot 掩盖配置变化。
+        before.update(configuration_before)
         evidence.record.update(inputs_before=before, attempt=str(attempt), source=str(src),
                                upstream_source=str(original), prefix=str(prefix), bundle=str(bundle),
                                source_recipe=record['source'], kernel=record['kernel'],
@@ -418,19 +474,21 @@ def qualify(root, archive, source_api):
         numeric = evidence_path / 'numeric'
         argv = [sys.executable, '-B', REPO / 'tools/verify-ffmpeg-h264-dc.py',
                 '--target', 'aarch64-linux-gnu', '--execute', '--source', src,
-                '--upstream-source', original, '--output', numeric, '--cc', 'clang']
+                '--upstream-source', original, '--output', numeric, '--cc', 'gcc']
         numeric_paths = numeric_input_paths(objects, installed)
         for obj in numeric_paths:
             argv += ['--object', obj]
         # runner 的 --object 为直接链接输入；加入此同 prefix DSO 使原 results.json 也记录其 hash。
         argv += ['--ldflag=-Wl,-rpath,' + str(prefix / 'lib')]
         evidence.record['runtime_environment'] = {'LD_LIBRARY_PATH': runtime_env['LD_LIBRARY_PATH'],
-                                                 'compiler': 'clang', 'default_cflags': ['-O3', '-std=c11', '-D_GNU_SOURCE']}
+                                                 'compiler': 'gcc', 'default_cflags': ['-O3', '-std=c11', '-D_GNU_SOURCE']}
         check_inputs(evidence, 'before-numeric', before, installed, attempt, root)
         numeric_output = evidence.run('numeric', argv, timeout=180, env=runtime_env)
         result = json.loads(safe_path(numeric / 'results.json', root).read_text())
         require(result.get('status') == 'passed' and result.get('mode') == 'parity' and
                 result.get('target') == 'aarch64-linux-gnu', '原数值 runner 没有原生成功证据')
+        evidence.record['runtime_environment']['compiler_version'] = _validate_numeric_compiler(
+            result, src, original, numeric, numeric_paths, prefix, record['configuration']['compiler'])
         validate_numeric_inputs(result, numeric_paths, before)
         require('PASS parity cases=5974518' in numeric_output and 'dispatch: 30 contexts' in numeric_output and
                 'guard pages; AArch64 ABI sentinels' in numeric_output, '数值/分派/内存/ABI 输出不完整')

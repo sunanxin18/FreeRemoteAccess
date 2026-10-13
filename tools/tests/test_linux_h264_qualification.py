@@ -17,6 +17,33 @@ spec.loader.exec_module(gate)
 
 
 class QualificationContracts(unittest.TestCase):
+    def test_retained_actual_gcc_configuration_accepted_without_evaluation(self):
+        retained = ROOT / ('target/ci-h264-linux-soname-20261014/failed-modified-arm64-artifact/'
+                           'build.qtKBox/source/ffmpeg-8.1.2/ffbuild/config.mak')
+        if not retained.exists():
+            self.skipTest('本机未保留失败 CI 的配置材料；其他合同不依赖 artifact')
+        self.assertTrue(callable(getattr(gate, '_configured_fixture_compiler', None)),
+                        '缺少固定 GCC 配置验证')
+        record = gate._configured_fixture_compiler(retained, gate.digest(retained))
+        self.assertEqual(record['command'], ['gcc'])
+        self.assertEqual(record['configuration_sha256'], gate.digest(retained))
+
+    def test_fixed_compiler_parser_requires_hash_and_unique_exact_assignment(self):
+        self.assertTrue(callable(getattr(gate, '_configured_fixture_compiler', None)),
+                        '缺少固定 GCC 配置验证')
+        with tempfile.TemporaryDirectory() as work:
+            path = Path(work).resolve() / 'config.mak'
+            path.write_text('# CC=ignored\nCC_IDENT=gcc 13\nCC=gcc\nCC_C=-c\n')
+            self.assertEqual(gate._configured_fixture_compiler(path, gate.digest(path))['command'], ['gcc'])
+            with self.assertRaisesRegex(ValueError, 'hash'):
+                gate._configured_fixture_compiler(path, '0' * 64)
+            for text in ('CC=gcc\r\n', 'CC::=gcc\n', 'private CC=gcc\n', 'define CC\ngcc\nendef\n',
+                         'define OTHER\nCC=gcc\nendef\n',
+                         'CC=gcc\nundefine CC\n', '\tCC=gcc\n', 'CC="gcc"\n', 'CC=/usr/bin/gcc\n'):
+                path.write_bytes(text.encode())
+                with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'CC=gcc'):
+                    gate._configured_fixture_compiler(path, gate.digest(path))
+
     def test_exact_installed_aliases_preserve_generic_no_link_gate(self):
         with tempfile.TemporaryDirectory() as work:
             root = Path(work).resolve()
@@ -355,7 +382,10 @@ class InstalledLibraryContracts(unittest.TestCase):
 
 
 class QualificationPhaseContracts(unittest.TestCase):
-    def run_contract(self, work, mutation_phase=None, failure_phase=None):
+    def run_contract(self, work, mutation_phase=None, failure_phase=None,
+                     config_text='CC=gcc\n', config_hash_mismatch=False,
+                     numeric_compiler='gcc', claimed_compiler='gcc (contract_double) 13.3.0\n',
+                     config_mutation_phase=None, numeric_mutation=None):
         """外部构建/目标运行的合同替身；真实文件身份与 qualify 控制流，不是 native 验证。"""
         root = Path(work).resolve() / 'fresh'
         archive = Path(work).resolve() / 'archive'
@@ -367,7 +397,7 @@ class QualificationPhaseContracts(unittest.TestCase):
         util_target = lib / 'libavutil.so.60.26.102'
         codec_target = lib / 'libavcodec.so.62.28.102'
         kernel = {'fixture': 'contract-only'}
-        config = {'args': []}
+        config = {'args': [], 'compiler': 'gcc (contract_double) 13.3.0'}
         adapter = SimpleNamespace(FIXED_ARGS=[], HELPERS=[], verify_bundle=lambda *args: None,
                                   kernel_identity=lambda path: kernel)
         source_api = SimpleNamespace(recipes=SimpleNamespace(ARCHIVE_SHA=gate.digest(archive),
@@ -390,6 +420,7 @@ class QualificationPhaseContracts(unittest.TestCase):
                     path = src / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(b'source fixture')
+                (src / 'ffbuild/config.mak').write_text(config_text)
                 (attempt / 'configuration.json').write_text(json.dumps(config))
                 (attempt / 'kernel.json').write_text(json.dumps(kernel))
                 bundle = root / 'bundle/linux-aarch64'
@@ -402,6 +433,8 @@ class QualificationPhaseContracts(unittest.TestCase):
                           'outputs': outputs, 'inputs': {name: gate.digest(src / name)
                             for name in ('config.h', 'ffbuild/config.mak')}}
                 record['inputs']['unstripped_libavcodec'] = gate.digest(src / 'libavcodec/libavcodec.so.62')
+                if config_hash_mismatch:
+                    record['inputs']['ffbuild/config.mak'] = '0' * 64
                 (bundle / 'FFmpeg-PROVENANCE.json').write_text(json.dumps(record))
                 output = (f'Linux FFmpeg retained configured attempt: {attempt}\n'
                           f'Linux FFmpeg retained shipping source: {src}\n')
@@ -416,8 +449,31 @@ class QualificationPhaseContracts(unittest.TestCase):
                     (out / name).write_bytes(b'contract executable, not native')
                 paths = [Path(argv[i + 1]) for i, value in enumerate(argv) if value == '--object']
                 inputs = {str(path.resolve()): gate.digest(path.resolve()) for path in paths}
-                (out / 'results.json').write_text(json.dumps({'status': 'passed', 'mode': 'parity',
-                    'target': 'aarch64-linux-gnu', 'inputs': inputs, 'contract_double': True}))
+                common = [numeric_compiler, '-O3', '-std=c11', '-D_GNU_SOURCE', '-I', str(src)]
+                fixtures = ROOT / 'third_party/ffmpeg/8.1.2/tests'
+                executable = out / 'h264-luma-dc-parity'
+                commands = [
+                    [numeric_compiler, '--version'],
+                    common + ['-Dff_h264dsp_init_aarch64=ff_h264dsp_init_aarch64_baseline', '-c',
+                              str(root / 'upstream/ffmpeg-8.1.2/libavcodec/aarch64/h264dsp_init_aarch64.c'),
+                              '-o', str(out / 'baseline-init.o')],
+                    common + ['-Wall', '-Wextra', '-Werror', '-c', str(fixtures / 'h264-luma-dc-parity.c'),
+                              '-o', str(out / 'parity.o')],
+                    [numeric_compiler, '-I', str(src), '-c', str(fixtures / 'h264-luma-dc-abi.S'),
+                     '-o', str(out / 'abi.o')],
+                    [numeric_compiler, str(out / 'parity.o'), str(out / 'abi.o'), str(out / 'baseline-init.o')]
+                    + [str(p) for p in paths] + ['-lm', '-pthread', '-Wl,-rpath,' + str(lib), '-o', str(executable)],
+                    [str(executable)],
+                ]
+                command_records = [{'argv': command, 'cwd': str(src), 'returncode': 0,
+                                    'output': claimed_compiler if i == 0 else '', 'contract_double': True}
+                                   for i, command in enumerate(commands)]
+                result = {'status': 'passed', 'mode': 'parity',
+                    'target': 'aarch64-linux-gnu', 'inputs': inputs, 'commands': command_records,
+                    'compiler': claimed_compiler, 'contract_double': True}
+                if numeric_mutation:
+                    numeric_mutation(result)
+                (out / 'results.json').write_text(json.dumps(result))
                 output = 'PASS parity cases=5974518\ndispatch: 30 contexts\nguard pages; AArch64 ABI sentinels\n'
             elif label == 'runtime-dependencies':
                 output = f'libavutil.so.60 => {util} (0x0000)\n'
@@ -430,6 +486,8 @@ class QualificationPhaseContracts(unittest.TestCase):
                 replacement = lib / 'replacement'
                 replacement.write_bytes(codec_target.read_bytes())
                 os.replace(replacement, codec_target)
+            if label == config_mutation_phase:
+                (src / 'ffbuild/config.mak').write_text('CC=clang\n')
             if label == failure_phase:
                 # 初始错误必须在 finally 中保留；alias 本体也进入失败记录。
                 util.unlink()
@@ -443,6 +501,101 @@ class QualificationPhaseContracts(unittest.TestCase):
             status = gate.qualify(root, archive, source_api)
         record = json.loads((root / 'runtime-evidence/qualification.json').read_text())
         return status, record, util_target, codec_target
+
+    def test_fixed_gcc_selection_and_version_bind_numeric_command_evidence(self):
+        with tempfile.TemporaryDirectory() as work:
+            status, record, _, _ = self.run_contract(work)
+            self.assertEqual(status, 0)
+            numeric = next(c for c in record['commands'] if c['label'] == 'numeric')
+            at = numeric['argv'].index('--cc')
+            self.assertEqual(numeric['argv'][at + 1], 'gcc')
+            self.assertEqual(numeric['argv'].count('--cc'), 1)
+            self.assertEqual(record['runtime_environment']['compiler'], 'gcc')
+            self.assertEqual(record['runtime_environment']['compiler_version'], 'gcc (contract_double) 13.3.0\n')
+            self.assertEqual(record['fixture_compiler']['command'], ['gcc'])
+            self.assertTrue(numeric['contract_double'])
+
+    def test_compiler_config_rejects_before_private_preparation_and_numeric(self):
+        bad = ['', 'CC=gcc\nCC=gcc\n', 'CC=clang\n', 'CC=aarch64-linux-gnu-gcc\n',
+               'CC=gcc -O3\n', 'CC=$(shell touch injected)\n', 'CC=gcc; touch injected\n',
+               'CC=gcc\nCC+= -O3\n', 'CC:=gcc\n', 'CC?=gcc\n', 'CC!=gcc\n',
+               'export CC=gcc\n', 'override CC=gcc\n', 'CC =gcc\n', 'CC=gcc # comment\n',
+               'CC=gcc\n$(eval CC=clang)\n', 'CC=gcc\\\n', 'IGNORED=\\\nCC=gcc\n']
+        for text in bad:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as work:
+                status, record, _, _ = self.run_contract(work, config_text=text)
+                self.assertEqual(status, 1)
+                self.assertEqual(record['status'], 'failed')
+                self.assertIn('CC=gcc', record['error'])
+                self.assertEqual([c['label'] for c in record['commands']], ['builder'])
+                self.assertNotIn('numeric_results_sha256', record)
+
+    def test_configuration_hash_gate_is_preserved_before_compiler_selection(self):
+        with tempfile.TemporaryDirectory() as work:
+            status, record, _, _ = self.run_contract(work, config_hash_mismatch=True)
+            self.assertEqual(status, 1)
+            self.assertIn('实际配置 hash', record['error'])
+            self.assertEqual([c['label'] for c in record['commands']], ['builder'])
+            self.assertNotIn('fixture_compiler', record)
+
+    def test_claimed_gcc_cannot_authorize_clang_or_other_numeric_compiler(self):
+        for compiler in ('clang', 'aarch64-linux-gnu-gcc', '/usr/bin/gcc', 'gcc -O3'):
+            with self.subTest(compiler=compiler), tempfile.TemporaryDirectory() as work:
+                status, record, _, _ = self.run_contract(work, numeric_compiler=compiler)
+                self.assertEqual(status, 1)
+                self.assertIn('gcc', record['error'])
+                self.assertEqual([c['label'] for c in record['commands']], ['builder', 'prepare-upstream', 'numeric'])
+                self.assertEqual(record['benchmarks'], [])
+
+    def test_numeric_version_must_match_configured_compiler(self):
+        for claimed in ('', 'Ubuntu clang version 18.1.3\n', 'gcc (other) 12.0.0\n', True):
+            with self.subTest(claimed=claimed), tempfile.TemporaryDirectory() as work:
+                status, record, _, _ = self.run_contract(work, claimed_compiler=claimed)
+                self.assertEqual(status, 1)
+                self.assertIn('compiler', record['error'])
+                self.assertEqual(record['benchmarks'], [])
+
+    def test_numeric_command_trace_must_cover_real_compile_link_and_execution(self):
+        def mutate(result, kind):
+            if kind == 'missing':
+                result['commands'].pop(3)
+            elif kind == 'extra':
+                result['commands'].append(dict(result['commands'][0]))
+            elif kind == 'clang-abi':
+                result['commands'][3]['argv'][0] = 'clang'
+            elif kind == 'clang-link':
+                result['commands'][4]['argv'][0] = 'clang'
+            elif kind == 'flags':
+                result['commands'][3]['argv'].insert(1, '-fno-integrated-as')
+            elif kind == 'wrong-version-output':
+                result['commands'][0]['output'] = 'clang version 18\n'
+            elif kind == 'wrong-cwd':
+                result['commands'][1]['cwd'] = '/unrelated'
+            elif kind == 'bool':
+                result['commands'][3]['returncode'] = False
+            else:
+                result['commands'][3]['returncode'] = 1
+        for kind in ('missing', 'extra', 'clang-abi', 'clang-link', 'flags', 'wrong-version-output',
+                     'wrong-cwd', 'bool', 'failure'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as work:
+                status, record, _, _ = self.run_contract(work, numeric_mutation=lambda r: mutate(r, kind))
+                self.assertEqual(status, 1)
+                self.assertEqual(record['status'], 'failed')
+                self.assertEqual(record['benchmarks'], [])
+                self.assertNotIn('runtime_avutil_binding', record)
+
+    def test_config_stays_bound_at_numeric_three_windows_and_final(self):
+        for mutate, reject in [('prepare-upstream', 'before-numeric'), ('quiet-1', 'before-benchmark-1'),
+                               ('quiet-2', 'before-benchmark-2'), ('quiet-3', 'before-benchmark-3'),
+                               ('benchmark-3', 'final')]:
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as work:
+                status, record, _, _ = self.run_contract(work, config_mutation_phase=mutate)
+                self.assertEqual(status, 1)
+                checks = {row['label']: row for row in record['identity_checks']}
+                self.assertEqual(checks[reject]['status'], 'failed')
+                config_path = record['source'] + '/ffbuild/config.mak'
+                self.assertNotEqual(record['inputs_before'][config_path],
+                                    record['inputs_after_failure'][config_path]['sha256'])
 
     def test_phase_checks_cover_numeric_ldd_three_windows_and_final(self):
         with tempfile.TemporaryDirectory() as work:
