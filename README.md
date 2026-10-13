@@ -121,7 +121,7 @@ GUI、分层和构建状态以以下矩阵、`AGENTS.md` 及 `docs/superpowers/s
 | macOS / Linux native video backend | **受限验证** | macOS 仅支持 ARM64：FFmpeg builder、stager、verifier 明确拒绝 Intel/x86_64，CI 仅使用 `aarch64-apple-darwin`。2026-09-08 ARM64 package、原生 decoder fixture 和产物门禁通过（run `34182980384`）。Linux i686、x86_64、ARM64 的固定 FFmpeg plugin 原生/32 位进程 fixture 与 ELF/ABI 门禁通过（run `34181521242`）；Linux GUI 包与真机控制仍未验收。历史 macOS Intel/Rosetta 记录不属于当前支持范围。 |
 | Android native video backend | **计划中** | 尚无 MediaCodec bridge、移动端 shell 或 package 构建验证。 |
 | HarmonyOS NEXT native video backend | **开发中** | 2026-10-13 按用户要求优先 AVCodec Kit 系统硬解、系统软解，未覆盖格式才使用 FFmpeg 后备；两台模拟器正常权限 HAP 均查询到系统 H.264 软件 decoder 并成功创建/销毁，未报告 H.264 硬解或 HEVC decoder；两个 AVC420 样本输出逐字节通过，但默认配置只在 EOS 后出帧，High444 精确输出未通过；顺序输出及同步接口对照仍只在 EOS 后出帧；`e1fb9fa` 新增显式 NativeFirst 策略，默认桌面行为不变，尚未注册系统 backend。官方基础镜像静态审计找到双帧线程等待路径及 NEON 分派；当前候选因静态单帧输出不合格保持不可选择，推进 FFmpeg 后备。运行时 SIMD、生命周期和产品接线仍待验证，模拟器不代表真机。见[系统解码验证](docs/validation/harmony-system-codec-20261013.md)。 |
-| HarmonyOS NEXT FFmpeg 后备构建 | **实验性** | 2026-10-13 `9c2cd42`/`8343bd3` 独立 API26 OHOS ARM64 构建与静态包校验通过，22 项产物/输入及实际链接回归、5 项策略测试通过，独立复审通过。H.264/HEVC NEON 编译对象已记录；OHOS 专属单线程策略避免 frame pipeline，桌面策略保持。尚未接入普通 HAP，未证明目标解码、静态帧及时输出、SIMD 执行、1440p/4K 吞吐或真实远程互操作，未注册 codec。见[后备包证据](docs/validation/harmony-ffmpeg-bundle-20261013.md)。 |
+| HarmonyOS NEXT FFmpeg 后备构建 | **实验性** | 2026-10-13 `9c2cd42`/`8343bd3` 独立 API26 OHOS ARM64 构建与静态包校验通过，22 项产物/输入及实际链接回归、5 项策略测试通过，独立复审通过。H.264/HEVC NEON 编译对象已记录；OHOS 专属单线程策略避免 frame pipeline，桌面策略保持。`4f5089e` 应用模块加载器已通过 47 项宿主测试、OHOS 构建与公开 NDK 链接检查及独立审查；尚未接入普通 HAP，未证明目标解码、静态帧及时输出、SIMD 执行、1440p/4K 吞吐或真实远程互操作，未注册 codec。见[后备包证据](docs/validation/harmony-ffmpeg-bundle-20261013.md)。 |
 
 ### 原生服务端目标
 

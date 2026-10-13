@@ -31,3 +31,13 @@
 
 
 独立审查 I1 的实际复现是：`verify-inputs` 检查带版本名的库，但原 `-lavcodec/-lavutil` 链接读取未检查的无版本别名。修复后 OHOS 使用 `dylib:+verbatim=libavcodec.so.62` / `libavutil.so.60`，桌面保留原链接方式。新增测试在临时 prefix 将 `libavcodec.so` 错指向 util60，并删除 `libavutil.so`，随后实际 OHOS 编译成功，验证精确链接指令、依赖清单及插件 bytes 与正常构建完全相同。它证明别名已不参与该平台链接，不声称畸形输入的所有场景均已覆盖。
+
+## OHOS 应用模块加载器
+
+`4f5089e` 增加 OHOS ARM64 专属加载分支：用私有模块标记的 `dladdr` 定位本应用 Rust 动态库，再从同目录加载三个固定后备库。公开 AbilityKit `OH_AbilityRuntime_ApplicationContextGetBundleCodeDir` 提供应用代码目录边界；不接受调用方路径、环境路径、桌面 Linux 的 executable 路径或私有系统 codec 库。
+
+实现保留目录/文件句柄和 dev/inode，拒绝符号链接及应用可写对象，并检查实际版本入口、getter 和六个 ABI callback 属于预期映射，完成检查后才转换函数指针。加载使用 NOW|LOCAL，句柄按依赖逆序清理。所有权与不可写检查依赖正常系统安装这一前提；`dladdr` 只给出路径和基址，不是映射 inode 或签名证明。
+
+固定 Rust 1.96 下宿主模块 47 项测试通过，覆盖路径/权限拒绝、文件替换、callback/ABI、依赖清退及 decoder/frame 生命周期。官方 OHOS ARM64 rlib 编译无 warning；独立 cdylib 链接探针确认为 ELF64/AArch64，公开 NDK 依赖包含 `libability_runtime.so` 与 `libc.so`。该探针未在设备执行。旧 `from_trusted_paths` warning 通过限定其真实 macOS 调用范围消除，桌面行为保持。
+
+正常 HAP 内的代码目录与实际模块路径是否一致、整个目录链是否满足保守所有权/权限假设，仍待两台模拟器分别确认。调用须在应用上下文建立后进行；当前没有后备库注册、真实出帧或远程互操作验收。独立审查通过，无 Critical/Important；审查记录一项非阻断测试改进：文件替换用例应精确断言身份错误，避免权限拒绝掩盖身份检查退化。正常 HAP 和解码门仍未完成。原始测试与链接产物在 `target/task4c3b-loader-check/`。
