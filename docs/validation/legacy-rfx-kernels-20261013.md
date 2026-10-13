@@ -33,3 +33,25 @@
 本轮 native 约慢 8.5–9.1%，**没有证明提速**。最初与宿主构建可能重叠的一次 PC 测试曾显示相反方向，随后三轮不再复现，不能选择该次结果宣称改善。原版 oracle 本身也被 LLVM 向量化；native 色彩路径还包含完整域预检，两者并非“SIMD 对纯标量”的比较。模拟器数值基准不是实际 RDP 帧率或交互延迟。
 
 `c3ae798` 独立审查通过，无 Critical/Important；新 crate clippy 干净，相邻 RDP 测试为 321 passed / 3 ignored，伴随四项既有 dead_code warning。仍需完成 Bitmap/RDP6 内核、生产 dispatch 与错误映射、完整 RLGR materialization 接入，以及每个 Windows/Linux 架构的实际执行、包和真实会话验收。现有桌面生产路径保持不变；不能用这一独立 crate 开放鸿蒙连接或扩展 codec 广告。
+
+
+## Bitmap packed 叶子增量（A2.1）
+
+`563de87` 在同一能力对象下新增 `PackedDepth` 与 copy、fill、XOR previous、LSB mask、双像素 dither 五类 checked API，支持 Index8、RGB555、RGB565、BGR24。独立审查通过，无 Critical/Important/Minor。此阶段不改变任何 parser、生产 dispatcher 或 codec 广告。
+
+全量块以显式 NEON 或 SSE2 搬运/异或；最多 48-byte 周期布局和 24-byte mask 准备是有界控制处理，所有非空数值短尾通过本地 16-byte staging 执行相同 SIMD。packed24 的三字节/六字节相位跨 lane 保持，555 原始高位保留，首行与跨行依赖由未来 parser 调用者决定。长度、pixel 尺寸和 mask 范围在写输出前全部验证，错误不改变目标。
+
+macOS ARM64 debug/release 各通过 19 项有效测试（包含既有 12 项 A1），另有两个显式 benchmark 默认 ignored；覆盖全部 256 mask、全部合法 offset/count、未对齐地址、奇数 dither split、非法输入原子性与保护页短尾。包级 clippy `-D warnings`、fmt 和 diff 检查通过。实际优化产物的完整块与短尾包含向量指令。
+
+Windows/Linux 各 i686、x86_64、ARM64，macOS ARM64 与 OHOS ARM64 共八个目标完成独立优化对象编译及反汇编。除 macOS ARM64 外，此增量尚未执行目标正确性或基准；对象生成不证明运行、链接、应用包或会话能力，未构建 macOS Intel。
+
+宿主基准使用 128 次预热、501 个样本，每样本 64 次、预分配输出。对照是普通优化 Rust 循环或 slice copy，可能由编译器向量化，且不包含 native checked 入口的同等预检成本。下表是 BGR24、1024 pixels 的 median/p95，单位 ns：
+
+| 叶子 | native | 对照 |
+| --- | --- | --- |
+| copy | 80 / 82 | 29 / 31 |
+| fill | 106 / 108 | 1826 / 1876 |
+| XOR | 127 / 131 | 2091 / 2132 |
+| dither | 110 / 111 | 1826 / 1878 |
+
+较大块 fill/XOR/dither 对本对照有改善，但 copy、小块及部分 mask 较慢；没有据此宣称完整 Bitmap 更快。单次宿主测量没有 CPU 绑定或频率隔离，原始测试、对象、反汇编和 120 组测量保留在 `target/frd-packed-evidence/`，哈希清单为 `EVIDENCE-SHA256SUMS`。下一阶段是 RDP6 planar 数值叶子，随后才是独立 oracle 与完整 parser/session 接线。

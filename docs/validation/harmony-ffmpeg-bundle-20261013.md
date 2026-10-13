@@ -75,3 +75,16 @@ v5 unsigned SHA-256 `8922f512634b1738aef7d1a39a9d9056ccbbc45fe30e8e952e80bdef855
 夹具及句柄修正提交 `6a2c91c`。宿主 FFI 38 项通过（另有一个既有 panic 子进程 helper 标记 ignored），加载器 49 项通过；OHOS 默认 debug 与显式 feature release 的实际库均不存在 fixture 日志标记，显式 debug 夹具包保留标记，互斥特性组合被明确拒绝。格式与 diff 检查通过。测试后两台恢复前述 `35c53d04…` 普通签名包，官方 Emulator CLI 确认登录界面及当前无已注册协议的提示。该恢复包是此前普通产物，不冒称新修正的生产构建。
 
 独立任务审查结论为 Spec compliant / Approved，无 Critical/Important；审查只读核对手机/PC 原始日志、签名 HAP 哈希和六项原生库与 checker 一致。既有 Hvigor 配置头资源及 unsigned 阶段缺省 signingConfig 警告作为非阻断项记录，不等同于最终签名失败。
+
+## 官方 profiler 的原包 SIMD 执行证据
+
+同日继续使用上述 v5 已签包和原样接受的三库，在两台正常可调试应用中通过系统 `hiperf` 采样：限定 FreeRemoteDesk 应用、`sw-cpu-clock:u`、1000 Hz、18 秒、8 MiB 上限，不采集调用栈、不使用系统范围模式、不提权或修改 perf 设置。手机/PC 测试仍各 13/13；实际捕获 12135/15656 个 sample，sample 与 non-sample 丢失均为 0。该轮采样不能用于无干扰性能结果。
+
+原构建未剥离 `libavcodec.so.62` 仅作为 profiler 读取的符号数据，未替换应用中的运行库。它与接受包的 `.text` 地址均为 `0x3a380`、大小 1954508 bytes、SHA-256 `6bd09fdf1784aecdba9a84a4dcb691b08f986b6cf34d1506bdecbbd0c97dc580`，已逐字节核对。官方报告把运行 PC 归属到下列原库函数；对应 IDCT 反汇编含向量载入、加减、移位和转置，证明计算核实际使用 NEON。
+
+| 设备 | 正向观测的部分计算核 |
+| --- | --- |
+| 手机 | `ff_h264_idct_add16intra_neon`、`ff_h264_idct_add_neon`、add8/add16、`ff_put_h264_chroma_mc8_neon` |
+| PC | 上述四类 IDCT、`ff_put_pixels16_neon`、`ff_pred16x16_vert_neon`、`ff_pred16x16_hor_neon` |
+
+这是原包 H.264 SIMD 的正向运行证据，范围为混合合成负载；尚不能逐样本归因到 AVC420/444，也不能宣称 HEVC 或全部计算热路径通过。未命中 tiny HEVC 不是没有 SIMD 的证明。报告的 period weight 不是函数调用次数，包含 debug SHA 的全进程百分比也不是 codec 内部占比。原始 perf、日志、官方符号报告、`.text` 与符号区间摘要、具体核反汇编位于 `target/task4c4-runtime/`。下一步只增加分格式有界负载及关闭 profiler 的优化 harness 基准，不修改或插桩 FFmpeg 库。
