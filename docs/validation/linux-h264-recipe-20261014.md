@@ -47,3 +47,5 @@ root下载该run实际诊断artifact并用当前受信bundle verifier重验：�
 本次运行的 artifact `11847986429` 与完整314,964-byte job日志已下载，位于 `target/ci-h264-linux-soname-20261014/`。`runtime-evidence/qualification.json` 保存原错误、成功的 builder/prepare-upstream、两组安装身份与检查前后记录；`numeric.log`、`numeric/results.json`、真实配置及同次对象保留。下一修复只令原生 Linux 私有夹具使用与受信固定 builder 一致的 GCC，并验证配置/实际 argv/证据一致；不得删汇编指令、改FFmpeg配置或重新编译另一套生产对象绕过门禁。
 
 同冻结提交的默认 upstream [Linux run 38461632726](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38461632726) 三架构完整流程成功，通用 [CI run 38461632276](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38461632276) 格式与 Ubuntu/macOS 编译及安全测试成功。它们不证明显式修改配方通过，也不包含后续 RDP adapter 工作树改动。
+
+`6d6cce0` 的后续两文件编译器修复已独立审查 Approved：先要求原 provenance hash绑定的配置中有唯一精确`CC=gcc`，再固定传入`--cc gcc`；版本、C/ABI编译、链接与执行的六条实际记录必须吻合原runner，并保留最初配置hash贯穿prepare、numeric、三个基准窗口及失败finally。30项本机合同通过，包含真实保留配置读取；模拟阶段明确为contract_double。原FFmpeg源码/配置/数学/ABI夹具及同shipping对象选择未改。修复后的真实GNU编译、数值/ABI/基准和完整修改包仍待新冻结CI结果。
