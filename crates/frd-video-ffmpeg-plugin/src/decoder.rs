@@ -10,6 +10,26 @@ struct SoftwareDecodeThreadPolicy {
 #[cfg(any(feature = "native-ffmpeg", test))]
 impl SoftwareDecodeThreadPolicy {
     fn for_stream(coded_width: u32, coded_height: u32, logical_cpus: usize) -> Self {
+        #[cfg(target_env = "ohos")]
+        {
+            Self::for_ohos_stream(coded_width, coded_height, logical_cpus)
+        }
+        #[cfg(not(target_env = "ohos"))]
+        Self::for_desktop_stream(coded_width, coded_height, logical_cpus)
+    }
+
+    // OHOS 静态更新不能依赖下一包来释放 frame-thread pipeline。
+    // 单线程仍使用 FFmpeg NEON；B 帧重排与实际 1440p/4K 吞吐另行验收。
+    #[cfg(any(target_env = "ohos", test))]
+    fn for_ohos_stream(_coded_width: u32, _coded_height: u32, _logical_cpus: usize) -> Self {
+        Self {
+            thread_count: 1,
+            thread_type: 0,
+        }
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    fn for_desktop_stream(coded_width: u32, coded_height: u32, logical_cpus: usize) -> Self {
         let long_edge = coded_width.max(coded_height);
         let short_edge = coded_width.min(coded_height);
         if long_edge >= 2560 && short_edge >= 1440 && logical_cpus >= 2 {
@@ -41,7 +61,7 @@ pub(crate) fn populate_api(output: *mut RawFrdFfmpegApiV1, output_size: usize) -
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_env = "ohos")))]
 mod software_decode_thread_policy_tests {
     use super::SoftwareDecodeThreadPolicy;
 
@@ -104,6 +124,33 @@ mod software_decode_thread_policy_tests {
                 thread_type: 0,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod ohos_software_decode_thread_policy_tests {
+    use super::SoftwareDecodeThreadPolicy;
+
+    #[test]
+    fn ohos_static_output_policy_disables_frame_pipeline() {
+        for (width, height) in [
+            (1, 1),
+            (1920, 1080),
+            (2560, 1440),
+            (3840, 2160),
+            (2160, 3840),
+        ] {
+            for cpus in [0, 1, 2, 64] {
+                let policy = SoftwareDecodeThreadPolicy::for_ohos_stream(width, height, cpus);
+                assert_eq!(policy.thread_count, 1);
+                assert_eq!(policy.thread_type, 0);
+                #[cfg(target_env = "ohos")]
+                assert_eq!(
+                    SoftwareDecodeThreadPolicy::for_stream(width, height, cpus),
+                    policy
+                );
+            }
+        }
     }
 }
 
