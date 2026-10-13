@@ -35,6 +35,29 @@ class ProductionInventoryTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_production_copy(self.base, 'ironrdp-graphics-0.9.0')
 
+    def test_planar_mutation_without_matching_posthash_is_rejected(self):
+        for relative in ['src/rdp6/rle.rs', 'src/rdp6/bitmap_stream/decoder.rs']:
+            with self.subTest(relative=relative):
+                path = self.base / relative
+                original = path.read_bytes()
+                path.write_bytes(original + b'\n// unrecorded mutation\n')
+                with self.assertRaises(AssertionError):
+                    validate_production_copy(self.base, 'ironrdp-graphics-0.9.0')
+                path.write_bytes(original)
+
+    def test_wrong_planar_posthash_and_original_identity_are_rejected(self):
+        path = self.base / 'FRD-MODIFICATIONS.json'
+        original = path.read_text()
+        for relative in ['src/rdp6/rle.rs', 'src/rdp6/bitmap_stream/decoder.rs']:
+            for key in ['post_sha256', 'upstream_sha256']:
+                with self.subTest(relative=relative, key=key):
+                    data = json.loads(original)
+                    data['modified_originals'][relative][key] = '0' * 64
+                    path.write_text(json.dumps(data))
+                    with self.assertRaises(AssertionError):
+                        validate_production_copy(self.base, 'ironrdp-graphics-0.9.0')
+        path.write_text(original)
+
     def test_unrecorded_other_original_source_mutation_is_rejected(self):
         path = self.base / 'src/rlgr.rs'
         path.write_bytes(path.read_bytes() + b'\n// unrecorded mutation\n')

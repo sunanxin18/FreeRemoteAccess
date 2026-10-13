@@ -47,3 +47,37 @@ malformed 每例再以目标 offset0..15 检查 prefix/suffix canary。native �
 
 观察范围仅本机 macOS ARM64 NEON：这些测试不证明 session native dispatcher、最终 RGBA conversion、其他 ISA/ABI、
 OHOS package/runtime 或 live RDP；默认 session 仍调用原 entrypoint。没有启用 whole-codec 能力。
+
+A2.5 新增 `run_planar_tests.py`：以固定 Rust 1.96.0、offline/locked Cargo JSON artifact 编译实际 shipping
+library，并由实际 `rdp6/rle.rs`/`bitmap_stream/decoder.rs` source wrapper 检查私有 plane consumption、scratch
+和仅 `cfg(test)` 叶子计数。未复制 decoder 实现。vendor 自带 `bmp`/`expect-test` dev dependency 在本机离线缓存缺失，
+因此不能声称完整 upstream suite；wrapper 的 `expect!` 适配器只做严格 pretty-Debug/deindent 相等断言，
+所有原有15个 rle/encoder 测试仍执行。它不提供 snapshot 更新或忽略断言功能。
+
+```sh
+export PATH=/Users/sun/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin:$PATH
+python3 third_party/ironrdp-graphics-0.9.0/tests/run_planar_tests.py
+python3 third_party/ironrdp-graphics-0.9.0/tests/run_planar_tests.py --release
+python3 third_party/ironrdp-graphics-0.9.0/tests/run_planar_tests.py --clippy
+python3 third_party/ironrdp-graphics-0.9.0/tests/test_planar_mutations.py
+```
+
+`freeze_planar_wire.py [--original-source <未修改crate目录>]` 仅在主动验证 provenance 时运行；先校验整个原 registry source inventory，再提取原版
+catalog 的全部4,972个 Planar records（包含六组原bin的既有oracle RGB bytes）；另将六组固定24-bit原BMP像素转换为独立RGB expected fixture，附加4,181个 records
+来自独立 hash-pinned 原版 actual-source process。其中2,237个 private plane cases覆盖256个control byte的
+各截断、16/32特殊run全部raw field、row-last reset、partial/error四类及short dst；1,944个 bitmap cases
+包括552个成功原用例的private scratch、所有header的截断和12个零几何及4个原版溢出panic用例。公共 bitmap API 的消费字节
+始终没有测量值；只有私有 plane 成功返回usize时记录实际消费。失败只对比error/scratch，不虚构消费量。
+
+原decoder零几何的接受/错误/可能panic与native安全拒绝分开；native在PDU之前拒绝零尺寸、RGB乘法/isize/append
+溢出；需要header的alpha/chroma总长检查在PDU之后、reserve/scratch写入之前完成，合法尺寸保留PDU/read/segment/raw-plane错误顺序。坏plane可修改私有scratch，RGB输出仅在全部plane
+成功后追加，既有dst前缀保持；rawalpha跳完整尺寸，RLEalpha始终解码消费，CLL0+CS保持ARGB。kernel错误不重试scalar。
+
+计数仅存在于 `cfg(test)` 路径，实际parser解码时计数copy/fill/delta/RGB/YCoCg并对全部64个header检查color dispatch；
+private plane case逐offset0..15验证canary。mutants仅存在target临时copy，验证alpha消费、奇数chroma ceil和CLL7
+断言能杀死行为变异。release harness明确启用opt-level=3、thin LTO与embed-bitcode，使LLVM22对象经过固定rustc处理。
+观察仅本机macOS ARM64 NEON，未验证OHOS/其他平台执行、session registration、生产eligibility或live RDP。
+
+四个overflow records的dims为u32且mode=2明确标记64bit原版panic。64bit比较该原panic；i686字段可表示，
+但原release算术wrap可能改变分类，因此只执行同4项native InvalidDimensions/prefix/scratch安全断言并显式计数，
+不将其宣称为64bit原版panic exact parity。其余正常wire/error/plane fixtures逐条运行。

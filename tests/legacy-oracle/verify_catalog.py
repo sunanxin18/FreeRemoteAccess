@@ -1,4 +1,4 @@
-"""校验冻结 wire hash 与原生产清单；仅允许精确记录的 Bitmap consumer/manifest 差异。"""
+"""校验冻结 wire hash 与原生产清单；仅允许精确记录的 Bitmap/RDP6 consumer/manifest 差异。"""
 import collections
 import gzip
 import hashlib
@@ -24,7 +24,7 @@ def validate_production_copy(base, name):
         assert inventory['upstream_archive_sha256'] == 'c7493e426b6a8104cd497e518ba7781a9c7fc9a5f58a9cc0c1111e6d66f63bcc'
         modifications = inventory['modified_originals']
         # 显式窄边界：不能通过向 inventory 添加其他源路径来扩大豁免。
-        assert set(modifications) == {'Cargo.toml', 'src/rle.rs'}, set(modifications)
+        assert set(modifications) == {'Cargo.toml', 'src/rle.rs', 'src/rdp6/rle.rs', 'src/rdp6/bitmap_stream/decoder.rs'}, set(modifications)
     for relative, expected in originals.items():
         if relative in modifications:
             record = modifications[relative]

@@ -11,16 +11,46 @@
       "upstream_sha256": "4a0a5132460e4890cf272743c0702890172d08a0336cca5f39e3800b44048fcb",
       "post_sha256": "43a90ca26fb4611395bbc78e9f6929d9797b96a35e2c26d1d7ab879ab46f1226",
       "reason": "A2.4 shared parser materializer and explicit checked native Bitmap entrypoint; preserved old defaults/errors/first-line quirks"
+    },
+    "src/rdp6/rle.rs": {
+      "upstream_sha256": "ad85655f20b6dfbf4fa3dacbad938fffaa8a56f98ea76043453a64975aa853b4",
+      "post_sha256": "bfb2d684bec6591fd247327a66b665df3549fd4df2115d7d2c801ae15fa31808",
+      "reason": "A2.5 shared original wire/plane controller with explicit checked native RDP6 materializer; alpha consumption, append/error boundary and old defaults preserved"
+    },
+    "src/rdp6/bitmap_stream/decoder.rs": {
+      "upstream_sha256": "f127369afbe9cb50d60334281a6b481e00d5a22e32616457ac7d03c96058659a",
+      "post_sha256": "cc0feb66799ee901be4f501d1b4d01047e7ff4c0ffab9428a99c352b3d69b4e7",
+      "reason": "A2.5 shared original wire/plane controller with explicit checked native RDP6 materializer; alpha consumption, append/error boundary and old defaults preserved"
     }
   },
   "added_files": {
-    "tests/README.md": "fa0b419dbbdf9c5c910df89ebe69eb3e9b8af462ef3b53c643084412856d1142",
+    "tests/README.md": "26d29df797906592947babb7183dfff6bcf70da33f41ffa238afa0671a099068",
     "tests/bitmap_wire.rs": "29c1143dd09028705ea019981248b2784e6f240535806da5ce9dd373eb0cd05d",
     "tests/fixtures/bitmap-original-malformed.bin": "22f9e235ca35c885672ffdefc3e2709d1268b30f7f819e2e09fed126199044b1",
     "tests/fixtures/bitmap-original-wire.bin": "005eafe20246107959fd3936a0219374307e76b5474740a3210dbc804d44b677",
     "tests/freeze_bitmap_wire.py": "1c64fbaee1938aeefc1f93f452c52cafda6d2ce50c2bfe34475ca7c5d866c15e",
-    "tests/run_bitmap_tests.py": "b45c20210fde0d1fed0d193d6dc2a87bca76d5d17a00b5e2a1d92e6b2e7020b7"
+    "tests/run_bitmap_tests.py": "b45c20210fde0d1fed0d193d6dc2a87bca76d5d17a00b5e2a1d92e6b2e7020b7",
+    "tests/fixtures/planar-original-supplemental.bin": "88192fd53630dd8c37ec51b1a7fd6933338d9c3df43c8bd5cae5735394f58dc7",
+    "tests/fixtures/planar-original-wire.bin": "2ea40f29e5d0ae621f9d3163dcc9c0059be08f01ab494ad223dae4fbe89e840c",
+    "tests/freeze_planar_wire.py": "9b6121aa38756590b2bfcf4f0b42bceac7eb74d843b247e91fa89b826655c195",
+    "tests/planar_support.py": "317a0eb598fe0eaa111a2485aa2493a685ecd912876dc44af689e7ae30daa24b",
+    "tests/planar_wire.rs": "a938e94e17610844dac64fce8576b12bc1e038fc07f5e7686fd6655928d2705c",
+    "tests/run_planar_tests.py": "460e3f06e677136d559ff259763b97e666a277fb227e3673b9196ae5ff64e443",
+    "tests/test_planar_mutations.py": "18a4b0cbc3c628b6e1b05ea546b40d03f64fa6f9450ac541c2ace8f651d7321f",
+    "tests/fixtures/planar-original-bmp.bin": "49a9bdd1b5640ce28189dd6ca1bdeb1ea2104d024d06abcb23877439c93482d3"
   },
   "oracle_catalog_sha256": "6fbe95d550096ce14e3a7fdd61ed2b6eea1235552fab9401df0907fd8017ea41",
-  "original_rle_source_sha256": "4a0a5132460e4890cf272743c0702890172d08a0336cca5f39e3800b44048fcb"
+  "original_rle_source_sha256": "4a0a5132460e4890cf272743c0702890172d08a0336cca5f39e3800b44048fcb",
+  "original_planar_sources": {
+    "src/rdp6/rle.rs": "ad85655f20b6dfbf4fa3dacbad938fffaa8a56f98ea76043453a64975aa853b4",
+    "src/rdp6/bitmap_stream/decoder.rs": "f127369afbe9cb50d60334281a6b481e00d5a22e32616457ac7d03c96058659a"
+  },
+  "planar_fixture_records": {
+    "original_catalog": 4972,
+    "original_supplemental": 4181,
+    "original_bmp_pixels": 6,
+    "supplemental_private_planes": 2237,
+    "supplemental_bitmap": 1944,
+    "supplemental_64bit_panic_geometry": 4
+  }
 }

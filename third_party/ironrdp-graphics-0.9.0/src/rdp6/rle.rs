@@ -1,7 +1,9 @@
 use core::cmp;
 use std::io::{Read as _, Write as _};
 
+use crate::rdp6::bitmap_stream::NativeBitmapError;
 use byteorder::ReadBytesExt as _;
+use frd_rdp_legacy_kernels::{NativeKernels, PackedDepth};
 use ironrdp_core::WriteCursor;
 
 /// Maximum possible segment size is 47 (run_length = 2, raw_bytes_count = 15), which is treated as
@@ -19,8 +21,12 @@ pub enum RleDecodeError {
 impl core::fmt::Display for RleDecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            RleDecodeError::ReadCompressedData(_error) => write!(f, "failed to read RLE-compressed data"),
-            RleDecodeError::WriteDecompressedData(_error) => write!(f, "failed to write decompressed data"),
+            RleDecodeError::ReadCompressedData(_error) => {
+                write!(f, "failed to read RLE-compressed data")
+            }
+            RleDecodeError::WriteDecompressedData(_error) => {
+                write!(f, "failed to write decompressed data")
+            }
             RleDecodeError::InvalidSegmentHeader => write!(f, "invalid RLE segment header"),
             RleDecodeError::SegmentDoNotFitScanline => {
                 write!(f, "decoded scanline segments length exceeds scanline length")
@@ -57,6 +63,91 @@ impl core::fmt::Display for RleEncodeError {
 
 impl core::error::Error for RleEncodeError {}
 
+// 解析器只管理 wire 顺序；materializer 决定实际批量写入。
+pub(crate) trait PlaneMaterializer {
+    type Error: From<RleDecodeError>;
+    fn decompress(&mut self, src: &[u8], dst: &mut [u8], width: usize, height: usize) -> Result<usize, Self::Error>
+    where
+        Self: Sized,
+    {
+        decompress_8bpp_plane_with(src, dst, width, height, self)
+    }
+    fn copy(&mut self, src: &[u8], dst: &mut [u8]) -> Result<(), Self::Error>;
+    fn fill(&mut self, value: u8, dst: &mut [u8]) -> Result<(), Self::Error>;
+    fn delta(&mut self, above: &[u8], row: &mut [u8]) -> Result<(), Self::Error>;
+}
+
+pub(crate) struct ScalarPlanes;
+impl PlaneMaterializer for ScalarPlanes {
+    type Error = RleDecodeError;
+    fn decompress(&mut self, src: &[u8], dst: &mut [u8], width: usize, height: usize) -> Result<usize, Self::Error> {
+        decompress_8bpp_plane(src, dst, width, height)
+    }
+
+    fn copy(&mut self, src: &[u8], mut dst: &mut [u8]) -> Result<(), Self::Error> {
+        dst.write_all(src).map_err(RleDecodeError::WriteDecompressedData)
+    }
+    fn fill(&mut self, value: u8, dst: &mut [u8]) -> Result<(), Self::Error> {
+        dst.fill(value);
+        Ok(())
+    }
+    fn delta(&mut self, above: &[u8], row: &mut [u8]) -> Result<(), Self::Error> {
+        RlePlaneDecoder::resolve_scanline_delta(above, row);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct PlaneCalls {
+    pub copy: usize,
+    pub fill: usize,
+    pub delta: usize,
+    pub rgb: usize,
+    pub ycocg: usize,
+}
+
+pub(crate) struct NativePlanes<'k> {
+    pub kernels: &'k NativeKernels,
+    #[cfg(test)]
+    pub calls: PlaneCalls,
+}
+impl<'k> NativePlanes<'k> {
+    pub(crate) fn new(kernels: &'k NativeKernels) -> Self {
+        Self {
+            kernels,
+            #[cfg(test)]
+            calls: PlaneCalls::default(),
+        }
+    }
+}
+impl PlaneMaterializer for NativePlanes<'_> {
+    type Error = NativeBitmapError;
+    fn copy(&mut self, src: &[u8], dst: &mut [u8]) -> Result<(), Self::Error> {
+        #[cfg(test)]
+        {
+            self.calls.copy += 1;
+        }
+        self.kernels.copy_u8(src, dst).map_err(Into::into)
+    }
+    fn fill(&mut self, value: u8, dst: &mut [u8]) -> Result<(), Self::Error> {
+        #[cfg(test)]
+        {
+            self.calls.fill += 1;
+        }
+        self.kernels
+            .fill_pixel(PackedDepth::Index8, &[value], dst)
+            .map_err(Into::into)
+    }
+    fn delta(&mut self, above: &[u8], row: &mut [u8]) -> Result<(), Self::Error> {
+        #[cfg(test)]
+        {
+            self.calls.delta += 1;
+        }
+        self.kernels.resolve_planar_delta(above, row).map_err(Into::into)
+    }
+}
+
 /// RLE-encoded color plane decoder implementation for RDP6 bitmap stream
 #[derive(Debug)]
 struct RlePlaneDecoder {
@@ -72,70 +163,6 @@ struct RlePlaneDecoder {
 }
 
 impl RlePlaneDecoder {
-    fn new(width: usize, height: usize) -> Self {
-        Self {
-            last_decoded_byte: 0,
-            width,
-            height,
-            decoded_data: [0; MAX_DECODED_SEGMENT_SIZE],
-            decoded_data_len: 0,
-        }
-    }
-
-    fn decompress_next_segment(&mut self, mut src: &[u8]) -> Result<usize, RleDecodeError> {
-        let control_byte = src.read_u8().map_err(RleDecodeError::ReadCompressedData)?;
-
-        if control_byte == 0 {
-            return Err(RleDecodeError::InvalidSegmentHeader);
-        }
-
-        let rle_bytes_field = control_byte & 0x0F;
-        let raw_bytes_field = (control_byte >> 4) & 0x0F;
-
-        let (run_length, raw_bytes_count) = match rle_bytes_field {
-            1 => (16 + usize::from(raw_bytes_field), 0),
-            2 => (32 + usize::from(raw_bytes_field), 0),
-            rle_control => (usize::from(rle_control), usize::from(raw_bytes_field)),
-        };
-
-        self.decoded_data_len = raw_bytes_count + run_length;
-
-        src.read_exact(&mut self.decoded_data[..raw_bytes_count])
-            .map_err(RleDecodeError::ReadCompressedData)?;
-
-        if raw_bytes_count > 0 {
-            // save last decoded byte for the next segments decoding
-            self.last_decoded_byte = self.decoded_data[raw_bytes_count - 1];
-        }
-
-        self.decoded_data[raw_bytes_count..self.decoded_data_len].fill(self.last_decoded_byte);
-
-        Ok(raw_bytes_count + 1)
-    }
-
-    /// Decodes single RLE-encoded scanline, without performing delta transformation
-    fn decode_scanline(&mut self, src: &[u8], mut dst: &mut [u8]) -> Result<usize, RleDecodeError> {
-        let mut decoded_columns = 0;
-        let mut read_bytes = 0;
-
-        self.last_decoded_byte = 0;
-
-        while decoded_columns < self.width {
-            read_bytes += self.decompress_next_segment(&src[read_bytes..])?;
-
-            if decoded_columns + self.decoded_data_len > self.width {
-                return Err(RleDecodeError::SegmentDoNotFitScanline);
-            }
-
-            dst.write_all(&self.decoded_data[..self.decoded_data_len])
-                .map_err(RleDecodeError::WriteDecompressedData)?;
-
-            decoded_columns += self.decoded_data_len;
-        }
-
-        Ok(read_bytes)
-    }
-
     /// Performs delta transformation as described in 3.1.9.2.3 of [MS-RDPEGDI]
     fn resolve_scanline_delta(prev_line: &[u8], current_scanline: &mut [u8]) {
         assert!(prev_line.len() == current_scanline.len());
@@ -157,18 +184,118 @@ impl RlePlaneDecoder {
             });
     }
 
-    fn decode(mut self, src: &[u8], dst: &mut [u8]) -> Result<usize, RleDecodeError> {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            last_decoded_byte: 0,
+            width,
+            height,
+            decoded_data: [0; MAX_DECODED_SEGMENT_SIZE],
+            decoded_data_len: 0,
+        }
+    }
+
+    fn decompress_next_segment<M: PlaneMaterializer>(
+        &mut self,
+        mut src: &[u8],
+        materializer: &mut M,
+    ) -> Result<usize, M::Error> {
+        let control_byte = src.read_u8().map_err(RleDecodeError::ReadCompressedData)?;
+
+        if control_byte == 0 {
+            return Err(RleDecodeError::InvalidSegmentHeader.into());
+        }
+
+        let rle_bytes_field = control_byte & 0x0F;
+        let raw_bytes_field = (control_byte >> 4) & 0x0F;
+
+        let (run_length, raw_bytes_count) = match rle_bytes_field {
+            1 => (16 + usize::from(raw_bytes_field), 0),
+            2 => (32 + usize::from(raw_bytes_field), 0),
+            rle_control => (usize::from(rle_control), usize::from(raw_bytes_field)),
+        };
+
+        self.decoded_data_len = raw_bytes_count + run_length;
+
+        // 原版 read_exact 的错误优先于 segment 超行；短输入仍修改私有 segment scratch。
+        // native raw 成功时直接由 copy leaf 消费输入，不做 scalar replay。
+        if src.len() < raw_bytes_count {
+            materializer.copy(src, &mut self.decoded_data[..src.len()])?;
+            // 零可读字节生成旧 read_exact 的静态 UnexpectedEof，避免失败时 scalar copy。
+            (&[][..])
+                .read_exact(&mut [0])
+                .map_err(RleDecodeError::ReadCompressedData)?;
+        }
+        materializer.copy(&src[..raw_bytes_count], &mut self.decoded_data[..raw_bytes_count])?;
+
+        if raw_bytes_count > 0 {
+            // save last decoded byte for the next segments decoding
+            self.last_decoded_byte = self.decoded_data[raw_bytes_count - 1];
+        }
+
+        materializer.fill(
+            self.last_decoded_byte,
+            &mut self.decoded_data[raw_bytes_count..self.decoded_data_len],
+        )?;
+
+        Ok(raw_bytes_count + 1)
+    }
+
+    /// Decodes single RLE-encoded scanline, without performing delta transformation
+    fn decode_scanline<M: PlaneMaterializer>(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        materializer: &mut M,
+    ) -> Result<usize, M::Error> {
+        let mut decoded_columns = 0;
         let mut read_bytes = 0;
 
-        read_bytes += self.decode_scanline(src, dst)?;
+        self.last_decoded_byte = 0;
+
+        while decoded_columns < self.width {
+            read_bytes += self.decompress_next_segment(&src[read_bytes..], materializer)?;
+
+            if decoded_columns + self.decoded_data_len > self.width {
+                return Err(RleDecodeError::SegmentDoNotFitScanline.into());
+            }
+
+            // write_all 原来可在短 dst 上写前缀再返回 WriteZero；保留该 scratch 边界。
+            let available = dst.len().saturating_sub(decoded_columns);
+            let written = available.min(self.decoded_data_len);
+            materializer.copy(
+                &self.decoded_data[..written],
+                &mut dst[decoded_columns..decoded_columns + written],
+            )?;
+            if written < self.decoded_data_len {
+                // 让标准库生成与旧 write_all 相同的静态 WriteZero 错误。
+                (&mut [][..])
+                    .write_all(&self.decoded_data[written..self.decoded_data_len])
+                    .map_err(RleDecodeError::WriteDecompressedData)?;
+            }
+
+            decoded_columns += self.decoded_data_len;
+        }
+
+        Ok(read_bytes)
+    }
+
+    fn decode<M: PlaneMaterializer>(
+        mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        materializer: &mut M,
+    ) -> Result<usize, M::Error> {
+        let mut read_bytes = 0;
+
+        read_bytes += self.decode_scanline(src, dst, materializer)?;
 
         let (mut prev_scanline, mut dst) = dst.split_at_mut(self.width);
 
         for _ in 1..self.height {
             let current_scanline = &mut dst[..self.width];
 
-            read_bytes += self.decode_scanline(&src[read_bytes..], current_scanline)?;
-            Self::resolve_scanline_delta(prev_scanline, current_scanline);
+            read_bytes += self.decode_scanline(&src[read_bytes..], current_scanline, materializer)?;
+            materializer.delta(prev_scanline, current_scanline)?;
 
             (prev_scanline, dst) = dst.split_at_mut(self.width);
         }
@@ -188,7 +315,17 @@ pub(crate) fn decompress_8bpp_plane(
     width: usize,
     height: usize,
 ) -> Result<usize, RleDecodeError> {
-    RlePlaneDecoder::new(width, height).decode(src, dst)
+    decompress_8bpp_plane_with(src, dst, width, height, &mut ScalarPlanes)
+}
+
+pub(crate) fn decompress_8bpp_plane_with<M: PlaneMaterializer>(
+    src: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+    materializer: &mut M,
+) -> Result<usize, M::Error> {
+    RlePlaneDecoder::new(width, height).decode(src, dst, materializer)
 }
 
 struct RleEncoderScanlineIterator<I> {
