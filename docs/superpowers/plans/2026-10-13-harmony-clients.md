@@ -82,6 +82,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4C0 手机/PC 正常权限系统能力与三个接口路线完成受限验证；AVC420 像素通过、EOS 前出帧未通过、精确444失败、HEVC 未报告，见[系统验证](../../validation/harmony-system-codec-20261013.md)。
 - [x] Task 4C1 中立 NativeFirst 显式策略 `e1fb9fa` 已实现并通过独立审查；默认桌面顺序保持，尚未接入系统 backend。
 - [x] Task 4C2 官方基础镜像静态审计找到双线程缓冲路径及安装 NEON 分派；与三轮运行结果形成高置信度原因解释，未证明当前进程加载身份。当前系统软解不满足静态单帧要求，优先推进合格 FFmpeg 后备，系统优先策略保留。
+- [x] Task 4C3A 独立官方 OHOS ARM64 FFmpeg builder/verifier 与专属静态输出线程策略完成（`9c2cd42`/`8343bd3`）；22 项产物/输入/实际链接回归通过，独立复审通过。仅构建证据，普通 HAP loader、逐像素与运行时性能仍待完成，见[后备包证据](../../validation/harmony-ffmpeg-bundle-20261013.md)。
 - [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。
 - [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、远程软键盘入口与 IME 提交、断开/重连与恢复。
