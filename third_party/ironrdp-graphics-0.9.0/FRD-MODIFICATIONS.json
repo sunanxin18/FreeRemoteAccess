@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "upstream_archive_sha256": "c7493e426b6a8104cd497e518ba7781a9c7fc9a5f58a9cc0c1111e6d66f63bcc",
+  "modified_originals": {
+    "Cargo.toml": {
+      "upstream_sha256": "e7a7529a1748047022752f465263bc8df1f508464da70e0d7f025b4f54e341e2",
+      "post_sha256": "262be82ad8afd0990fd46e95c2ec6789dd55608083523d48b9b4b391371f8b87",
+      "reason": "A2.3 private checked SIMD leaf dependency; source parser default unchanged"
+    },
+    "src/rle.rs": {
+      "upstream_sha256": "4a0a5132460e4890cf272743c0702890172d08a0336cca5f39e3800b44048fcb",
+      "post_sha256": "43a90ca26fb4611395bbc78e9f6929d9797b96a35e2c26d1d7ab879ab46f1226",
+      "reason": "A2.4 shared parser materializer and explicit checked native Bitmap entrypoint; preserved old defaults/errors/first-line quirks"
+    }
+  },
+  "added_files": {
+    "tests/README.md": "fa0b419dbbdf9c5c910df89ebe69eb3e9b8af462ef3b53c643084412856d1142",
+    "tests/bitmap_wire.rs": "29c1143dd09028705ea019981248b2784e6f240535806da5ce9dd373eb0cd05d",
+    "tests/fixtures/bitmap-original-malformed.bin": "22f9e235ca35c885672ffdefc3e2709d1268b30f7f819e2e09fed126199044b1",
+    "tests/fixtures/bitmap-original-wire.bin": "005eafe20246107959fd3936a0219374307e76b5474740a3210dbc804d44b677",
+    "tests/freeze_bitmap_wire.py": "1c64fbaee1938aeefc1f93f452c52cafda6d2ce50c2bfe34475ca7c5d866c15e",
+    "tests/run_bitmap_tests.py": "b45c20210fde0d1fed0d193d6dc2a87bca76d5d17a00b5e2a1d92e6b2e7020b7"
+  },
+  "oracle_catalog_sha256": "6fbe95d550096ce14e3a7fdd61ed2b6eea1235552fab9401df0907fd8017ea41",
+  "original_rle_source_sha256": "4a0a5132460e4890cf272743c0702890172d08a0336cca5f39e3800b44048fcb"
+}

@@ -12,6 +12,12 @@
 use core::fmt;
 use core::ops::BitXor;
 
+use frd_rdp_legacy_kernels::{KernelError, NativeKernels, PackedDepth};
+
+#[cfg(test)]
+#[path = "../tests/bitmap_wire.rs"]
+mod bitmap_wire;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RlePixelFormat {
     Rgb24,
@@ -41,6 +47,74 @@ pub fn decompress(
         Mode8Bpp::BPP => decompress_8_bpp(src, dst, width, height),
         invalid => Err(RleError::InvalidBpp { bpp: invalid }),
     }
+}
+
+/// 原版 wire 错误与 checked native 叶子错误保持可区分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeRleError {
+    Rle(RleError),
+    Kernel(KernelError),
+}
+
+impl From<RleError> for NativeRleError {
+    fn from(error: RleError) -> Self {
+        Self::Rle(error)
+    }
+}
+impl From<KernelError> for NativeRleError {
+    fn from(error: KernelError) -> Self {
+        Self::Kernel(error)
+    }
+}
+impl fmt::Display for NativeRleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rle(error) => error.fmt(f),
+            Self::Kernel(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for NativeRleError {}
+
+/// 显式选择 checked SIMD materialization；默认入口保持原版行为。
+/// 尺寸溢出在 resize 前返回错误，wire 错误保留原版优先序与已写入的 dst 前缀。
+pub fn decompress_native(
+    src: &[u8],
+    dst: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+    bpp: usize,
+    kernels: &NativeKernels,
+) -> Result<RlePixelFormat, NativeRleError> {
+    match bpp {
+        Mode24Bpp::BPP => decompress_native_helper::<Mode24Bpp>(src, dst, width, height, kernels),
+        Mode16Bpp::BPP => decompress_native_helper::<Mode16Bpp>(src, dst, width, height, kernels),
+        Mode15Bpp::BPP => decompress_native_helper::<Mode15Bpp>(src, dst, width, height, kernels),
+        Mode8Bpp::BPP => decompress_native_helper::<Mode8Bpp>(src, dst, width, height, kernels),
+        bpp => Err(RleError::InvalidBpp { bpp }.into()),
+    }
+}
+
+fn decompress_native_helper<Mode: DepthMode>(
+    src: &[u8],
+    dst: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+    kernels: &NativeKernels,
+) -> Result<RlePixelFormat, NativeRleError> {
+    if width == 0 || height == 0 {
+        return Err(RleError::EmptyImage.into());
+    }
+    let row_delta = Mode::COLOR_DEPTH
+        .checked_mul(width)
+        .ok_or(KernelError::InvalidDimensions)?;
+    let size = row_delta
+        .checked_mul(height)
+        .filter(|&size| size <= isize::MAX as usize)
+        .ok_or(KernelError::InvalidDimensions)?;
+    dst.resize(size, 0);
+    decompress_with::<Mode, _>(src, dst, row_delta, &mut NativeMaterializer::new(kernels))?;
+    Ok(Mode::PIXEL_FORMAT)
 }
 
 /// Decompresses a 24-bpp RLE compressed bitmap.
@@ -127,7 +201,10 @@ impl fmt::Display for RleError {
             RleError::InvalidBpp { bpp } => write!(f, "invalid bytes per pixel: {bpp}"),
             RleError::BadOrderCode => write!(f, "bad RLE order code"),
             RleError::NotEnoughBytes { expected, actual } => {
-                write!(f, "not enough bytes: expected {expected} bytes, but got {actual}")
+                write!(
+                    f,
+                    "not enough bytes: expected {expected} bytes, but got {actual}"
+                )
             }
             RleError::InvalidImageSize {
                 maximum_additional,
@@ -166,7 +243,7 @@ macro_rules! ensure_size {
         let actual = $buf.remaining_len();
         let expected = $expected;
         if expected > actual {
-            return Err(RleError::NotEnoughBytes { expected, actual });
+            return Err(RleError::NotEnoughBytes { expected, actual }.into());
         }
     }};
     (into: $buf:ident, size: $required_additional:expr) => {{
@@ -176,7 +253,8 @@ macro_rules! ensure_size {
             return Err(RleError::InvalidImageSize {
                 maximum_additional,
                 required_additional,
-            });
+            }
+            .into());
         }
     }};
 }
@@ -186,7 +264,21 @@ macro_rules! ensure_size {
 /// `src`: source buffer containing compressed bitmap
 /// `dst`: destination buffer
 /// `row_delta`: scanline length in bytes
-fn decompress_impl<Mode: DepthMode>(src: &[u8], dst: &mut [u8], row_delta: usize) -> Result<(), RleError> {
+fn decompress_impl<Mode: DepthMode>(
+    src: &[u8],
+    dst: &mut [u8],
+    row_delta: usize,
+) -> Result<(), RleError> {
+    decompress_with::<Mode, _>(src, dst, row_delta, &mut ScalarMaterializer)
+}
+
+// 解析、命令级 first-line 状态、源消费及错误检查只有这一份实现。
+fn decompress_with<Mode: DepthMode, M: Materializer<Mode>>(
+    src: &[u8],
+    dst: &mut [u8],
+    row_delta: usize,
+    materializer: &mut M,
+) -> Result<(), M::Error> {
     let mut src = Buf::new(src);
     let mut dst = BufMut::new(dst);
 
@@ -215,32 +307,16 @@ fn decompress_impl<Mode: DepthMode>(src: &[u8], dst: &mut [u8], row_delta: usize
         if code == Code::REGULAR_BG_RUN || code == Code::MEGA_MEGA_BG_RUN {
             ensure_size!(into: dst, size: run_length * Mode::COLOR_DEPTH);
 
-            if is_first_line {
-                let num_iterations = if insert_fg_pel {
-                    Mode::write_pixel(&mut dst, fg_pel);
-                    run_length - 1
-                } else {
-                    run_length
-                };
-
-                for _ in 0..num_iterations {
-                    Mode::write_pixel(&mut dst, Mode::BLACK_PIXEL);
-                }
-            } else {
-                let num_iterations = if insert_fg_pel {
-                    let pixel_above = dst.read_pixel_above::<Mode>(row_delta);
-                    let xored = pixel_above ^ fg_pel;
-                    Mode::write_pixel(&mut dst, xored);
-                    run_length - 1
-                } else {
-                    run_length
-                };
-
-                for _ in 0..num_iterations {
-                    let pixel_above = dst.read_pixel_above::<Mode>(row_delta);
-                    Mode::write_pixel(&mut dst, pixel_above);
-                }
+            if insert_fg_pel {
+                materializer.background(&mut dst, row_delta, is_first_line, Some(fg_pel), 1)?;
             }
+            materializer.background(
+                &mut dst,
+                row_delta,
+                is_first_line,
+                None,
+                run_length - usize::from(insert_fg_pel),
+            )?;
 
             // A follow-on background run order will need a foreground pel inserted.
             insert_fg_pel = true;
@@ -267,17 +343,13 @@ fn decompress_impl<Mode: DepthMode>(src: &[u8], dst: &mut [u8], row_delta: usize
 
             ensure_size!(into: dst, size: run_length * Mode::COLOR_DEPTH);
 
-            if is_first_line {
-                for _ in 0..run_length {
-                    Mode::write_pixel(&mut dst, fg_pel);
-                }
-            } else {
-                for _ in 0..run_length {
-                    let pixel_above = dst.read_pixel_above::<Mode>(row_delta);
-                    let xored = pixel_above ^ fg_pel;
-                    Mode::write_pixel(&mut dst, xored);
-                }
-            }
+            materializer.background(
+                &mut dst,
+                row_delta,
+                is_first_line,
+                Some(fg_pel),
+                run_length,
+            )?;
         } else if code == Code::LITE_DITHERED_RUN || code == Code::MEGA_MEGA_DITHERED_RUN {
             // Handle Dithered Run Orders.
 
@@ -288,10 +360,7 @@ fn decompress_impl<Mode: DepthMode>(src: &[u8], dst: &mut [u8], row_delta: usize
 
             ensure_size!(into: dst, size: run_length * 2 * Mode::COLOR_DEPTH);
 
-            for _ in 0..run_length {
-                Mode::write_pixel(&mut dst, pixel_a);
-                Mode::write_pixel(&mut dst, pixel_b);
-            }
+            materializer.dither(&mut dst, pixel_a, pixel_b, run_length * 2)?;
         } else if code == Code::REGULAR_COLOR_RUN || code == Code::MEGA_MEGA_COLOR_RUN {
             // Handle Color Run Orders.
 
@@ -301,9 +370,7 @@ fn decompress_impl<Mode: DepthMode>(src: &[u8], dst: &mut [u8], row_delta: usize
 
             ensure_size!(into: dst, size: run_length * Mode::COLOR_DEPTH);
 
-            for _ in 0..run_length {
-                Mode::write_pixel(&mut dst, pixel);
-            }
+            materializer.fill(&mut dst, pixel, run_length)?;
         } else if code == Code::REGULAR_FGBG_IMAGE
             || code == Code::MEGA_MEGA_FGBG_IMAGE
             || code == Code::LITE_SET_FG_FGBG_IMAGE
@@ -324,11 +391,8 @@ fn decompress_impl<Mode: DepthMode>(src: &[u8], dst: &mut [u8], row_delta: usize
                 ensure_size!(from: src, size: 1);
                 let bitmask = src.read_u8();
 
-                if is_first_line {
-                    write_first_line_fg_bg_image::<Mode>(&mut dst, bitmask, fg_pel, c_bits)?;
-                } else {
-                    write_fg_bg_image::<Mode>(&mut dst, row_delta, bitmask, fg_pel, c_bits)?;
-                }
+                ensure_size!(into: dst, size: c_bits * Mode::COLOR_DEPTH);
+                materializer.mask(&mut dst, row_delta, is_first_line, bitmask, fg_pel, c_bits)?;
 
                 number_to_read -= c_bits;
             }
@@ -340,47 +404,343 @@ fn decompress_impl<Mode: DepthMode>(src: &[u8], dst: &mut [u8], row_delta: usize
             ensure_size!(from: src, size: byte_count);
             ensure_size!(into: dst, size: byte_count);
 
-            for _ in 0..byte_count {
-                dst.write_u8(src.read_u8());
-            }
+            materializer.copy(&mut dst, &src.inner[src.pos..src.pos + byte_count])?;
+            src.pos += byte_count;
         } else if code == Code::SPECIAL_FGBG_1 {
             // Handle Special Order 1.
 
             const MASK_SPECIAL_FG_BG_1: u8 = 0x03;
 
-            if is_first_line {
-                write_first_line_fg_bg_image::<Mode>(&mut dst, MASK_SPECIAL_FG_BG_1, fg_pel, 8)?;
-            } else {
-                write_fg_bg_image::<Mode>(&mut dst, row_delta, MASK_SPECIAL_FG_BG_1, fg_pel, 8)?;
-            }
+            ensure_size!(into: dst, size: 8 * Mode::COLOR_DEPTH);
+            materializer.mask(
+                &mut dst,
+                row_delta,
+                is_first_line,
+                MASK_SPECIAL_FG_BG_1,
+                fg_pel,
+                8,
+            )?;
         } else if code == Code::SPECIAL_FGBG_2 {
             // Handle Special Order 2.
 
             const MASK_SPECIAL_FG_BG_2: u8 = 0x05;
 
-            if is_first_line {
-                write_first_line_fg_bg_image::<Mode>(&mut dst, MASK_SPECIAL_FG_BG_2, fg_pel, 8)?;
-            } else {
-                write_fg_bg_image::<Mode>(&mut dst, row_delta, MASK_SPECIAL_FG_BG_2, fg_pel, 8)?;
-            }
+            ensure_size!(into: dst, size: 8 * Mode::COLOR_DEPTH);
+            materializer.mask(
+                &mut dst,
+                row_delta,
+                is_first_line,
+                MASK_SPECIAL_FG_BG_2,
+                fg_pel,
+                8,
+            )?;
         } else if code == Code::SPECIAL_WHITE {
             // Handle White Order.
 
             ensure_size!(into: dst, size: Mode::COLOR_DEPTH);
 
-            Mode::write_pixel(&mut dst, Mode::WHITE_PIXEL);
+            materializer.fill(&mut dst, Mode::WHITE_PIXEL, 1)?;
         } else if code == Code::SPECIAL_BLACK {
             // Handle Black Order.
 
             ensure_size!(into: dst, size: Mode::COLOR_DEPTH);
 
-            Mode::write_pixel(&mut dst, Mode::BLACK_PIXEL);
+            materializer.fill(&mut dst, Mode::BLACK_PIXEL, 1)?;
         } else {
-            return Err(RleError::BadOrderCode);
+            return Err(RleError::BadOrderCode.into());
         }
     }
 
     Ok(())
+}
+
+// Materializer 不决定 wire 检查或命令状态；调用前由共享 parser 保证 dst 空间。
+trait Materializer<Mode: DepthMode> {
+    type Error: From<RleError>;
+    fn fill(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        pixel: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), Self::Error>;
+    fn background(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        row_delta: usize,
+        first: bool,
+        fg: Option<Mode::Pixel>,
+        count: usize,
+    ) -> Result<(), Self::Error>;
+    fn dither(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        a: Mode::Pixel,
+        b: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), Self::Error>;
+    fn mask(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        row_delta: usize,
+        first: bool,
+        mask: u8,
+        fg: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), Self::Error>;
+    fn copy(&mut self, dst: &mut BufMut<'_>, src: &[u8]) -> Result<(), Self::Error>;
+}
+
+struct ScalarMaterializer;
+
+impl<Mode: DepthMode> Materializer<Mode> for ScalarMaterializer {
+    type Error = RleError;
+    fn fill(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        pixel: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), RleError> {
+        for _ in 0..count {
+            Mode::write_pixel(dst, pixel);
+        }
+        Ok(())
+    }
+    fn background(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        row_delta: usize,
+        first: bool,
+        fg: Option<Mode::Pixel>,
+        count: usize,
+    ) -> Result<(), RleError> {
+        for _ in 0..count {
+            let pixel = if first {
+                fg.unwrap_or(Mode::BLACK_PIXEL)
+            } else {
+                let above = dst.read_pixel_above::<Mode>(row_delta);
+                fg.map_or(above, |fg| above ^ fg)
+            };
+            Mode::write_pixel(dst, pixel);
+        }
+        Ok(())
+    }
+    fn dither(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        a: Mode::Pixel,
+        b: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), RleError> {
+        for i in 0..count {
+            Mode::write_pixel(dst, if i % 2 == 0 { a } else { b });
+        }
+        Ok(())
+    }
+    fn mask(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        row_delta: usize,
+        first: bool,
+        mask: u8,
+        fg: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), RleError> {
+        if first {
+            write_first_line_fg_bg_image::<Mode>(dst, mask, fg, count)
+        } else {
+            write_fg_bg_image::<Mode>(dst, row_delta, mask, fg, count)
+        }
+    }
+    fn copy(&mut self, dst: &mut BufMut<'_>, src: &[u8]) -> Result<(), RleError> {
+        for &byte in src {
+            dst.write_u8(byte);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct LeafCalls {
+    fill: usize,
+    copy: usize,
+    xor: usize,
+    mask: usize,
+    dither: usize,
+}
+
+struct NativeMaterializer<'a> {
+    kernels: &'a NativeKernels,
+    #[cfg(test)]
+    calls: LeafCalls,
+}
+
+impl<'a> NativeMaterializer<'a> {
+    fn new(kernels: &'a NativeKernels) -> Self {
+        Self {
+            kernels,
+            #[cfg(test)]
+            calls: LeafCalls::default(),
+        }
+    }
+    fn depth<Mode: DepthMode>() -> PackedDepth {
+        match Mode::BPP {
+            8 => PackedDepth::Index8,
+            15 => PackedDepth::Rgb555,
+            16 => PackedDepth::Rgb565,
+            24 => PackedDepth::Bgr24,
+            _ => unreachable!("内部固定 DepthMode"),
+        }
+    }
+}
+
+impl<Mode: DepthMode> Materializer<Mode> for NativeMaterializer<'_> {
+    type Error = NativeRleError;
+    fn fill(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        pixel: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), NativeRleError> {
+        let bytes = Into::<u32>::into(pixel).to_le_bytes();
+        let len = count * Mode::COLOR_DEPTH;
+        self.kernels.fill_pixel(
+            Self::depth::<Mode>(),
+            &bytes[..Mode::COLOR_DEPTH],
+            &mut dst.inner[dst.pos..dst.pos + len],
+        )?;
+        #[cfg(test)]
+        {
+            self.calls.fill += 1;
+        }
+        dst.pos += len;
+        Ok(())
+    }
+    fn background(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        row_delta: usize,
+        first: bool,
+        fg: Option<Mode::Pixel>,
+        mut count: usize,
+    ) -> Result<(), NativeRleError> {
+        // first 是整个命令的判定；跨行不将它重新解释为当前 row。
+        if first {
+            return <Self as Materializer<Mode>>::fill(
+                self,
+                dst,
+                fg.unwrap_or(Mode::BLACK_PIXEL),
+                count,
+            );
+        }
+        let fg_bytes = fg.map(|pixel| Into::<u32>::into(pixel).to_le_bytes());
+        while count != 0 {
+            let pixels = count.min((row_delta - dst.pos % row_delta) / Mode::COLOR_DEPTH);
+            let len = pixels * Mode::COLOR_DEPTH;
+            // 当前段最多一行；上一行已写数据与当前写入区域不重叠。
+            let (before, current) = dst.inner.split_at_mut(dst.pos);
+            let previous = &before[dst.pos - row_delta..dst.pos - row_delta + len];
+            if let Some(bytes) = fg_bytes {
+                self.kernels.xor_previous(
+                    Self::depth::<Mode>(),
+                    previous,
+                    &bytes[..Mode::COLOR_DEPTH],
+                    &mut current[..len],
+                )?;
+                #[cfg(test)]
+                {
+                    self.calls.xor += 1;
+                }
+            } else {
+                self.kernels.copy_u8(previous, &mut current[..len])?;
+                #[cfg(test)]
+                {
+                    self.calls.copy += 1;
+                }
+            }
+            dst.pos += len;
+            count -= pixels;
+        }
+        Ok(())
+    }
+    fn dither(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        a: Mode::Pixel,
+        b: Mode::Pixel,
+        count: usize,
+    ) -> Result<(), NativeRleError> {
+        let a = Into::<u32>::into(a).to_le_bytes();
+        let b = Into::<u32>::into(b).to_le_bytes();
+        let len = count * Mode::COLOR_DEPTH;
+        // 无上一行依赖，单次 leaf 保留整个命令的 pair 相位，短尾由 leaf staging。
+        self.kernels.dither_pixels(
+            Self::depth::<Mode>(),
+            &a[..Mode::COLOR_DEPTH],
+            &b[..Mode::COLOR_DEPTH],
+            false,
+            &mut dst.inner[dst.pos..dst.pos + len],
+        )?;
+        #[cfg(test)]
+        {
+            self.calls.dither += 1;
+        }
+        dst.pos += len;
+        Ok(())
+    }
+    fn mask(
+        &mut self,
+        dst: &mut BufMut<'_>,
+        row_delta: usize,
+        first: bool,
+        mask: u8,
+        fg: Mode::Pixel,
+        mut count: usize,
+    ) -> Result<(), NativeRleError> {
+        let fg = Into::<u32>::into(fg).to_le_bytes();
+        let mut bit_offset = 0;
+        while count != 0 {
+            let pixels = if first {
+                count
+            } else {
+                count.min((row_delta - dst.pos % row_delta) / Mode::COLOR_DEPTH)
+            };
+            let len = pixels * Mode::COLOR_DEPTH;
+            let (before, current) = dst.inner.split_at_mut(dst.pos);
+            let previous = if first {
+                None
+            } else {
+                Some(&before[dst.pos - row_delta..dst.pos - row_delta + len])
+            };
+            self.kernels.mask_previous(
+                Self::depth::<Mode>(),
+                previous,
+                &fg[..Mode::COLOR_DEPTH],
+                mask,
+                bit_offset,
+                &mut current[..len],
+            )?;
+            #[cfg(test)]
+            {
+                self.calls.mask += 1;
+            }
+            dst.pos += len;
+            count -= pixels;
+            // 一个 mask 只覆盖最多 8 个 pixel；row 边界不能重置 mask 位。
+            bit_offset += u8::try_from(pixels).expect("mask 至多 8 pixels");
+        }
+        Ok(())
+    }
+    fn copy(&mut self, dst: &mut BufMut<'_>, src: &[u8]) -> Result<(), NativeRleError> {
+        self.kernels
+            .copy_u8(src, &mut dst.inner[dst.pos..dst.pos + src.len()])?;
+        #[cfg(test)]
+        {
+            self.calls.copy += 1;
+        }
+        dst.pos += src.len();
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -463,15 +823,22 @@ impl Code {
     /// Extract the run length of a compression order.
     fn extract_run_length(self, header: u8, src: &mut Buf<'_>) -> Result<usize, RleError> {
         match self {
-            Self::REGULAR_FGBG_IMAGE => extract_run_length_fg_bg(header, MASK_REGULAR_RUN_LENGTH, src),
-
-            Self::LITE_SET_FG_FGBG_IMAGE => extract_run_length_fg_bg(header, MASK_LITE_RUN_LENGTH, src),
-
-            Self::REGULAR_BG_RUN | Self::REGULAR_FG_RUN | Self::REGULAR_COLOR_RUN | Self::REGULAR_COLOR_IMAGE => {
-                extract_run_length_regular(header, src)
+            Self::REGULAR_FGBG_IMAGE => {
+                extract_run_length_fg_bg(header, MASK_REGULAR_RUN_LENGTH, src)
             }
 
-            Self::LITE_SET_FG_FG_RUN | Self::LITE_DITHERED_RUN => extract_run_length_lite(header, src),
+            Self::LITE_SET_FG_FGBG_IMAGE => {
+                extract_run_length_fg_bg(header, MASK_LITE_RUN_LENGTH, src)
+            }
+
+            Self::REGULAR_BG_RUN
+            | Self::REGULAR_FG_RUN
+            | Self::REGULAR_COLOR_RUN
+            | Self::REGULAR_COLOR_IMAGE => extract_run_length_regular(header, src),
+
+            Self::LITE_SET_FG_FG_RUN | Self::LITE_DITHERED_RUN => {
+                extract_run_length_lite(header, src)
+            }
 
             Self::MEGA_MEGA_BG_RUN
             | Self::MEGA_MEGA_FG_RUN
@@ -482,7 +849,10 @@ impl Code {
             | Self::MEGA_MEGA_SET_FGBG_IMAGE
             | Self::MEGA_MEGA_COLOR_IMAGE => extract_run_length_mega_mega(src),
 
-            Self::SPECIAL_FGBG_1 | Self::SPECIAL_FGBG_2 | Self::SPECIAL_WHITE | Self::SPECIAL_BLACK => Ok(0),
+            Self::SPECIAL_FGBG_1
+            | Self::SPECIAL_FGBG_2
+            | Self::SPECIAL_WHITE
+            | Self::SPECIAL_BLACK => Ok(0),
 
             _ => Ok(0),
         }
@@ -493,7 +863,11 @@ const MASK_REGULAR_RUN_LENGTH: u8 = 0x1F;
 const MASK_LITE_RUN_LENGTH: u8 = 0x0F;
 
 /// Extract the run length of a Foreground/Background Image Order.
-fn extract_run_length_fg_bg(header: u8, length_mask: u8, src: &mut Buf<'_>) -> Result<usize, RleError> {
+fn extract_run_length_fg_bg(
+    header: u8,
+    length_mask: u8,
+    src: &mut Buf<'_>,
+) -> Result<usize, RleError> {
     match header & length_mask {
         0 => {
             ensure_size!(from: src, size: 1);
@@ -546,7 +920,10 @@ struct Buf<'a> {
 
 impl<'a> Buf<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { inner: bytes, pos: 0 }
+        Self {
+            inner: bytes,
+            pos: 0,
+        }
     }
 
     fn remaining_len(&self) -> usize {
@@ -592,7 +969,10 @@ struct BufMut<'a> {
 
 impl<'a> BufMut<'a> {
     fn new(bytes: &'a mut [u8]) -> Self {
-        Self { inner: bytes, pos: 0 }
+        Self {
+            inner: bytes,
+            pos: 0,
+        }
     }
 
     fn remaining_len(&self) -> usize {
@@ -627,7 +1007,7 @@ impl<'a> BufMut<'a> {
 }
 
 trait DepthMode {
-    type Pixel: Copy + BitXor<Output = Self::Pixel>;
+    type Pixel: Copy + BitXor<Output = Self::Pixel> + Into<u32>;
 
     /// The color depth (in bytes per pixel) for this mode
     const COLOR_DEPTH: usize;
