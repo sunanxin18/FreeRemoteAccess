@@ -20,6 +20,7 @@ members = [
     "crates/frd-app",
     "crates/frd-protocol-apple",
     "crates/frd-protocol-rdp",
+    "crates/frd-rdp-legacy-kernels",
     "crates/frd-render-state",
     "crates/frd-render-gl",
     "crates/frd-render-wgpu",

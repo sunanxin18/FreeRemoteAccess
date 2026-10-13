@@ -1,0 +1,14 @@
+[package]
+name = "frd-rdp-legacy-kernels"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND BSD-3-Clause"
+description = "独立、受检查的 RemoteFX 原生 SIMD 数值叶子；尚未接入生产 decoder"
+
+[dev-dependencies]
+ironrdp-graphics = "=0.9.0"
+ironrdp-pdu = "=0.9.0"
+yuv = { version = "=0.8.17", features = ["rdp"] }
+sha2 = "0.10"
+ironrdp-session = "=0.11.0"
+libc = "0.2"

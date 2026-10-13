@@ -2087,6 +2087,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "frd-rdp-legacy-kernels"
+version = "0.1.0"
+dependencies = [
+ "ironrdp-graphics",
+ "ironrdp-pdu",
+ "ironrdp-session",
+ "libc",
+ "sha2 0.10.9",
+ "yuv",
+]
+
+[[package]]
 name = "frd-render-gl"
 version = "0.1.0"
 dependencies = [
