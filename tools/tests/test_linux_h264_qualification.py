@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,25 @@ spec.loader.exec_module(gate)
 
 
 class QualificationContracts(unittest.TestCase):
+    def test_exact_installed_aliases_preserve_generic_no_link_gate(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work).resolve()
+            attempt = root / 'build.ABC123'
+            lib = attempt / 'dist/usr/lib'
+            lib.mkdir(parents=True)
+            for name, concrete in [('libavutil.so.60', 'libavutil.so.60.26.102'),
+                                   ('libavcodec.so.62', 'libavcodec.so.62.28.102')]:
+                (lib / concrete).write_bytes(b'installed bytes')
+                (lib / name).symlink_to(concrete)
+                self.assertTrue(callable(getattr(gate, 'installed_library', None)),
+                                '缺少受限安装 SONAME 解析器')
+                identity = gate.installed_library(lib / name, attempt, root)
+                self.assertEqual(identity['alias']['path'], str(lib / name))
+                self.assertEqual(identity['alias']['readlink'], concrete)
+                self.assertEqual(identity['target']['path'], str(lib / concrete))
+                with self.assertRaises(ValueError):
+                    gate.safe_path(lib / name, root)
+
     def test_native_and_recipe_guard_precedes_output_creation(self):
         with tempfile.TemporaryDirectory() as work:
             absent = Path(work).resolve() / 'absent'
@@ -141,6 +161,343 @@ class QualificationContracts(unittest.TestCase):
             record = json.loads((Path(work).resolve() / 'qualification.json').read_text())
             self.assertEqual(record['commands'][0]['returncode'], 7)
             self.assertIn('failure preserved', (Path(work).resolve() / 'failure.log').read_text())
+
+
+class InstalledLibraryContracts(unittest.TestCase):
+    def setUp(self):
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.root = Path(self.work.name).resolve()
+        self.attempt = self.root / 'build.ABC123'
+        self.lib = self.attempt / 'dist/usr/lib'
+        self.lib.mkdir(parents=True)
+        self.util = self.lib / 'libavutil.so.60'
+        self.target = self.lib / 'libavutil.so.60.26.102'
+        self.codec = self.lib / 'libavcodec.so.62'
+        self.codec_target = self.lib / 'libavcodec.so.62.28.102'
+        self.target.write_bytes(b'util bytes')
+        self.codec_target.write_bytes(b'codec bytes')
+        self.util.symlink_to(self.target.name)
+        self.codec.symlink_to(self.codec_target.name)
+
+    def identities(self):
+        return {p.name: gate.installed_library(p, self.attempt, self.root)
+                for p in (self.util, self.codec)}
+
+    def test_rejects_absolute_path_bearing_wrong_version_chain_cycle_and_dangling_links(self):
+        chain = self.lib / 'chain'
+        chain.symlink_to(self.target.name)
+        for link in (str(self.target), './' + self.target.name, '../lib/' + self.target.name,
+                     'libavutil.so.60.99.102', 'chain', self.util.name, 'missing',
+                     '../escape', '../../../../../escape'):
+            with self.subTest(link=link):
+                self.util.unlink()
+                self.util.symlink_to(link)
+                with self.assertRaises(ValueError):
+                    gate.installed_library(self.util, self.attempt, self.root)
+
+    def test_fixed_target_must_be_regular_and_not_a_link_directory_fifo_or_missing(self):
+        self.target.unlink()
+        for kind in ('link', 'directory', 'fifo', 'missing'):
+            with self.subTest(kind=kind):
+                if kind == 'link':
+                    self.target.symlink_to(self.codec_target.name)
+                elif kind == 'directory':
+                    self.target.mkdir()
+                elif kind == 'fifo':
+                    os.mkfifo(self.target)
+                with self.assertRaises((ValueError, OSError)):
+                    gate.installed_library(self.util, self.attempt, self.root)
+                if self.target.is_dir():
+                    self.target.rmdir()
+                elif self.target.exists() or self.target.is_symlink():
+                    self.target.unlink()
+
+    def test_rejects_nonlink_alias_other_prefix_and_linked_ancestors(self):
+        self.util.unlink()
+        self.util.write_bytes(self.target.read_bytes())
+        with self.assertRaises(ValueError):
+            gate.installed_library(self.util, self.attempt, self.root)
+        self.util.unlink()
+        self.util.symlink_to(self.target.name)
+        other = self.root / 'build.OTHER/dist/usr/lib'
+        other.mkdir(parents=True)
+        (other / self.target.name).write_bytes(self.target.read_bytes())
+        (other / self.util.name).symlink_to(self.target.name)
+        for alias in (other / self.util.name, self.lib / 'unknown.so', self.target):
+            with self.subTest(alias=alias), self.assertRaises(ValueError):
+                gate.installed_library(alias, self.attempt, self.root)
+        original = self.attempt / 'dist/usr'
+        moved = self.attempt / 'dist/moved'
+        original.rename(moved)
+        original.symlink_to('moved', target_is_directory=True)
+        with self.assertRaises(ValueError):
+            gate.installed_library(self.util, self.attempt, self.root)
+
+    def test_source_and_bundle_aliases_remain_rejected(self):
+        for relative in ('source/ffmpeg-8.1.2/libavcodec/libavcodec.so.62',
+                         'bundle/linux-aarch64/libavutil.so.60'):
+            path = self.root / relative
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b'regular')
+            self.assertEqual(gate.safe_path(path, self.root), path)
+            path.unlink()
+            path.symlink_to(self.target)
+            with self.assertRaises(ValueError):
+                gate.safe_path(path, self.root)
+            with self.assertRaises(ValueError):
+                gate.installed_library(path, self.attempt, self.root)
+
+    def test_alias_and_same_byte_target_replacement_are_identity_changes(self):
+        mutations = ('util-bytes', 'target-replace', 'target-link', 'alias-recreate',
+                     'alias-readlink', 'alias-regular', 'codec-bytes', 'codec-replace',
+                     'codec-alias-recreate')
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as work:
+                root = Path(work).resolve()
+                attempt = root / 'build.TEST'
+                lib = attempt / 'dist/usr/lib'
+                shutil.copytree(self.lib, lib, symlinks=True)
+                before = {name: gate.installed_library(lib / name, attempt, root)
+                          for name in ('libavutil.so.60', 'libavcodec.so.62')}
+                alias = lib / ('libavcodec.so.62' if mutation.startswith('codec') else self.util.name)
+                target = lib / ('libavcodec.so.62.28.102' if mutation.startswith('codec') else self.target.name)
+                if mutation.endswith('bytes'):
+                    target.write_bytes(b'mutated')
+                elif mutation.endswith('replace'):
+                    replacement = lib / 'replacement'
+                    replacement.write_bytes(target.read_bytes())
+                    os.replace(replacement, target)
+                elif mutation == 'target-link':
+                    target.unlink()
+                    target.symlink_to(self.codec_target.name)
+                else:
+                    alias.unlink()
+                    if mutation.endswith('recreate'):
+                        alias.symlink_to(target.name)
+                    elif mutation == 'alias-readlink':
+                        alias.symlink_to(self.codec_target.name)
+                    else:
+                        alias.write_bytes(target.read_bytes())
+                with self.assertRaises((ValueError, OSError)):
+                    gate.assert_installed_unchanged(before, attempt, root)
+                failure = gate.installed_failure_snapshot(before, attempt, root)
+                self.assertTrue(failure[alias.name]['changed'])
+                self.assertEqual(before[alias.name]['alias']['readlink'], target.name)
+
+    def test_read_races_reject_target_replacement_alias_recreation_and_parent_replacement(self):
+        for kind in ('target', 'alias', 'directory'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as work:
+                root = Path(work).resolve()
+                attempt = root / 'build.RACE'
+                lib = attempt / 'dist/usr/lib'
+                shutil.copytree(self.lib, lib, symlinks=True)
+                real_open = gate.os.open
+                changed = False
+
+                def racing_open(path, flags, *args, **kwargs):
+                    nonlocal changed
+                    if path == self.target.name and not changed:
+                        changed = True
+                        if kind == 'target':
+                            replacement = lib / 'replacement'
+                            replacement.write_bytes((lib / self.target.name).read_bytes())
+                            os.replace(replacement, lib / self.target.name)
+                        elif kind == 'alias':
+                            (lib / self.util.name).unlink()
+                            (lib / self.util.name).symlink_to(self.target.name)
+                        else:
+                            moved = lib.parent / 'moved'
+                            lib.rename(moved)
+                            shutil.copytree(moved, lib, symlinks=True)
+                    return real_open(path, flags, *args, **kwargs)
+
+                with patch.object(gate.os, 'open', side_effect=racing_open), \
+                     self.assertRaises(ValueError):
+                    gate.installed_library(lib / self.util.name, attempt, root)
+
+    def test_ldd_requires_exact_lexical_soname_then_binds_target(self):
+        before = self.identities()
+        good = f'\tlibavutil.so.60 => {self.util} (0x0000)\n\tlibc.so.6 => /lib/libc.so.6 (0x1000)\n'
+        binding = gate.ldd_binding(good, before, self.attempt, self.root)
+        self.assertEqual(binding['lexical_path'], str(self.util))
+        self.assertEqual(binding['canonical_path'], str(self.target))
+        alternate = self.lib / 'same-bytes'
+        alternate.symlink_to(self.target.name)
+        for output in (good.replace(str(self.util), str(self.target)),
+                       good.replace(str(self.util), str(alternate)),
+                       good.replace(str(self.util), '/lib/libavutil.so.60'),
+                       good + good.splitlines()[0] + '\n',
+                       'libavutil.so.60 => not found\n', good + 'another => not found\n',
+                       good.replace('libavutil.so.60 =>', 'libavutil.so.60')):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                gate.ldd_binding(output, before, self.attempt, self.root)
+        self.util.unlink()
+        self.util.symlink_to(self.target.name)
+        with self.assertRaises(ValueError):
+            gate.ldd_binding(good, before, self.attempt, self.root)
+
+    def test_numeric_canonical_input_keys_match_real_resolved_paths(self):
+        installed = self.identities()
+        obj = self.root / 'shipping.o'
+        obj.write_bytes(b'object')
+        paths = gate.numeric_input_paths([obj], installed)
+        self.assertEqual(paths, [obj, self.target])
+        before = gate.snapshot(paths)
+        # 原 runner 的输入键使用 resolve；这里实际解析真实 symlink 与普通文件。
+        actual = {str(path.resolve()): gate.digest(path.resolve()) for path in paths}
+        gate.validate_numeric_inputs({'inputs': actual}, paths, before)
+        for wrong in ({str(obj): actual[str(obj)], str(self.util): actual[str(self.target)]},
+                      {str(obj): actual[str(obj)], str(self.lib / 'libavutil.so.60.99.102'): actual[str(self.target)]},
+                      dict(actual, **{str(self.target): '0' * 64})):
+            with self.subTest(wrong=wrong), self.assertRaises(ValueError):
+                gate.validate_numeric_inputs({'inputs': wrong}, paths, before)
+
+
+class QualificationPhaseContracts(unittest.TestCase):
+    def run_contract(self, work, mutation_phase=None, failure_phase=None):
+        """外部构建/目标运行的合同替身；真实文件身份与 qualify 控制流，不是 native 验证。"""
+        root = Path(work).resolve() / 'fresh'
+        archive = Path(work).resolve() / 'archive'
+        archive.write_bytes(b'archive')
+        attempt = root / 'build.TEST'
+        src = attempt / 'source/ffmpeg-8.1.2'
+        lib = attempt / 'dist/usr/lib'
+        util = lib / 'libavutil.so.60'
+        util_target = lib / 'libavutil.so.60.26.102'
+        codec_target = lib / 'libavcodec.so.62.28.102'
+        kernel = {'fixture': 'contract-only'}
+        config = {'args': []}
+        adapter = SimpleNamespace(FIXED_ARGS=[], HELPERS=[], verify_bundle=lambda *args: None,
+                                  kernel_identity=lambda path: kernel)
+        source_api = SimpleNamespace(recipes=SimpleNamespace(ARCHIVE_SHA=gate.digest(archive),
+            trusted=lambda: {'kernel': kernel, 'files': {}, 'unchanged_oracle': {}}))
+        benchmark = ('benchmark C: warmup=65536 measured_calls=8126464 batches=31 ns/call '
+                     'median=6.039 p95=60.306 max=70.000 checksum=6170d61369b74c40\n'
+                     'benchmark NEON: warmup=65536 measured_calls=8126464 batches=31 ns/call '
+                     'median=4.761 p95=65.165 max=75.000 checksum=6170d61369b74c40\n')
+
+        def run(evidence, label, argv, **kwargs):
+            evidence.record['commands'].append({'label': label, 'argv': [str(p) for p in argv],
+                                                'contract_double': True})
+            if label == 'builder':
+                lib.mkdir(parents=True)
+                util_target.write_bytes(b'util')
+                codec_target.write_bytes(b'codec')
+                util.symlink_to(util_target.name)
+                (lib / 'libavcodec.so.62').symlink_to(codec_target.name)
+                for name in gate.OBJECTS + ('libavcodec/libavcodec.so.62', 'config.h', 'ffbuild/config.mak'):
+                    path = src / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'source fixture')
+                (attempt / 'configuration.json').write_text(json.dumps(config))
+                (attempt / 'kernel.json').write_text(json.dumps(kernel))
+                bundle = root / 'bundle/linux-aarch64'
+                bundle.mkdir(parents=True)
+                outputs = {}
+                for name, target in [('libavutil.so.60', util_target), ('libavcodec.so.62', codec_target)]:
+                    shutil.copyfile(target, bundle / name)
+                    outputs[name] = gate.digest(target)
+                record = {'configuration': config, 'kernel': kernel, 'source': {}, 'source_asset': {},
+                          'outputs': outputs, 'inputs': {name: gate.digest(src / name)
+                            for name in ('config.h', 'ffbuild/config.mak')}}
+                record['inputs']['unstripped_libavcodec'] = gate.digest(src / 'libavcodec/libavcodec.so.62')
+                (bundle / 'FFmpeg-PROVENANCE.json').write_text(json.dumps(record))
+                output = (f'Linux FFmpeg retained configured attempt: {attempt}\n'
+                          f'Linux FFmpeg retained shipping source: {src}\n')
+            elif label == 'prepare-upstream':
+                original = root / 'upstream/ffmpeg-8.1.2'
+                original.mkdir(parents=True)
+                output = str(original)
+            elif label == 'numeric':
+                out = root / 'runtime-evidence/numeric'
+                out.mkdir()
+                for name in ('h264-luma-dc-parity', 'baseline-init.o', 'parity.o', 'abi.o'):
+                    (out / name).write_bytes(b'contract executable, not native')
+                paths = [Path(argv[i + 1]) for i, value in enumerate(argv) if value == '--object']
+                inputs = {str(path.resolve()): gate.digest(path.resolve()) for path in paths}
+                (out / 'results.json').write_text(json.dumps({'status': 'passed', 'mode': 'parity',
+                    'target': 'aarch64-linux-gnu', 'inputs': inputs, 'contract_double': True}))
+                output = 'PASS parity cases=5974518\ndispatch: 30 contexts\nguard pages; AArch64 ABI sentinels\n'
+            elif label == 'runtime-dependencies':
+                output = f'libavutil.so.60 => {util} (0x0000)\n'
+            elif label.startswith('benchmark-'):
+                output = benchmark
+            else:
+                output = ''
+            (evidence.path / (label + '.log')).write_text(output)
+            if label == mutation_phase:
+                replacement = lib / 'replacement'
+                replacement.write_bytes(codec_target.read_bytes())
+                os.replace(replacement, codec_target)
+            if label == failure_phase:
+                # 初始错误必须在 finally 中保留；alias 本体也进入失败记录。
+                util.unlink()
+                util.write_bytes(b'replaced alias')
+                raise ValueError('initial external failure')
+            evidence.save()
+            return output
+
+        with patch.object(gate, 'module', return_value=adapter), \
+             patch.object(gate, 'object_identity'), patch.object(gate.Evidence, 'run', run):
+            status = gate.qualify(root, archive, source_api)
+        record = json.loads((root / 'runtime-evidence/qualification.json').read_text())
+        return status, record, util_target, codec_target
+
+    def test_phase_checks_cover_numeric_ldd_three_windows_and_final(self):
+        with tempfile.TemporaryDirectory() as work:
+            status, record, util, codec = self.run_contract(work)
+            self.assertEqual(status, 0)  # 仅控制流替身状态，record 明确标注 contract_double。
+            self.assertEqual([row['label'] for row in record['identity_checks']],
+                             ['before-numeric', 'before-ldd', 'after-ldd',
+                              'before-benchmark-1', 'before-benchmark-2', 'before-benchmark-3', 'final'])
+            self.assertTrue(all(row['status'] == 'passed' for row in record['identity_checks']))
+            self.assertIn(str(codec), record['inputs_before'])
+            self.assertEqual(record['installed_libraries_before'], record['installed_libraries_after'])
+            numeric = next(c for c in record['commands'] if c['label'] == 'numeric')
+            inputs = [numeric['argv'][i + 1] for i, v in enumerate(numeric['argv']) if v == '--object']
+            self.assertEqual(inputs[-1], str(util))
+            self.assertEqual(len(inputs), 7)
+
+    def test_codec_only_replacement_fails_each_window_and_final_without_benchmark_retry(self):
+        phases = [('prepare-upstream', 'before-numeric'), ('numeric', 'before-ldd'),
+                  ('runtime-dependencies', 'after-ldd'), ('quiet-1', 'before-benchmark-1'),
+                  ('quiet-2', 'before-benchmark-2'), ('quiet-3', 'before-benchmark-3'),
+                  ('benchmark-1', 'before-benchmark-2'), ('benchmark-2', 'before-benchmark-3'),
+                  ('benchmark-3', 'final')]
+        for mutate, reject in phases:
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as work:
+                status, record, _, _ = self.run_contract(work, mutation_phase=mutate)
+                self.assertEqual(status, 1)
+                self.assertEqual(record['status'], 'failed')
+                checks = {row['label']: row for row in record['identity_checks']}
+                self.assertEqual(checks[reject]['status'], 'failed')
+                self.assertTrue(record['installed_libraries_after_failure']['libavcodec.so.62']['changed'])
+                self.assertEqual(sum(c['label'] == 'builder' for c in record['commands']), 1)
+                for number in (1, 2, 3):
+                    self.assertLessEqual(sum(c['label'] == f'benchmark-{number}' for c in record['commands']), 1)
+
+    def test_finally_preserves_initial_error_alias_stat_and_original_target_hash(self):
+        with tempfile.TemporaryDirectory() as work:
+            status, record, _, _ = self.run_contract(work, failure_phase='numeric')
+            self.assertEqual(status, 1)
+            self.assertEqual(record['error'], 'initial external failure')
+            self.assertEqual(record['status'], 'failed')
+            before = record['installed_libraries_before']['libavutil.so.60']
+            self.assertEqual(before['alias']['readlink'], 'libavutil.so.60.26.102')
+            self.assertEqual(len(before['target']['sha256']), 64)
+            after = record['installed_libraries_after_failure']['libavutil.so.60']
+            self.assertTrue(after['changed'])
+            self.assertIn('stat', after['alias'])
+            self.assertIn('inputs_after_failure', record)
+
+    def test_builder_failure_is_single_attempt_and_terminal_without_identity_baseline(self):
+        with tempfile.TemporaryDirectory() as work:
+            status, record, _, _ = self.run_contract(work, failure_phase='builder')
+            self.assertEqual(status, 1)
+            self.assertEqual(record['error'], 'initial external failure')
+            self.assertEqual([c['label'] for c in record['commands']], ['builder'])
+            self.assertNotIn('installed_libraries_before', record)
 
 
 if __name__ == '__main__':

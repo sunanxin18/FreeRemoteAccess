@@ -21,6 +21,9 @@ OBJECTS = ('libavcodec/h264dsp.o', 'libavcodec/h264idct.o',
            'libavcodec/aarch64/h264dsp_init_aarch64.o',
            'libavcodec/aarch64/h264dsp_neon.o',
            'libavcodec/aarch64/h264idct_neon.o', 'libavcodec/startcode.o')
+# 固定 FFmpeg 8.1.2 安装名；不从调用者或 provenance 推导链接信任。
+INSTALLED_LIBRARIES = {'libavutil.so.60': 'libavutil.so.60.26.102',
+                       'libavcodec.so.62': 'libavcodec.so.62.28.102'}
 
 
 def require(ok, message):
@@ -57,6 +60,129 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             result.update(chunk)
     return result.hexdigest()
+
+
+def stat_identity(value):
+    return {name: getattr(value, 'st_' + name) for name in
+            ('dev', 'ino', 'mode', 'size', 'mtime_ns', 'ctime_ns', 'uid', 'gid', 'nlink')}
+
+
+def directory_identity(value):
+    # 祖先中的无关目录项创建不会改变目录本体；仍检测替换、类型和权限变化。
+    return {name: getattr(value, 'st_' + name) for name in ('dev', 'ino', 'mode', 'uid', 'gid')}
+
+
+def installed_library(alias, attempt, root):
+    """唯一链接例外：本次安装目录的两个固定单层 SONAME 叶子别名。"""
+    root = Path(os.path.abspath(root))
+    attempt = safe_path(attempt, root, 'dir')
+    require(attempt.parent == root and re.fullmatch(r'build\.[A-Za-z0-9]+', attempt.name),
+            '安装库 attempt 不属于本次隔离根')
+    directory = safe_path(attempt / 'dist/usr/lib', root, 'dir')
+    alias = Path(os.path.abspath(alias))
+    require(alias.parent == directory and alias.name in INSTALLED_LIBRARIES,
+            '安装库别名不属于精确 prefix')
+    directories = {str(p): directory_identity(p.stat()) for p in (directory, *directory.parents)}
+    alias_stat = stat_identity(alias.lstat())
+    require(stat.S_ISLNK(alias_stat['mode']), '安装 SONAME 必须为 symlink 叶子')
+    link = os.readlink(alias)
+    require(link == INSTALLED_LIBRARIES[alias.name], '安装 SONAME readlink 不匹配固定 basename')
+    target = safe_path(directory / link, root)
+    target_stat = stat_identity(target.stat())
+    require(stat.S_ISREG(target_stat['mode']), '安装目标必须为普通文件')
+    # 目录 fd 固定读取位置；O_NOFOLLOW 防止最后一刻换成链接，fstat 检测同字节替换。
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        require(directory_identity(os.fstat(directory_fd)) == directories[str(directory)], '安装目录身份改变')
+        require(stat_identity(os.stat(alias.name, dir_fd=directory_fd, follow_symlinks=False)) == alias_stat
+                and os.readlink(alias.name, dir_fd=directory_fd) == link, '安装别名读取前身份改变')
+        fd = os.open(link, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        with os.fdopen(fd, 'rb') as stream:
+            require(stat_identity(os.fstat(stream.fileno())) == target_stat, '安装目标读取前身份改变')
+            result = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                result.update(chunk)
+            require(stat_identity(os.fstat(stream.fileno())) == target_stat, '安装目标读取期间身份改变')
+        require(stat_identity(os.stat(alias.name, dir_fd=directory_fd, follow_symlinks=False)) == alias_stat
+                and os.readlink(alias.name, dir_fd=directory_fd) == link, '安装别名读取期间身份改变')
+        require(directory_identity(os.fstat(directory_fd)) == directories[str(directory)], '安装目录读取期间身份改变')
+    finally:
+        os.close(directory_fd)
+    safe_path(directory, root, 'dir')
+    safe_path(target, root)
+    require({str(p): directory_identity(p.stat()) for p in (directory, *directory.parents)} == directories,
+            '安装路径祖先身份改变')
+    require(stat_identity(alias.lstat()) == alias_stat and os.readlink(alias) == link,
+            '安装别名读取后身份改变')
+    require(stat_identity(target.stat()) == target_stat, '安装目标读取后身份改变')
+    return {'alias': {'path': str(alias), 'readlink': link, 'stat': alias_stat},
+            'target': {'path': str(target), 'stat': target_stat, 'sha256': result.hexdigest()},
+            'directories': directories}
+
+
+def assert_installed_unchanged(before, attempt, root):
+    after = {name: installed_library(Path(value['alias']['path']), attempt, root)
+             for name, value in before.items()}
+    require(after == before, '资格检查期间安装库 alias/target 身份发生改变')
+    return after
+
+
+def check_inputs(evidence, label, before, installed, attempt, root):
+    item = {'label': label, 'status': 'failed'}
+    evidence.record.setdefault('identity_checks', []).append(item)
+    try:
+        aliases = assert_installed_unchanged(installed, attempt, root)
+        regular = assert_unchanged(before)
+        item['status'] = 'passed'
+        return regular, aliases
+    except (ValueError, OSError) as error:
+        item['error'] = str(error)
+        raise
+    finally:
+        evidence.save()
+
+
+def numeric_input_paths(objects, installed):
+    return objects + [Path(installed['libavutil.so.60']['target']['path'])]
+
+
+def validate_numeric_inputs(result, paths, before):
+    require(all(result['inputs'].get(str(path)) == before[str(path)] for path in paths),
+            '原数值 runner 实际输入不是本次 shipping 对象/库')
+
+
+def ldd_binding(output, installed, attempt, root):
+    lines = re.findall(r'^\s*libavutil\.so\.60(?:\s|$).*$', output, re.M)
+    entries = re.findall(r'^\s*libavutil\.so\.60 => (\S+) \([^\n]*\)\s*$', output, re.M)
+    value = installed['libavutil.so.60']
+    require(len(lines) == 1 and entries == [value['alias']['path']] and 'not found' not in output,
+            '运行 avutil 解析不匹配同 prefix SONAME')
+    bound = installed_library(Path(entries[0]), attempt, root)
+    require(bound == value, '运行 avutil alias/target 身份改变')
+    return {'soname': 'libavutil.so.60', 'lexical_path': entries[0],
+            'canonical_path': bound['target']['path'], 'sha256': bound['target']['sha256']}
+
+
+def installed_failure_snapshot(before, attempt, root):
+    """只记录安全重新验证结果；失败路径另存 lstat/readlink，不读取不可信目标。"""
+    after = {}
+    for name, value in before.items():
+        try:
+            current = installed_library(Path(value['alias']['path']), attempt, root)
+            after[name] = {'identity': current, 'changed': current != value}
+        except (ValueError, OSError) as error:
+            item = {'error': str(error), 'changed': True}
+            for kind in ('alias', 'target'):
+                path = Path(value[kind]['path'])
+                try:
+                    info = path.lstat()
+                    item[kind] = {'path': str(path), 'stat': stat_identity(info)}
+                    if stat.S_ISLNK(info.st_mode):
+                        item[kind]['readlink'] = os.readlink(path)
+                except OSError as stat_error:
+                    item[kind] = {'path': str(path), 'error': str(stat_error)}
+            after[name] = item
+    return after
 
 
 def preflight(env):
@@ -224,13 +350,17 @@ def qualify(root, archive, source_api):
         'FRD_FFMPEG_KEEP_BUILD', 'FRD_FFMPEG_ARCHIVE', 'FRD_FFMPEG_SOURCE_RECIPE',
         'FRD_FFMPEG_ARCH', 'FRD_CARGO_TARGET', 'LD_LIBRARY_PATH')}
     before = None
+    installed = {}
+    attempt = None
     try:
         # builder 内插件/native main444 夹具只执行一次；失败不重试/回退。
         output = evidence.run('builder', ['bash', '-x', REPO / 'tools/build-ffmpeg-linux.sh'], timeout=4200)
         attempt, src = retained_paths(output, root)
         bundle = safe_path(root / 'bundle/linux-aarch64', root, 'dir')
         prefix = safe_path(attempt / 'dist/usr', root, 'dir')
-        library = safe_path(prefix / 'lib/libavutil.so.60', root)
+        for name in INSTALLED_LIBRARIES:
+            installed[name] = installed_library(prefix / 'lib' / name, attempt, root)
+        evidence.record['installed_libraries_before'] = installed
         adapter = module('linux-ffmpeg-bundle')
         adapter.verify_bundle(bundle, 'linux-aarch64', RECIPE)
         record = json.loads(safe_path(bundle / 'FFmpeg-PROVENANCE.json', root).read_text())
@@ -246,7 +376,7 @@ def qualify(root, archive, source_api):
         require(digest(src / 'libavcodec/libavcodec.so.62') == record['inputs']['unstripped_libavcodec'],
                 '未 strip 库身份不匹配')
         for name in ('libavcodec.so.62', 'libavutil.so.60'):
-            require(digest(safe_path(prefix / 'lib' / name, root)) == record['outputs'][name],
+            require(installed[name]['target']['sha256'] == record['outputs'][name],
                     '实际 prefix 与 bundle 库身份不匹配')
         objects = [safe_path(src / name, root) for name in OBJECTS]
         pin = source_api.recipes.trusted()
@@ -267,7 +397,8 @@ def qualify(root, archive, source_api):
             require(digest(safe_path(original / name, root)) == hashes['pre'], '独立源码 preimage 不匹配')
         for name, expected in pin['unchanged_oracle'].items():
             require(digest(safe_path(original / name, root)) == expected, '独立 C oracle 不匹配')
-        inputs = objects + [library, archive, src / 'libavcodec/libavcodec.so.62',
+        inputs = objects + [Path(v['target']['path']) for v in installed.values()]
+        inputs += [archive, src / 'libavcodec/libavcodec.so.62',
                            src / 'config.h', src / 'ffbuild/config.mak',
                            attempt / 'configuration.json', attempt / 'kernel.json']
         inputs += [src / name for name in set(pin['files']) | set(pin['unchanged_oracle'])]
@@ -288,25 +419,27 @@ def qualify(root, archive, source_api):
         argv = [sys.executable, '-B', REPO / 'tools/verify-ffmpeg-h264-dc.py',
                 '--target', 'aarch64-linux-gnu', '--execute', '--source', src,
                 '--upstream-source', original, '--output', numeric, '--cc', 'clang']
-        for obj in objects:
+        numeric_paths = numeric_input_paths(objects, installed)
+        for obj in numeric_paths:
             argv += ['--object', obj]
         # runner 的 --object 为直接链接输入；加入此同 prefix DSO 使原 results.json 也记录其 hash。
-        argv += ['--object', library, '--ldflag=-Wl,-rpath,' + str(prefix / 'lib')]
+        argv += ['--ldflag=-Wl,-rpath,' + str(prefix / 'lib')]
         evidence.record['runtime_environment'] = {'LD_LIBRARY_PATH': runtime_env['LD_LIBRARY_PATH'],
                                                  'compiler': 'clang', 'default_cflags': ['-O3', '-std=c11', '-D_GNU_SOURCE']}
+        check_inputs(evidence, 'before-numeric', before, installed, attempt, root)
         numeric_output = evidence.run('numeric', argv, timeout=180, env=runtime_env)
         result = json.loads(safe_path(numeric / 'results.json', root).read_text())
         require(result.get('status') == 'passed' and result.get('mode') == 'parity' and
                 result.get('target') == 'aarch64-linux-gnu', '原数值 runner 没有原生成功证据')
-        require(all(result['inputs'].get(str(path)) == before[str(path)] for path in objects + [library]),
-                '原数值 runner 实际输入不是本次 shipping 对象/库')
+        validate_numeric_inputs(result, numeric_paths, before)
         require('PASS parity cases=5974518' in numeric_output and 'dispatch: 30 contexts' in numeric_output and
                 'guard pages; AArch64 ABI sentinels' in numeric_output, '数值/分派/内存/ABI 输出不完整')
         exe = safe_path(numeric / 'h264-luma-dc-parity', root)
         # 动态加载解析必须定位到本次 prefix，不能使用另一缓存或系统 avutil。
+        check_inputs(evidence, 'before-ldd', before, installed, attempt, root)
         dependencies = evidence.run('runtime-dependencies', ['/usr/bin/ldd', exe], env=runtime_env)
-        avutil = re.findall(r'^\s*libavutil\.so\.60 => (.+) \(', dependencies, re.M)
-        require(avutil == [str(library)] and 'not found' not in dependencies, '运行 avutil 解析不匹配同 prefix')
+        evidence.record['runtime_avutil_binding'] = ldd_binding(dependencies, installed, attempt, root)
+        check_inputs(evidence, 'after-ldd', before, installed, attempt, root)
         evidence.record['numeric_results_sha256'] = digest(numeric / 'results.json')
         private_inputs = [exe, numeric / 'baseline-init.o', numeric / 'parity.o', numeric / 'abi.o']
         before.update(snapshot(private_inputs))
@@ -317,8 +450,8 @@ def qualify(root, archive, source_api):
             item = {'window': window, 'status': 'failed', 'executable_sha256': digest(exe)}
             evidence.record['benchmarks'].append(item)
             try:
-                assert_unchanged(before)
                 evidence.quiet(f'quiet-{window}')
+                check_inputs(evidence, f'before-benchmark-{window}', before, installed, attempt, root)
                 output = evidence.run(label, [exe, '--benchmark'], timeout=60, env=runtime_env)
                 item.update(status='passed', results=benchmark_result(output))
             except (ValueError, OSError, subprocess.TimeoutExpired) as error:
@@ -330,7 +463,9 @@ def qualify(root, archive, source_api):
         require(not benchmark_errors, '基准窗口失败：' + '; '.join(benchmark_errors))
         checksums = {r['results'][k]['checksum'] for r in evidence.record['benchmarks'] for k in ('C', 'NEON')}
         require(len(checksums) == 1, '三个窗口 checksum 不一致')
-        evidence.record['inputs_after'] = assert_unchanged(before)
+        regular_after, installed_after = check_inputs(evidence, 'final', before, installed, attempt, root)
+        evidence.record['inputs_after'] = regular_after
+        evidence.record['installed_libraries_after'] = installed_after
         evidence.record['status'] = 'passed'
         evidence.record['scope'] = 'native Linux ARM64 single H264 luma DC kernel; bounded CI-host measurements'
         return 0
@@ -339,6 +474,9 @@ def qualify(root, archive, source_api):
         print(str(error), file=sys.stderr)
         return 1
     finally:
+        if installed and 'installed_libraries_after' not in evidence.record:
+            evidence.record['installed_libraries_before'] = installed
+            evidence.record['installed_libraries_after_failure'] = installed_failure_snapshot(installed, attempt, root)
         if before is not None and 'inputs_after' not in evidence.record:
             # 输入消失/变为 symlink 也必须保留失败状态，不能在 finally 再抛错遮住日志。
             after_failure = {}
