@@ -49,3 +49,13 @@ root下载该run实际诊断artifact并用当前受信bundle verifier重验：�
 同冻结提交的默认 upstream [Linux run 38461632726](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38461632726) 三架构完整流程成功，通用 [CI run 38461632276](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38461632276) 格式与 Ubuntu/macOS 编译及安全测试成功。它们不证明显式修改配方通过，也不包含后续 RDP adapter 工作树改动。
 
 `6d6cce0` 的后续两文件编译器修复已独立审查 Approved：先要求原 provenance hash绑定的配置中有唯一精确`CC=gcc`，再固定传入`--cc gcc`；版本、C/ABI编译、链接与执行的六条实际记录必须吻合原runner，并保留最初配置hash贯穿prepare、numeric、三个基准窗口及失败finally。30项本机合同通过，包含真实保留配置读取；模拟阶段明确为contract_double。原FFmpeg源码/配置/数学/ABI夹具及同shipping对象选择未改。修复后的真实GNU编译、数值/ABI/基准和完整修改包仍待新冻结CI结果。
+
+## GCC 修复后的原生资格与完整修改包通过
+
+冻结 `6e075c48b5f47965af7c38123b95324e53196daf` 的显式修改配方 [run 38467007932](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38467007932)、job `115543695006` 已成功结束。原生 Linux ARM64 / GCC 13.3 / glibc 2.39 上，同一次 builder 的六个生产对象和已绑定 avutil 执行原 C oracle：5,974,518 组数值、30 种 CPU/位深/色度分派、未对齐、别名、保护页和 AArch64 ABI 哨兵全部通过。真实六条版本/编译/链接/执行记录均返回0；完整配置、工具和对象身份贯穿测试及三个基准窗口，七次检查均通过。
+
+三轮预先固定的微基准各实现每 backend 65,536 次 warmup、31×262,144 次测量；原 C 与 NEON checksum 一致。C 中位数为 19.584 / 19.516 / 18.795 ns，NEON 为 15.251 / 15.253 / 15.331 ns，同窗口约快 1.23–1.28 倍。这只描述该单核在 CI 主机上的有界测量，不代表整个 H.264 decoder 或远程桌面提速。
+
+实际 builder 的插件12项、精确解码 fixture 6项通过；完整修改配方客户端包生成、静态验证及 Linux 目标进程解码器装载均通过。最终三库、provenance 和配方文件与 qualification 的 bundle 相同。Root 下载 runtime-evidence artifact `11851302358`（80,855,735 bytes，ZIP SHA256 `5cadc8152487ffa0cb919f9e6c7ebb21090a637239265059f49eedbd66fd1618`）和完整客户端 artifact `11850729802`，核对 GitHub 提供的 digest/精确 head，并逐一重验43个保留输入 hash、前后身份、数值记录与三个窗口。下载三库的固定276字节核仍为原 pin，来源ZIP与受信材料校验通过；客户端 ELF64 AArch64 与 interpreter 另以官方 LLVM 工具静态检查。完整 Linux package verifier及装载实际执行证据属于原生 CI；Mac 未执行 Linux 代码，亦未将本机缺少 readelf/desktop-file-validate 的直接 verifier 调用记为通过。
+
+所有结果和390,966-byte完整job日志保存在 `target/ci-h264-linux-gcc-20261014/`。本门关闭前两轮真实失败对应的安装别名及编译器问题；默认仍为 upstream，完整 H264/HEVC 资格、Windows 新配方与真实远端互操作仍未完成。

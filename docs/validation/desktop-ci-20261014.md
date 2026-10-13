@@ -18,3 +18,9 @@ Mac/GTK/GL/Linux每条成功范围以对应工作流的实际步骤为边界；h
 单独显式修改配方 [Linux38452572725](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38452572725) **失败**：native builder/bundle与6项解码fixture已通过，但qualification误拒正常SONAME安装别名，未执行到同对象数值/ABI/基准及完整修改包。默认upstream三架构成功不能替代此失败门，详见[Linux专项记录](linux-h264-recipe-20261014.md)。Windows修改配方也尚未实现。
 
 匹配状态、artifact索引、失败artifact、专项日志与完整Windows ARM64 native日志保存在 `target/ci-h264-linux-20261014/`。没有改默认GH账号、remote、系统签名配置或服务器，也没有在这些运行中输入真实远端账号密码。
+
+## 后续冻结 6e075c4 托管回归
+
+2026-10-14重新观察同一批实际运行，全部成功结束：Windows `38467005504` 三架构包、macOS ARM64 `38467005270`、默认 upstream Linux 三架构 `38467005318`、GTK 三架构 `38467005498` 与通用 CI `38467005418`。各 run 的 head 均为 `6e075c48b5f47965af7c38123b95324e53196daf`；本轮没有新触发 GL workflow，不将历史 GL 证据记作该 head 的回归。
+
+Windows ARM64 原生 job `115550527102` 完整149,424-byte日志保存于 `target/ci-h264-linux-gcc-20261014/windows-native-job.log`：原生 Rust 1.96 / `aarch64-pc-windows-msvc` 加载同 run 下载的 upstream 包，Main444 fixture 6项、ClearCodec/NSCodec 39项与独立运行的2项基准、Progressive 61项与独立运行的1项基准全部通过。该 head 尚不含 `2015400` 的 native factory 策略或 Windows 新 kernel helper；不能作为后续源码的验证。Linux 显式修改配方 `38467007932` 的独立成功范围见[专项记录](linux-h264-recipe-20261014.md)。
