@@ -77,15 +77,80 @@ pub struct InputAdapter {
     focused: bool,
     foreground: bool,
     remote_owned: bool,
-    blocked_until_release: bool,
+    quarantined_keys: std::collections::BTreeSet<u16>,
+    quarantined_buttons: bool,
+    owned_epoch: Option<(u64, u64, u64)>,
+    last_pointer: Option<PixelPoint>,
     held_keys: std::collections::BTreeSet<u16>,
     held_buttons: frd_core::PointerButtons,
 }
 impl InputAdapter {
     // 必须在 controller epoch 仍有效时调用；即使 ledger 未见按下，也释放协议侧状态。
     pub fn release(&mut self, c: &AppController) -> Option<SessionCommand> {
-        self.blocked_until_release = true;
+        self.quarantine_owned();
         c.route_input(InputEvent::ReleaseAll)
+    }
+    fn quarantine_owned(&mut self) {
+        self.quarantined_keys.append(&mut self.held_keys);
+        self.quarantined_buttons |= self.held_buttons.any_pressed();
+        self.held_buttons = frd_core::PointerButtons::default();
+        self.last_pointer = None;
+    }
+    pub fn pointer(
+        &mut self,
+        c: &AppController,
+        session: u64,
+        generation: u64,
+        revision: u64,
+        x: f32,
+        y: f32,
+        buttons: frd_core::PointerButtons,
+        wheel: frd_core::WheelDelta,
+    ) -> Option<SessionCommand> {
+        if revision != self.revision
+            || c.interactive_input_epoch().map(|(s, g)| (s.get(), g)) != Some((session, generation))
+        {
+            return None;
+        }
+        if let Some(remote) = self.viewport().and_then(|v| v.map(x, y)) {
+            let command = self.route(
+                c,
+                session,
+                generation,
+                revision,
+                InputEvent::PointerSample(frd_core::PointerSample::new(remote, buttons, wheel)),
+                buttons.any_pressed(),
+            );
+            if command.is_some() {
+                self.last_pointer = Some(remote);
+            }
+            return command;
+        }
+        // 坐标在 letterbox/clip 外也必须处理释放；绝不把越界移动变成新的按下。
+        if !buttons.any_pressed() {
+            self.quarantined_buttons = false;
+        }
+        if self.held_buttons.any_pressed() && buttons != self.held_buttons {
+            let release_buttons = frd_core::PointerButtons {
+                primary: self.held_buttons.primary && buttons.primary,
+                middle: self.held_buttons.middle && buttons.middle,
+                secondary: self.held_buttons.secondary && buttons.secondary,
+            };
+            let remote = self.last_pointer?;
+            return self.route(
+                c,
+                session,
+                generation,
+                revision,
+                InputEvent::PointerSample(frd_core::PointerSample::new(
+                    remote,
+                    release_buttons,
+                    frd_core::WheelDelta::default(),
+                )),
+                release_buttons.any_pressed(),
+            );
+        }
+        None
     }
     pub fn focus(
         &mut self,
@@ -121,7 +186,7 @@ impl InputAdapter {
         generation: u64,
         revision: u64,
         event: InputEvent,
-        pressed: bool,
+        _pressed: bool,
     ) -> Option<SessionCommand> {
         if revision != self.revision
             || c.interactive_input_epoch().map(|(s, g)| (s.get(), g)) != Some((session, generation))
@@ -129,25 +194,47 @@ impl InputAdapter {
         {
             return None;
         }
+        let epoch = (session, generation, revision);
+        if self.owned_epoch != Some(epoch) {
+            self.quarantine_owned();
+            self.owned_epoch = Some(epoch);
+        }
+        let enabled = self.foreground && self.focused && self.remote_owned;
         match &event {
             InputEvent::PhysicalKey { code, state, .. } => {
-                if *state == frd_core::KeyState::Pressed {
-                    self.held_keys.insert(code.usb_hid_usage());
+                let code = code.usb_hid_usage();
+                if *state == frd_core::KeyState::Released {
+                    self.held_keys.remove(&code);
+                    if self.quarantined_keys.remove(&code) {
+                        return None;
+                    }
                 } else {
-                    self.held_keys.remove(&code.usb_hid_usage());
+                    // 旧物理按键的重复不重放；只隔离该键，不阻塞其他键/文本/指针。
+                    if !enabled {
+                        self.quarantined_keys.insert(code);
+                        return None;
+                    }
+                    if self.quarantined_keys.contains(&code) {
+                        return None;
+                    }
+                    self.held_keys.insert(code);
                 }
             }
-            InputEvent::PointerSample(sample) => self.held_buttons = sample.buttons,
+            InputEvent::PointerSample(sample) => {
+                if self.quarantined_buttons {
+                    self.quarantined_buttons = sample.buttons.any_pressed();
+                    return None;
+                }
+                if !enabled {
+                    self.quarantined_buttons |= sample.buttons.any_pressed();
+                    return None;
+                }
+                self.held_buttons = sample.buttons;
+            }
+            InputEvent::ReleaseAll => self.quarantine_owned(),
             _ => {}
         }
-        // 已进入本地控件仍观察释放，避免前台恢复后重放旧held state。
-        if !self.foreground || !self.focused || !self.remote_owned {
-            return None;
-        }
-        if self.blocked_until_release {
-            if !pressed && self.held_keys.is_empty() && !self.held_buttons.any_pressed() {
-                self.blocked_until_release = false
-            };
+        if !enabled {
             return None;
         }
         c.route_input(event)
@@ -288,6 +375,190 @@ mod tests {
         assert!(i
             .route(&c, s.get(), 7, i.revision, InputEvent::ReleaseAll, false)
             .is_none());
+    }
+    fn active_fixture() -> (AppController, InputAdapter, SessionId) {
+        let (mut c, i, s) = fixture();
+        c.set_platform_capabilities(frd_platform_api::PlatformCapabilities {
+            text_input: true,
+            ..Default::default()
+        });
+        c.set_product_policy(frd_app::ProductPolicy {
+            text_input: true,
+            ..Default::default()
+        });
+        let stores =
+            crate::app_adapter::Stores::at(std::env::temp_dir().join("unused-ohos-fixture"));
+        c.handle_session_event_with_stores(
+            s,
+            frd_protocol_api::SessionEvent::CapabilitiesChanged(
+                frd_protocol_api::SessionCapabilities {
+                    text_input: true,
+                    ..Default::default()
+                },
+            ),
+            frd_app::AppPlatformStores {
+                server_identities: &Pins,
+                profiles: stores.profiles.as_ref(),
+                credentials: stores.credentials.as_ref(),
+            },
+        );
+        c.handle_presentation(PresentationEvent::FramePresented {
+            session_id: s,
+            generation: 7,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        (c, i, s)
+    }
+    fn key(code: u16, state: frd_core::KeyState) -> InputEvent {
+        InputEvent::PhysicalKey {
+            code: frd_core::PhysicalKeyCode::from_usb_hid_usage(code),
+            state,
+            modifiers: Default::default(),
+        }
+    }
+    #[test]
+    fn pointer_up_in_letterbox_and_beyond_panzoom_clip_releases_at_last_valid_point() {
+        for (zoom, outside_y) in [(1.0, 210.0), (2.0, 10.0)] {
+            let (c, mut i, s) = active_fixture();
+            let mut g = i.geometry.unwrap();
+            g.scale = zoom;
+            i.set_geometry(&c, g);
+            let revision = i.revision;
+            let down = frd_core::PointerButtons {
+                primary: true,
+                ..Default::default()
+            };
+            let sent = i.pointer(
+                &c,
+                s.get(),
+                7,
+                revision,
+                250.0,
+                210.0,
+                down,
+                Default::default(),
+            );
+            assert!(sent.is_some());
+            assert!(i
+                .pointer(
+                    &c,
+                    s.get(),
+                    7,
+                    revision,
+                    31.0,
+                    outside_y,
+                    down,
+                    Default::default()
+                )
+                .is_none());
+            let up = i
+                .pointer(
+                    &c,
+                    s.get(),
+                    7,
+                    revision,
+                    31.0,
+                    outside_y,
+                    Default::default(),
+                    Default::default(),
+                )
+                .unwrap();
+            let SessionCommand::Input(input) = up else {
+                panic!("input");
+            };
+            let InputEvent::PointerSample(sample) = input.event else {
+                panic!("sample");
+            };
+            assert!(!sample.buttons.any_pressed());
+            assert_eq!(sample.remote, i.last_pointer.unwrap());
+            assert!(!i.held_buttons.any_pressed());
+        }
+    }
+    #[test]
+    fn missing_old_key_up_does_not_block_fresh_epoch_or_replay_old_repeat() {
+        let (c, mut i, s) = active_fixture();
+        let revision = i.revision;
+        assert!(i
+            .route(
+                &c,
+                s.get(),
+                7,
+                revision,
+                key(4, frd_core::KeyState::Pressed),
+                true
+            )
+            .is_some());
+        assert!(i.focus(&c, false, false, false).is_some());
+        assert!(i.held_keys.is_empty());
+        // 原 up 在应用失焦期间丢失；下一会话不能被旧 remote ledger 永久阻塞。
+        let (next, _, next_session) = active_fixture();
+        assert_ne!(s, next_session);
+        i.focus(&next, true, true, true);
+        assert!(i
+            .route(
+                &next,
+                next_session.get(),
+                7,
+                revision,
+                key(4, frd_core::KeyState::Pressed),
+                true
+            )
+            .is_none());
+        assert!(i
+            .route(
+                &next,
+                next_session.get(),
+                7,
+                revision,
+                key(5, frd_core::KeyState::Pressed),
+                true
+            )
+            .is_some());
+        assert!(i
+            .route(
+                &next,
+                next_session.get(),
+                7,
+                revision,
+                InputEvent::Text {
+                    utf8: "新输入".into()
+                },
+                false
+            )
+            .is_some());
+        assert!(i
+            .pointer(
+                &next,
+                next_session.get(),
+                7,
+                revision,
+                250.0,
+                210.0,
+                Default::default(),
+                Default::default()
+            )
+            .is_some());
+        assert!(i
+            .route(
+                &next,
+                next_session.get(),
+                7,
+                revision,
+                key(4, frd_core::KeyState::Released),
+                false
+            )
+            .is_none());
+        assert!(i
+            .route(
+                &next,
+                next_session.get(),
+                7,
+                revision,
+                key(4, frd_core::KeyState::Pressed),
+                true
+            )
+            .is_some());
     }
     #[test]
     fn clip_panzoom_nonfinite_and_edges_share_transform() {

@@ -176,6 +176,7 @@ impl AppEngine {
                     pending: BTreeMap::new(),
                     tx,
                     last_submit: 0,
+                    form_invalid_before: 0,
                     cancelled_launch: false,
                     stopping: false,
                     notice: storage_failed.then_some("平台应用沙盒初始化失败"),
@@ -275,6 +276,7 @@ struct Owner {
     pending: BTreeMap<u64, PendingLoad>,
     tx: SyncSender<Command>,
     last_submit: u64,
+    form_invalid_before: u64,
     cancelled_launch: bool,
     stopping: bool,
     notice: Option<&'static str>,
@@ -283,11 +285,13 @@ struct Owner {
 }
 impl Owner {
     fn apply_control(&mut self) {
-        let flags = self.control.fetch_and(!CONTROL_MASK, Ordering::AcqRel) & CONTROL_MASK;
+        let state = self.control.fetch_and(!CONTROL_MASK, Ordering::AcqRel);
+        let flags = state & CONTROL_MASK;
         if flags & FOCUS_LOST != 0 {
             self.focus(false, false, false);
         }
         if flags & FORM_INVALID != 0 {
+            self.form_invalid_before = state / CONTROL_REVISION;
             if let Some(form) = self.controller.connection_form_mut() {
                 form.set_password(SecretBuffer::new(Vec::new()));
             }
@@ -382,7 +386,13 @@ impl Owner {
         self.apply_control();
         let c = if let Command::Queued(revision, command) = c {
             let control = self.control.load(Ordering::Acquire);
-            if revision != control / CONTROL_REVISION || control & CONTROL_MASK != 0 {
+            // 已接受的身份/密码编辑按 FIFO 落实；远程焦点屏障不能丢弃用户输入。
+            // 仅显式表单溢出屏障作废旧编辑，同时已清除旧密码及 load ticket。
+            let form_edit = matches!(*command, Command::Edit(_) | Command::Password(_));
+            if (form_edit && revision < self.form_invalid_before)
+                || (!form_edit
+                    && (revision != control / CONTROL_REVISION || control & CONTROL_MASK != 0))
+            {
                 return;
             }
             *command
@@ -517,20 +527,17 @@ impl Owner {
                 self.send(c)
             }
             Command::Pointer(e, x, y, buttons, wheel) => {
-                if let Some(remote) = self.input.viewport().and_then(|v| v.map(x, y)) {
-                    let event = InputEvent::PointerSample(frd_core::PointerSample::new(
-                        remote, buttons, wheel,
-                    ));
-                    let c = self.input.route(
-                        &self.controller,
-                        e.session,
-                        e.generation,
-                        e.revision,
-                        event,
-                        buttons.any_pressed(),
-                    );
-                    self.send(c)
-                }
+                let c = self.input.pointer(
+                    &self.controller,
+                    e.session,
+                    e.generation,
+                    e.revision,
+                    x,
+                    y,
+                    buttons,
+                    wheel,
+                );
+                self.send(c)
             }
             Command::Presentation(e) => self.controller.handle_presentation(e),
             Command::Loaded(id, result) => {
@@ -688,6 +695,40 @@ impl Owner {
             Page::Disconnecting { .. } => 4,
             Page::Failed { .. } => 5,
         };
+        let (status_code, status_message) = match self.controller.page() {
+            Page::Failed { code, .. } => match code.as_str() {
+                "rdp_server_identity_changed" => (
+                    "rdp_server_identity_changed",
+                    "服务器证书指纹已变化，已停止自动连接；请核实服务器身份",
+                ),
+                "rdp_identity_store_failed" => (
+                    "rdp_identity_store_failed",
+                    "无法读取或保存服务器证书记录，已停止连接",
+                ),
+                "rdp_server_identity_rejected" => (
+                    "rdp_server_identity_rejected",
+                    "服务器身份未获信任，已停止连接",
+                ),
+                "authentication_failed" | "rdp_logon_failed" | "rdp_nla_failed" => (
+                    "authentication_failed",
+                    "身份验证失败，请检查账户和密码后重试",
+                ),
+                "rdp_dns_failed" => ("rdp_dns_failed", "无法解析服务器地址，请检查主机名"),
+                "rdp_tcp_failed" => ("rdp_tcp_failed", "无法连接服务器，请检查地址、端口和网络"),
+                "rdp_tls_failed" => ("rdp_tls_failed", "安全连接建立失败，请检查服务器设置"),
+                "rdp_license_failed" => ("rdp_license_failed", "服务器未接受远程桌面许可"),
+                "rdp_activation_failed" | "rdp_egfx_failed" => (
+                    "remote_display_failed",
+                    "远程画面初始化失败，请检查服务器支持的显示设置",
+                ),
+                _ => ("session_failed", "连接失败，请检查服务器与网络后重试"),
+            },
+            Page::Connecting { .. } => ("connecting", "正在连接"),
+            Page::AwaitingFirstFrame { .. } => ("awaiting_first_frame", "等待首个完整画面"),
+            Page::RemoteSession { .. } => ("connected", "已连接"),
+            Page::Disconnecting { .. } => ("disconnecting", "正在断开"),
+            Page::ConnectionForm(_) => ("connection_form", "准备连接"),
+        };
         let d = self.controller.page().retained_draft();
         let protocol = match d.protocol {
             ProtocolChoice::Automatic => "auto".into(),
@@ -711,6 +752,8 @@ impl Owner {
             )
             .is_ok();
         let mut value = json!({"abiVersion":1,"initialized":true,"page":page,"target":match d.target_system{Some(TargetSystem::Windows)=>1,Some(TargetSystem::MacOs)=>2,Some(TargetSystem::Linux)=>3,_=>0},"address":d.address,"port":d.port.unwrap_or(0),"username":d.username,"protocol":protocol,"available":available,"session":epoch.0,"generation":epoch.1,"geometryRevision":self.input.revision.to_string(),"notice":self.notice.unwrap_or(""),"probe":self.probe});
+        value["statusCode"] = json!(status_code);
+        value["statusMessage"] = json!(status_message);
         if let Page::ConnectionForm(f) = self.controller.page() {
             value["selectedIndex"] = json!(f
                 .selected_profile
@@ -849,6 +892,7 @@ mod tests {
             pending: BTreeMap::new(),
             tx,
             last_submit: 0,
+            form_invalid_before: 0,
             cancelled_launch: false,
             stopping: false,
             notice: None,
@@ -976,6 +1020,151 @@ mod tests {
             STOP | CANCEL | FOCUS_LOST | FORM_INVALID
         );
     }
+    #[test]
+    fn focus_fence_preserves_accepted_password_and_identity_edits_and_invalidates_late_load() {
+        for has_load in [false, true] {
+            let mut o = owner();
+            let ticket = has_load.then(|| pending(&mut o));
+            if !has_load {
+                o.command(Command::Password(SecretBuffer::from_text("old-A".into())));
+            }
+            let (sender, receiver) = mpsc::sync_channel(4);
+            let e = AppEngine {
+                sender,
+                snapshot: Arc::new(Mutex::new(json!({}))),
+                control: o.control.clone(),
+            };
+            e.send(Command::Password(SecretBuffer::from_text(
+                "accepted-B".into(),
+            )))
+            .unwrap();
+            e.lose_focus();
+            o.command(receiver.recv().unwrap());
+            if let Some(ticket) = ticket {
+                o.command(Command::Loaded(
+                    ticket,
+                    Ok(Some(SecretBuffer::from_text("late-A".into()))),
+                ));
+            }
+            assert_eq!(
+                o.controller
+                    .connection_form_mut()
+                    .unwrap()
+                    .password_mut()
+                    .expose_text(),
+                Some("accepted-B")
+            );
+        }
+        let mut o = owner();
+        let ticket = pending(&mut o);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let e = AppEngine {
+            sender,
+            snapshot: Arc::new(Mutex::new(json!({}))),
+            control: o.control.clone(),
+        };
+        e.send(Command::Edit(Edit {
+            target: 1,
+            address: "replacement.invalid".into(),
+            port: 3389,
+            username: "replacement".into(),
+            protocol: "auto".into(),
+            remember: false,
+        }))
+        .unwrap();
+        e.lose_focus();
+        o.command(receiver.recv().unwrap());
+        o.command(Command::Loaded(
+            ticket,
+            Ok(Some(SecretBuffer::from_text("late-old-identity".into()))),
+        ));
+        let form = o.controller.connection_form_mut().unwrap();
+        assert_eq!(form.draft.address, "replacement.invalid");
+        assert!(form.password_is_empty());
+    }
+    struct UnavailablePins;
+    impl ServerIdentityStore for UnavailablePins {
+        fn load_pin(
+            &self,
+            _: &ProtocolId,
+            _: &frd_core::Endpoint,
+        ) -> Result<Option<[u8; 32]>, PlatformError> {
+            Err(PlatformError::StorageFailed)
+        }
+        fn store_pin(
+            &self,
+            _: &ProtocolId,
+            _: &frd_core::Endpoint,
+            _: [u8; 32],
+        ) -> Result<(), PlatformError> {
+            Err(PlatformError::StorageFailed)
+        }
+    }
+    #[test]
+    fn snapshots_explain_real_changed_identity_store_failure_and_auth_failure_without_raw_payloads()
+    {
+        for store_failure in [false, true] {
+            let (mut o, session, _commits) = staged_owner();
+            if store_failure {
+                o.stores.identities = Arc::new(UnavailablePins);
+            }
+            o.runtime_event(
+                session,
+                SessionEvent::ServerIdentityChallenge(frd_protocol_api::ServerIdentityChallenge {
+                    session_id: session,
+                    challenge_id: 1,
+                    protocol_id: ProtocolId::rdp(),
+                    endpoint: frd_core::Endpoint::new("fixture.invalid", 3389).unwrap(),
+                    sha256_fingerprint: [2; 32],
+                    subject: "fixture.invalid".into(),
+                    issuer: "test".into(),
+                    validation: frd_protocol_api::evaluate_server_identity(Some([1; 32]), [2; 32]),
+                }),
+            );
+            let snapshot = o.snapshot();
+            assert_eq!(snapshot["page"], 5);
+            assert_eq!(
+                snapshot["statusCode"],
+                if store_failure {
+                    "rdp_identity_store_failed"
+                } else {
+                    "rdp_server_identity_changed"
+                }
+            );
+            assert!(snapshot["statusMessage"]
+                .as_str()
+                .unwrap()
+                .contains(if store_failure {
+                    "证书记录"
+                } else {
+                    "指纹已变化"
+                }));
+        }
+        for code in [
+            "rdp_logon_failed",
+            "rdp_tcp_failed",
+            "untrusted-raw-secret-diagnostic",
+        ] {
+            let (mut o, session, _commits) = staged_owner();
+            o.runtime_event(
+                session,
+                SessionEvent::Error(ProtocolError::adapter(ProtocolId::rdp(), code)),
+            );
+            let snapshot = o.snapshot();
+            assert_eq!(snapshot["page"], 5);
+            assert!(!snapshot
+                .to_string()
+                .contains("untrusted-raw-secret-diagnostic"));
+            assert_eq!(
+                snapshot["statusCode"],
+                match code {
+                    "rdp_logon_failed" => "authentication_failed",
+                    "rdp_tcp_failed" => "rdp_tcp_failed",
+                    _ => "session_failed",
+                }
+            );
+        }
+    }
     struct CommitSignal(mpsc::Sender<()>);
     impl SecureCredentialStore for CommitSignal {
         fn load(&self, _: &ConnectionProfileKey) -> Result<Option<SecretBuffer>, PlatformError> {
@@ -1066,7 +1255,8 @@ mod tests {
         ));
     }
     #[test]
-    fn emergency_barrier_rejects_queued_submit_password_and_focus_but_accepts_new_geometry() {
+    fn emergency_barrier_rejects_queued_submit_focus_but_preserves_accepted_edit_and_new_geometry()
+    {
         let mut o = owner();
         let (tx, rx) = mpsc::sync_channel(4);
         let e = AppEngine {
@@ -1096,11 +1286,14 @@ mod tests {
             o.command(command);
         }
         assert_eq!(o.last_submit, 0);
-        assert!(o
-            .controller
-            .connection_form_mut()
-            .unwrap()
-            .password_is_empty());
+        assert_eq!(
+            o.controller
+                .connection_form_mut()
+                .unwrap()
+                .password_mut()
+                .expose_text(),
+            Some("obsolete-secret")
+        );
         // 新代际的几何可紧随失焦通知到达，不依赖 owner 恰好先被唤醒。
         e.lose_focus();
         let geometry = ViewGeometry {
