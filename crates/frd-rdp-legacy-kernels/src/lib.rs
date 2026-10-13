@@ -25,6 +25,7 @@ pub enum KernelError {
     ColorOverflow,
     InvalidDimensions,
     InvalidColorLossLevel,
+    MissingPalette,
 }
 impl std::fmt::Display for KernelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,6 +36,7 @@ impl std::fmt::Display for KernelError {
             Self::ColorOverflow => "色彩转换的上游算术中间值溢出",
             Self::InvalidDimensions => "平面尺寸为零或尺寸算术溢出",
             Self::InvalidColorLossLevel => "色彩损失级别必须在 1..=7 范围",
+            Self::MissingPalette => "索引像素行缺少已归一的 RGB 调色板",
         })
     }
 }
@@ -69,6 +71,49 @@ impl PackedDepth {
     }
 }
 
+/// 名称表示内存字节顺序；X 格式的 padding 行为由源模式决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pixel32Format {
+    ARgb,
+    XRgb,
+    ABgr,
+    XBgr,
+    BgrA,
+    BgrX,
+    RgbA,
+    RgbX,
+}
+impl Pixel32Format {
+    fn offsets(self) -> [u8; 4] {
+        match self {
+            Self::ARgb | Self::XRgb => [1, 2, 3, 0],
+            Self::ABgr | Self::XBgr => [3, 2, 1, 0],
+            Self::BgrA | Self::BgrX => [2, 1, 0, 3],
+            Self::RgbA | Self::RgbX => [0, 1, 2, 3],
+        }
+    }
+    fn has_alpha(self) -> bool {
+        matches!(self, Self::ARgb | Self::ABgr | Self::BgrA | Self::RgbA)
+    }
+}
+/// Raw32 保留原 bitmap alpha 规则；Region32 保留原 tile copy/read/write 规则。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelRowSource {
+    Packed(PackedDepth),
+    Rgb24,
+    Raw32(Pixel32Format),
+    Region32(Pixel32Format),
+}
+impl PixelRowSource {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Packed(depth) => depth.bytes(),
+            Self::Rgb24 => 3,
+            Self::Raw32(_) | Self::Region32(_) => 4,
+        }
+    }
+}
+
 /// RDP6 YCoCg 布局；alpha flag 决定输出通道顺序，不消费 alpha plane。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanarLayout {
@@ -85,6 +130,13 @@ type DitherKernel = unsafe fn(&[u8], &[u8], bool, &mut [u8]);
 type RgbPlanarKernel = unsafe fn(&[u8], &[u8], &[u8], &mut [u8]);
 type YcocgKernel = unsafe fn(PlanarLayout, &[u8], &[u8], &[u8], &mut [u8]);
 type ColorKernel = unsafe fn(&[i16], &[i16], &[i16], &mut [u8]) -> Result<(), KernelError>;
+type PixelRowKernel = unsafe fn(
+    PixelRowSource,
+    Pixel32Format,
+    &[u8],
+    Option<&[[u8; 3]; 256]>,
+    &mut [u8],
+) -> Result<(), KernelError>;
 
 /// 构造即验证 CPU；私有函数表不能由调用者伪造，也不能启用 scalar。
 #[derive(Clone, Copy)]
@@ -103,8 +155,48 @@ pub struct NativeKernels {
     planar_delta: unsafe fn(&[u8], &mut [u8]),
     planar_rgb: RgbPlanarKernel,
     planar_ycocg: YcocgKernel,
+    pixel_row: PixelRowKernel,
 }
 impl NativeKernels {
+    /// 转换恰好一行；不消费 padding、stride、rect 或协议状态，不分配内存。
+    pub fn convert_pixel_row(
+        &self,
+        source_format: PixelRowSource,
+        destination_format: Pixel32Format,
+        source: &[u8],
+        palette: Option<&[[u8; 3]; 256]>,
+        destination: &mut [u8],
+    ) -> Result<(), KernelError> {
+        let width = source_format.bytes();
+        if !source.len().is_multiple_of(width)
+            || (source.len() / width).checked_mul(4) != Some(destination.len())
+        {
+            return Err(KernelError::Length);
+        }
+        if source_format == PixelRowSource::Packed(PackedDepth::Index8) && palette.is_none() {
+            return Err(KernelError::MissingPalette);
+        }
+        // 原版 raw 同枚举及 region 同字节序分支是真正的整行copy，保留 X padding。
+        // 复用已经检查 ISA 的 bulk copy；不逐四像素重复执行格式分派。
+        let raw_copy = match source_format {
+            PixelRowSource::Raw32(src) => src == destination_format,
+            PixelRowSource::Region32(src) => src.offsets() == destination_format.offsets(),
+            _ => false,
+        };
+        if raw_copy {
+            return self.copy_u8(source, destination);
+        }
+        // SAFETY: 构造器验证 ISA；完整像素、精确输出长度和 Index8 palette 先于任何写入检查。
+        unsafe {
+            (self.pixel_row)(
+                source_format,
+                destination_format,
+                source,
+                palette,
+                destination,
+            )
+        }
+    }
     /// 原始字节精确搬运；任意长度含空，不要求 padding 或对齐。
     pub fn copy_u8(&self, src: &[u8], dst: &mut [u8]) -> Result<(), KernelError> {
         if src.len() != dst.len() {

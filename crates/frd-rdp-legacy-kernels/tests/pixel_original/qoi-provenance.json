@@ -1,0 +1,30 @@
+{
+  "source_image_sha256": "61cb9451695daa51e4e9bfe05ee7fae3faf746ae5275cb178b8a1f09c5cb5499",
+  "wrapper_sha256": "1254c06f03b13cf1a9597ecc0a8640c9977fd8d766843a2b1c2c8a72b56685b0",
+  "expected_sha256": "e09f03d6dd10d3977a2730856d881dd0f7a4e55d17779d1161802d00add93bee",
+  "bytes": 192,
+  "command": [
+    "/Users/sun/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/rustc",
+    "--edition=2021",
+    "--cfg",
+    "feature=\"qoi\"",
+    "/Users/sun/FreeRemoteAccess/crates/frd-rdp-legacy-kernels/tests/pixel_original/qoi_anchor.rs",
+    "-L",
+    "dependency=/Users/sun/FreeRemoteAccess/target/legacy-oracle/debug/deps",
+    "--extern",
+    "ironrdp_session=/Users/sun/FreeRemoteAccess/target/legacy-oracle/debug/deps/libironrdp_session-bdcc08cdbd2d7f09.rlib",
+    "--extern",
+    "ironrdp_graphics=/Users/sun/FreeRemoteAccess/target/legacy-oracle/debug/deps/libironrdp_graphics-1bd84b9c85f66d6a.rlib",
+    "--extern",
+    "ironrdp_core=/Users/sun/FreeRemoteAccess/target/legacy-oracle/debug/deps/libironrdp_core-71183368b15dcf84.rlib",
+    "--extern",
+    "ironrdp_pdu=/Users/sun/FreeRemoteAccess/target/legacy-oracle/debug/deps/libironrdp_pdu-8fc33204e4179dd7.rlib",
+    "--extern",
+    "tracing=/Users/sun/FreeRemoteAccess/target/legacy-oracle/debug/deps/libtracing-40d7d6449d1fdab6.rlib",
+    "--extern",
+    "yuv=/Users/sun/FreeRemoteAccess/target/legacy-oracle/debug/deps/libyuv-7a4b5cc1511dc429.rlib",
+    "-o",
+    "/Users/sun/FreeRemoteAccess/target/pixel-kernels/qoi-original-anchor"
+  ],
+  "scope": "stock feature=qoi apply_rgba32 helper; QOI wire decoder not exercised"
+}

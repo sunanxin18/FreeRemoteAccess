@@ -71,3 +71,25 @@
 显式 bounded host benchmark：`cargo test --offline --locked --release -p frd-rdp-legacy-kernels --test planar_benchmark -- --ignored --nocapture`。128 warmup、501 samples×64 batch，1/7/8/16/65/1024/4096 pixels。双方使用预分配 output，delta 双方每次重置输入；native 包含 checked 入口，reference 是普通优化 Rust 数值/布局循环，compiler 允许优化或自动向量化。报告 median/p95，不设性能断言，不代表原版 parser/RLE/whole-codec/session 成本。
 
 macOS ARM64/Apple M4 已执行 debug/release parity、guard 与 benchmark，优化对象中的实际 NEON primitive/调用路径已检查。Windows/Linux x86、AMD64、ARM64 和 OHOS ARM64仅交叉编译优化 object 并核对 SSE2/NEON 指令；没有目标执行、per-target benchmark、应用链接、包或 live 互操作证明。完整 RDP6 alpha/RLE/parser 消费与 session publication 接线仍待后续独立 scope。
+
+## 独立像素行转换（A2.7A，2026-10-13）
+
+`convert_pixel_row(source_format,destination_format,source,palette,destination)` 仅转换一条紧密行；不接受调用方 offsets、padding、stride、rect、cursor 或协议类型。`Pixel32Format::{ARgb,XRgb,ABgr,XBgr,BgrA,BgrX,RgbA,RgbX}` 描述内存字节顺序。源为 `Packed(PackedDepth)`、`Rgb24`、`Raw32(Pixel32Format)` 或 `Region32(Pixel32Format)`。
+
+入口先检查完整源像素与 checked `pixel_count*4==destination.len()`，错误为 `Length`；其后 Index8 检查归一 `[[R,G,B];256]` palette，缺少为 `MissingPalette`，包含空行。其余源格式忽略 Some palette。合法空行成功，任何错误保持全部目标 bytes，生产不分配内存。
+
+| 模式 | 第四逻辑通道 |
+|---|---|
+| Packed / RGB24 | 所有 A/X 目标均为255。555/565 LE 输入保留原版精确 `(c5*527+23)>>6` / `(c6*259+33)>>6`。 |
+| Raw32 同 enum | 全 byte 原样 copy，包括 X padding。 |
+| Raw32 不同 enum | A 源保持 alpha，X 源为255；即使目标为 X 也写入该值。 |
+| Region32 同字节序 | A/X 配对也全 byte 原样 copy。 |
+| Region32 不同字节序 | read_color→write_color；仅 A→A 保持，X 源或 X 目标均为255。 |
+
+同格式/同字节序整行 copy 复用现有 checked ISA `copy_u8`。其他完整四像素与短尾均调用同一 NEON/SSE2 core；尾部仅使用16byte输入/输出 staging。555/565 用 vector word multiply/add/shift，24bit 用 NEON table 或 SSE2 byte mask/shift 解交织，32bit 用 vector swizzle。Index8 的索引、地址计算、16bit RG 与8bit B读取和 canonical RGBA组装均在目标 inline assembly；index255不会读取第768byte。NEON opaque格式只做一次固定 TBL，SSE2仅用固定mask/shift/OR；RGBA/X直接返回 canonical向量。x86/i686 和 AMD64 分别 cfg，不要求 SSSE3，ARM64不使用x18。inline assembly由编译器管理 ABI寄存器保存，不能把对象编译视作另一 OS 的运行证明。
+
+`tests/pixel_original` 保存原版 image.rs / image_processing.rs / color_conversion.rs 完整、原样源和独立 rustc process wrapper。archive/member hash 与独立原版 registry rlib/depfile hash 均记录；不修改或继承根 patch，K正常和dev图没有这些decoder。生成器可在固定本地 original artifact 存在时用 `python3 crates/frd-rdp-legacy-kernels/tests/pixel_original/generate.py` 重算；普通测试只读取已冻结、hash核验的6,453,432byte期望（gzip3.3MiB）。176records包含555/565各65536×8、两组非灰palette所有256索引、Raw32/Region32各64组合和六个alpha锚点。QOI仅单独编译stock feature=qoi RGBA helper，证明映射Raw32(RgbA)的八格式alpha；不代表QOI wire解码。
+
+`pixel_parity` 测全部格式的短尾、source/destination byte offset0..15、canary、错误零写入和手算锚点。`pixel_guard_pages` 在Unix用真实不可访问页包围source/destination，并将只读palette末项紧贴保护页；`pixel_abi` 在macOS ARM64实际填充并核验x19..28及d8..15保存规则。Rust1.96固定工具链已运行macARM debug/release K全集与strict scoped clippy；八个既有非macIntel目标只完成优化对象/反汇编，Windows/Linux/OHOS未执行本叶子的native parity或ABI。
+
+`pixel_benchmark` 为须协调quiet window的显式 ignored release host基准。原版另process使用预分配stock单行apply（pointer hidden），Region32调用stock ImageRegion::copy_to；native包含public checks、gather、ISA调用与tail staging。双方176records×1/3/4/65/1024/4096长度，32warmup、51samples×16calls，逐例输入和输出SHA256必须相同。stock image check/隐藏pointer bookkeeping与native leaf成本边界不同，不是whole-codec或session性能结论。Index8和raw-copy慢项及优化前后数据见ignored实施报告；保留剩余慢项而不以大类median隐藏慢case。A2.7B image/padding/cursor/session接线、目标包/runtime/live门仍由主代理单独验收。

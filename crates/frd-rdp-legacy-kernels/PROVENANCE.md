@@ -21,3 +21,9 @@ A2.3 oracle 拓扑隔离（2026-10-13）：原 A1 对原版函数的每个输入
 四份原版 crate 的 archive 与全部 source hashes 见 `tests/legacy-oracle/SOURCE-INVENTORY.json`；vendored graphics/session 的原始清单见各自 `UPSTREAM-SHA256SUMS`。新增 standalone 完整 wire catalog、原版错误/profile测试、同边界基准与重新生成验证均不依赖 kernel。根 patch 前后已审查 Cargo metadata 图；dependency alias 不视为隔离手段。当前证据只覆盖 macOS ARM64 host 数据生成与测试，不增加其他目标 runtime/live 声明。
 
 自审补齐：`original-rlgr-replay.bin.gz` 冻结独立原版catalog所有546个成功RLGR输出，保留旧逐byte截断/modes/terminal padding的native零区间重放覆盖；每条保留catalog索引及exactbytes，SHA256SUMS/sidecar/独立verify均覆盖，不成为parser接线证据。
+
+A2.7A（2026-10-13）：checked pixel row API、四像素 NEON/SSE2 数值/排列、目标 inline assembly indexed palette gather、固定opaque排列和短尾staging是本项目新实现。Raw32与Region32分别遵循固定session0.11.0 image.rs和graphics0.9.0 ImageRegion语义，555/565公式来自固定color_conversion.rs；正常依赖仍为空，既有叶子与packed/planar实现不变。主代理批准native.rs仅添加新module路径和私有fn表字段初始化；该文件精确diff为三行新增。
+
+`tests/pixel_original/source/{image,image_processing,color_conversion}.rs` 是archive member逐byte原样副本，选择同一IronRDP MIT许可，完整许可见 `licenses/IronRDP-MIT.txt`。`generate.py` 在独立rustc process中include完整stock源，复用原独立registry依赖rlib；校验archive/source、rlib、depfile身份，拒绝vendor/K路径，没有新Cargo manifest/lock或decoder dev依赖。generator.rs wrapper与原版源分别hash；expected sha256=`ee69627eb9513f5e71a7b310dd60b41ececf12ef72aa2be45562fc7cd0910f26`。源码、依赖、Rust1.96身份、压缩/未压缩hash和尺寸见provenance.json。fixture在新row实现前冻结，原版真实apply/region调用产生expected；普通K tests仅读冻结bytes，不重算decoder公式。
+
+QOI锚点独立wrapper `qoi_anchor.rs` 只把stock image.rs以feature=qoi编译，调用原apply_rgba32；192byte原版helper输出sha256=`e09f03d6dd10d3977a2730856d881dd0f7a4e55d17779d1161802d00add93bee`，编译命令/源与wrapperhash见qoi-provenance.json；生成主fixture的qoi关闭构建与此helper开启构建分别记录，没有QOI wire声明。`benchmark.rs` 是独立原版process，同输入/计时helper仅含测试读取/计时，不链接K；基准结果与binary/dependency身份位于本地target/pixel-kernels，性能范围仅单行apply与新checked leaf。没有新增第三方生产decoder或assembly来源。

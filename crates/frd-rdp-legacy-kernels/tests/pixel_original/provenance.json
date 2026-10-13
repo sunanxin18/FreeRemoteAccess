@@ -1,0 +1,51 @@
+{
+  "archives": {
+    "ironrdp-session-0.11.0": "3f1a5a20c24d8ebf47477f9f513201aeb894e7c7f779ea633ece65e42a9f0652",
+    "ironrdp-graphics-0.9.0": "c7493e426b6a8104cd497e518ba7781a9c7fc9a5f58a9cc0c1111e6d66f63bcc"
+  },
+  "sources": {
+    "image.rs": "61cb9451695daa51e4e9bfe05ee7fae3faf746ae5275cb178b8a1f09c5cb5499",
+    "image_processing.rs": "95d6817539049d48cbc9347a7318102534ce40ce6167339965abeac8fc525a51",
+    "color_conversion.rs": "ddcc027718044e0bee6b98c1bf660ebe3cbcfeb45e5ee15cae5ca6b9911f5c17"
+  },
+  "dependencies": {
+    "ironrdp_session": {
+      "rlib_sha256": "175d59cc7d71ab06f12e709c4da698b0205dfd0dec3426d476d2346d0b4d8495",
+      "depfile_sha256": "354238bf29ffed636aefd368760cbddf6feea4f30b9c1f04f3b5af953cb3789b",
+      "path": "target/legacy-oracle/debug/deps/libironrdp_session-bdcc08cdbd2d7f09.rlib"
+    },
+    "ironrdp_graphics": {
+      "rlib_sha256": "ac1a720a6f203ced5a496d5fbb5248f007005d31821a6c7775ec25c0b9aedc30",
+      "depfile_sha256": "58388efcfee98bfd38efd18b825237c6d10286abce6ae28ba477db7dcfaab5a9",
+      "path": "target/legacy-oracle/debug/deps/libironrdp_graphics-1bd84b9c85f66d6a.rlib"
+    },
+    "ironrdp_core": {
+      "rlib_sha256": "761bd589b9920ed8577a2190177a880196c5e15ab502d2a0dc14700e29423302",
+      "depfile_sha256": "c36d49fcdf1521a5d97ada9f8738280fa1c95de41ba109c3fab76475225fb85e",
+      "path": "target/legacy-oracle/debug/deps/libironrdp_core-71183368b15dcf84.rlib"
+    },
+    "ironrdp_pdu": {
+      "rlib_sha256": "7d5077391107971155bfb933f06a962f021595d141af5e30ba2e4a597e5b296a",
+      "depfile_sha256": "81da7d44e49d7ca309f8ec76d5d8675bd9fa14a28ce7f3dd0d26632c0204a081",
+      "path": "target/legacy-oracle/debug/deps/libironrdp_pdu-8fc33204e4179dd7.rlib"
+    },
+    "tracing": {
+      "rlib_sha256": "41272391cdf991042e369c777f60569cd7f21e1574c7a5726958f218f1ec8960",
+      "depfile_sha256": "265ffb9c3a9e8c62a099608ef8bd5b1aaa540d6db30fc2376558d830853ea273",
+      "path": "target/legacy-oracle/debug/deps/libtracing-40d7d6449d1fdab6.rlib"
+    },
+    "yuv": {
+      "rlib_sha256": "e2f39db2e76f69afd91d432ae07d398a98d6ad62bf31c71b2cf35bd2c39a9e5f",
+      "depfile_sha256": "e2f5cff18cfbe4bd4d610ba1234ab8df82df19663aeea8a970c17a009fc8cf09",
+      "path": "target/legacy-oracle/debug/deps/libyuv-7a4b5cc1511dc429.rlib"
+    }
+  },
+  "wrapper": {
+    "generator.rs": "0f8bdb52a41704738301e5602e5b3909df903b2b4f676b8c4677a41250ae42bf",
+    "generate.py": "af5a37d12d664ca4d21fc969d27309a2779a12077c119f9f2d204f3b9e32f655"
+  },
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "expected_sha256": "ee69627eb9513f5e71a7b310dd60b41ececf12ef72aa2be45562fc7cd0910f26",
+  "gzip_sha256": "ebfe8d6db6195ae1f45213733c8789fb48425f57e1ae2d106a9decc103592196",
+  "expected_bytes": 6453432
+}
