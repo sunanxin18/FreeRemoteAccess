@@ -19,8 +19,12 @@ NATIVE_PREFIX = 'libs/arm64-v8a/'
 RAW_PREFIX = 'resources/rawfile/ffmpeg-ohos/'
 BASE_LIBS = {'libentry.so', 'libfrd_shell_ohos_ffi.so', 'libc++_shared.so'}
 NATIVE = {NATIVE_PREFIX + name for name in BASE_LIBS | set(ffmpeg.LIBS)}
-MATERIALS = ffmpeg.FILES - set(ffmpeg.LIBS)
-RAW = {RAW_PREFIX + name for name in MATERIALS}
+def materials(recipe="upstream"):
+    return ffmpeg.files_for_recipe(recipe) - set(ffmpeg.LIBS)
+
+
+def raw_files(recipe="upstream"):
+    return {RAW_PREFIX + name for name in materials(recipe)}
 # 逐项来自桥/Rust现有实际链接的公开 NDK 库；新依赖必须单独审核。
 PUBLIC = {'libc.so', 'libace_napi.z.so', 'libace_ndk.z.so', 'libnative_window.so',
           'libhilog_ndk.z.so', 'libhuks_ndk.z.so', 'libohcrypto.so', 'libability_runtime.so'}
@@ -38,7 +42,8 @@ def accepted_bundle(bundle: Path, sdk: Path, manifest_sha256: str):
     return ffmpeg.verify_bundle(bundle, sdk)
 
 
-def entries(package):
+def entries(package, recipe="upstream"):
+    raw = raw_files(recipe)
     result = {}
     for item in package.infolist():
         name = item.filename
@@ -60,27 +65,28 @@ def entries(package):
                 require(item.compress_type == zipfile.ZIP_STORED, f'native 库必须不压缩：{name}')
         result[name] = data
     require(NATIVE <= result.keys(), 'HAP 缺少固定六个 native 文件')
-    require(RAW <= result.keys(), 'HAP 缺少 FFmpeg 来源/许可材料')
-    require({n for n in result if n.startswith(RAW_PREFIX) and not n.endswith('/')} == RAW,
+    require(raw <= result.keys(), 'HAP 缺少 FFmpeg 来源/许可材料')
+    require({n for n in result if n.startswith(RAW_PREFIX) and not n.endswith('/')} == raw,
             'FFmpeg rawfile 文件集合不匹配')
     return result
 
 
-def relevant_bytes(hap):
+def relevant_bytes(hap, recipe="upstream"):
     with zipfile.ZipFile(hap) as package:
-        data = entries(package)
-        return {name: data[name] for name in NATIVE | RAW | {'module.json'}}
+        data = entries(package, recipe)
+        return {name: data[name] for name in NATIVE | raw_files(recipe) | {'module.json'}}
 
 
-def compare_signed(unsigned, signed):
-    require(relevant_bytes(unsigned) == relevant_bytes(signed), '签名改变了 native/来源材料/模块清单字节')
+def compare_signed(unsigned, signed, recipe="upstream"):
+    require(relevant_bytes(unsigned, recipe) == relevant_bytes(signed, recipe), '签名改变了 native/来源材料/模块清单字节')
 
 
 def check(hap: Path, readelf: Path, bundle: Path, manifest_sha256: str) -> dict:
     sdk = readelf.parent.parent.parent.parent
     expected = accepted_bundle(bundle, sdk, manifest_sha256)
+    recipe = ffmpeg.recipes.identify(ffmpeg.read_json(bundle / "manifest.json"))
     with zipfile.ZipFile(hap) as package, tempfile.TemporaryDirectory(prefix='frd-hap-check-') as temporary:
-        data = entries(package)
+        data = entries(package, recipe)
         module = json.loads(data['module.json'])
         require(module['app']['bundleName'] == 'org.freeremotedesk.client', '应用标识不符')
         require(module['module']['deviceTypes'] == ['phone', '2in1'], '需要真正 phone/2in1 清单')
@@ -88,7 +94,7 @@ def check(hap: Path, readelf: Path, bundle: Path, manifest_sha256: str) -> dict:
                 module['module'].get('compressNativeLibs') is False, '需要显式普通 native extraction 模式')
         permissions = module['module'].get('requestPermissions', [])
         require(permissions == [{'name': 'ohos.permission.INTERNET'}], '权限集合改变')
-        for name in MATERIALS:
+        for name in materials(recipe):
             require(data[RAW_PREFIX + name] == (bundle / name).read_bytes(), f'来源材料字节不匹配：{name}')
         dependencies = {}
         summaries = {}
@@ -143,7 +149,7 @@ def main():
     args = parser.parse_args()
     print(json.dumps(check(args.hap, args.readelf, args.ffmpeg_bundle, args.ffmpeg_manifest_sha256), ensure_ascii=False, indent=2))
     if args.unsigned_hap:
-        compare_signed(args.unsigned_hap, args.hap)
+        compare_signed(args.unsigned_hap, args.hap, ffmpeg.recipes.identify(ffmpeg.read_json(args.ffmpeg_bundle / "manifest.json")))
 
 
 if __name__ == '__main__':

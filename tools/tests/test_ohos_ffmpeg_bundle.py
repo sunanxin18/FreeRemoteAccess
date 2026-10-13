@@ -55,6 +55,44 @@ class ActualBundleMutations(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, message):
             bundle.verify_bundle(self.path, self.sdk)
 
+    def test_unknown_source_recipe_even_with_self_consistent_manifest(self):
+        self.manifest['source']['recipe'] = 'unapproved-recipe'
+        self.write_manifest()
+        self.rejected('来源/recipe')
+
+    def test_modified_flag_cannot_relabel_source(self):
+        self.manifest['source']['modified'] = not self.manifest['source']['modified']
+        self.write_manifest()
+        self.rejected('来源/recipe')
+
+    def test_extra_patch_cannot_self_authorize(self):
+        name = 'extra.patch'
+        (self.path / name).write_bytes(b'unapproved patch')
+        self.manifest['files'][name] = bundle.sha(self.path / name)
+        self.write_manifest()
+        self.rejected('文件集合')
+
+    def test_modified_patch_with_rewritten_file_hash_rejected(self):
+        if self.manifest['schema'] != 2:
+            self.skipTest('仅修改配方携带 patch')
+        path = self.path / 'FFmpeg-CHANGES.diff'
+        path.write_bytes(path.read_bytes() + b'\nextra hunk')
+        self.manifest['files'][path.name] = bundle.sha(path)
+        self.write_manifest()
+        self.rejected('受信源码材料')
+
+    def test_old_library_cannot_claim_applied_patch(self):
+        if self.manifest['schema'] != 2:
+            self.skipTest('需要修改配方实际产物')
+        old = bundle.REPO / 'target/ffmpeg-ohos/bundle-attempt-qjsezbh7/libavcodec.so.62'
+        target = self.path / old.name
+        shutil.copyfile(old, target)
+        self.manifest['files'][target.name] = bundle.sha(target)
+        self.manifest['elf'][target.name] = bundle.elf(target)
+        self.manifest['libraries'][target.name] = bundle.sha(target)
+        self.write_manifest()
+        self.rejected('kernel')
+
     def test_valid_actual_bundle(self):
         self.assertEqual(set(bundle.verify_bundle(self.path, self.sdk)), set(bundle.LIBS))
 

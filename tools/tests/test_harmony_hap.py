@@ -31,6 +31,7 @@ class HapMutations(unittest.TestCase):
         cls.good = Path(os.environ['FRD_HAP_TEST_HAP'])
         cls.bundle = Path(os.environ['FRD_OHOS_FFMPEG_TEST_BUNDLE'])
         cls.digest = os.environ['FRD_OHOS_FFMPEG_TEST_MANIFEST_SHA256']
+        cls.recipe = checker.ffmpeg.recipes.identify(checker.ffmpeg.read_json(cls.bundle / 'manifest.json'))
         cls.readelf = Path(os.environ.get('FRD_HAP_TEST_READELF', checker.ffmpeg.DEFAULT_SDK + '/native/llvm/bin/llvm-readelf'))
         checker.check(cls.good, cls.readelf, cls.bundle, cls.digest)
         with zipfile.ZipFile(cls.good) as package:
@@ -190,19 +191,19 @@ class HapMutations(unittest.TestCase):
     def test_signature_metadata_container_change_allowed(self):
         self.extra.append(('META-INF/controlled-signature', b'test-only signature metadata'))
         self.write()
-        checker.compare_signed(self.good, self.path)
+        checker.compare_signed(self.good, self.path, self.recipe)
 
     def test_signature_native_change_rejected(self):
         self.mutate_elf('libentry.so', lambda b: b.extend(b'changed'))
         self.write()
         with self.assertRaisesRegex(ValueError, '签名改变'):
-            checker.compare_signed(self.good, self.path)
+            checker.compare_signed(self.good, self.path, self.recipe)
 
     def test_signature_resource_change_rejected(self):
         self.data[checker.RAW_PREFIX + 'FFmpeg-NOTICE.txt'] += b'changed'
         self.write()
         with self.assertRaisesRegex(ValueError, '签名改变'):
-            checker.compare_signed(self.good, self.path)
+            checker.compare_signed(self.good, self.path, self.recipe)
 
 
 class OwnedStaging(unittest.TestCase):
@@ -210,6 +211,7 @@ class OwnedStaging(unittest.TestCase):
     def setUpClass(cls):
         cls.bundle = Path(os.environ['FRD_OHOS_FFMPEG_TEST_BUNDLE'])
         cls.digest = os.environ['FRD_OHOS_FFMPEG_TEST_MANIFEST_SHA256']
+        cls.recipe = checker.ffmpeg.recipes.identify(checker.ffmpeg.read_json(cls.bundle / 'manifest.json'))
         cls.sdk = Path(checker.ffmpeg.DEFAULT_SDK)
 
     def setUp(self):
@@ -220,20 +222,56 @@ class OwnedStaging(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    @unittest.skipUnless(os.environ.get('FRD_HAP_OTHER_RECIPE_BUNDLE'), '需要两个实际 recipe bundle')
+    def test_old_new_old_transitions_and_legacy_marker(self):
+        other = Path(os.environ['FRD_HAP_OTHER_RECIPE_BUNDLE'])
+        other_digest = checker.ffmpeg.sha(other / 'manifest.json')
+        other_recipe = checker.ffmpeg.recipes.identify(checker.ffmpeg.read_json(other / 'manifest.json'))
+        self.assertNotEqual(other_recipe, self.recipe)
+        user = self.entry / 'user.txt'
+        user.write_text('keep')
+        for source, digest, recipe in [(self.bundle, self.digest, self.recipe),
+                                       (other, other_digest, other_recipe),
+                                       (self.bundle, self.digest, self.recipe)]:
+            stager.stage(self.entry, source, self.sdk, digest)
+            marker = self.entry / '.frd-ffmpeg-stage.json'
+            value = json.loads(marker.read_text())
+            self.assertEqual(value['recipe'], recipe)
+            self.assertEqual(set(value['files']), set(stager.destinations(recipe)))
+            for relative, name in stager.destinations(recipe).items():
+                self.assertEqual((self.entry / relative).read_bytes(), (source / name).read_bytes())
+            if recipe == 'upstream':
+                # 真正的旧版 flat marker 必须也能完成下次过渡/清理。
+                marker.write_text(json.dumps(value['files']))
+            self.assertEqual(user.read_text(), 'keep')
+        stager.clean(self.entry)
+        self.assertEqual(user.read_text(), 'keep')
+        self.assertFalse(any(p.is_file() for p in self.entry.rglob('*') if p != user))
+
+    @unittest.skipUnless(os.environ.get('FRD_HAP_OTHER_RECIPE_BUNDLE'), '需要两个实际 recipe bundle')
+    def test_changed_owned_bytes_block_recipe_transition(self):
+        stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        path = self.entry / next(iter(stager.destinations(self.recipe)))
+        path.write_bytes(b'changed by user')
+        other = Path(os.environ['FRD_HAP_OTHER_RECIPE_BUNDLE'])
+        with self.assertRaisesRegex(ValueError, '被更改'):
+            stager.stage(self.entry, other, self.sdk, checker.ffmpeg.sha(other / 'manifest.json'))
+        self.assertEqual(path.read_bytes(), b'changed by user')
+
     def test_stage_and_clean_keeps_userfiles_and_input(self):
         user = self.entry / 'user.txt'
         user.write_bytes(b'keep')
         before = checker.ffmpeg.sha(self.bundle / 'manifest.json')
         stager.stage(self.entry, self.bundle, self.sdk, self.digest)
-        for relative, source in stager.destinations().items():
+        for relative, source in stager.destinations(self.recipe).items():
             self.assertEqual((self.entry / relative).read_bytes(), (self.bundle / source).read_bytes())
         stager.clean(self.entry)
         self.assertEqual(user.read_bytes(), b'keep')
         self.assertEqual(checker.ffmpeg.sha(self.bundle / 'manifest.json'), before)
-        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations()))
+        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations(self.recipe)))
 
     def test_unknown_existing_library_never_overwritten(self):
-        relative = next(iter(stager.destinations()))
+        relative = next(iter(stager.destinations(self.recipe)))
         path = self.entry / relative
         path.parent.mkdir(parents=True)
         path.write_bytes(b'user-owned')
@@ -243,7 +281,7 @@ class OwnedStaging(unittest.TestCase):
 
     def test_changed_owned_stage_never_deleted(self):
         stager.stage(self.entry, self.bundle, self.sdk, self.digest)
-        path = self.entry / next(iter(stager.destinations()))
+        path = self.entry / next(iter(stager.destinations(self.recipe)))
         path.write_bytes(b'user changed')
         with self.assertRaisesRegex(ValueError, '被更改'):
             stager.clean(self.entry)
@@ -267,7 +305,7 @@ class OwnedStaging(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'controlled publication failure'):
                 stager.stage(self.entry, self.bundle, self.sdk, self.digest)
         self.assertEqual(user.read_bytes(), b'keep')
-        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations()))
+        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations(self.recipe)))
         self.assertFalse((self.entry / '.frd-ffmpeg-stage.json').exists())
         stager.stage(self.entry, self.bundle, self.sdk, self.digest)
         stager.clean(self.entry)
@@ -275,11 +313,11 @@ class OwnedStaging(unittest.TestCase):
 
     def assert_marker_failure_recovers(self):
         self.assertFalse((self.entry / '.frd-ffmpeg-stage.json').exists())
-        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations()))
+        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations(self.recipe)))
         self.assertFalse(any(self.entry.glob('.frd-marker-*')))
         stager.clean(self.entry)
         stager.stage(self.entry, self.bundle, self.sdk, self.digest)
-        for relative, source in stager.destinations().items():
+        for relative, source in stager.destinations(self.recipe).items():
             self.assertEqual((self.entry / relative).read_bytes(), (self.bundle / source).read_bytes())
         stager.clean(self.entry)
         self.assertFalse((self.entry / '.frd-ffmpeg-stage.json').exists())
@@ -351,7 +389,7 @@ class OwnedStaging(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 stager.stage(self.entry, self.bundle, self.sdk, self.digest)
         self.assertEqual(marker.read_text(), '{user-created-during-publication')
-        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations()))
+        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations(self.recipe)))
         self.assertFalse(any(self.entry.glob('.frd-marker-*')))
 
     def test_preexisting_invalid_marker_is_preserved(self):

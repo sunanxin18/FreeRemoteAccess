@@ -3,6 +3,7 @@
 import argparse
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,14 @@ TOOLS = {"cc": "aarch64-unknown-linux-ohos-clang", "cxx": "aarch64-unknown-linux
          "ar": "llvm-ar", "nm": "llvm-nm", "ranlib": "llvm-ranlib", "strip": "llvm-strip",
          "clang": "clang", "readelf": "llvm-readelf"}
 REPO = Path(__file__).resolve().parent.parent
+_recipe_spec = importlib.util.spec_from_file_location('ffmpeg_source_recipe', Path(__file__).with_name('ffmpeg-source-recipe.py'))
+recipes = importlib.util.module_from_spec(_recipe_spec)
+_recipe_spec.loader.exec_module(recipes)
+
+
+def files_for_recipe(recipe):
+    recipes.metadata(recipe)
+    return FILES | (set(recipes.EXTRA) if recipe == recipes.MODIFIED else set())
 
 
 def require(condition, message):
@@ -64,7 +73,7 @@ def tree_hashes(root):
     return {str(p.relative_to(root)): sha(p) for p in sorted(root.rglob("*")) if p.is_file()}
 
 
-def plugin_inputs(repo):
+def plugin_inputs(repo, recipe="upstream"):
     result = {name: sha(repo / name) for name in ("Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml")}
     for crate in ("frd-video-ffmpeg-plugin", "frd-video-ffmpeg", "frd-core", "frd-media-api", "frd-frame"):
         for path in sorted((repo / "crates" / crate).rglob("*")):
@@ -72,6 +81,9 @@ def plugin_inputs(repo):
                 result[str(path.relative_to(repo))] = sha(path)
     for name in ("tools/build-ffmpeg-ohos.sh", "tools/ohos-ffmpeg-bundle.py"):
         result[name] = sha(repo / name)
+    for name in ("tools/ffmpeg-source-recipe.py", str(recipes.PIN), str(recipes.PATCH)):
+        result[name] = sha(repo / name)
+    recipes.metadata(recipe, repo=repo)
     return result
 
 
@@ -233,19 +245,19 @@ def config_check(directory, sdk):
     require("prefix=/usr\n" in make and "ARCH=aarch64\n" in make, "FFmpeg 安装/架构配置不符")
 
 
-def base_manifest(sdk, identity, rust):
-    return {"schema": 1, "target": TARGET, "target_os": "linux", "target_env": "ohos", "ffmpeg_version": VERSION,
-            "source": {"url": URL, "archive_sha256": ARCHIVE_SHA, "modified": False},
+def base_manifest(sdk, identity, rust, recipe="upstream"):
+    return {"schema": 2 if recipe == recipes.MODIFIED else 1, "target": TARGET, "target_os": "linux", "target_env": "ohos", "ffmpeg_version": VERSION,
+            "source": recipes.metadata(recipe),
             "sdk": identity, "rust": rust, "configure": configure_args(sdk),
             "logical_prefix": "/usr", "plugin_abi": 1, "thread_policy": [1, 0],
-            "plugin_inputs": plugin_inputs(REPO)}
+            "plugin_inputs": plugin_inputs(REPO, recipe)}
 
 
 def manifest_check(manifest, sdk, repo=None):
-    require(manifest.get("schema") == 1 and manifest.get("target") == TARGET and manifest.get("target_os") == "linux"
+    recipe = recipes.identify(manifest)
+    require(manifest.get("target") == TARGET and manifest.get("target_os") == "linux"
             and manifest.get("target_env") == "ohos", "来源目标不匹配")
-    require(manifest.get("ffmpeg_version") == VERSION and manifest.get("source") == {
-        "url": URL, "archive_sha256": ARCHIVE_SHA, "modified": False}, "FFmpeg 来源不匹配")
+    require(manifest.get("ffmpeg_version") == VERSION, "FFmpeg 来源不匹配")
     require(manifest.get("configure") == configure_args(sdk) and manifest.get("logical_prefix") == "/usr",
             "manifest configure 不匹配")
     require(manifest.get("plugin_abi") == 1 and manifest.get("thread_policy") == [1, 0], "OHOS ABI/线程策略不匹配")
@@ -256,13 +268,15 @@ def manifest_check(manifest, sdk, repo=None):
         if repo:
             require(sha(rust[key]["path"]) == rust[key]["sha256"], f"Rust 工具 bytes 不匹配：{key}")
     if repo:
-        require(manifest.get("plugin_inputs") == plugin_inputs(repo), "plugin/workspace/recipe 来源不匹配")
+        require(manifest.get("plugin_inputs") == plugin_inputs(repo, recipe), "plugin/workspace/recipe 来源不匹配")
 
 
 def verify_inputs(prefix, sdk, repo):
     m = read_json(prefix / "ohos-ffmpeg-inputs.json")
     manifest_check(m, sdk, repo)
     config_check(prefix, sdk)
+    recipe = recipes.identify(m)
+    verify_source_materials(prefix, recipe)
     for path in (prefix / "include").rglob("*"):
         require(not path.is_symlink(), "FFmpeg header 拒绝 symlink")
     require(m.get("headers") == tree_hashes(prefix / "include"), "FFmpeg headers bytes 不匹配")
@@ -274,6 +288,8 @@ def verify_inputs(prefix, sdk, repo):
         path = prefix / "lib" / name
         # make install 的版本 symlink 仅允许在私有编译输入中；发布库必须普通文件。
         require(path.resolve().parent == (prefix / "lib").resolve(), "输入库逃逸 lib 目录")
+        if recipe == recipes.MODIFIED and name == "libavcodec.so.62":
+            recipes.kernel_identity(path.resolve(), m.get("h264_dc_kernel", {}))
         info = elf(path)
         require(info["soname"] == name and info["needed"] == sorted(DEPS[name]), f"OHOS 输入 ELF 闭包不匹配：{name}")
         configuration = re.search(r'^#define FFMPEG_CONFIGURATION (".*")$', (prefix / "FFmpeg-config.h").read_text(), re.M)
@@ -286,14 +302,17 @@ def verify_inputs(prefix, sdk, repo):
 
 def verify_bundle(bundle, sdk):
     require(bundle.is_dir() and not bundle.is_symlink(), "bundle 必须为普通目录")
-    require({p.name for p in bundle.iterdir()} == FILES, "bundle 文件集合不匹配")
+    m = read_json(bundle / "manifest.json")
+    recipe = recipes.identify(m)
+    files = files_for_recipe(recipe)
+    require({p.name for p in bundle.iterdir()} == files, "bundle 文件集合不匹配")
     for path in bundle.iterdir():
         regular(path)
     m = read_json(bundle / "manifest.json")
     manifest_check(m, sdk)
     config_check(bundle, sdk)
-    require(set(m.get("files", {})) == FILES - {"manifest.json"}, "manifest 文件集合不匹配")
-    for name in FILES - {"manifest.json"}:
+    require(set(m.get("files", {})) == files - {"manifest.json"}, "manifest 文件集合不匹配")
+    for name in files - {"manifest.json"}:
         require(m["files"][name] == sha(bundle / name), f"manifest hash 不匹配：{name}")
     summaries = {}
     for name in LIBS:
@@ -313,20 +332,47 @@ def verify_bundle(bundle, sdk):
     # 来源材料也要核对固定内容，不能用改写的 manifest 自证许可/源码身份。
     require((bundle / "FFmpeg-LGPL-2.1-or-later.txt").read_bytes() ==
             (REPO / "third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1").read_bytes(), "LGPL 许可不匹配")
-    require((bundle / "FFmpeg-NOTICE.txt").read_text() == notice(), "NOTICE 不匹配")
-    require((bundle / "FFmpeg-SOURCE.txt").read_text() == source_material(), "源码取得材料不匹配")
+    require((bundle / "FFmpeg-NOTICE.txt").read_text() == notice(recipe), "NOTICE 不匹配")
+    require((bundle / "FFmpeg-SOURCE.txt").read_text() == source_material(recipe), "源码取得材料不匹配")
+    verify_source_materials(bundle, recipe)
+    if recipe == recipes.MODIFIED:
+        recipes.kernel_identity(bundle / "libavcodec.so.62", m.get("h264_dc_kernel", {}))
     return summaries
 
 
-def notice():
-    return (f"FFmpeg {VERSION}; LGPL-2.1-or-later; unmodified upstream source.\n"
+def verify_source_materials(directory, recipe):
+    for name in recipes.EXTRA:
+        path = directory / name
+        if recipe == recipes.MODIFIED:
+            regular(path)
+            require(path.read_bytes() == recipes.materials()[name], "受信源码材料 bytes 不匹配")
+        else:
+            require(not path.exists() and not path.is_symlink(), "原样来源不能携带 patch 材料")
+
+
+def notice(recipe="upstream"):
+    label = "unmodified upstream source" if recipe == "upstream" else "local AArch64 8-bit H264 luma DC patch"
+    return (f"FFmpeg {VERSION}; LGPL-2.1-or-later; {label}.\n"
             "H.264/HEVC decoder/parser only; shared PIC; AArch64 NEON enabled.\n"
             "No GPL/nonfree/version3/network/programs/autodetect.\n"
             "OHOS ARM64 plugin ABI v1; software thread_count=1, thread_type=0.\n"
             "Build/ELF proof only; normal HAP loading, pixel parity, throughput and live interoperability pending.\n")
 
 
-def source_material():
+def source_material(recipe="upstream"):
+    if recipe == recipes.MODIFIED:
+        return (f"Base upstream source: {URL}\nSHA-256: {ARCHIVE_SHA}\n"
+                f"Modified recipe: {recipes.MODIFIED}; local patch is not signed by upstream.\n"
+                f"FFmpeg-CHANGES.diff SHA-256: {recipes.PATCH_SHA}\n"
+                f"FFmpeg-SOURCE-RECIPE.json SHA-256: {recipes.PIN_SHA}\n"
+                f"Corresponding source asset: {recipes.ASSET}\n"
+                "Distributors must publish this complete base archive + patch + recipe + builder asset beside each binary on the same release/download page.\n"
+                "Extract the pinned base archive into a fresh tree; verify preimages in FFmpeg-SOURCE-RECIPE.json.\n"
+                "Apply: patch --dry-run --batch --forward --fuzz=0 -p1 < FFmpeg-CHANGES.diff, then repeat without --dry-run.\n"
+                "Reject offsets/fuzz and verify postimages and unchanged oracle before configure.\n"
+                "Rebuild from matching FreeRemoteDesk source with tools/build-ffmpeg-ohos.sh --archive ffmpeg-8.1.2.tar.xz --source-recipe frd-h264dc-aarch64-v1.\n"
+                "Exact configure: configure-args.json; SDK/tool/Rust/workspace/output digests: manifest.json.\n"
+                "Retain LGPL license, patch, recipe and these source materials when redistributing.\n")
     return (f"Upstream source: {URL}\nSHA-256: {ARCHIVE_SHA}\n"
             "Unmodified source; no patches. Retrieve the exact archive using:\n"
             f"curl --fail --location '{URL}' -o ffmpeg-{VERSION}.tar.xz\n"
@@ -376,9 +422,8 @@ def build(args, sdk):
     require(sha(archive) == ARCHIVE_SHA, "FFmpeg archive SHA256 不匹配")
     attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=root))
     print(f"私有本次构建：{attempt}", flush=True)
-    with tarfile.open(archive) as tar:
-        tar.extractall(attempt, filter="data")
-    source, dest = attempt / f"ffmpeg-{VERSION}", attempt / "dest"
+    source, _ = recipes.prepare(archive, attempt / "source", args.source_recipe)
+    dest = attempt / "dest"
     prefix = dest / "usr"
     config = configure_args(sdk)
     # 禁止环境偷偷注入主机库、编译/链接选项或旧 Cargo artifact。
@@ -401,7 +446,11 @@ def build(args, sdk):
     # 记录实际 AArch64 汇编对象与 NEON dispatch 符号；并非设备运行/性能证明。
     objects = sorted(str(p.relative_to(source)) for p in source.rglob("*.o") if "/aarch64/" in str(p.relative_to(source)))
     require(any("h264" in p for p in objects) and any("hevc" in p for p in objects), "缺少 H264/HEVC AArch64 编译对象")
-    manifest = base_manifest(sdk, identity, rust)
+    manifest = base_manifest(sdk, identity, rust, args.source_recipe)
+    if args.source_recipe == recipes.MODIFIED:
+        for name, data in recipes.materials().items():
+            (prefix / name).write_bytes(data)
+        manifest["h264_dc_kernel"] = recipes.kernel_identity(source / "libavcodec/libavcodec.so.62")
     manifest["assembly_objects"] = {name: sha(source / name) for name in objects}
     manifest["headers"] = tree_hashes(prefix / "include")
     manifest["libraries"] = {name: sha(prefix / "lib" / name) for name in LIBS[:2]}
@@ -425,8 +474,14 @@ def build(args, sdk):
     for name in CONFIG_FILES:
         shutil.copyfile(prefix / name, bundle / name)
     shutil.copyfile(REPO / "third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1", bundle / MATERIALS[0])
-    (bundle / MATERIALS[1]).write_text(notice())
-    (bundle / MATERIALS[2]).write_text(source_material())
+    (bundle / MATERIALS[1]).write_text(notice(args.source_recipe))
+    (bundle / MATERIALS[2]).write_text(source_material(args.source_recipe))
+    if args.source_recipe == recipes.MODIFIED:
+        for name, data in recipes.materials().items():
+            (bundle / name).write_bytes(data)
+        asset = attempt / recipes.ASSET
+        recipes.write_asset(archive, asset)
+        manifest["corresponding_source"] = {"asset": asset.name, "sha256": sha(asset)}
     manifest["files"] = {p.name: sha(p) for p in bundle.iterdir()}
     manifest["elf"] = {name: elf(bundle / name) for name in LIBS}
     save_json(bundle / "manifest.json", manifest)
@@ -447,6 +502,7 @@ def main():
     b.add_argument("--sdk", default=argparse.SUPPRESS)
     b.add_argument("--build-root", default=str(REPO / "target/ffmpeg-ohos"))
     b.add_argument("--archive", help="可选已缓存、仍须验证固定 hash 的上游源码")
+    b.add_argument("--source-recipe", choices=recipes.CHOICES, default="upstream")
     b.add_argument("--target", default=TARGET)
     b.add_argument("--jobs", type=int, default=2)
     v = commands.add_parser("verify", help="静态 bundle 门，不执行 ELF")

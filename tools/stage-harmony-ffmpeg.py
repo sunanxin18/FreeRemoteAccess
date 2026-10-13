@@ -13,9 +13,9 @@ hap_check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hap_check)
 
 
-def destinations():
+def destinations(recipe="upstream"):
     return {**{f'libs/arm64-v8a/{n}': n for n in hap_check.ffmpeg.LIBS},
-            **{f'src/main/resources/rawfile/ffmpeg-ohos/{n}': n for n in hap_check.MATERIALS}}
+            **{f'src/main/resources/rawfile/ffmpeg-ohos/{n}': n for n in hap_check.materials(recipe)}}
 
 
 def safe_path(entry, path):
@@ -26,14 +26,29 @@ def safe_path(entry, path):
             break
 
 
+def owned_files(recorded):
+    # 旧版本是无 envelope 的 schema1 文件 map；永远按旧集合解释。
+    if 'schema' not in recorded:
+        recipe, files = 'upstream', recorded
+    else:
+        hap_check.require(set(recorded) == {'schema', 'recipe', 'files'} and
+                          type(recorded['schema']) is int and recorded['schema'] == 2,
+                          '暂存 ownership envelope 不匹配')
+        recipe, files = recorded['recipe'], recorded['files']
+    expected = destinations(recipe)
+    hap_check.require(isinstance(files, dict) and set(files) == set(expected), '暂存 ownership 清单不匹配')
+    hap_check.require(all(isinstance(h, str) and hap_check.re.fullmatch('[0-9a-f]{64}', h) for h in files.values()),
+                      '暂存 ownership hash 不匹配')
+    return files
+
+
 def clean(entry):
     marker = entry / '.frd-ffmpeg-stage.json'
     safe_path(entry, marker)
     if not marker.exists():
         return
     hap_check.ffmpeg.regular(marker)
-    recorded = json.loads(marker.read_text())
-    hap_check.require(set(recorded) == set(destinations()), '暂存 ownership 清单不匹配')
+    recorded = owned_files(json.loads(marker.read_text()))
     for relative, digest in recorded.items():
         path = entry / relative
         safe_path(entry, path)
@@ -48,7 +63,8 @@ def clean(entry):
 def stage(entry, bundle, sdk, digest):
     hap_check.accepted_bundle(bundle, sdk, digest)
     clean(entry)
-    files = destinations()
+    recipe = hap_check.ffmpeg.recipes.identify(hap_check.ffmpeg.read_json(bundle / "manifest.json"))
+    files = destinations(recipe)
     for relative in files:
         path = entry / relative
         hap_check.require(not path.exists() and not path.is_symlink(), f'拒绝覆盖未知暂存文件：{path}')
@@ -63,7 +79,8 @@ def stage(entry, bundle, sdk, digest):
         with tempfile.TemporaryDirectory(prefix='.frd-marker-', dir=entry) as temporary:
             private_marker = Path(temporary) / 'ownership.json'
             with private_marker.open('x') as output:
-                json.dump({relative: hashlib.sha256(data).hexdigest() for relative, data in content.items()}, output)
+                json.dump({'schema': 2, 'recipe': recipe,
+                           'files': {relative: hashlib.sha256(data).hexdigest() for relative, data in content.items()}}, output)
             os.link(private_marker, marker)
             marker_published = True
         for relative, data in content.items():

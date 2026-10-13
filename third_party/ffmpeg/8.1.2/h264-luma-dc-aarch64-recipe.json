@@ -1,0 +1,30 @@
+{
+  "architecture": "aarch64",
+  "archive_sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+  "author": "FreeRemoteDesk contributors",
+  "date": "2026-10-13",
+  "files": {
+    "libavcodec/aarch64/h264dsp_init_aarch64.c": {
+      "post": "54ed484b42d9c51e22dafa8d379c2f7e41a753d7bea28b10ed42229ebcf3d4c0",
+      "pre": "f8f12b10c797ad875ccbf2481447e2d5a2b6b7c6de70e8dc92da7cfc0de80cb0"
+    },
+    "libavcodec/aarch64/h264idct_neon.S": {
+      "post": "b0debd265560c16110a0bfa0c2d92ceb283cf1fe967776ea00fad4274eb06cc4",
+      "pre": "963ffe5f31b5a6a422e13b0d394cf5630126927abfb23aa214f7cbe83d60683f"
+    }
+  },
+  "kernel": {
+    "sha256": "1e70d378b34fb196afd0942b9bd0c31c1715b4042c6c3e8f032dad5e76b42476",
+    "size": 276,
+    "symbol": "ff_h264_luma_dc_dequant_idct_neon"
+  },
+  "license": "LGPL-2.1-or-later",
+  "patch": "patches/0001-aarch64-h264-luma-dc-neon.patch",
+  "patch_sha256": "4527ec807869f2a8ae8c2843ce51c693f3cbb728104e4fb9e617627dec593c7c",
+  "provenance": "FreeRemoteDesk commit 93e0a6b260cabb8cb4094b54e33a2fd8d64af2d6; derived from unchanged FFmpeg 8.1.2 C arithmetic and existing AArch64 macros; local patch is not signed by upstream.",
+  "recipe": "frd-h264dc-aarch64-v1",
+  "unchanged_oracle": {
+    "libavcodec/h264idct_template.c": "13b6d5b4fc41f4c22350c84209970af86aac7d445e867b362a8808f076487735"
+  },
+  "version": "8.1.2"
+}

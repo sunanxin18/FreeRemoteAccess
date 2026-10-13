@@ -35,3 +35,39 @@ pwsh -NoProfile -Command "Import-Module Pester -Force; Invoke-Pester -Script 'to
 本目录保存 FFmpeg 原始 `LICENSE.LGPLv2.1`；`changes.diff` 记录源码未修改。
 
 该构建仅建立 CPU software HEVC Main444 8-bit 精确解码，不声明任何 FFmpeg hardware exact 路径。
+
+## 固定 AArch64 H.264 luma DC 修改配方
+
+OHOS builder 现在显式接受 `--source-recipe upstream`（默认，保留原 schema 1）
+或 `--source-recipe frd-h264dc-aarch64-v1`（schema 2）。后者仅支持 AArch64，
+使用 `h264-luma-dc-aarch64-recipe.json` 与
+`patches/0001-aarch64-h264-luma-dc-neon.patch` 固定的两文件修改；
+`tools/ffmpeg-source-recipe.py` 固定 pin/patch hash，验证完整归档、preimage、
+无 fuzz/offset 的 fresh 重放、postimage 及所有其他文件未改变。不能传入任意 patch。
+此来源身份与每个 bundle 的输入记录和真实 ELF 可执行核字节相互核对。
+原 `changes.diff` 继续仅说明 upstream 配方；修改配方没有“源码未修改”标签。
+
+```sh
+tools/build-ffmpeg-ohos.sh --archive /path/to/ffmpeg-8.1.2.tar.xz \
+  --source-recipe frd-h264dc-aarch64-v1
+```
+
+修改包附带 `FFmpeg-CHANGES.diff` 和 `FFmpeg-SOURCE-RECIPE.json`。同一 unique
+build attempt 还生成并逐字节验证
+`FreeRemoteDesk-ffmpeg-8.1.2-frd-h264dc-aarch64-v1-corresponding-source.zip`，
+包含完整 base archive、许可、固定 patch/pin、builder/helper 和 source manifest。
+分发者必须将此 ZIP 与 binary 放在同一 release/download 页面；本地生成不表示已发布。
+原归档保持原 hash；local patch 没有上游发布签名。修改来源不能误指仅含原样源码的 ZIP。
+
+从对应源码 ZIP 解压后，可用其中 helper 单独重建修改树：
+
+```sh
+python3 tools/ffmpeg-source-recipe.py --archive ffmpeg-8.1.2.tar.xz \
+  --destination fresh-source --source-recipe frd-h264dc-aarch64-v1
+```
+
+OHOS 构建还需要匹配的完整 FreeRemoteDesk 源码、官方 API26 / 26.0.0.105 SDK
+和 coherent Rust 1.96.0。SDK、configure、codec、线程、plugin ABI 保持原合同。
+HAP 仍为固定六个 native 库；新增的是来源材料。此配方与静态 ELF/HAP 验证
+不能代替目标进程的 dispatch、像素、性能或 live interoperability 验收。
+桌面 builders 尚未消费这个修改配方，不宣称其新核已验证。
