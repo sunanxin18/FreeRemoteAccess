@@ -1,0 +1,18 @@
+{
+  "format": "FRDPLN01, magic8 then records: 5 LEu32 width,height,header,wire_len,expected_len; wire bytes; original RGB24 output bytes",
+  "records": 64,
+  "generation_command": "cargo run --offline --locked -p frd-rdp-legacy-kernels --example generate_planar_fixture",
+  "generation_source": "examples/generate_planar_fixture.rs",
+  "generation_source_sha256": "ac1116f21b140fa046d6501a624dcbd0fee0135f1bd23a0970aa04feaeb629c0",
+  "fixture_sha256": "32aff1b11ae76167f9dae70d8c244468ab04fbb67f6f72bbd9e7d63fdd44c9a7",
+  "fixture_bytes": 116497,
+  "oracle": "Unmodified registry ironrdp-graphics =0.9.0 public rdp6::BitmapStreamDecoder::decode_bitmap_stream_to_rgb24; no NativeKernels call in generator; root has no graphics/session patch at generation time",
+  "source_archive_sha256": "c7493e426b6a8104cd497e518ba7781a9c7fc9a5f58a9cc0c1111e6d66f63bcc",
+  "decoder_source_sha256": {
+    "ironrdp-graphics-0.9.0/src/rdp6/bitmap_stream/decoder.rs": "f127369afbe9cb50d60334281a6b481e00d5a22e32616457ac7d03c96058659a",
+    "ironrdp-graphics-0.9.0/src/rdp6/rle.rs": "ad85655f20b6dfbf4fa3dacbad938fffaa8a56f98ea76043453a64975aa853b4",
+    "ironrdp-pdu-0.9.0/src/basic_output/bitmap/rdp6.rs": "5160eb3abf472811fa2c6350b716915982c04fecba736c05c71432bb0deee129"
+  },
+  "coverage": "28 configurations CLL1..7 x alpha x subsampling each with6x8x8 discriminator grid and3x3 odd geometry (56 records); ARGB33x1 alpha/noalpha RGB marker planes(2); RLE256x2 delta records previous0,1,127,128,254,255(6)",
+  "boundary": "Original decoder expected output includes alpha consumption and raw parser padding/RLE decode; native tests exercise leaves only. No production dispatcher, session publication or runtime interoperability claim."
+}

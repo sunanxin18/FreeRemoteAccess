@@ -1,4 +1,4 @@
-//! 受检查的 RemoteFX 数值与 packed Bitmap run 叶子，不解析协议，也不代表 codec/session 就绪。
+//! 受检查的 RemoteFX 数值、packed Bitmap run 与 RDP6 planar 叶子，不解析协议，也不代表 codec/session 就绪。
 //! 仅 AArch64 NEON 或非 macOS x86/x86_64 SSE2；没有 scalar 后备。
 //! 所有错误均在修改调用方输出之前返回。参见 README.md 的算术契约。
 
@@ -23,6 +23,8 @@ pub enum KernelError {
     Length,
     InvalidQuant,
     ColorOverflow,
+    InvalidDimensions,
+    InvalidColorLossLevel,
 }
 impl std::fmt::Display for KernelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,6 +33,8 @@ impl std::fmt::Display for KernelError {
             Self::Length => "缓冲区长度不符合叶子契约",
             Self::InvalidQuant => "量化值必须在 0..=16 范围",
             Self::ColorOverflow => "色彩转换的上游算术中间值溢出",
+            Self::InvalidDimensions => "平面尺寸为零或尺寸算术溢出",
+            Self::InvalidColorLossLevel => "色彩损失级别必须在 1..=7 范围",
         })
     }
 }
@@ -65,9 +69,21 @@ impl PackedDepth {
     }
 }
 
+/// RDP6 YCoCg 布局；alpha flag 决定输出通道顺序，不消费 alpha plane。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanarLayout {
+    pub width: usize,
+    pub height: usize,
+    pub subsampled: bool,
+    pub color_loss_level: u8,
+    pub has_alpha: bool,
+}
+
 type XorKernel = unsafe fn(&[u8], &[u8], &mut [u8]);
 type MaskKernel = unsafe fn(Option<&[u8]>, &[u8], u8, u8, &mut [u8]);
 type DitherKernel = unsafe fn(&[u8], &[u8], bool, &mut [u8]);
+type RgbPlanarKernel = unsafe fn(&[u8], &[u8], &[u8], &mut [u8]);
+type YcocgKernel = unsafe fn(PlanarLayout, &[u8], &[u8], &[u8], &mut [u8]);
 type ColorKernel = unsafe fn(&[i16], &[i16], &[i16], &mut [u8]) -> Result<(), KernelError>;
 
 /// 构造即验证 CPU；私有函数表不能由调用者伪造，也不能启用 scalar。
@@ -84,6 +100,9 @@ pub struct NativeKernels {
     xor_previous: XorKernel,
     mask_previous: MaskKernel,
     dither: DitherKernel,
+    planar_delta: unsafe fn(&[u8], &mut [u8]),
+    planar_rgb: RgbPlanarKernel,
+    planar_ycocg: YcocgKernel,
 }
 impl NativeKernels {
     /// 原始字节精确搬运；任意长度含空，不要求 padding 或对齐。
@@ -158,6 +177,68 @@ impl NativeKernels {
         depth.check(b_le, dst)?;
         // SAFETY: ISA、两种 pixel 尺寸和完整目标 pixel 数已检查。
         unsafe { (self.dither)(a_le, b_le, starts_with_b, dst) };
+        Ok(())
+    }
+    /// 仅用于 caller 指定的非首行：逐 byte delta 解码后与上一行模 256 相加。
+    pub fn resolve_planar_delta(
+        &self,
+        previous: &[u8],
+        current: &mut [u8],
+    ) -> Result<(), KernelError> {
+        if previous.len() != current.len() {
+            return Err(KernelError::Length);
+        }
+        // SAFETY: ISA、相等长度及无重叠借用已检查；短尾在本地数组上执行。
+        unsafe { (self.planar_delta)(previous, current) };
+        Ok(())
+    }
+    /// 同长度 R/G/B planes 合并为 RGB24；允许空 slice，没有 stride 或 padding 假设。
+    pub fn rgb_planes_to_rgb24(
+        &self,
+        r: &[u8],
+        g: &[u8],
+        b: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), KernelError> {
+        if r.len() != g.len() || r.len() != b.len() || r.len().checked_mul(3) != Some(out.len()) {
+            return Err(KernelError::Length);
+        }
+        // SAFETY: ISA 与全部输入/输出长度在写入前检查。
+        unsafe { (self.planar_rgb)(r, g, b, out) };
+        Ok(())
+    }
+    /// u8 shift 截断后再符号扩展；无 alpha 时输出 B/G/R，有 alpha 时输出 R/G/B。
+    /// alpha plane 的解析/消费由 caller 负责。2×2 chroma 支持最后单行/单列。
+    pub fn ycocg_planes_to_rgb24(
+        &self,
+        layout: PlanarLayout,
+        y: &[u8],
+        co: &[u8],
+        cg: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), KernelError> {
+        if layout.width == 0 || layout.height == 0 {
+            return Err(KernelError::InvalidDimensions);
+        }
+        let full = layout
+            .width
+            .checked_mul(layout.height)
+            .ok_or(KernelError::InvalidDimensions)?;
+        let output = full.checked_mul(3).ok_or(KernelError::InvalidDimensions)?;
+        let (cw, ch) = if layout.subsampled {
+            (layout.width.div_ceil(2), layout.height.div_ceil(2))
+        } else {
+            (layout.width, layout.height)
+        };
+        let chroma = cw.checked_mul(ch).ok_or(KernelError::InvalidDimensions)?;
+        if !(1..=7).contains(&layout.color_loss_level) {
+            return Err(KernelError::InvalidColorLossLevel);
+        }
+        if y.len() != full || co.len() != chroma || cg.len() != chroma || out.len() != output {
+            return Err(KernelError::Length);
+        }
+        // SAFETY: ISA、非零几何、checked sizes、CLL 与精确 plane/output 长度已检查。
+        unsafe { (self.planar_ycocg)(layout, y, co, cg, out) };
         Ok(())
     }
     pub fn detect() -> Result<Self, KernelError> {

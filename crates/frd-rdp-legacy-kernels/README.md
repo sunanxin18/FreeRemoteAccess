@@ -1,4 +1,4 @@
-# RemoteFX 原生数值叶子
+# RemoteFX / Bitmap / RDP6 原生数值叶子
 
 独立 checked backend；当前没有任何生产调用者、graphics patch、能力广告或 session 就绪接口。正常 dependencies 为空。registry `ironrdp-graphics =0.9.0`、`yuv =0.8.17` 和 `ironrdp-session =0.11.0` 仅为未修改的 dev oracle。完整协议接线、Bitmap/RDP6、平台包和 live 验证仍未完成。
 
@@ -51,3 +51,23 @@
 有界host benchmark：`cargo test --offline --locked --release -p frd-rdp-legacy-kernels --test bitmap_benchmark -- --ignored --nocapture`。128warmup、501samples×64batch；1/7/8/16/65/1024pixel和1/7/8mask。预分配输出，native包含checked入口/pattern准备；reference为普通优化Rust逐pixel循环和标准slice copy，不含checked入口；compiler可能自动向量化reference。输入和输出在调用边界用black_box，输出逐字节验证。报告median/p95，无性能断言；这不是原版Bitmap wire parser或whole-codec成本。
 
 本次macOS ARM64/Apple M4 debug与release packed及原A1测试通过，优化object中的完整块和短尾NEON指令已核对。Windows/Linux x86、AMD64、ARM64及OHOS ARM64仅完成Rust1.96优化object交叉编译与指令检查，未在这些目标执行parity/benchmark，未链接平台应用或验证package/runtime/live互操作。未来目标执行和完整Bitmap/RDP6/session门仍须单独完成；macOS Intel不支持。
+
+## RDP6 planar 叶子（A2.2，2026-10-13）
+
+当前仍没有 production dispatcher。`PlanarLayout` 包含非零 `width/height`、`subsampled`、`color_loss_level` 和 `has_alpha`。入口在任何写入前检查尺寸乘法、输出乘法、ceil chroma 尺寸、CLL 和全部 slice 长度；零尺寸或尺寸溢出返回 `InvalidDimensions`，CLL 非 1..=7 返回 `InvalidColorLossLevel`，slice 不匹配返回 `Length`。错误保持整个 output/current 原样。
+
+| 方法 | 精确契约 |
+|---|---|
+| `resolve_planar_delta(previous,current)` | 两 slice 长度完全相同，含空。偶数 d 转为 d/2，奇数转为 255−(d−1)/2，再与 previous 模 256 相加；没有 saturation 或水平 prefix。caller 只对非首行调用。 |
+| `rgb_planes_to_rgb24(r,g,b,out)` | 同长度三 planes，输出恰 3×len，含空；输出 `[R,G,B]`。没有 stride、alpha 或 subsampling。 |
+| `ycocg_planes_to_rgb24(layout,y,co,cg,out)` | Y 恰 width×height，Co/Cg 恰完整尺寸或 ceil(width/2)×ceil(height/2)，out 恰 3×full。Co/Cg 先在 u8 域左移 CLL−1 截断，再 cast i8 扩展到 i16；t=Y−Cg，R=t+Co，G=Y+Cg，B=t−Co，每通道 clamp0..255。has_alpha=true 输出 `[R,G,B]`，false 输出 `[B,G,R]`。 |
+
+所有数值中间值在 i16 内有界；无 alpha 数值输入，alpha plane 的读取、解码、丢弃仍是未来 parser caller 的责任。subsampled chroma 每 2×2 pixels 复用，奇数最后 row/column 只输出合法像素。没有全尺寸 chroma 分配；逐行处理最多 8 pixels 的本地 staging。
+
+`planar_neon.rs` 提供 16-byte delta、8-lane u8 shift/signed-widen/i16 add/sub/saturating-narrow、NEON `zip1` chroma duplicate 和 `st3` RGB24 pack。`planar_x86.rs` 以 SSE2 word shift 后 low-byte sign extension、`paddb/paddw/psubw/packuswb` 实现同一语义；RGB pack 用 SSE2 unpack、byte shift、mask/OR，不依赖 SSSE3。两个 x86 架构分别 cfg/import/编译，macOS Intel 没有 backend。固定 lane primitive 不内联，完整块与尾部 staging 调用同一 ISA 路径；只在有限数组间搬运布局 bytes，不以 scalar color/delta loop 作为生产后备。
+
+`planar_parity` 覆盖 delta 全 65536 pairs，CLL1..7 × alpha × subsampling，11×11 dimensions（1/2/3/7/8/15/16/17/63/64/65），所有 byte offset0..15、RGB marker、尾部 canary、尺寸/CLL/长度错误原子性。`planar_guard_pages` 将每个独立 plane/output 紧靠不可访问页首/页尾，覆盖 empty RGB/delta 和完整块/短尾；不要求外部 padding。`tests/fixtures/planar-original.bin` 是未修改 registry IronRDP decoder 实际输出的 64 条固定 records，包含 28 色彩配置的6×8×8判别值与3×3各 chroma cell 不同的奇数尺寸、ARGB marker 与六条 RLE delta plane。生成源码、hash、格式与来源见 `tests/fixtures/planar-original-provenance.json`。tests 同时对照固定 bytes 与当前未修改 dev oracle；后续全局 graphics patch 前仍须完成独立 oracle workspace 隔离。
+
+显式 bounded host benchmark：`cargo test --offline --locked --release -p frd-rdp-legacy-kernels --test planar_benchmark -- --ignored --nocapture`。128 warmup、501 samples×64 batch，1/7/8/16/65/1024/4096 pixels。双方使用预分配 output，delta 双方每次重置输入；native 包含 checked 入口，reference 是普通优化 Rust 数值/布局循环，compiler 允许优化或自动向量化。报告 median/p95，不设性能断言，不代表原版 parser/RLE/whole-codec/session 成本。
+
+macOS ARM64/Apple M4 已执行 debug/release parity、guard 与 benchmark，优化对象中的实际 NEON primitive/调用路径已检查。Windows/Linux x86、AMD64、ARM64 和 OHOS ARM64仅交叉编译优化 object 并核对 SSE2/NEON 指令；没有目标执行、per-target benchmark、应用链接、包或 live 互操作证明。完整 RDP6 alpha/RLE/parser 消费与 session publication 接线仍待后续独立 scope。

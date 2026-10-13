@@ -10,6 +10,8 @@ mod arch;
 use arch::*;
 #[path = "bitmap.rs"]
 mod bitmap;
+#[path = "planar.rs"]
+mod planar;
 
 pub(super) fn available() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -37,6 +39,9 @@ pub(super) fn kernels() -> NativeKernels {
         xor_previous: bitmap::xor_previous,
         mask_previous: bitmap::mask_previous,
         dither: bitmap::dither,
+        planar_delta: planar::delta,
+        planar_rgb: planar::rgb,
+        planar_ycocg: planar::ycocg,
     }
 }
 

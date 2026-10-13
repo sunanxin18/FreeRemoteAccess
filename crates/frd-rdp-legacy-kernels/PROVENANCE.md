@@ -10,3 +10,7 @@
 Cargo.lock 保留以上 registry pin；没有 `ironrdp-graphics` crates.io patch，也没有 vendored 第二份生产 decoder。未来任何 production dispatch 接入需另行审查并保留这些独立 oracle。
 
 A2.1 packed Bitmap run（2026-10-13）：checked depth/length/mask契约、48byte周期pattern、有限mask准备与NEON/SSE2显式16bytecopy/XOR为本项目新实现；没有复制第三方parser、RLEdecoder或bulk libc实现。原始packed555/565/24语义遵循已冻结Task4A2.1接口合同；test-only逐pixeloracle独立于生产pattern/SIMD，555高位、555/565WHITE以及跨lane24bit交替预期值手写固定。tests/common仅为dev测试模块，不进入正常依赖。原A1来源/fixture/pin及许可证不变。
+
+A2.2 RDP6 planar（2026-10-13）：新的 checked layout/API、NEON/SSE2 delta/color/chroma/pack 和有限 staging 按固定原版 `rdp6/rle.rs` 与 `rdp6/bitmap_stream/decoder.rs` 语义实现；原文件及 PDU layout 文件精确 hashes 已追加到 `SOURCE-SHA256SUMS`。没有复制 parser 或 dispatcher，没有新增正常依赖或修改 registry。
+
+独立固定 fixture `tests/fixtures/planar-original.bin` 的 expected bytes 由 `examples/generate_planar_fixture.rs` 直接调用未修改 registry `ironrdp-graphics =0.9.0` 的公开 `rdp6::BitmapStreamDecoder` 输出，生成器不调用 NativeKernels 或 test-only 色彩公式。原版消费输入含 alpha plane、raw padding 和 RLE delta；64 条记录保留原始 wire 与原版 output。生成源码 hash、archive/source hashes、fixture hash、binary schema、精确 command 与判别范围见 `tests/fixtures/planar-original-provenance.json`，fixture hash 同时保存在 `tests/fixtures/SHA256SUMS`。这些 bytes 在 native 实现前生成。普通 test-only scalar model 另作穷举与尺寸组合 oracle，不替代原版固定输出。当前根无 graphics/session patch；未来 A2.3 必须先隔离原版 oracle 再增加 production patch，不能让 dev oracle 自动指向新实现。

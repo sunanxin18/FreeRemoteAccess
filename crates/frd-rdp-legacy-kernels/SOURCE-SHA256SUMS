@@ -8,3 +8,6 @@ a29af9320d6fe24f86d293615088f3797ad08aa4cb0079b39799cd4a81e06127  yuv-0.8.17/src
 227b2b0f37483a9c8b8ff313ef1766b522a790b1539e2b62d5b54cd27aec90fc  upstream-tests/rlgr.rs
 35564c90eb9b0a99ae01733ca7ce5d4b2e01ea20119a85efdd5122f6da450a18  upstream-tests/rfx.rs
 e36d61b41b9fa8bd74c61dc2744991cd8143c2610f00d69a5acb0191dd126a88  upstream-tests/color_conversion.rs
+f127369afbe9cb50d60334281a6b481e00d5a22e32616457ac7d03c96058659a  ironrdp-graphics-0.9.0/src/rdp6/bitmap_stream/decoder.rs
+ad85655f20b6dfbf4fa3dacbad938fffaa8a56f98ea76043453a64975aa853b4  ironrdp-graphics-0.9.0/src/rdp6/rle.rs
+5160eb3abf472811fa2c6350b716915982c04fecba736c05c71432bb0deee129  ironrdp-pdu-0.9.0/src/basic_output/bitmap/rdp6.rs
