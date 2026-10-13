@@ -4,3 +4,9 @@ local.properties
 entry/build/
 entry/.cxx/
 signing/
+# 仅构建脚本拥有的已验证 FFmpeg 暂存文件。
+entry/libs/arm64-v8a/libavutil.so.60
+entry/libs/arm64-v8a/libavcodec.so.62
+entry/libs/arm64-v8a/libfreeremotedesk_ffmpeg.so
+entry/src/main/resources/rawfile/ffmpeg-ohos/
+entry/.frd-ffmpeg-stage.json

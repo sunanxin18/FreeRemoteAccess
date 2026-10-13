@@ -1,6 +1,16 @@
 {
   "apiType": "stageMode",
   "buildOption": {
+    "nativeLib": {
+      "debugSymbol": {
+        "strip": true,
+        "exclude": [
+          "**/libavutil.so.60",
+          "**/libavcodec.so.62",
+          "**/libfreeremotedesk_ffmpeg.so"
+        ]
+      }
+    },
     "externalNativeOptions": {
       "path": "./src/main/cpp/CMakeLists.txt",
       "arguments": "",
