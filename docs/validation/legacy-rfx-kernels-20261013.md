@@ -1,6 +1,6 @@
 # Legacy RemoteFX 数值 SIMD 验证
 
-日期：2026-10-13。`frd-rdp-legacy-kernels` 是独立的 checked 数值后端，尚未接入生产 IronRDP graphics dispatch。本记录不将 Progressive、Bitmap/RDP6、legacy RemoteFX 或 OHOS 客户端整体标为已完成。
+日期：2026-10-13。`frd-rdp-legacy-kernels` 是独立的 checked 数值后端，已有显式 Bitmap/RDP6 消费者，session 生产默认尚未切换。本记录不将 Progressive、Bitmap/RDP6、legacy RemoteFX 或 OHOS 客户端整体标为已完成。
 
 ## 范围与契约
 
@@ -109,3 +109,13 @@ Windows/Linux 各 i686、x86_64、ARM64，macOS ARM64 与 OHOS ARM64 共八个�
 Host macOS ARM64 原版16,721 catalog与另7,616固定原版源码生成的畸形输入全部逐字节/结果一致；121,856偏移canary、80命令族深度组合/224header行变体通过。实际生产rle.rs的debug strictclippy及opt3/thinLTO release各7 tests、kernel Bitmap7、RDP321/3ignored通过。独立registry oracle保持，与K无依赖循环；显式FRD-MODIFICATIONS.json固定修改后sourcehash，原source/archive检查仍严格，6个来源mutation测试通过。没有让期望值来自生产实现。
 
 独立审查 Spec compliant / Approved，无Critical/Important；protocol既有25个clippy及4个test警告均在未改文件，不能称整包零警告；rle strictclippy本身干净。生产source SHA256为`43a90ca26fb4611395bbc78e9f6929d9797b96a35e2c26d1d7ab879ab46f1226`。完整报告与日志保留在`.superpowers/sdd/2026-10-13-harmony-clients/task-4a24-*`。本任务没有OHOS HAP/runtime/Windows实连证明，剩余RDP6、RLGR/RFX、像素转换和session接线继续受门禁约束。
+
+## A2.5 RDP6 parser native consumer
+
+`0f207c8` 让共享的 RDP6 plane parser/controller 在显式 native 入口中调用 checked copy/fill/delta/RGB/YCoCg 叶子；原入口默认保持。Alpha RLE 必须完整解码并消费，raw alpha 跳过完整平面；CLL0+CS 仍为ARGB，奇数chroma尺寸用ceil。三平面全成功后追加RGB，prefix保留；parser失败允许原私有scratch变化，Kernel错误分别携带来源，输出新增部分回滚且不回退scalar。零尺寸、乘积/isize、append和header特定aggregate/reservation失败走显式安全错误，不能说成原版panic或wrap行为相同。
+
+固定原版4,972 catalog（552成功/4,420错误）和4,181补充（950成功/3,227错误/4个64bit原panic），另六个独立BMP RGB。6,906个普通bitmap字节/错误parity与16个geometry安全拒绝分开；2,237个私有plane病例测实际成功consumption、partial和16偏移canary，bitmap及error的不可观测消费数不伪造。i686四个原64bitpanic只作native安全classification，不外推panic相同。宿主debug/release/strictclippy各20/20、Bitmap7、RDP321/3ignored及三变异控制通过；独立审查 Approved，无Critical/Important。四条既有RDP dead_code警告保留，新增scopedclippy干净。
+
+Root使用`83ec96e`隔离gitarchive加全部且仅15个`0f207c8`提交文件，保存每个overlay hash，再以官方API26 NDK和Rust1.96 offline/locked构建实际shipping graphics与相邻RDP库。新消费者构建5.74秒通过。私有harness复用作者的实际源码测试与Cargo-built library public API，由Cargo JSON精确识别五个OHOS rlib；首次direct rustc未加入host proc-macro搜索目录而E0463，补充该目录后成功，未改产品源码。目标ELF只依赖系统libc.so，SHA256 `e49b21f96a7d10a2d3cb3f7950525e3f7dd796c186e9896756d39a619a704e67`。发送前与guest SHA相同，手机/PC API26 ARM64各20/20、实际exit0，PC约0.49秒。
+
+原expect-test/bmp dev依赖缺offline缓存，因此15个原RLE/encoder测试使用严格Snapshot assertion adapter，不能宣称原framework或全上游suite运行。目标harness为debug正确性程序，没有目标优化性能、普通HAP解码接线、Windows/Linux native执行或真实RDP证明。现有登录包和UI未改变；session/default/native production eligibility仍待A2.6/7。全部artifact身份、命令、库哈希和两台原始日志在`target/harmony-rdp-platform-check-83ec96e/`，宿主记录在`target/task-4a25-*.log`。
