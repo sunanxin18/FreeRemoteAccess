@@ -8,3 +8,5 @@
 - 独立 session oracle `ironrdp-session =0.11.0` registry archive SHA-256 `3f1a5a20c24d8ebf47477f9f513201aeb894e7c7f779ea633ece65e42a9f0652`；只读 dev 依赖。PDU oracle `ironrdp-pdu =0.9.0` registry SHA-256 `4ccd1179a4d106df1930347701388b5c79bc3725fa7dab4438d57db0d9d19347`。
 
 Cargo.lock 保留以上 registry pin；没有 `ironrdp-graphics` crates.io patch，也没有 vendored 第二份生产 decoder。未来任何 production dispatch 接入需另行审查并保留这些独立 oracle。
+
+A2.1 packed Bitmap run（2026-10-13）：checked depth/length/mask契约、48byte周期pattern、有限mask准备与NEON/SSE2显式16bytecopy/XOR为本项目新实现；没有复制第三方parser、RLEdecoder或bulk libc实现。原始packed555/565/24语义遵循已冻结Task4A2.1接口合同；test-only逐pixeloracle独立于生产pattern/SIMD，555高位、555/565WHITE以及跨lane24bit交替预期值手写固定。tests/common仅为dev测试模块，不进入正常依赖。原A1来源/fixture/pin及许可证不变。

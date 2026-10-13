@@ -29,3 +29,25 @@
 显式 release benchmark：`cargo test --locked --release -p frd-rdp-legacy-kernels --test benchmark -- --ignored --nocapture`。固定 wire SHA-256，128 warmup、501 samples（每个样本批量 16 次以避免时钟分辨率导致零值），报告 median/p95 ns、backend、host 架构、oracle/native 比值；不设置性能断言。预分配 scratch 和输出，dequant/DWT 计时包含输入重置 copy，color 包含 checked 预检。component/full-tile 包含未修改 RLGR 的 parser **及其原版零 materialization**；zero leaf 单独测量，不能将组合计时称为全部 SIMD 的生产 decoder。
 
 跨目标编译不代表目标运行：Windows/Linux x86、x86_64、ARM64，OHOS ARM64 各自需要执行 parity/benchmark、包与 runtime 门。macOS 只覆盖 ARM64。native host 数值/指令证据同样不证明任何客户端能控制目标系统。
+
+## Packed Bitmap run 叶子（A2.1，2026-10-13）
+
+`PackedDepth::{Index8,Rgb555,Rgb565,Bgr24}` 分别为1/2/2/3个原始小端字节。555的高位也原样保留；WHITE由parser决定，555 `[ff,7f]` 与565 `[ff,ff]` 不合并。以下API只接受已构造的 `NativeKernels` 能力对象，任何错误返回 `Length` 并保持整个dst原样。
+
+| 方法 | 契约 |
+|---|---|
+| `copy_u8(src,dst)` | 两slice长度相等；任意字节长度，含空。 |
+| `fill_pixel(depth,pixel_le,dst)` | pixel长度精确等于depth；dst必须是完整pixel数；重复原始packed值。 |
+| `xor_previous(depth,previous,fg_le,dst)` | previous与dst长度相同，fg长度精确；逐原始字节XOR同一FG。 |
+| `mask_previous(depth,previous,fg_le,mask,bit_offset,dst)` | previous=None是caller决定的命令级first-line零背景；Some长度与dst相等。LSB-first，每pixel选择background或background XOR FG；checked `bit_offset+pixel_count<=8`。空目标仍检查offset，8有效，9..255错误。 |
+| `dither_pixels(depth,a_le,b_le,starts_with_b,dst)` | 两pixel长度精确；交替重复，caller按已发pixel奇偶传相位；odd split必须切换相位。 |
+
+长度和mask范围在首次输出写入前全部检查。借用不重叠；上一行依赖、跨行命令first-line状态、setFG、wire pair数量和dither相位属于未来parser caller。没有对whole parser scratch回滚的承诺，也没有生产注册或协议广告。
+
+实现与RemoteFX分文件：`bitmap.rs` 准备最多48bytes周期pattern，三个16byte相位处理packed24和6byte dither；一个mask最多准备24bytes。其后重复输出、copy和XOR均由 `bitmap_neon.rs` 的显式 `ldr/str q`、`eor v.16b` 或 `bitmap_x86.rs` 的显式SSE2 `movdqu/pxor` 完成。两种x86架构分别编译；不依赖SSSE3/SSE4。显式assembly阻止小case或bulk被LLVM替换成scalar/libc。短尾在本地16byte staging上执行相同vector操作，再只搬运合法字节；不足16byte的staging搬运允许标准slice copy，不作为bulk生产后备。
+
+`bitmap_parity` 是独立test-only逐pixel模型与手写packed24/555/565预期值；覆盖全部256mask、每个有效offset/count（含空）、两种previous模式、byte offset0..15、长度0/1/7/8/15/16/31/32/63/64/65、raw555高位、odd split、canary，以及pixel/长度/mask范围错误原子性。`bitmap_guard_pages` 在Unix将输入/输出及pixel参数分别紧靠页首和不可访问页尾，覆盖长度0..65及所有有效mask。没有新增正常dependencies。
+
+有界host benchmark：`cargo test --offline --locked --release -p frd-rdp-legacy-kernels --test bitmap_benchmark -- --ignored --nocapture`。128warmup、501samples×64batch；1/7/8/16/65/1024pixel和1/7/8mask。预分配输出，native包含checked入口/pattern准备；reference为普通优化Rust逐pixel循环和标准slice copy，不含checked入口；compiler可能自动向量化reference。输入和输出在调用边界用black_box，输出逐字节验证。报告median/p95，无性能断言；这不是原版Bitmap wire parser或whole-codec成本。
+
+本次macOS ARM64/Apple M4 debug与release packed及原A1测试通过，优化object中的完整块和短尾NEON指令已核对。Windows/Linux x86、AMD64、ARM64及OHOS ARM64仅完成Rust1.96优化object交叉编译与指令检查，未在这些目标执行parity/benchmark，未链接平台应用或验证package/runtime/live互操作。未来目标执行和完整Bitmap/RDP6/session门仍须单独完成；macOS Intel不支持。

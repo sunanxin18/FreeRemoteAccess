@@ -8,6 +8,8 @@ mod arch;
 #[path = "x86.rs"]
 mod arch;
 use arch::*;
+#[path = "bitmap.rs"]
+mod bitmap;
 
 pub(super) fn available() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -30,6 +32,11 @@ pub(super) fn kernels() -> NativeKernels {
         prefix: differential,
         zero: zero_i16,
         color,
+        copy: bitmap::copy,
+        fill: bitmap::fill,
+        xor_previous: bitmap::xor_previous,
+        mask_previous: bitmap::mask_previous,
+        dither: bitmap::dither,
     }
 }
 
