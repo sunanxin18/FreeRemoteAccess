@@ -1,5 +1,5 @@
 // 固定合成输入及独立宿主像素参考；身份见 tests/codec-fixtures/provenance.json。
-fn cases() -> Vec<Case> {
+pub(super) fn cases() -> Vec<Case> {
     vec![
         Case {
             id: "synthetic-avc420-2x2.h264",

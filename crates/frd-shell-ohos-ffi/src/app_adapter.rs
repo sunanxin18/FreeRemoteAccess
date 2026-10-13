@@ -221,7 +221,25 @@ impl AppEngine {
                     target_env = "ohos"
                 ))]
                 let mut codec_fixture = crate::codec_fixture::Worker::start();
+                #[cfg(all(
+                    target_env = "ohos",
+                    any(
+                        feature = "normal-hap-codec-benchmark",
+                        feature = "normal-hap-avc444-profile",
+                        feature = "normal-hap-hevc444-profile"
+                    )
+                ))]
+                let mut codec_measurement = crate::codec_measurement::Worker::start();
                 loop {
+                    #[cfg(all(
+                        target_env = "ohos",
+                        any(
+                            feature = "normal-hap-codec-benchmark",
+                            feature = "normal-hap-avc444-profile",
+                            feature = "normal-hap-hevc444-profile"
+                        )
+                    ))]
+                    codec_measurement.reap();
                     #[cfg(all(
                         debug_assertions,
                         feature = "normal-hap-codec-fixture",

@@ -10,6 +10,12 @@ crate-type = ["cdylib", "rlib"]
 native-presentation-fixture = []
 normal-hap-codec-fixture = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
 
+
+# 显式验证包允许优化 Rust；默认关闭，不注册产品 codec。
+normal-hap-codec-benchmark = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
+normal-hap-avc444-profile = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
+normal-hap-hevc444-profile = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
+
 [dependencies]
 frd-video-ffmpeg = { path = "../frd-video-ffmpeg", optional = true }
 sha2 = { version = "0.10", optional = true }

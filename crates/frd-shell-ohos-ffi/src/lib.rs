@@ -10,6 +10,33 @@
     feature = "native-presentation-fixture"
 ))]
 compile_error!("两个合成夹具必须分别构建");
+
+#[cfg(any(
+    all(
+        feature = "normal-hap-codec-benchmark",
+        feature = "normal-hap-avc444-profile"
+    ),
+    all(
+        feature = "normal-hap-codec-benchmark",
+        feature = "normal-hap-hevc444-profile"
+    ),
+    all(
+        feature = "normal-hap-avc444-profile",
+        feature = "normal-hap-hevc444-profile"
+    ),
+    all(
+        any(
+            feature = "normal-hap-codec-benchmark",
+            feature = "normal-hap-avc444-profile",
+            feature = "normal-hap-hevc444-profile"
+        ),
+        any(
+            feature = "normal-hap-codec-fixture",
+            feature = "native-presentation-fixture"
+        )
+    )
+))]
+compile_error!("测量与正确性/呈现夹具必须分别构建");
 mod app_abi;
 pub mod app_adapter;
 #[cfg(all(
@@ -18,6 +45,27 @@ pub mod app_adapter;
     any(test, target_env = "ohos")
 ))]
 mod codec_fixture;
+#[cfg(all(
+    any(test, target_env = "ohos"),
+    any(
+        all(debug_assertions, feature = "normal-hap-codec-fixture"),
+        any(
+            feature = "normal-hap-codec-benchmark",
+            feature = "normal-hap-avc444-profile",
+            feature = "normal-hap-hevc444-profile"
+        )
+    )
+))]
+mod codec_fixture_common;
+#[cfg(all(
+    any(test, target_env = "ohos"),
+    any(
+        feature = "normal-hap-codec-benchmark",
+        feature = "normal-hap-avc444-profile",
+        feature = "normal-hap-hevc444-profile"
+    )
+))]
+mod codec_measurement;
 #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
 mod fixture;
 pub mod input_adapter;
