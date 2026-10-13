@@ -21,7 +21,7 @@ def main():
     qoi_wrapper=ROOT/('target/task-4a27b-'+str(os.getpid())+'-qoi-image-module.rs')
     qoi_wrapper.write_text('include!('+json.dumps(str((a.source or S)/'src/image.rs'))+');\n#[cfg(test)] mod qoi_helper_tests { include!('+json.dumps(str(S/'tests/image_qoi_helper_native.rs'))+'); }')
     qoi_source=ROOT/f'target/task-4a27b-qoi-helper-{mode}.rs'
-    qoi_source.write_text('pub use ironrdp_session::{SessionResult,SessionError,SessionErrorExt,custom_err};\n#[allow(dead_code)] #[path='+json.dumps(str(qoi_wrapper))+'] mod image;')
+    qoi_source.write_text('pub use ironrdp_session::{SessionResult,SessionError,SessionErrorExt,custom_err,ActiveStageOutput,fast_path};\n#[allow(dead_code)] #[path='+json.dumps(str(qoi_wrapper))+'] mod image;')
     qoi_output=qoi_source.with_suffix('')
     qoi_cmd=['clippy-driver' if a.clippy else 'rustc','--test',str(qoi_source),'--cfg','feature="qoi"','-o',str(qoi_output)]+flags(libs,a.release)
     if a.clippy:qoi_cmd+=['-D','warnings']

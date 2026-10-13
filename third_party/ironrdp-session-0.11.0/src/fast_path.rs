@@ -17,7 +17,7 @@ use ironrdp_pdu::rdp::headers::{CompressionFlags, ShareDataPdu};
 use ironrdp_pdu::surface_commands::{FrameAction, FrameMarkerPdu, SurfaceCommand};
 use tracing::{debug, trace, warn};
 
-use crate::image::DecodedImage;
+use crate::image::{CoverageCollector, DecodedImage};
 use crate::palette::Palette;
 use crate::pointer::PointerCache;
 use crate::{SessionError, SessionErrorExt as _, SessionResult, custom_err, reason_err, rfx};
@@ -70,10 +70,23 @@ impl Processor {
         input: &[u8],
         output: &mut WriteBuf,
     ) -> SessionResult<Vec<UpdateKind>> {
+        self.process_collected(image, input, output, &mut CoverageCollector::default())
+    }
+
+    pub(crate) fn process_collected(
+        &mut self,
+        image: &mut DecodedImage,
+        input: &[u8],
+        output: &mut WriteBuf,
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<Vec<UpdateKind>> {
         let mut processor_updates = Vec::new();
 
         // 默认保留旧次序；native 的首个失败不能先消费 pending mouse 或改 cursor。
         if self.native_legacy_kernels.is_none() {
+            if self.mouse_pos_update.is_some() {
+                coverage.reserve_entry()?;
+            }
             if let Some((x, y)) = self.mouse_pos_update.take() {
                 if let Some(rect) = image.move_pointer(x, y)? {
                     processor_updates.push(UpdateKind::Region(rect));
@@ -81,6 +94,7 @@ impl Processor {
             }
         }
 
+        coverage.finish_updates(&processor_updates)?;
         let mut input = ReadCursor::new(input);
 
         let header = decode_cursor::<FastPathHeader>(&mut input).map_err(SessionError::decode)?;
@@ -90,19 +104,37 @@ impl Processor {
         // A single FastPath output PDU can contain multiple updates.
         // Loop over all updates within the PDU payload.
         while !input.is_empty() {
-            let update_result = self.process_single_update(&mut input, image, output, &mut flush_pending_mouse)?;
+            let update_result =
+                self.process_single_update(&mut input, image, output, &mut flush_pending_mouse, coverage)?;
+            coverage.finish_updates(&update_result)?;
             processor_updates.extend(update_result);
         }
 
         if flush_pending_mouse {
-            self.flush_native_mouse(image, &mut processor_updates)?;
+            if coverage.enabled {
+                let mut mouse_updates = Vec::new();
+                self.flush_native_mouse(image, &mut mouse_updates, coverage)?;
+                coverage.finish_updates(&mouse_updates)?;
+                processor_updates.extend(mouse_updates);
+            } else {
+                // collector-off 原路径复用已分配 updates，不新增 mouse Vec allocation。
+                self.flush_native_mouse(image, &mut processor_updates, coverage)?;
+            }
         }
 
         Ok(processor_updates)
     }
 
-    fn flush_native_mouse(&mut self, image: &mut DecodedImage, updates: &mut Vec<UpdateKind>) -> SessionResult<()> {
+    fn flush_native_mouse(
+        &mut self,
+        image: &mut DecodedImage,
+        updates: &mut Vec<UpdateKind>,
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<()> {
         if self.native_legacy_kernels.is_some() {
+            if self.mouse_pos_update.is_some() {
+                coverage.reserve_entries(1 + updates.iter().filter(|u| matches!(u, UpdateKind::Region(_))).count())?;
+            }
             if let Some((x, y)) = self.mouse_pos_update.take() {
                 if let Some(rect) = image.move_pointer(x, y)? {
                     updates.push(UpdateKind::Region(rect));
@@ -119,6 +151,7 @@ impl Processor {
         image: &mut DecodedImage,
         output: &mut WriteBuf,
         flush_pending_mouse: &mut bool,
+        coverage: &mut CoverageCollector,
     ) -> SessionResult<Vec<UpdateKind>> {
         let mut processor_updates = Vec::new();
 
@@ -175,7 +208,8 @@ impl Processor {
         match update {
             Ok(FastPathUpdate::SurfaceCommands(surface_commands)) => {
                 trace!("Received Surface Commands: {} pieces", surface_commands.len());
-                let update_region = self.process_surface_commands(image, output, surface_commands)?;
+                let update_region =
+                    self.process_surface_commands_collected(image, output, surface_commands, coverage)?;
                 *flush_pending_mouse = true;
                 if let Some(update_region) = update_region {
                     processor_updates.push(UpdateKind::Region(update_region));
@@ -183,13 +217,13 @@ impl Processor {
             }
             Ok(FastPathUpdate::Bitmap(bitmap_update)) => {
                 trace!("Received bitmap update");
-                let updates = self.process_bitmap_update(image, bitmap_update)?;
+                let updates = self.process_bitmap_update_collected(image, bitmap_update, coverage)?;
                 *flush_pending_mouse = true;
                 processor_updates.extend(updates);
             }
             Ok(FastPathUpdate::Pointer(update)) => {
                 let unmatched_cached = matches!(&update, PointerUpdateData::Cached(c) if self.enable_server_pointer && self.pointer_cache.get(usize::from(c.cache_index)).is_none());
-                let updates = self.process_pointer_update(image, update)?;
+                let updates = self.process_pointer_update_collected(image, update, coverage)?;
                 *flush_pending_mouse = !unmatched_cached;
                 processor_updates.extend(updates);
             }
@@ -221,8 +255,23 @@ impl Processor {
         image: &mut DecodedImage,
         bitmap_update: BitmapUpdateData<'_>,
     ) -> SessionResult<Vec<UpdateKind>> {
+        self.process_bitmap_update_collected(image, bitmap_update, &mut CoverageCollector::default())
+    }
+
+    pub(crate) fn process_bitmap_update_collected(
+        &mut self,
+        image: &mut DecodedImage,
+        bitmap_update: BitmapUpdateData<'_>,
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<Vec<UpdateKind>> {
+        if coverage.enabled {
+            coverage.reserve_entry()?;
+        }
         if let Some(kernels) = self.native_legacy_kernels {
-            return self.process_bitmap_update_native(image, bitmap_update, &kernels);
+            return self.process_bitmap_update_native(image, bitmap_update, &kernels, coverage);
+        }
+        if coverage.enabled {
+            return self.process_bitmap_update_compat(image, bitmap_update, coverage);
         }
         let mut buf = Vec::new();
         let mut update_kind = UpdateKind::None;
@@ -348,6 +397,7 @@ impl Processor {
         image: &mut DecodedImage,
         bitmap_update: BitmapUpdateData<'_>,
         kernels: &NativeKernels,
+        coverage: &mut CoverageCollector,
     ) -> SessionResult<Vec<UpdateKind>> {
         let mut region: Option<InclusiveRectangle> = None;
         let mut decoded = Vec::new();
@@ -401,6 +451,7 @@ impl Processor {
             } else {
                 bitmap.bitmap_data
             };
+            coverage.reserve_rectangles(1)?;
             if let Some(current) = image.apply_bitmap_native(
                 source,
                 format,
@@ -412,7 +463,119 @@ impl Processor {
                 Some(self.palette.colors()),
                 kernels,
             )? {
+                coverage.content([bitmap.rectangle.clone()]);
                 region = Some(region.map_or_else(|| current.clone(), |prior| prior.union(&current)));
+            }
+        }
+        Ok(vec![region.map_or(UpdateKind::None, UpdateKind::Region)])
+    }
+
+    fn process_bitmap_update_compat(
+        &mut self,
+        image: &mut DecodedImage,
+        bitmap_update: BitmapUpdateData<'_>,
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<Vec<UpdateKind>> {
+        let mut region: Option<InclusiveRectangle> = None;
+        let mut decoded = Vec::new();
+        for bitmap in bitmap_update.rectangles {
+            let compressed = bitmap
+                .compression_flags
+                .contains(ironrdp_pdu::bitmap::Compression::BITMAP_COMPRESSION);
+            let (format, bytes) = match native_bitmap_format(bitmap.bits_per_pixel, compressed) {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!("不支持的 Bitmap 深度：{}", bitmap.bits_per_pixel);
+                    continue;
+                }
+            };
+            let sw = usize::from(bitmap.width);
+            let sh = usize::from(bitmap.height);
+            let tight = sw
+                .checked_mul(bytes)
+                .ok_or_else(|| custom_err!("Bitmap geometry", KernelError::InvalidDimensions))?;
+            let stride = if compressed {
+                tight
+            } else {
+                tight
+                    .checked_add(3)
+                    .map(|n| n & !3)
+                    .ok_or_else(|| custom_err!("Bitmap geometry", KernelError::InvalidDimensions))?
+            };
+            let expected = image.native_bitmap_size(format, sw, sh, stride, &bitmap.rectangle)?;
+            // 合法图外整矩形 skip；不把 sentinel 误认成真实原点。
+            if bitmap.rectangle.right >= image.width() || bitmap.rectangle.bottom >= image.height() {
+                continue;
+            }
+            decoded.clear();
+            let source = if compressed {
+                if bitmap.bits_per_pixel == 32 {
+                    sw.checked_mul(sh)
+                        .and_then(|n| n.checked_mul(4))
+                        .filter(|&n| n <= ironrdp_graphics::rle::MAX_NATIVE_BITMAP_BYTES && n <= isize::MAX as usize)
+                        .ok_or_else(|| custom_err!("RDP6 plane resource limit", KernelError::InvalidDimensions))?;
+                    match self.bitmap_stream_decoder.decode_bitmap_stream_to_rgb24_observed(
+                        bitmap.bitmap_data,
+                        &mut decoded,
+                        sw,
+                        sh,
+                    ) {
+                        Ok(Some(shape)) if shape == (sw, sh) => {}
+                        Ok(_) => {
+                            return Err(custom_err!("RDP6 完整源形状", KernelError::InvalidDimensions));
+                        }
+                        Err(e) => {
+                            warn!("Invalid RDP6_BITMAP_STREAM: {e}");
+                            region =
+                                Some(region.map_or_else(|| bitmap.rectangle.clone(), |r| r.union(&bitmap.rectangle)));
+                            continue;
+                        }
+                    }
+                } else {
+                    match ironrdp_graphics::rle::decompress_observed(
+                        bitmap.bitmap_data,
+                        &mut decoded,
+                        sw,
+                        sh,
+                        usize::from(bitmap.bits_per_pixel),
+                    ) {
+                        Ok((_format, progress)) => {
+                            if progress.written != expected {
+                                return Err(custom_err!(
+                                    "完整 portable RLE",
+                                    ironrdp_graphics::rle::CompleteRleError::Incomplete {
+                                        expected,
+                                        written: progress.written,
+                                        consumed: progress.consumed,
+                                    }
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Invalid RLE-compressed bitmap: {e}");
+                            region =
+                                Some(region.map_or_else(|| bitmap.rectangle.clone(), |r| r.union(&bitmap.rectangle)));
+                            continue;
+                        }
+                    }
+                }
+                decoded.as_slice()
+            } else {
+                bitmap.bitmap_data
+            };
+            coverage.reserve_rectangles(1)?;
+            if let Some(damage) = image.apply_bitmap_compat(
+                source,
+                format,
+                sw,
+                sh,
+                stride,
+                true,
+                &bitmap.rectangle,
+                self.palette.colors(),
+            )? {
+                coverage.content([bitmap.rectangle]);
+                region = Some(region.map_or_else(|| damage.clone(), |r| r.union(&damage)));
             }
         }
         Ok(vec![region.map_or(UpdateKind::None, UpdateKind::Region)])
@@ -423,6 +586,14 @@ impl Processor {
         &mut self,
         image: &mut DecodedImage,
         update: PointerUpdateData<'_>,
+    ) -> SessionResult<Vec<UpdateKind>> {
+        self.process_pointer_update_collected(image, update, &mut CoverageCollector::default())
+    }
+    pub(crate) fn process_pointer_update_collected(
+        &mut self,
+        image: &mut DecodedImage,
+        update: PointerUpdateData<'_>,
+        coverage: &mut CoverageCollector,
     ) -> SessionResult<Vec<UpdateKind>> {
         let mut processor_updates = Vec::new();
 
@@ -439,20 +610,32 @@ impl Processor {
         let server_position = matches!(&update, PointerUpdateData::SetPosition(_));
         match update {
             PointerUpdateData::SetHidden => {
-                self.flush_native_mouse(image, &mut processor_updates)?;
+                self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 processor_updates.push(UpdateKind::PointerHidden);
                 if self.pointer_software_rendering && !self.use_system_pointer {
                     self.use_system_pointer = true;
+                    coverage.reserve_entries(
+                        1 + processor_updates
+                            .iter()
+                            .filter(|u| matches!(u, UpdateKind::Region(_)))
+                            .count(),
+                    )?;
                     if let Some(rect) = image.hide_pointer()? {
                         processor_updates.push(UpdateKind::Region(rect));
                     }
                 }
             }
             PointerUpdateData::SetDefault => {
-                self.flush_native_mouse(image, &mut processor_updates)?;
+                self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 processor_updates.push(UpdateKind::PointerDefault);
                 if self.pointer_software_rendering && !self.use_system_pointer {
                     self.use_system_pointer = true;
+                    coverage.reserve_entries(
+                        1 + processor_updates
+                            .iter()
+                            .filter(|u| matches!(u, UpdateKind::Region(_)))
+                            .count(),
+                    )?;
                     if let Some(rect) = image.hide_pointer()? {
                         processor_updates.push(UpdateKind::Region(rect));
                     }
@@ -464,8 +647,16 @@ impl Processor {
                         x: position.x,
                         y: position.y,
                     });
-                } else if let Some(rect) = image.move_pointer(position.x, position.y)? {
-                    processor_updates.push(UpdateKind::Region(rect));
+                } else {
+                    coverage.reserve_entries(
+                        1 + processor_updates
+                            .iter()
+                            .filter(|u| matches!(u, UpdateKind::Region(_)))
+                            .count(),
+                    )?;
+                    if let Some(rect) = image.move_pointer(position.x, position.y)? {
+                        processor_updates.push(UpdateKind::Region(rect));
+                    }
                 }
             }
             PointerUpdateData::Color(pointer) => {
@@ -476,11 +667,19 @@ impl Processor {
                         .map_err(|e| SessionError::custom("failed to decode color pointer attribute", e))?,
                 );
 
-                self.flush_native_mouse(image, &mut processor_updates)?;
+                self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 let _ = self
                     .pointer_cache
                     .insert(usize::from(cache_index), Arc::clone(&decoded_pointer));
 
+                if self.pointer_software_rendering {
+                    coverage.reserve_entries(
+                        1 + processor_updates
+                            .iter()
+                            .filter(|u| matches!(u, UpdateKind::Region(_)))
+                            .count(),
+                    )?;
+                }
                 if !self.pointer_software_rendering {
                     processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&decoded_pointer)));
                 } else if let Some(rect) = image.update_pointer(decoded_pointer)? {
@@ -491,11 +690,19 @@ impl Processor {
                 let cache_index = cached.cache_index;
 
                 if let Some(cached_pointer) = self.pointer_cache.get(usize::from(cache_index)) {
-                    self.flush_native_mouse(image, &mut processor_updates)?;
+                    self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                     // Disable system pointer
                     processor_updates.push(UpdateKind::PointerHidden);
                     self.use_system_pointer = false;
                     // Send graphics update
+                    if self.pointer_software_rendering {
+                        coverage.reserve_entries(
+                            1 + processor_updates
+                                .iter()
+                                .filter(|u| matches!(u, UpdateKind::Region(_)))
+                                .count(),
+                        )?;
+                    }
                     if !self.pointer_software_rendering {
                         processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&cached_pointer)));
                     } else if let Some(rect) = image.update_pointer(cached_pointer)? {
@@ -518,11 +725,19 @@ impl Processor {
                         .map_err(|e| SessionError::custom("failed to decode pointer attribute", e))?,
                 );
 
-                self.flush_native_mouse(image, &mut processor_updates)?;
+                self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 let _ = self
                     .pointer_cache
                     .insert(usize::from(cache_index), Arc::clone(&decoded_pointer));
 
+                if self.pointer_software_rendering {
+                    coverage.reserve_entries(
+                        1 + processor_updates
+                            .iter()
+                            .filter(|u| matches!(u, UpdateKind::Region(_)))
+                            .count(),
+                    )?;
+                }
                 if !self.pointer_software_rendering {
                     processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&decoded_pointer)));
                 } else if let Some(rect) = image.update_pointer(decoded_pointer)? {
@@ -537,11 +752,19 @@ impl Processor {
                         .map_err(|e| SessionError::custom("failed to decode large pointer attribute", e))?,
                 );
 
-                self.flush_native_mouse(image, &mut processor_updates)?;
+                self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 let _ = self
                     .pointer_cache
                     .insert(usize::from(cache_index), Arc::clone(&decoded_pointer));
 
+                if self.pointer_software_rendering {
+                    coverage.reserve_entries(
+                        1 + processor_updates
+                            .iter()
+                            .filter(|u| matches!(u, UpdateKind::Region(_)))
+                            .count(),
+                    )?;
+                }
                 if !self.pointer_software_rendering {
                     processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&decoded_pointer)));
                 } else if let Some(rect) = image.update_pointer(decoded_pointer)? {
@@ -558,14 +781,27 @@ impl Processor {
         Ok(processor_updates)
     }
 
+    #[allow(dead_code)] // 保留原私有入口供既有独立 harness 使用。
     fn process_surface_commands(
         &mut self,
         image: &mut DecodedImage,
         output: &mut WriteBuf,
         surface_commands: Vec<SurfaceCommand<'_>>,
     ) -> SessionResult<Option<InclusiveRectangle>> {
-        if let Some(kernels) = self.native_legacy_kernels {
-            return self.process_surface_commands_native(image, output, surface_commands, &kernels);
+        self.process_surface_commands_collected(image, output, surface_commands, &mut CoverageCollector::default())
+    }
+
+    fn process_surface_commands_collected(
+        &mut self,
+        image: &mut DecodedImage,
+        output: &mut WriteBuf,
+        surface_commands: Vec<SurfaceCommand<'_>>,
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        coverage.reserve_entry()?;
+        if coverage.enabled || self.native_legacy_kernels.is_some() {
+            let kernels = self.native_legacy_kernels;
+            return self.process_surface_commands_checked(image, output, surface_commands, kernels.as_ref(), coverage);
         }
         let mut update_rectangle = None;
 
@@ -671,12 +907,13 @@ impl Processor {
 
         Ok(Some(update_rectangle.unwrap_or_else(InclusiveRectangle::empty)))
     }
-    fn process_surface_commands_native(
+    fn process_surface_commands_checked(
         &mut self,
         image: &mut DecodedImage,
         output: &mut WriteBuf,
         commands: Vec<SurfaceCommand<'_>>,
-        kernels: &NativeKernels,
+        kernels: Option<&NativeKernels>,
+        coverage: &mut CoverageCollector,
     ) -> SessionResult<Option<InclusiveRectangle>> {
         let mut region: Option<InclusiveRectangle> = None;
         for command in commands {
@@ -699,23 +936,43 @@ impl Processor {
                         .checked_mul(bytes)
                         .ok_or_else(|| custom_err!("native Surface geometry", KernelError::InvalidDimensions))?;
                     // 固定 baseline 兼容约定：bottom-up tight BGR/BgrX，不按长度猜 padded 或 top-down。
-                    image.apply_bitmap_native(
-                        ext.data,
-                        format,
-                        usize::from(ext.width),
-                        usize::from(ext.height),
-                        stride,
-                        true,
-                        &destination,
-                        Some(self.palette.colors()),
-                        kernels,
-                    )?
+                    coverage.reserve_rectangles(1)?;
+                    let current = if let Some(kernels) = kernels {
+                        image.apply_bitmap_native(
+                            ext.data,
+                            format,
+                            usize::from(ext.width),
+                            usize::from(ext.height),
+                            stride,
+                            true,
+                            &destination,
+                            Some(self.palette.colors()),
+                            kernels,
+                        )?
+                    } else {
+                        image.apply_bitmap_compat(
+                            ext.data,
+                            format,
+                            usize::from(ext.width),
+                            usize::from(ext.height),
+                            stride,
+                            true,
+                            &destination,
+                            self.palette.colors(),
+                        )?
+                    };
+                    if current.is_some() {
+                        coverage.content([destination.clone()]);
+                    }
+                    current
                 }
                 CODEC_ID_REMOTEFX => {
                     let mut data = ReadCursor::new(ext.data);
                     let mut frame_region: Option<InclusiveRectangle> = None;
                     while !data.is_empty() {
-                        let (_, current) = self.rfx_handler.decode_region(image, &destination, &mut data)?;
+                        let (_, current) =
+                            self.rfx_handler
+                                .decode_region_collected(image, &destination, &mut data, coverage)?;
                         if let Some(current) = current {
                             frame_region = Some(frame_region.map_or_else(|| current.clone(), |r| r.union(&current)));
                         }
@@ -724,7 +981,13 @@ impl Processor {
                 }
                 #[cfg(feature = "qoi")]
                 ironrdp_pdu::rdp::capability_sets::CODEC_ID_QOI => {
-                    qoi_apply_native(image, destination, ext.data, ext.width, ext.height, kernels)?
+                    coverage.reserve_rectangles(1)?;
+                    let current =
+                        qoi_apply_checked(image, destination.clone(), ext.data, ext.width, ext.height, kernels)?;
+                    if current.is_some() {
+                        coverage.content([destination.clone()]);
+                    }
+                    current
                 }
                 #[cfg(feature = "qoiz")]
                 ironrdp_pdu::rdp::capability_sets::CODEC_ID_QOIZ => {
@@ -733,7 +996,15 @@ impl Processor {
                         &mut self.zdctx,
                         ironrdp_graphics::rle::MAX_NATIVE_BITMAP_BYTES,
                     )?;
-                    qoi_apply_native(image, destination, &data, ext.width, ext.height, kernels)?
+                    {
+                        coverage.reserve_rectangles(1)?;
+                        let current =
+                            qoi_apply_checked(image, destination.clone(), &data, ext.width, ext.height, kernels)?;
+                        if current.is_some() {
+                            coverage.content([destination.clone()]);
+                        }
+                        current
+                    }
                 }
                 _ => {
                     warn!("Unsupported codec ID: {}", ext.codec_id);
@@ -744,7 +1015,12 @@ impl Processor {
                 region = Some(region.map_or_else(|| current.clone(), |prior| prior.union(&current)));
             }
         }
-        Ok(region)
+        // 默认约定仍能产生 empty sentinel damage；receipt 为空，不能推断为原点内容。
+        Ok(if kernels.is_some() {
+            region
+        } else {
+            Some(region.unwrap_or_else(InclusiveRectangle::empty))
+        })
     }
 }
 
@@ -819,10 +1095,7 @@ fn checked_native_staging_size(required: usize, limit: usize) -> SessionResult<u
 #[cfg(feature = "qoi")]
 fn checked_qoi_pixel_size(width: usize, height: usize, channels: usize) -> SessionResult<usize> {
     if width == 0 || height == 0 || !matches!(channels, 3 | 4) {
-        return Err(custom_err!(
-            "native QOI geometry",
-            KernelError::InvalidDimensions
-        ));
+        return Err(custom_err!("native QOI geometry", KernelError::InvalidDimensions));
     }
     let required = width
         .checked_mul(height)
@@ -863,15 +1136,17 @@ fn decompress_qoiz_native(
         if pos < out.capacity() {
             break;
         }
-        let next = data.len().checked_mul(2).ok_or_else(|| {
-            custom_err!("native QOIZ resource limit", KernelError::InvalidDimensions)
-        })?;
+        let next = data
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| custom_err!("native QOIZ resource limit", KernelError::InvalidDimensions))?;
         resize_qoiz_staging(&mut data, next, limit)?;
     }
     data.truncate(pos);
     Ok(data)
 }
 #[cfg(feature = "qoi")]
+#[allow(dead_code)] // 既有可选 wire harness 的同签名入口。
 fn qoi_apply_native(
     image: &mut DecodedImage,
     destination: InclusiveRectangle,
@@ -879,6 +1154,17 @@ fn qoi_apply_native(
     declared_width: u16,
     declared_height: u16,
     kernels: &NativeKernels,
+) -> SessionResult<Option<InclusiveRectangle>> {
+    qoi_apply_checked(image, destination, data, declared_width, declared_height, Some(kernels))
+}
+#[cfg(feature = "qoi")]
+fn qoi_apply_checked(
+    image: &mut DecodedImage,
+    destination: InclusiveRectangle,
+    data: &[u8],
+    declared_width: u16,
+    declared_height: u16,
+    kernels: Option<&NativeKernels>,
 ) -> SessionResult<Option<InclusiveRectangle>> {
     // 同一个decoder只解析一次header；库的decode_to_vec不能承担本地分配前资源门。
     let mut decoder = qoi::Decoder::new(data).map_err(|e| custom_err!("native QOI header", e))?;
@@ -921,17 +1207,30 @@ fn qoi_apply_native(
     }
     #[cfg(test)]
     OPTIONAL_STAGING_CALLS.with(|v| v.borrow_mut().push(("qoi_apply", size)));
-    image.apply_bitmap_native(
-        &decoded,
-        format,
-        width,
-        height,
-        stride,
-        false,
-        &destination,
-        None,
-        kernels,
-    )
+    if let Some(kernels) = kernels {
+        image.apply_bitmap_native(
+            &decoded,
+            format,
+            width,
+            height,
+            stride,
+            false,
+            &destination,
+            None,
+            kernels,
+        )
+    } else {
+        image.apply_bitmap_compat(
+            &decoded,
+            format,
+            width,
+            height,
+            stride,
+            false,
+            &destination,
+            &[[0; 3]; 256],
+        )
+    }
 }
 
 #[cfg(feature = "qoi")]

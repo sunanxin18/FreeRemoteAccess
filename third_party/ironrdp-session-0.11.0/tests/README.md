@@ -72,3 +72,55 @@ mutants 的 test-only allocator 在触大内存前退出73；增长使用同一 
 异形源布局、压缩长度初始 reserve、增长门绕过、preflight 后移、TryReserve source 丢失
 和回到 scalar helper。原2,624-record fixture 未改；可选线码正确性/分配前资源门证据
 不代表 QOI 算法 SIMD、产品启用、跨架构包、性能或 live 生产合格。
+
+## A2.8B 精确 session 内容覆盖
+
+`image::ActiveStageProcessResult` 的 `outputs` 保持原枚举；每个 GraphicsUpdate
+对应一份带 `graphics_output_index` 的 receipt，包括 cursor/sentinel 的明确空内容。
+新 rich Stage API 共用一次实际 parser/dispatch，旧公开入口禁用 collector。
+默认 rich 路径从实际 RLE written 或 RDP6 完整形状事实验证成功，再按完整 SW/SH、
+raw padding 与逻辑左上裁剪复用原转换 helper；不按预分配长度推断完整性。
+原生路径仍须显式选择受检查能力，工厂/协议广告不变。
+
+```sh
+export PATH=/Users/sun/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin:$PATH
+export PYTHONDONTWRITEBYTECODE=1
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --release --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --optional --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --optional --release --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --production --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --production --release --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --production --optional --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/run_decoded_coverage_tests.py --production --optional --release --clippy
+python3 third_party/ironrdp-session-0.11.0/tests/test_decoded_coverage_mutations.py
+python3 third_party/ironrdp-session-0.11.0/tests/test_decoded_coverage_mutations.py --release
+python3 third_party/ironrdp-session-0.11.0/tests/run_image_consumers_tests.py --clippy
+python3 tests/legacy-oracle/verify_sources.py
+python3 tests/legacy-oracle/verify_catalog.py
+```
+
+`--optional` 只复用已经准备好的独立可选依赖 workspace，仍 offline/locked，
+不修改产品 features、manifest 或锁。旧14项 QOI/QOIZ 测试继续包含；新的默认/原生
+QOI/QOIZ crop 测试覆盖 RGB/RGBA 和八种目标格式。非可选 harness 的分配失败探针
+只存在于新 runner 的私有壳，可选壳复用原 allocator；shipping allocator 不变。
+既有 image-only QOI runner 仅补真实 Stage output/fast_path reexport。
+
+新增测试包含真实 FastPath/X224 两端点留空和后续中点、完整 raw/packed/RDP6
+裁剪、奇数 chroma/alpha、最终 padding、原版632份适用冻结图像记录、typed underfill
+与 decoder-error 空内容、软件 cursor 和 palette/control 输出索引、分片完成后同一次
+Stage 调用的65,536/65,537限额、try_reserve 失败先于 image/cursor begin，以及
+独立小网格 RFX 实际像素和 coverage 成员枚举。RFX 采用 checked、排序且允许重叠
+的 clip/交集列表，rich writer 与 receipt 共用同一列表，避免上游 inclusive Region
+union/simplify 丢单行或缩短不等高 band；旧入口保留原行为。
+
+元数据 raw rectangles 上限512KiB；receipt/index/Vec header 另限65,536项，64位ABI
+最多2MiB、32位最多1MiB。另有≤512KiB RFX clip 列表和≤512KiB单 tile精确交集，
+decoder、staging、输入重组、原 outputs、allocator 开销和 framebuffer 分别计费。
+预算不能每次 update 重置，也不能 bbox 回退。Err 不返回部分 receipts；之前成功
+像素或鼠标动作可能保留，调用者必须终止/重置，不提供整 PDU 回滚。
+
+所有九个 mutation 必须实际编译成功后被像素/元数据语义拒绝。原2,624-record
+fixture、原版 archive/source inventory、generator 和 allowlist 不变；最终 hash
+记录在 FRD-MODIFICATIONS.json 与本次报告。host 测试不是 OHOS phone/PC、跨架构、
+HAP、live、软件 codec SIMD/性能或生产选择的资格证据。

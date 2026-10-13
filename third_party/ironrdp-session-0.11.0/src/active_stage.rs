@@ -18,7 +18,7 @@ use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessag
 use tracing::{debug, info, warn};
 
 use crate::fast_path::UpdateKind;
-use crate::image::DecodedImage;
+use crate::image::{ActiveStageProcessResult, CoverageCollector, DecodedImage};
 use crate::{SessionError, SessionErrorExt as _, SessionResult, fast_path, x224};
 
 /// Converts the PDU-layer compression type to the bulk crate's compression type.
@@ -129,6 +129,29 @@ impl ActiveStage {
         image: &mut DecodedImage,
         events: &[FastPathInputEvent],
     ) -> SessionResult<Vec<ActiveStageOutput>> {
+        self.process_fastpath_input_internal(image, events, &mut CoverageCollector::default())
+    }
+
+    /// 本地输入只改变 cursor damage；每个 GraphicsUpdate 明确返回空内容。
+    pub fn process_fastpath_input_with_decoded_coverage(
+        &mut self,
+        image: &mut DecodedImage,
+        events: &[FastPathInputEvent],
+    ) -> SessionResult<ActiveStageProcessResult> {
+        let mut coverage = CoverageCollector::enabled();
+        let outputs = self.process_fastpath_input_internal(image, events, &mut coverage)?;
+        Ok(ActiveStageProcessResult {
+            outputs,
+            decoded_coverage: coverage.receipts,
+        })
+    }
+
+    fn process_fastpath_input_internal(
+        &mut self,
+        image: &mut DecodedImage,
+        events: &[FastPathInputEvent],
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<Vec<ActiveStageOutput>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -162,7 +185,14 @@ impl ActiveStage {
         };
 
         // Graphics update is only sent when update is visually changed the framebuffer
+        coverage.reserve_entry()?;
         if let Some(rect) = image.move_pointer(mouse_x, mouse_y)? {
+            if coverage.enabled {
+                coverage.receipts.push(crate::image::DecodedCoverageReceipt {
+                    graphics_output_index: output.len(),
+                    rectangles: Vec::new(),
+                });
+            }
             output.push(ActiveStageOutput::GraphicsUpdate(rect));
         }
 
@@ -176,10 +206,38 @@ impl ActiveStage {
         action: Action,
         frame: &[u8],
     ) -> SessionResult<Vec<ActiveStageOutput>> {
+        self.process_internal(image, action, frame, &mut CoverageCollector::default())
+    }
+
+    /// 同一次 parser/dispatch 的成功内容，独立于 cursor 展示 damage。
+    /// Err 不返回 receipts；此前成功更新可能已生效，调用者必须终止或重置会话。
+    pub fn process_with_decoded_coverage(
+        &mut self,
+        image: &mut DecodedImage,
+        action: Action,
+        frame: &[u8],
+    ) -> SessionResult<ActiveStageProcessResult> {
+        let mut coverage = CoverageCollector::enabled();
+        let outputs = self.process_internal(image, action, frame, &mut coverage)?;
+        Ok(ActiveStageProcessResult {
+            outputs,
+            decoded_coverage: coverage.receipts,
+        })
+    }
+
+    fn process_internal(
+        &mut self,
+        image: &mut DecodedImage,
+        action: Action,
+        frame: &[u8],
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<Vec<ActiveStageOutput>> {
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {
                 let mut output = WriteBuf::new();
-                let processor_updates = self.fast_path_processor.process(image, frame, &mut output)?;
+                let processor_updates =
+                    self.fast_path_processor
+                        .process_collected(image, frame, &mut output, coverage)?;
                 (
                     vec![ActiveStageOutput::ResponseFrame(output.into_inner())],
                     processor_updates,
@@ -193,11 +251,23 @@ impl ActiveStage {
                 for output in x224_outputs {
                     match output {
                         x224::ProcessorOutput::GraphicsUpdate(data) => {
-                            let updates = process_slow_path_graphics(&mut self.fast_path_processor, image, &data)?;
+                            let updates = process_slow_path_graphics_collected(
+                                &mut self.fast_path_processor,
+                                image,
+                                &data,
+                                coverage,
+                            )?;
+                            coverage.finish_updates(&updates)?;
                             processor_updates.extend(updates);
                         }
                         x224::ProcessorOutput::PointerUpdate(data) => {
-                            let updates = process_slow_path_pointer(&mut self.fast_path_processor, image, &data)?;
+                            let updates = process_slow_path_pointer_collected(
+                                &mut self.fast_path_processor,
+                                image,
+                                &data,
+                                coverage,
+                            )?;
+                            coverage.finish_updates(&updates)?;
                             processor_updates.extend(updates);
                         }
                         other => {
@@ -210,10 +280,16 @@ impl ActiveStage {
             }
         };
 
-        for update in processor_updates {
+        let mut receipt_index = 0;
+        for (update_index, update) in processor_updates.into_iter().enumerate() {
             match update {
                 UpdateKind::None => {}
                 UpdateKind::Region(region) => {
+                    if coverage.enabled {
+                        debug_assert_eq!(coverage.receipts[receipt_index].graphics_output_index, update_index);
+                        coverage.receipts[receipt_index].graphics_output_index = stage_outputs.len();
+                        receipt_index += 1;
+                    }
                     stage_outputs.push(ActiveStageOutput::GraphicsUpdate(region));
                 }
                 UpdateKind::PointerDefault => {
@@ -439,10 +515,19 @@ impl core::fmt::Display for GracefulDisconnectReason {
 }
 
 /// Parse and process a slow-path graphics update through the shared bitmap pipeline.
+#[allow(dead_code)] // 既有独立 harness 保留 collector-off 入口。
 fn process_slow_path_graphics(
     fast_path_processor: &mut fast_path::Processor,
     image: &mut DecodedImage,
     data: &[u8],
+) -> SessionResult<Vec<UpdateKind>> {
+    process_slow_path_graphics_collected(fast_path_processor, image, data, &mut CoverageCollector::default())
+}
+fn process_slow_path_graphics_collected(
+    fast_path_processor: &mut fast_path::Processor,
+    image: &mut DecodedImage,
+    data: &[u8],
+    coverage: &mut CoverageCollector,
 ) -> SessionResult<Vec<UpdateKind>> {
     let mut src = ReadCursor::new(data);
     let update_type = slow_path::read_graphics_update_type(&mut src).map_err(SessionError::decode)?;
@@ -450,7 +535,7 @@ fn process_slow_path_graphics(
     match update_type {
         GraphicsUpdateType::Bitmap => {
             let bitmap = slow_path::decode_slow_path_bitmap(&mut src).map_err(SessionError::decode)?;
-            fast_path_processor.process_bitmap_update(image, bitmap)
+            fast_path_processor.process_bitmap_update_collected(image, bitmap, coverage)
         }
         GraphicsUpdateType::Orders => {
             warn!("Slow-path drawing orders not supported (MS-RDPEGDI)");
@@ -470,12 +555,21 @@ fn process_slow_path_graphics(
 }
 
 /// Parse and process a slow-path pointer update through the shared pointer pipeline.
+#[allow(dead_code)] // 保留原 collector-off 私有入口。
 fn process_slow_path_pointer(
     fast_path_processor: &mut fast_path::Processor,
     image: &mut DecodedImage,
     data: &[u8],
 ) -> SessionResult<Vec<UpdateKind>> {
+    process_slow_path_pointer_collected(fast_path_processor, image, data, &mut CoverageCollector::default())
+}
+fn process_slow_path_pointer_collected(
+    fast_path_processor: &mut fast_path::Processor,
+    image: &mut DecodedImage,
+    data: &[u8],
+    coverage: &mut CoverageCollector,
+) -> SessionResult<Vec<UpdateKind>> {
     let mut src = ReadCursor::new(data);
     let pointer = slow_path::decode_slow_path_pointer(&mut src).map_err(SessionError::decode)?;
-    fast_path_processor.process_pointer_update(image, pointer)
+    fast_path_processor.process_pointer_update_collected(image, pointer, coverage)
 }

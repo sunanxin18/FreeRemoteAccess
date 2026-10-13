@@ -10,7 +10,7 @@ use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{Decode as _, ReadCursor, decode_cursor};
 use tracing::{instrument, trace};
 
-use crate::image::DecodedImage;
+use crate::image::{CoverageCollector, DecodedImage};
 use crate::{SessionResult, custom_err, general_err, reason_err};
 
 const TILE_SIZE: u16 = 64;
@@ -65,6 +65,16 @@ impl DecodingContext {
         destination: &InclusiveRectangle,
         input: &mut ReadCursor<'_>,
     ) -> SessionResult<(FrameId, Option<InclusiveRectangle>)> {
+        self.decode_region_collected(image, destination, input, &mut CoverageCollector::default())
+    }
+
+    pub(crate) fn decode_region_collected(
+        &mut self,
+        image: &mut DecodedImage,
+        destination: &InclusiveRectangle,
+        input: &mut ReadCursor<'_>,
+        coverage: &mut CoverageCollector,
+    ) -> SessionResult<(FrameId, Option<InclusiveRectangle>)> {
         loop {
             let block = rfx::Block::decode(input).map_err(|e| custom_err!("decode block", e))?;
 
@@ -73,7 +83,7 @@ impl DecodingContext {
                     self.process_sync(input)?;
                 }
                 rfx::Block::CodecChannel(rfx::CodecChannel::FrameBegin(f)) => {
-                    return self.process_frame(f, input, image, destination);
+                    return self.process_frame(f, input, image, destination, coverage);
                 }
                 _ => {
                     return Err(reason_err!(
@@ -126,6 +136,7 @@ impl DecodingContext {
         input: &mut ReadCursor<'_>,
         image: &mut DecodedImage,
         destination: &InclusiveRectangle,
+        coverage: &mut CoverageCollector,
     ) -> SessionResult<(FrameId, Option<InclusiveRectangle>)> {
         let channel = self
             .channels
@@ -167,7 +178,9 @@ impl DecodingContext {
         trace!(channels = ?self.channels);
         trace!(?region);
 
-        let clipping_rectangles = if self.native_legacy_kernels.is_some() {
+        let clipping_rectangles = if coverage.enabled {
+            checked_clipping_rectangles(region.rectangles.as_slice(), destination, width, height, true)?
+        } else if self.native_legacy_kernels.is_some() {
             native_clipping_rectangles(region.rectangles.as_slice(), destination, width, height)?
         } else {
             clipping_rectangles(region.rectangles.as_slice(), destination, width, height)
@@ -179,7 +192,7 @@ impl DecodingContext {
             Some(clipping_rectangles.extents.clone())
         };
         // Native 几何与 quant 索引先于 tile publication 验证；默认保留原惰性迭代次序。
-        if self.native_legacy_kernels.is_some() {
+        if self.native_legacy_kernels.is_some() || coverage.enabled {
             for tile in &tile_set.tiles {
                 native_tile_rectangle(tile, destination)?;
                 for index in [tile.y_quant_index, tile.cb_quant_index, tile.cr_quant_index] {
@@ -205,7 +218,45 @@ impl DecodingContext {
                 self.native_legacy_kernels.as_ref(),
             )?;
 
-            let current_update_rectangle = if let Some(kernels) = self.native_legacy_kernels.as_ref() {
+            let target_fits = image.width() > clipping_rectangles.extents.right
+                && image.height() > clipping_rectangles.extents.bottom;
+            let actual = || {
+                clipping_rectangles.rectangles.iter().filter_map(|r| {
+                    if !target_fits {
+                        return None;
+                    }
+                    let left = r.left.max(update_rectangle.left);
+                    let top = r.top.max(update_rectangle.top);
+                    let right = r.right.min(update_rectangle.right);
+                    let bottom = r.bottom.min(update_rectangle.bottom);
+                    (left <= right && top <= bottom).then_some(InclusiveRectangle {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    })
+                })
+            };
+            let mut exact_regions = Region::new();
+            if coverage.enabled {
+                let count = actual().count();
+                coverage.reserve_rectangles(count)?;
+                exact_regions
+                    .rectangles
+                    .try_reserve_exact(count)
+                    .map_err(|e| custom_err!("RFX exact allocation", e))?;
+                exact_regions.rectangles.extend(actual());
+                exact_regions.extents = InclusiveRectangle::union_all(&exact_regions.rectangles);
+            }
+            let current_update_rectangle = if coverage.enabled {
+                image.apply_tile_exact(
+                    &self.decoding_tiles.tile_output,
+                    PixelFormat::RgbA32,
+                    &exact_regions,
+                    &update_rectangle,
+                    self.native_legacy_kernels.as_ref(),
+                )?
+            } else if let Some(kernels) = self.native_legacy_kernels.as_ref() {
                 image.apply_tile_native(
                     &self.decoding_tiles.tile_output,
                     PixelFormat::RgbA32,
@@ -222,6 +273,7 @@ impl DecodingContext {
                 )?)
             };
             if let Some(current) = current_update_rectangle {
+                coverage.content(exact_regions.rectangles);
                 final_update_rectangle =
                     Some(final_update_rectangle.map_or_else(|| current.clone(), |prior| prior.union(&current)));
             }
@@ -311,6 +363,15 @@ fn native_clipping_rectangles(
     width: u16,
     height: u16,
 ) -> SessionResult<Region> {
+    checked_clipping_rectangles(rectangles, destination, width, height, false)
+}
+fn checked_clipping_rectangles(
+    rectangles: &[RfxRectangle],
+    destination: &InclusiveRectangle,
+    width: u16,
+    height: u16,
+    exact: bool,
+) -> SessionResult<Region> {
     if width == 0 || height == 0 {
         return Err(custom_err!(
             "native RFX geometry",
@@ -318,6 +379,12 @@ fn native_clipping_rectangles(
         ));
     }
     let mut region = Region::new();
+    if exact {
+        region
+            .rectangles
+            .try_reserve_exact(rectangles.len())
+            .map_err(|e| custom_err!("RFX clip allocation", e))?;
+    }
     for rect in rectangles {
         if rect.width == 0 || rect.height == 0 {
             return Err(custom_err!(
@@ -333,13 +400,29 @@ fn native_clipping_rectangles(
         if left >= u32::from(width) || top >= u32::from(height) {
             continue;
         }
-        region.union_rectangle(InclusiveRectangle {
+        let rectangle = InclusiveRectangle {
             left: u16::try_from(left).map_err(|e| custom_err!("native RFX geometry", e))?,
             top: u16::try_from(top).map_err(|e| custom_err!("native RFX geometry", e))?,
             right: u16::try_from(right.min(u32::from(width) - 1)).map_err(|e| custom_err!("native RFX geometry", e))?,
             bottom: u16::try_from(bottom.min(u32::from(height) - 1))
                 .map_err(|e| custom_err!("native RFX geometry", e))?,
-        });
+        };
+        if exact {
+            // 上游 union 的半开 band 比较可丢单行。rich 保留精确 checked 列表；允许重叠。
+            region.extents = if region.rectangles.is_empty() {
+                rectangle.clone()
+            } else {
+                region.extents.union(&rectangle)
+            };
+            region.rectangles.push(rectangle);
+        } else {
+            region.union_rectangle(rectangle);
+        }
+    }
+    if exact {
+        region
+            .rectangles
+            .sort_unstable_by_key(|r| (r.top, r.bottom, r.left, r.right));
     }
     Ok(region)
 }

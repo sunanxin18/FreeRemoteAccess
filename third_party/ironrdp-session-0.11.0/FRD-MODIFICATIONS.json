@@ -4,23 +4,23 @@
   "modified_originals": {
     "src/rfx.rs": {
       "upstream_sha256": "aa49df5cd1cac0a5c23af97e48565f6402888afd58ce4fbd808e5f7db40b4c5b",
-      "post_sha256": "a92f8425c9ac274dfdf8f65189bb56792de0e2cd22fe38d1600739d69e3b20db",
-      "reason": "A2.7B explicit native complete-source Bitmap/image/Surface/RFX row consumers; old default wrappers preserved, typed completeness/resource/geometry gates and Option publication"
+      "post_sha256": "5228e8cb80e3209aeb6ba5261322ceab5df046752282c617be2a540eaadd8c34",
+      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection"
     },
     "src/fast_path.rs": {
       "upstream_sha256": "6f617adab8e20101c93226b649ab90ba927f54305f741635412975211bade8d3",
-      "post_sha256": "f484405fe42ba4d0645042b824fa9181f51dd7430bbd31f80da89b53921419af",
-      "reason": "A2.7B explicit native complete-source consumers; round1 QOI same-decoder header/declared-shape checked preallocation, bounded QOIZ initial/growth staging, typed source; default None unchanged"
+      "post_sha256": "5a94025297abc93cdffc76377a76689810a46d207d8717a918e0364855c8cf16",
+      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection"
     },
     "src/active_stage.rs": {
       "upstream_sha256": "e16cf3d0eadf92c9803fadca39efad540e0d6eb8a19902ed0143175b7e24b97a",
-      "post_sha256": "09687dac04ad956d619fcd6edfb06c7bbd861b4bd94b8117b360e7a0f4fd63aa",
-      "reason": "A2.6 explicit checked native RLGR/component/session policy consumers; old builders and defaults preserved"
+      "post_sha256": "59c2c50f7db940fe5ff12dd16390d2205647a7a67f8c875707c1e6f6ac342672",
+      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection"
     },
     "src/image.rs": {
       "upstream_sha256": "61cb9451695daa51e4e9bfe05ee7fae3faf746ae5275cb178b8a1f09c5cb5499",
-      "post_sha256": "a48c8b5e425125c3e8af101cd02d32f141f6b866196a54f54573fc8b30dad165",
-      "reason": "A2.7B explicit native complete-source Bitmap/image/Surface/RFX row consumers; old default wrappers preserved, typed completeness/resource/geometry gates and Option publication"
+      "post_sha256": "c4a26906263a368115871c10d2a07286ba5d17e11dbb31850b0182906d6ba248",
+      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection"
     }
   },
   "added_files": {
@@ -29,7 +29,7 @@
     "tests/rfx_support.py": "9aa2f3f86c374b064bbe4545b7bc44d95306d718749303f8e21edac9987ec7a7",
     "tests/test_rfx_mutations.py": "9988c87393fe0f3369f8b34811c3326bae51445ec69a0b1d5121f76e7f552ec0",
     "tests/active_stage_native.rs": "8e9de1fc2ec2d8a7057e1d79902404351a49b66ce30a49de0ecaa46090467407",
-    "tests/README.md": "924b89f3138ee9b67a60106736d5bc08600571f029ddd3ef9d766714134e0ed7",
+    "tests/README.md": "90498ee1afe9a13e7b2013af4409c3060c6e0289746f4a5f658f4e853266b6d0",
     "tests/run_rfx_tests.py": "db9f0369fd5e0ca863d44f7dc2ff7051af8a47793f4aadb98fa63d20be1aa76f",
     "tests/freeze_rfx.py": "294dee6af7d3e9e4f395db66163912b3b32c9fde48057dd7b0956d0123dfec87",
     "tests/fixtures/rfx-original-quant-order.bin": "635252cf344eb283f9328296c8602d37ef2dc68a2bfbbd4ea29f3b7f922bcbf2",
@@ -38,7 +38,7 @@
     "tests/image_consumers_original_generator.rs": "31908b83e6c3d1a9ab3eb2311d0110e3dee1f1cbe6392491256d4ba4976b4959",
     "tests/freeze_image_consumers.py": "fc5928f5e73aaf5c469d73b9a160a32b6a76ae184946cdd5b1ae6ff7e2829104",
     "tests/image_consumers_native.rs": "42cda4ce6acca93087d9a7a51be750bfde2bf66fecc25fcc8bd2cb6dba4f3a1b",
-    "tests/run_image_consumers_tests.py": "910657b1758bf5742fb57f28c47c0faa526620fe2ff5376bb48f1a7277d77a05",
+    "tests/run_image_consumers_tests.py": "19d91da39b481ff6f7e2086574b5f4c49768de282a4f3833951a2779549a00db",
     "tests/test_image_consumers_mutations.py": "fe7c5a4be44d1e3cb1413db7ba06c95fe25b146ca0d8764ea4eeee817cd06958",
     "tests/image_qoi_helper_native.rs": "01ff42a9f4a37d02251580765108ace27881e4ffb9e93f78be690fc72167e021",
     "tests/fixtures/image-consumers-original.bin": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80",
@@ -46,7 +46,10 @@
     "tests/image_optional_wire.rs": "2e1e2ad33dd438b72aa772b01415805a3987b8cebe07086b43d892a07306fe8f",
     "tests/optional_image_support.py": "586b5e669a63f2c1ca5da1713c2e897de363f661ef3eef2b57adf46811c64b4b",
     "tests/run_image_optional_tests.py": "1e438ed3566756ff0d9465cedfcc66c89d2cbc82cd4b0097dd59deea93e9da4a",
-    "tests/test_image_optional_mutations.py": "c2161661abd20fc116270a4052ac8f09fc0edc0e8f5b0ff26eb025536de56828"
+    "tests/test_image_optional_mutations.py": "c2161661abd20fc116270a4052ac8f09fc0edc0e8f5b0ff26eb025536de56828",
+    "tests/decoded_coverage.rs": "58abb78ee6e736d9a9487c181b2d44376e1253c1074a694bf8418c6d662fc273",
+    "tests/run_decoded_coverage_tests.py": "a781ef986c663335281aa2fdeb0ce8f2b7ef489fcb3c30cca3e7c95e97ead96a",
+    "tests/test_decoded_coverage_mutations.py": "ed5bce3a150323372151da31d09dd16c27f53fd5510d234d49f4d42d6dc3663b"
   },
   "image_consumer_fixture_sha256": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80"
 }

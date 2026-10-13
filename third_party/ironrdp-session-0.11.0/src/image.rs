@@ -14,6 +14,122 @@ use crate::{SessionResult, custom_err};
 
 const TILE_SIZE: u16 = 64;
 
+/// 一次调用的原输出与实际成功内容；错误不返回部分 receipts。
+#[derive(Debug)]
+pub struct ActiveStageProcessResult {
+    pub outputs: Vec<crate::ActiveStageOutput>,
+    pub decoded_coverage: Vec<DecodedCoverageReceipt>,
+}
+
+/// 对应 outputs 中的 GraphicsUpdate；空数组明确表示只有展示 damage。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedCoverageReceipt {
+    pub graphics_output_index: usize,
+    pub rectangles: Vec<InclusiveRectangle>,
+}
+
+/// 每次调用至多 65536 个矩形与 65536 个 receipt，二者独立计费。
+pub(crate) const MAX_COVERAGE_ENTRIES: usize = 65_536;
+#[derive(Debug)]
+pub(crate) enum CoverageError {
+    Budget,
+    Allocation(std::collections::TryReserveError),
+}
+impl core::fmt::Display for CoverageError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Budget => f.write_str("实际内容覆盖元数据超出单次调用限额"),
+            Self::Allocation(e) => e.fmt(f),
+        }
+    }
+}
+impl std::error::Error for CoverageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Allocation(e) => Some(e),
+            Self::Budget => None,
+        }
+    }
+}
+
+/// 禁用时所有函数立即返回，Vec::new 不分配；不会执行 rich 几何与资源门。
+#[derive(Default)]
+pub(crate) struct CoverageCollector {
+    pub(crate) enabled: bool,
+    pub(crate) receipts: Vec<DecodedCoverageReceipt>,
+    pending: Vec<InclusiveRectangle>,
+    total_rectangles: usize,
+    update_offset: usize,
+}
+impl CoverageCollector {
+    pub(crate) fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+    pub(crate) fn reserve_entry(&mut self) -> SessionResult<()> {
+        self.reserve_entries(1)
+    }
+    pub(crate) fn reserve_entries(&mut self, count: usize) -> SessionResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self
+            .receipts
+            .len()
+            .checked_add(count)
+            .is_none_or(|n| n > MAX_COVERAGE_ENTRIES)
+        {
+            return Err(custom_err!("decoded coverage", CoverageError::Budget));
+        }
+        self.receipts
+            .try_reserve_exact(count)
+            .map_err(|e| custom_err!("decoded coverage", CoverageError::Allocation(e)))
+    }
+    pub(crate) fn reserve_rectangles(&mut self, count: usize) -> SessionResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self
+            .total_rectangles
+            .checked_add(count)
+            .is_none_or(|n| n > MAX_COVERAGE_ENTRIES)
+        {
+            return Err(custom_err!("decoded coverage", CoverageError::Budget));
+        }
+        self.pending
+            .try_reserve_exact(count)
+            .map_err(|e| custom_err!("decoded coverage", CoverageError::Allocation(e)))
+    }
+    pub(crate) fn content(&mut self, rectangles: impl IntoIterator<Item = InclusiveRectangle>) {
+        if !self.enabled {
+            return;
+        }
+        for rect in rectangles {
+            self.pending.push(rect);
+            self.total_rectangles += 1;
+        }
+    }
+    pub(crate) fn finish_updates(&mut self, updates: &[crate::fast_path::UpdateKind]) -> SessionResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        for (index, update) in updates.iter().enumerate() {
+            if matches!(update, crate::fast_path::UpdateKind::Region(_)) {
+                self.reserve_entry()?;
+                self.receipts.push(DecodedCoverageReceipt {
+                    graphics_output_index: self.update_offset + index,
+                    rectangles: core::mem::take(&mut self.pending),
+                });
+            }
+        }
+        debug_assert!(self.pending.is_empty(), "内容写入必须对应 GraphicsUpdate");
+        self.update_offset += updates.len();
+        Ok(())
+    }
+}
+
 pub struct DecodedImage {
     pixel_format: PixelFormat,
     data: Vec<u8>,
@@ -629,6 +745,64 @@ impl DecodedImage {
         self.pointer_rendering_end(state).map(Some)
     }
 
+    /// rich 默认路径仅调整行布局；像素转换仍复用原版 helper，保持独立参考语义。
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn apply_bitmap_compat(
+        &mut self,
+        source: &[u8],
+        format: PixelRowSource,
+        sw: usize,
+        sh: usize,
+        stride: usize,
+        bottom_up: bool,
+        rectangle: &InclusiveRectangle,
+        palette: &[[u8; 3]; 256],
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        let expected = self.native_bitmap_size(format, sw, sh, stride, rectangle)?;
+        if source.len() != expected {
+            return Err(custom_err!("完整 Bitmap 源", KernelError::Length));
+        }
+        let (dw, dh) = native_rect_size(rectangle).map_err(|e| custom_err!("Bitmap 目标", e))?;
+        let row = dw
+            .checked_mul(native_source_bytes(format))
+            .ok_or_else(|| custom_err!("Bitmap 行", KernelError::InvalidDimensions))?;
+        let size = row
+            .checked_mul(dh)
+            .filter(|&n| n <= MAX_NATIVE_BITMAP_BYTES && n <= isize::MAX as usize)
+            .ok_or_else(|| custom_err!("Bitmap staging", KernelError::InvalidDimensions))?;
+        if !self.rect_fits(rectangle) {
+            return Ok(None);
+        }
+        // 完整源的逻辑左上角，bottom-up 必须按 SH 定位；staging 自身也保持 bottom-up。
+        let mut cropped = Vec::new();
+        cropped
+            .try_reserve_exact(size)
+            .map_err(|e| custom_err!("Bitmap staging allocation", e))?;
+        for y in (0..dh).rev() {
+            let sy = if bottom_up { sh - 1 - y } else { y };
+            let start = sy * stride;
+            cropped.extend_from_slice(&source[start..start + row]);
+        }
+        let damage = match format {
+            PixelRowSource::Packed(PackedDepth::Index8) => {
+                self.apply_rgb8_with_palette(&cropped, rectangle, palette)?
+            }
+            PixelRowSource::Packed(PackedDepth::Rgb555) => self.apply_rgb15_bitmap(&cropped, rectangle)?,
+            PixelRowSource::Packed(PackedDepth::Rgb565) => self.apply_rgb16_bitmap(&cropped, rectangle)?,
+            PixelRowSource::Packed(PackedDepth::Bgr24) => self.apply_bgr24_bitmap(&cropped, rectangle)?,
+            PixelRowSource::Rgb24 => self.apply_rgb24(&cropped, rectangle, true)?,
+            PixelRowSource::Raw32(Pixel32Format::BgrX) => {
+                self.apply_rgb32_bitmap(&cropped, PixelFormat::BgrX32, rectangle)?
+            }
+            #[cfg(feature = "qoi")]
+            PixelRowSource::Raw32(Pixel32Format::RgbA) => self.apply_rgba32(&cropped, rectangle, true)?,
+            _ => {
+                return Err(custom_err!("Bitmap 参考格式", KernelError::InvalidDimensions));
+            }
+        };
+        Ok(Some(damage))
+    }
+
     /// 完整 tile 已解码后，保持 Region32 alpha、region 顺序与固定 64 像素源 stride。
     pub(crate) fn apply_tile_native(
         &mut self,
@@ -637,6 +811,28 @@ impl DecodedImage {
         clips: &Region,
         update: &InclusiveRectangle,
         kernels: &NativeKernels,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        self.apply_tile_rows(source, source_format, clips, update, Some(kernels), false)
+    }
+    /// rich 已验证的精确交集；不再经过上游 Region 的 lossy simplify。
+    pub(crate) fn apply_tile_exact(
+        &mut self,
+        source: &[u8],
+        source_format: PixelFormat,
+        regions: &Region,
+        update: &InclusiveRectangle,
+        kernels: Option<&NativeKernels>,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        self.apply_tile_rows(source, source_format, regions, update, kernels, true)
+    }
+    fn apply_tile_rows(
+        &mut self,
+        source: &[u8],
+        source_format: PixelFormat,
+        clips: &Region,
+        update: &InclusiveRectangle,
+        kernels: Option<&NativeKernels>,
+        exact: bool,
     ) -> SessionResult<Option<InclusiveRectangle>> {
         let (width, height) = native_rect_size(update).map_err(|e| custom_err!("native tile geometry", e))?;
         if width > 64 || height > 64 || source.len() != 64 * 64 * 4 {
@@ -651,19 +847,34 @@ impl DecodedImage {
         }
         let format = PixelRowSource::Region32(native_pixel_format(source_format));
         let destination_format = native_pixel_format(self.pixel_format);
-        kernels
-            .convert_pixel_row(format, destination_format, &[], None, &mut [])
-            .map_err(|e| custom_err!("native tile capability", e))?;
+        if let Some(kernels) = kernels {
+            kernels
+                .convert_pixel_row(format, destination_format, &[], None, &mut [])
+                .map_err(|e| custom_err!("native tile capability", e))?;
+        }
         if !self.rect_fits(&clips.extents) {
             return Ok(None);
         }
-        let region = clips.intersect_rectangle(update);
+        let intersected;
+        let region = if exact {
+            clips
+        } else {
+            intersected = clips.intersect_rectangle(update);
+            &intersected
+        };
         if region.rectangles.is_empty() {
             return Ok(None);
         }
         // 全部 source/destination row 先验证，不让第二 region 几何错误发生在 pointer begin 后。
         for rect in &region.rectangles {
             let (width, height) = native_rect_size(rect).map_err(|e| custom_err!("native tile clips", e))?;
+            if rect.left < update.left
+                || rect.top < update.top
+                || rect.right > update.right
+                || rect.bottom > update.bottom
+            {
+                return Err(custom_err!("精确 tile 交集", KernelError::InvalidDimensions));
+            }
             let x = usize::from(rect.left - update.left);
             let y = usize::from(rect.top - update.top);
             if x + width > 64 || y + height > 64 {
@@ -691,15 +902,40 @@ impl DecodedImage {
                 let to = (usize::from(rect.top) + row) * stride + usize::from(rect.left) * 4;
                 #[cfg(test)]
                 NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("row", width * 4)));
-                kernels
-                    .convert_pixel_row(
-                        format,
-                        destination_format,
-                        &source[start..start + width * 4],
-                        None,
-                        &mut self.data[to..to + width * 4],
-                    )
-                    .map_err(|e| custom_err!("native tile row", e))?;
+                if let Some(kernels) = kernels {
+                    kernels
+                        .convert_pixel_row(
+                            format,
+                            destination_format,
+                            &source[start..start + width * 4],
+                            None,
+                            &mut self.data[to..to + width * 4],
+                        )
+                        .map_err(|e| custom_err!("native tile row", e))?;
+                } else {
+                    // 复用原 copy_to 像素算法；单行切片避免 full-image u16 stride 溢出。
+                    let row_width = u16::try_from(width).map_err(|e| custom_err!("tile 行", e))?;
+                    let row_rect = InclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: row_width - 1,
+                        bottom: 0,
+                    };
+                    let from = ImageRegion {
+                        region: row_rect.clone(),
+                        data: &source[start..start + width * 4],
+                        step: row_width * 4,
+                        pixel_format: source_format,
+                    };
+                    let mut dest = ImageRegionMut {
+                        region: row_rect,
+                        data: &mut self.data[to..to + width * 4],
+                        step: row_width * 4,
+                        pixel_format: self.pixel_format,
+                    };
+                    from.copy_to(&mut dest)
+                        .map_err(|e| custom_err!("精确 tile copy_to", e))?;
+                }
             }
         }
         #[cfg(test)]

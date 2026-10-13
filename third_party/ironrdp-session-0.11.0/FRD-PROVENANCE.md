@@ -76,3 +76,74 @@ wire tests do not enable the optional codecs in the product cache graph and do
 not qualify QOI algorithm SIMD, package/live/performance or production selection.
 No production factory, advertisement, active-stage interface, UI, device,
 package, protocol manifest/lock or server component is changed.
+
+## A2.8B exact session decoded coverage
+
+The existing public `image` module owns `ActiveStageProcessResult { outputs,
+decoded_coverage }` and `DecodedCoverageReceipt { graphics_output_index,
+rectangles }`. `ActiveStage::process_with_decoded_coverage` and
+`process_fastpath_input_with_decoded_coverage` parse and dispatch once through the
+same internal paths as the old methods. A receipt exists for every resulting
+GraphicsUpdate, including an explicit empty receipt for sentinel or cursor-only
+damage. Content means an actual successful target write; cursor shape, cache,
+move, hide/show, background restore, palette, marker and control outputs never
+create content. Existing enums, reexports, builders and public signatures remain
+fixed. Old wrappers use a disabled collector, do not call the rich API and do not
+allocate metadata or execute rich geometry/budget/completeness gates.
+
+Rich default Bitmap decoding uses the approved actual RLE write progress or
+positive complete RDP6 source-shape fact from the same scalar decode call. RLE
+success-underfill returns typed CompleteRleError before image apply; decode Err
+keeps the historical default warning/damage with empty content. The explicit
+native path remains strict. Portable checked full SW/SH/stride preflight and
+256MiB/isize bounds are shared with the native image adapter. Default rich
+materialization copies the logical upper-left crop into bounded tight staging,
+then calls the original palette/15/16/BGR24/RGB24/Raw32 conversion helpers; it does
+not duplicate their pixel formulas. Raw Bitmap validates align4(SW*B)*SH including
+final padding; compressed packed/RDP6 use their tight source layouts, and bottom-up
+selection indexes SH. SetSurfaceBits ignores incoming right/bottom in favor of
+extended dimensions, StreamSurfaceBits validates exclusive bounds separately,
+and CODEC_NONE keeps the tight bottom-up BGR/BgrX baseline. Legal outside rectangles
+are skipped in whole; no skipped or failed source manufactures origin content.
+QOI/QOIZ rich paths reuse the existing checked same-header and bounded-growth
+helpers, with original optional tests retained. This is optional-feature
+validation, not QOI SIMD or production qualification.
+
+RFX rich clip construction retains checked, sorted exact rectangles and permits
+exact overlaps/duplicates. The upstream inclusive Region union can lose a single
+row; its simplify can shorten unequal-height bands. Rich tile materialization
+therefore consumes a single precomputed checked intersection list directly,
+without union/intersect/simplify. Its receipt uses that same list only after
+successful apply. Native row conversion and original ImageRegion.copy_to row
+conversion remain the numerical implementations. Old tile wrappers retain their
+original Region behavior. Independent pixel enumeration covers disjoint and
+partial tiles, empty wire region with only actual arrived tiles, gaps, a genuine
+origin pixel, unequal-height overlapping bands and duplicate clips across all
+eight target formats; both image writes and receipts are checked.
+
+The short-lived call collector bounds raw rectangles and receipt entries
+independently at 65,536. Rectangles consume at most 512KiB of payload. Each receipt
+stores usize plus a Vec header: 32 bytes on a 64-bit ABI (at most 2MiB), 16 bytes
+on a 32-bit ABI (at most 1MiB). Vec capacities are checked with try_reserve_exact
+before predictable apply/pointer operations. RFX additionally has at most 65,535
+checked clip rectangles (under 512KiB) and a per-tile exact intersection list
+(at most 512KiB); staging/framebuffer, legacy output vectors, input reassembly,
+allocator overhead and decoder buffers are separate. There is no second
+persistent per-pixel coverage map and no whole-process 512KiB memory claim.
+An exhausted budget is a typed source-bearing error, never a bounding-box
+fallback. The cap spans updates in a process call, including a completed large
+fragment and subsequent updates. Err returns no metadata; earlier valid pixels
+or pointer actions can remain. The caller must terminate/reset after Err.
+
+The actual-source harness uses Rust1.96 with offline/locked Cargo JSON artifact
+identities in debug/release, scoped strict clippy and non-test compilation.
+Executable mutations must compile then fail semantic tests, including replacing
+coverage with bbox, counting cursor damage, confusing SW/DW or SH/DH, trusting
+Vec length instead of write progress, removing/resetting the batch cap, index
+mismatch and lossy writer intersection. The original 2,624-record image fixture,
+original source inventories, archive identities, generators, allowlists and
+protocol/graphics/K sources are unchanged. One authorized prelude-only change in
+the existing image-only QOI helper harness imports actual ActiveStageOutput and
+fast_path so the additive public image types remain compilable there.
+No production selection, advertisement, platform adapter, UI, package, target,
+network, server helper, signing or credential action is part of this change.
