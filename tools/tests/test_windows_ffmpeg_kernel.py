@@ -254,6 +254,138 @@ class WindowsKernelContract(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.k.Pe(bytes(data)).kernel(4096)
 
+    def loader_pe(self):
+        # 新 data section 与 kernel 完全分开；预期值不由生产 parser 推导。
+        data = bytearray(self.pe + b'\0' * 512)
+        struct.pack_into('<H', data, self.pe_header + 6, 2)
+        struct.pack_into('<I', data, self.optional + 56, 12288)
+        struct.pack_into('<8sIIIIIIHHI', data, self.section + 40,
+                         b'.rdata\0\0', 512, 8192, 512, 1024, 0, 0, 0, 0, 0xC0000040)
+        return data
+
+    def import_pe(self, target=8400, *, iat_directory=True, delay=False):
+        data = self.loader_pe()
+        struct.pack_into('<QQ', data, 1096, 8344, 0)  # lookup RVA8264
+        data[1152:1165] = b'KERNEL32.dll\0'  # DLL name RVA8320
+        struct.pack_into('<H', data, 1176, 0)
+        data[1178:1191] = b'GetTickCount\0'  # hint/name RVA8344
+        if target >= 8192:
+            struct.pack_into('<QQ', data, 1024 + target - 8192, 8344, 0)
+        if delay:
+            struct.pack_into('<IIIIIIII', data, 1024, 1, 8320, 8496, target, 8264, 0, 0, 0)
+            struct.pack_into('<II', data, self.optional + 112 + 13 * 8, 8192, 64)
+        else:
+            struct.pack_into('<IIIII', data, 1024, 8264, 0, 0, 8320, target)
+            struct.pack_into('<II', data, self.optional + 112 + 1 * 8, 8192, 40)
+        if iat_directory:
+            struct.pack_into('<II', data, self.optional + 112 + 12 * 8, target, 16)
+        return bytes(data)
+
+    def test_authoritative_import_firstthunk_cannot_overwrite_kernel_without_iat_directory(self):
+        for iat in (False, True):
+            for delay in (False, True):
+                with self.subTest(iat=iat, delay=delay), self.assertRaisesRegex(ValueError, 'loader|import'):
+                    self.k.Pe(self.import_pe(4096, iat_directory=iat, delay=delay)).kernel(4096)
+
+    def test_iat_directory_cannot_mask_descriptor_target_or_partial_instruction_overlap(self):
+        data = put(self.import_pe(4096), self.optional + 112 + 12 * 8, '<II', 8400, 16)
+        with self.assertRaisesRegex(ValueError, 'FirstThunk'):
+            self.k.Pe(data).kernel(4096)
+        data = put(self.import_pe(4368, iat_directory=False), self.section + 8, '<I', 512)
+        with self.assertRaisesRegex(ValueError, 'FirstThunk'):
+            self.k.Pe(data).kernel(4096)
+
+    def test_positive_normal_delay_and_originalfirstthunk_zero_imports(self):
+        for delay in (False, True):
+            with self.subTest(delay=delay):
+                self.assertEqual(self.k.Pe(self.import_pe(delay=delay)).kernel(4096)['rva'], 4096)
+        data = put(self.import_pe(), 1024, '<I', 0)
+        self.assertEqual(self.k.Pe(data).kernel(4096)['rva'], 4096)
+
+    def test_import_structure_thunks_names_targets_and_delay_handles_are_checked(self):
+        normal, delay = self.import_pe(), self.import_pe(delay=True)
+        cases = [put(normal, self.optional + 112 + 8 + 4, '<I', 20),
+                 put(normal, 1028, '<I', 1), put(normal, 1032, '<I', 1),
+                 put(normal, 1040, '<I', 0), put(normal, 1036, '<I', 0),
+                 put(normal, 1024, '<I', 8700), put(normal, 1040, '<I', 12280),
+                 put(normal, 1036, '<I', 8703), put(normal, 1096, '<Q', 0x180002100),
+                 put(normal, 1096, '<Q', 0x8000000000010001),
+                 put(normal, 1096, '<Q', 8703),
+                 put(delay, 1024, '<I', 2), put(delay, 1032, '<I', 4096),
+                 put(delay, 1032, '<I', 12280), put(delay, 1036, '<I', 12280),
+                 put(delay, 1048, '<I', 4096),
+                 put(delay, self.optional + 112 + 13 * 8 + 4, '<I', 32)]
+        for index, data in enumerate(cases):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.k.Pe(data).kernel(4096)
+        data = bytearray(put(normal, 1024, '<I', 8688))
+        struct.pack_into('<QQ', data, 1520, 8344, 8344)
+        with self.assertRaisesRegex(ValueError, '终止'):
+            self.k.Pe(bytes(data)).kernel(4096)
+
+    def test_ordinary_tls_index_supported_but_kernel_index_and_unknown_load_config_fail(self):
+        data = self.loader_pe()
+        base = 0x180000000
+        struct.pack_into('<QQQQII', data, 1024, base + 8560, base + 8564, base + 8528, base + 8544, 0, 0)
+        struct.pack_into('<QQ', data, 1376, base + 4096, 0)
+        struct.pack_into('<II', data, self.optional + 112 + 9 * 8, 8192, 40)
+        self.assertEqual(self.k.Pe(bytes(data)).kernel(4096)['rva'], 4096)
+        with self.assertRaisesRegex(ValueError, 'loader|TLS'):
+            self.k.Pe(put(data, 1040, '<Q', base + 4096)).kernel(4096)
+        with self.assertRaisesRegex(ValueError, 'unsupported|不支持'):
+            self.k.Pe(put(data, self.optional + 112 + 10 * 8, '<II', 8256, 4)).kernel(4096)
+
+    def test_tls_and_import_targets_can_use_valid_data_zero_fill_but_not_gaps_or_headers(self):
+        data = self.loader_pe()
+        struct.pack_into('<H', data, self.pe_header + 6, 3)
+        struct.pack_into('<I', data, self.optional + 56, 16384)
+        struct.pack_into('<8sIIIIIIHHI', data, self.section + 80,
+                         b'.bss\0\0\0\0', 256, 12288, 0, 0, 0, 0, 0, 0, 0xC0000080)
+        base = 0x180000000
+        struct.pack_into('<QQQQII', data, 1024, 0, 0, base + 12288, 0, 16, 0)
+        struct.pack_into('<II', data, self.optional + 112 + 9 * 8, 8192, 40)
+        self.assertEqual(self.k.Pe(bytes(data)).kernel(4096)['rva'], 4096)
+        for va in (base + 32, base + 8704, base + 12544):
+            with self.subTest(va=va), self.assertRaises(ValueError):
+                self.k.Pe(put(data, 1040, '<Q', va)).kernel(4096)
+        imported = bytearray(self.import_pe(iat_directory=False))
+        imported[self.section + 80:self.section + 120] = data[self.section + 80:self.section + 120]
+        struct.pack_into('<H', imported, self.pe_header + 6, 3)
+        struct.pack_into('<I', imported, self.optional + 56, 16384)
+        struct.pack_into('<I', imported, 1040, 12288)
+        struct.pack_into('<II', imported, self.optional + 112 + 12 * 8, 12288, 16)
+        self.assertEqual(self.k.Pe(bytes(imported)).kernel(4096)['rva'], 4096)
+
+    def test_empty_import_tables_and_delay_unload_ranges_are_bounded(self):
+        for index, size in ((1, 20), (13, 32)):
+            data = self.loader_pe()
+            struct.pack_into('<II', data, self.optional + 112 + index * 8, 8192, size)
+            self.assertEqual(self.k.Pe(bytes(data)).kernel(4096)['rva'], 4096)
+        data = bytearray(self.import_pe(delay=True))
+        struct.pack_into('<QQ', data, 1312, 8344, 0)  # unload IAT RVA8480
+        struct.pack_into('<I', data, 1048, 8480)
+        self.assertEqual(self.k.Pe(bytes(data)).kernel(4096)['rva'], 4096)
+
+    def test_unknown_loader_directories_and_relocation_types_fail_closed(self):
+        for index in (7, 8, 10, 11, 14, 15):
+            data = put(self.loader_pe(), self.optional + 112 + index * 8, '<II', 8192, 4)
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, '不支持'):
+                self.k.Pe(data).kernel(4096)
+        data = self.loader_pe()
+        struct.pack_into('<II', data, self.optional + 112 + 5 * 8, 8192, 12)
+        struct.pack_into('<IIHH', data, 1024, 8192, 12, 0x3000, 0)
+        with self.assertRaisesRegex(ValueError, 'relocation type'):
+            self.k.Pe(bytes(data)).kernel(4096)
+
+    def test_static_assembler_statements_ignore_strings_comments_but_not_dynamic_opcodes(self):
+        self.k.reject_external_assembler_input('.ascii "literal ; .incbin"\n// .include\n'
+                                              '/* .incbin */\n.macro f name\n\\name:\nret\n.endm\n')
+        for statement in ('1: .incbin "x"', 'x: .include "x"', 'ret; .include "x"',
+                          '.macro f name\n.\\name "x"\n.endm', '.inc\\()bin "x"',
+                          '\\prefix\\name "x"', '.inc&bin "x"'):
+            with self.subTest(statement=statement), self.assertRaises(ValueError):
+                self.k.reject_external_assembler_input(statement)
+
     def test_map_exact_input_contribution_and_symbol_address(self):
         obj = self.save('map-aux.obj', self.aux_object())
         record = self.k.coff_kernel_identity(obj)
@@ -428,6 +560,29 @@ class WindowsKernelContract(unittest.TestCase):
         data['flags'].append('@response.txt')
         with self.assertRaises(ValueError):
             self.k.coff_kernel_identity(obj, data)
+
+    def test_actual_config_external_readers_labels_separators_and_macro_construction_fail(self):
+        fixture = TOOLS / 'tests/fixtures/macos-h264dc-kernel.bin'
+        outside = self.save('windows-h264dc-external-include.s', b'.byte 123\n')
+        snippets = [f'endpoint_read: .incbin "{fixture}"\n',
+                    f'.p2align 2; endpoint_read: .include "{outside}"\n',
+                    '.macro frd_reader name\n' + f'.\\name "{fixture}"\n.endm\nfrd_reader incbin\n',
+                    '.macro frd_reader\n' + f'.inc\\()bin "{fixture}"\n.endm\nfrd_reader\n',
+                    '.macro frd_reader prefix name\n' + f'\\prefix\\name "{fixture}"\n.endm\nfrd_reader ., incbin\n']
+        archive = TOOLS.parent / 'target/ffmpeg-macos/ffmpeg-8.1.2.tar.xz'
+        for index, body in enumerate(snippets):
+            # 实际 assembler 必须成功；随后 gate 失败，不能让无效汇编替代检测证明。
+            obj, endpoint = self.g.generate_source(self.directory / f'outside-reader-{index}', archive,
+                                                   config_append='.section .rdata,"dr"\n' + body + '.text\n')
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, 'assembler|config'):
+                self.k.coff_kernel_identity(obj, endpoint)
+
+    def test_configuration_cannot_smuggle_raw_assembler_even_without_external_reader_token(self):
+        archive = TOOLS.parent / 'target/ffmpeg-macos/ffmpeg-8.1.2.tar.xz'
+        obj, endpoint = self.g.generate_source(self.directory / 'raw-config-assembler', archive,
+                                               config_append='.section .rdata,"dr"\n.byte 123\n.text\n')
+        with self.assertRaisesRegex(ValueError, 'config.h'):
+            self.k.coff_kernel_identity(obj, endpoint)
 
     def test_source_proof_output_link_cannot_modify_shipping_source(self):
         obj, endpoint = self.source_fixture()

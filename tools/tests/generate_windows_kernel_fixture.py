@@ -55,7 +55,7 @@ def generate(directory):
     return record
 
 
-def generate_source(directory, archive):
+def generate_source(directory, archive, *, config_append=''):
     """固定源码+归档宏+最小 synthetic config；不是 actual shipping 配置。"""
     spec = importlib.util.spec_from_file_location('recipe', TOOLS / 'ffmpeg-source-recipe.py')
     recipe = importlib.util.module_from_spec(spec)
@@ -81,7 +81,7 @@ def generate_source(directory, archive):
             path.write_bytes(data)
     (directory / 'config.h').write_text('#define EXTERN_ASM\n#define HAVE_AS_FUNC 0\n'
                                       '#define HAVE_AS_ARCH_DIRECTIVE 0\n#define CONFIG_PIC 1\n'
-                                      '#define HAVE_NEON 1\n', encoding='utf-8')
+                                      '#define HAVE_NEON 1\n' + config_append, encoding='utf-8')
     (directory / 'ffbuild').mkdir(exist_ok=True)
     (directory / 'ffbuild/config.mak').write_text('fixture=synthetic-config-compiled-only\n', encoding='utf-8')
     clang = shutil.which('clang')

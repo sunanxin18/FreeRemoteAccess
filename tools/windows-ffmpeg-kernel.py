@@ -159,6 +159,7 @@ class Pe:
         self.image_base = unpack(data, '<Q', optional + 24, 'PE ImageBase')[0]
         alignment, file_alignment = unpack(data, '<II', optional + 32, 'PE alignments')
         image_size, header_size = unpack(data, '<II', optional + 56, 'PE image/header size')
+        self.image_size = image_size
         dirs = unpack(data, '<I', optional + 108, 'PE directories')[0]
         require(dirs <= 16 and optsize == 112 + dirs * 8 and
                 self.image_base % 65536 == 0 and self.image_base + image_size <= 1 << 64 and
@@ -223,6 +224,8 @@ class Pe:
                     extent(address, size, len(data), 'PE certificate file range')
                     require(address >= max(s['raw'] + s['size'] for s in self.sections),
                             'PE certificate 覆盖 section')
+                elif index == 12:
+                    self.memory(address, size)
                 else:
                     self.map(address, size, executable=False)
 
@@ -239,6 +242,142 @@ class Pe:
         extent(offset, size, len(self.data), 'PE mapped bytes')
         return section, offset
 
+    def memory(self, rva, size):
+        """loader 写目标可在合法 data zero-fill；读取表仍必须走 file-backed map。"""
+        extent(rva, size, self.image_size, 'PE loader memory RVA')
+        matches = [s for s in self.sections if s['rva'] <= rva and rva + size <= s['rva'] + s['virtual']]
+        require(size > 0 and len(matches) == 1, 'PE loader target 不在唯一 virtual section')
+        return matches[0]
+
+    def va_rva(self, va):
+        require(type(va) is int and self.image_base <= va < self.image_base + self.image_size,
+                'PE loader VA/RVA 范围无效')
+        return va - self.image_base
+
+    def read(self, rva, size, label):
+        _, offset = self.map(rva, size, executable=False)
+        return self.data[offset:offset + size]
+
+    def name(self, rva, hint=False):
+        section, offset = self.map(rva, 3 if hint else 1, executable=False)
+        end = section['raw'] + min(section['size'], section['virtual'])
+        name = cstring(self.data[offset + (2 if hint else 0):end], 0, 'PE import name')
+        require(bool(name), 'PE import name 为空')
+
+    def thunks(self, rva):
+        require(rva != 0 and rva % 8 == 0, 'PE import lookup alignment/pointer 无效')
+        section, offset = self.map(rva, 8, executable=False)
+        available = min(section['virtual'], section['size']) - (rva - section['rva'])
+        for index in range(available // 8):
+            value = unpack(self.data, '<Q', offset + index * 8, 'PE import lookup')[0]
+            if value == 0:
+                return index + 1  # 保守包括终止slot，不把缺失目录当空write set。
+            if value >> 63:
+                require(value & 0x7FFFFFFFFFFF0000 == 0, 'PE import ordinal reserved bits 无效')
+            else:
+                require(value <= 0xFFFFFFFF, 'PE import thunk 不是 RVA')
+                self.name(value, hint=True)
+        raise ValueError('PE import lookup 缺少有界终止项')
+
+    def loader_writes(self):
+        """枚举 PE metadata 指定的 loader 写；不执行/分析 TLS callback 或 DllMain。"""
+        writes = []
+        def directory(index):
+            return self.directories[index] if index < len(self.directories) else (0, 0)
+        def write(address, size, label, alignment=1):
+            require(address != 0 and address % alignment == 0, f'PE loader {label} pointer/alignment 无效')
+            self.memory(address, size)
+            writes.append((address, size, label))
+        for index in (7, 8, 10, 11, 14, 15):
+            require(directory(index) == (0, 0), f'PE loader 不支持 directory {index} mutation mechanism')
+        # IAT directory 仅补充保守范围；authoritative FirstThunk 不依赖它。
+        address, size = directory(12)
+        if size:
+            require(size % 8 == 0, 'PE import IAT directory size 无效')
+            write(address, size, 'declared IAT', 8)
+        for index, descriptor_size in ((1, 20), (13, 32)):
+            address, size = directory(index)
+            if not size:
+                continue
+            require(size >= descriptor_size and size % descriptor_size == 0,
+                    'PE import descriptor table/terminator size 无效')
+            table = self.read(address, size, 'import descriptors')
+            terminated = False
+            for offset in range(0, size, descriptor_size):
+                fields = struct.unpack_from('<' + 'I' * (descriptor_size // 4), table, offset)
+                if not any(fields):
+                    require(not any(table[offset:]), 'PE import descriptor 终止后存在非零记录')
+                    terminated = True
+                    break
+                if index == 1:
+                    lookup, timestamp, forwarder, name, target = fields
+                    require(timestamp == 0 and forwarder in (0, 0xFFFFFFFF),
+                            'PE loader 不支持 pre-bound import/forwarder write mechanism')
+                    require(name and target, 'PE import descriptor Name/FirstThunk 缺失')
+                    self.name(name)
+                    count = self.thunks(lookup or target)
+                    write(target, count * 8, 'normal import FirstThunk', 8)
+                else:
+                    attributes, name, module, target, lookup, bound, unload, _ = fields
+                    require(attributes == 1, 'PE delay import 仅支持明确 RVA descriptors')
+                    require(name and module and target and lookup, 'PE delay import required pointer 缺失')
+                    self.name(name)
+                    count = self.thunks(lookup)
+                    write(module, 8, 'delay import module handle', 8)
+                    write(target, count * 8, 'delay import IAT', 8)
+                    for pointer, label in ((bound, 'bound IAT'), (unload, 'unload IAT')):
+                        if pointer:
+                            require(pointer % 8 == 0, f'PE delay {label} alignment 无效')
+                            data = self.read(pointer, count * 8, label)
+                            require(data[-8:] == b'\0' * 8, f'PE delay {label} 缺少终止项')
+                            if label == 'unload IAT':
+                                write(pointer, count * 8, 'delay unload IAT', 8)
+            require(terminated, 'PE import descriptor 缺少终止项')
+        address, size = directory(9)
+        if size:
+            require(size == 40, 'PE TLS directory size 不支持')
+            start, end, index, callbacks, zero_fill, characteristics = struct.unpack(
+                '<QQQQII', self.read(address, 40, 'TLS directory'))
+            require(bool(start) == bool(end) and start <= end and characteristics & ~0x00F00000 == 0 and
+                    characteristics >> 20 <= 14, 'PE TLS template/characteristics 无效')
+            if start:
+                start_rva = self.va_rva(start)
+                require(end <= self.image_base + self.image_size and end - start + zero_fill <= 0xFFFFFFFF,
+                        'PE TLS template extent 无效')
+                if end > start:
+                    self.map(start_rva, end - start, executable=False)
+            write(self.va_rva(index), 4, 'TLS AddressOfIndex', 4)
+            if callbacks:
+                callback_rva = self.va_rva(callbacks)
+                require(callback_rva % 8 == 0, 'PE TLS callbacks alignment 无效')
+                section, offset = self.map(callback_rva, 8, executable=False)
+                available = min(section['virtual'], section['size']) - (callback_rva - section['rva'])
+                terminated = False
+                for index in range(available // 8):
+                    callback = unpack(self.data, '<Q', offset + index * 8, 'TLS callback')[0]
+                    if not callback:
+                        terminated = True
+                        break
+                    self.map(self.va_rva(callback), 1)
+                require(terminated, 'PE TLS callbacks 缺少有界终止项')
+        address, size = directory(5)
+        if size:
+            table = self.read(address, size, 'base relocation directory')
+            position = 0
+            while position < size:
+                require(size - position >= 8, 'PE base relocation header 截断')
+                page, block = struct.unpack_from('<II', table, position)
+                require(page % 4096 == 0 and block >= 8 and block % 2 == 0 and block <= size - position,
+                        'PE base relocation block 无效')
+                for delta in range(8, block, 2):
+                    entry = struct.unpack_from('<H', table, position + delta)[0]
+                    typ = entry >> 12
+                    require(typ in (0, 10), 'PE loader 不支持 ARM64 base relocation type')
+                    if typ:
+                        write(page + (entry & 4095), 8, 'base relocation DIR64')
+                position += block
+        return writes
+
     def kernel(self, rva):
         pin = recipes.trusted()['kernel']
         symbols = [s for s in self.symbols if s['name'] == pin['symbol']]
@@ -250,21 +389,8 @@ class Pe:
                     'PE COFF kernel symbol 与 map/final RVA 不匹配')
         section, offset = self.map(rva, pin['size'])
         require(digest(self.data[offset:offset + pin['size']]) == pin['sha256'], 'PE 固定核 bytes 不匹配')
-        if len(self.directories) > 5 and self.directories[5][1]:
-            address, size = self.directories[5]
-            _, start = self.map(address, size, executable=False)
-            position = 0
-            while position < size:
-                page, block = unpack(self.data, '<II', start + position, 'PE base relocation block')
-                require(block >= 8 and block % 2 == 0 and block <= size - position,
-                        'PE base relocation block 无效')
-                for delta in range(8, block, 2):
-                    entry = unpack(self.data, '<H', start + position + delta, 'PE base relocation')[0]
-                    if entry >> 12:
-                        target = page + (entry & 4095)
-                        require(target + 8 <= rva or target >= rva + pin['size'],
-                                'PE base relocation 覆盖 kernel')
-                position += block
+        for target, size, label in self.loader_writes():
+            require(target + size <= rva or target >= rva + pin['size'], f'PE loader {label} 覆盖 kernel')
         return dict(rva=rva, section=section['name'], section_index=section['index'], file_offset=offset,
                     image_base=self.image_base, **pin)
 
@@ -292,6 +418,58 @@ def _run(argv, cwd, log=None):
                     'stdout': result.stdout.decode(errors='replace'), 'stderr': result.stderr.decode(errors='replace')})
     require(result.returncode == 0, f'受控 compiler 调用失败：{result.stderr.decode(errors="replace")}')
     return result.stdout
+
+
+def reject_external_assembler_input(text):
+    """逐 statement 检查，不把 labels/分号/macro 动态 opcode 当作源依赖证明。
+
+    当前固定 source 只需要 static opcode 与 macro labels/operands。
+    动态构造 opcode 一律不支持；未展开的 macro body 也必须经过此门。
+    """
+    clean, index = [], 0
+    while index < len(text):
+        if text.startswith('//', index):
+            end = text.find('\n', index)
+            index = len(text) if end < 0 else end
+            clean.append(' ')
+        elif text.startswith('/*', index):
+            end = text.find('*/', index + 2)
+            require(end >= 0, 'assembler comment 截断')
+            clean.append(' ' + '\n' * text[index:end + 2].count('\n'))
+            index = end + 2
+        elif text[index] in ('"', "'"):
+            quote = text[index]
+            index += 1
+            clean.append(' ')
+            closed = False
+            while index < len(text):
+                char = text[index]
+                index += 1
+                if char == '\\':
+                    require(index < len(text), 'assembler string escape 截断')
+                    index += 1
+                elif char == quote:
+                    closed = True
+                    break
+            require(closed, 'assembler string 截断')
+        else:
+            clean.append(text[index])
+            index += 1
+    for statement in re.split(r'[;\n]', ''.join(clean)):
+        statement = statement.strip()
+        if not statement or statement.startswith('#'):
+            continue
+        while True:
+            label = re.match(r'(?:[A-Za-z_.$\\][A-Za-z0-9_.$\\()]*|[0-9]+)\s*:', statement)
+            if label is None:
+                break
+            statement = statement[label.end():].lstrip()
+        if not statement:
+            continue
+        opcode = statement.split()[0]
+        require(re.fullmatch(r'(?:\.[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_.]*)', opcode) is not None,
+                'assembler 动态 opcode/未知 statement 不支持')
+        require(opcode.lower() not in ('.include', '.incbin'), 'assembler 外部文件读取不支持')
 
 
 def replay_source_endpoint(tree, archive, object_path, compiler, flags, evidence_dir):
@@ -332,7 +510,16 @@ def replay_source_endpoint(tree, archive, object_path, compiler, flags, evidence
     preprocess = [*prefix, '-E', '-x', 'assembler-with-cpp', str(tree / SOURCE)]
     preprocessed = _run(preprocess, tree, logs)
     text = preprocessed.decode('utf-8')
-    require(not re.search(r'(?m)^\s*\.(?:include|incbin)\b', text), 'endpoint 拒绝未由 CPP 捕获的外部 assembler 输入')
+    reject_external_assembler_input(text)
+    owner = None
+    for line in text.splitlines():
+        marker = re.match(r'^#\s+\d+\s+"([^"\n]+)"', line)
+        if marker:
+            path = Path(marker[1])
+            owner = (tree / path).resolve() if not path.is_absolute() else path.resolve()
+        elif owner == tree / 'config.h':
+            require(not line.strip() or line.lstrip().startswith('#'),
+                    'endpoint config.h 只能提供 CPP 配置，不能发出 raw assembler statement')
     dependencies = set(re.findall(r'^#\s+\d+\s+"([^"\n]+)"', text, re.M))
     inputs = {}
     with tarfile.open(archive) as package:
