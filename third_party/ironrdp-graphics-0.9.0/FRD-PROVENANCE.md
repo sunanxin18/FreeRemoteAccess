@@ -51,3 +51,27 @@ the portable graphics RLE module. There is no new ISA
 selection, dependency or scalar production fallback. Focused original image
 fixtures, public session tests and mutations are owned by the session vendor;
 A2.4 Bitmap parity remains an independent unchanged-behavior regression gate.
+
+## A2.8A portable scalar completion facts
+
+`rle::decompress_observed` 返回固定大小 `RleDecodeProgress { written, consumed }`，
+权威来自同一个 scalar/native wire parser 的真实 destination/source cursor。
+原 scalar helper 同序执行 bpp 分派、零尺寸判断、原算术、resize 和单次 scalar materialization，
+旧 public wrappers 丢弃事实。成功欠填充仍成功；Err 保留原错误顺序和 private prefix，
+不增加资源门、错误类型、二次解析、strict/native fallback 或 CPU 选择。
+
+`BitmapStreamDecoder::decode_bitmap_stream_to_rgb24_observed` 调用旧 scalar 入口一次，
+只有原平面和完整 RGB writer 都成功之后，才对正且 checked 的源尺寸返回 `(SW, SH)`。
+四字节/像素的 checked 上界同时覆盖 RGB24、完整 alpha+color planes 和奇数 chroma。
+失败时保留旧错误和 private scratch；成功零尺寸/算术不可证明只返回 `None`。
+不读追加 Vec 长度作为证明，不要求消费尾部，不修改 plane parser 或 session。
+
+新增测试与 runner 身份记录于 `FRD-MODIFICATIONS.json`。原版 archive、SOURCE-INVENTORY、
+UPSTREAM-SHA256SUMS、原 fixtures/generators、修改原件 allowlist 均保持原身份。
+runner 使用既有 Cargo JSON/source harness、固定 Rust 1.96.0 和独立 registry-only oracle。
+观察器窄测试覆盖实际 production library、真实 cursor、空源/欠填充/全零合法输出、
+8/15/16/24bpp、错误/private prefix、ARGB/AYCoCg/alpha/奇数 subsampling、append/tail、
+原版完整和畸形记录，以及无完成计数/resize 伪计数故障变体。
+
+本门仅给出当次 portable 解码事实，不认证 destination crop/padding/stride、
+精确 session receipts、baseline、生产软件热路径、跨目标运行或 live 互操作。

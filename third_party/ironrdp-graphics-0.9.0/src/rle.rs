@@ -49,6 +49,24 @@ pub fn decompress(
     }
 }
 
+/// 返回这一次原标量解析实际写入和消费的字节数。
+/// 成功欠填充仍为 `Ok`；预分配长度和旧缓冲区内容不是完成性证明。
+pub fn decompress_observed(
+    src: &[u8],
+    dst: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+    bpp: usize,
+) -> Result<(RlePixelFormat, RleDecodeProgress), RleError> {
+    match bpp {
+        Mode24Bpp::BPP => decompress_observed_helper::<Mode24Bpp>(src, dst, width, height),
+        Mode16Bpp::BPP => decompress_observed_helper::<Mode16Bpp>(src, dst, width, height),
+        Mode15Bpp::BPP => decompress_observed_helper::<Mode15Bpp>(src, dst, width, height),
+        Mode8Bpp::BPP => decompress_observed_helper::<Mode8Bpp>(src, dst, width, height),
+        invalid => Err(RleError::InvalidBpp { bpp: invalid }),
+    }
+}
+
 /// 原版 wire 错误与 checked native 叶子错误保持可区分。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeRleError {
@@ -329,15 +347,24 @@ fn decompress_helper<Mode: DepthMode>(
     width: usize,
     height: usize,
 ) -> Result<RlePixelFormat, RleError> {
+    decompress_observed_helper::<Mode>(src, dst, width, height).map(|(format, _)| format)
+}
+
+fn decompress_observed_helper<Mode: DepthMode>(
+    src: &[u8],
+    dst: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+) -> Result<(RlePixelFormat, RleDecodeProgress), RleError> {
     if width == 0 || height == 0 {
         return Err(RleError::EmptyImage);
     }
 
     let row_delta = Mode::COLOR_DEPTH * width;
     dst.resize(row_delta * height, 0);
-    decompress_impl::<Mode>(src, dst, row_delta)?;
+    let progress = decompress_impl::<Mode>(src, dst, row_delta)?;
 
-    Ok(Mode::PIXEL_FORMAT)
+    Ok((Mode::PIXEL_FORMAT, progress))
 }
 
 macro_rules! ensure_size {
@@ -370,8 +397,8 @@ fn decompress_impl<Mode: DepthMode>(
     src: &[u8],
     dst: &mut [u8],
     row_delta: usize,
-) -> Result<(), RleError> {
-    decompress_with::<Mode, _>(src, dst, row_delta, &mut ScalarMaterializer)
+) -> Result<RleDecodeProgress, RleError> {
+    decompress_with_progress::<Mode, _>(src, dst, row_delta, &mut ScalarMaterializer)
 }
 
 // 解析、命令级 first-line 状态、源消费及错误检查只有这一份实现。
@@ -384,10 +411,13 @@ fn decompress_with<Mode: DepthMode, M: Materializer<Mode>>(
     decompress_with_progress::<Mode, M>(src, dst, row_delta, materializer).map(|_| ())
 }
 
+/// 单次成功解析的真实游标事实；不证明其他缓冲区或整幅图像已经完成。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DecodeProgress {
-    written: usize,
-    consumed: usize,
+pub struct RleDecodeProgress {
+    /// 实际连续写入目标前缀的字节数（15bpp 每像素仍为两字节）。
+    pub written: usize,
+    /// 实际消费源流的字节数。
+    pub consumed: usize,
 }
 
 fn decompress_with_progress<Mode: DepthMode, M: Materializer<Mode>>(
@@ -395,7 +425,7 @@ fn decompress_with_progress<Mode: DepthMode, M: Materializer<Mode>>(
     dst: &mut [u8],
     row_delta: usize,
     materializer: &mut M,
-) -> Result<DecodeProgress, M::Error> {
+) -> Result<RleDecodeProgress, M::Error> {
     let mut src = Buf::new(src);
     let mut dst = BufMut::new(dst);
 
@@ -568,7 +598,7 @@ fn decompress_with_progress<Mode: DepthMode, M: Materializer<Mode>>(
         }
     }
 
-    Ok(DecodeProgress {
+    Ok(RleDecodeProgress {
         written: dst.pos,
         consumed: src.pos,
     })

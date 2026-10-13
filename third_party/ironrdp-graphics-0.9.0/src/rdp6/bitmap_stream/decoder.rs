@@ -435,6 +435,29 @@ fn checked_output_size(width: usize, height: usize) -> Result<usize, KernelError
 }
 
 impl BitmapStreamDecoder {
+    /// 执行一次原标量解码，成功后仅对正且算术有效的源尺寸返回形状事实。
+    /// 所有必要平面和 RGB 转换都已完成；不从追加长度推断，也不要求消费尾部。
+    /// 零尺寸或不可证明的算术不新增旧入口错误，成功时仅返回 `None`。
+    pub fn decode_bitmap_stream_to_rgb24_observed(
+        &mut self,
+        bitmap_data: &[u8],
+        dst: &mut Vec<u8>,
+        image_width: usize,
+        image_height: usize,
+    ) -> Result<Option<(usize, usize)>, BitmapDecodeError> {
+        self.decode_bitmap_stream_to_rgb24(bitmap_data, dst, image_width, image_height)?;
+
+        // 四个完整平面是所有 header 形状（含 alpha/奇数 chroma）和 RGB24 的上界。
+        let valid_shape = image_width > 0
+            && image_height > 0
+            && image_width
+                .checked_mul(image_height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+                .is_some();
+        Ok(valid_shape.then_some((image_width, image_height)))
+    }
+
     /// 显式 checked 原生入口；不改变旧入口或 session 默认选择。
     /// RGB/append 几何在 PDU 前检查，header-specific 平面总长在 PDU 后、写入前检查。
     /// 合法几何保留原 parser 的错误顺序。
