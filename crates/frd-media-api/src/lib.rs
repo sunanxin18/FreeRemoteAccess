@@ -7,7 +7,9 @@ pub mod video;
 
 pub use decoder::*;
 pub use diagnostics::*;
-pub use registry::*;
+pub use registry::{
+    CreatedVideoDecoder, VideoDecoderRegistry, VideoDecoderSelection, VideoDecoderSelectionPolicy,
+};
 pub use video::*;
 
 #[cfg(test)]

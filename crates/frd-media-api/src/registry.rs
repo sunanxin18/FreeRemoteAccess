@@ -4,13 +4,31 @@ use crate::{
     VideoDecoderFactory, VideoStreamConfig,
 };
 
+/// 只决定精确且就绪候选的选择顺序，不替代后端自身的资格验证。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VideoDecoderSelectionPolicy {
+    /// 保留原有原生硬件、FFmpeg 硬件、FFmpeg 软件顺序，不选择原生软件。
+    #[default]
+    Default,
+    /// 显式优先原生硬件和软件，再选择 FFmpeg 硬件和软件。
+    NativeFirst,
+}
+
 pub struct VideoDecoderRegistry {
     factories: Vec<Box<dyn VideoDecoderFactory>>,
+    policy: VideoDecoderSelectionPolicy,
 }
 
 impl VideoDecoderRegistry {
     pub fn new(factories: Vec<Box<dyn VideoDecoderFactory>>) -> Self {
-        Self { factories }
+        Self::with_policy(factories, VideoDecoderSelectionPolicy::Default)
+    }
+
+    pub fn with_policy(
+        factories: Vec<Box<dyn VideoDecoderFactory>>,
+        policy: VideoDecoderSelectionPolicy,
+    ) -> Self {
+        Self { factories, policy }
     }
 
     pub fn select(
@@ -88,7 +106,7 @@ impl VideoDecoderRegistry {
             });
 
             if availability == VideoBackendAvailability::DecoderReady {
-                if let Some(tier) = selection_tier(kind, &support, query) {
+                if let Some(tier) = selection_tier(self.policy, kind, &support, query) {
                     candidates.push(SelectionCandidate {
                         tier,
                         registration_index,
@@ -112,27 +130,47 @@ struct SelectionCandidate {
 
 /// 注册顺序只用于相同 tier 的稳定决胜；不得依赖枚举或发现顺序。
 fn selection_tier(
+    policy: VideoDecoderSelectionPolicy,
     kind: VideoBackendKind,
     support: &VideoDecodeSupport,
     query: &VideoDecodeQuery,
 ) -> Option<u8> {
-    match (kind, support) {
-        (VideoBackendKind::Native, VideoDecodeSupport::HardwareExact(capability))
-            if capability.matches_exactly(query) =>
-        {
-            Some(0)
-        }
-        (VideoBackendKind::Ffmpeg, VideoDecodeSupport::HardwareExact(capability))
-            if capability.matches_exactly(query) =>
-        {
-            Some(1)
-        }
-        (VideoBackendKind::Ffmpeg, VideoDecodeSupport::SoftwareExact(capability))
-            if capability.matches_exactly(query) =>
-        {
-            Some(2)
-        }
-        (_, VideoDecodeSupport::Unsupported(_)) => None,
+    let capability = match support {
+        VideoDecodeSupport::HardwareExact(capability)
+        | VideoDecodeSupport::SoftwareExact(capability) => capability,
+        VideoDecodeSupport::Unsupported(_) => return None,
+    };
+    if !capability.matches_exactly(query) {
+        return None;
+    }
+
+    match (policy, kind, support) {
+        (_, VideoBackendKind::Native, VideoDecodeSupport::HardwareExact(_)) => Some(0),
+        (
+            VideoDecoderSelectionPolicy::NativeFirst,
+            VideoBackendKind::Native,
+            VideoDecodeSupport::SoftwareExact(_),
+        ) => Some(1),
+        (
+            VideoDecoderSelectionPolicy::Default,
+            VideoBackendKind::Ffmpeg,
+            VideoDecodeSupport::HardwareExact(_),
+        ) => Some(1),
+        (
+            VideoDecoderSelectionPolicy::Default,
+            VideoBackendKind::Ffmpeg,
+            VideoDecodeSupport::SoftwareExact(_),
+        ) => Some(2),
+        (
+            VideoDecoderSelectionPolicy::NativeFirst,
+            VideoBackendKind::Ffmpeg,
+            VideoDecodeSupport::HardwareExact(_),
+        ) => Some(2),
+        (
+            VideoDecoderSelectionPolicy::NativeFirst,
+            VideoBackendKind::Ffmpeg,
+            VideoDecodeSupport::SoftwareExact(_),
+        ) => Some(3),
         _ => None,
     }
 }
@@ -163,7 +201,7 @@ impl CreatedVideoDecoder {
 mod tests {
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use frd_core::PixelSize;
 
@@ -172,9 +210,9 @@ mod tests {
         VideoBackendAvailability, VideoBackendId, VideoBackendKind, VideoBitstreamFormat,
         VideoCodec, VideoColorimetry, VideoDecodeCapability, VideoDecodeError,
         VideoDecodeErrorCode, VideoDecodeQuery, VideoDecodeSupport, VideoDecoder,
-        VideoDecoderFactory, VideoDecoderRegistry, VideoParameterSets, VideoPixelFormat,
-        VideoProfile, VideoRange, VideoStreamConfig, VideoStreamConfigInput, VideoStreamIdentity,
-        VideoTimeBase, VideoUnsupportedReason,
+        VideoDecoderFactory, VideoDecoderRegistry, VideoDecoderSelectionPolicy, VideoParameterSets,
+        VideoPixelFormat, VideoProfile, VideoRange, VideoStreamConfig, VideoStreamConfigInput,
+        VideoStreamIdentity, VideoTimeBase, VideoUnsupportedReason,
     };
 
     #[test]
@@ -507,6 +545,228 @@ mod tests {
         assert_eq!(second_creates.load(Ordering::Acquire), 0);
     }
 
+    #[test]
+    fn registry_default_policy_preserves_all_existing_tiers() {
+        for expected in ["native-hardware", "ffmpeg-hardware", "ffmpeg-software"] {
+            let factories = policy_factories(expected);
+            let registry = VideoDecoderRegistry::new(factories);
+            let selection = registry
+                .select(&main444_query())
+                .expect("默认策略应保留原顺序");
+            assert_eq!(selection.backend_id.as_str(), expected);
+        }
+
+        let registry = VideoDecoderRegistry::with_policy(
+            policy_factories("native-software"),
+            VideoDecoderSelectionPolicy::default(),
+        );
+        assert_eq!(
+            registry
+                .select(&main444_query())
+                .expect("显式默认策略应与 new 一致")
+                .backend_id
+                .as_str(),
+            "ffmpeg-hardware"
+        );
+    }
+
+    #[test]
+    fn registry_native_first_orders_native_software_before_both_ffmpeg_modes() {
+        for expected in [
+            "native-hardware",
+            "native-software",
+            "ffmpeg-hardware",
+            "ffmpeg-software",
+        ] {
+            let registry = VideoDecoderRegistry::with_policy(
+                policy_factories(expected),
+                VideoDecoderSelectionPolicy::NativeFirst,
+            );
+            let selection = registry
+                .select(&main444_query())
+                .expect("显式策略应按原生优先选择");
+            assert_eq!(selection.backend_id.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn registry_native_first_rejects_probe_only_and_lying_native_software() {
+        let registry = VideoDecoderRegistry::with_policy(
+            vec![
+                fake_factory(
+                    "native-probe",
+                    VideoBackendKind::Native,
+                    VideoBackendAvailability::ProbeOnly,
+                    VideoDecodeSupport::SoftwareExact(main444_capability("native-probe")),
+                ),
+                fake_factory(
+                    "native-mismatch",
+                    VideoBackendKind::Native,
+                    VideoBackendAvailability::DecoderReady,
+                    VideoDecodeSupport::SoftwareExact(hevc_main10_capability("native-mismatch")),
+                ),
+                fake_factory(
+                    "ffmpeg-software",
+                    VideoBackendKind::Ffmpeg,
+                    VideoBackendAvailability::DecoderReady,
+                    VideoDecodeSupport::SoftwareExact(main444_capability("ffmpeg-software")),
+                ),
+            ],
+            VideoDecoderSelectionPolicy::NativeFirst,
+        );
+        let selection = registry
+            .select(&main444_query())
+            .expect("策略不得跳过能力或就绪门槛");
+        assert_eq!(selection.backend_id.as_str(), "ffmpeg-software");
+        assert_eq!(selection.diagnostics.len(), 3);
+        assert_eq!(selection.diagnostics[0].backend_id.as_str(), "native-probe");
+        assert_eq!(
+            selection.diagnostics[0].availability,
+            VideoBackendAvailability::ProbeOnly
+        );
+        assert_eq!(
+            selection.diagnostics[1].support,
+            VideoDecodeSupport::SoftwareExact(hevc_main10_capability("native-mismatch"))
+        );
+    }
+
+    #[test]
+    fn registry_native_first_breaks_every_tier_tie_by_registration_order() {
+        for (kind, hardware) in [
+            (VideoBackendKind::Native, true),
+            (VideoBackendKind::Native, false),
+            (VideoBackendKind::Ffmpeg, true),
+            (VideoBackendKind::Ffmpeg, false),
+        ] {
+            let registry = VideoDecoderRegistry::with_policy(
+                ["first", "second"]
+                    .into_iter()
+                    .map(|id| {
+                        fake_factory(
+                            id,
+                            kind,
+                            VideoBackendAvailability::DecoderReady,
+                            exact_support(id, hardware),
+                        )
+                    })
+                    .collect(),
+                VideoDecoderSelectionPolicy::NativeFirst,
+            );
+            assert_eq!(
+                registry
+                    .select(&main444_query())
+                    .expect("同 tier 应稳定选择首个工厂")
+                    .backend_id
+                    .as_str(),
+                "first"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_policies_create_in_selection_order_and_stop_after_success() {
+        for policy in [
+            VideoDecoderSelectionPolicy::Default,
+            VideoDecoderSelectionPolicy::NativeFirst,
+        ] {
+            let expected = match policy {
+                VideoDecoderSelectionPolicy::Default => {
+                    vec!["native-hardware", "ffmpeg-hardware", "ffmpeg-software"]
+                }
+                VideoDecoderSelectionPolicy::NativeFirst => vec![
+                    "native-hardware",
+                    "native-software",
+                    "ffmpeg-hardware",
+                    "ffmpeg-software",
+                ],
+            };
+            for success_index in 0..expected.len() {
+                let create_order = Arc::new(Mutex::new(Vec::new()));
+                let factories = [
+                    ("ffmpeg-software", VideoBackendKind::Ffmpeg, false),
+                    ("ffmpeg-hardware", VideoBackendKind::Ffmpeg, true),
+                    ("native-software", VideoBackendKind::Native, false),
+                    ("native-hardware", VideoBackendKind::Native, true),
+                    ("native-probe", VideoBackendKind::Native, false),
+                    ("native-mismatch", VideoBackendKind::Native, false),
+                ]
+                .into_iter()
+                .map(|(id, kind, hardware)| {
+                    let mut factory = CreatingFactory {
+                        backend_id: VideoBackendId::new(id),
+                        kind,
+                        availability: VideoBackendAvailability::DecoderReady,
+                        support: exact_support(id, hardware),
+                        create_count: Arc::new(AtomicUsize::new(0)),
+                        create_order: Some(create_order.clone()),
+                        outcome: if id == expected[success_index] {
+                            Ok(Arc::new(AtomicUsize::new(0)))
+                        } else {
+                            Err(VideoDecodeErrorCode::DecoderCreationFailed)
+                        },
+                    };
+                    if id == "native-probe" {
+                        factory.availability = VideoBackendAvailability::ProbeOnly;
+                    } else if id == "native-mismatch" {
+                        factory.support =
+                            VideoDecodeSupport::SoftwareExact(hevc_main10_capability(id));
+                    }
+                    Box::new(factory) as Box<dyn VideoDecoderFactory>
+                })
+                .collect();
+                let registry = VideoDecoderRegistry::with_policy(factories, policy);
+                let selected = registry
+                    .select(&main444_query())
+                    .expect("首个精确候选应可选");
+                assert_eq!(selected.backend_id.as_str(), expected[0]);
+                assert!(create_order.lock().expect("测试锁有效").is_empty());
+                let created = registry
+                    .select_and_create(&main444_query(), &main444_config())
+                    .expect("创建失败后应按同一顺序回退");
+                assert_eq!(
+                    created.selection().backend_id.as_str(),
+                    expected[success_index]
+                );
+                assert_eq!(created.selection().diagnostics, selected.diagnostics);
+                assert_eq!(
+                    *create_order.lock().expect("测试锁有效"),
+                    expected[..=success_index]
+                );
+            }
+        }
+    }
+
+    fn exact_support(id: &str, hardware: bool) -> VideoDecodeSupport {
+        if hardware {
+            VideoDecodeSupport::HardwareExact(main444_capability(id))
+        } else {
+            VideoDecodeSupport::SoftwareExact(main444_capability(id))
+        }
+    }
+
+    fn policy_factories(first_tier: &str) -> Vec<Box<dyn VideoDecoderFactory>> {
+        let mut include = false;
+        let mut factories = Vec::new();
+        for (id, kind, hardware) in [
+            ("native-hardware", VideoBackendKind::Native, true),
+            ("native-software", VideoBackendKind::Native, false),
+            ("ffmpeg-hardware", VideoBackendKind::Ffmpeg, true),
+            ("ffmpeg-software", VideoBackendKind::Ffmpeg, false),
+        ] {
+            include |= id == first_tier;
+            if include {
+                factories.push(fake_factory(
+                    id,
+                    kind,
+                    VideoBackendAvailability::DecoderReady,
+                    exact_support(id, hardware),
+                ));
+            }
+        }
+        factories.reverse();
+        factories
+    }
+
     fn main444_query() -> VideoDecodeQuery {
         VideoDecodeQuery {
             codec: crate::VideoCodec::Hevc,
@@ -675,14 +935,22 @@ mod tests {
     ) -> Box<dyn VideoDecoderFactory> {
         Box::new(CreatingFactory {
             backend_id: VideoBackendId::new(backend_id),
+            kind: VideoBackendKind::Ffmpeg,
+            availability: VideoBackendAvailability::DecoderReady,
+            support: VideoDecodeSupport::SoftwareExact(main444_capability(backend_id)),
             create_count,
+            create_order: None,
             outcome,
         })
     }
 
     struct CreatingFactory {
         backend_id: VideoBackendId,
+        kind: VideoBackendKind,
+        availability: VideoBackendAvailability,
+        support: VideoDecodeSupport,
         create_count: Arc<AtomicUsize>,
+        create_order: Option<Arc<Mutex<Vec<String>>>>,
         outcome: Result<Arc<AtomicUsize>, VideoDecodeErrorCode>,
     }
 
@@ -692,15 +960,15 @@ mod tests {
         }
 
         fn backend_kind(&self) -> VideoBackendKind {
-            VideoBackendKind::Ffmpeg
+            self.kind
         }
 
         fn availability(&self) -> VideoBackendAvailability {
-            VideoBackendAvailability::DecoderReady
+            self.availability
         }
 
         fn query(&self, _query: &VideoDecodeQuery) -> VideoDecodeSupport {
-            VideoDecodeSupport::SoftwareExact(main444_capability(self.backend_id.as_str()))
+            self.support.clone()
         }
     }
 
@@ -710,6 +978,12 @@ mod tests {
             _config: &VideoStreamConfig,
         ) -> Result<Box<dyn VideoDecoder>, VideoDecodeError> {
             self.create_count.fetch_add(1, Ordering::AcqRel);
+            if let Some(create_order) = &self.create_order {
+                create_order
+                    .lock()
+                    .expect("测试锁有效")
+                    .push(self.backend_id.as_str().to_owned());
+            }
             match &self.outcome {
                 Ok(submit_count) => Ok(Box::new(SubmitFailureDecoder(submit_count.clone()))),
                 Err(code) => Err(VideoDecodeError::new(*code)),
