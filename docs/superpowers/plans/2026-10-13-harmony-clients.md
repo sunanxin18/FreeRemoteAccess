@@ -31,7 +31,7 @@
 - 官方 PC ARM64 镜像已下载，独立 phone/2in1 模拟器均启动且 HDC Connected；Rust 1.96 OHOS std 已安装。
 - 源码未改动的 desktop/session 基线共 228 项测试通过；现有 core/frame/app 的 OHOS target check 通过。
 - [环境证据](../../validation/harmony-environment-20261013.md)与[鸿蒙手机原生服务调查](../../validation/harmony-native-service-20261013.md)已记录。
-- Task 1–2 已完成并通过独立审查，当前进入 Task 3；准备结果不将任何 HAP、图形、协议互操作任务标为完成，各步骤在实现及审查后单独勾选。
+- Task 1–3 实现及修复已通过独立审查，当前进入 Task 4；准备结果不将任何 HAP、图形、协议互操作任务标为完成，各步骤在实现及审查后单独勾选。
 
 ### Task 1: OHOS 工具链与共享执行器边界
 
@@ -65,9 +65,11 @@ Task 2 于 `822c359` 实现、`2636a6c` 修复并通过独立复审。两台图�
 
 **Interfaces:** 实现现有 `SecureCredentialStore`、`ConnectionProfileStore`、`ServerIdentityStore`；复用 `AppController` / `AppIntent` / `ConnectionForm`。C ABI 快照仅含可复制非秘密状态，连接请求中的密码按调用期借用并立即转入 SecretBuffer。
 
-- [ ] 覆盖 stale credential ticket、认证成功后才commit、指纹变化拒绝与未知能力不可用。
-- [ ] 实现 phone/PC 响应式表单和状态意图，HUKS保存/读取、IME commit、触控/键鼠归一化。
-- [ ] 验证横竖屏、PC窗口缩放、明暗主题、安全区、字体缩放、键盘焦点和 ReleaseAll。
+- [x] 覆盖 stale credential ticket、认证成功后才commit、指纹变化拒绝与未知能力不可用。
+- [x] 实现 phone/PC 响应式表单和状态意图，HUKS保存/读取、密码字段 IME 提交与 native committed-text 归一化、触控/键鼠归一化。真实远程软键盘入口和端到端 IME 随 Task 4 的实际会话视图完成，不由本任务 ABI 测试代替。
+- [x] 验证横竖屏、PC窗口缩放、明暗主题、安全区、普通设置最大字体缩放、密码字段焦点及安全键盘；ReleaseAll 有确定性回归。完整 Tab 遍历/PC 滚轮、真实会话输入与窄窗口 chrome 保留为后续实际会话验收，不由 ABI 单测替代。
+
+Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；两台模拟器 HUKS、实际字体及安全键盘复验范围见[应用与安全存储验证](../../validation/harmony-app-services-20261013.md)。生产协议目录仍为空，不代表远程登录完成。
 
 ### Task 4: Windows RDP 实际连接
 
@@ -76,7 +78,7 @@ Task 2 于 `822c359` 实现、`2636a6c` 修复并通过独立复审。两台图�
 **Interfaces:** 注册 `RdpProtocolFactory`（wire identity Unix），沿用 TOFU；FrameMailbox/FrameTransactionCompiler → renderer。UI 只有真实完整基线呈现后进入交互状态。
 
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换满足现有 SIMD gate；FFmpeg OHOS 原生构建及 ABI/parity 独立验证。
-- [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、断开/重连与恢复。
+- [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、远程软键盘入口与 IME 提交、断开/重连与恢复。
 - [ ] AVC/HEVC广告继续受原精确门禁控制；未通过的 codec 不由新平台构建自动开放。
 
 ### Task 5: Mac 实际连接与平台媒体

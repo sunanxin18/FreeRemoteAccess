@@ -28,6 +28,8 @@ RDP 能力门保持现状：生产 LegacyOnly；实际 AVC/HEVC wire/profile/dec
 
 HIG、Material 3 的可访问性、焦点和交互基线继续适用；具体窗口与控件遵循鸿蒙 ArkUI 平台能力，手机不复制桌面标题栏，PC 不复制手机导航。功能图标仍使用现有 Material Symbols Rounded 资源和许可证。验证明暗主题、字体缩放、触控目标、横竖屏、IME 与 PC 窗口缩放。
 
+PC 标题栏采用[华为官方自由多窗沉浸式方案](https://developer.huawei.com/consumer/cn/doc/doccenter-dev-faq/faqs-arkui-1089)：`setWindowDecorVisible(false)` 隐藏默认标题区但保留系统三键，`setWindowDecorHeight` 设置高度，`getTitleButtonRect` 与 `windowTitleButtonRectChange` 驱动避让。产品会话控件在原标题区按窗口几何中心排列；远程内容从该区下缘开始，渲染与输入使用同一矩形。不得在系统标题栏下另加工具栏，也不修改系统 ArkUI 的 titlebar 构建文件。正常权限 API 可用性、系统三键、拖动、双击、窗口缩放、全屏和窄宽折叠仍需实际 GUI 验证；接口文档不是运行通过的证据。
+
 2026-10-13 设计资料核对：[Apple HIG Windows](https://developer.apple.com/design/human-interface-guidelines/windows) 要求适应窗口大小并保留系统窗口行为；[Material 3 Text fields](https://m3.material.io/components/text-fields/guidelines) 与其[官方组件文档](https://github.com/material-components/material-web/blob/main/docs/components/text-field.md) 为标签、支持文字和错误语义的基线；[华为多设备适配指南](https://developer.huawei.com/consumer/cn/multidevice/adaptive-apps/) 要求布局和交互随窗口空间动态响应。M3 主站在当前网络下正文不可读取，具体 GUI 实施前仍需核对可访问的官方组件资料。没有批准省略持久标签、焦点、触控尺寸或系统窗口行为的例外。
 
 ## 当前工具链证据

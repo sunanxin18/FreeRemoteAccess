@@ -59,3 +59,15 @@ SDK 镜像位于本机配置的 `Library/Huawei/Sdk/system-image/HarmonyOS-7.0.0
 宿主 Mac 最初锁屏，用户随后已手动解锁。CUA 已能读取 DevEco 的设备管理器，但不能按名称或完整路径选中 SDK 裸 Mach-O `Emulator` 进程；IDE 设备投屏列表也没有可选设备。已请求用户明确指定官方 Emulator CLI 作为替代界面验证通道。在该通道获准并实际检查以前，不能用 guest 启动参数或原生呈现日志替代视觉验收。
 
 2026-10-13 用户随后明确授权官方 Emulator CLI 进行两个专用实例的截图、旋转、点击及前后台验证。已实际完成初步图形与生命周期检查，结果和未通过的手机方向项见 [HAP 图形验证](harmony-hap-20261013.md)。该替代只用于本地测试界面，不改变产品的客户端边界。
+
+## 协议原生依赖实际编译检查补充
+
+2026-10-13 15:44–15:45，在初版应用层提交 `c908733` 上，以独立 `CARGO_TARGET_DIR=target/harmony-protocol-preflight`、`CARGO_BUILD_JOBS=2` 运行官方 OHOS helper：
+
+```sh
+tools/build-harmony.sh --check -p frd-protocol-rdp -p frd-protocol-apple
+```
+
+显式选择已安装 OHOS 标准库的 Rust 1.96.0 ARM64 cargo/rustc，结果 exit 0，用时 1 分 10 秒。`aws-lc-sys 0.44.0` 和 `fdk-aac-sys 0.5.0` 实际完成原生依赖构建，两个协议 crate 检查通过。RDP 有四条既存 scalar reference 未使用警告，无编译错误；日志保存在本地忽略目录 `target/harmony-protocol-preflight-check.log`。
+
+这只补齐当前 macOS ARM64 宿主到 OHOS ARM64 的依赖编译证据：尚未证明最终 cdylib 链接、HAP 加载、guest AAC/视频 fixture、解码 SIMD 合规或远程认证。fdk-aac 上游 build script 按宿主选择 C++ runtime 的跨宿主风险仍须在后续构建适配中处理，不能从本机编译成功推断所有宿主都支持。
