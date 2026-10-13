@@ -83,7 +83,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4A2.3 原版 oracle workspace/process 与开发依赖隔离、固定 graphics/session 生产副本完成（`1455c2d`），前后依赖图及独立审查通过；保留22,337条完整wire记录和原数值覆盖，宿主正确性/来源复算/RDP321项通过，生产decoder源码未改。
 - [x] Task 4A2.4 `484d1b2` Bitmap 共享 parser 原行为保持，显式 native checked 叶子接入；16721冻结原版及7616畸形case、121856canary运行通过，独立审查 Approved。范围为host ARM64，session尚未切换。
 - [x] Task 4A2.5 `0f207c8` RDP6共享parser/controller原生接线与独立审查通过；6906普通bitmap、2237privateplane与16geometry安全classification，宿主debug/release各20项、冻结实际OHOS库手机/PC各20项通过。当前仅显式consumer，session默认未切。
-- [ ] Task 4A2.6–7 接入RLGR/RFX parser、会话publication和像素转换，再验证每目标实际运行与包。
+- [x] Task 4A2.6 `23ea916` 共享RLGR真实零填充、checked RFX组件与显式会话接线，独立审查Approved；宿主core3/session4 debug/release、6故障变体及既有回归通过，root冻结实际OHOS库/源码harness手机和PC各core3/session4通过。默认未切换，不代表完整codec/普通HAP/live。
+- [ ] Task 4A2.7 完成八像素格式原生row与image/session接线，补Bitmap真实written计数、source stride/crop/padding和Set/Stream几何门，再验证每目标实际运行、性能、包与生产选择。
 - [x] Task 4B1 真实事务→原生呈现、统一视口与输入门接线完成（`87c829a`/`bccb321`），两台合成首帧、触点及本地重绘受限验证，跳帧重试修复经独立复审；不代表真实协议连接，见[呈现验证](../../validation/harmony-native-presentation-20261013.md)。
 - [x] Task 4C0 手机/PC 正常权限系统能力与三个接口路线完成受限验证；AVC420 像素通过、EOS 前出帧未通过、精确444失败、HEVC 未报告，见[系统验证](../../validation/harmony-system-codec-20261013.md)。
 - [x] Task 4C1 中立 NativeFirst 显式策略 `e1fb9fa` 已实现并通过独立审查；默认桌面顺序保持，尚未接入系统 backend。

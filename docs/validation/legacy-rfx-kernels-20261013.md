@@ -119,3 +119,22 @@ Host macOS ARM64 原版16,721 catalog与另7,616固定原版源码生成的畸�
 Root使用`83ec96e`隔离gitarchive加全部且仅15个`0f207c8`提交文件，保存每个overlay hash，再以官方API26 NDK和Rust1.96 offline/locked构建实际shipping graphics与相邻RDP库。新消费者构建5.74秒通过。私有harness复用作者的实际源码测试与Cargo-built library public API，由Cargo JSON精确识别五个OHOS rlib；首次direct rustc未加入host proc-macro搜索目录而E0463，补充该目录后成功，未改产品源码。目标ELF只依赖系统libc.so，SHA256 `e49b21f96a7d10a2d3cb3f7950525e3f7dd796c186e9896756d39a619a704e67`。发送前与guest SHA相同，手机/PC API26 ARM64各20/20、实际exit0，PC约0.49秒。
 
 原expect-test/bmp dev依赖缺offline缓存，因此15个原RLE/encoder测试使用严格Snapshot assertion adapter，不能宣称原framework或全上游suite运行。目标harness为debug正确性程序，没有目标优化性能、普通HAP解码接线、Windows/Linux native执行或真实RDP证明。现有登录包和UI未改变；session/default/native production eligibility仍待A2.6/7。全部artifact身份、命令、库哈希和两台原始日志在`target/harmony-rdp-platform-check-83ec96e/`，宿主记录在`target/task-4a25-*.log`。
+
+
+## A2.6：实际 RLGR/RFX 与会话原生消费者
+
+2026-10-13，`23ea916` 让同一 RLGR parser 在真实零游程和末尾补齐处调用已有原生 zero；不扫描/重放解码后的输出。Checked component 在首次写入前验证两个4096缓冲区，按明确十band量化映射执行 LL3 4032..4096 differential、dequant、DWT；三组件和checked color均成功后才apply当前tile。Native失败保留来源，不回退scalar；第二tile失败保留此前已apply的第一tile，不承诺整帧回滚。
+
+构建器字段与默认None保持。显式Stage/Processor/Context setter传入中立能力，Stage替换Processor时保留选择并传递到新RFX context；Bitmap fast/slow共享同一consumer。Native Bitmap错误在imageapply/Region前返回，默认的历史warn+rectangle行为保留。生产工厂和codec广告尚未切换，image.rs仍为下一步像素转换门。独立审查为Spec compliant / Approved，无Critical/Important/Minor。
+
+宿主ARM64 debug/release各core3/session4、scoped clippy通过。独立原版冻结1471 RLGR、30组件及28实际会话记录；包括2970byte wire/16384byte原图、裁剪与两个tile错误发布。最初HL/LH互换故障无法被相同shift的量化fixture区分，增加6条独立原版q=[2,3,...11]记录后，六个语义故障变体全部被拒绝，旧fixture不改。原Bitmap7、RDP6 20、RDP321/3既有ignored以及来源/依赖隔离检查通过。完整命令与边界见vendored session [测试说明](../../third_party/ironrdp-session-0.11.0/tests/README.md)。这不是完整上游dev-dependency suite。
+
+Root在既有83ec96e隔离源码加0f207c8 overlay上，仅加入全部24个冻结23ea916文件，保存逐文件SHA；没有编译并行A2.7A工作树。官方API26 NDK/Rust1.96 offline/locked实际shipping库构建13.74秒通过。最初验证环境PATH漏掉Homebrew cmake而构建失败；补充工具路径后通过，未改产品源码或依赖。Cargo JSON精确识别目标rlibs；实际RLGR/bridge源码及实际session全模块harness分别链接这些库，两份ELF都仅依赖系统libc.so。
+
+- core ELF SHA256：`6d5eacec7039a98876512698f1547d9f86232c92a80414c6725f55b82cec9034`。
+- session ELF SHA256：`6208f0e845ed5311ade3791262893d4b210c3a915e2dcbf4b9be85cb47bd0745`。
+- 手机API26 ARM64：core3/3、session4/4；PC API26 ARM64：core3/3、session4/4。发送前后hash一致，各程序有实际FRD_EXIT=0标记。
+
+原始overlay/build/harness身份、两端stage与test日志及`a26-guest-results.json`在`target/harmony-rdp-platform-check-83ec96e/`。这是actual-source/shipping-library数值与会话夹具运行，不是普通HAP、真实Windows登录、端到端延迟或Windows/Linux架构运行。已安装正常登录包未替换，开发验证入口没有恢复。
+
+生产选择前仍须补齐Bitmap EOF underfill的真实written计数（预resize后的len不能证明完整）、声明源尺寸与目标矩形的明确stride/crop/padding、八格式row/image/cursor写入，以及每个目标的运行和包门。当前成功Bitmap夹具完整且尺寸相同，不能借Region声称全幅baseline准备成功。原版非法量化/色彩溢出的panic或wrap与native typed拒绝单独分类。
