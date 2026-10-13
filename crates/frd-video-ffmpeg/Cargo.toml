@@ -9,6 +9,7 @@ frd-media-api = { path = "../frd-media-api" }
 libloading = "=0.8.9"
 
 [dev-dependencies]
+libc = "0.2"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
@@ -18,3 +19,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
 ] }
+
+[target.'cfg(all(target_env = "ohos", target_arch = "aarch64"))'.dependencies]
+libc = "0.2"

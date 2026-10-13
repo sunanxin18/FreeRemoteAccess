@@ -16,20 +16,24 @@ use frd_media_api::{
     VideoPixelFormat, VideoPlane, VideoProfile, VideoStreamConfig, VideoTimestamp,
     VideoUnsupportedReason, MAX_DECODED_VIDEO_FRAME_BYTES, MAX_ENCODED_VIDEO_ACCESS_UNIT_BYTES,
 };
-use libloading::{Library, Symbol};
+use libloading::Library;
+#[cfg(any(not(target_env = "ohos"), test))]
+use libloading::Symbol;
 
 pub use crate::abi::FRD_FFMPEG_ABI_VERSION;
 use crate::abi::{
     FrdByteSlice, FrdCreateDecoderFn, FrdDecodedFrame, FrdDecoderHandle, FrdDestroyFn, FrdFlushFn,
-    FrdGetFfmpegApiV1, FrdOwnedBuffer, FrdReceiveFn, FrdReclaimFrameFn, FrdStatus, FrdSubmitFn,
-    FrdVideoConfig, RawFrdFfmpegApiV1, FRD_API_CONTRACT_REQUIRED, FRD_BITSTREAM_ANNEX_B,
-    FRD_CHROMA_YUV_420, FRD_CHROMA_YUV_444, FRD_CODEC_CAP_ALL_KNOWN, FRD_CODEC_CAP_H264_AVC420,
+    FrdOwnedBuffer, FrdReceiveFn, FrdReclaimFrameFn, FrdStatus, FrdSubmitFn, FrdVideoConfig,
+    RawFrdFfmpegApiV1, FRD_API_CONTRACT_REQUIRED, FRD_BITSTREAM_ANNEX_B, FRD_CHROMA_YUV_420,
+    FRD_CHROMA_YUV_444, FRD_CODEC_CAP_ALL_KNOWN, FRD_CODEC_CAP_H264_AVC420,
     FRD_CODEC_CAP_H264_AVC444, FRD_CODEC_CAP_HEVC_MAIN_444_8, FRD_CODEC_H264, FRD_CODEC_HEVC,
-    FRD_FFMPEG_API_SYMBOL, FRD_FFMPEG_API_V1_ALIGNMENT, FRD_FFMPEG_API_V1_SIZE,
-    FRD_FFMPEG_AVCODEC_MAJOR, FRD_PIXEL_FORMAT_YUV_420_P8, FRD_PIXEL_FORMAT_YUV_444_P8,
-    FRD_PROFILE_H264_AVC420, FRD_PROFILE_H264_AVC444, FRD_PROFILE_HEVC_MAIN_444_8,
-    FRD_SUBMIT_RANDOM_ACCESS,
+    FRD_FFMPEG_API_V1_ALIGNMENT, FRD_FFMPEG_API_V1_SIZE, FRD_FFMPEG_AVCODEC_MAJOR,
+    FRD_PIXEL_FORMAT_YUV_420_P8, FRD_PIXEL_FORMAT_YUV_444_P8, FRD_PROFILE_H264_AVC420,
+    FRD_PROFILE_H264_AVC444, FRD_PROFILE_HEVC_MAIN_444_8, FRD_SUBMIT_RANDOM_ACCESS,
 };
+
+#[cfg(any(not(target_env = "ohos"), test))]
+use crate::abi::{FrdGetFfmpegApiV1, FRD_FFMPEG_API_SYMBOL};
 
 const MAX_DECODE_FRAMES_PER_BATCH: usize = 8;
 const MAX_DECODE_BATCH_BYTES: usize = MAX_DECODED_VIDEO_FRAME_BYTES;
@@ -42,6 +46,8 @@ pub struct FfmpegBackend {
 struct LoadedPlugin {
     api: CallableFfmpegApiV1,
     _libraries: Vec<Library>,
+    #[cfg(any(all(target_env = "ohos", target_arch = "aarch64"), all(test, unix)))]
+    _ohos_resources: Option<crate::ohos_bundle::Resources>,
 }
 
 #[derive(Clone, Copy)]
@@ -120,14 +126,30 @@ impl FfmpegBackend {
         VideoCapabilityProvider::query(self, &query).is_exact()
     }
 
-    /// 从当前可执行文件目录下的固定、受信版本目录加载；失败只禁用该 backend。
+    /// 从平台固定受信位置加载；OHOS 仅由自身模块锚点定位，失败只禁用该 backend。
     pub fn load() -> Result<Self, VideoDecodeError> {
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             return Err(backend_unavailable());
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_env = "ohos", not(target_arch = "aarch64")))]
+        {
+            return Err(backend_unavailable());
+        }
+        #[cfg(all(target_env = "ohos", target_arch = "aarch64"))]
+        {
+            let (raw, resources) = crate::ohos_bundle::load()?;
+            let api = validate_raw_api(raw)?;
+            Ok(Self {
+                plugin: Arc::new(LoadedPlugin {
+                    api,
+                    _libraries: Vec::new(),
+                    _ohos_resources: Some(resources),
+                }),
+            })
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let executable = std::env::current_exe().map_err(|_| backend_unavailable())?;
             let trusted = crate::linux_bundle::prepare(
@@ -245,6 +267,7 @@ impl FfmpegBackend {
         Self::from_validated_api(api, libraries)
     }
 
+    #[cfg(any(not(target_env = "ohos"), test))]
     fn from_validated_api(
         api: CallableFfmpegApiV1,
         libraries: Vec<Library>,
@@ -253,10 +276,13 @@ impl FfmpegBackend {
             plugin: Arc::new(LoadedPlugin {
                 api,
                 _libraries: libraries,
+                #[cfg(any(all(target_env = "ohos", target_arch = "aarch64"), all(test, unix)))]
+                _ohos_resources: None,
             }),
         })
     }
 
+    #[cfg(target_os = "macos")]
     fn from_trusted_paths(
         dependencies: Vec<std::path::PathBuf>,
         plugin_path: std::path::PathBuf,
@@ -829,6 +855,7 @@ fn canonical_library_path(codec_dir: &Path, name: &str) -> Result<PathBuf, Video
     Ok(path)
 }
 
+#[cfg(any(not(target_env = "ohos"), test))]
 fn load_api(plugin: &Library) -> Result<CallableFfmpegApiV1, VideoDecodeError> {
     // SAFETY: `plugin` remains loaded while the symbol is read. The symbol name and function
     // signature are the versioned FreeRemoteDesk plugin ABI, and the returned table is copied
@@ -849,7 +876,7 @@ fn load_api(plugin: &Library) -> Result<CallableFfmpegApiV1, VideoDecodeError> {
     validate_raw_api(raw_api)
 }
 
-fn validate_raw_api(raw: RawFrdFfmpegApiV1) -> Result<CallableFfmpegApiV1, VideoDecodeError> {
+pub(crate) fn validate_raw_api_header(raw: &RawFrdFfmpegApiV1) -> Result<(), VideoDecodeError> {
     if raw.struct_size != FRD_FFMPEG_API_V1_SIZE
         || raw.struct_alignment != FRD_FFMPEG_API_V1_ALIGNMENT
         || raw.abi_version != FRD_FFMPEG_ABI_VERSION
@@ -869,6 +896,11 @@ fn validate_raw_api(raw: RawFrdFfmpegApiV1) -> Result<CallableFfmpegApiV1, Video
         ));
     }
 
+    Ok(())
+}
+
+fn validate_raw_api(raw: RawFrdFfmpegApiV1) -> Result<CallableFfmpegApiV1, VideoDecodeError> {
+    validate_raw_api_header(&raw)?;
     const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdCreateDecoderFn>());
     const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdSubmitFn>());
     const _: () = assert!(mem::size_of::<usize>() == mem::size_of::<FrdReceiveFn>());
@@ -910,7 +942,7 @@ fn open_library(path: &Path) -> Result<Library, VideoDecodeError> {
         .map_err(|_| backend_unavailable())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn open_dependency_library(path: &Path) -> Result<Library, VideoDecodeError> {
     use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
 
@@ -922,12 +954,12 @@ fn open_dependency_library(path: &Path) -> Result<Library, VideoDecodeError> {
         .map_err(|_| backend_unavailable())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_env = "ohos")))]
 fn open_dependency_library(path: &Path) -> Result<Library, VideoDecodeError> {
     open_library(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(not(target_env = "ohos"), test)))]
 fn open_library(path: &Path) -> Result<Library, VideoDecodeError> {
     use libloading::os::unix::{Library as UnixLibrary, RTLD_LOCAL, RTLD_NOW};
 
@@ -973,17 +1005,17 @@ const fn platform_directory_name() -> &'static str {
     "macos-aarch64"
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), target_arch = "x86_64"))]
 const fn platform_directory_name() -> &'static str {
     "linux-x86_64"
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86"))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), target_arch = "x86"))]
 const fn platform_directory_name() -> &'static str {
     "linux-x86"
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), target_arch = "aarch64"))]
 const fn platform_directory_name() -> &'static str {
     "linux-aarch64"
 }
@@ -999,11 +1031,12 @@ const fn platform_directory_name() -> &'static str {
     all(target_os = "windows", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86"),
-    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "linux", not(target_env = "ohos"), target_arch = "x86_64"),
+    all(target_os = "linux", not(target_env = "ohos"), target_arch = "x86"),
+    all(target_os = "linux", not(target_env = "ohos"), target_arch = "aarch64"),
     target_os = "android"
 )))]
+#[cfg(any(not(target_env = "ohos"), test))]
 const fn platform_directory_name() -> &'static str {
     "unsupported"
 }
@@ -1019,6 +1052,7 @@ const fn ffmpeg_dependency_names() -> &'static [&'static str] {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(any(not(target_env = "ohos"), test))]
 const fn ffmpeg_dependency_names() -> &'static [&'static str] {
     &["libavutil.so.60", "libavcodec.so.62"]
 }
@@ -1034,16 +1068,19 @@ const fn plugin_library_name() -> &'static str {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(any(not(target_env = "ohos"), test))]
 const fn plugin_library_name() -> &'static str {
     "libfreeremotedesk_ffmpeg.so"
 }
 
 #[cfg(not(any(windows, unix)))]
+#[cfg(any(not(target_env = "ohos"), test))]
 const fn ffmpeg_dependency_names() -> &'static [&'static str] {
     &[]
 }
 
 #[cfg(not(any(windows, unix)))]
+#[cfg(any(not(target_env = "ohos"), test))]
 const fn plugin_library_name() -> &'static str {
     "unsupported"
 }
@@ -1554,6 +1591,27 @@ mod tests {
         assert_eq!(frames[0].as_input().range, VideoRange::Limited);
         assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 3);
         assert_eq!(FRAME_RECLAIM_CALL_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn decoder_retains_plugin_resources_after_backend_drop_through_reclaim_and_destroy() {
+        let _guard = FAKE_FRAME_TEST_LOCK.lock().expect("fake frame 测试锁有效");
+        RELEASE_COUNT.store(0, Ordering::SeqCst);
+        FRAME_RECLAIM_CALL_COUNT.store(0, Ordering::SeqCst);
+        let backend = FfmpegBackend::from_raw_api_for_test(ready_fake_api()).unwrap();
+        let lifetime = Arc::downgrade(&backend.plugin);
+        let config = main444_config();
+        let mut decoder = backend.create(&config).unwrap();
+        drop(backend);
+        assert!(lifetime.upgrade().is_some());
+        let outcome = decoder.submit(test_access_unit(&config)).unwrap();
+        assert!(matches!(outcome, DecodeOutcome::Frames(ref frames) if frames.len() == 1));
+        assert_eq!(FRAME_RECLAIM_CALL_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 3);
+        drop(decoder);
+        assert!(lifetime.upgrade().is_none());
+        // 输出已复制为宿主所有的帧，插件资源释放后仍可持有。
+        assert!(matches!(outcome, DecodeOutcome::Frames(ref frames) if frames.len() == 1));
     }
 
     #[test]
