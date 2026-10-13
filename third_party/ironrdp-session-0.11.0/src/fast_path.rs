@@ -724,38 +724,16 @@ impl Processor {
                 }
                 #[cfg(feature = "qoi")]
                 ironrdp_pdu::rdp::capability_sets::CODEC_ID_QOI => {
-                    qoi_apply_native(image, destination, ext.data, kernels)?
+                    qoi_apply_native(image, destination, ext.data, ext.width, ext.height, kernels)?
                 }
                 #[cfg(feature = "qoiz")]
                 ironrdp_pdu::rdp::capability_sets::CODEC_ID_QOIZ => {
-                    let compressed = ext.data;
-                    let mut input = zstd_safe::InBuffer::around(compressed);
-                    let mut data = Vec::new();
-                    data.try_reserve(compressed.len())
-                        .map_err(|e| custom_err!("native QOIZ allocation", e))?;
-                    data.resize(compressed.len(), 0);
-                    let mut pos = 0;
-                    loop {
-                        let mut out = zstd_safe::OutBuffer::around_pos(data.as_mut_slice(), pos);
-                        self.zdctx
-                            .decompress_stream(&mut out, &mut input)
-                            .map_err(zstd_safe::get_error_name)
-                            .map_err(|e| reason_err!("zstd", "{}", e))?;
-                        pos = out.pos();
-                        if pos < out.capacity() {
-                            break;
-                        }
-                        let next = data
-                            .len()
-                            .checked_mul(2)
-                            .filter(|&n| n > data.len() && n <= ironrdp_graphics::rle::MAX_NATIVE_BITMAP_BYTES)
-                            .ok_or_else(|| custom_err!("native QOIZ resource limit", KernelError::InvalidDimensions))?;
-                        data.try_reserve(next - data.len())
-                            .map_err(|e| custom_err!("native QOIZ allocation", e))?;
-                        data.resize(next, 0);
-                    }
-                    data.truncate(pos);
-                    qoi_apply_native(image, destination, &data, kernels)?
+                    let data = decompress_qoiz_native(
+                        ext.data,
+                        &mut self.zdctx,
+                        ironrdp_graphics::rle::MAX_NATIVE_BITMAP_BYTES,
+                    )?;
+                    qoi_apply_native(image, destination, &data, ext.width, ext.height, kernels)?
                 }
                 _ => {
                     warn!("Unsupported codec ID: {}", ext.codec_id);
@@ -820,25 +798,129 @@ fn native_surface_rectangle(
         bottom: bottom.ok_or_else(|| custom_err!("native Surface geometry", KernelError::InvalidDimensions))?,
     })
 }
+#[cfg(all(test, feature = "qoi"))]
+std::thread_local! {
+    static OPTIONAL_STAGING_CALLS: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(feature = "qoi")]
+fn checked_native_staging_size(required: usize, limit: usize) -> SessionResult<usize> {
+    // 内部测试可用更小限额，任何调用都不能扩大统一256MiB/isize资源边界。
+    if required == 0
+        || required > isize::MAX as usize
+        || required > limit.min(ironrdp_graphics::rle::MAX_NATIVE_BITMAP_BYTES)
+    {
+        return Err(custom_err!(
+            "native codec resource limit",
+            KernelError::InvalidDimensions
+        ));
+    }
+    Ok(required)
+}
+#[cfg(feature = "qoi")]
+fn checked_qoi_pixel_size(width: usize, height: usize, channels: usize) -> SessionResult<usize> {
+    if width == 0 || height == 0 || !matches!(channels, 3 | 4) {
+        return Err(custom_err!(
+            "native QOI geometry",
+            KernelError::InvalidDimensions
+        ));
+    }
+    let required = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(channels))
+        .ok_or_else(|| custom_err!("native QOI geometry", KernelError::InvalidDimensions))?;
+    checked_native_staging_size(required, ironrdp_graphics::rle::MAX_NATIVE_BITMAP_BYTES)
+}
+#[cfg(feature = "qoiz")]
+const NATIVE_QOIZ_INITIAL_BYTES: usize = 16 * 1024;
+#[cfg(feature = "qoiz")]
+fn resize_qoiz_staging(data: &mut Vec<u8>, required: usize, limit: usize) -> SessionResult<()> {
+    let required = checked_native_staging_size(required, limit)?;
+    #[cfg(test)]
+    OPTIONAL_STAGING_CALLS.with(|v| v.borrow_mut().push(("qoiz_allocation", required)));
+    data.try_reserve_exact(required.saturating_sub(data.len()))
+        .map_err(|e| custom_err!("native QOIZ allocation", e))?;
+    data.resize(required, 0);
+    Ok(())
+}
+#[cfg(feature = "qoiz")]
+fn decompress_qoiz_native(
+    compressed: &[u8],
+    context: &mut zstd_safe::DCtx<'_>,
+    limit: usize,
+) -> SessionResult<Vec<u8>> {
+    // 源压缩长度是借用长度，不作为首次私有staging容量。生产limit固定统一资源门。
+    let mut input = zstd_safe::InBuffer::around(compressed);
+    let mut data = Vec::new();
+    resize_qoiz_staging(&mut data, NATIVE_QOIZ_INITIAL_BYTES.min(limit), limit)?;
+    let mut pos = 0;
+    loop {
+        let mut out = zstd_safe::OutBuffer::around_pos(data.as_mut_slice(), pos);
+        context
+            .decompress_stream(&mut out, &mut input)
+            .map_err(zstd_safe::get_error_name)
+            .map_err(|e| reason_err!("zstd", "{}", e))?;
+        pos = out.pos();
+        if pos < out.capacity() {
+            break;
+        }
+        let next = data.len().checked_mul(2).ok_or_else(|| {
+            custom_err!("native QOIZ resource limit", KernelError::InvalidDimensions)
+        })?;
+        resize_qoiz_staging(&mut data, next, limit)?;
+    }
+    data.truncate(pos);
+    Ok(data)
+}
 #[cfg(feature = "qoi")]
 fn qoi_apply_native(
     image: &mut DecodedImage,
     destination: InclusiveRectangle,
     data: &[u8],
+    declared_width: u16,
+    declared_height: u16,
     kernels: &NativeKernels,
 ) -> SessionResult<Option<InclusiveRectangle>> {
-    let (header, decoded) = qoi::decode_to_vec(data).map_err(|e| reason_err!("QOI decode", "{}", e))?;
+    // 同一个decoder只解析一次header；库的decode_to_vec不能承担本地分配前资源门。
+    let mut decoder = qoi::Decoder::new(data).map_err(|e| custom_err!("native QOI header", e))?;
+    #[cfg(test)]
+    OPTIONAL_STAGING_CALLS.with(|v| v.borrow_mut().push(("qoi_header", 0)));
+    let header = *decoder.header();
     let (format, bytes) = match header.channels {
         qoi::Channels::Rgb => (PixelRowSource::Rgb24, 3),
         qoi::Channels::Rgba => (PixelRowSource::Raw32(Pixel32Format::RgbA), 4),
     };
-    let width =
-        usize::try_from(header.width).map_err(|_| custom_err!("QOI geometry", KernelError::InvalidDimensions))?;
-    let height =
-        usize::try_from(header.height).map_err(|_| custom_err!("QOI geometry", KernelError::InvalidDimensions))?;
+    let width = usize::try_from(header.width)
+        .map_err(|_| custom_err!("native QOI geometry", KernelError::InvalidDimensions))?;
+    let height = usize::try_from(header.height)
+        .map_err(|_| custom_err!("native QOI geometry", KernelError::InvalidDimensions))?;
+    let size = checked_qoi_pixel_size(width, height, bytes)?;
+    if width != usize::from(declared_width) || height != usize::from(declared_height) {
+        return Err(custom_err!(
+            "native QOI declared source shape",
+            KernelError::InvalidDimensions
+        ));
+    }
     let stride = width
         .checked_mul(bytes)
-        .ok_or_else(|| custom_err!("QOI geometry", KernelError::InvalidDimensions))?;
+        .ok_or_else(|| custom_err!("native QOI geometry", KernelError::InvalidDimensions))?;
+    image.native_bitmap_size(format, width, height, stride, &destination)?;
+    let mut decoded = Vec::new();
+    #[cfg(test)]
+    OPTIONAL_STAGING_CALLS.with(|v| v.borrow_mut().push(("qoi_allocation", size)));
+    decoded
+        .try_reserve_exact(size)
+        .map_err(|e| custom_err!("native QOI allocation", e))?;
+    decoded.resize(size, 0);
+    #[cfg(test)]
+    OPTIONAL_STAGING_CALLS.with(|v| v.borrow_mut().push(("qoi_decode", size)));
+    let written = decoder
+        .decode_to_buf(decoded.as_mut_slice())
+        .map_err(|e| custom_err!("native QOI decode", e))?;
+    if written != size {
+        return Err(custom_err!("native QOI decoded size", KernelError::Length));
+    }
+    #[cfg(test)]
+    OPTIONAL_STAGING_CALLS.with(|v| v.borrow_mut().push(("qoi_apply", size)));
     image.apply_bitmap_native(
         &decoded,
         format,

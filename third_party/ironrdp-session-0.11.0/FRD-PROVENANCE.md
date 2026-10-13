@@ -52,7 +52,27 @@ malformed behavior. Tests compile actual shipping sources and real public
 Processor/Stage APIs; native call traces and mutations discriminate missing
 completeness, geometry, alpha, native consumption and preflight publication.
 The separate QOI helper test uses the reviewed independent stock 192-byte alpha
-anchor. QOI/QOIZ wire feature branches are not enabled in the product cache graph
-and remain uncompiled/unexecuted here; no QOI codec SIMD/production claim follows.
+anchor. A2.7B round1 additionally compiles and runs the real QOI/QOIZ wire
+branches in an ignored independent validation dependency workspace, including
+non-test library compilation. Cargo verifies exact original-lock qoicoubeh 0.5.0,
+zstd-safe 7.2.4 and zstd-sys 2.0.16+zstd.1.5.7 archives; root/oracle manifests,
+locks and default feature graph stay unchanged. Native QOI validates the same
+Decoder header's complete checked dimensions/channels/isize/256MiB allocation
+budget, exact extended source W/H and crop shape before TryReserve/decode_to_buf.
+Native QOIZ starts with at most 16KiB and gates every growth before TryReserve.
+The limit is a local resource boundary, distinct from wire geometry or a display
+resolution ceiling; 4K/8K geometry remains valid. Typed QOI/Kernel/TryReserve
+sources survive; predictable failures do not publish pixels/cursor state or
+consume pending movement. This preserves the existing per-update boundary.
+
+14 optional tests plus 23 existing session tests run in debug/release, along with
+strict scoped clippy, real default None old/new wire comparisons from fixed
+848258c source, eight compiled/killed actual-source mutants per profile, and the
+immutable 192-byte alpha anchor. Oversize allocation probes terminate before
+System allocation; small-budget real zstd growth uses the same private helper
+and cannot expand the 256MiB production gate. Dependency object identities and
+commands are recorded in target/task-4a27b-repair and the round1 report. These
+wire tests do not enable the optional codecs in the product cache graph and do
+not qualify QOI algorithm SIMD, package/live/performance or production selection.
 No production factory, advertisement, active-stage interface, UI, device,
 package, protocol manifest/lock or server component is changed.

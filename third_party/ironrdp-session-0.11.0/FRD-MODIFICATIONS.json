@@ -9,8 +9,8 @@
     },
     "src/fast_path.rs": {
       "upstream_sha256": "6f617adab8e20101c93226b649ab90ba927f54305f741635412975211bade8d3",
-      "post_sha256": "5ee7b9451b83771320b3b5d0764aa4cf8e5568be9324276b1b6a457edd3088e2",
-      "reason": "A2.7B explicit native complete-source Bitmap/image/Surface/RFX row consumers; old default wrappers preserved, typed completeness/resource/geometry gates and Option publication"
+      "post_sha256": "f484405fe42ba4d0645042b824fa9181f51dd7430bbd31f80da89b53921419af",
+      "reason": "A2.7B explicit native complete-source consumers; round1 QOI same-decoder header/declared-shape checked preallocation, bounded QOIZ initial/growth staging, typed source; default None unchanged"
     },
     "src/active_stage.rs": {
       "upstream_sha256": "e16cf3d0eadf92c9803fadca39efad540e0d6eb8a19902ed0143175b7e24b97a",
@@ -29,7 +29,7 @@
     "tests/rfx_support.py": "9aa2f3f86c374b064bbe4545b7bc44d95306d718749303f8e21edac9987ec7a7",
     "tests/test_rfx_mutations.py": "9988c87393fe0f3369f8b34811c3326bae51445ec69a0b1d5121f76e7f552ec0",
     "tests/active_stage_native.rs": "8e9de1fc2ec2d8a7057e1d79902404351a49b66ce30a49de0ecaa46090467407",
-    "tests/README.md": "6533b8b79b839cd577d23e4fb240b1c2dbc8b62553c2732a2b330679d742bd8c",
+    "tests/README.md": "924b89f3138ee9b67a60106736d5bc08600571f029ddd3ef9d766714134e0ed7",
     "tests/run_rfx_tests.py": "db9f0369fd5e0ca863d44f7dc2ff7051af8a47793f4aadb98fa63d20be1aa76f",
     "tests/freeze_rfx.py": "294dee6af7d3e9e4f395db66163912b3b32c9fde48057dd7b0956d0123dfec87",
     "tests/fixtures/rfx-original-quant-order.bin": "635252cf344eb283f9328296c8602d37ef2dc68a2bfbbd4ea29f3b7f922bcbf2",
@@ -42,7 +42,11 @@
     "tests/test_image_consumers_mutations.py": "fe7c5a4be44d1e3cb1413db7ba06c95fe25b146ca0d8764ea4eeee817cd06958",
     "tests/image_qoi_helper_native.rs": "01ff42a9f4a37d02251580765108ace27881e4ffb9e93f78be690fc72167e021",
     "tests/fixtures/image-consumers-original.bin": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80",
-    "tests/fixtures/IMAGE-CONSUMERS-PROVENANCE.json": "219f32ccb5211d5c2ad5128e7e1b511cf8d2d794fa04701c1476426338e6c25a"
+    "tests/fixtures/IMAGE-CONSUMERS-PROVENANCE.json": "219f32ccb5211d5c2ad5128e7e1b511cf8d2d794fa04701c1476426338e6c25a",
+    "tests/image_optional_wire.rs": "2e1e2ad33dd438b72aa772b01415805a3987b8cebe07086b43d892a07306fe8f",
+    "tests/optional_image_support.py": "586b5e669a63f2c1ca5da1713c2e897de363f661ef3eef2b57adf46811c64b4b",
+    "tests/run_image_optional_tests.py": "1e438ed3566756ff0d9465cedfcc66c89d2cbc82cd4b0097dd59deea93e9da4a",
+    "tests/test_image_optional_mutations.py": "c2161661abd20fc116270a4052ac8f09fc0edc0e8f5b0ff26eb025536de56828"
   },
   "image_consumer_fixture_sha256": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80"
 }
