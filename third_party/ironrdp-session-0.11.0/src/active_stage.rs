@@ -4,6 +4,7 @@ use ironrdp_bulk::BulkCompressor;
 use ironrdp_core::{ReadCursor, WriteBuf};
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};
+use ironrdp_graphics::legacy_native::NativeKernels;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
@@ -34,6 +35,7 @@ pub struct ActiveStage {
     x224_processor: x224::Processor,
     fast_path_processor: fast_path::Processor,
     enable_server_pointer: bool,
+    native_legacy_kernels: Option<NativeKernels>,
 }
 
 /// Builder for [`ActiveStage`].
@@ -104,11 +106,18 @@ impl ActiveStageBuilder {
             x224_processor,
             fast_path_processor,
             enable_server_pointer,
+            native_legacy_kernels: None,
         }
     }
 }
 
 impl ActiveStage {
+    /// 显式选择受检查的原生 legacy decoder，并在再激活替换处理器时保留选择。
+    pub fn set_native_legacy_kernels(&mut self, kernels: NativeKernels) {
+        self.native_legacy_kernels = Some(kernels);
+        self.fast_path_processor.set_native_legacy_kernels(kernels);
+    }
+
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.fast_path_processor.update_mouse_pos(x, y);
     }
@@ -225,7 +234,10 @@ impl ActiveStage {
         Ok(stage_outputs)
     }
 
-    pub fn set_fastpath_processor(&mut self, processor: fast_path::Processor) {
+    pub fn set_fastpath_processor(&mut self, mut processor: fast_path::Processor) {
+        if let Some(kernels) = self.native_legacy_kernels {
+            processor.set_native_legacy_kernels(kernels);
+        }
         self.fast_path_processor = processor;
     }
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ironrdp_bulk::BulkCompressor;
 use ironrdp_core::{DecodeErrorKind, ReadCursor, WriteBuf, decode_cursor};
 use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_graphics::legacy_native::NativeKernels;
 use ironrdp_graphics::pointer::{DecodedPointer, PointerBitmapTarget};
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_graphics::rle::RlePixelFormat;
@@ -36,6 +37,7 @@ pub struct Processor {
     rfx_handler: rfx::DecodingContext,
     marker_processor: FrameMarkerProcessor,
     bitmap_stream_decoder: BitmapStreamDecoder,
+    native_legacy_kernels: Option<NativeKernels>,
     pointer_cache: PointerCache,
     use_system_pointer: bool,
     mouse_pos_update: Option<(u16, u16)>,
@@ -51,6 +53,12 @@ pub struct Processor {
 }
 
 impl Processor {
+    /// 显式选择原生 legacy decoder；Bitmap 快慢路径与 RFX 共用同一能力。
+    pub fn set_native_legacy_kernels(&mut self, kernels: NativeKernels) {
+        self.native_legacy_kernels = Some(kernels);
+        self.rfx_handler.set_native_legacy_kernels(kernels);
+    }
+
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.mouse_pos_update = Some((x, y));
     }
@@ -205,16 +213,29 @@ impl Processor {
                     // structure ([MS-RDPEGDI] section 2.2.2.5.1).
                     debug!("32 bpp compressed RDP6_BITMAP_STREAM");
 
-                    match self.bitmap_stream_decoder.decode_bitmap_stream_to_rgb24(
-                        update.bitmap_data,
-                        &mut buf,
-                        usize::from(update.width),
-                        usize::from(update.height),
-                    ) {
-                        Ok(()) => image.apply_rgb24(&buf, &update.rectangle, true)?,
-                        Err(err) => {
-                            warn!("Invalid RDP6_BITMAP_STREAM: {err}");
-                            update.rectangle.clone()
+                    if let Some(kernels) = self.native_legacy_kernels.as_ref() {
+                        self.bitmap_stream_decoder
+                            .decode_bitmap_stream_to_rgb24_native(
+                                update.bitmap_data,
+                                &mut buf,
+                                usize::from(update.width),
+                                usize::from(update.height),
+                                kernels,
+                            )
+                            .map_err(|e| custom_err!("decode native RDP6 bitmap", e))?;
+                        image.apply_rgb24(&buf, &update.rectangle, true)?
+                    } else {
+                        match self.bitmap_stream_decoder.decode_bitmap_stream_to_rgb24(
+                            update.bitmap_data,
+                            &mut buf,
+                            usize::from(update.width),
+                            usize::from(update.height),
+                        ) {
+                            Ok(()) => image.apply_rgb24(&buf, &update.rectangle, true)?,
+                            Err(err) => {
+                                warn!("Invalid RDP6_BITMAP_STREAM: {err}");
+                                update.rectangle.clone()
+                            }
                         }
                     }
                 } else {
@@ -223,23 +244,43 @@ impl Processor {
                     // 2.2.9.1.1.3.1.2.4).
                     debug!(bpp = update.bits_per_pixel, "Non-32 bpp compressed RLE_BITMAP_STREAM",);
 
-                    match ironrdp_graphics::rle::decompress(
-                        update.bitmap_data,
-                        &mut buf,
-                        usize::from(update.width),
-                        usize::from(update.height),
-                        usize::from(update.bits_per_pixel),
-                    ) {
-                        Ok(RlePixelFormat::Rgb16) => image.apply_rgb16_bitmap(&buf, &update.rectangle)?,
-                        Ok(RlePixelFormat::Rgb15) => image.apply_rgb15_bitmap(&buf, &update.rectangle)?,
-                        Ok(RlePixelFormat::Rgb24) => image.apply_bgr24_bitmap(&buf, &update.rectangle)?,
-                        Ok(RlePixelFormat::Rgb8) => {
-                            image.apply_rgb8_with_palette(&buf, &update.rectangle, self.palette.colors())?
+                    if let Some(kernels) = self.native_legacy_kernels.as_ref() {
+                        let format = ironrdp_graphics::rle::decompress_native(
+                            update.bitmap_data,
+                            &mut buf,
+                            usize::from(update.width),
+                            usize::from(update.height),
+                            usize::from(update.bits_per_pixel),
+                            kernels,
+                        )
+                        .map_err(|e| custom_err!("decode native RLE bitmap", e))?;
+                        match format {
+                            RlePixelFormat::Rgb16 => image.apply_rgb16_bitmap(&buf, &update.rectangle)?,
+                            RlePixelFormat::Rgb15 => image.apply_rgb15_bitmap(&buf, &update.rectangle)?,
+                            RlePixelFormat::Rgb24 => image.apply_bgr24_bitmap(&buf, &update.rectangle)?,
+                            RlePixelFormat::Rgb8 => {
+                                image.apply_rgb8_with_palette(&buf, &update.rectangle, self.palette.colors())?
+                            }
                         }
+                    } else {
+                        match ironrdp_graphics::rle::decompress(
+                            update.bitmap_data,
+                            &mut buf,
+                            usize::from(update.width),
+                            usize::from(update.height),
+                            usize::from(update.bits_per_pixel),
+                        ) {
+                            Ok(RlePixelFormat::Rgb16) => image.apply_rgb16_bitmap(&buf, &update.rectangle)?,
+                            Ok(RlePixelFormat::Rgb15) => image.apply_rgb15_bitmap(&buf, &update.rectangle)?,
+                            Ok(RlePixelFormat::Rgb24) => image.apply_bgr24_bitmap(&buf, &update.rectangle)?,
+                            Ok(RlePixelFormat::Rgb8) => {
+                                image.apply_rgb8_with_palette(&buf, &update.rectangle, self.palette.colors())?
+                            }
 
-                        Err(e) => {
-                            warn!("Invalid RLE-compressed bitmap: {e}");
-                            update.rectangle.clone()
+                            Err(e) => {
+                                warn!("Invalid RLE-compressed bitmap: {e}");
+                                update.rectangle.clone()
+                            }
                         }
                     }
                 }
@@ -610,6 +651,7 @@ impl ProcessorBuilder {
             rfx_handler: rfx::DecodingContext::new(),
             marker_processor: FrameMarkerProcessor::new(self.user_channel_id, self.io_channel_id, self.share_id),
             bitmap_stream_decoder: BitmapStreamDecoder::default(),
+            native_legacy_kernels: None,
             pointer_cache: PointerCache::default(),
             use_system_pointer: true,
             mouse_pos_update: None,

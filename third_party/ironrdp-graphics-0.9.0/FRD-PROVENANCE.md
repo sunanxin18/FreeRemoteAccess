@@ -25,3 +25,9 @@ RGB/append的unsafe geometry在PDU之前拒绝，header-specific alpha/chroma总
 新增fixture只提取冻结原catalog，或通过hash-pinned原版actual source process产生，未用patched实现生成期望值。
 六组bin/BMP与许可证沿用原 `UPSTREAM-SHA256SUMS`/隔离oracle source inventory，未复制修改或重写原始清单。
 public bitmap无bytes-consumed字段；测量只来自private plane原版成功返回值。
+
+## A2.6 显式 RLGR/RFX bridge
+
+仅 `src/rlgr.rs` shared zero materializer、`src/lib.rs` module 声明和新增 `src/legacy_native.rs`。原版 encoder 保留，RLGR default 保留原标量 zero；显式 native 在真正 run 和终端 pad 两处调用已有能力 zero 叶子。component 检查两个 4096 长度，映射明确十个 Quant 字段，依次 RLGR→LL3[4032..4096] differential→dequant→DWT，并返回有 source 的 typed error。没有 ISA 分支或重新选择 CPU，没有 K/数值/Cargo 修改。
+
+独立原版 RLGR/session/component fixtures 及 generator 来源、hash、命令和 checked/default 差别记录于 session vendor `tests/README.md`。`FRD-MODIFICATIONS.json` 扩展的两个原始路径均固定 upstream/post SHA；A2.3/A2.4/A2.5 四个既有记录不变。新消费者没有生产启用，image.rs/A2.7 仍是剩余 whole-codec 门。

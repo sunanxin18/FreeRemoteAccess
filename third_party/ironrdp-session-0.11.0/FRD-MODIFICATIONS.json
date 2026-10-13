@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "upstream_archive_sha256": "3f1a5a20c24d8ebf47477f9f513201aeb894e7c7f779ea633ece65e42a9f0652",
+  "modified_originals": {
+    "src/rfx.rs": {
+      "upstream_sha256": "aa49df5cd1cac0a5c23af97e48565f6402888afd58ce4fbd808e5f7db40b4c5b",
+      "post_sha256": "c39fcce342941ea8dbe42ef536cfaecbb1745156e8992a5fbddcb5926ee107e8",
+      "reason": "A2.6 explicit checked native RLGR/component/session policy consumers; old builders and defaults preserved"
+    },
+    "src/fast_path.rs": {
+      "upstream_sha256": "6f617adab8e20101c93226b649ab90ba927f54305f741635412975211bade8d3",
+      "post_sha256": "56dfa2d0226380c2395e4bb59610b95683bd703bfc78edd56a86950c9452cc17",
+      "reason": "A2.6 explicit checked native RLGR/component/session policy consumers; old builders and defaults preserved"
+    },
+    "src/active_stage.rs": {
+      "upstream_sha256": "e16cf3d0eadf92c9803fadca39efad540e0d6eb8a19902ed0143175b7e24b97a",
+      "post_sha256": "09687dac04ad956d619fcd6edfb06c7bbd861b4bd94b8117b360e7a0f4fd63aa",
+      "reason": "A2.6 explicit checked native RLGR/component/session policy consumers; old builders and defaults preserved"
+    }
+  },
+  "added_files": {
+    "tests/rfx_original_generator.rs": "5f3abfe6be027e1b5e1afe8a3b0c9f0884739f567df09d36014c76483c4c06fc",
+    "tests/rfx_native.rs": "a99e0423945764c00ed7910cf63d97172bf591fd5ee834f54ee49b0690bef90e",
+    "tests/rfx_support.py": "9aa2f3f86c374b064bbe4545b7bc44d95306d718749303f8e21edac9987ec7a7",
+    "tests/test_rfx_mutations.py": "9988c87393fe0f3369f8b34811c3326bae51445ec69a0b1d5121f76e7f552ec0",
+    "tests/active_stage_native.rs": "8e9de1fc2ec2d8a7057e1d79902404351a49b66ce30a49de0ecaa46090467407",
+    "tests/README.md": "6533b8b79b839cd577d23e4fb240b1c2dbc8b62553c2732a2b330679d742bd8c",
+    "tests/run_rfx_tests.py": "db9f0369fd5e0ca863d44f7dc2ff7051af8a47793f4aadb98fa63d20be1aa76f",
+    "tests/freeze_rfx.py": "294dee6af7d3e9e4f395db66163912b3b32c9fde48057dd7b0956d0123dfec87",
+    "tests/fixtures/rfx-original-quant-order.bin": "635252cf344eb283f9328296c8602d37ef2dc68a2bfbbd4ea29f3b7f922bcbf2",
+    "tests/fixtures/rfx-original-supplemental.bin": "9fbccd33f4d3de61ea170805077d6b41f66f2dd305adb0b15d1851956aed1bfe",
+    "tests/fixtures/rfx-original-catalog.bin": "9c03b62a6d53dcfe01ea4add02371f7d7aa338299330e4889f406f5e99d540b3"
+  }
+}

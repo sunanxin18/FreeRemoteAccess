@@ -187,7 +187,57 @@ fn code_gr(bits: &mut BitStream<'_>, krp: &mut u32, val: u32) {
     }
 }
 
-pub fn decode(mode: EntropyAlgorithm, tile: &[u8], mut output: &mut [i16]) -> Result<(), RlgrError> {
+pub fn decode(mode: EntropyAlgorithm, tile: &[u8], output: &mut [i16]) -> Result<(), RlgrError> {
+    decode_with(mode, tile, output, &mut ScalarZero)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ZeroSite {
+    Run,
+    Padding,
+}
+
+pub(crate) trait ZeroMaterializer {
+    fn zero(&mut self, output: &mut [i16], site: ZeroSite);
+}
+
+struct ScalarZero;
+impl ZeroMaterializer for ScalarZero {
+    fn zero(&mut self, output: &mut [i16], _site: ZeroSite) {
+        for value in output {
+            *value = 0;
+        }
+    }
+}
+
+pub(crate) struct NativeZero<'a> {
+    kernels: &'a frd_rdp_legacy_kernels::NativeKernels,
+    #[cfg(test)]
+    calls: Vec<(ZeroSite, usize)>,
+}
+impl<'a> NativeZero<'a> {
+    pub(crate) fn new(kernels: &'a frd_rdp_legacy_kernels::NativeKernels) -> Self {
+        Self {
+            kernels,
+            #[cfg(test)]
+            calls: Vec::new(),
+        }
+    }
+}
+impl ZeroMaterializer for NativeZero<'_> {
+    fn zero(&mut self, output: &mut [i16], _site: ZeroSite) {
+        self.kernels.zero_i16(output);
+        #[cfg(test)]
+        self.calls.push((_site, output.len()));
+    }
+}
+
+pub(crate) fn decode_with<M: ZeroMaterializer>(
+    mode: EntropyAlgorithm,
+    tile: &[u8],
+    mut output: &mut [i16],
+    materializer: &mut M,
+) -> Result<(), RlgrError> {
     #![expect(
         clippy::as_conversions,
         clippy::cast_possible_truncation,
@@ -226,7 +276,7 @@ pub fn decode(mode: EntropyAlgorithm, tile: &[u8], mut output: &mut [i16]) -> Re
                 let magnitude = compute_rl_magnitude(sign_bit, code_remainder)?;
 
                 let size = min(run as usize, output.len());
-                fill(&mut output[..size], 0);
+                materializer.zero(&mut output[..size], ZeroSite::Run);
                 output = &mut output[size..];
                 write_byte!(output, magnitude);
             }
@@ -268,15 +318,9 @@ pub fn decode(mode: EntropyAlgorithm, tile: &[u8], mut output: &mut [i16]) -> Re
     }
 
     // Fill remaining buffer with zeros.
-    fill(output, 0);
+    materializer.zero(output, ZeroSite::Padding);
 
     Ok(())
-}
-
-fn fill(buffer: &mut [i16], value: i16) {
-    for v in buffer {
-        *v = value;
-    }
 }
 
 fn load_be_u32(s: &BitSlice<u8, Msb0>) -> u32 {
@@ -398,7 +442,9 @@ impl core::fmt::Display for RlgrError {
             Self::Io(_) => write!(f, "IO error"),
             Self::Yuv(_) => write!(f, "YUV error"),
             Self::EmptyTile => write!(f, "the input tile is empty"),
-            Self::InvalidIntegralConversion(s) => write!(f, "invalid `{s}`: out of range integral type conversion"),
+            Self::InvalidIntegralConversion(s) => {
+                write!(f, "invalid `{s}`: out of range integral type conversion")
+            }
         }
     }
 }

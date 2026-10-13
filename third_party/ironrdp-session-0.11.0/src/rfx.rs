@@ -2,6 +2,7 @@ use core::cmp::min;
 
 use ironrdp_graphics::color_conversion::{self, YCbCrBuffer};
 use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_graphics::legacy_native::{self, NativeKernels};
 use ironrdp_graphics::rectangle_processing::Region;
 use ironrdp_graphics::{dwt, quantization, rlgr, subband_reconstruction};
 use ironrdp_pdu::codecs::rfx::{self, EntropyAlgorithm, Quant, RfxRectangle, Tile};
@@ -20,6 +21,7 @@ pub struct DecodingContext {
     context: rfx::ContextPdu,
     channels: rfx::ChannelsPdu,
     decoding_tiles: DecodingTileContext,
+    native_legacy_kernels: Option<NativeKernels>,
 }
 
 impl Default for DecodingContext {
@@ -31,6 +33,7 @@ impl Default for DecodingContext {
             },
             channels: rfx::ChannelsPdu(Vec::new()),
             decoding_tiles: DecodingTileContext::new(),
+            native_legacy_kernels: None,
         }
     }
 }
@@ -38,6 +41,11 @@ impl Default for DecodingContext {
 impl DecodingContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 显式选择已验证 CPU 的原生 legacy 能力；默认仍使用原版 decoder。
+    pub fn set_native_legacy_kernels(&mut self, kernels: NativeKernels) {
+        self.native_legacy_kernels = Some(kernels);
     }
 
     pub fn decode(
@@ -162,6 +170,7 @@ impl DecodingContext {
                 self.decoding_tiles.tile_output.as_mut(),
                 self.decoding_tiles.ycbcr_buffer.as_mut(),
                 self.decoding_tiles.ycbcr_temp_buffer.as_mut(),
+                self.native_legacy_kernels.as_ref(),
             )?;
 
             let current_update_rectangle = image.apply_tile(
@@ -202,9 +211,22 @@ fn decode_tile(
     output: &mut [u8],
     ycbcr_temp: &mut [Vec<i16>],
     temp: &mut [i16],
+    kernels: Option<&NativeKernels>,
 ) -> SessionResult<()> {
     for ((quant, data), ycbcr_buffer) in tile.quants.iter().zip(tile.data.iter()).zip(ycbcr_temp.iter_mut()) {
-        decode_component(quant, entropy_algorithm, data, ycbcr_buffer.as_mut_slice(), temp)?;
+        if let Some(kernels) = kernels {
+            legacy_native::decode_component_native(
+                quant,
+                entropy_algorithm,
+                data,
+                ycbcr_buffer.as_mut_slice(),
+                temp,
+                kernels,
+            )
+            .map_err(|e| custom_err!("decode_component", e))?;
+        } else {
+            decode_component(quant, entropy_algorithm, data, ycbcr_buffer.as_mut_slice(), temp)?;
+        }
     }
 
     let ycbcr_buffer = YCbCrBuffer {
@@ -213,7 +235,13 @@ fn decode_tile(
         cr: ycbcr_temp[2].as_slice(),
     };
 
-    color_conversion::ycbcr_to_rgba(ycbcr_buffer, output).map_err(|e| custom_err!("decode_tile", e))?;
+    if let Some(kernels) = kernels {
+        kernels
+            .ycbcr_to_rgba(ycbcr_buffer.y, ycbcr_buffer.cb, ycbcr_buffer.cr, output)
+            .map_err(|e| custom_err!("decode_tile", e))?;
+    } else {
+        color_conversion::ycbcr_to_rgba(ycbcr_buffer, output).map_err(|e| custom_err!("decode_tile", e))?;
+    }
 
     Ok(())
 }
