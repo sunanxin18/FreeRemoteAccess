@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "date": "2026-10-13",
+  "oracle": "independent workspace registry graphics=0.9.0 session=0.11.0 pdu=0.9.0 yuv=0.8.17",
+  "toolchain": "rustc 1.96.0 ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96; aarch64-apple-darwin Apple M4",
+  "generation_command": "CARGO_TARGET_DIR=target/legacy-oracle cargo run --offline --locked --manifest-path tests/legacy-oracle/Cargo.toml -- generate",
+  "verification_command": "CARGO_TARGET_DIR=target/legacy-oracle cargo run --offline --locked --manifest-path tests/legacy-oracle/Cargo.toml -- verify",
+  "leaf_unique_keys": 25962,
+  "dwt_impulses": 4096,
+  "wire_records": 22337,
+  "wire_codecs": {
+    "bitmap": 16721,
+    "planar": 4972,
+    "rlgr": 634,
+    "session": 10
+  },
+  "wire_result_classes": {
+    "Ok": 17787,
+    "Err": 4550
+  },
+  "files": {
+    "crates/frd-rdp-legacy-kernels/tests/fixtures/original-leaves.bin.gz": {
+      "bytes": 2974939,
+      "sha256": "507edc26e5d89d0b9ed6b5a6ed4cddb98caf0055e41766dc079db98bd9817768"
+    },
+    "crates/frd-rdp-legacy-kernels/tests/fixtures/original-composition.bin": {
+      "bytes": 49190,
+      "sha256": "d1b26abccc5066c4699d59b8c9128bc92c5f0937551228a39b420e4301e4c2e4"
+    },
+    "crates/frd-rdp-legacy-kernels/tests/fixtures/planar-original.bin": {
+      "bytes": 116497,
+      "sha256": "32aff1b11ae76167f9dae70d8c244468ab04fbb67f6f72bbd9e7d63fdd44c9a7"
+    },
+    "tests/legacy-oracle/fixtures/wire-catalog.json.gz": {
+      "bytes": 2095421,
+      "sha256": "6fbe95d550096ce14e3a7fdd61ed2b6eea1235552fab9401df0907fd8017ea41"
+    },
+    "crates/frd-rdp-legacy-kernels/tests/fixtures/original-rlgr-replay.bin.gz": {
+      "bytes": 5839,
+      "sha256": "1207f0c6744ccbeb780fd9ea7204850e938feb7ece7c807c1d225cded8aa89c6"
+    }
+  },
+  "generator_files": {
+    "tests/legacy-oracle/src/main.rs": "dedec3f1b65bd1f2f1fdb2c90a36be965ab1212fb0c286530366991dab3ddfd0",
+    "tests/legacy-oracle/src/planar.rs": "057898322cf4ec48cc1fd241564c6614278dd3c0d85c203080947994737dbd2e",
+    "tests/legacy-oracle/src/snapshots.rs": "fb9882bb3dfc8ad72b45d5927b00764c88c8aadb31a78ce07d5ac404db4e0377",
+    "tests/legacy-oracle/src/wire.rs": "98babb35230843bb92d54a6f253ba04ff559d6970f16a171f1737e565aa83a66"
+  },
+  "shared_serialization_only": {
+    "path": "crates/frd-rdp-legacy-kernels/tests/common/snapshot_format.rs",
+    "sha256": "941a1a2785822633e10ef2db949c2d888972cc071d43857e681a187c08799f4b"
+  },
+  "upstream_fixture_files": {
+    "32x64_rgb_raw.bin": "432332d7a5f5c8ac2ba02308729edc00ae94a487c031a0eb9a41a571f3693a5f",
+    "32x64_rgb_raw.bmp": "93d05cc125dd352612c5f9f4d4147bf1fb8457db8f25449b6dc5f9f137e5b750",
+    "64x24_argb_rle.bin": "cc4faa39d3cd6a43ce4cf7fa17083eab6fe20497989bef3066ebadb560ade462",
+    "64x24_argb_rle.bmp": "cb770ac42e6f93420942a3d0fab2957373bd679388f5d41b7cee9223925f5f5f",
+    "64x35_ycocg_rle_ss.bin": "9dab23d7f5378cc0674db9f03d17ad5a2dbacb98db21652a1561303e1db0db9f",
+    "64x35_ycocg_rle_ss.bmp": "f37ea9650480877a7349331c290b5ddd152bf86c1d68b8a025a32587b8195843",
+    "64x64_aycocg_rle.bin": "dd46dbd95029b754599776f663de37dae9f7f3344726774c4887d497ae655b62",
+    "64x64_aycocg_rle.bmp": "f5eccf3d35c8987d5de5457325b55c00db9090dbe9337d9c1efd15bd742a6e07",
+    "64x64_ycocg_raw_ss.bin": "f9384b2f22e5def585ee3e1a663e942b395e066c5b1681250edabc9c6a7daf8d",
+    "64x64_ycocg_raw_ss.bmp": "5f7e535c217fb7ec4cf2ba07984e49fd06415800a5ead97806fae909bc16b809",
+    "64x64_ycocg_rle_ss.bin": "edef6b6addbe5f18db4beaa6c39797455950bfbffabce3f9f0bdb3c7c4d15c37",
+    "64x64_ycocg_rle_ss.bmp": "d326152504a13e0dbe08a2297f954fcbad5dbb0a8db3ddf57e59e6b58c9a5246",
+    "LICENSE-APACHE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+  },
+  "source_inventory_sha256": "3b74fc88447e27b437d7fca5d09d202ec31003fdbec2ca07508205e67bf38d69",
+  "oracle_lock_sha256": "ab69a7f8790e89b73a12e3e5c5412b8eccfed6661f5b710be87d5468f3e4c04e",
+  "boundary": "No kernel numerical/API source is shared with the oracle. Catalog public API does not expose consumed bytes or private scratch; no asserted values. Original planar64 bytes unchanged. Native tests load frozen bytes without spawning oracle.",
+  "rlgr_success_replays": 546
+}

@@ -14,5 +14,12 @@
     "ironrdp-pdu-0.9.0/src/basic_output/bitmap/rdp6.rs": "5160eb3abf472811fa2c6350b716915982c04fecba736c05c71432bb0deee129"
   },
   "coverage": "28 configurations CLL1..7 x alpha x subsampling each with6x8x8 discriminator grid and3x3 odd geometry (56 records); ARGB33x1 alpha/noalpha RGB marker planes(2); RLE256x2 delta records previous0,1,127,128,254,255(6)",
-  "boundary": "Original decoder expected output includes alpha consumption and raw parser padding/RLE decode; native tests exercise leaves only. No production dispatcher, session publication or runtime interoperability claim."
+  "boundary": "Original decoder expected output includes alpha consumption and raw parser padding/RLE decode; native tests exercise leaves only. No production dispatcher, session publication or runtime interoperability claim.",
+  "isolation_migration": {
+    "date": "2026-10-13",
+    "current_generator": "tests/legacy-oracle/src/planar.rs",
+    "current_generator_sha256": "057898322cf4ec48cc1fd241564c6614278dd3c0d85c203080947994737dbd2e",
+    "verification_command": "CARGO_TARGET_DIR=target/legacy-oracle cargo run --offline --locked --manifest-path tests/legacy-oracle/Cargo.toml -- verify",
+    "boundary": "Original generation record above retained; original fixture bytes unchanged; new independent workspace re-runs original registry public API."
+  }
 }

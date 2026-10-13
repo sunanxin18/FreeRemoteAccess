@@ -1,6 +1,6 @@
 # RemoteFX / Bitmap / RDP6 原生数值叶子
 
-独立 checked backend；当前没有任何生产调用者、graphics patch、能力广告或 session 就绪接口。正常 dependencies 为空。registry `ironrdp-graphics =0.9.0`、`yuv =0.8.17` 和 `ironrdp-session =0.11.0` 仅为未修改的 dev oracle。完整协议接线、Bitmap/RDP6、平台包和 live 验证仍未完成。
+独立 checked backend；正常 dependencies 为空。生产 graphics/session 已固定为最小 vendored 副本，graphics 私有依赖本 crate，但尚无 decoder 数值调用者或能力广告。原版 graphics/PDU/session/yuv 位于 `tests/legacy-oracle` 的独立 workspace/process，kernel 的 dev 图也不再含这些 decoder。完整协议接线、平台包和 live 验证仍未完成。
 
 `NativeKernels::detect()` 仅在 AArch64 NEON 或非 macOS 的 x86/x86_64 SSE2 可用时构造能力对象，其他 CPU 返回 `Unavailable`。32-bit x86 与 x86_64 使用分别 cfg 的 intrinsics import；只用 SSE2（`loadu`，用两次 `mul_epu32` 拼低 32 位乘积），不需要 SSE3/SSE4.1。macOS Intel 不提供 backend。`detect_if(false)` 可收紧策略，`true` 仍须通过真实硬件检测。没有 scalar 后备。OHOS 的 Linux OS cfg 不加载任何桌面服务。
 
@@ -22,11 +22,11 @@
 
 ## 测试与验收边界
 
-`cargo test --locked -p frd-rdp-legacy-kernels` 对比原版 oracle，覆盖全部 4096 位置 DWT 极值脉冲、原版 DWT/RLGR/完整 session wire fixture、quant 各 band、任意尾部与非对齐 slice、色彩全 i16 域抽样与合法域边界、失效能力和错误不修改输出。
+`cargo test --offline --locked -p frd-rdp-legacy-kernels` 对比独立原版生成的冻结逐例 bytes，保留全部 4096 位置 DWT 极值脉冲、12 random seeds、5 constant extremes、170 dequant cases、prefix/tail/canary 与 100000 组色彩全 i16 域抽样及全部原错误门。`tests/common/frozen.rs` 只做带输入 SHA-256 的查表，没有 decoder 公式；gzip 只在 dev 图加载一次。fixture 生成与独立重算见 [`tests/legacy-oracle`](../../tests/legacy-oracle/README.md)。kernel 测试可以在目标运行，不启动外部 Cargo/oracle binary。
 
-`wire_composition` 用原版 parser/RLGR 和新数值叶子测试期组合得到完整 tile，另与未修改的 session decoder 及原版期望图像逐字节比较。RLGR zero-run 回调尚未接入：测试只是按原版 decoder 产出的零区间重放独立 materialization。截断 bit 流按原版规则可成功并补零；空 tile 返回原版 `EmptyTile`。编码器字节末尾 padding 在输出长度被人为扩大时可能解出额外非零符号，不能臆定全部多余样本为零。wire 截断拒绝由未修改原版 session 测试保留。这些均不是生产 wiring、错误映射、发布原子性或 live 互操作证明。
+`wire_composition` 使用原版完整 wire 捕获的 RLGR 系数/quant 做数值叶子组合，并逐平面对照原版 DWT 输出及 16384-byte 原始图像。零区间重放保留原有边界，不是 entropy zero hook。原版真实 RLGR、完整 2970-byte wire/session、truncate/error/padding 测试已迁到独立 runner，并新增完整 wire catalog；kernel 不将 patched parser 当 oracle。原版逐字节消费未由 public API 暴露，catalog 不臆测该数值。独立原版 debug panic/release wrap 的色彩测试同样保留。这些均不是生产 wiring、错误映射、发布原子性或 live 互操作证明。
 
-显式 release benchmark：`cargo test --locked --release -p frd-rdp-legacy-kernels --test benchmark -- --ignored --nocapture`。固定 wire SHA-256，128 warmup、501 samples（每个样本批量 16 次以避免时钟分辨率导致零值），报告 median/p95 ns、backend、host 架构、oracle/native 比值；不设置性能断言。预分配 scratch 和输出，dequant/DWT 计时包含输入重置 copy，color 包含 checked 预检。component/full-tile 包含未修改 RLGR 的 parser **及其原版零 materialization**；zero leaf 单独测量，不能将组合计时称为全部 SIMD 的生产 decoder。
+显式 release benchmark：`cargo test --offline --locked --release -p frd-rdp-legacy-kernels --test benchmark -- --ignored --nocapture`。原版使用 `cargo test --offline --locked --release --manifest-path tests/legacy-oracle/Cargo.toml --test benchmark -- --ignored --nocapture`（仓库根执行并设不同 `CARGO_TARGET_DIR`）。双方相同输入 hash、thin LTO、128 warmup、501 samples×16；报告 median/p95、架构和 profile。dequant/DWT/LL3 包含相同输入 reset copy，color 包含 native checked 预检。新的 `component_*_coefficients_4096` / `tile_*_coefficients_3x4096` 从相同冻结系数开始且都包括 copy，适合跨进程同边界比较；fixture 加载/解压/进程启动不进入计时。独立原版仍报告含 RLGR 的原 `component_oracle_4096`、`tile_oracle_3x4096` 与单独 RLGR 计时。旧 mixed native/fullwire 历史结果保留历史含义；不得将新 native coefficients 数值除以 original fullwire 数值。真正全 native wire benchmark 等待 A2.6 parser 接线，不设置性能断言。
 
 跨目标编译不代表目标运行：Windows/Linux x86、x86_64、ARM64，OHOS ARM64 各自需要执行 parity/benchmark、包与 runtime 门。macOS 只覆盖 ARM64。native host 数值/指令证据同样不证明任何客户端能控制目标系统。
 
@@ -66,7 +66,7 @@
 
 `planar_neon.rs` 提供 16-byte delta、8-lane u8 shift/signed-widen/i16 add/sub/saturating-narrow、NEON `zip1` chroma duplicate 和 `st3` RGB24 pack。`planar_x86.rs` 以 SSE2 word shift 后 low-byte sign extension、`paddb/paddw/psubw/packuswb` 实现同一语义；RGB pack 用 SSE2 unpack、byte shift、mask/OR，不依赖 SSSE3。两个 x86 架构分别 cfg/import/编译，macOS Intel 没有 backend。固定 lane primitive 不内联，完整块与尾部 staging 调用同一 ISA 路径；只在有限数组间搬运布局 bytes，不以 scalar color/delta loop 作为生产后备。
 
-`planar_parity` 覆盖 delta 全 65536 pairs，CLL1..7 × alpha × subsampling，11×11 dimensions（1/2/3/7/8/15/16/17/63/64/65），所有 byte offset0..15、RGB marker、尾部 canary、尺寸/CLL/长度错误原子性。`planar_guard_pages` 将每个独立 plane/output 紧靠不可访问页首/页尾，覆盖 empty RGB/delta 和完整块/短尾；不要求外部 padding。`tests/fixtures/planar-original.bin` 是未修改 registry IronRDP decoder 实际输出的 64 条固定 records，包含 28 色彩配置的6×8×8判别值与3×3各 chroma cell 不同的奇数尺寸、ARGB marker 与六条 RLE delta plane。生成源码、hash、格式与来源见 `tests/fixtures/planar-original-provenance.json`。tests 同时对照固定 bytes 与当前未修改 dev oracle；后续全局 graphics patch 前仍须完成独立 oracle workspace 隔离。
+`planar_parity` 覆盖 delta 全 65536 pairs，CLL1..7 × alpha × subsampling，11×11 dimensions（1/2/3/7/8/15/16/17/63/64/65），所有 byte offset0..15、RGB marker、尾部 canary、尺寸/CLL/长度错误原子性。`planar_guard_pages` 将每个独立 plane/output 紧靠不可访问页首/页尾，覆盖 empty RGB/delta 和完整块/短尾；不要求外部 padding。`tests/fixtures/planar-original.bin` 是未修改 registry IronRDP decoder 实际输出的 64 条固定 records，包含 28 色彩配置的6×8×8判别值与3×3各 chroma cell 不同的奇数尺寸、ARGB marker 与六条 RLE delta plane。生成源码、hash、格式与来源见 `tests/fixtures/planar-original-provenance.json`。kernel tests 对照全部固定 bytes；独立 oracle runner 重新生成并逐字节验证原版 64 records，原始 bytes/hash 未变。全局 patch 不进入独立 oracle。
 
 显式 bounded host benchmark：`cargo test --offline --locked --release -p frd-rdp-legacy-kernels --test planar_benchmark -- --ignored --nocapture`。128 warmup、501 samples×64 batch，1/7/8/16/65/1024/4096 pixels。双方使用预分配 output，delta 双方每次重置输入；native 包含 checked 入口，reference 是普通优化 Rust 数值/布局循环，compiler 允许优化或自动向量化。报告 median/p95，不设性能断言，不代表原版 parser/RLE/whole-codec/session 成本。
 

@@ -1,6 +1,6 @@
 //! 显式离线生成器：只调用未修改的 registry IronRDP decoder，不调用 NativeKernels。
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
-use std::{fs, path::PathBuf};
+
 fn emit(blob: &mut Vec<u8>, width: usize, height: usize, header: u8, wire: &[u8]) {
     let mut expected = Vec::new();
     BitmapStreamDecoder::default()
@@ -44,7 +44,7 @@ fn rle_row(wire: &mut Vec<u8>, row: &[u8]) {
         wire.extend_from_slice(chunk);
     }
 }
-fn main() {
+pub fn generate() -> Vec<u8> {
     let mut blob = b"FRDPLN01".to_vec();
     for cll in 1..=7 {
         for alpha in [false, true] {
@@ -86,7 +86,5 @@ fn main() {
         }
         emit(&mut blob, 256, 2, 0x30, &wire);
     }
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/planar-original.bin");
-    fs::write(&path, &blob).unwrap();
-    println!("records=64 bytes={} output={}", blob.len(), path.display());
+    blob
 }

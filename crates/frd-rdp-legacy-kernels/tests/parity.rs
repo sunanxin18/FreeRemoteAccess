@@ -1,9 +1,11 @@
 use frd_rdp_legacy_kernels::{KernelError, NativeKernels, Quantization};
-use ironrdp_graphics::{
+#[path = "common/frozen.rs"]
+mod frozen;
+use frozen::Quant;
+use frozen::{
     color_conversion::{ycbcr_to_rgba, YCbCrBuffer},
     dwt, quantization, subband_reconstruction,
 };
-use ironrdp_pdu::codecs::rfx::Quant;
 
 fn native() -> NativeKernels {
     NativeKernels::detect().expect("本测试需要获准架构上的原生 SIMD")
@@ -100,7 +102,7 @@ fn arbitrary_tails_unaligned_prefix_zero_and_canaries() {
     }
 }
 
-// 独立 checked scalar 只用于判定上游合法算术域，像素期望始终调用原版 oracle。
+// 独立 checked scalar 只用于判定上游合法算术域，像素期望始终查询独立原版 oracle 冻结 bytes。
 fn valid(y: i16, cb: i16, cr: i16) -> bool {
     let Some(y) = y
         .checked_add(4096)
@@ -265,29 +267,11 @@ fn checked_errors_do_not_mutate_and_capability_cannot_be_forced() {
 }
 
 #[test]
-fn upstream_color_overflow_is_profile_dependent_native_is_explicit() {
+fn overflow_native_is_explicit_original_profile_test_is_isolated() {
     let mut native_output = [0xa5; 4];
     assert_eq!(
         native().ycbcr_to_rgba(&[32767], &[0], &[0], &mut native_output),
         Err(KernelError::ColorOverflow)
     );
     assert_eq!(native_output, [0xa5; 4]);
-    let upstream = std::panic::catch_unwind(|| {
-        let mut out = [0; 4];
-        ycbcr_to_rgba(
-            YCbCrBuffer {
-                y: &[32767],
-                cb: &[0],
-                cr: &[0],
-            },
-            &mut out,
-        )
-        .unwrap();
-        out
-    });
-    if cfg!(debug_assertions) {
-        assert!(upstream.is_err());
-    } else {
-        assert_eq!(upstream.unwrap(), [0, 0, 0, 255]);
-    }
 }

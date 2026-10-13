@@ -2090,12 +2090,9 @@ dependencies = [
 name = "frd-rdp-legacy-kernels"
 version = "0.1.0"
 dependencies = [
- "ironrdp-graphics",
- "ironrdp-pdu",
- "ironrdp-session",
+ "flate2",
  "libc",
  "sha2 0.10.9",
- "yuv",
 ]
 
 [[package]]
@@ -3323,13 +3320,12 @@ checksum = "cd344ce9518ab83f6f7568ca4f1bc6dc8c55bd2da04cb5ee7b3e8740d5041734"
 [[package]]
 name = "ironrdp-graphics"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7493e426b6a8104cd497e518ba7781a9c7fc9a5f58a9cc0c1111e6d66f63bcc"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
  "bitvec",
  "byteorder",
+ "frd-rdp-legacy-kernels",
  "ironrdp-core",
  "ironrdp-pdu",
  "num-derive",
@@ -3387,8 +3383,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-session"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f1a5a20c24d8ebf47477f9f513201aeb894e7c7f779ea633ece65e42a9f0652"
 dependencies = [
  "ironrdp-bulk",
  "ironrdp-core",
