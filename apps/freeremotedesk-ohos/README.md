@@ -5,9 +5,9 @@ API 26 ArkUI Stage 工程，同一清单声明 `phone` 与 `2in1`，当前打包
 应用图标使用仓库已审 `assets/app-icon/apple/{foreground,background}.png` 无预制遮罩层，
 由 HarmonyOS layered-image 与系统规则组合。功能按钮使用原生文字，没有添加第二图标家族。
 
-当前页面明确为**离线图形验证**。普通启动不自动创建测试表面；debug 构建可通过按钮或
-`aa start ... --pb frd_graphics_poc true` 启动四色 POC。release 原生 NAPI 编译门与 Rust
-C ABI 运行门均拒绝 POC。此页面没有远程连接、协议解析、密码字段或伪造成功事件。
+应用页面提供远程连接表单、服务器身份与连接状态，以及远程桌面原生表面。
+普通应用不提供开发验证按钮、面板、离线图形页面或验证启动参数；debug 构建也使用相同
+产品界面。原生图形与安全存储的底层独立验证设施保留，不通过产品页面调用。
 GUI 基线参考已批准设计中的 HIG Windows、Material 3 按钮和鸿蒙多设备适配资料；
 控件为 ArkUI 原生 Button，目标为48逻辑像素，使用中文可访问名称及系统字体/主题。
 

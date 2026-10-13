@@ -4,6 +4,8 @@
 
 用户随后明确要求“请把开发验证去掉”，覆盖此前任务说明保留调试入口的要求。因此从登录页完全删除开发验证按钮、面板、专用状态与返回分支，不提供折叠菜单等替代入口。底层离线图形/test 设施保持原状，不作为登录产品 UI 的一部分。此前包含该入口的截图属于中间版本；主代理必须重新构建、签名、安装并验收最终无入口版本。
 
+2026-10-14补充：debug HAP也不得通过启动参数打开离线图形验证页。删除ArkUI的POC页面分支、状态轮询以及EntryAbility的`frd_graphics_poc` Want处理；独立原生测试设施保留。验收覆盖手机与PC的普通启动、旧参数冷启动和旧参数运行中启动，均保持正常登录页。
+
 ## 设计依据与目标
 
 遵循官方 [Material 3 文本字段指南](https://m3.material.io/components/text-fields/guidelines)的持久标签与字段分组原则、[Material 3 自适应布局](https://m3.material.io/foundations/layout/canonical-examples/overview)的紧凑宽度适配，以及 [Apple HIG 布局](https://developer.apple.com/design/human-interface-guidelines/layout)和[文本字段](https://developer.apple.com/design/human-interface-guidelines/text-fields)的安全区、平台输入与标签关联原则。主代理在实施前完成相关官方指导审阅。

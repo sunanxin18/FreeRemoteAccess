@@ -9,7 +9,7 @@ interface AppSnapshot {
   initialized: boolean; page: number; available: boolean; canConnect?: boolean;
   target?: number; address?: string; port?: number; username?: string; protocol?: string;
   remember?: boolean; credentialLoaded?: boolean; loading?: string; profiles?: ProfileSummary[];
-  selectedIndex?: number; errors?: FormErrors; notice?: string; probe?: number;
+  selectedIndex?: number; errors?: FormErrors; notice?: string;
   session?: string; generation?: string; geometryRevision?: string; certificate?: CertificateSummary;
   persistenceWarning?: string; statusCode?: string; statusMessage?: string;
 }
@@ -17,7 +17,6 @@ interface FormEdit { target: number; address: string; port: number; username: st
 @Entry
 @Component
 struct Index {
-  @StorageLink('frd_graphics_poc') private showingPoc: boolean = false;
   @StorageLink('frd_native_buttons_width') private nativeButtonsWidth: number = 0;
   @StorageLink('frd_native_chrome') private nativeChrome: boolean = false;
   @StorageLink('frd_cutout_left') private cutoutLeft: number = 0;
@@ -35,7 +34,6 @@ struct Index {
   @State private windowWidth: number = 500;
   @State private passwordEpoch: number = 0;
   @State private bridgeNotice: string = '';
-  @State private graphicsStatus: string = '';
   private controller: XComponentController = new XComponentController();
   private timer: number = -1;
   private submitEvent: number = 0;
@@ -117,7 +115,6 @@ struct Index {
           this.username = this.model.username ?? ''; this.protocol = this.model.protocol ?? 'auto'; this.remember = this.model.remember ?? false;
           this.passwordEpoch++; this.selectPending = false;
         }
-        if (this.showingPoc) { const s = native.pocStatus(); this.graphicsStatus = s.code === 0 ? `离线图形：${s.width} × ${s.height}，${s.frames} 帧` : `图形验证失败（${s.code}）`; }
       } catch { this.bridgeNotice = '应用状态读取失败'; }
     }, 100);
   }
@@ -269,14 +266,7 @@ struct Index {
   build() {
     Column() {
       if (this.nativeChrome || this.model.page !== 0) { this.sessionChrome() }
-      if (this.showingPoc) {
-        Column({ space: 8 }) {
-          Button('停止离线图形验证').constraintSize({ minHeight: 48 }).onClick(() => { this.showingPoc = false; })
-          Text(this.graphicsStatus).fontSize(14).fontColor($r('app.color.text_primary'))
-          XComponent({ id: 'frdPocSurface', type: XComponentType.SURFACE, libraryname: 'entry', controller: this.controller })
-            .width('100%').layoutWeight(1).accessibilityText('离线图形测试表面')
-        }.width('100%').layoutWeight(1)
-      } else if (this.model.page === 0) {
+      if (this.model.page === 0) {
         this.connectionForm()
       } else {
         // session controls/status 由平台 window chrome 接管，不占用 remote-content toolbar。
