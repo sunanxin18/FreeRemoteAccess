@@ -12,6 +12,7 @@ CREDENTIALS.local.md
 # 本地代理、IDE 与任务运行产物
 /.claude/
 /.codex-target/
+/.hvigor/
 /.superpowers/
 /.mcp.json
 /.worktrees/
