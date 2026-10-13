@@ -15,3 +15,5 @@ worker 在应用上下文建立后异步启动，每进程至多一次。UI 销�
 一次冷创建及完整首序列单列，随后 4 次完整序列预热，再 3 批各 20 次完整序列。所有重放从 reset/new generation 后的 IDR 开始，然后喂依赖 P。每个 AU 在计时前构造；计时区间只包住生产 `VideoDecoder::submit`，包括生产 framing、plugin send/receive 和 owned frame copy，排除身份检查、日志、hash、oracle、reset、frame drop 及析构。reset、frame drop 与最终 decoder/backend 析构另外报告。统计输出实际 n、整数纳秒 median、nearest-rank p95、max、sum；compute-only fps/pixels/sec 只表示指定合成输入的同步调用成本，不是 kernel 时间或真实桌面持续帧率。无有效样本的组报告 n=0，不补零成本帧；部分序列不增加完成序列数。
 
 profile 模式每进程只选择一个 codec/profile，完整序列重复约 7 秒，保留 case 剩余期限供最终 oracle 与清理。`profile_begin`/`profile_end` 的同一 TID/monotonic 时间用于采样归属；性能验收须使用独立 benchmark 包并关闭 profiler/断点。当前三库、loader、线程策略和 plugin ABI 不变；HEVC 独立参考来源见 `tests/codec-fixtures/hevc-measurement-provenance.json`，其输入不证明线上 HEVC 协商。
+
+夹具再生成可用 `python3 tests/codec-fixtures/prepare-hevc-measurement.py --output-dir 临时目录`。脚本写出实际消费的 `hevc-measurement-provenance.json`，序列化命令只保留合成输出文件名，不包含本机绝对路径。核对再生成时应比较清单及两个 AU、两个像素参考与现有 SHA pin；本切片使用独立临时目录通过完整再生成比较，跟踪夹具和清单未覆盖。
