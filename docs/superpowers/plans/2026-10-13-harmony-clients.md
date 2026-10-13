@@ -78,6 +78,9 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 **Interfaces:** 注册 `RdpProtocolFactory`（wire identity Unix），沿用 TOFU；FrameMailbox/FrameTransactionCompiler → renderer。UI 只有真实完整基线呈现后进入交互状态。
 
 - [x] Task 4A1 独立 RemoteFX checked NEON/SSE2 数值叶子及审查完成（`c3ae798`）；尚未接入生产，模拟器基准未证明提速。
+- [x] Task 4A2.1 packed Bitmap 五类 checked SIMD 叶子完成（`563de87`），独立审查通过，宿主及后续 OHOS 正确性/基准、八目标对象生成；完整 parser/session 仍待后续。
+- [x] Task 4A2.2 RDP6 planar 数值叶子完成（`9fe010b`），独立审查通过，固定工具链宿主及手机/PC OHOS 各 25 项回归；两台叶子基准保留更快/更慢差异，不代表完整 RDP6 接线。
+- [ ] Task 4A2.3 先隔离原版 oracle workspace/process 与开发依赖，再固定最小 graphics/session 生产副本；通过依赖图审查后依次推进完整 Bitmap、RDP6、RLGR/RFX 和图像转换接线。
 - [x] Task 4B1 真实事务→原生呈现、统一视口与输入门接线完成（`87c829a`/`bccb321`），两台合成首帧、触点及本地重绘受限验证，跳帧重试修复经独立复审；不代表真实协议连接，见[呈现验证](../../validation/harmony-native-presentation-20261013.md)。
 - [x] Task 4C0 手机/PC 正常权限系统能力与三个接口路线完成受限验证；AVC420 像素通过、EOS 前出帧未通过、精确444失败、HEVC 未报告，见[系统验证](../../validation/harmony-system-codec-20261013.md)。
 - [x] Task 4C1 中立 NativeFirst 显式策略 `e1fb9fa` 已实现并通过独立审查；默认桌面顺序保持，尚未接入系统 backend。
@@ -86,6 +89,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4C3B 应用自身模块锚定加载器完成（`4f5089e`），47 项宿主测试、OHOS ARM64 构建与公开 NDK 链接通过，独立审查通过；普通 HAP 安装路径/权限与实际加载仍待验证。
 - [x] Task 4C3D 普通 HAP 包装与签前/签后字节校验完成（`22513b2`/`dc9419b`），38 项范围测试及独立复审通过；同一最终签名 Debug 包已在手机/PC 安装启动。应用进程内加载和解码仍待 Task 4C3E，包中存在库不代表 DecoderReady。
 - [x] Task 4C3E 正常应用内真实 FFmpeg 解码夹具完成（`6a2c91c`），手机/PC 同一签名包各 13/13；无 EOS 首/末帧、独立像素、1440p/4K 合成帧与生命周期通过，OHOS 目录句柄修正保留检查，38 项 FFI/49 项 loader 测试及独立审查通过。未注册生产 codec，运行时 SIMD、持续吞吐与真实远程会话仍待验证。
+- [x] Task 4C4 原三库优化应用测量及分格式运行审计完成（`f70b381`），两台基准各 10/10、AVC444/HEVC444 指令级正向证据，独立代码审查通过；夹具再生成脚本小项由 `c9f5217` 修正并通过临时目录完整比较。实际仍存在计算标量分支，不代表生产资格。
+- [ ] Task 4C5 优先补 AArch64 8-bit H264 luma DC 变换/反量化；维护显式补丁来源、C oracle、逐核 parity、目标基准和普通 HAP 同流验证。HEVC 16×16 planar/angular 与已识别的 32×32 angular 标量分支随后处理，避免重写已向量化分支。
 - [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。
 - [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、远程软键盘入口与 IME 提交、断开/重连与恢复。

@@ -88,3 +88,56 @@ v5 unsigned SHA-256 `8922f512634b1738aef7d1a39a9d9056ccbbc45fe30e8e952e80bdef855
 | PC | 上述四类 IDCT、`ff_put_pixels16_neon`、`ff_pred16x16_vert_neon`、`ff_pred16x16_hor_neon` |
 
 这是原包 H.264 SIMD 的正向运行证据，范围为混合合成负载；尚不能逐样本归因到 AVC420/444，也不能宣称 HEVC 或全部计算热路径通过。未命中 tiny HEVC 不是没有 SIMD 的证明。报告的 period weight 不是函数调用次数，包含 debug SHA 的全进程百分比也不是 codec 内部占比。原始 perf、日志、官方符号报告、`.text` 与符号区间摘要、具体核反汇编位于 `target/task4c4-runtime/`。下一步只增加分格式有界负载及关闭 profiler 的优化 harness 基准，不修改或插桩 FFmpeg 库。
+
+
+## 优化应用内基准及分格式运行证据
+
+`f70b381` 增加三个默认关闭、互斥的编译期开关：优化基准、AVC444 采样负载、HEVC444 采样负载。原正确性夹具仍只在 debug 生效；新增测量模式刻意允许 Rust release 优化，但包装为正常可调试 HAP。所有模式保持空产品协议目录，不接收运行时路径或凭据、不启动网络、不改变 NativeFirst 策略、插件 ABI、FFmpeg 原三库或 OHOS 单线程策略。具体界限见 [`MEASUREMENT.md`](../../crates/frd-shell-ohos-ffi/MEASUREMENT.md)。
+
+| 运行产物 | 未签名 SHA-256 | 已签名 SHA-256 |
+| --- | --- | --- |
+| benchmark | `1cc5341697d6d4f1501edc9f65bceab6e6befcbe2e96d4f1ce68c6e617181b75` | `292d683d95d0439db042f2eac52c18d26a41d508c712cecff2a9399439853cfd` |
+| AVC444 profile v2 | `89c4c53355dea68c2e589f02cb59c24d62e38e2020d178c0050eea32d2237f11` | `3ca1b829eedfb76792bd7cc0bb87d4b619ddce279d1ec0a5c430531b24c0e7c1` |
+| HEVC444 profile v2 | `8fe512dd31d2d8ec96a652c68e9ba6bc52076c1606025bb828cd749b521aa194` | `adf62f3cab1668fd03e2d32210dc253502b9be16773a37df247a4df6df32b820` |
+
+三包均经未修改的产物检查、官方签名/验签、签后库内容比较。benchmark 产物早于 profile-only 的零重复工作拒绝修复；基准执行分支未变，未将已测包冒称为后续源码的重建。两个 profile v2 已包含该修复。
+
+### 关闭 profiler 的测时
+
+手机 PID10781/TID10906、PC PID11473/TID11592 各通过全部 10 组：256×144 AVC420/444、1440p/4K AVC420 的两种输入 framing，tiny HEVC 与新增 256×144 HEVC。测试前后独立像素/可见平面 SHA 通过，每次 AU 返回恰好一帧，包含最终 P 帧，不发送 EOS。完整 worker 分别 5.709/5.750 秒；期间暂停相关宿主构建和其他基准，但未作 CPU 绑定或频率隔离。
+
+每组冷创建和首序列单列，随后 4 次预热，再三批各 20 次完整序列；每轮 reset 后重新发送 IDR/P。下表是 Annex-B、各 60 个有效样本的 submit median / p95，单位 ms。submit 包含 framing、原生 send/receive 和帧数据复制，排除 AU 创建、校验、日志、reset 与清理；后两项另行测量。
+
+| 样本 / 帧 | 手机 | PC |
+| --- | --- | --- |
+| AVC420 256×144 / IDR | 0.082 / 0.500 | 0.091 / 1.093 |
+| AVC420 256×144 / P | 0.035 / 0.333 | 0.038 / 0.121 |
+| AVC444 256×144 / IDR | 0.198 / 2.826 | 0.122 / 0.468 |
+| AVC444 256×144 / P | 0.067 / 0.240 | 0.046 / 0.315 |
+| AVC420 2560×1440 / IDR | 5.210 / 9.801 | 4.937 / 6.097 |
+| AVC420 2560×1440 / P | 4.554 / 10.491 | 4.352 / 6.084 |
+| AVC420 3840×2160 / IDR | 13.173 / 15.017 | 13.301 / 14.392 |
+| AVC420 3840×2160 / P | 13.155 / 14.020 | 13.408 / 15.260 |
+| HEVC444 256×144 / IDR | 0.308 / 0.457 | 0.316 / 0.448 |
+| HEVC444 256×144 / P | 0.085 / 0.125 | 0.084 / 0.132 |
+
+每种输入只有固定两帧，重复 reset，不代表长 GOP 或复杂桌面负载。小样本 p95 波动明显，不能用均值或最优轮次掩盖它；模拟器共享宿主，也不是两台独立真机。结果不包含网络、渲染、用户输入往返，不证明真实桌面持续帧率、功耗或硬件解码性能。全部组、两种 framing、冷启动/清理指标见本地 `target/task4c4-runtime/benchmark-statistics.json` 与两个 `*-benchmark-codec.log`。
+
+### 分格式采样与身份边界
+
+AVC444 和 HEVC444 分别在独立进程运行约七秒，重复完整 IDR/P 代际序列，前后像素和无 EOS 检查均通过。官方 profiler 限制本应用、用户态、12 秒、1000 Hz、8 MiB，不提权、不采集栈。初轮 AVC 手机/PC 6583/6642 samples，HEVC 手机/PC 6796/6413 samples，均零丢样本；样本总数不是 SIMD 调用次数。
+
+PC HEVC 初轮虽通过正确性，但 perf 缺失 libavcodec 的 MMAP2，不能归属计算地址。保留该失败证据后，仅以同一 HAP 补跑 PC：PID19698/TID19763、6931 samples、零丢样本、前后校验通过。读取该进程 `/proc/maps` 被拒绝，没有提权；补跑的官方 perf 自身已包含正确映射，随后以本轮映射、worker TID、阶段时间和原库符号对应实际采样指令。未套用旧进程 ASLR 地址。原始数据和报告含 `pc-hevc444-profile-r2` 后缀。
+
+已正向观测 AVC444 与 HEVC444 的计算 SIMD，但**仍有实际标量计算缺口**：H.264 `ff_h264_luma_dc_dequant_idct_8_c`，HEVC 16×16 planar/angular，以及 32×32 angular 中一个实际命中的标量分支。另一些 C 命名函数确实由编译器向量化，不能一概标成标量；也不把 wire/entropy 控制解析列为计算核违规。此结果收窄了后续优化范围，未满足全部生产软件解码计算路径的项目规则；生产 codec 和会话注册仍关闭。H.264 缺口优先，HEVC 按用户要求较后推进。
+
+以上模式的宿主默认 suite 为 31 passed；旧正确性及初版测量 suite 各 38 passed，另有一个既有 panic 子进程 helper 按设计 ignored。profile 零工作拒绝经过先红后绿，最终 8 项测量测试通过；28 项特性配置、OHOS 默认和旧夹具 release 排除、三个显式优化包构建通过。此处记录测试与实测，不替代独立任务审查或整分支审查。
+
+验证后恢复此前普通签名 HAP `35c53d04…`：手机 PID18452，最终 PC PID21584，官方 Emulator CLI 确认登录页和当前无已注册协议的提示。恢复包不是此次源码的生产构建；没有将合成出帧宣称为鸿蒙真实 Windows/Mac 登录。
+
+
+独立实际指令审计再次核对已签 HAP 三库与原 `.text`，按各自 MMAP2、worker TID、profile 起止单调时钟筛选，再将 sample ELF PC 对应具体机器指令。代表性正向证据：AVC444 手机 `0x3d0b0 sub v5.4h,...`、PC `0x3d0cc trn1 v4.4h,...`；HEVC 手机 residual `0x5da14 sqadd v2.8h,...`、PC r2 transform `0x5ea50 smlal v30.4s,...`。水平插值、滤波和 32×32 planar 的对应向量 PC 也有记录。AVC444 算术滤波与 HEVC SAO 未观测，不据此声称它们不存在或已经优化。
+
+标量缺口也有精确证据：两台 H264 luma DC 命中 `0xe7640 madd w13,w13,w2,w8`；HEVC 16×16 planar 函数没有向量指令，32×32 angular 的混合函数在 PC r2 命中 `0x1f5d00 mul w1,w14,w1`。原样 FFmpeg 在其他架构有相关实现，但不能直接拿 x86/MIPS 指令用于 ARM64。全部选定样本、PT_LOAD 换算、映射、哈希与窄反汇编保留为 `target/task4c4-runtime/profile-pc-evidence.json` 和 `profile-selected-disassembly.txt`。
+
+`f70b381` 独立代码审查为 Spec compliant / Approved，无 Critical/Important。两项 Minor：夹具再生成脚本的 manifest 命名/路径归一化已由 `c9f5217` 修正，独立临时目录完整再生成的 JSON、两个 AU 与两个像素参考均和既有 pin 相同，主代理窄差异复核通过；Hvigor 既有额外源文件打包 warning 留待整包整理。unsigned 阶段 signingConfig warning 与最终官方签名结果分开记录。独立指令审计和代码质量审查职责分离，没有把测试完成标记当作指令覆盖证明。

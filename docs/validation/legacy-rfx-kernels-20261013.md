@@ -43,7 +43,7 @@
 
 macOS ARM64 debug/release 各通过 19 项有效测试（包含既有 12 项 A1），另有两个显式 benchmark 默认 ignored；覆盖全部 256 mask、全部合法 offset/count、未对齐地址、奇数 dither split、非法输入原子性与保护页短尾。包级 clippy `-D warnings`、fmt 和 diff 检查通过。实际优化产物的完整块与短尾包含向量指令。
 
-Windows/Linux 各 i686、x86_64、ARM64，macOS ARM64 与 OHOS ARM64 共八个目标完成独立优化对象编译及反汇编。除 macOS ARM64 外，此增量尚未执行目标正确性或基准；对象生成不证明运行、链接、应用包或会话能力，未构建 macOS Intel。
+Windows/Linux 各 i686、x86_64、ARM64，macOS ARM64 与 OHOS ARM64 共八个目标完成独立优化对象编译及反汇编。A2.1 冻结时，除 macOS ARM64 外尚未执行目标正确性或基准；后续 OHOS 结果见下节。对象生成不证明运行、链接、应用包或会话能力，未构建 macOS Intel。
 
 宿主基准使用 128 次预热、501 个样本，每样本 64 次、预分配输出。对照是普通优化 Rust 循环或 slice copy，可能由编译器向量化，且不包含 native checked 入口的同等预检成本。下表是 BGR24、1024 pixels 的 median/p95，单位 ns：
 
@@ -55,3 +55,36 @@ Windows/Linux 各 i686、x86_64、ARM64，macOS ARM64 与 OHOS ARM64 共八个�
 | dither | 110 / 111 | 1826 / 1878 |
 
 较大块 fill/XOR/dither 对本对照有改善，但 copy、小块及部分 mask 较慢；没有据此宣称完整 Bitmap 更快。单次宿主测量没有 CPU 绑定或频率隔离，原始测试、对象、反汇编和 120 组测量保留在 `target/frd-packed-evidence/`，哈希清单为 `EVIDENCE-SHA256SUMS`。下一阶段是 RDP6 planar 数值叶子，随后才是独立 oracle 与完整 parser/session 接线。
+
+
+## RDP6 planar 叶子与 OHOS 目标执行（A2.2）
+
+`9fe010b` 新增 checked `PlanarLayout`、planar delta、RGB 三平面打包和 YCoCg→RGB24。维度、乘法溢出、颜色损失级别和全部长度先验证再写；CLL 先在 u8 截断再有符号扩展，保留 alpha 标志对应的 R/B 顺序，奇数尺寸色度按实际 2×2 单元复制。NEON/SSE2 的完整块与数值短尾共用 ISA 原语，pack 与 chroma duplication 也使用 SIMD，没有新增正常依赖或 scalar fallback。
+
+固定 64 条原版独立 wire/输出记录（116497 bytes，SHA-256 `32aff1b11ae76167f9dae70d8c244468ab04fbb67f6f72bbd9e7d63fdd44c9a7`），原始结果由未 patch 的 `ironrdp-graphics=0.9.0` 公共 decoder 生成，不调用新内核。测试另有独立公式和手写非灰判别值；包括全部 65536 个 delta/previous 组合、CLL1..7、alpha/子采样、121 个尺寸组合、非法输入原子性及各平面的保护页边界。未来全局 patch 前，仍须将 oracle 移到独立 workspace/process，避免同源比较。
+
+最终显式 Rust 1.96 宿主 debug/release 各 25 项通过，3 个 benchmark 默认 ignored；fmt/clippy 通过。前期 PATH 曾命中 Homebrew 1.98.1，不能混称固定工具链结果；最终正确性回归、优化对象与基准均重新使用固定 1.96。八个受支持架构完成优化对象和 ISA 检查，未生成 macOS Intel。实际宿主 release 产物的完整块和短尾调用均对应向量数学与 pack 指令。
+
+主代理用官方 SDK linker 完成 OHOS ARM64 release 的真实链接，随后通过 HDC 对两台专用模拟器分别执行同一组新产物，发送前及设备端 SHA-256 一致。每台原 RemoteFX 12 项、packed Bitmap 7 项、planar 6 项合计 **25/25**；这属于目标数值程序执行，尚不是普通 HAP 内完整 Bitmap/RDP6 会话接线。
+
+| 新增目标程序 | SHA-256 |
+| --- | --- |
+| bitmap parity | `460a2418ced60337f902ef0803f568b09df29fb8f1fc8c46cc5fcbf8d1b643ff` |
+| bitmap guard pages | `9a2a469339fe8d5a08e17824d96195b442ec0aeba23658a031e19c68b3cd7a47` |
+| planar parity | `297c25cf6e24bd2dd06fab452bd36414cadaaf0946149b4ff5a72d605af16916` |
+| planar guard pages | `8b6ab408a55576209a1e75d477b8dda746c2a276de1aa69be2ebe9e8ff4c3cc8` |
+| bitmap benchmark | `9e13dbb1524bfb789bec1d866835746f2f51b59bce0f5eeb80c3bd65b2237c3b` |
+| planar benchmark | `8e344ebde19a3d00b215acfa85d0febb1463275d65bc340d0c34aa53082f3ce0` |
+
+停止构建与其他基准后，两台顺序运行相同预分配叶子基准，128 warmup、501 samples、每样本 64 次；对照是可能自动向量化的普通优化 Rust。以下为一次有界目标测量，单位 ns，未绑定 CPU/频率，不作整 codec 性能推断：
+
+| 4096 pixels 操作 | 手机 native median / p95 | 手机对照 median / p95 | PC native median / p95 | PC 对照 median / p95 |
+| --- | --- | --- | --- | --- |
+| RGB pack | 521 / 563 | 147 / 178 | 526 / 646 | 147 / 203 |
+| delta（包含重置） | 240 / 512 | 160 / 162 | 236 / 275 | 158 / 172 |
+| YCoCg full | 1180 / 1400 | 351 / 397 | 1149 / 1246 | 351 / 391 |
+| YCoCg subsampled | 1439 / 1697 | 6645 / 7597 | 1440 / 1891 | 6662 / 7318 |
+
+子采样 YCoCg 对此对照约快 4.62 倍，其余三类较慢。在 packed BGR24/1024 中，native fill/XOR/dither 相比对照约快 13–16 倍，copy 仍较慢；短尾原语固定调用与 checked 边界有开销。这些差异完整保留，不能把“已使用 SIMD”写成“整体更快”。宿主数据在 `target/frd-planar-evidence/`，OHOS 构建日志、产物/哈希、两台全部测试和基准在 `target/frd-planar-runtime/`。
+
+`9fe010b` 独立任务审查为 Spec compliant / Approved，未发现 Critical/Important/Minor。审查逐项核对源合同、原版 fixture、宿主测试和指令证据；上述 OHOS 执行为主代理另行补充，不冒称审查者操作设备。后续必须先隔离 oracle 依赖，再接入生产 parser、状态和 publication，不能以叶子通过跳过这一层。
