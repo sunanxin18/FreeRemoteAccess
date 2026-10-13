@@ -36,3 +36,14 @@ Linux adapter检查LE ELF64/AArch64/ET_DYN、真实定义的FUNC符号、唯一s
 root下载该run实际诊断artifact并用当前受信bundle verifier重验：九成员、来源ZIP受信十一成员、配置/源码/材料、三个最终库hash与固定276字节核全部匹配。未strip库实际核地址/文件偏移147728、`.text`、固定hash仍为上述pin；installed prefix副本与bundle一致。下载过程可能解引用链接，这次本地复验只证明下载bytes和来源身份，实际别名布局依据target失败记录与固定FFmpeg安装规则，未在Mac执行Linux代码。完整builder日志、失败qualification JSON、artifact与root重验JSON位于 `target/ci-h264-linux-20261014/`。
 
 同冻结commit的默认upstream三架构 [run 38452184404](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38452184404) 均完成成功，Mac ARM64、GTK及GL三架构回归也成功。这些各自有界CI结果不替代修改配方的失败门，更不证明真实远程登录。
+
+
+## SONAME 修复后的真实复测：私有夹具编译配置失败
+
+`b93d5e9689704925cc897c3e47011b4213d20004` 的两文件 SONAME 修复经独立审查 Approved。专用解析器仅接受同次安装目录中的两个固定别名，保存 alias/readlink/stat 与普通 canonical target/stat/SHA；数值链接使用 canonical avutil，ldd 保持精确 lexical SONAME 路径，并在各阶段校验两组身份。21 项文件系统/阶段合同通过，未放宽其它 source/object/package 路径门。
+
+该冻结提交的显式修改配方 [run 38461630760](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38461630760) 已完成失败，job `115526173158`。真实 builder 与独立 upstream 重放均返回0，安装别名身份检查通过；随后私有数值程序在**编译 ABI wrapper**时失败：保留配置 `config.h` 为 `HAVE_AS_FUNC=1`、`ffbuild/config.mak` 为 `CC=gcc`，qualification 却显式使用 `--cc clang`，Clang 集成汇编器拒绝宏展开的 `.func` 和 `.endfunc`。未运行任何数值/30分派/保护页/ABI用例或三轮基准，不是数学结果不匹配；完整修改配方客户端包未执行。
+
+本次运行的 artifact `11847986429` 与完整314,964-byte job日志已下载，位于 `target/ci-h264-linux-soname-20261014/`。`runtime-evidence/qualification.json` 保存原错误、成功的 builder/prepare-upstream、两组安装身份与检查前后记录；`numeric.log`、`numeric/results.json`、真实配置及同次对象保留。下一修复只令原生 Linux 私有夹具使用与受信固定 builder 一致的 GCC，并验证配置/实际 argv/证据一致；不得删汇编指令、改FFmpeg配置或重新编译另一套生产对象绕过门禁。
+
+同冻结提交的默认 upstream [Linux run 38461632726](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38461632726) 三架构完整流程成功，通用 [CI run 38461632276](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38461632276) 格式与 Ubuntu/macOS 编译及安全测试成功。它们不证明显式修改配方通过，也不包含后续 RDP adapter 工作树改动。
