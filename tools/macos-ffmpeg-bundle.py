@@ -70,6 +70,9 @@ class MachO:
                     extent(section['address'] - vmaddr, section['size'], vmsize, 'section VM')
                     if section['flags'] & 0xff not in (1, 0xc, 0x12):
                         extent(section['offset'] - fileoff, section['size'], filesize, 'section file')
+                        if kind == 6:
+                            require(section['offset'] == fileoff + section['address'] - vmaddr,
+                                    'Mach-O dylib section 地址/file offset 与 segment 映射不匹配')
                     self.sections.append(section)
             elif command == 2:
                 require(size == 24 and self.symtab is None, 'Mach-O 重复/无效 symtab')
@@ -99,7 +102,13 @@ class MachO:
             if (parent['executable'] and section['flags'] & 0x80000400 and
                     section['flags'] & 0xff == 0 and section['address'] <= address and
                     length <= section['size'] - (address - section['address'])):
-                offset = section['offset'] + address - section['address']
+                if self.kind == 6:
+                    # dylib 的真实加载地址由 segment 线性映射；不能只相信 section 的独立声明。
+                    extent(address - parent['address'], length, parent['filesize'], 'kernel file-backed segment')
+                    offset = parent['offset'] + address - parent['address']
+                else:
+                    # relocatable object 的 section file offset 包含 header/command 前缀，独立处理。
+                    offset = section['offset'] + address - section['address']
                 extent(offset, length, len(self.data), 'kernel code')
                 extent(offset - parent['offset'], length, parent['filesize'], 'kernel executable segment')
                 matches.append((section, offset))

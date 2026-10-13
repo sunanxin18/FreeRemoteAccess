@@ -31,6 +31,7 @@ esac
 source_recipe="${FRD_FFMPEG_SOURCE_RECIPE:-upstream}"
 python3 "$repo_root/tools/desktop-ffmpeg-source.py" metadata --source-recipe "$source_recipe" > /dev/null
 codec_build_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-macos}"
+if [[ "$codec_build_root" != /* ]]; then codec_build_root="$repo_root/$codec_build_root"; fi
 codec_bundle="$codec_build_root/bundle"
 if [[ -d "$codec_bundle" ]]; then
     python3 "$repo_root/tools/macos-ffmpeg-bundle.py" verify-bundle --path "$codec_bundle" --source-recipe "$source_recipe"

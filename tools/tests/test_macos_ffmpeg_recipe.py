@@ -234,6 +234,40 @@ class MachOAndBundle(unittest.TestCase):
             self.bundle.kernel_identity(path)
         self.assertEqual(self.bundle.kernel_identity(path, self.identity), self.identity)
 
+    def test_dylib_section_and_symbol_shift_without_file_offset_is_rejected(self):
+        # 只改变声明地址，保留原数学bytes与文件offset；实际segment映射已经偏移。
+        image = self.bundle.MachO(self.original)
+        section, offset = image.executable(self.identity['address'], self.identity['size'])
+        parent_sections = [item for item in image.sections if item['parent'] is section['parent']]
+        section_position = section['parent']['command_offset'] + 72 + parent_sections.index(section) * 80
+        data = bytearray(self.original)
+        struct.pack_into('<Q', data, section_position + 32, section['address'] + 4)
+        symoff, count, stroff, _ = image.symtab
+        matches = []
+        for i in range(count):
+            position = symoff + i * 16
+            name_index = struct.unpack_from('<I', data, position)[0]
+            if data[stroff + name_index:].startswith(self.identity['macho_symbol'].encode() + b'\0'):
+                matches.append(position)
+        self.assertEqual(len(matches), 1)
+        shifted_address = self.identity['address'] + 4
+        struct.pack_into('<Q', data, matches[0] + 8, shifted_address)
+        shifted_record = dict(self.identity, address=shifted_address)
+        actual_offset = section['parent']['offset'] + shifted_address - section['parent']['address']
+        self.assertEqual(offset, self.identity['file_offset'])
+        self.assertEqual(actual_offset, offset + 4)
+        self.assertNotEqual(hashlib.sha256(data[actual_offset:actual_offset + 276]).hexdigest(),
+                            self.identity['sha256'])
+        path = self.root / 'false-segment-mapping.dylib'
+        path.write_bytes(data)
+        for signed in (False, True):
+            if signed:
+                subprocess.run(['codesign', '--force', '--sign', '-', str(path)], check=True, capture_output=True)
+                subprocess.run(['codesign', '--verify', '--strict', str(path)], check=True, capture_output=True)
+            for record in (None, shifted_record):
+                with self.subTest(signed=signed, record=record is not None), self.assertRaises(ValueError):
+                    self.bundle.kernel_identity(path, record)
+
     def test_signature_normalization_cannot_hide_other_bytes_or_invalid_vm_sizes(self):
         path = self.root / 'signed-mutant.dylib'
         image = self.bundle.MachO(self.original)
@@ -340,6 +374,14 @@ class MachOAndBundle(unittest.TestCase):
                 self.bundle.verify_bundle(path)
 
     def test_stage_script_modified_materials_with_mock_product_build(self):
+        self.exercise_stage_script()
+
+    def test_stage_script_external_cwd_relative_and_absolute_roots(self):
+        for relative in (False, True):
+            with self.subTest(relative=relative):
+                self.exercise_stage_script(relative_root=relative, external_cwd=True)
+
+    def exercise_stage_script(self, relative_root=False, external_cwd=False):
         # 执行真实 stager 的材料路径/重签门；cargo、图标和最终应用 verifier 隔离。
         # 这不是产品 .app 构建，也不执行 codec/GUI。
         with tempfile.TemporaryDirectory() as work:
@@ -362,7 +404,7 @@ class MachOAndBundle(unittest.TestCase):
             target = root / 'target'
             (target / 'debug').mkdir(parents=True)
             (target / 'debug/freeremotedesk-macos').write_bytes(b'mock product binary; not executed')
-            codec = root / 'codec'
+            codec = repo / 'target/codec'
             shutil.copytree(self.good, codec / 'bundle')
             binaries = root / 'bin'
             binaries.mkdir()
@@ -378,10 +420,13 @@ class MachOAndBundle(unittest.TestCase):
                 path.write_text(content)
                 path.chmod(0o755)
             env = dict(os.environ, PATH=str(binaries) + ':' + os.environ['PATH'], CARGO_TARGET_DIR=str(target),
-                       FRD_FFMPEG_BUILD_ROOT=str(codec), FRD_MACOS_SIGNING_IDENTITY='-',
+                       FRD_FFMPEG_BUILD_ROOT='target/codec' if relative_root else str(codec), FRD_MACOS_SIGNING_IDENTITY='-',
                        FRD_FFMPEG_SOURCE_RECIPE=self.bundle.source.recipes.MODIFIED)
+            caller = root / 'external-caller'
+            caller.mkdir()
+            cwd = caller if external_cwd else ROOT
             result = subprocess.run(['bash', str(repo / 'tools/stage-macos-package.sh')], env=env,
-                                    capture_output=True, text=True)
+                                    cwd=cwd, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             app = target / 'macos/debug/FreeRemoteDesk.app'
             self.assertEqual(self.bundle.verify_app(app), self.bundle.source.recipes.MODIFIED)
@@ -390,7 +435,7 @@ class MachOAndBundle(unittest.TestCase):
                              self.bundle.files_for_recipe(self.bundle.source.recipes.MODIFIED) - self.bundle.LIBRARIES)
             (codec / 'bundle/extra.dylib').write_bytes(self.original)
             result = subprocess.run(['bash', str(repo / 'tools/stage-macos-package.sh')], env=env,
-                                    capture_output=True, text=True)
+                                    cwd=cwd, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('文件集合', result.stderr)
 
