@@ -95,6 +95,7 @@ pub(crate) struct Consumer {
     session: Option<(SessionId, u64)>,
     presented: Option<Epoch>,
     initialized: bool,
+    pending_present: bool,
 }
 impl Consumer {
     pub fn poll(&mut self, link: &Link, backend: &mut dyn Backend) -> Result<bool, i32> {
@@ -116,6 +117,7 @@ impl Consumer {
             self.session = session;
             self.presented = None;
             self.initialized = false;
+            self.pending_present = false;
         }
         let Some(epoch) = epoch else {
             return Ok(false);
@@ -142,10 +144,11 @@ impl Consumer {
                 }
                 backend.apply(batch)?;
                 self.initialized = true;
+                self.pending_present = true;
                 link.0.lock().map_err(|_| PANIC)?.applied += 1;
             }
         }
-        if !had_batch && self.presented == Some(epoch) {
+        if !self.pending_present && self.presented == Some(epoch) {
             return Ok(false);
         }
         let mut event = None;
@@ -154,6 +157,7 @@ impl Consumer {
             event = backend.render_remote(viewport, repaint)?;
             if event.is_some() {
                 self.presented = Some(epoch);
+                self.pending_present = false;
             }
         }
         let presented = event.is_some();
@@ -178,6 +182,8 @@ mod tests {
         receipt: Option<PresentationEvent>,
         fail: bool,
         resets: usize,
+        skip_once: bool,
+        repaints: Vec<bool>,
     }
     impl Backend for Mock {
         fn attach(&mut self, _: usize, _: u32, _: u32) -> Result<(), i32> {
@@ -214,8 +220,12 @@ mod tests {
         fn render_remote(
             &mut self,
             _: TransformedViewport,
-            _: bool,
+            repaint: bool,
         ) -> Result<Option<PresentationEvent>, i32> {
+            self.repaints.push(repaint);
+            if std::mem::take(&mut self.skip_once) {
+                return Ok(None);
+            }
             if self.fail {
                 Err(GPU_FAILED)
             } else {
@@ -290,6 +300,8 @@ mod tests {
             receipt: None,
             fail: false,
             resets: 0,
+            skip_once: false,
+            repaints: vec![],
         };
         link.0.lock().unwrap().batch = Some((epoch, vec![transaction(epoch, 1)]));
         assert!(consumer.poll(&link, &mut backend).unwrap());
@@ -309,6 +321,77 @@ mod tests {
         assert_eq!(backend.resets, 2);
     }
     #[test]
+    fn skipped_present_retries_applied_incremental_and_partial_first_full_later_without_rearm() {
+        for (initial, next) in [
+            (
+                FrameCompleteness::FullBaseline,
+                FrameCompleteness::Incremental,
+            ),
+            (
+                FrameCompleteness::Incremental,
+                FrameCompleteness::FullBaseline,
+            ),
+        ] {
+            let (link, epoch) = link();
+            let mut consumer = Consumer::default();
+            let mut backend = Mock {
+                revisions: vec![],
+                receipt: None,
+                fail: false,
+                resets: 0,
+                skip_once: false,
+                repaints: vec![],
+            };
+            let mut first = transaction(epoch, 1);
+            if let FrameTransaction::Startup { revision, .. } = &mut first {
+                revision.completeness = initial;
+            }
+            link.0.lock().unwrap().batch = Some((epoch, vec![first]));
+            assert!(consumer.poll(&link, &mut backend).unwrap());
+            link.0.lock().unwrap().feedback.take();
+            let next_transaction = FrameTransaction::Revision {
+                earliest_constituent_enqueue_at: std::time::Instant::now(),
+                revision: FrameRevision {
+                    session_id: epoch.session,
+                    generation: epoch.remote,
+                    revision: 2,
+                    patches: vec![],
+                    completeness: next,
+                },
+            };
+            link.0.lock().unwrap().batch = Some((epoch, vec![next_transaction]));
+            backend.skip_once = true;
+            assert!(!consumer.poll(&link, &mut backend).unwrap());
+            assert!(link
+                .0
+                .lock()
+                .unwrap()
+                .feedback
+                .take()
+                .unwrap()
+                .event
+                .is_none());
+            assert!(consumer.poll(&link, &mut backend).unwrap());
+            let event = link
+                .0
+                .lock()
+                .unwrap()
+                .feedback
+                .take()
+                .unwrap()
+                .event
+                .unwrap();
+            assert!(matches!(event, PresentationEvent::FramePresented {
+                revision: 2, completeness, ..
+            } if completeness == next));
+            // 同 epoch 的重试不是完整快照 rearm；没有额外事务也必须重试。
+            assert_eq!(backend.repaints, vec![true, false, false]);
+            assert_eq!(backend.revisions, vec![1, 2]);
+            assert!(!consumer.poll(&link, &mut backend).unwrap());
+            assert_eq!(backend.repaints.len(), 3);
+        }
+    }
+    #[test]
     fn pause_keeps_owned_prefix_repaint_requires_actual_present_and_failure_is_visible() {
         let (link, epoch) = link();
         let mut consumer = Consumer::default();
@@ -317,6 +400,8 @@ mod tests {
             receipt: None,
             fail: false,
             resets: 0,
+            skip_once: false,
+            repaints: vec![],
         };
         {
             let mut s = link.0.lock().unwrap();

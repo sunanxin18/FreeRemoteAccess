@@ -6,6 +6,7 @@ use crate::RendererError;
 pub(crate) struct RemotePass {
     target_format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
+    vertices: Option<([[f32; 4]; 6], wgpu::Buffer)>,
 }
 
 impl RemotePass {
@@ -56,6 +57,7 @@ impl RemotePass {
         Ok(Self {
             target_format,
             pipeline,
+            vertices: None,
         })
     }
 
@@ -64,26 +66,33 @@ impl RemotePass {
     }
 
     pub(crate) fn record(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         bind_group: Option<&wgpu::BindGroup>,
         content: Option<TransformedViewport>,
     ) {
-        let vertices = content.map(|v| v.vertices());
-        let buffer = vertices.map(|vertices| {
-            let bytes: Vec<u8> = vertices
-                .iter()
-                .flatten()
-                .flat_map(|v| v.to_ne_bytes())
-                .collect();
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("远端视口顶点"),
-                contents: &bytes,
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
+        if let Some(vertices) = content.map(|v| v.vertices()) {
+            if self
+                .vertices
+                .as_ref()
+                .is_none_or(|(cached, _)| *cached != vertices)
+            {
+                let mut bytes = [0u8; 96];
+                for (slot, value) in bytes.chunks_exact_mut(4).zip(vertices.iter().flatten()) {
+                    slot.copy_from_slice(&value.to_ne_bytes());
+                }
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("远端视口顶点"),
+                    contents: &bytes,
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                // 单个缓存只随几何变化替换；旧 command buffer 保留自己的 GPU 引用，
+                // 避免 queue.write_buffer 改写同一提交内已经录制的不同视口。
+                self.vertices = Some((vertices, buffer));
+            }
+        }
         let color_attachment = Some(wgpu::RenderPassColorAttachment {
             view: target,
             depth_slice: None,
@@ -105,7 +114,7 @@ impl RemotePass {
         if let (Some(bind_group), Some(content)) = (bind_group, content) {
             let clip = content.clip();
             pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
-            pass.set_vertex_buffer(0, buffer.as_ref().unwrap().slice(..));
+            pass.set_vertex_buffer(0, self.vertices.as_ref().unwrap().1.slice(..));
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..6, 0..1);

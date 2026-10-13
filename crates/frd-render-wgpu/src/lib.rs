@@ -459,7 +459,11 @@ mod limits_request_tests {
             )
             .unwrap(),
         ];
-        for viewport in variants {
+        // 每种几何连续绘制两次，覆盖同一顶点缓存复用及下一种几何替换。
+        for viewport in variants
+            .into_iter()
+            .flat_map(|viewport| [viewport, viewport])
+        {
             let target = context.device().create_texture(&wgpu::TextureDescriptor {
                 label: Some("远端 letterbox 像素回读"),
                 size: wgpu::Extent3d {

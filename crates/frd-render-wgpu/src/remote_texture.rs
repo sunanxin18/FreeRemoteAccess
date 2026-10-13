@@ -369,7 +369,7 @@ impl RemoteRenderer {
         } = self;
         let scope_backend = GpuContextRecordScopeBackend::new(context);
         let (old_pass, pending_receipt) = execute_record_with_fault_scope(&scope_backend, || {
-            let replacement_pass = if pass
+            let mut replacement_pass = if pass
                 .as_ref()
                 .is_none_or(|pass| !pass.matches(target_format))
             {
@@ -382,8 +382,8 @@ impl RemoteRenderer {
                 None
             };
             replacement_pass
-                .as_ref()
-                .or(pass.as_ref())
+                .as_mut()
+                .or(pass.as_mut())
                 .expect("远端 pass 已创建")
                 .record(
                     context.device(),
