@@ -7,6 +7,7 @@ use ironrdp::session::image::DecodedImage;
 use crate::surface::extract_bgrx_patch;
 
 const FULL_SNAPSHOT_PATCH_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_DECODED_COVERAGE_ENTRIES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BaselineError {
@@ -131,16 +132,8 @@ impl CoverageTracker {
         Ok(())
     }
 
-    fn mark_full(&mut self) {
-        self.coverage_words.fill(u64::MAX);
-        let trailing_bits = (self.total_pixels() % 64) as u32;
-        if trailing_bits != 0 {
-            let final_mask = (1_u64 << trailing_bits) - 1;
-            if let Some(last) = self.coverage_words.last_mut() {
-                *last = final_mask;
-            }
-        }
-        self.covered_pixels = self.total_pixels();
+    fn is_full(&self) -> bool {
+        self.covered_pixels == self.total_pixels()
     }
 
     fn mark_range(&mut self, start: u64, end: u64) -> Result<u64, BaselineError> {
@@ -215,20 +208,80 @@ impl RdpBaseline {
         Ok(())
     }
 
+    /// 外部 surface 成功发布后只接管呈现与修订号，不改变 legacy 内容知识。
+    pub(crate) fn observe_external_revision(
+        &mut self,
+        generation: u64,
+        revision: u64,
+    ) -> Result<(), ProtocolError> {
+        if generation != self.coverage.generation {
+            return Err(ProtocolError::StaleSurface);
+        }
+        self.revision = self.revision.max(revision);
+        self.baseline_established = false;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn presentation_revision(&self) -> u64 {
+        self.revision
+    }
+
     pub(crate) fn publish(
         &mut self,
         runtime: &mut ProtocolRuntime,
         image: &DecodedImage,
         generation: u64,
-        region: InclusiveRectangle,
+        damage: InclusiveRectangle,
+        content: &[InclusiveRectangle],
     ) -> Result<(), ProtocolError> {
         self.publish_with_recovery_patch_limit(
             runtime,
             image,
             generation,
-            region,
+            damage,
+            content,
             FULL_SNAPSHOT_PATCH_BYTES,
         )
+    }
+
+    /// 完整校验先于覆盖记账；损伤框内的空洞不得成为已收到的内容。
+    pub(crate) fn validate_publication(
+        &self,
+        image: &DecodedImage,
+        generation: u64,
+        damage: &InclusiveRectangle,
+        content: &[InclusiveRectangle],
+    ) -> Result<(), ProtocolError> {
+        self.validate_image_generation(image, generation)?;
+        Self::validate_regions(image, damage, content)
+    }
+
+    pub(crate) fn validate_regions(
+        image: &DecodedImage,
+        damage: &InclusiveRectangle,
+        content: &[InclusiveRectangle],
+    ) -> Result<(), ProtocolError> {
+        let fits = |r: &InclusiveRectangle| {
+            r.left <= r.right
+                && r.top <= r.bottom
+                && r.right < image.width()
+                && r.bottom < image.height()
+        };
+        if content.len() > MAX_DECODED_COVERAGE_ENTRIES || !fits(damage) {
+            return Err(ProtocolError::FramePortRejected);
+        }
+        for r in content {
+            if !fits(r)
+                || r.left < damage.left
+                || r.top < damage.top
+                || r.right > damage.right
+                || r.bottom > damage.bottom
+            {
+                return Err(ProtocolError::FramePortRejected);
+            }
+        }
+        Ok(())
     }
 
     fn publish_with_recovery_patch_limit(
@@ -236,32 +289,26 @@ impl RdpBaseline {
         runtime: &mut ProtocolRuntime,
         image: &DecodedImage,
         generation: u64,
-        region: InclusiveRectangle,
+        damage: InclusiveRectangle,
+        content: &[InclusiveRectangle],
         recovery_patch_bytes: usize,
     ) -> Result<(), ProtocolError> {
-        self.validate_image_generation(image, generation)?;
-        self.coverage
-            .validate_current_region(self.coverage.session_id, generation, &region)
-            .map_err(map_baseline_error)?;
-
-        // IronRDP may report the first bitmap updates as partial rectangles. A
-        // surface reset cannot be committed to the renderer until the decoded
-        // image has exact full coverage, so keep accumulating coverage without
-        // publishing partial startup transactions. Once coverage is complete,
-        // publish the current decoded image as a bounded full snapshot.
-        if !self.baseline_established {
-            let covered = self
-                .coverage
-                .record(self.coverage.session_id, generation, region)
+        self.validate_publication(image, generation, &damage, content)?;
+        // 只有成功解码的实际内容贡献知识；光标和 no-op damage 不贡献。
+        for region in content {
+            self.coverage
+                .record(self.coverage.session_id, generation, region.clone())
                 .map_err(map_baseline_error)?;
-            if !covered {
+        }
+        if !self.baseline_established {
+            if !self.coverage.is_full() {
                 return Ok(());
             }
             return self.recover_full_snapshot(runtime, image, recovery_patch_bytes);
         }
 
-        let patch = extract_bgrx_patch(image, region.clone())
-            .map_err(|_| ProtocolError::FramePortRejected)?;
+        let patch =
+            extract_bgrx_patch(image, damage).map_err(|_| ProtocolError::FramePortRejected)?;
         let revision = self.next_revision()?;
         match runtime.publish_surface(SurfaceUpdate::Damage {
             session_id: self.coverage.session_id,
@@ -271,36 +318,29 @@ impl RdpBaseline {
         }) {
             Ok(()) => {}
             Err(ProtocolError::NeedsFullSnapshot) => {
+                self.baseline_established = false;
                 return self.recover_full_snapshot(runtime, image, recovery_patch_bytes);
             }
             Err(error) => return Err(error),
         }
-
-        let is_full = self
-            .coverage
-            .record(self.coverage.session_id, generation, region)
-            .map_err(map_baseline_error)?;
-        let completeness = if !self.baseline_established && is_full {
-            FrameCompleteness::FullBaseline
-        } else {
-            FrameCompleteness::Incremental
-        };
         match runtime.publish_surface(SurfaceUpdate::FrameBoundary {
             session_id: self.coverage.session_id,
             generation,
             revision,
-            completeness,
+            completeness: FrameCompleteness::Incremental,
         }) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(ProtocolError::NeedsFullSnapshot) => {
-                return self.recover_full_snapshot(runtime, image, recovery_patch_bytes);
+                self.baseline_established = false;
+                self.recover_full_snapshot(runtime, image, recovery_patch_bytes)
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
-        if completeness == FrameCompleteness::FullBaseline {
-            self.baseline_established = true;
-        }
-        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_pixels(&self) -> u64 {
+        self.coverage.covered_pixels()
     }
 
     #[cfg(test)]
@@ -315,6 +355,9 @@ impl RdpBaseline {
         patch_byte_limit: usize,
     ) -> Result<(), ProtocolError> {
         self.validate_image_generation(image, self.coverage.generation)?;
+        if !self.coverage.is_full() {
+            return Err(ProtocolError::NeedsFullSnapshot);
+        }
         let regions = full_snapshot_regions(self.coverage.size, patch_byte_limit)?;
         // 背压会清除整个待发布事务，完整快照必须共享一个修订号，
         // 只在全部有界 patch 入队后提交一次完整基线。恢复失败后也不得
@@ -350,7 +393,6 @@ impl RdpBaseline {
                 Err(error) => return Err(error),
             }
         }
-        self.coverage.mark_full();
         self.baseline_established = true;
         Ok(())
     }
@@ -618,7 +660,14 @@ mod tests {
         let image = DecodedImage::new(IronPixelFormat::RgbA32, 4, 4);
 
         baseline
-            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(0, 0, 3, 3), 16)
+            .publish_with_recovery_patch_limit(
+                &mut runtime,
+                &image,
+                1,
+                region(0, 0, 3, 3),
+                &[region(0, 0, 3, 3)],
+                16,
+            )
             .expect("one recoverable mailbox request rebuilds a full snapshot");
 
         let mut state = frames.lock().expect("frame log");
@@ -674,7 +723,14 @@ mod tests {
         let image = DecodedImage::new(IronPixelFormat::RgbA32, 4, 4);
 
         baseline
-            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(1, 1, 1, 1), 16)
+            .publish_with_recovery_patch_limit(
+                &mut runtime,
+                &image,
+                1,
+                region(1, 1, 1, 1),
+                &[region(1, 1, 1, 1)],
+                16,
+            )
             .expect("partial first update is buffered");
 
         {
@@ -690,7 +746,14 @@ mod tests {
         }
 
         baseline
-            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(0, 0, 3, 3), 16)
+            .publish_with_recovery_patch_limit(
+                &mut runtime,
+                &image,
+                1,
+                region(0, 0, 3, 3),
+                &[region(0, 0, 3, 3)],
+                16,
+            )
             .expect("exact coverage publishes the complete baseline");
 
         let state = frames.lock().expect("frame log");
@@ -729,7 +792,14 @@ mod tests {
         let mut baseline = RdpBaseline::begin(&mut runtime, session_id, size).unwrap();
         let image = DecodedImage::new(IronPixelFormat::RgbA32, 4, 4);
         baseline
-            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(0, 0, 3, 3), 16)
+            .publish_with_recovery_patch_limit(
+                &mut runtime,
+                &image,
+                1,
+                region(0, 0, 3, 3),
+                &[region(0, 0, 3, 3)],
+                16,
+            )
             .unwrap();
         let state = frames.lock().unwrap();
         assert_complete_snapshot(&state.updates, session_id, size);
@@ -807,7 +877,14 @@ mod tests {
         let image = DecodedImage::new(IronPixelFormat::RgbA32, 4, 4);
         if established {
             baseline
-                .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(0, 0, 3, 3), 16)
+                .publish_with_recovery_patch_limit(
+                    &mut runtime,
+                    &image,
+                    1,
+                    region(0, 0, 3, 3),
+                    &[region(0, 0, 3, 3)],
+                    16,
+                )
                 .unwrap();
             frames.lock().unwrap().updates.clear();
         }
@@ -815,6 +892,10 @@ mod tests {
             let mut state = frames.lock().unwrap();
             state.fail_boundaries = if always_fail { 2 } else { 1 };
         }
+        baseline
+            .coverage
+            .record(session_id, 1, region(0, 0, 3, 3))
+            .unwrap();
         let result = baseline.recover_full_snapshot(&mut runtime, &image, 16);
         let state = frames.lock().unwrap();
         if always_fail {
@@ -938,7 +1019,14 @@ mod tests {
             assert_eq!(mailbox.lock().unwrap().len(), 3);
         }
         baseline
-            .publish_with_recovery_patch_limit(&mut runtime, &image, 1, region(0, 0, 3, 3), 16)
+            .publish_with_recovery_patch_limit(
+                &mut runtime,
+                &image,
+                1,
+                region(0, 0, 3, 3),
+                &[region(0, 0, 3, 3)],
+                16,
+            )
             .unwrap();
         let mut mailbox = mailbox.lock().unwrap();
         assert_eq!(mailbox.len(), 3);
@@ -970,6 +1058,205 @@ mod tests {
         }
         assert_eq!(actual, expected, "原子快照必须保留每个彩色像素及行位置");
         assert!(baseline.baseline_established());
+    }
+
+    #[test]
+    fn baseline_recovery_cannot_certify_unknown_image_pixels() {
+        let session_id = SessionId::allocate();
+        let frames = Arc::new(Mutex::new(FailFirstDamageState {
+            failed_damage: true,
+            updates: Vec::new(),
+        }));
+        let (_, rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            rx,
+            Box::new(NoopEvents),
+            Box::new(FailFirstDamageFrames(frames.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut baseline = RdpBaseline::begin(
+            &mut runtime,
+            session_id,
+            PixelSize {
+                width: 3,
+                height: 1,
+            },
+        )
+        .unwrap();
+        let image = DecodedImage::new(IronPixelFormat::RgbA32, 3, 1);
+        assert_eq!(
+            baseline.recover_full_snapshot(&mut runtime, &image, 12),
+            Err(ProtocolError::NeedsFullSnapshot)
+        );
+        assert_eq!(baseline.coverage.covered_pixels(), 0);
+        assert!(!baseline.baseline_established());
+        assert_eq!(frames.lock().unwrap().updates.len(), 1);
+    }
+
+    #[test]
+    fn baseline_explicit_content_validates_all_rectangles_before_recording_any_prefix() {
+        let session_id = SessionId::allocate();
+        let frames = Arc::new(Mutex::new(FailFirstDamageState {
+            failed_damage: true,
+            updates: Vec::new(),
+        }));
+        let (_, rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            rx,
+            Box::new(NoopEvents),
+            Box::new(FailFirstDamageFrames(frames.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut baseline = RdpBaseline::begin(
+            &mut runtime,
+            session_id,
+            PixelSize {
+                width: 3,
+                height: 1,
+            },
+        )
+        .unwrap();
+        let image = DecodedImage::new(IronPixelFormat::RgbA32, 3, 1);
+        for content in [
+            vec![region(0, 0, 0, 0), region(3, 0, 3, 0)],
+            vec![region(0, 0, 0, 0), region(2, 0, 1, 0)],
+        ] {
+            assert_eq!(
+                baseline.publish(&mut runtime, &image, 1, region(0, 0, 2, 0), &content),
+                Err(ProtocolError::FramePortRejected)
+            );
+            assert_eq!(baseline.known_pixels(), 0);
+            assert_eq!(baseline.revision, 0);
+            assert_eq!(frames.lock().unwrap().updates.len(), 1);
+        }
+        baseline
+            .publish(
+                &mut runtime,
+                &image,
+                1,
+                region(0, 0, 2, 0),
+                &[region(0, 0, 0, 0), region(2, 0, 2, 0)],
+            )
+            .unwrap();
+        assert_eq!(baseline.known_pixels(), 2);
+        assert!(!baseline.baseline_established());
+    }
+
+    #[test]
+    fn baseline_real_mailbox_overflow_cannot_recover_incomplete_content() {
+        use frd_frame::{FrameMailbox, FrameTransactionCompiler};
+        use frd_protocol_api::MailboxSurfacePublisher;
+        let session_id = SessionId::allocate();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(2, 12)));
+        let (_, rx) = mpsc::channel();
+        let mut runtime = ProtocolRuntime::new(
+            session_id,
+            rx,
+            Box::new(NoopEvents),
+            Box::new(MailboxSurfacePublisher::new(mailbox.clone())),
+            None,
+            Box::new(NoopWake),
+        );
+        let mut baseline = RdpBaseline::begin(
+            &mut runtime,
+            session_id,
+            PixelSize {
+                width: 3,
+                height: 1,
+            },
+        )
+        .unwrap();
+        let mut image = DecodedImage::new(IronPixelFormat::RgbA32, 3, 1);
+        let mut stage = ironrdp::session::ActiveStageBuilder {
+            static_channels: ironrdp::svc::StaticChannelSet::new(),
+            user_channel_id: 1001,
+            io_channel_id: 1003,
+            message_channel_id: None,
+            share_id: 1,
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+        }
+        .build();
+        use ironrdp::core::encode_vec;
+        use ironrdp::pdu::fast_path::{
+            EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode,
+        };
+        let data = encode_vec(&ironrdp::pdu::bitmap::BitmapUpdateData {
+            rectangles: vec![ironrdp::pdu::bitmap::BitmapData {
+                rectangle: region(0, 0, 0, 0),
+                width: 1,
+                height: 1,
+                bits_per_pixel: 24,
+                compression_flags: ironrdp::pdu::bitmap::Compression::empty(),
+                compressed_data_header: None,
+                bitmap_data: &[1, 2, 3, 0],
+            }],
+        })
+        .unwrap();
+        let payload = encode_vec(&FastPathUpdatePdu {
+            fragmentation: Fragmentation::Single,
+            update_code: UpdateCode::Bitmap,
+            compression_flags: None,
+            compression_type: None,
+            data: &data,
+        })
+        .unwrap();
+        let mut packet = encode_vec(&FastPathHeader::new(
+            EncryptionFlags::empty(),
+            payload.len(),
+        ))
+        .unwrap();
+        packet.extend(payload);
+        let result = stage
+            .process_with_decoded_coverage(&mut image, ironrdp::pdu::Action::FastPath, &packet)
+            .unwrap();
+        for receipt in &result.decoded_coverage {
+            let ironrdp::session::ActiveStageOutput::GraphicsUpdate(damage) =
+                &result.outputs[receipt.graphics_output_index]
+            else {
+                panic!("真实内容必须对应 graphic output");
+            };
+            baseline
+                .publish(&mut runtime, &image, 1, damage.clone(), &receipt.rectangles)
+                .unwrap();
+        }
+        assert_eq!(baseline.known_pixels(), 1);
+        // 通过真实邮箱制造队列背压；它不赋予 adapter 的 DecodedImage 新内容知识。
+        runtime
+            .publish_surface(SurfaceUpdate::Damage {
+                session_id,
+                generation: 1,
+                revision: 1,
+                patches: vec![
+                    crate::surface::extract_bgrx_patch(&image, region(0, 0, 0, 0)).unwrap(),
+                ],
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.publish_surface(SurfaceUpdate::FrameBoundary {
+                session_id,
+                generation: 1,
+                revision: 1,
+                completeness: FrameCompleteness::Incremental
+            }),
+            Err(ProtocolError::NeedsFullSnapshot)
+        );
+        assert_eq!(
+            baseline.recover_full_snapshot(&mut runtime, &image, 12),
+            Err(ProtocolError::NeedsFullSnapshot)
+        );
+        assert_eq!(baseline.known_pixels(), 1);
+        assert!(!baseline.baseline_established());
+        let mut compiler = FrameTransactionCompiler::new(session_id);
+        assert!(compiler
+            .compile(mailbox.lock().unwrap().drain_committed_updates())
+            .unwrap()
+            .is_empty());
     }
 
     struct NoopEvents;
