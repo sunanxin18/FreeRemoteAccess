@@ -33,3 +33,7 @@ pub(super) unsafe fn row(
     }
     Ok(())
 }
+
+#[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
+#[path = "../tests/support/pixel_abi_private.rs"]
+mod abi;
