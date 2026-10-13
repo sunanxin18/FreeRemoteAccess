@@ -256,6 +256,8 @@ class OwnedStaging(unittest.TestCase):
         calls = []
 
         def fail_second(source, target):
+            if target.name == '.frd-ffmpeg-stage.json':
+                return original(source, target)
             calls.append(target)
             if len(calls) == 2:
                 raise OSError('controlled publication failure')
@@ -267,6 +269,99 @@ class OwnedStaging(unittest.TestCase):
         self.assertEqual(user.read_bytes(), b'keep')
         self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations()))
         self.assertFalse((self.entry / '.frd-ffmpeg-stage.json').exists())
+        stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        stager.clean(self.entry)
+        self.assertEqual(user.read_bytes(), b'keep')
+
+    def assert_marker_failure_recovers(self):
+        self.assertFalse((self.entry / '.frd-ffmpeg-stage.json').exists())
+        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations()))
+        self.assertFalse(any(self.entry.glob('.frd-marker-*')))
+        stager.clean(self.entry)
+        stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        for relative, source in stager.destinations().items():
+            self.assertEqual((self.entry / relative).read_bytes(), (self.bundle / source).read_bytes())
+        stager.clean(self.entry)
+        self.assertFalse((self.entry / '.frd-ffmpeg-stage.json').exists())
+
+    def test_marker_partial_json_write_failure_allows_clean_and_retry(self):
+        user = self.entry / 'user.txt'
+        user.write_bytes(b'keep')
+        before = checker.ffmpeg.sha(self.bundle / 'manifest.json')
+
+        def partial_write(value, output):
+            output.write('{')
+            raise OSError('controlled marker write failure')
+
+        with mock.patch.object(stager.json, 'dump', side_effect=partial_write):
+            with self.assertRaisesRegex(OSError, 'controlled marker write failure'):
+                stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        self.assert_marker_failure_recovers()
+        self.assertEqual(user.read_bytes(), b'keep')
+        self.assertEqual(checker.ffmpeg.sha(self.bundle / 'manifest.json'), before)
+
+    def test_marker_close_failure_allows_clean_and_retry(self):
+        original = Path.open
+
+        class FailClose:
+            def __init__(self, output):
+                self.output = output
+
+            def __enter__(self):
+                return self.output.__enter__()
+
+            def __exit__(self, *args):
+                self.output.__exit__(*args)
+                raise OSError('controlled marker close failure')
+
+        def open_file(path, *args, **kwargs):
+            output = original(path, *args, **kwargs)
+            if path.name == 'ownership.json':
+                return FailClose(output)
+            return output
+
+        with mock.patch.object(Path, 'open', open_file):
+            with self.assertRaisesRegex(OSError, 'controlled marker close failure'):
+                stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        self.assert_marker_failure_recovers()
+
+    def test_marker_publish_failure_allows_clean_and_retry(self):
+        original = stager.os.link
+
+        def fail_marker(source, target):
+            if target.name == '.frd-ffmpeg-stage.json':
+                raise OSError('controlled marker publish failure')
+            return original(source, target)
+
+        with mock.patch.object(stager.os, 'link', side_effect=fail_marker):
+            with self.assertRaisesRegex(OSError, 'controlled marker publish failure'):
+                stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        self.assert_marker_failure_recovers()
+
+    def test_marker_publish_collision_preserves_unknown_marker(self):
+        original = stager.os.link
+        marker = self.entry / '.frd-ffmpeg-stage.json'
+
+        def collide(source, target):
+            if target == marker:
+                marker.write_text('{user-created-during-publication')
+            return original(source, target)
+
+        with mock.patch.object(stager.os, 'link', side_effect=collide):
+            with self.assertRaises(FileExistsError):
+                stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        self.assertEqual(marker.read_text(), '{user-created-during-publication')
+        self.assertTrue(all(not (self.entry / n).exists() for n in stager.destinations()))
+        self.assertFalse(any(self.entry.glob('.frd-marker-*')))
+
+    def test_preexisting_invalid_marker_is_preserved(self):
+        marker = self.entry / '.frd-ffmpeg-stage.json'
+        marker.write_text('{user-owned-invalid')
+        with self.assertRaises(json.JSONDecodeError):
+            stager.stage(self.entry, self.bundle, self.sdk, self.digest)
+        with self.assertRaises(json.JSONDecodeError):
+            stager.clean(self.entry)
+        self.assertEqual(marker.read_text(), '{user-owned-invalid')
 
     def test_stage_parent_symlink_never_followed(self):
         outside = Path(self.temp.name) / 'userdir'

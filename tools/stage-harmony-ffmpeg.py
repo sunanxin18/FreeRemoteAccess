@@ -56,9 +56,16 @@ def stage(entry, bundle, sdk, digest):
         safe_path(entry, path)
     content = {relative: (bundle / name).read_bytes() for relative, name in files.items()}
     marker = entry / '.frd-ffmpeg-stage.json'
-    with marker.open('x') as output:
-        json.dump({relative: hashlib.sha256(data).hexdigest() for relative, data in content.items()}, output)
+    marker_published = False
     try:
+        # ownership 标记也必须完整写好、成功关闭后才无覆盖地原子发布。
+        # 写入/关闭失败只留下私有临时内容，不阻断下次 clean/stage。
+        with tempfile.TemporaryDirectory(prefix='.frd-marker-', dir=entry) as temporary:
+            private_marker = Path(temporary) / 'ownership.json'
+            with private_marker.open('x') as output:
+                json.dump({relative: hashlib.sha256(data).hexdigest() for relative, data in content.items()}, output)
+            os.link(private_marker, marker)
+            marker_published = True
         for relative, data in content.items():
             path = entry / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +76,9 @@ def stage(entry, bundle, sdk, digest):
                 private.write_bytes(data)
                 os.link(private, path)
     except Exception:
-        clean(entry)
+        # 未成功发布的标记可能是其他调用者/用户的文件，绝不代为清理。
+        if marker_published:
+            clean(entry)
         raise
 
 
