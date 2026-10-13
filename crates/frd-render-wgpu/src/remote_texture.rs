@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::transaction_state::InstalledSurface;
-use frd_core::{ContentViewport, PixelSize};
+use frd_core::{ContentViewport, PixelSize, TransformedViewport};
 use frd_frame::{FrameReset, FrameTransaction, PixelPatch};
 
 use crate::transaction_state::{
@@ -327,6 +327,31 @@ impl RemoteRenderer {
         viewport: Option<ContentViewport>,
         target_format: wgpu::TextureFormat,
     ) -> Result<Option<PresentationReceipt>, RendererError> {
+        self.record_transformed(
+            encoder,
+            target,
+            viewport
+                .map(|v| {
+                    TransformedViewport::new(v, v.content, 1.0, [0.0; 2])
+                        .ok_or(RendererError::InvalidGeometry)
+                })
+                .transpose()?,
+            target_format,
+        )
+    }
+
+    pub fn request_repaint(&mut self) -> bool {
+        self.state.request_repaint()
+    }
+
+    pub fn record_transformed(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        transformed: Option<TransformedViewport>,
+        target_format: wgpu::TextureFormat,
+    ) -> Result<Option<PresentationReceipt>, RendererError> {
+        let viewport = transformed.map(|v| v.base());
         match (self.remote.as_ref(), viewport) {
             (Some(remote), Some(viewport)) if remote.size != viewport.remote => {
                 return Err(RendererError::InvalidGeometry)
@@ -361,10 +386,11 @@ impl RemoteRenderer {
                 .or(pass.as_ref())
                 .expect("远端 pass 已创建")
                 .record(
+                    context.device(),
                     encoder,
                     target,
                     remote.as_ref().map(|texture| &texture.bind_group),
-                    viewport.map(|viewport| viewport.content),
+                    transformed,
                 );
             Ok(WgpuPreparedRecord {
                 replacement_pass,

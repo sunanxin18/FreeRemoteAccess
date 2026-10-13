@@ -347,3 +347,37 @@ pub unsafe extern "C" fn frd_ohos_app_huks_probe(id: u64, path: *const u8, len: 
         }
     })
 }
+
+/// 仅 native bridge 使用；没有脚本可写的成功/首帧入口。
+#[no_mangle]
+pub extern "C" fn frd_ohos_app_bind_renderer(id: u64, renderer: u64) -> i32 {
+    boundary(|| app(id)?.bind(lookup(renderer)?.link.clone()))
+}
+
+/// Native XComponent 的物理坐标；当前本地窗口代际必须匹配已呈现证明。
+#[no_mangle]
+pub extern "C" fn frd_ohos_app_native_pointer(
+    id: u64,
+    local: u64,
+    x: f32,
+    y: f32,
+    buttons: u32,
+    take_focus: u32,
+) -> i32 {
+    boundary(|| {
+        if local == 0 || !x.is_finite() || !y.is_finite() || buttons > 7 || take_focus > 1 {
+            return Err(INVALID_ARGUMENT);
+        }
+        app(id)?.native_pointer(
+            local,
+            x,
+            y,
+            PointerButtons {
+                primary: buttons & 1 != 0,
+                middle: buttons & 2 != 0,
+                secondary: buttons & 4 != 0,
+            },
+            take_focus != 0,
+        )
+    })
+}

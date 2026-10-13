@@ -398,3 +398,47 @@ fn panic_redaction_child() {
     println!("abi={abi} worker={worker} cleanup={cleaned}");
     let _ = std::panic::catch_unwind(|| panic!("FRD_UNSCOPED_PANIC_SENTINEL"));
 }
+
+#[test]
+fn full_remote_feedback_slot_cannot_block_resize_detach_or_shutdown_ack() {
+    let (engine, _) = probe(false);
+    let generation = engine
+        .call(Command::Attach {
+            window: 1,
+            width: 10,
+            height: 10,
+        })
+        .unwrap();
+    {
+        let mut link = engine.link.0.lock().unwrap();
+        link.bound = true;
+        let session = frd_core::SessionId::allocate();
+        link.session = Some((session, 1));
+        link.feedback = Some(crate::presentation::Feedback {
+            epoch: crate::presentation::Epoch {
+                session,
+                remote: 1,
+                local: generation,
+                lifecycle: 1,
+                geometry: 1,
+            },
+            event: None,
+        });
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let join = std::thread::spawn(move || {
+        engine
+            .call(Command::Resize {
+                generation,
+                width: 20,
+                height: 20,
+            })
+            .unwrap();
+        engine.call(Command::Foreground(false)).unwrap();
+        engine.call(Command::Detach(generation)).unwrap();
+        engine.shutdown().unwrap();
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    join.join().unwrap();
+}

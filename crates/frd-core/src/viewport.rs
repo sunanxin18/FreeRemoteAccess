@@ -256,3 +256,192 @@ mod tests {
         assert_eq!(viewport.map_pointer(50.0, 39.999), None);
     }
 }
+
+/// 已验证的带裁剪仿射视口；输入与绘制共享同一个逆变换。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformedViewport {
+    base: ContentViewport,
+    clip: PixelRect,
+    origin: [f32; 2],
+    extent: [f32; 2],
+}
+impl TransformedViewport {
+    pub fn new(base: ContentViewport, clip: PixelRect, scale: f32, pan: [f32; 2]) -> Option<Self> {
+        ContentViewport::fit_in(base.remote, base.drawable, clip)?;
+        ContentViewport::fit_in(base.remote, base.drawable, base.content)?;
+        if base.remote.width == 0
+            || base.remote.height == 0
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !pan.iter().all(|v| v.is_finite())
+        {
+            return None;
+        }
+        let extent = [
+            base.content.width as f32 * scale,
+            base.content.height as f32 * scale,
+        ];
+        let origin = [
+            base.content.x as f32 + (base.content.width as f32 - extent[0]) / 2.0 + pan[0],
+            base.content.y as f32 + (base.content.height as f32 - extent[1]) / 2.0 + pan[1],
+        ];
+        if !extent
+            .iter()
+            .all(|v| v.is_finite() && *v >= 1.0 && *v <= 16777216.0)
+            || !origin
+                .iter()
+                .all(|v| v.is_finite() && v.abs() <= 16777216.0)
+        {
+            return None;
+        }
+        if origin[0] >= (clip.x + clip.width) as f32
+            || origin[1] >= (clip.y + clip.height) as f32
+            || origin[0] + extent[0] <= clip.x as f32
+            || origin[1] + extent[1] <= clip.y as f32
+        {
+            return None;
+        }
+        Some(Self {
+            base,
+            clip,
+            origin,
+            extent,
+        })
+    }
+    pub fn base(self) -> ContentViewport {
+        self.base
+    }
+    pub fn clip(self) -> PixelRect {
+        self.clip
+    }
+    pub fn origin(self) -> [f32; 2] {
+        self.origin
+    }
+    pub fn extent(self) -> [f32; 2] {
+        self.extent
+    }
+    pub fn map_pointer(self, x: f32, y: f32) -> Option<PixelPoint> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < self.clip.x as f32
+            || y < self.clip.y as f32
+            || x >= (self.clip.x + self.clip.width) as f32
+            || y >= (self.clip.y + self.clip.height) as f32
+            || x < self.origin[0]
+            || y < self.origin[1]
+            || x >= self.origin[0] + self.extent[0]
+            || y >= self.origin[1] + self.extent[1]
+        {
+            return None;
+        }
+        let axis = |v: f32, i: usize, n: u32| {
+            if self.extent[i] <= 1.0 || n <= 1 {
+                return 0;
+            }
+            ((v - self.origin[i]) as f64 * f64::from(n - 1) / f64::from(self.extent[i] - 1.0))
+                .floor()
+                .min(f64::from(n - 1)) as u32
+        };
+        Some(PixelPoint {
+            x: axis(x, 0, self.base.remote.width),
+            y: axis(y, 1, self.base.remote.height),
+        })
+    }
+    /// 有界四边形的 NDC xy 与纹理 uv；GPU 裁剪允许负 origin。
+    /// 不使用越过远端矩形的超大三角形，以免 clamp 采样填满 letterbox。
+    pub fn vertices(self) -> [[f32; 4]; 6] {
+        let [x, y] = self.origin;
+        let [w, h] = self.extent;
+        let dw = self.base.drawable.width as f32;
+        let dh = self.base.drawable.height as f32;
+        let tl = [2.0 * x / dw - 1.0, 1.0 - 2.0 * y / dh, 0.0, 0.0];
+        let tr = [2.0 * (x + w) / dw - 1.0, 1.0 - 2.0 * y / dh, 1.0, 0.0];
+        let bl = [2.0 * x / dw - 1.0, 1.0 - 2.0 * (y + h) / dh, 0.0, 1.0];
+        let br = [2.0 * (x + w) / dw - 1.0, 1.0 - 2.0 * (y + h) / dh, 1.0, 1.0];
+        [bl, br, tl, tl, br, tr]
+    }
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    #[test]
+    fn identity_and_fractional_negative_pan_share_clip_and_inverse() {
+        let size = PixelSize {
+            width: 100,
+            height: 100,
+        };
+        let base = ContentViewport::fit(size, size);
+        let identity = TransformedViewport::new(base, base.content, 1.0, [0.0; 2]).unwrap();
+        for (x, y) in [(0.0, 0.0), (49.25, 68.5), (99.9, 99.9)] {
+            assert_eq!(identity.map_pointer(x, y), base.map_pointer(x, y));
+        }
+        let narrow = ContentViewport::fit(
+            PixelSize {
+                width: 100,
+                height: 100,
+            },
+            PixelSize {
+                width: 1,
+                height: 1,
+            },
+        );
+        let narrow_transform =
+            TransformedViewport::new(narrow, narrow.content, 1.0, [0.0; 2]).unwrap();
+        assert_eq!(
+            narrow_transform.map_pointer(0.9, 0.9),
+            narrow.map_pointer(0.9, 0.9)
+        );
+        assert!(TransformedViewport::new(
+            ContentViewport {
+                content: PixelRect {
+                    x: 99,
+                    y: 0,
+                    width: 100,
+                    height: 100
+                },
+                ..base
+            },
+            base.content,
+            1.0,
+            [0.0; 2]
+        )
+        .is_none());
+        assert!(TransformedViewport::new(base, base.content, 1.0, [1000.0, 0.0]).is_none());
+        assert_eq!(
+            identity.vertices(),
+            [
+                [-1.0, -1.0, 0.0, 1.0],
+                [1.0, -1.0, 1.0, 1.0],
+                [-1.0, 1.0, 0.0, 0.0],
+                [-1.0, 1.0, 0.0, 0.0],
+                [1.0, -1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 0.0]
+            ]
+        );
+        let clip = PixelRect {
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 80,
+        };
+        let v = TransformedViewport::new(base, clip, 1.25, [-5.5, 4.25]).unwrap();
+        assert_eq!(v.origin(), [-18.0, -8.25]);
+        assert_eq!(v.extent(), [125.0, 125.0]);
+        assert_eq!(v.map_pointer(10.0, 10.0), Some(PixelPoint { x: 22, y: 14 }));
+        assert_eq!(v.map_pointer(9.99, 10.0), None);
+        assert_eq!(v.map_pointer(90.0, 89.0), None);
+        assert!(TransformedViewport::new(base, clip, f32::NAN, [0.0; 2]).is_none());
+        assert!(TransformedViewport::new(base, clip, 1.0, [f32::MAX; 2]).is_none());
+        assert!(TransformedViewport::new(
+            base,
+            PixelRect {
+                x: u32::MAX,
+                ..clip
+            },
+            1.0,
+            [0.0; 2]
+        )
+        .is_none());
+    }
+}

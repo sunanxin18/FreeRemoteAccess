@@ -18,7 +18,7 @@ pub use input::{
 };
 pub use secret::{SecretBuffer, SecretBytes};
 pub use session::SessionId;
-pub use viewport::ContentViewport;
+pub use viewport::{ContentViewport, TransformedViewport};
 
 #[cfg(test)]
 mod tests {

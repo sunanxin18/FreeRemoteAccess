@@ -6,6 +6,9 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+native-presentation-fixture = []
+
 [dependencies]
 frd-core = { path = "../frd-core" }
 frd-frame = { path = "../frd-frame" }
@@ -26,4 +29,5 @@ wgpu.workspace = true
 pollster = "0.4"
 
 [dev-dependencies]
+frd-shell-runtime = { path = "../frd-shell-runtime", features = ["test-support"] }
 wgpu.workspace = true

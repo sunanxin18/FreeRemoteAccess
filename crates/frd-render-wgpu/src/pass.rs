@@ -1,4 +1,5 @@
-use frd_core::PixelRect;
+use frd_core::TransformedViewport;
+use wgpu::util::DeviceExt;
 
 use crate::RendererError;
 
@@ -30,7 +31,11 @@ impl RemotePass {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[],
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                })],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -60,11 +65,25 @@ impl RemotePass {
 
     pub(crate) fn record(
         &self,
+        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         bind_group: Option<&wgpu::BindGroup>,
-        content: Option<PixelRect>,
+        content: Option<TransformedViewport>,
     ) {
+        let vertices = content.map(|v| v.vertices());
+        let buffer = vertices.map(|vertices| {
+            let bytes: Vec<u8> = vertices
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect();
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("远端视口顶点"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
         let color_attachment = Some(wgpu::RenderPassColorAttachment {
             view: target,
             depth_slice: None,
@@ -84,17 +103,12 @@ impl RemotePass {
         });
 
         if let (Some(bind_group), Some(content)) = (bind_group, content) {
-            pass.set_viewport(
-                content.x as f32,
-                content.y as f32,
-                content.width as f32,
-                content.height as f32,
-                0.0,
-                1.0,
-            );
+            let clip = content.clip();
+            pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+            pass.set_vertex_buffer(0, buffer.as_ref().unwrap().slice(..));
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            pass.draw(0..6, 0..1);
         }
     }
 }

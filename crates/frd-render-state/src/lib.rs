@@ -338,6 +338,28 @@ impl StateSnapshot {
         self.baseline_presented
     }
 
+    /// 保留纹理重新呈现，只有已提交的完整基线可重开本地呈现证明。
+    /// 不恢复丢失的 GPU 状态，也不从孤立增量推断完整性。
+    fn request_repaint(&mut self) -> bool {
+        let s = self;
+        let Some(c) = s.current else {
+            return false;
+        };
+        if s.recovery.is_some()
+            || !(s.baseline_presented || s.unpresented_full_baseline)
+            || c.last_boundary_revision == 0
+            || c.last_boundary_revision != c.last_damage_revision
+        {
+            return false;
+        }
+        s.pending_receipt = Some(PresentationReceipt {
+            session_id: c.session_id,
+            generation: c.generation,
+            revision: c.last_boundary_revision,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        true
+    }
     fn confirm_presented(&mut self, receipt: PresentationReceipt) -> Result<(), TransactionError> {
         if self.pending_receipt != Some(receipt) {
             return Err(TransactionError::StalePresentationReceipt);
@@ -555,6 +577,10 @@ impl RemoteUpdateState {
     pub fn pending_receipt(&self) -> Option<PresentationReceipt> {
         self.snapshot.pending_receipt()
     }
+    /// 显式请求完整保留纹理的新一次呈现；不恢复设备丢失的状态。
+    pub fn request_repaint(&mut self) -> bool {
+        self.snapshot.request_repaint()
+    }
     pub fn confirm_presented(
         &mut self,
         receipt: PresentationReceipt,
@@ -752,6 +778,69 @@ mod tests {
                 .unwrap_err(),
             RendererError::BoundaryWithoutMatchingDamage
         );
+    }
+
+    #[test]
+    fn explicit_repaint_requires_retained_complete_committed_state() {
+        let session = SessionId::allocate();
+        let size = PixelSize::new(2, 2).unwrap();
+        let rect = pixel_rect(0, 0, 2, 2);
+        let mut state = RemoteUpdateState::default();
+        assert!(!state.request_repaint());
+        for update in [
+            reset(session, 1, size, PixelFormat::Bgrx8UnormSrgb),
+            damage(session, 1, 1, rect, 8, vec![0; 16]),
+            boundary(session, 1, 1, FrameCompleteness::Incremental),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+        assert!(!state.request_repaint());
+        for update in [
+            damage(session, 1, 2, rect, 8, vec![1; 16]),
+            boundary(session, 1, 2, FrameCompleteness::FullBaseline),
+        ] {
+            let plan = state.plan(update).unwrap();
+            state.commit(plan);
+        }
+        state
+            .confirm_presented(state.pending_receipt().unwrap())
+            .unwrap();
+        // 未提交的候选不能改变已提交视图，也不会创建新的完整性。
+        let candidate = state
+            .plan(damage(session, 1, 3, rect, 8, vec![2; 16]))
+            .unwrap();
+        assert!(state.request_repaint());
+        assert_eq!(state.pending_receipt().unwrap().revision, 2);
+        state
+            .confirm_presented(state.pending_receipt().unwrap())
+            .unwrap();
+        state.commit(candidate);
+        assert!(!state.request_repaint());
+        let plan = state
+            .plan(boundary(session, 1, 3, FrameCompleteness::Incremental))
+            .unwrap();
+        state.commit(plan);
+        assert_eq!(
+            state.pending_receipt().unwrap().completeness,
+            FrameCompleteness::Incremental
+        );
+        state
+            .confirm_presented(state.pending_receipt().unwrap())
+            .unwrap();
+        assert!(state.request_repaint());
+        assert_eq!(state.pending_receipt().unwrap().revision, 3);
+        assert_eq!(
+            state.pending_receipt().unwrap().completeness,
+            FrameCompleteness::FullBaseline
+        );
+        state.invalidate_for_device_loss();
+        assert!(!state.request_repaint());
+        let plan = state
+            .plan(reset(session, 1, size, PixelFormat::Bgrx8UnormSrgb))
+            .unwrap();
+        state.commit(plan);
+        assert!(!state.request_repaint());
     }
 
     #[test]

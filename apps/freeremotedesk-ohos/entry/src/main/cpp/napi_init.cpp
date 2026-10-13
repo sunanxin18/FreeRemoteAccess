@@ -20,6 +20,7 @@ namespace {
 std::unordered_map<OH_NativeXComponent *, std::unique_ptr<ComponentState>> components;
 std::unordered_set<napi_env> cleanupEnvironments;
 bool foreground = true;
+uint64_t remoteEngine = 0;
 FrdOhosPocStatus lastStatus{};
 int32_t lastCode = FRD_OHOS_OK;
 void Log(const char *event, int32_t code, const ComponentState &state) {
@@ -38,16 +39,23 @@ bool Extent(OH_NativeXComponent *component, void *window, uint32_t &width, uint3
 }
 void Frame(OH_NativeXComponent *component, uint64_t, uint64_t) {
     auto *state=Find(component);
-    if (state && state->ticks && foreground) frd_ohos_poc_tick(state->engine, state->generation);
+    if (state && !state->remote && state->ticks && foreground) frd_ohos_poc_tick(state->engine, state->generation);
 }
 void Created(OH_NativeXComponent *component, void *window) {
     auto *state=Find(component); if (!state) return;
     state->BeginAttach();
-    if (!FRD_GRAPHICS_POC_ENABLED) { state->bridgeError=lastCode=FRD_OHOS_UNSUPPORTED_PLATFORM; return; }
+    if (!state->remote && !FRD_GRAPHICS_POC_ENABLED) { state->bridgeError=lastCode=FRD_OHOS_UNSUPPORTED_PLATFORM; return; }
     uint32_t width=0, height=0;
     if (!Extent(component, window, width, height)) { state->bridgeError=lastCode=FRD_OHOS_INVALID_ARGUMENT; return; }
-    if (state->engine == 0) state->engine=frd_ohos_create();
+    if (state->remote) {
+        if (remoteEngine == 0) remoteEngine = frd_ohos_create();
+        state->engine = remoteEngine;
+    } else if (state->engine == 0) state->engine=frd_ohos_create();
     if (state->engine == 0) { state->bridgeError=lastCode=FRD_OHOS_WORKER_STOPPED; return; }
+    if (state->remote) {
+        const auto bindCode = FrdAppBindRenderer(state->engine);
+        if (bindCode != FRD_OHOS_OK) { state->bridgeError=lastCode=bindCode; return; }
+    }
     const auto foregroundCode=frd_ohos_set_foreground(state->engine, foreground ? 1 : 0);
     if (foregroundCode != FRD_OHOS_OK) { state->bridgeError=lastCode=foregroundCode; return; }
     // 同步等待，没有超时；callback 返回前取得 own ref 或完成全部失败清理。
@@ -77,13 +85,51 @@ void Destroyed(OH_NativeXComponent *component, void *window) {
     lastCode=state->StatusCode(lastCode == FRD_OHOS_OK ? statusCode : lastCode, lastStatus);
     // detach 返回前已暂停/释放 Surface/清空访问/unref，然后 join worker。
     Log("detach", lastCode, *state);
-    const auto destroyCode=frd_ohos_destroy(state->engine);
-    Log("destroy", destroyCode, *state);
-    state->engine=0; state->generation=0; state->borrowedWindow=nullptr;
+    if (!state->remote) {
+        const auto destroyCode=frd_ohos_destroy(state->engine);
+        Log("destroy", destroyCode, *state);
+        state->engine=0;
+    }
+    state->generation=0; state->borrowedWindow=nullptr;
     state->bridgeError=FRD_OHOS_OK;
     // 同一 XComponent 在系统重建 Surface 时仍可再次 Created，保留已清零 POD。
 }
-void Touch(OH_NativeXComponent *, void *) { /* 图形 POC 不发送远程输入。 */ }
+void RemoteBlur(OH_NativeXComponent *component, void *window) {
+    auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow) return;
+    state->mouseButtons=0; FrdAppRemoteFocus(foreground,false);
+}
+void RemoteFocus(OH_NativeXComponent *component, void *window) {
+    auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow) return;
+    FrdOhosPocStatus current{};
+    if (frd_ohos_poc_status(state->engine,&current) != FRD_OHOS_OK || current.surface_generation != state->generation || !current.attached) return;
+    FrdAppRemoteFocus(foreground,true);
+}
+void Touch(OH_NativeXComponent *component, void *window) {
+    auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow || !state->generation) return;
+    OH_NativeXComponent_TouchEvent event{};
+    if (OH_NativeXComponent_GetTouchEvent(component,window,&event) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) { RemoteBlur(component,window); return; }
+    if (event.numPoints > 1 || event.type == OH_NATIVEXCOMPONENT_CANCEL) {
+        state->touchBlocked=event.numPoints>1; RemoteBlur(component,window); return;
+    }
+    if (event.type != OH_NATIVEXCOMPONENT_DOWN && event.type != OH_NATIVEXCOMPONENT_UP && event.type != OH_NATIVEXCOMPONENT_MOVE) { RemoteBlur(component,window); return; }
+    if (state->touchBlocked) {
+        if (event.type == OH_NATIVEXCOMPONENT_UP && event.numPoints <= 1) state->touchBlocked=false;
+        return;
+    }
+    // Native TouchEvent 的本地坐标来自 XComponent 物理表面；MouseEvent 则由 SDK 明确为 vp。
+    lastCode=FrdAppNativePointer(state->generation,event.x,event.y,event.type == OH_NATIVEXCOMPONENT_UP ? 0 : 1,event.type == OH_NATIVEXCOMPONENT_DOWN,false);
+}
+void Mouse(OH_NativeXComponent *component, void *window) {
+    auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow || !state->generation) return;
+    OH_NativeXComponent_MouseEvent event{};
+    if (OH_NativeXComponent_GetMouseEvent(component,window,&event) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS || event.action == OH_NATIVEXCOMPONENT_MOUSE_CANCEL) { RemoteBlur(component,window); return; }
+    const auto button=event.button == OH_NATIVEXCOMPONENT_LEFT_BUTTON ? 1U : event.button == OH_NATIVEXCOMPONENT_MIDDLE_BUTTON ? 2U : event.button == OH_NATIVEXCOMPONENT_RIGHT_BUTTON ? 4U : 0U;
+    if (event.action == OH_NATIVEXCOMPONENT_MOUSE_PRESS) state->mouseButtons |= button;
+    if (event.action == OH_NATIVEXCOMPONENT_MOUSE_RELEASE) state->mouseButtons &= ~button;
+    lastCode=FrdAppNativePointer(state->generation,event.x,event.y,state->mouseButtons,event.action == OH_NATIVEXCOMPONENT_MOUSE_PRESS,true);
+}
+void Hover(OH_NativeXComponent *, bool) {}
+OH_NativeXComponent_MouseEvent_Callback mouseCallbacks{Mouse,Hover};
 OH_NativeXComponent_Callback callbacks{Created, Changed, Destroyed, Touch};
 napi_value PocAvailable(napi_env env, napi_callback_info) {
     napi_value result=nullptr; napi_get_boolean(env, FRD_GRAPHICS_POC_ENABLED != 0, &result); return result;
@@ -133,6 +179,7 @@ void Cleanup(void *environment) {
     cleanupEnvironments.erase(static_cast<napi_env>(environment));
     // env 清理时不访问可能已失效的 XComponent，只 join native worker。
     for (auto &item : components) if (item.second->engine) frd_ohos_destroy(item.second->engine);
+    remoteEngine = 0;
     components.clear();
 }
 napi_value Init(napi_env env, napi_value exports) {
@@ -150,6 +197,20 @@ napi_value Init(napi_env env, napi_value exports) {
         napi_unwrap(env,object,reinterpret_cast<void **>(&component)) == napi_ok && component) {
         if (components.find(component) == components.end()) components.emplace(component,std::make_unique<ComponentState>());
         auto *state=Find(component);
+        char componentId[OH_XCOMPONENT_ID_LEN_MAX + 1]{};
+        uint64_t componentIdSize = sizeof(componentId);
+        if (OH_NativeXComponent_GetXComponentId(component, componentId, &componentIdSize) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
+            state->bridgeError=lastCode=FRD_OHOS_INVALID_ARGUMENT; return exports;
+        }
+        state->remote = std::string(componentId) == "frdRemoteSurface";
+        if (!state->remote && std::string(componentId) != "frdPocSurface") {
+            state->bridgeError=lastCode=FRD_OHOS_INVALID_ARGUMENT; return exports;
+        }
+        if (state->remote && (OH_NativeXComponent_RegisterMouseEventCallback(component,&mouseCallbacks) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS ||
+            OH_NativeXComponent_RegisterFocusEventCallback(component,RemoteFocus) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS ||
+            OH_NativeXComponent_RegisterBlurEventCallback(component,RemoteBlur) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS)) {
+            state->bridgeError=lastCode=FRD_OHOS_INVALID_ARGUMENT; return exports;
+        }
         if (OH_NativeXComponent_RegisterCallback(component,&callbacks) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) {
             state->bridgeError=lastCode=FRD_OHOS_GPU_FAILED;
             Log("register-lifecycle", lastCode, *state);

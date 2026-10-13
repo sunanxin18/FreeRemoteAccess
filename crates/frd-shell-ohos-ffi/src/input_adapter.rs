@@ -11,32 +11,32 @@ pub struct ViewGeometry {
     pub pan_y: f32,
 }
 impl ViewGeometry {
-    pub fn viewport(self, remote: PixelSize) -> Option<RemoteViewport> {
-        if !self.scale.is_finite()
-            || !(1.0..=8.0).contains(&self.scale)
-            || !self.pan_x.is_finite()
-            || !self.pan_y.is_finite()
-        {
+    pub fn transformed(self, remote: PixelSize) -> Option<frd_core::TransformedViewport> {
+        if !(1.0..=8.0).contains(&self.scale) {
             return None;
         }
         let fit = ContentViewport::fit_in(remote, self.drawable, self.bounds)?;
-        let w = fit.content.width as f32 * self.scale;
-        let h = fit.content.height as f32 * self.scale;
-        let x = fit.content.x as f32 + (fit.content.width as f32 - w) / 2.0 + self.pan_x;
-        let y = fit.content.y as f32 + (fit.content.height as f32 - h) / 2.0 + self.pan_y;
-        // 渲染器使用 origin/extent 的同一逆变换，clip 永远限制在安全内容矩形内。
+        frd_core::TransformedViewport::new(fit, self.bounds, self.scale, [self.pan_x, self.pan_y])
+    }
+    pub fn viewport(self, remote: PixelSize) -> Option<RemoteViewport> {
+        let transform = self.transformed(remote)?;
+        let [x, y] = transform.origin();
+        let [width, height] = transform.extent();
         Some(RemoteViewport {
             remote,
-            clip: self.bounds,
+            clip: transform.clip(),
             x,
             y,
-            width: w,
-            height: h,
+            width,
+            height,
+            transform,
         })
     }
 }
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RemoteViewport {
+    transform: frd_core::TransformedViewport,
     pub remote: PixelSize,
     pub clip: PixelRect,
     pub x: f32,
@@ -46,29 +46,10 @@ pub struct RemoteViewport {
 }
 impl RemoteViewport {
     pub fn map(self, x: f32, y: f32) -> Option<PixelPoint> {
-        if !x.is_finite()
-            || !y.is_finite()
-            || x < self.clip.x as f32
-            || y < self.clip.y as f32
-            || x >= (self.clip.x + self.clip.width) as f32
-            || y >= (self.clip.y + self.clip.height) as f32
-            || x < self.x
-            || y < self.y
-            || x >= self.x + self.width
-            || y >= self.y + self.height
-        {
-            return None;
-        }
-        Some(PixelPoint {
-            x: ((x - self.x) / (self.width - 1.0).max(1.0) * (self.remote.width - 1) as f32)
-                .floor()
-                .min((self.remote.width - 1) as f32) as u32,
-            y: ((y - self.y) / (self.height - 1.0).max(1.0) * (self.remote.height - 1) as f32)
-                .floor()
-                .min((self.remote.height - 1) as f32) as u32,
-        })
+        self.transform.map_pointer(x, y)
     }
 }
+
 #[derive(Default)]
 pub struct InputAdapter {
     pub revision: u64,
@@ -85,6 +66,23 @@ pub struct InputAdapter {
     held_buttons: frd_core::PointerButtons,
 }
 impl InputAdapter {
+    /// 门关闭时仍消费本地物理释放，避免恢复后全新按键误留在隔离集。
+    pub fn observe_blocked(&mut self, event: &InputEvent) {
+        if let InputEvent::PhysicalKey { code, state, .. } = event {
+            let code = code.usb_hid_usage();
+            if *state == frd_core::KeyState::Released {
+                self.quarantined_keys.remove(&code);
+                self.held_keys.remove(&code);
+            } else {
+                self.quarantined_keys.insert(code);
+            }
+        }
+    }
+    pub fn observe_blocked_pointer(&mut self, buttons: frd_core::PointerButtons) {
+        self.quarantined_buttons = buttons.any_pressed();
+        self.held_buttons = frd_core::PointerButtons::default();
+    }
+
     // 必须在 controller epoch 仍有效时调用；即使 ledger 未见按下，也释放协议侧状态。
     pub fn release(&mut self, c: &AppController) -> Option<SessionCommand> {
         self.quarantine_owned();
@@ -559,6 +557,55 @@ mod tests {
                 true
             )
             .is_some());
+    }
+    #[test]
+    fn blocked_local_release_clears_quarantine_before_fresh_press() {
+        let (mut c, mut i, session) = fixture();
+        c.handle_presentation(PresentationEvent::FramePresented {
+            session_id: session,
+            generation: 7,
+            revision: 1,
+            completeness: FrameCompleteness::FullBaseline,
+        });
+        let rev = i.revision;
+        let buttons = frd_core::PointerButtons {
+            primary: true,
+            ..Default::default()
+        };
+        assert!(i
+            .pointer(
+                &c,
+                session.get(),
+                7,
+                rev,
+                250.0,
+                200.0,
+                buttons,
+                Default::default()
+            )
+            .is_some());
+        i.release(&c);
+        assert!(i.quarantined_buttons);
+        i.observe_blocked_pointer(Default::default());
+        assert!(!i.quarantined_buttons);
+        assert!(i
+            .pointer(
+                &c,
+                session.get(),
+                7,
+                rev,
+                250.0,
+                200.0,
+                buttons,
+                Default::default()
+            )
+            .is_some());
+        i.observe_blocked(&key(4, frd_core::KeyState::Pressed));
+        assert!(i.quarantined_keys.contains(&4));
+        i.observe_blocked(&key(4, frd_core::KeyState::Released));
+        assert!(!i.quarantined_keys.contains(&4));
+        i.observe_blocked(&key(5, frd_core::KeyState::Pressed));
+        assert!(i.quarantined_keys.contains(&5));
     }
     #[test]
     fn clip_panzoom_nonfinite_and_edges_share_transform() {

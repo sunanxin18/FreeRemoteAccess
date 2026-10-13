@@ -1,6 +1,7 @@
 // UI 线程只导入调用期密码；临时复制 volatile wipe，不保留/打印 NAPI payload。
 #include "app_bridge.h"
 #include "frd_ohos_app.h"
+#include "frd_ohos.h"
 #include <charconv>
 #include <cmath>
 #include <limits>
@@ -8,6 +9,7 @@
 #include <vector>
 namespace {
 uint64_t application = 0;
+float pointerDensity = 0;
 std::string sandbox;
 struct Text {
     std::vector<uint8_t> bytes;
@@ -128,13 +130,17 @@ napi_value Focus(napi_env env, napi_callback_info info) {
     return Code(env, frd_ohos_app_focus(application, foreground, focused, remote));
 }
 napi_value Geometry(napi_env env, napi_callback_info info) {
-    napi_value a[7];
+    napi_value a[8];
+    float density = 0;
     FrdOhosAppGeometry g{1, sizeof(FrdOhosAppGeometry), 0, 0, 0, 0, 0, 0, 1, 0, 0};
-    if (!Args(env, info, a, 7) || !U32(env, a[0], g.width) || !U32(env, a[1], g.height) ||
+    if (!Args(env, info, a, 8) || !U32(env, a[0], g.width) || !U32(env, a[1], g.height) ||
         !U32(env, a[2], g.content_width) || !U32(env, a[3], g.content_height) ||
-        !Float(env, a[4], g.scale) || !Float(env, a[5], g.pan_x) || !Float(env, a[6], g.pan_y))
+        !Float(env, a[4], g.scale) || !Float(env, a[5], g.pan_x) || !Float(env, a[6], g.pan_y) || !Float(env, a[7], density) || density <= 0 || density > 16)
         return Code(env, -2);
-    return Code(env, frd_ohos_app_geometry(application, &g));
+    const auto code = frd_ohos_app_geometry(application, &g);
+    // 与几何在同一 UI 线程发布；后续 native pointer 意图按 FIFO 使用此转换。
+    pointerDensity = code == 0 ? density : 0;
+    return Code(env, code);
 }
 napi_value Input(napi_env env, napi_callback_info info) {
     napi_value a[11];
@@ -175,6 +181,7 @@ void FrdAppCleanup() {
     if (application)
         frd_ohos_app_destroy(application);
     application = 0;
+    pointerDensity = 0;
     sandbox.clear();
 }
 void RegisterFrdApp(napi_env env, napi_value exports) {
@@ -191,4 +198,15 @@ void RegisterFrdApp(napi_env env, napi_value exports) {
         {"commitText", nullptr, CommitText, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"huksProbe", nullptr, Probe, nullptr, nullptr, nullptr, napi_default, nullptr}};
     napi_define_properties(env, exports, sizeof(d) / sizeof(d[0]), d);
+}
+
+int32_t FrdAppBindRenderer(uint64_t renderer) { return frd_ohos_app_bind_renderer(application, renderer); }
+
+void FrdAppRemoteFocus(bool foreground, bool focused) {
+    if (application) frd_ohos_app_focus(application, foreground, focused, focused);
+}
+int32_t FrdAppNativePointer(uint64_t local, float x, float y, uint32_t buttons, bool takeFocus, bool logical) {
+    if (!application || pointerDensity <= 0) return FRD_OHOS_INVALID_ARGUMENT;
+    const float factor = logical ? pointerDensity : 1.0F;
+    return frd_ohos_app_native_pointer(application, local, x * factor, y * factor, buttons, takeFocus ? 1 : 0);
 }

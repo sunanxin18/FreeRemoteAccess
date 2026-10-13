@@ -117,6 +117,15 @@ pub enum Command {
     },
     Geometry(ViewGeometry),
     Input(InputEpoch, InputEvent, bool),
+    NativePointer(
+        u64,
+        u64,
+        InputEpoch,
+        f32,
+        f32,
+        frd_core::PointerButtons,
+        bool,
+    ),
     Pointer(
         InputEpoch,
         f32,
@@ -124,8 +133,6 @@ pub enum Command {
         frd_core::PointerButtons,
         frd_core::WheelDelta,
     ),
-    // 只有实际 renderer 能提供此入口；ArkTS 没有 ready/epoch setter。
-    Presentation(PresentationEvent),
     Launch(BackgroundLaunchOutcome),
     Cleanup(BackgroundCleanupOutcome),
     Loaded(u64, Result<Option<SecretBuffer>, PlatformError>),
@@ -139,6 +146,7 @@ pub struct AppEngine {
     sender: SyncSender<Command>,
     snapshot: Arc<Mutex<Value>>,
     control: Arc<AtomicU64>,
+    renderer: Arc<Mutex<Option<Arc<crate::presentation::Link>>>>,
 }
 impl AppEngine {
     pub fn spawn(
@@ -153,6 +161,8 @@ impl AppEngine {
         ));
         let control = Arc::new(AtomicU64::new(0));
         let published = snapshot.clone();
+        let renderer = Arc::new(Mutex::new(None));
+        let owner_renderer = renderer.clone();
         let flags = control.clone();
         let tx = sender.clone();
         std::thread::Builder::new()
@@ -169,6 +179,9 @@ impl AppEngine {
                 );
                 let mut owner = Owner {
                     controller,
+                    renderer: owner_renderer,
+                    ready: None,
+                    remote_epoch: None,
                     host: SessionHost::new(factories, Arc::new(Wake), audio, loader),
                     catalog,
                     stores,
@@ -183,6 +196,25 @@ impl AppEngine {
                     probe: 0,
                     control: flags.clone(),
                 };
+                #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
+                {
+                    owner.command(Command::Edit(Edit {
+                        target: 1,
+                        address: "fixture.invalid".into(),
+                        port: 3389,
+                        username: "synthetic".into(),
+                        protocol: "auto".into(),
+                        remember: false,
+                    }));
+                    owner.command(Command::Password(SecretBuffer::from_text(
+                        "synthetic-no-network".into(),
+                    )));
+                    owner.command(Command::Submit {
+                        event: 1,
+                        composition: false,
+                        repeat: false,
+                    });
+                }
                 loop {
                     owner.apply_control();
                     // 关键 control 先于任何已排队成功事件；取消前认证 job 从未 admitted。
@@ -210,12 +242,67 @@ impl AppEngine {
             sender,
             snapshot,
             control,
+            renderer,
         })
+    }
+    pub(crate) fn native_pointer(
+        &self,
+        local: u64,
+        x: f32,
+        y: f32,
+        buttons: frd_core::PointerButtons,
+        focus: bool,
+    ) -> Result<(), i32> {
+        let link = self
+            .renderer
+            .lock()
+            .map_err(|_| crate::PANIC)?
+            .clone()
+            .ok_or(crate::NOT_ATTACHED)?;
+        let state = link.0.lock().map_err(|_| crate::PANIC)?;
+        if state.surface.local != local {
+            return Err(crate::STALE_GENERATION);
+        }
+        let lifecycle = state.surface.lifecycle;
+        let input = state
+            .epoch()
+            .map(|epoch| InputEpoch {
+                session: epoch.session.get(),
+                generation: epoch.remote,
+                revision: epoch.geometry,
+            })
+            .unwrap_or(InputEpoch {
+                session: 0,
+                generation: 0,
+                revision: state.geometry_revision,
+            });
+        drop(state);
+        self.send(Command::NativePointer(
+            local, lifecycle, input, x, y, buttons, focus,
+        ))
+    }
+    pub(crate) fn bind(&self, link: Arc<crate::presentation::Link>) -> Result<(), i32> {
+        let mut current = self.renderer.lock().map_err(|_| crate::PANIC)?;
+        if current.as_ref().is_some_and(|old| !Arc::ptr_eq(old, &link)) {
+            return Err(crate::INVALID_ARGUMENT);
+        }
+        link.0.lock().map_err(|_| crate::PANIC)?.bound = true;
+        *current = Some(link);
+        Ok(())
     }
     pub fn unregistered(root: PathBuf) -> Result<Self, i32> {
         Self::spawn(
             Stores::at(root),
-            vec![],
+            {
+                #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
+                {
+                    vec![Arc::new(crate::fixture::Factory) as Arc<dyn ProtocolFactory>]
+                }
+                #[cfg(not(all(debug_assertions, feature = "native-presentation-fixture")))]
+                {
+                    vec![]
+                }
+            },
             Arc::new(|_| {
                 Err(frd_media_api::VideoDecodeError::new(
                     frd_media_api::VideoDecodeErrorCode::BackendUnavailable,
@@ -227,7 +314,7 @@ impl AppEngine {
     pub fn send(&self, command: Command) -> Result<(), i32> {
         let recovery = match &command {
             Command::Edit(_) | Command::Password(_) => FORM_INVALID,
-            Command::Input(..) | Command::Pointer(..) => FOCUS_LOST,
+            Command::Input(..) | Command::Pointer(..) | Command::NativePointer(..) => FOCUS_LOST,
             _ => 0,
         };
         let revision = self.control.load(Ordering::Acquire) / CONTROL_REVISION;
@@ -268,6 +355,9 @@ struct PendingLoad {
     timed_out: bool,
 }
 struct Owner {
+    renderer: Arc<Mutex<Option<Arc<crate::presentation::Link>>>>,
+    ready: Option<crate::presentation::Epoch>,
+    remote_epoch: Option<(frd_core::SessionId, u64)>,
     controller: AppController,
     host: SessionHost,
     catalog: ProtocolCatalog,
@@ -319,6 +409,7 @@ impl Owner {
     }
     fn cancel(&mut self) {
         self.release();
+        self.clear_remote();
         if self.host.launch_is_pending() {
             self.host.cancel_pending_launch();
             self.cancelled_launch = true;
@@ -352,7 +443,8 @@ impl Owner {
             intent,
             AppIntent::CancelConnect | AppIntent::Disconnect | AppIntent::ReturnToConnection
         ) {
-            self.release()
+            self.release();
+            self.clear_remote();
         }
         match self
             .controller
@@ -384,6 +476,7 @@ impl Owner {
     }
     fn command(&mut self, c: Command) {
         self.apply_control();
+        self.sync_presentation(false);
         let c = if let Command::Queued(revision, command) = c {
             let control = self.control.load(Ordering::Acquire);
             // 已接受的身份/密码编辑按 FIFO 落实；远程焦点屏障不能丢弃用户输入。
@@ -516,6 +609,10 @@ impl Owner {
                 self.send(c)
             }
             Command::Input(e, event, pressed) => {
+                if !self.input_ready() {
+                    self.input.observe_blocked(&event);
+                    return;
+                }
                 let c = self.input.route(
                     &self.controller,
                     e.session,
@@ -526,7 +623,41 @@ impl Owner {
                 );
                 self.send(c)
             }
+            Command::NativePointer(local, lifecycle, input, x, y, buttons, take_focus) => {
+                if !self.input_ready() {
+                    self.input.observe_blocked_pointer(buttons);
+                    return;
+                }
+                if self.ready.is_none_or(|e| {
+                    e.local != local
+                        || e.lifecycle != lifecycle
+                        || e.session.get() != input.session
+                        || e.remote != input.generation
+                        || e.geometry != input.revision
+                }) {
+                    return;
+                }
+                let epoch = self.ready.unwrap();
+                if take_focus {
+                    self.focus(true, true, true);
+                }
+                let command = self.input.pointer(
+                    &self.controller,
+                    epoch.session.get(),
+                    epoch.remote,
+                    epoch.geometry,
+                    x,
+                    y,
+                    buttons,
+                    Default::default(),
+                );
+                self.send(command);
+            }
             Command::Pointer(e, x, y, buttons, wheel) => {
+                if !self.input_ready() {
+                    self.input.observe_blocked_pointer(buttons);
+                    return;
+                }
                 let c = self.input.pointer(
                     &self.controller,
                     e.session,
@@ -539,7 +670,6 @@ impl Owner {
                 );
                 self.send(c)
             }
-            Command::Presentation(e) => self.controller.handle_presentation(e),
             Command::Loaded(id, result) => {
                 if let Some(p) = self.pending.remove(&id) {
                     if !p.timed_out && Instant::now() <= p.deadline {
@@ -608,6 +738,129 @@ impl Owner {
         for (s, e) in self.host.drain_session_events() {
             self.runtime_event(s, e);
         }
+        self.sync_presentation(true);
+    }
+    fn clear_remote(&mut self) {
+        self.ready = None;
+        self.remote_epoch = None;
+        self.input.remote = None;
+        if let Some(link) = self.renderer.lock().ok().and_then(|r| r.clone()) {
+            if let Ok(mut state) = link.0.lock() {
+                state.session = None;
+                state.batch = None;
+                state.feedback = None;
+                state.busy = false;
+            }
+        }
+    }
+    fn input_ready(&self) -> bool {
+        let Some(ready) = self.ready else {
+            return false;
+        };
+        if self.controller.interactive_input_epoch() != Some((ready.session, ready.remote)) {
+            return false;
+        }
+        self.renderer
+            .lock()
+            .ok()
+            .and_then(|r| r.clone())
+            .is_some_and(|link| {
+                link.0
+                    .lock()
+                    .ok()
+                    .is_some_and(|s| s.ready_epoch() == Some(ready))
+            })
+    }
+    fn sync_presentation(&mut self, drain: bool) {
+        let Some(link) = self.renderer.lock().ok().and_then(|r| r.clone()) else {
+            return;
+        };
+        let (feedback, eligible, failed) = {
+            let Ok(mut state) = link.0.lock() else {
+                return;
+            };
+            state.session = self.remote_epoch;
+            state.geometry = self.input.geometry;
+            state.geometry_revision = self.input.revision;
+            state.remote_size = self.input.remote;
+            let feedback = state.feedback.take();
+            if feedback.is_some() {
+                state.busy = false;
+            }
+            (feedback, state.ready_epoch(), state.failure)
+        };
+        if self.ready.is_some() && self.ready != eligible {
+            self.release();
+            self.ready = None;
+        }
+        if failed.is_some() {
+            self.release();
+            self.ready = None;
+            self.notice = Some("原生呈现失败，请重新启动应用");
+            if let Some((session, _)) = self.remote_epoch {
+                self.runtime_event(
+                    session,
+                    SessionEvent::Error(ProtocolError::adapter(
+                        ProtocolId::rdp(),
+                        "native_presentation_failed",
+                    )),
+                );
+                self.clear_remote();
+            }
+            return;
+        }
+        if let Some(crate::presentation::Feedback {
+            epoch,
+            event: Some(event),
+        }) = feedback
+        {
+            if eligible == Some(epoch) {
+                if let PresentationEvent::FramePresented {
+                    session_id,
+                    generation,
+                    completeness,
+                    ..
+                } = &event
+                {
+                    if *session_id == epoch.session
+                        && *generation == epoch.remote
+                        && *completeness == frd_frame::FrameCompleteness::FullBaseline
+                    {
+                        self.controller.handle_presentation(event);
+                        if self.controller.interactive_input_epoch()
+                            == Some((epoch.session, epoch.remote))
+                        {
+                            self.ready = Some(epoch);
+                        }
+                    }
+                }
+            }
+        }
+        if !drain || eligible.is_none() {
+            return;
+        }
+        let can_drain = link
+            .0
+            .lock()
+            .ok()
+            .is_some_and(|s| !s.busy && s.batch.is_none() && s.feedback.is_none());
+        if !can_drain {
+            return;
+        }
+        match self.host.drain_frame_transactions() {
+            Ok(batch) => {
+                let batch = batch.into_transactions();
+                if batch.is_empty() {
+                    return;
+                }
+                // mailbox 自身有界；单批次槽使暂停/背压期间不继续排空生产者。
+                if let Ok(mut state) = link.0.lock() {
+                    state.batch = Some((eligible.unwrap(), batch));
+                    state.busy = true;
+                }
+            }
+            Err(_) => link.fail(crate::GPU_FAILED),
+        }
     }
     fn runtime_event(&mut self, s: frd_core::SessionId, e: SessionEvent) {
         if matches!(
@@ -642,8 +895,32 @@ impl Owner {
         if terminal {
             self.release()
         }
-        if let SessionEvent::SurfaceGenerationChanged { size, .. } = &e {
-            self.input.remote = Some(*size)
+        if let SessionEvent::SurfaceGenerationChanged {
+            session_id,
+            generation,
+            size,
+        } = &e
+        {
+            if *session_id == s
+                && self.host.active_session_id() == Some(s)
+                && self
+                    .remote_epoch
+                    .is_none_or(|(old, g)| old != s || *generation > g)
+            {
+                self.ready = None;
+                self.remote_epoch = Some((s, *generation));
+                self.input.remote = Some(*size);
+            }
+        }
+        if matches!(
+            e,
+            SessionEvent::Error(_)
+                | SessionEvent::Closed(_)
+                | SessionEvent::StageChanged(ConnectionStage::Disconnecting)
+        ) {
+            if self.remote_epoch.is_some_and(|(session, _)| session == s) {
+                self.clear_remote();
+            }
         }
         let success = matches!(
             e,
@@ -697,6 +974,9 @@ impl Owner {
         };
         let (status_code, status_message) = match self.controller.page() {
             Page::Failed { code, .. } => match code.as_str() {
+                "native_presentation_failed" => {
+                    ("native_presentation_failed", "原生呈现失败，请重新启动应用")
+                }
                 "rdp_server_identity_changed" => (
                     "rdp_server_identity_changed",
                     "服务器证书指纹已变化，已停止自动连接；请核实服务器身份",
@@ -734,6 +1014,7 @@ impl Owner {
             ProtocolChoice::Automatic => "auto".into(),
             ProtocolChoice::Explicit(p) => p.as_str().to_owned(),
         };
+        // 保留已建立的远端身份用于接收本地 key-up；发送仍由当前原生呈现证明门控。
         let epoch = self
             .controller
             .interactive_input_epoch()
@@ -752,6 +1033,24 @@ impl Owner {
             )
             .is_ok();
         let mut value = json!({"abiVersion":1,"initialized":true,"page":page,"target":match d.target_system{Some(TargetSystem::Windows)=>1,Some(TargetSystem::MacOs)=>2,Some(TargetSystem::Linux)=>3,_=>0},"address":d.address,"port":d.port.unwrap_or(0),"username":d.username,"protocol":protocol,"available":available,"session":epoch.0,"generation":epoch.1,"geometryRevision":self.input.revision.to_string(),"notice":self.notice.unwrap_or(""),"probe":self.probe});
+        #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
+        {
+            value["syntheticFixture"] = json!(true);
+            value["fixtureInputs"] = json!(crate::fixture::INPUTS.load(Ordering::Relaxed));
+            value["fixtureReleases"] = json!(crate::fixture::RELEASES.load(Ordering::Relaxed));
+        }
+        if let Some(link) = self.renderer.lock().ok().and_then(|r| r.clone()) {
+            if let Ok(s) = link.0.lock() {
+                #[cfg(all(
+                    debug_assertions,
+                    feature = "native-presentation-fixture",
+                    target_env = "ohos"
+                ))]
+                crate::fixture::observe(&s, self.ready.is_some() && s.ready_epoch() == self.ready);
+                value["nativePresentation"] = json!({"local":s.surface.local.to_string(),"lifecycle":s.surface.lifecycle.to_string(),"appliedBatches":s.applied,"presentedFrames":s.presented,"ready":self.ready.is_some() && s.ready_epoch()==self.ready,"failure":s.failure.unwrap_or(0)});
+            }
+        }
+        value["inputReady"] = json!(self.input_ready());
         value["statusCode"] = json!(status_code);
         value["statusMessage"] = json!(status_message);
         if let Page::ConnectionForm(f) = self.controller.page() {
@@ -875,6 +1174,9 @@ mod tests {
         );
         let (tx, _rx) = mpsc::sync_channel(64);
         Owner {
+            renderer: Arc::new(Mutex::new(None)),
+            ready: None,
+            remote_epoch: None,
             controller,
             host: SessionHost::new(
                 vec![],
@@ -916,6 +1218,242 @@ mod tests {
         );
         id
     }
+    fn presentation_owner() -> (Owner, frd_core::SessionId, Arc<crate::presentation::Link>) {
+        let (mut owner, session, _commits) = staged_owner();
+        owner.controller.handle_session_event_with_stores(
+            session,
+            SessionEvent::StageChanged(ConnectionStage::TransportReady),
+            owner.stores.borrow(),
+        );
+        owner.controller.handle_session_event_with_stores(
+            session,
+            SessionEvent::SurfaceGenerationChanged {
+                session_id: session,
+                generation: 1,
+                size: frd_core::PixelSize {
+                    width: 2,
+                    height: 2,
+                },
+            },
+            owner.stores.borrow(),
+        );
+        owner.remote_epoch = Some((session, 1));
+        owner.input.remote = Some(frd_core::PixelSize {
+            width: 2,
+            height: 2,
+        });
+        owner.input.geometry = Some(ViewGeometry {
+            drawable: frd_core::PixelSize {
+                width: 100,
+                height: 100,
+            },
+            bounds: frd_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            scale: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+        });
+        let link = Arc::new(crate::presentation::Link::default());
+        link.surface(crate::PocStatus {
+            surface_generation: 1,
+            width: 100,
+            height: 100,
+            attached: 1,
+            foreground: 1,
+            ..Default::default()
+        });
+        link.0.lock().unwrap().bound = true;
+        *owner.renderer.lock().unwrap() = Some(link.clone());
+        owner.sync_presentation(false);
+        (owner, session, link)
+    }
+    fn feedback(
+        link: &crate::presentation::Link,
+        epoch: crate::presentation::Epoch,
+        completeness: frd_frame::FrameCompleteness,
+    ) {
+        link.0.lock().unwrap().feedback = Some(crate::presentation::Feedback {
+            epoch,
+            event: Some(PresentationEvent::FramePresented {
+                session_id: epoch.session,
+                generation: epoch.remote,
+                revision: 1,
+                completeness,
+            }),
+        });
+    }
+    #[test]
+    fn only_actual_current_full_receipt_opens_local_input_and_lifecycle_rejects_late_feedback() {
+        let (mut owner, _, link) = presentation_owner();
+        let epoch = link.0.lock().unwrap().epoch().unwrap();
+        assert!(!owner.input_ready());
+        feedback(&link, epoch, frd_frame::FrameCompleteness::Incremental);
+        owner.sync_presentation(false);
+        assert!(!owner.input_ready());
+        for stale in [
+            crate::presentation::Epoch {
+                session: frd_core::SessionId::allocate(),
+                ..epoch
+            },
+            crate::presentation::Epoch { remote: 2, ..epoch },
+            crate::presentation::Epoch { local: 2, ..epoch },
+            crate::presentation::Epoch {
+                geometry: 2,
+                ..epoch
+            },
+        ] {
+            feedback(&link, stale, frd_frame::FrameCompleteness::FullBaseline);
+            owner.sync_presentation(false);
+            assert!(!owner.input_ready());
+        }
+        feedback(&link, epoch, frd_frame::FrameCompleteness::FullBaseline);
+        owner.sync_presentation(false);
+        assert!(owner.input_ready());
+        for mode in 0..3 {
+            let old = link.0.lock().unwrap().epoch().unwrap();
+            link.surface(crate::PocStatus {
+                surface_generation: 1,
+                width: 100,
+                height: 100,
+                attached: u32::from(mode != 0),
+                foreground: u32::from(mode != 1),
+                ..Default::default()
+            });
+            assert!(!owner.input_ready());
+            feedback(&link, old, frd_frame::FrameCompleteness::FullBaseline);
+            owner.sync_presentation(false);
+            assert!(!owner.input_ready());
+            link.surface(crate::PocStatus {
+                surface_generation: 2,
+                width: 100,
+                height: 100,
+                attached: 1,
+                foreground: 1,
+                ..Default::default()
+            });
+            owner.sync_presentation(false);
+            let new = link.0.lock().unwrap().epoch().unwrap();
+            feedback(&link, new, frd_frame::FrameCompleteness::FullBaseline);
+            owner.sync_presentation(false);
+            assert!(owner.input_ready());
+        }
+        owner.clear_remote();
+        assert!(!owner.input_ready());
+        feedback(&link, epoch, frd_frame::FrameCompleteness::FullBaseline);
+        owner.sync_presentation(false);
+        assert!(!owner.input_ready());
+    }
+    #[test]
+    fn native_failure_is_visible_terminal_and_old_feedback_cannot_reopen() {
+        let (mut owner, _, link) = presentation_owner();
+        let epoch = link.0.lock().unwrap().epoch().unwrap();
+        feedback(&link, epoch, frd_frame::FrameCompleteness::FullBaseline);
+        owner.sync_presentation(false);
+        assert!(owner.input_ready());
+        link.fail(crate::GPU_FAILED);
+        owner.sync_presentation(false);
+        assert!(!owner.input_ready());
+        assert!(owner.remote_epoch.is_none());
+        assert_eq!(owner.snapshot()["statusCode"], "native_presentation_failed");
+        feedback(&link, epoch, frd_frame::FrameCompleteness::FullBaseline);
+        owner.sync_presentation(false);
+        assert!(!owner.input_ready());
+    }
+    #[test]
+    fn real_mailbox_compiler_drains_only_one_owned_batch_until_feedback() {
+        use frd_frame::{
+            FrameCompleteness, FrameMailbox, PixelBuffer, PixelFormat, PixelPatch, SurfaceUpdate,
+        };
+        let (mut owner, session, link) = presentation_owner();
+        let mailbox = Arc::new(Mutex::new(FrameMailbox::new(8, 128)));
+        owner
+            .host
+            .attach_frame_test_mailbox(session, mailbox.clone());
+        mailbox.lock().unwrap().push(SurfaceUpdate::Reset {
+            session_id: session,
+            generation: 1,
+            size: frd_core::PixelSize {
+                width: 2,
+                height: 2,
+            },
+            format: PixelFormat::Bgrx8UnormSrgb,
+        });
+        let push = |revision| {
+            let mut mailbox = mailbox.lock().unwrap();
+            mailbox.push(SurfaceUpdate::Damage {
+                session_id: session,
+                generation: 1,
+                revision,
+                patches: vec![PixelPatch {
+                    rect: frd_core::PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 2,
+                    },
+                    stride_bytes: 8,
+                    pixels: PixelBuffer::new(vec![0; 16]),
+                }],
+            });
+            mailbox.push(SurfaceUpdate::FrameBoundary {
+                session_id: session,
+                generation: 1,
+                revision,
+                completeness: if revision == 1 {
+                    FrameCompleteness::FullBaseline
+                } else {
+                    FrameCompleteness::Incremental
+                },
+            });
+        };
+        push(1);
+        owner.sync_presentation(true);
+        assert!(link.0.lock().unwrap().batch.is_some());
+        push(2);
+        owner.sync_presentation(true);
+        assert_eq!(mailbox.lock().unwrap().len(), 2);
+        link.surface(crate::PocStatus {
+            surface_generation: 1,
+            width: 100,
+            height: 100,
+            attached: 0,
+            foreground: 1,
+            ..Default::default()
+        });
+        owner.sync_presentation(true);
+        assert_eq!(mailbox.lock().unwrap().len(), 2);
+        let mut state = link.0.lock().unwrap();
+        let (_, batch) = state.batch.take().unwrap();
+        assert!(matches!(
+            batch.as_slice(),
+            [frd_frame::FrameTransaction::Startup { .. }]
+        ));
+        state.feedback = Some(crate::presentation::Feedback {
+            epoch: state.epoch().unwrap(),
+            event: None,
+        });
+        drop(state);
+        owner.sync_presentation(true);
+        assert_eq!(mailbox.lock().unwrap().len(), 2);
+        link.surface(crate::PocStatus {
+            surface_generation: 2,
+            width: 100,
+            height: 100,
+            attached: 1,
+            foreground: 1,
+            ..Default::default()
+        });
+        owner.sync_presentation(true);
+        assert_eq!(mailbox.lock().unwrap().len(), 0);
+        assert!(
+            matches!(link.0.lock().unwrap().batch.as_ref().unwrap().1.as_slice(), [frd_frame::FrameTransaction::Revision { revision, .. }] if revision.revision==2)
+        );
+    }
+
     #[test]
     fn stale_password_result_after_edit_and_timeout_are_wiped_not_reselected() {
         let mut o = owner();
@@ -999,6 +1537,7 @@ mod tests {
         let (tx, _rx) = mpsc::sync_channel(1);
         let e = AppEngine {
             sender: tx,
+            renderer: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(Mutex::new(json!({}))),
             control: Arc::new(AtomicU64::new(0)),
         };
@@ -1031,6 +1570,7 @@ mod tests {
             let (sender, receiver) = mpsc::sync_channel(4);
             let e = AppEngine {
                 sender,
+                renderer: Arc::new(Mutex::new(None)),
                 snapshot: Arc::new(Mutex::new(json!({}))),
                 control: o.control.clone(),
             };
@@ -1060,6 +1600,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         let e = AppEngine {
             sender,
+            renderer: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(Mutex::new(json!({}))),
             control: o.control.clone(),
         };
@@ -1261,6 +1802,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(4);
         let e = AppEngine {
             sender: tx,
+            renderer: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(Mutex::new(json!({}))),
             control: o.control.clone(),
         };

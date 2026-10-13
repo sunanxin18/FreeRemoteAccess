@@ -34,6 +34,8 @@ int32_t frd_ohos_set_foreground(uint64_t engine, uint32_t foreground);
 /* 仅开发图形 POC。bounded 非阻塞 tick，无像素数组/协议/秘密。 */
 int32_t frd_ohos_poc_tick(uint64_t engine, uint64_t surface_generation);
 int32_t frd_ohos_poc_status(uint64_t engine, FrdOhosPocStatus *out_status);
+int32_t frd_ohos_app_bind_renderer(uint64_t app, uint64_t renderer);
+int32_t frd_ohos_app_native_pointer(uint64_t app, uint64_t local, float x, float y, uint32_t buttons, uint32_t take_focus);
 #ifdef __cplusplus
 }
 #endif

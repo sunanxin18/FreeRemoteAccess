@@ -8,6 +8,9 @@ struct ComponentState {
     uint64_t generation = 0;
     void *borrowedWindow = nullptr;
     bool ticks = false;
+    bool remote = false;
+    bool touchBlocked = false;
+    uint32_t mouseButtons = 0;
     int32_t bridgeError = FRD_OHOS_OK;
 
     void FrameRegistrationCompleted(bool registered) {
@@ -15,6 +18,7 @@ struct ComponentState {
         if (!registered) bridgeError = FRD_OHOS_GPU_FAILED;
     }
     void BeginAttach() {
+        mouseButtons = 0; touchBlocked = false;
         ticks = false;
         bridgeError = FRD_OHOS_OK;
     }

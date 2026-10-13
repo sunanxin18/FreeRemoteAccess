@@ -399,6 +399,146 @@ mod limits_request_tests {
         wgpu::Instance::new(descriptor)
     }
     #[test]
+    fn transformed_letterbox_and_fractional_negative_pan_are_pixel_bounded() {
+        use frd_core::{ContentViewport, PixelRect, PixelSize, SessionId, TransformedViewport};
+        use frd_frame::{
+            FrameCompleteness, FrameReset, FrameRevision, FrameTransaction, PixelBuffer,
+            PixelFormat, PixelPatch,
+        };
+        let context = pollster::block_on(GpuContext::request(instance(), None)).unwrap();
+        let mut renderer = super::RemoteRenderer::new(context.clone()).unwrap();
+        let session = SessionId::allocate();
+        let remote = PixelSize::new(4, 2).unwrap();
+        renderer
+            .apply_update_batch(vec![FrameTransaction::Startup {
+                earliest_constituent_enqueue_at: std::time::Instant::now(),
+                reset: FrameReset {
+                    session_id: session,
+                    generation: 1,
+                    size: remote,
+                    format: PixelFormat::Bgrx8UnormSrgb,
+                },
+                revision: FrameRevision {
+                    session_id: session,
+                    generation: 1,
+                    revision: 1,
+                    completeness: FrameCompleteness::FullBaseline,
+                    patches: vec![PixelPatch {
+                        rect: PixelRect {
+                            x: 0,
+                            y: 0,
+                            width: 4,
+                            height: 2,
+                        },
+                        stride_bytes: 16,
+                        pixels: PixelBuffer::new([0, 0, 255, 0].repeat(8)),
+                    }],
+                },
+            }])
+            .unwrap();
+        let drawable = PixelSize::new(8, 8).unwrap();
+        let base = ContentViewport::fit(remote, drawable);
+        let full = PixelRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let variants = [
+            TransformedViewport::new(base, full, 1.0, [0.0; 2]).unwrap(),
+            TransformedViewport::new(
+                base,
+                PixelRect {
+                    x: 2,
+                    y: 1,
+                    width: 4,
+                    height: 6,
+                },
+                1.5,
+                [-2.25, 0.25],
+            )
+            .unwrap(),
+        ];
+        for viewport in variants {
+            let target = context.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("远端 letterbox 像素回读"),
+                size: wgpu::Extent3d {
+                    width: 8,
+                    height: 8,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = target.create_view(&Default::default());
+            let readback = context.device().create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256 * 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = context.device().create_command_encoder(&Default::default());
+            renderer
+                .record_transformed(
+                    &mut encoder,
+                    &view,
+                    Some(viewport),
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                )
+                .unwrap();
+            encoder.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(8),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 8,
+                    height: 8,
+                    depth_or_array_layers: 1,
+                },
+            );
+            context.queue().submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+            context
+                .device()
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            rx.recv().unwrap().unwrap();
+            let bytes = readback.slice(..).get_mapped_range().unwrap();
+            for y in 0..8 {
+                for x in 0..8 {
+                    let visible = viewport
+                        .map_pointer(x as f32 + 0.5, y as f32 + 0.5)
+                        .is_some();
+                    let expected = if visible {
+                        [255, 0, 0, 255]
+                    } else {
+                        [0, 0, 0, 255]
+                    };
+                    assert_eq!(
+                        &bytes[y * 256 + x * 4..y * 256 + x * 4 + 4],
+                        &expected,
+                        "pixel ({x},{y}), viewport {viewport:?}"
+                    );
+                }
+            }
+            drop(bytes);
+            readback.unmap();
+        }
+    }
+    #[test]
     fn limits_policy_rejects_impossible_texture_size_before_renderer_creation() {
         let result = pollster::block_on(GpuContext::request_with_limits(
             instance(),

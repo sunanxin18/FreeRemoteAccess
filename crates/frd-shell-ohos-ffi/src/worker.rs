@@ -15,6 +15,17 @@ pub(crate) trait Backend {
     fn pause(&mut self);
     fn render_poc(&mut self) -> Result<bool, i32>;
     fn detach(&mut self);
+    fn reset_remote(&mut self) {}
+    fn apply(&mut self, _: Vec<frd_frame::FrameTransaction>) -> Result<(), i32> {
+        Err(UNSUPPORTED_PLATFORM)
+    }
+    fn render_remote(
+        &mut self,
+        _: frd_core::TransformedViewport,
+        _: bool,
+    ) -> Result<Option<frd_protocol_api::PresentationEvent>, i32> {
+        Err(UNSUPPORTED_PLATFORM)
+    }
 }
 #[cfg(not(target_env = "ohos"))]
 pub(crate) struct UnavailableBackend;
@@ -59,6 +70,7 @@ struct Gate {
 pub(crate) struct Engine {
     gate: Mutex<Gate>,
     status: Arc<Mutex<PocStatus>>,
+    pub(crate) link: Arc<crate::presentation::Link>,
 }
 impl Engine {
     pub(crate) fn spawn(
@@ -70,6 +82,8 @@ impl Engine {
             ..Default::default()
         }));
         let published = status.clone();
+        let link = Arc::new(crate::presentation::Link::default());
+        let worker_link = link.clone();
         let join = thread::Builder::new()
             .name("frd-ohos-render".into())
             .spawn(move || {
@@ -84,37 +98,104 @@ impl Engine {
                             ..Default::default()
                         },
                     });
-                    for message in receiver {
-                        let shutdown = matches!(message.command, Command::Shutdown);
-                        // reply 留在 unwind 作用域外；异常路径也先清理 owned 窗口再 ack。
-                        let executed = catch_unwind(AssertUnwindSafe(|| {
-                            state.as_mut().unwrap().execute(message.command)
+                    let mut consumer = crate::presentation::Consumer::default();
+                    loop {
+                        let message =
+                            match receiver.recv_timeout(std::time::Duration::from_millis(15)) {
+                                Ok(m) => Some(m),
+                                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(_) => break,
+                            };
+                        if let Some(message) = message {
+                            let lifecycle = !matches!(message.command, Command::Tick(_));
+                            let shutdown = matches!(message.command, Command::Shutdown);
+                            if lifecycle {
+                                if let Ok(mut shared) = worker_link.0.lock() {
+                                    shared.surface.lifecycle =
+                                        shared.surface.lifecycle.saturating_add(1);
+                                    shared.surface.attached = false;
+                                }
+                            }
+                            // reply 留在 unwind 作用域外；异常路径也先清理 owned 窗口再 ack。
+                            let executed = catch_unwind(AssertUnwindSafe(|| {
+                                let bound = worker_link.0.lock().map_err(|_| PANIC)?.bound;
+                                if bound && matches!(message.command, Command::Tick(_)) {
+                                    return Ok(0);
+                                }
+                                state.as_mut().unwrap().execute(message.command)
+                            }));
+                            let panicked = executed.is_err();
+                            let outcome = executed.unwrap_or(Err(PANIC));
+                            if panicked {
+                                let _ = catch_unwind(AssertUnwindSafe(|| drop(state.take())));
+                                if let Ok(mut shared) = published.lock() {
+                                    shared.last_error = PANIC;
+                                    shared.attached = 0;
+                                }
+                            } else if let Some(state) = &mut state {
+                                if let Err(code) = outcome {
+                                    state.status.last_error = code;
+                                }
+                                if let Ok(mut shared) = published.lock() {
+                                    *shared = state.status;
+                                }
+                            }
+                            if lifecycle {
+                                if let Some(state) = &state {
+                                    worker_link.surface(state.status);
+                                }
+                            }
+                            if panicked {
+                                worker_link.fail(PANIC);
+                            }
+                            if let Err(
+                                code @ (GPU_FAILED
+                                | PANIC
+                                | WINDOW_REFERENCE_FAILED
+                                | WORKER_STOPPED),
+                            ) = outcome
+                            {
+                                worker_link.fail(code);
+                            }
+                            if let Some(reply) = message.reply {
+                                let _ = reply.send(outcome);
+                            }
+                            if shutdown || panicked {
+                                break;
+                            }
+                        }
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            consumer.poll(&worker_link, state.as_mut().unwrap().backend.as_mut())
                         }));
-                        let panicked = executed.is_err();
-                        let outcome = executed.unwrap_or(Err(PANIC));
-                        if panicked {
-                            let _ = catch_unwind(AssertUnwindSafe(|| drop(state.take())));
-                            if let Ok(mut shared) = published.lock() {
-                                shared.last_error = PANIC;
-                                shared.attached = 0;
+                        match result {
+                            Ok(Ok(true)) => {
+                                if let Some(state) = &mut state {
+                                    state.status.presented_frames += 1;
+                                    if let Ok(mut shared) = published.lock() {
+                                        *shared = state.status;
+                                    }
+                                }
                             }
-                        } else if let Some(state) = &mut state {
-                            if let Err(code) = outcome {
-                                state.status.last_error = code;
+                            Ok(Ok(false)) => {}
+                            Ok(Err(code)) => {
+                                worker_link.fail(code);
+                                if let Ok(mut shared) = published.lock() {
+                                    shared.last_error = code;
+                                }
                             }
-                            if let Ok(mut shared) = published.lock() {
-                                *shared = state.status;
+                            Err(_) => {
+                                worker_link.fail(PANIC);
+                                if let Ok(mut shared) = published.lock() {
+                                    shared.last_error = PANIC;
+                                    shared.attached = 0;
+                                }
+                                break;
                             }
-                        }
-                        if let Some(reply) = message.reply {
-                            let _ = reply.send(outcome);
-                        }
-                        if shutdown || panicked {
-                            break;
                         }
                     }
                 }));
                 if result.is_err() {
+                    worker_link.fail(PANIC);
                     if let Ok(mut shared) = published.lock() {
                         shared.last_error = PANIC;
                         shared.attached = 0;
@@ -128,6 +209,7 @@ impl Engine {
                 join: Some(join),
             }),
             status,
+            link,
         })
     }
     pub(crate) fn call(&self, command: Command) -> Result<u64, i32> {

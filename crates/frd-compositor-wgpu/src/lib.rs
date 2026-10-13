@@ -1,3 +1,4 @@
+use frd_core::TransformedViewport;
 mod state;
 mod surface;
 
@@ -185,7 +186,7 @@ where
         action: AcquisitionAction,
         remote: &'a mut RemoteRenderer,
         texture: wgpu::SurfaceTexture,
-        viewport: Option<ContentViewport>,
+        viewport: Option<TransformedViewport>,
         explicit_viewport: bool,
         physical_size: PixelSize,
         target_format: wgpu::TextureFormat,
@@ -202,7 +203,7 @@ where
                     label: Some("FreeRemoteDesk presentation encoder"),
                 });
         let receipt = if explicit_viewport {
-            remote.record_in(&mut encoder, &view, viewport, target_format)?
+            remote.record_transformed(&mut encoder, &view, viewport, target_format)?
         } else {
             remote.record(&mut encoder, &view, physical_size, target_format)?
         };
@@ -493,7 +494,19 @@ impl PresentationCompositor {
         overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
         hooks: &dyn PresentationHooks,
     ) -> Result<Option<PresentationEvent>, PresentError> {
-        self.render_with_viewport(remote, viewport, true, overlay, hooks)
+        self.render_with_viewport(
+            remote,
+            viewport
+                .map(|v| {
+                    TransformedViewport::new(v, v.content, 1.0, [0.0; 2]).ok_or(
+                        PresentError::Renderer(frd_render_wgpu::RendererError::InvalidGeometry),
+                    )
+                })
+                .transpose()?,
+            true,
+            overlay,
+            hooks,
+        )
     }
 
     pub fn render_video(
@@ -592,10 +605,20 @@ impl PresentationCompositor {
         }
     }
 
+    pub fn render_transformed(
+        &mut self,
+        remote: &mut RemoteRenderer,
+        viewport: Option<TransformedViewport>,
+        overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+        hooks: &dyn PresentationHooks,
+    ) -> Result<Option<PresentationEvent>, PresentError> {
+        self.render_with_viewport(remote, viewport, true, overlay, hooks)
+    }
+
     fn render_with_viewport(
         &mut self,
         remote: &mut RemoteRenderer,
-        viewport: Option<ContentViewport>,
+        viewport: Option<TransformedViewport>,
         explicit_viewport: bool,
         overlay: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
         hooks: &dyn PresentationHooks,
@@ -608,6 +631,11 @@ impl PresentationCompositor {
         let Some(physical_size) = self.size_state.active() else {
             return Ok(None);
         };
+        if viewport.is_some_and(|v| v.base().drawable != physical_size) {
+            return Err(PresentError::Renderer(
+                frd_render_wgpu::RendererError::InvalidGeometry,
+            ));
+        }
         let target_format = self
             .configuration
             .as_ref()

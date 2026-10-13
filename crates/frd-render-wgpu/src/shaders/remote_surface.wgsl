@@ -10,20 +10,10 @@ var remote_texture: texture_2d<f32>;
 var remote_sampler: sampler;
 
 @vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    let positions = array(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(3.0, -1.0),
-        vec2<f32>(-1.0, 3.0),
-    );
-    let tex_coords = array(
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(2.0, 1.0),
-        vec2<f32>(0.0, -1.0),
-    );
+fn vs_main(@location(0) position: vec2<f32>, @location(1) tex_coord: vec2<f32>) -> VertexOutput {
     var output: VertexOutput;
-    output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    output.tex_coord = tex_coords[vertex_index];
+    output.position = vec4<f32>(position, 0.0, 1.0);
+    output.tex_coord = tex_coord;
     return output;
 }
 

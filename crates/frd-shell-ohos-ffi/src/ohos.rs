@@ -4,7 +4,7 @@ use frd_compositor_wgpu::{
     PresentationCompositor, PresentationHooks, PresentationSurface, PresentationSurfaceLease,
 };
 use frd_core::PixelSize;
-use frd_render_wgpu::RemoteRenderer;
+use frd_render_wgpu::{GpuContext, RemoteRenderer};
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, OhosDisplayHandle,
     OhosNdkWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
@@ -107,34 +107,53 @@ impl PresentationHooks for Hooks {
         self.0.set(true);
     }
 }
+struct Resident {
+    context: GpuContext,
+    remote: RemoteRenderer,
+}
 struct Graphics {
     compositor: PresentationCompositor,
-    remote: RemoteRenderer,
+    resident: Option<Resident>,
     pipeline: wgpu::RenderPipeline,
     // 额外保留 lease，确保 remote/pipeline/context 全部销毁后才最终 unref。
     lease: Arc<NativeWindowLease>,
 }
 impl Graphics {
-    fn create(lease: Arc<NativeWindowLease>, width: u32, height: u32) -> Result<Self, i32> {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = wgpu::Backends::GL;
-        // 当前官方模拟器 libdgles 在 EGL debug context 的
-        // d_eglCreateDebugMessageBuffer 崩溃。只关闭驱动 debug context，保留
-        // wgpu VALIDATION、错误作用域与 device-lost 检测；真机尚未验证。
-        descriptor.flags.remove(wgpu::InstanceFlags::DEBUG);
-        let instance = wgpu::Instance::new(descriptor);
-        let surface =
-            PresentationSurface::create(&instance, PresentationSurfaceLease::new(lease.clone()))
-                .map_err(|error| gpu_error("surface-create", error))?;
-        let context = pollster::block_on(
-            surface.request_gpu_context_with_limits(instance, crate::limits::renderer_limits),
-        )
-        .map_err(|error| gpu_error("gpu-request", error))?;
+    fn create(
+        lease: Arc<NativeWindowLease>,
+        width: u32,
+        height: u32,
+        resident: Option<Resident>,
+    ) -> Result<Self, i32> {
+        let (surface, resident) = if let Some(resident) = resident {
+            let surface = PresentationSurface::create(
+                resident.context.instance(),
+                PresentationSurfaceLease::new(lease.clone()),
+            )
+            .map_err(|_| GPU_FAILED)?;
+            (surface, resident)
+        } else {
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = wgpu::Backends::GL;
+            // 官方模拟器 debug EGL context 不可用；保留验证及 device-lost 观察。
+            descriptor.flags.remove(wgpu::InstanceFlags::DEBUG);
+            let instance = wgpu::Instance::new(descriptor);
+            let surface = PresentationSurface::create(
+                &instance,
+                PresentationSurfaceLease::new(lease.clone()),
+            )
+            .map_err(|error| gpu_error("surface-create", error))?;
+            let context = pollster::block_on(
+                surface.request_gpu_context_with_limits(instance, crate::limits::renderer_limits),
+            )
+            .map_err(|error| gpu_error("gpu-request", error))?;
+            let remote = RemoteRenderer::new(context.clone()).map_err(|_| GPU_FAILED)?;
+            (surface, Resident { context, remote })
+        };
+        let context = &resident.context;
         let compositor =
             PresentationCompositor::new(surface, context.clone(), PixelSize { width, height })
-                .map_err(|error| gpu_error("surface-configure", error))?;
-        let remote = RemoteRenderer::new(context.clone())
-            .map_err(|error| gpu_error("renderer-create", error))?;
+                .map_err(|_| GPU_FAILED)?;
         // 明确的离线图形 POC；没有 SessionId、网络帧或伪造 FramePresented。
         let module = context
             .device()
@@ -171,7 +190,7 @@ impl Graphics {
             });
         Ok(Self {
             compositor,
-            remote,
+            resident: Some(resident),
             pipeline,
             lease,
         })
@@ -179,7 +198,6 @@ impl Graphics {
     fn detach(&mut self) {
         self.compositor.pause_presenting();
         self.compositor.detach();
-        self.remote.detach();
     }
 }
 impl Drop for Graphics {
@@ -191,13 +209,19 @@ impl Drop for Graphics {
 #[derive(Default)]
 pub(crate) struct OhosBackend {
     graphics: Option<Graphics>,
+    retained: Option<Resident>,
 }
 impl Backend for OhosBackend {
     fn attach(&mut self, window: usize, width: u32, height: u32) -> Result<(), i32> {
         self.detach();
         // SAFETY: worker 的同步 attach 调用期间借用仍有效。
         let lease = unsafe { NativeWindowLease::acquire(window)? };
-        self.graphics = Some(Graphics::create(lease, width, height)?);
+        self.graphics = Some(Graphics::create(
+            lease,
+            width,
+            height,
+            self.retained.take(),
+        )?);
         Ok(())
     }
     fn resize(&mut self, width: u32, height: u32) -> Result<(), i32> {
@@ -220,7 +244,7 @@ impl Backend for OhosBackend {
         graphics
             .compositor
             .render(
-                &mut graphics.remote,
+                &mut graphics.resident.as_mut().ok_or(GPU_FAILED)?.remote,
                 |encoder, view| {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("仅测试：确定性四色"),
@@ -247,6 +271,52 @@ impl Backend for OhosBackend {
         Ok(hooks.0.get())
     }
     fn detach(&mut self) {
-        drop(self.graphics.take());
+        if let Some(mut graphics) = self.graphics.take() {
+            graphics.detach();
+            self.retained = graphics.resident.take();
+            // surface 与 lease 在此线程销毁，保留的 context/texture 不持有 native window。
+        }
+    }
+    fn reset_remote(&mut self) {
+        if let Some(resident) = self.resident_mut() {
+            resident.remote.detach();
+        }
+    }
+    fn apply(&mut self, transactions: Vec<frd_frame::FrameTransaction>) -> Result<(), i32> {
+        self.resident_mut()
+            .ok_or(GPU_FAILED)?
+            .remote
+            .apply_update_batch(transactions)
+            .map_err(|_| GPU_FAILED)?;
+        Ok(())
+    }
+    fn render_remote(
+        &mut self,
+        viewport: frd_core::TransformedViewport,
+        repaint: bool,
+    ) -> Result<Option<frd_protocol_api::PresentationEvent>, i32> {
+        let graphics = self.graphics.as_mut().ok_or(GPU_FAILED)?;
+        let remote = &mut graphics.resident.as_mut().ok_or(GPU_FAILED)?.remote;
+        if repaint {
+            remote.request_repaint();
+        }
+        graphics
+            .compositor
+            .render_transformed(
+                remote,
+                Some(viewport),
+                |_, _| {},
+                &Hooks(std::cell::Cell::new(false)),
+            )
+            .map_err(|_| GPU_FAILED)
+    }
+}
+impl OhosBackend {
+    fn resident_mut(&mut self) -> Option<&mut Resident> {
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.resident.as_mut()
+        } else {
+            self.retained.as_mut()
+        }
     }
 }

@@ -6,12 +6,15 @@
 
 mod app_abi;
 pub mod app_adapter;
+#[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
+mod fixture;
 pub mod input_adapter;
 #[cfg(any(test, target_env = "ohos"))]
 mod limits;
 #[cfg(target_env = "ohos")]
 mod ohos;
 mod panic_scope;
+mod presentation;
 #[cfg(test)]
 mod tests;
 mod worker;

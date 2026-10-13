@@ -85,7 +85,7 @@ struct Index {
   }
   private geometry(): void {
     if (this.surfaceWidth > 0 && this.surfaceHeight > 0) {
-      this.check(native.appGeometry(this.surfaceWidth, this.surfaceHeight, this.surfaceWidth, this.surfaceHeight, this.zoomScale, this.panX, this.panY));
+      this.check(native.appGeometry(this.surfaceWidth, this.surfaceHeight, this.surfaceWidth, this.surfaceHeight, this.zoomScale, this.panX, this.panY, this.getUIContext().vp2px(1)));
     }
   }
   private focus(value: boolean): void { this.remoteFocused = value; this.check(native.appFocus(true, value, value)); }
@@ -192,23 +192,7 @@ struct Index {
       .width('100%').layoutWeight(1).focusable(true).accessibilityText('远程桌面')
       .onAreaChange((_, area) => { this.release(); this.surfaceWidth = Math.round(this.getUIContext().vp2px(Number(area.width))); this.surfaceHeight = Math.round(this.getUIContext().vp2px(Number(area.height))); this.geometry(); })
       .onFocus(() => this.focus(true)).onBlur(() => this.focus(false))
-      .onTouch((event: TouchEvent) => {
-        if (event.type === TouchType.Cancel) { this.release(); return; }
-        if (event.touches.length > 1) { this.release(); return; }
-        const touch = event.changedTouches[0]; if (!touch) { return; }
-        if (event.type === TouchType.Down) { this.focus(true); }
-        this.pointer(touch.x, touch.y, event.type === TouchType.Up ? 0 : 1);
-      })
-      .onMouse((event: MouseEvent) => {
-        if (event.action === MouseAction.Press) { this.focus(true); }
-        let buttons = 0;
-        for (const button of event.pressedButtons ?? []) {
-          if (button === MouseButton.Left) { buttons |= 1; }
-          if (button === MouseButton.Middle) { buttons |= 2; }
-          if (button === MouseButton.Right) { buttons |= 4; }
-        }
-        this.pointer(event.x, event.y, buttons);
-      })
+      // SURFACE 的触摸/鼠标由 native XComponent 回调唯一生产，避免双送。
       .onAxisEvent((event: AxisEvent) => {
         const step = Math.max(1, event.scrollStep ?? 1);
         const wx = Math.max(-127, Math.min(127, Math.round(event.getHorizontalAxisValue() / step)));
