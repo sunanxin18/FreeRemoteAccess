@@ -1,6 +1,6 @@
 # 鸿蒙 FFmpeg 后备包构建验证
 
-日期：2026-10-13。系统解码器按精确格式和远程桌面延迟要求优先；当前两台模拟器的系统 AVC 静态帧输出未通过，原因与边界见[系统验证](harmony-system-codec-20261013.md)。本记录仅覆盖 ARM64 OHOS 独立后备包的构建与静态检查，尚未将该包集成至普通 HAP、运行目标解码或注册协议。
+日期：2026-10-13。系统解码器按精确格式和远程桌面延迟要求优先；当前两台模拟器的系统 AVC 静态帧输出未通过，原因与边界见[系统验证](harmony-system-codec-20261013.md)。本记录覆盖 ARM64 OHOS 后备包构建、模块加载器实现、普通 HAP 包装及两台模拟器安装启动；尚未从应用进程调用该加载器、运行目标解码或注册协议。
 
 ## 目标边界
 
@@ -41,3 +41,17 @@
 固定 Rust 1.96 下宿主模块 47 项测试通过，覆盖路径/权限拒绝、文件替换、callback/ABI、依赖清退及 decoder/frame 生命周期。官方 OHOS ARM64 rlib 编译无 warning；独立 cdylib 链接探针确认为 ELF64/AArch64，公开 NDK 依赖包含 `libability_runtime.so` 与 `libc.so`。该探针未在设备执行。旧 `from_trusted_paths` warning 通过限定其真实 macOS 调用范围消除，桌面行为保持。
 
 正常 HAP 内的代码目录与实际模块路径是否一致、整个目录链是否满足保守所有权/权限假设，仍待两台模拟器分别确认。调用须在应用上下文建立后进行；当前没有后备库注册、真实出帧或远程互操作验收。独立审查通过，无 Critical/Important；审查记录一项非阻断测试改进：文件替换用例应精确断言身份错误，避免权限拒绝掩盖身份检查退化。正常 HAP 和解码门仍未完成。原始测试与链接产物在 `target/task4c3b-loader-check/`。
+
+## 普通 HAP 包装、签名与安装
+
+普通 Debug/Release HAP 均已构建；构建入口显式接收已验证 bundle 和独立 manifest SHA-256，纳入三个带固定版本名的 FFmpeg 库与许可、来源材料。最终包精确包含桥接库、Rust FFI、SDK C++ 运行库及三项后备库。Hvigor 使用针对后备库的 strip 排除规则；Debug/Release 三库均与上表字节一致。最终 module.json 显式 `extractNativeLibs=true`、`compressNativeLibs=false`。桥接库构建时的 RUNPATH 已去除。
+
+33 项 HAP/暂存检查通过，包含重复/额外/缺失文件、架构/SONAME/依赖错误、损坏字节、许可缺失、签名前后内容比较、暂存符号链接及部分失败清理。实际错误 manifest 构建被拒绝，已有输入 bundle 和已生成 HAP 哈希未改变。受控 ZIP 测试完成后，主代理另行执行真实签名与安装，见下文。
+
+未签名包：Debug `ede7490ca3e03622da1ab2b3ae7f2a15ec5b69acf5cb391686f0e74ee4a3690c`，Release `2a5559a21eca4bc86da03874e930b0c7f09a88335018d870f137dfca1a9addea`，位于 `target/task4c3d-hap-bundle/`。没有通过此次包装注册 codec 或协议；普通包仍为空协议目录。独立审查及修复复审已通过；实际库加载仍为后续门。
+
+同日主代理沿用既有 normal 开发身份执行官方 sign-app/verify-app，随后产品 checker 再次逐项比较 signed/unsigned 六库、八份材料和 module.json，通过。签名 Debug SHA-256 `35c53d0472e3467c7b3e716fb6970778a5e45e21c482f5b4251a128911e31481`；密码仅经关闭回显的交互 console 提交，未进入 argv 或日志。
+
+两台专用模拟器均以该同一 HAP 完成覆盖安装和新进程启动，官方 Emulator CLI UI 树显示 FreeRemoteDesk 登录表单及“此设备尚无可用的远程连接协议”。这只验证安装与启动；此包尚无 loader caller，不证明后备库被实际加载。两台 bm 元数据仍报告 `isCompressNativeLibs=true`/模块 `compressNativeLibs=true`，尽管 HAP 的 module.json 为上述显式配置；不将该字段当成实际提取路径或压缩行为的结论。代码根、版本名库提取与运行映射留待应用内 fixture 验证，未采用 shell 权限绕过。签名、安装、布局和筛选后的非秘密安装元数据保存在 `target/task4c3d-hap-bundle/`。
+
+包装实现 `22513b2` 的独立审查发现 ownership 清单直接写正式路径，半截 JSON 会阻断清理和重试。`dc9419b` 将清单完整写入并关闭私有临时文件后无覆盖发布，失败时只清理本次已发布对象，保留未知清单。10 项定向、38 项范围测试通过，独立复审确认 I1 已解决且无新增阻断项。既有 Hvigor SemVer warning 延后处理。该修复只变更暂存工具与测试，未重新构建 HAP；上列签名安装证据对应 `22513b2` 的产物，不能描述为一次 `dc9419b` 新构建。下一步是普通应用内加载与解码 fixture。

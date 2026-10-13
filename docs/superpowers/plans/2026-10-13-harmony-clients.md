@@ -84,6 +84,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4C2 官方基础镜像静态审计找到双线程缓冲路径及安装 NEON 分派；与三轮运行结果形成高置信度原因解释，未证明当前进程加载身份。当前系统软解不满足静态单帧要求，优先推进合格 FFmpeg 后备，系统优先策略保留。
 - [x] Task 4C3A 独立官方 OHOS ARM64 FFmpeg builder/verifier 与专属静态输出线程策略完成（`9c2cd42`/`8343bd3`）；22 项产物/输入/实际链接回归通过，独立复审通过。仅构建证据，普通 HAP loader、逐像素与运行时性能仍待完成，见[后备包证据](../../validation/harmony-ffmpeg-bundle-20261013.md)。
 - [x] Task 4C3B 应用自身模块锚定加载器完成（`4f5089e`），47 项宿主测试、OHOS ARM64 构建与公开 NDK 链接通过，独立审查通过；普通 HAP 安装路径/权限与实际加载仍待验证。
+- [x] Task 4C3D 普通 HAP 包装与签前/签后字节校验完成（`22513b2`/`dc9419b`），38 项范围测试及独立复审通过；同一最终签名 Debug 包已在手机/PC 安装启动。应用进程内加载和解码仍待 Task 4C3E，包中存在库不代表 DecoderReady。
 - [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。
 - [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、远程软键盘入口与 IME 提交、断开/重连与恢复。
