@@ -1,6 +1,6 @@
 # 鸿蒙 FFmpeg 后备包构建验证
 
-日期：2026-10-13。系统解码器按精确格式和远程桌面延迟要求优先；当前两台模拟器的系统 AVC 静态帧输出未通过，原因与边界见[系统验证](harmony-system-codec-20261013.md)。本记录覆盖 ARM64 OHOS 后备包构建、模块加载器实现、普通 HAP 包装及两台模拟器安装启动；尚未从应用进程调用该加载器、运行目标解码或注册协议。
+日期：2026-10-13。系统解码器按精确格式和远程桌面延迟要求优先；当前两台模拟器的系统 AVC 静态帧输出未通过，原因与边界见[系统验证](harmony-system-codec-20261013.md)。本记录覆盖 ARM64 OHOS 后备包构建、模块加载器实现、普通 HAP 包装及两台模拟器应用内合成解码。实际测试进度见文末；尚未注册生产协议或证明真实远程互操作。
 
 ## 目标边界
 
@@ -55,3 +55,23 @@
 两台专用模拟器均以该同一 HAP 完成覆盖安装和新进程启动，官方 Emulator CLI UI 树显示 FreeRemoteDesk 登录表单及“此设备尚无可用的远程连接协议”。这只验证安装与启动；此包尚无 loader caller，不证明后备库被实际加载。两台 bm 元数据仍报告 `isCompressNativeLibs=true`/模块 `compressNativeLibs=true`，尽管 HAP 的 module.json 为上述显式配置；不将该字段当成实际提取路径或压缩行为的结论。代码根、版本名库提取与运行映射留待应用内 fixture 验证，未采用 shell 权限绕过。签名、安装、布局和筛选后的非秘密安装元数据保存在 `target/task4c3d-hap-bundle/`。
 
 包装实现 `22513b2` 的独立审查发现 ownership 清单直接写正式路径，半截 JSON 会阻断清理和重试。`dc9419b` 将清单完整写入并关闭私有临时文件后无覆盖发布，失败时只清理本次已发布对象，保留未知清单。10 项定向、38 项范围测试通过，独立复审确认 I1 已解决且无新增阻断项。既有 Hvigor SemVer warning 延后处理。该修复只变更暂存工具与测试，未重新构建 HAP；上列签名安装证据对应 `22513b2` 的产物，不能描述为一次 `dc9419b` 新构建。下一步是普通应用内加载与解码 fixture。
+
+## 正常应用内解码夹具与目录句柄修正
+
+显式 `normal-hap-codec-fixture` 只在 debug 构建的正常应用上下文建立后运行，使用真实 `FfmpegBackend::load`，没有路径注入、网络、凭据或生产协议注册。测试线程自有 decoder/frame 并协作取消；同步原生调用不能安全抢占，缺少完成标记时不能宣称完成或清理。默认和 release 包排除测试入口。
+
+首轮手机和 PC 均在打开祖先根目录时返回 EACCES，根目录模式为 0711；普通应用有路径搜索权限而没有目录读取权限。第二轮通过 `OpenOptions.custom_flags` 添加 `O_PATH` 仍失败。对实际 HAP `.text` 与未剥离中间产物逐字节对应后发现，Rust 1.96 标准库使用 `!O_ACCMODE` 屏蔽自定义标志，而 OHOS/musl 的该常量包含 `O_PATH`，导致真正调用时该标志被清除。[固定版本 Rust 源码](https://github.com/rust-lang/rust/blob/1.96.0/library/std/src/sys/fs/unix.rs#L1273-L1283)与包内反汇编一致；不能将这一轮误称为沙箱拒绝了实际 O_PATH 调用。
+
+修正仅限 OHOS 目录句柄：直接调用公开 `open`，保留 `O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`，成功后立即移交 `File`。锚点及三项库仍使用可读句柄；全部祖先的不可写、所有权、类型、符号链接及 dev/inode 重查保持。没有修改系统权限、省略目录或使用私有 namespace。v4 包机器码确认标志完整传至公开 `open`，两台随后通过全部 loader 检查。
+
+v4 同一已签 HAP SHA-256 `725298c852d1867fe002d481204af491c96c7a4e2ebd0a55ddad5376b69b8180` 在手机和 PC 分别运行，均完整通过 10/13 组。256×144 AVC420/444、1440p/4K AVC420 的 Annex-B 和长度前缀输入均在各自 submit 返回时产生一帧，首 IDR 与最终依赖 P 帧无需后续输入或 EOS；像素与独立参考相等。剩余三个失败是 tiny AVC420 两种输入格式的编码/裁剪尺寸契约，以及 HEVC 坏包即时拒绝判定。未将循环完成或部分出帧标记为全组通过。
+
+原始分轮 HAP、签名与包检查日志、两台 hilog、机器码和摘要保留在 `target/task4c3e-runtime/`；合成输入的来源、命令和参考哈希进入夹具 provenance。模拟器合成 submit 耗时不是持续吞吐或远程端到端延迟；H.264 High444 解码不是 RDP AVC444 双流组合验证，HEVC 样本也不是 RDP HEVC wire 支持证明。运行时 SIMD 分派与完整热路径、真机、生产注册及实际 Windows/Mac 互操作仍是独立待验收项。
+
+最终 v5 修正夹具尺寸契约：原 tiny H.264 的 SPS 为 16×16 编码尺寸、右/下各裁剪 14 像素，可见 2×2；保留原输入及 6-byte 参考不变。插件本来禁用自动裁剪，故夹具必须分别传编码尺寸和可见矩形。HEVC 原无效 VCL 在 FFmpeg 下可能被丢弃并返回 NeedMoreData；保留为观察项，不计拒绝成功。单独用无 Annex-B 起始码的确定无效输入检查 typed 错误，再重新创建解码器验证首帧，没有改变 FFmpeg 容错策略。
+
+v5 unsigned SHA-256 `8922f512634b1738aef7d1a39a9d9056ccbbc45fe30e8e952e80bdef8555504b`，signed `555e0464fc62cff8f8df13b3ba7ee0f843493406a1498e96473b7aed5c2791ce`。官方签名、验签及签后包内容比对通过；同一包分别在手机新进程 10463、PC 新进程 13585 运行。两台均 `completed=1 passed=13 failed=0`，包含 tiny/cropped、256×144、2560×1440 和 3840×2160，各组无 EOS 出帧、独立像素比较、重置/旧代际拒绝、重复创建、backend/decoder drop 后帧所有权、确定无效输入拒绝及重建恢复全部通过。总测试约 12.4/12.3 秒包含 debug 逐像素/SHA 核对，不是媒体延迟。
+
+夹具及句柄修正提交 `6a2c91c`。宿主 FFI 38 项通过（另有一个既有 panic 子进程 helper 标记 ignored），加载器 49 项通过；OHOS 默认 debug 与显式 feature release 的实际库均不存在 fixture 日志标记，显式 debug 夹具包保留标记，互斥特性组合被明确拒绝。格式与 diff 检查通过。测试后两台恢复前述 `35c53d04…` 普通签名包，官方 Emulator CLI 确认登录界面及当前无已注册协议的提示。该恢复包是此前普通产物，不冒称新修正的生产构建。
+
+独立任务审查结论为 Spec compliant / Approved，无 Critical/Important；审查只读核对手机/PC 原始日志、签名 HAP 哈希和六项原生库与 checker 一致。既有 Hvigor 配置头资源及 unsigned 阶段缺省 signingConfig 警告作为非阻断项记录，不等同于最终签名失败。
