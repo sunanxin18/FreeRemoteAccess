@@ -101,3 +101,11 @@ Windows/Linux 各 i686、x86_64、ARM64，macOS ARM64 与 OHOS ARM64 共八个�
 基准拆为独立进程后，双方新增相同“系数复制起点”的component/tile计时。一次本机安静窗口中，中位数component为native8145ns/原版4828ns，tile为31830ns/15898ns；原版包含RLGR的完整wire指标另行保留，不能跨范围相除。此处是测试拓扑和计时范围的验证，不是新的优化收益或OHOS性能证据。此前手机/PC25项结果属于A2.2旧测试产物，本轮未重新执行目标程序。
 
 独立任务审查为 Spec compliant / Approved，无 Critical/Important；两项 Minor 分别是过时的 patch 说明和警告披露，均由文档修正处理。完整Bitmap、RDP6、RLGR/RFX parser与会话publication、像素转换和目标包/实时连接仍是后续工作。
+
+## A2.4 Bitmap parser native consumer
+
+`484d1b2` 以一个共享 parser 保留原入口行为，新增显式 `decompress_native(..., &NativeKernels)`，在实际解析时调用 checked fill/copy/XOR/mask/dither。命令级 first-line 特例、FG源长度检查、mask跨行位偏移、555 WHITE、错误先后和失败前已写部分输出保持。Native入口检查几何溢出并分别报告RLE/Kernel错误，不静默重试scalar。当前session仍使用原默认入口。
+
+Host macOS ARM64 原版16,721 catalog与另7,616固定原版源码生成的畸形输入全部逐字节/结果一致；121,856偏移canary、80命令族深度组合/224header行变体通过。实际生产rle.rs的debug strictclippy及opt3/thinLTO release各7 tests、kernel Bitmap7、RDP321/3ignored通过。独立registry oracle保持，与K无依赖循环；显式FRD-MODIFICATIONS.json固定修改后sourcehash，原source/archive检查仍严格，6个来源mutation测试通过。没有让期望值来自生产实现。
+
+独立审查 Spec compliant / Approved，无Critical/Important；protocol既有25个clippy及4个test警告均在未改文件，不能称整包零警告；rle strictclippy本身干净。生产source SHA256为`43a90ca26fb4611395bbc78e9f6929d9797b96a35e2c26d1d7ab879ab46f1226`。完整报告与日志保留在`.superpowers/sdd/2026-10-13-harmony-clients/task-4a24-*`。本任务没有OHOS HAP/runtime/Windows实连证明，剩余RDP6、RLGR/RFX、像素转换和session接线继续受门禁约束。
