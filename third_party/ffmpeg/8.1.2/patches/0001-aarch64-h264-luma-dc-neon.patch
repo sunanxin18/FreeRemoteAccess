@@ -1,0 +1,96 @@
+--- a/libavcodec/aarch64/h264idct_neon.S
++++ b/libavcodec/aarch64/h264idct_neon.S
+@@ -413,3 +413,73 @@
+         .byte           4+13*8, 5+13*8, 4+14*8, 5+14*8
+         .byte           6+13*8, 7+13*8, 6+14*8, 7+14*8
+ endconst
++
++// 8-bit luma DC：signed32 Hadamard 与模 2^32 反量化。
++// 首次稀疏 halfword 写入前读取全部 32 bytes，保留输入/输出别名语义。
++function ff_h264_luma_dc_dequant_idct_neon, export=1
++        AARCH64_VALID_CALL_TARGET
++        ld4             {v0.4h, v1.4h, v2.4h, v3.4h}, [x1]
++        sshll           v0.4s, v0.4h, #0
++        sshll           v1.4s, v1.4h, #0
++        sshll           v2.4s, v2.4h, #0
++        sshll           v3.4s, v3.4h, #0
++
++        add             v4.4s, v0.4s, v1.4s
++        sub             v5.4s, v0.4s, v1.4s
++        sub             v6.4s, v2.4s, v3.4s
++        add             v7.4s, v2.4s, v3.4s
++        add             v0.4s, v4.4s, v7.4s
++        sub             v1.4s, v4.4s, v7.4s
++        sub             v2.4s, v5.4s, v6.4s
++        add             v3.4s, v5.4s, v6.4s
++
++        trn1            v4.4s, v0.4s, v1.4s
++        trn2            v5.4s, v0.4s, v1.4s
++        trn1            v6.4s, v2.4s, v3.4s
++        trn2            v7.4s, v2.4s, v3.4s
++        trn1            v0.2d, v4.2d, v6.2d
++        trn1            v1.2d, v5.2d, v7.2d
++        trn2            v2.2d, v4.2d, v6.2d
++        trn2            v3.2d, v5.2d, v7.2d
++
++        add             v4.4s, v0.4s, v2.4s
++        sub             v5.4s, v0.4s, v2.4s
++        sub             v6.4s, v1.4s, v3.4s
++        add             v7.4s, v1.4s, v3.4s
++        add             v0.4s, v4.4s, v7.4s
++        add             v1.4s, v5.4s, v6.4s
++        sub             v2.4s, v5.4s, v6.4s
++        sub             v3.4s, v4.4s, v7.4s
++
++        dup             v4.4s, w2
++        movi            v5.4s, #128
++.irp n, 0, 1, 2, 3
++        mul             v\n\().4s, v\n\().4s, v4.4s
++        add             v\n\().4s, v\n\().4s, v5.4s
++        sshr            v\n\().4s, v\n\().4s, #8
++        xtn             v\n\().4h, v\n\().4s
++.endr
++
++        add             x3, x0, #64
++        add             x4, x0, #256
++        add             x5, x0, #320
++        mov             x6, #32
++        mov             x7, #96
++        st1             {v0.h}[0], [x0], x6
++        st1             {v0.h}[1], [x3], x6
++        st1             {v0.h}[2], [x4], x6
++        st1             {v0.h}[3], [x5], x6
++        st1             {v1.h}[0], [x0], x7
++        st1             {v1.h}[1], [x3], x7
++        st1             {v1.h}[2], [x4], x7
++        st1             {v1.h}[3], [x5], x7
++        st1             {v2.h}[0], [x0], x6
++        st1             {v2.h}[1], [x3], x6
++        st1             {v2.h}[2], [x4], x6
++        st1             {v2.h}[3], [x5], x6
++        st1             {v3.h}[0], [x0]
++        st1             {v3.h}[1], [x3]
++        st1             {v3.h}[2], [x4]
++        st1             {v3.h}[3], [x5]
++        ret
++endfunc
+--- a/libavcodec/aarch64/h264dsp_init_aarch64.c
++++ b/libavcodec/aarch64/h264dsp_init_aarch64.c
+@@ -64,6 +64,8 @@
+ void ff_biweight_h264_pixels_4_neon(uint8_t *dst, uint8_t *src, ptrdiff_t stride,
+                                     int height, int log2_den, int weightd,
+                                     int weights, int offset);
++
++void ff_h264_luma_dc_dequant_idct_neon(int16_t *output, int16_t *input, int qmul);
+
+ void ff_h264_idct_add_neon(uint8_t *dst, int16_t *block, int stride);
+ void ff_h264_idct_dc_add_neon(uint8_t *dst, int16_t *block, int stride);
+@@ -139,6 +141,8 @@
+         c->biweight_pixels_tab[1] = ff_biweight_h264_pixels_8_neon;
+         c->biweight_pixels_tab[2] = ff_biweight_h264_pixels_4_neon;
+
++        c->luma_dc_dequant_idct = ff_h264_luma_dc_dequant_idct_neon;
++
+         c->idct_add        = ff_h264_idct_add_neon;
+         c->idct_dc_add     = ff_h264_idct_dc_add_neon;
+         c->idct_add16      = ff_h264_idct_add16_neon;
