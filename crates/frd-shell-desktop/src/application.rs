@@ -2300,24 +2300,24 @@ impl DesktopApplication {
         let drain = match self.sessions.drain_frame_transactions() {
             Ok(drain) => drain,
             Err(failure) => {
-                self.metrics
-                    .observe_compile_failure(failure.metrics, failure.error);
+                let (error, metrics) = failure.into_parts();
+                self.metrics.observe_compile_failure(metrics, error);
                 return Err(terminate_failed_frame_batch(
                     self,
-                    FrameDrainFailure::Compile(failure.error),
+                    FrameDrainFailure::Compile(error),
                 ));
             }
         };
-        if drain.transactions.is_empty() {
+        if drain.transactions().is_empty() {
             self.publish_metrics_failure();
             return Ok(outcome);
         }
-        let metrics = drain.metrics;
+        let (transactions, metrics) = drain.into_parts();
         let Some(window) = self.window.as_mut() else {
             self.publish_metrics_failure();
             return Ok(outcome);
         };
-        let applied = apply_compiled_drain(drain.transactions, |transactions| {
+        let applied = apply_compiled_drain(transactions, |transactions| {
             window.renderer.apply_update_batch(transactions)
         });
         let success = match applied {
@@ -5946,10 +5946,7 @@ mod tests {
             test_boundary(session_id, at + Duration::from_millis(2)),
         );
         assert!(matches!(
-            host.drain_frame_transactions()
-                .unwrap()
-                .transactions
-                .as_slice(),
+            host.drain_frame_transactions().unwrap().transactions(),
             [FrameTransaction::Startup { .. }]
         ));
     }
@@ -5981,7 +5978,7 @@ mod tests {
         );
         let control = attached.drain_frame_transactions().unwrap();
         assert!(matches!(
-            control.transactions.as_slice(),
+            control.transactions(),
             [FrameTransaction::Revision { revision, .. }]
                 if revision.session_id == session_id
                     && revision.generation == 1
@@ -6000,7 +5997,7 @@ mod tests {
         assert!(retired
             .drain_frame_transactions()
             .unwrap()
-            .transactions
+            .transactions()
             .is_empty());
 
         enqueue_incremental_revision(
@@ -6012,7 +6009,7 @@ mod tests {
         assert!(retired
             .drain_frame_transactions()
             .unwrap()
-            .transactions
+            .transactions()
             .is_empty());
     }
 
@@ -6109,13 +6106,13 @@ mod tests {
 
         enqueue_frame(&mut host, test_reset(session_id, at));
         let reset_only = host.drain_frame_transactions().unwrap();
-        if !reset_only.transactions.is_empty() {
-            let _ = apply_compiled_drain(reset_only.transactions, |_| {
+        assert_eq!(reset_only.metrics().transaction_count(), 0);
+        if !reset_only.transactions().is_empty() {
+            let _ = apply_compiled_drain(reset_only.into_transactions(), |_| {
                 renderer_batch_calls += 1;
                 Ok(successful_startup(session_id))
             });
         }
-        assert_eq!(reset_only.metrics.transaction_count, 0);
         assert_eq!(renderer_batch_calls, 0);
         assert!(binding.is_none());
         assert!(!RuntimeDrainOutcome::default().frame_redraw_needed);
@@ -6125,8 +6122,9 @@ mod tests {
             test_damage(session_id, at + Duration::from_millis(1)),
         );
         let reset_damage = host.drain_frame_transactions().unwrap();
-        if !reset_damage.transactions.is_empty() {
-            let success = apply_compiled_drain(reset_damage.transactions, |_| {
+        assert_eq!(reset_damage.metrics().transaction_count(), 0);
+        if !reset_damage.transactions().is_empty() {
+            let success = apply_compiled_drain(reset_damage.into_transactions(), |_| {
                 renderer_batch_calls += 1;
                 Ok(successful_startup(session_id))
             })
@@ -6137,7 +6135,6 @@ mod tests {
                 &success.outcome,
             );
         }
-        assert_eq!(reset_damage.metrics.transaction_count, 0);
         assert_eq!(renderer_batch_calls, 0);
         assert!(binding.is_none());
         assert!(!RuntimeDrainOutcome::default().frame_redraw_needed);
@@ -6152,7 +6149,7 @@ mod tests {
         assert!(host
             .drain_frame_transactions()
             .unwrap()
-            .transactions
+            .transactions()
             .is_empty());
         enqueue_frame(
             &mut host,
@@ -6161,17 +6158,17 @@ mod tests {
         assert!(host
             .drain_frame_transactions()
             .unwrap()
-            .transactions
+            .transactions()
             .is_empty());
         enqueue_frame(
             &mut host,
             test_boundary(session_id, at + Duration::from_millis(2)),
         );
         let drain = host.drain_frame_transactions().unwrap();
-        assert_eq!(drain.metrics.source_update_count, 3);
-        assert_eq!(drain.metrics.transaction_count, 1);
+        assert_eq!(drain.metrics().source_update_count(), 3);
+        assert_eq!(drain.metrics().transaction_count(), 1);
         let mut renderer_batch_calls = 0;
-        let success = apply_compiled_drain(drain.transactions, |transactions| {
+        let success = apply_compiled_drain(drain.into_transactions(), |transactions| {
             renderer_batch_calls += 1;
             assert_eq!(transactions.len(), 1);
             Ok(successful_startup(session_id))

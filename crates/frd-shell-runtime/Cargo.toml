@@ -1,0 +1,15 @@
+[package]
+name = "frd-shell-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# 仅供桌面壳跨 crate 回归测试使用，不进入产品构建。
+test-support = []
+
+[dependencies]
+frd-core = { path = "../frd-core" }
+frd-frame = { path = "../frd-frame" }
+frd-media-api = { path = "../frd-media-api" }
+frd-protocol-api = { path = "../frd-protocol-api" }
+frd-session = { path = "../frd-session" }

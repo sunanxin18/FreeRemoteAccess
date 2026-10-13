@@ -16,6 +16,7 @@ frd-video-ffmpeg = { path = "../frd-video-ffmpeg" }
 frd-platform-api = { path = "../frd-platform-api" }
 frd-protocol-api = { path = "../frd-protocol-api" }
 frd-render-wgpu = { path = "../frd-render-wgpu" }
+frd-shell-runtime = { path = "../frd-shell-runtime" }
 frd-session = { path = "../frd-session" }
 frd-ui-egui = { path = "../frd-ui-egui" }
 frd-ui-model = { path = "../frd-ui-model" }
@@ -44,3 +45,6 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[dev-dependencies]
+frd-shell-runtime = { path = "../frd-shell-runtime", features = ["test-support"] }

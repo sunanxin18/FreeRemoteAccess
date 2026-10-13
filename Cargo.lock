@@ -2129,6 +2129,7 @@ dependencies = [
  "frd-protocol-api",
  "frd-render-wgpu",
  "frd-session",
+ "frd-shell-runtime",
  "frd-ui-egui",
  "frd-ui-model",
  "frd-video-ffmpeg",
@@ -2159,6 +2160,17 @@ dependencies = [
  "gtk4",
  "libloading",
  "x11-dl",
+]
+
+[[package]]
+name = "frd-shell-runtime"
+version = "0.1.0"
+dependencies = [
+ "frd-core",
+ "frd-frame",
+ "frd-media-api",
+ "frd-protocol-api",
+ "frd-session",
 ]
 
 [[package]]
