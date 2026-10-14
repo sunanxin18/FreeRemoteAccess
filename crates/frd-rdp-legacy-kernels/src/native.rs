@@ -197,7 +197,7 @@ unsafe fn checked_mul(a: V, coefficient: i32) -> Result<V, KernelError> {
     }
     Ok(mul(a, coefficient))
 }
-unsafe fn color4(y: &[i16; 4], cb: &[i16; 4], cr: &[i16; 4]) -> Result<[u8; 16], KernelError> {
+unsafe fn validate_color4(y: &[i16; 4], cb: &[i16; 4], cr: &[i16; 4]) -> Result<(), KernelError> {
     let y = load(y);
     let cb = load(cb);
     let cr = load(cr);
@@ -206,46 +206,77 @@ unsafe fn color4(y: &[i16; 4], cb: &[i16; 4], cr: &[i16; 4]) -> Result<[u8; 16],
         return Err(KernelError::ColorOverflow);
     }
     let yy = mul(add(y, splat(4096)), 65536);
-    let r = checked_add(yy, checked_mul(cr, 91915)?)?;
-    let g = checked_sub(
+    checked_add(yy, checked_mul(cr, 91915)?)?;
+    checked_sub(
         checked_sub(yy, checked_mul(cr, 46818)?)?,
         checked_mul(cb, 22526)?,
     )?;
-    let b = checked_add(yy, checked_mul(cb, 115992)?)?;
-    Ok(rgba(
+    checked_add(yy, checked_mul(cb, 115992)?)?;
+    Ok(())
+}
+
+/// 仅供整输入预检成功后的第二遍使用，不进入公开函数表。
+///
+/// # Safety
+/// ISA 已检查；三个数组必须是 validate_color4 已通过的相同不可变输入，
+/// 或相同短尾的相同零填充 staging。预检证明每个中间式均在上游合法域内，
+/// 因此 SIMD 原始加减乘与 checked 结果一致；不能重排 g 的两次减法。
+unsafe fn color4_validated(y: &[i16; 4], cb: &[i16; 4], cr: &[i16; 4]) -> [u8; 16] {
+    let y = load(y);
+    let cb = load(cb);
+    let cr = load(cr);
+    let yy = mul(add(y, splat(4096)), 65536);
+    let r = add(yy, mul(cr, 91915));
+    let g = sub(sub(yy, mul(cr, 46818)), mul(cb, 22526));
+    let b = add(yy, mul(cb, 115992));
+    rgba(
         clamp_byte(shr::<21>(r)),
         clamp_byte(shr::<21>(g)),
         clamp_byte(shr::<21>(b)),
-    ))
+    )
 }
 unsafe fn color(y: &[i16], cb: &[i16], cr: &[i16], out: &mut [u8]) -> Result<(), KernelError> {
-    // 两遍检查保证后部非法系数也不会留下部分已写像素；不分配整帧副本。
+    // 第一遍检查全部像素（含短尾）后才能写出；后部非法系数不留下部分像素。
+    // 第二遍只转换同一不可变输入，不重复 overflow 检查，也不分配整帧副本。
     let full = y.len() / 4 * 4;
-    for write in [false, true] {
-        // 完整向量直接借用已检查的定长数组，只有短尾需要 staging。
-        for start in (0..full).step_by(4) {
-            let rgba = color4(
-                y[start..start + 4].try_into().unwrap(),
-                cb[start..start + 4].try_into().unwrap(),
-                cr[start..start + 4].try_into().unwrap(),
-            )?;
-            if write {
-                out[4 * start..4 * start + 16].copy_from_slice(&rgba);
-            }
-        }
-        if full != y.len() {
-            let len = y.len() - full;
-            let mut ys = [0; 4];
-            let mut us = [0; 4];
-            let mut vs = [0; 4];
-            ys[..len].copy_from_slice(&y[full..]);
-            us[..len].copy_from_slice(&cb[full..]);
-            vs[..len].copy_from_slice(&cr[full..]);
-            let rgba = color4(&ys, &us, &vs)?;
-            if write {
-                out[4 * full..].copy_from_slice(&rgba[..4 * len]);
-            }
-        }
+    // 完整向量直接借用已检查的定长数组，只有短尾需要 staging。
+    for start in (0..full).step_by(4) {
+        validate_color4(
+            y[start..start + 4].try_into().unwrap(),
+            cb[start..start + 4].try_into().unwrap(),
+            cr[start..start + 4].try_into().unwrap(),
+        )?;
+    }
+    if full != y.len() {
+        let len = y.len() - full;
+        let mut ys = [0; 4];
+        let mut us = [0; 4];
+        let mut vs = [0; 4];
+        ys[..len].copy_from_slice(&y[full..]);
+        us[..len].copy_from_slice(&cb[full..]);
+        vs[..len].copy_from_slice(&cr[full..]);
+        validate_color4(&ys, &us, &vs)?;
+    }
+    for start in (0..full).step_by(4) {
+        // SAFETY: 上面的整输入预检已通过；借用阻止输入在两遍间合法地改变。
+        let rgba = color4_validated(
+            y[start..start + 4].try_into().unwrap(),
+            cb[start..start + 4].try_into().unwrap(),
+            cr[start..start + 4].try_into().unwrap(),
+        );
+        out[4 * start..4 * start + 16].copy_from_slice(&rgba);
+    }
+    if full != y.len() {
+        let len = y.len() - full;
+        let mut ys = [0; 4];
+        let mut us = [0; 4];
+        let mut vs = [0; 4];
+        ys[..len].copy_from_slice(&y[full..]);
+        us[..len].copy_from_slice(&cb[full..]);
+        vs[..len].copy_from_slice(&cr[full..]);
+        // SAFETY: 同一不可变短尾与第一遍相同零填充；填充 lane 也已预检。
+        let rgba = color4_validated(&ys, &us, &vs);
+        out[4 * full..].copy_from_slice(&rgba[..4 * len]);
     }
     Ok(())
 }

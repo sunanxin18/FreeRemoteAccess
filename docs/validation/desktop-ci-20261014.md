@@ -40,3 +40,47 @@ Windows ARM64 原生 job `115550527102` 完整149,424-byte日志保存于 `targe
 Windows ARM64 原生 job `115584007364` 使用原生 Rust 1.96 / `aarch64-pc-windows-msvc` 和同 run 下载的默认 upstream 包。实际日志确认 Main444 6项、ClearCodec/NSCodec 39项及随后单独运行的2项基准、Progressive 61项及随后单独运行的1项基准均通过。完整日志221,697 bytes，SHA256 `4ee6c8bdb60567c5fde7a78f2e947c5d2e1911c49122a291311257d9d867c321`。
 
 全部 run/head/jobs 状态、完整原生日志和摘要保存在 `target/ci-native-factory-and-windows-identity-20261014/`。此 head 含 `2015400` 显式 native factory 和已审查 Windows 核身份接口；本轮仍使用默认 upstream Windows 包，未执行 Windows 修改配方的私有 ABI/数值资格，不证明 RequiredNative 所有热路径、待提交整管线测试或普通鸿蒙 HAP 的生产注册与真实登录。本轮没有重新触发 GL，也没有重复已通过且来源链未变的 Linux 显式修改配方资格。日志保留 CI 的 Node.js 20 action 被托管环境转为 Node.js 24 执行的弃用警告，未将成功状态描述为无警告。
+
+## 冻结 f475cf2 桌面回归
+
+2026-10-14，匹配 `f475cf28ec6fcc65fd8c17984ee88b23a4a16fcd` 的四条实际工作流
+成功结束：Windows38513518674（三架构包与独立ARM64原生运行）、macOS38513518793
+（仅ARM64）、Linux38513518716（三架构默认包）和通用CI38513518664。此次没有
+对应GTK/GL工作流，不将旧head结果混入。原始状态保存于
+`target/desktop-ci-f475cf2-20261014/`。
+
+Windows ARM64原生job115696620466加载同run的默认包；原始日志223683bytes，
+SHA-256 `58ffb9b7081bf2a989f0b4ebc606fe46f5ef09d0dc0dee64973a7a07f5c710db`。
+日志确认ClearCodec/NSCodec39项通过（2项ignored后独立执行通过），Progressive61项
+通过（1项ignored后独立执行通过）；包解码夹具步骤成功。这是既有默认包/子系统
+回归，不是新Windows私有ABI/数值资格，亦非HEVC私有内核生产注册或鸿蒙真实登录。
+后续122f44e的新专项编译结果另见Windows私有平台记录，两个head的证据独立。
+
+## 冻结 122f44e 的回归与运行器失败
+
+2026-10-14，通用 CI `38516856108` 对提交
+`122f44e9a1c691a723cdb0229d7aa40b41ae123b` 成功结束。Windows 包工作流
+`38516856165` 的第 1 次尝试失败：x86、ARM64 包任务成功，x64 任务
+`115698712834` 在准备 Ubuntu 24.04 WSL 环境时失去托管运行器通信，尚未进入
+FFmpeg 或客户端编译。GitHub check annotation 明确报告 hosted runner lost
+communication；不能据此断言具体宿主资源或网络根因，也不能把它记作源码回归。
+该失败使依赖的 Windows ARM64 原生解码任务被跳过，本提交尚无完整 Windows
+回归通过证据（第 1 次尝试的状态）。
+
+原始 run/job/annotation JSON 保存于
+`target/desktop-ci-122f44e-20261014/`；读取失败日志返回 `log not found`，没有用
+其它任务的日志替代。仅对同一 run 发起失败任务重试，命令终态 exit 0，记录于
+`rerun-failed-receipt.json`；重试期间仍保留上述失败和跳过状态。
+
+后续同一 run 的第 2 次尝试成功结束：x64 包任务 `115716170441` 完成，三架构
+包及依赖的 ARM64 原生任务 `115727145778` 均为 success，head 仍为上述
+122f44e。该原生任务加载同次默认包，ClearCodec/NSCodec 39 项通过，2 项
+ignored 随后独立执行通过；Progressive 61 项通过，1 项 ignored 随后独立
+执行通过，包解码夹具步骤成功。完整原生日志 224305 bytes，SHA-256 为
+`e5b1eeb9517860f77158c19f9984520b1c92fcb7fa2d475d56808f0843754780`。
+第 2 次尝试 run JSON 与原始日志保存为 `windows-run-attempt2.json` 和
+`windows-native-attempt2.log`，没有覆盖首次失败证据。
+
+这补齐了本提交的既有 Windows 回归；上一提交 f475cf2 的记录及本提交 Windows
+私有对象专项结果仍各自保持验证范围。未提交的 C contract 驱动和色彩优化
+不属于本次源码，仍无它们的 Windows 原生或完整产品验证。
