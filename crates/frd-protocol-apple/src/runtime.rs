@@ -2898,7 +2898,10 @@ mod tests {
         blocked_sender.join().unwrap();
 
         assert!(matches!(exit, frd_protocol_api::ProtocolExit::Closed));
-        assert!(blocked_error.to_string().contains("写入失败"));
+        assert!(
+            blocked_error.to_string().contains("写入失败"),
+            "阻塞发送应返回写入失败，实际错误链：{blocked_error:#}"
+        );
         assert!(writer.send_private_message(b"after-cleanup").is_err());
         assert!(matches!(
             exit_rx.try_recv(),
