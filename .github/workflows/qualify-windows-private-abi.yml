@@ -42,6 +42,15 @@ jobs:
             --source-root "$GITHUB_WORKSPACE" \
             --output "$GITHUB_WORKSPACE/target/task4c5c3b2c-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
+      - name: Run narrow contract parser and orchestration checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "target/task4c5c3b2e-checks-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python3 -B -m unittest discover -s tools/tests -p test_compile_windows_contract.py -v \
+            > "target/task4c5c3b2e-checks-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/stdout.txt" \
+            2> "target/task4c5c3b2e-checks-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/stderr.txt"
+
       - name: Compile three mandatory objects and five bad metadata candidates
         shell: bash
         run: |
@@ -50,6 +59,16 @@ jobs:
             --source-root "$GITHUB_WORKSPACE" \
             --installation "$GITHUB_WORKSPACE/target/task4c5c3b2c-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --output "$GITHUB_WORKSPACE/target/task4c5c3b2c-compile-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: Compile five private C drivers and link matching ARM64 PE contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tools/compile-windows-contract.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --compile-input "$GITHUB_WORKSPACE/target/task4c5c3b2c-compile-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --installation "$GITHUB_WORKSPACE/target/task4c5c3b2c-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --output "$GITHUB_WORKSPACE/target/task4c5c3b2e-contract-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       - name: Preserve exact checks and object evidence on success or failure
         if: always()
@@ -65,5 +84,7 @@ jobs:
             target/task4c5c3b2c-compile-${{ github.run_id }}-${{ github.run_attempt }}/evidence.zip
             target/task4c5c3b2c-compile-${{ github.run_id }}-${{ github.run_attempt }}/archive.json
             target/task4c5c3b2c-compile-${{ github.run_id }}-${{ github.run_attempt }}/summary.json
+            target/task4c5c3b2e-checks-${{ github.run_id }}-${{ github.run_attempt }}/
+            target/task4c5c3b2e-contract-${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: error
           retention-days: 14
