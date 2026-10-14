@@ -57,3 +57,20 @@ oracle 独立核对完整输入序列、整数结果、终止标记和 EOF。
 
 普通鸿蒙客户端的协议目录、codec 注册与真实 Windows/Mac 登录不受本次验证
 影响，仍须按完整实施计划完成。
+
+## Windows ABI 辅助源码准备
+
+后续 Task 4C5C3B2B 的三个私有文件已完成源码准备并通过独立 StaticSpec/Quality
+审查：`h264-luma-dc-abi-windows.S`、`h264-luma-dc-abi-windows-negative.S` 和
+`README-windows-abi.md`。默认 helper 使用 192 字节有效帧链、明确保存与恢复、
+逐指令 SEH 描述；独立外层探针覆盖调用者恢复、逐寄存器负例、合法 SIMD 上半区
+变化、参数高位及隔离结构损坏。共享数值 C、原 POSIX ABI、recipe 和生产核保持。
+
+这一结果仅为源码提案；没有 compiler、COFF、PE、native test 或 SEH 运行结果。
+错误 unwind 副本须在预先选定的有效 PC 区分点与正确副本对照，不能要求所有 PC
+都失败；若某个错误 scope 被汇编器拒绝，只能记录实际拒绝，不能计作原生负例。
+
+独立 C driver、固定 LLVM-MinGW 编译、对象元数据与反汇编、真实 Rtl* 已知 PC
+回溯、实际 kernel 的完整输出 oracle 及后续共享 parity/性能/包仍待完成。
+INT32 极值期望须绑定既有 normalized/dequant 的无符号模运算及 signed floor
+语义，不能用可能有 signed overflow 的原 C 极值结果替代独立期望。

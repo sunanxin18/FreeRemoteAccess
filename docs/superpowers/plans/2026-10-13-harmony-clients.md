@@ -109,6 +109,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4C5C3A `9e773ce`/`7c50370`/`42d3403` Windows ARM64固定source endpoint、COFF/map/PE及静态loader写范围接口完成；两轮独立复审关闭全部P2，初始30/修复41/第二轮14项各自范围测试通过。仅本机交叉容器与接口，真实LLVM-MinGW自然构建/strip/package、Windows私有ABI与原生数值/基准待完成，见[Windows接口验证](../../validation/windows-h264-kernel-identity-20261014.md)。
 - [x] Task 4C5C3B1 私有数值测试的保护页/时钟最小平台接口完成并经独立源码/执行复审通过；macOS ARM64 contract GREEN、两项精确弱保护 RED、同shipping对象5974518/30分派/ABI/guard通过，原数学与配方保持。Windows adapter/QPC/SEH/native及Linux/OHOS本轮运行待完成，见[私有平台接口验证](../../validation/ffmpeg-private-platform-20261014.md)。
 - [x] Task 4C5C3B2A 源码与宿主层：Windows ARM64 私有保护页/QPC及纯整数换算完成，独立源码和宿主执行复审通过；22锚点、10036完整输入、11拒绝负例、10注入逻辑案例通过。首记录脚本失败和仅补两项的续轮均保留。仅本子步骤完成，真实Windows编译/ABI/SEH/native/共享parity/性能/修改包仍待完成，见[Windows私有平台验证](../../validation/windows-private-platform-20261014.md)。
+- [x] Task 4C5C3B2B 源码准备子步骤：独立Windows ARM64 ABI/SEH helper、外层恢复与逐寄存器assembly负例完成并经静态Spec/Quality审查通过；仅源码提案，无编译或原生SEH结果。依赖Cdriver、固定工具链COFF/PE、真实Rtl*回溯/异常/完整输出oracle和全部生产资格仍待完成，见[Windows私有平台验证](../../validation/windows-private-platform-20261014.md)。
 - [x] Task 4C5D1A HEVC16原版C/独立floor模型119600 cases、完整context、精确原版selector RED及有限Mac保护页前置门完成，独立审查通过；不代表NEON或生产资格，见[原版参考验证](../../validation/hevc-intra16-reference-20261014.md)。
 - [ ] Task 4C5 优先补 AArch64 8-bit H264 luma DC 变换/反量化；维护显式补丁来源、C oracle、逐核 parity、目标基准和普通 HAP 同流验证。HEVC 16×16 planar/angular 与已识别的 32×32 angular 标量分支随后处理，避免重写已向量化分支。
 - [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
