@@ -462,7 +462,10 @@ def sections_at(data, pos, count):
     return sections
 
 
-def pe_admit(path):
+def pe_admit(path, *, variant=0):
+    # 仅接受固定构建循环的整数 selector；不得从文件名、receipt 或 imports 推断。
+    if type(variant) is not int or variant not in VARIANTS:
+        raise GateError("PE variant 必须为整数 0..4，不能为 bool")
     ordinary(path)
     if path.stat().st_size > MAX_FILE:
         raise GateError("PE 太大")
@@ -534,13 +537,16 @@ def pe_admit(path):
     dlls = [item["dll"].lower() for item in imports]
     if not terminated or len(dlls) != 2 or set(dlls) != {"kernel32.dll", "msvcrt.dll"}:
         raise GateError("actual import closure 必须恰为 KERNEL32/default MSVCRT")
-    required_apis = {"RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind"}
+    protected_apis = {"RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind"}
+    # bad1 缺 nonleaf table 分支不会调用 unwind；正确 KERNEL32 第三名称可选。
+    # 来源保护始终覆盖全部三个名称，不能随 required 集合一起缩小。
+    required_apis = protected_apis - {"RtlVirtualUnwind"} if variant == 1 else protected_apis
     for item in imports:
         names = {symbol["name"] for symbol in item["symbols"] if "name" in symbol}
         if item["dll"].lower() == "kernel32.dll":
             if not required_apis.issubset(names):
-                raise GateError("KERNEL32 缺少精确命名 RtlCaptureContext/RtlLookupFunctionEntry/RtlVirtualUnwind")
-        elif required_apis & names:
+                raise GateError("KERNEL32 缺少精确命名 " + "/".join(sorted(required_apis - names)))
+        elif protected_apis & names:
             raise GateError("Rtl API 必须由 KERNEL32 提供")
     prva, psize = dirs[3]
     if not prva or not psize or psize % 8:
@@ -849,7 +855,7 @@ def build(root, source, installation, out, support, summary, allowed, evidence):
             raise GateError("link exit0 + empty map")
         run(stem + "-pe-readobj")
         support.readobj_agrees((out / (stem + "-pe-readobj.stdout")).read_text(), exe)
-        pe = pe_admit(exe)
+        pe = pe_admit(exe, variant=variant)
         helper = source / (("abi" if variant == 0 else "bad-unwind-%d" % variant) + ".obj")
         owned, ranges = bindings(pe, helper, source / "negative.obj")
         # map 原文与 -### 是真实完整 closure diagnostic；绝不执行其中 linker commands。

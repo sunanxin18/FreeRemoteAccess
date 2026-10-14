@@ -174,3 +174,30 @@ C 对象 SHA-256 为
 PE 进行纯字节 parser 观察也通过，未执行 PE，未补齐链接 ownership 检查。
 首次 CI 的 76 个原始文件保持字节身份和 failed 终态。root 只放行新提交上的
 同配方有限编译，仍不放行原生 ABI、异常、数值、基准或生产选择。
+
+## 第二次 C/PE 执行与负例变体的导入差异
+
+冻结 `65a22c583b6e0dd75c65a4aa58718aeb42c7284f` 的
+[专项运行38542776507](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38542776507)
+仍失败。19+29 项检查通过，variant0 完成 compiled-only 接受、绑定及有限
+反汇编；其 `isolated_child` 被编译器内联，仍明确 OPEN。variant1 的 C 编译、
+链接和 readobj 均 exit0，随后因未导入 RtlVirtualUnwind 被验证器拒绝。
+variants2–4 未执行，没有原生 ABI/SEH 资格。
+
+variant1 是缺少 nonleaf unwind table 的负例。固定 C 源在确认 Lookup 返回
+NULL 后继续下一 PC，不调用 unwind_one；优化编译器因此删去 VirtualUnwind。
+实际 variant1 导入仍为 KERNEL32/MSVCRT，但只包含命名 CaptureContext 和
+LookupFunctionEntry。不能用假 C 调用或修改优化参数强制留下第三个导入。
+
+第四轮 scoped 源码修复及独立复审通过：生产循环明确传入可信 variant index；
+仅 variant1 不要求 VirtualUnwind，0/2/3/4 仍要求三个 API。三个名称的提供者
+保护及精确 DLL 集合始终保留，不从文件名、receipt 或导入集合推断变体。
+原 29 项测试保留，新增 7 项变体控制，共 36 项；本轮尚未执行。root 只放行
+下一提交的托管窄检查及同配方 C/PE 编译，完整五变体和独立编译产物审查仍待完成。
+
+artifact11883052555 的 API/local ZIP SHA-256 一致：
+`6817be0b65d5de351252564015c3cb44510e1be5ecd885f619582f01a2f8dc5f`。
+原始资料在 `target/windows-contract-65a22c5-38542776507/`。两个真实失败目录
+合计 210 个文件前后指纹保持；第二次终态 SHA-256 为
+`f030ef84e60c042197d593d903171afe80c542cb965088e9ac0c123071c9d936`，
+状态仍 failed，不覆盖首次失败或将源码复审替代执行。

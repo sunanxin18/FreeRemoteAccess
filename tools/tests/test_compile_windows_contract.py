@@ -250,6 +250,75 @@ class BinaryAndRecordTests(TempTests):
                 with self.assertRaisesRegex(GATE.GateError, "actual import closure 必须恰为"):
                     GATE.pe_admit(path)
 
+    def test_variant_one_two_names_and_optional_kernel32_virtual_unwind(self):
+        path = self.root / "container.exe"
+        for symbols in (CONTRACT_APIS[:2], CONTRACT_APIS):
+            for kernel, crt in (("KERNEL32.dll", "msvcrt.dll"), ("KeRnEl32.DlL", "MSVCRT.DLL")):
+                with self.subTest(symbols=symbols, kernel=kernel):
+                    path.write_bytes(container_pe(((kernel, symbols), (crt, ("__C_specific_handler",)))))
+                    parsed = GATE.pe_admit(path, variant=1)
+                    self.assertEqual(parsed["imports"][0]["symbols"], [{"name": name} for name in symbols])
+
+    def test_other_variants_require_virtual_unwind_regardless_of_filename(self):
+        # 即使名称宣称 variant1，也只有显式可信 selector 可以选该规则。
+        path = self.root / "abi-contract-1.exe"
+        for variant in (0, 2, 3, 4):
+            with self.subTest(variant=variant):
+                path.write_bytes(container_pe())
+                GATE.pe_admit(path, variant=variant)
+                path.write_bytes(container_pe((("KERNEL32.dll", CONTRACT_APIS[:2]), DEFAULT_IMPORTS[1])))
+                with self.assertRaisesRegex(GATE.GateError, "KERNEL32 缺少精确命名 RtlVirtualUnwind"):
+                    GATE.pe_admit(path, variant=variant)
+        # 私有默认值只保留 variant0 的完整 required 集合。
+        with self.assertRaisesRegex(GATE.GateError, "KERNEL32 缺少精确命名 RtlVirtualUnwind"):
+            GATE.pe_admit(path)
+
+    def test_variant_one_each_required_api_missing_spelling_or_ordinal_rejected(self):
+        path = self.root / "container.exe"
+        for index, api in enumerate(CONTRACT_APIS[:2]):
+            for kind in ("missing", "spelling", "ordinal"):
+                symbols = list(CONTRACT_APIS[:2])
+                if kind == "missing":
+                    del symbols[index]
+                else:
+                    symbols[index] = api.lower() if kind == "spelling" else 1
+                with self.subTest(api=api, kind=kind):
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), DEFAULT_IMPORTS[1])))
+                    with self.assertRaisesRegex(GATE.GateError, "KERNEL32 缺少精确命名 " + api):
+                        GATE.pe_admit(path, variant=1)
+
+    def test_variant_one_all_three_provider_protections_remain(self):
+        path = self.root / "container.exe"
+        for api in CONTRACT_APIS:
+            for duplicate in (False, True):
+                symbols = CONTRACT_APIS if duplicate else tuple(name for name in CONTRACT_APIS if name != api)
+                with self.subTest(api=api, duplicate=duplicate):
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), ("msvcrt.dll", ("__C_specific_handler", api)))))
+                    error = "KERNEL32 缺少精确命名" if not duplicate and api != "RtlVirtualUnwind" else "Rtl API 必须由 KERNEL32 提供"
+                    with self.assertRaisesRegex(GATE.GateError, error):
+                        GATE.pe_admit(path, variant=1)
+
+    def test_variant_one_dll_closure_is_unchanged(self):
+        path = self.root / "container.exe"
+        minimal = (("KERNEL32.dll", CONTRACT_APIS[:2]), DEFAULT_IMPORTS[1])
+        for imports in (minimal + (("NTDLL.dll", ("RtlVirtualUnwind",)),),
+                        minimal + (("other.dll", ("OtherFunction",)),),
+                        (minimal[0],), (minimal[1],),
+                        (("other.dll", CONTRACT_APIS[:2]), minimal[1]),
+                        minimal + (("kernel32.DLL", ("RtlVirtualUnwind",)),)):
+            with self.subTest(dlls=[item[0] for item in imports]):
+                path.write_bytes(container_pe(imports))
+                with self.assertRaisesRegex(GATE.GateError, "actual import closure 必须恰为"):
+                    GATE.pe_admit(path, variant=1)
+
+    def test_variant_selector_rejects_noninteger_bool_and_out_of_range(self):
+        path = self.root / "container.exe"
+        path.write_bytes(container_pe())
+        for variant in (None, True, False, "1", 1.0, -1, 5, [], {}):
+            with self.subTest(variant=variant):
+                with self.assertRaisesRegex(GATE.GateError, "PE variant 必须为整数 0..4"):
+                    GATE.pe_admit(path, variant=variant)
+
     def test_actual_input_missing_mutated_or_malformed_not_receipt_success(self):
         # trusted support COFF parser，手写容器只测试 bytes gate。
         support = GATE.pinned_support(SCRIPT.parents[1])
@@ -426,6 +495,65 @@ class StopOnFailureTests(TempTests):
         calls, out, summary = self.model("registered-json-drift")
         self.assertEqual(calls, ["variant-0-compile-expansion"])
         self.assertFalse((out / "driver-0.obj").exists())
+
+
+class VariantAdmissionCallTests(TempTests):
+    def test_each_trusted_loop_variant_is_explicitly_bound_at_pe_admission(self):
+        # 每轮在 PE admission 主动停止；只检测参数传递，不授予 compile/native 成功。
+        self.assertEqual(GATE.VARIANTS, (0, 1, 2, 3, 4))
+        seen = []
+        for expected in range(5):
+            with self.subTest(variant=expected):
+                base = self.root / str(expected)
+                source, install, out = (base / "source", base / "install", base / "out")
+                for folder in (source, install, out):
+                    folder.mkdir(parents=True)
+                calls = []
+                support = SimpleNamespace(CC=Path("/opt/tool/clang"), READOBJ=Path("/opt/tool/readobj"),
+                                          TOOL_ROOT=Path("/opt/tool"), TARGET="aarch64-w64-mingw32",
+                                          host_gate=lambda: None, coff_admit=lambda path: {},
+                                          readobj_agrees=lambda text, path: None)
+                def terminal(folder, label, argv, **kwargs):
+                    kwargs["validator"]()
+                    calls.append(label)
+                    if label.endswith("-compile"):
+                        self.assertIn("-DFRD_CONTRACT_VARIANT=%d" % expected, argv)
+                        (folder / ("driver-%d.obj" % expected)).write_bytes(b"opaque modeled object")
+                    elif label.endswith("-link"):
+                        (folder / ("abi-contract-%d.exe" % expected)).write_bytes(b"opaque modeled PE")
+                        (folder / ("abi-contract-%d.map" % expected)).write_bytes(b"opaque modeled map")
+                    # 冲突的 receipt metadata 不得成为 selector；record 仍只是数据。
+                    record = {"argv": argv, "variant": (expected + 1) % 5,
+                              "wait_terminal": "exited", "returncode": 0}
+                    for stream in ("stdout", "stderr"):
+                        path = folder / (label + "." + stream)
+                        path.write_bytes(b"orchestration-only model")
+                        record[stream] = {"sha256": GATE.sha(path)}
+                    GATE.write_json(folder / (label + ".receipt.json"), record)
+                    kwargs["validator"]()
+                    return record
+                def stop_at_admission(path, *, variant):
+                    self.assertEqual(path, out / ("abi-contract-%d.exe" % expected))
+                    self.assertIs(type(variant), int)
+                    self.assertEqual(variant, expected)
+                    seen.append(variant)
+                    raise GATE.GateError("modeled stop at explicit variant admission")
+                support.terminal = terminal
+                summary = {"variants": [], "not_attempted": list(range(5)), "status": "failed"}
+                allowed = set(GATE.FIXED_MEMBERS)
+                evidence = GATE.Evidence(out, allowed)
+                with mock.patch.object(GATE, "VARIANTS", (expected,)), mock.patch.object(GATE, "source_snapshot", return_value={}), mock.patch.object(GATE, "admit_inputs", return_value=({}, {}, {}, {})), mock.patch.object(GATE, "tools_match", return_value={}), mock.patch.object(GATE, "CRT", ()), mock.patch.object(GATE, "pe_admit", side_effect=stop_at_admission) as admission, mock.patch.object(GATE, "bindings") as bindings:
+                    with self.assertRaisesRegex(GATE.GateError, "modeled stop at explicit variant admission"):
+                        GATE.build(self.root, source, install, out, support, summary, allowed, evidence)
+                admission.assert_called_once_with(out / ("abi-contract-%d.exe" % expected), variant=expected)
+                bindings.assert_not_called()
+                self.assertEqual(calls, ["variant-%d-%s" % (expected, suffix) for suffix in
+                                        ("compile-expansion", "compile", "object-readobj", "link-expansion", "link", "pe-readobj")])
+                self.assertEqual(summary["not_attempted"], [value for value in range(5) if value != expected])
+                self.assertEqual(summary["status"], "failed")
+                self.assertEqual([item["status"] for item in summary["variants"]], ["failed"])
+                self.assertFalse((out / "terminal-status.json").exists())
+        self.assertEqual(seen, [0, 1, 2, 3, 4])
 
 
 class EvidenceFinalizationFailureTests(TempTests):
