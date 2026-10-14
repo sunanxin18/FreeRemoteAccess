@@ -6,9 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
-#include <time.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "h264-luma-dc-platform.h"
 #include "libavcodec/h264dsp.h"
 #include "libavutil/cpu.h"
 
@@ -156,26 +154,26 @@ static void memory_cases(void) {
         neon((int16_t*)(b+32),(int16_t*)(b+32+2*alias[k]),3655680);
         require(!memcmp(a,b,sizeof a),"alias complete memory image"); cases++;
     }
-    size_t page=(size_t)sysconf(_SC_PAGESIZE);
-    unsigned char *mi=mmap(NULL,page*3,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0);
-    unsigned char *mo=mmap(NULL,page*3,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0);
-    require(mi!=MAP_FAILED && mo!=MAP_FAILED,"guard mmap");
-    require(!mprotect(mi+page,page,PROT_READ|PROT_WRITE) && !mprotect(mo+page,page,PROT_READ|PROT_WRITE),"guard mprotect");
+    frd_dc_guard input={0}, output={0}; const char *failure=NULL;
+    if(frd_dc_guard_create(&input) || frd_dc_guard_create(&output)) { failure="guard create"; goto guard_cleanup; }
     for(int edge=0;edge<2;edge++) for(int outedge=0;outedge<2;outedge++) {
-        int16_t *in=(int16_t*)(mi+(edge ? 2*page-32 : page));
-        int16_t *out=(int16_t*)(mo+(outedge ? 2*page-482 : page));
+        int16_t *in=(int16_t*)(input.page+(edge ? input.page_size-32 : 0));
+        int16_t *out=(int16_t*)(output.page+(outedge ? output.page_size-482 : 0));
         memcpy(in,vectors[5],32); fill(out,241);
         _Alignas(16) int16_t expected[256]; fill(expected,256); normalized(expected,in,3655680);
-        require(!mprotect(mi+page,page,PROT_READ),"input read-only");
-        neon(out,in,3655680); require(!memcmp(out,expected,482),"guard page parity");
-        require(!mprotect(mi+page,page,PROT_READ|PROT_WRITE),"restore input access"); cases++;
+        if(frd_dc_guard_access(&input,FRD_DC_READ_ONLY)) { failure="input read-only"; goto guard_cleanup; }
+        neon(out,in,3655680);
+        if(memcmp(out,expected,482)) { failure="guard page parity"; goto guard_cleanup; }
+        if(frd_dc_guard_access(&input,FRD_DC_READ_WRITE)) { failure="restore input access"; goto guard_cleanup; } cases++;
     }
-    munmap(mi,page*3); munmap(mo,page*3);
+guard_cleanup:
+    { int input_error=frd_dc_guard_destroy(&input), output_error=frd_dc_guard_destroy(&output);
+      require(!failure && !input_error && !output_error,failure ? failure : "guard cleanup"); }
     _Alignas(16) int16_t out[256];
     require(!frd_h264_dc_check_abi(out,vectors[2],3655680,neon),"callee saved GPR/SIMD, x18 and SP");
     puts("memory: 8 output alignments; alias indices 0/16/128/240; read-only input and input/output start/end guard pages; AArch64 ABI sentinels");
 }
-static uint64_t ns(void) { struct timespec t; require(!clock_gettime(CLOCK_MONOTONIC,&t),"clock"); return (uint64_t)t.tv_sec*1000000000+t.tv_nsec; }
+static uint64_t ns(void) { uint64_t value; require(!frd_dc_clock_ns(&value),"clock"); return value; }
 static int cmp_double(const void *a,const void *b) { double x=*(const double*)a,y=*(const double*)b; return (x>y)-(x<y); }
 static void benchmark(void) {
     enum { POOL=256, BATCHES=31, CALLS=262144, WARMUP=65536 };

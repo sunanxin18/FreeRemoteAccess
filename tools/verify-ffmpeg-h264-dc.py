@@ -69,7 +69,8 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     repo = Path(__file__).resolve().parent.parent
     fixtures = repo / "third_party/ffmpeg/8.1.2/tests"
-    inputs = [fixtures / "h264-luma-dc-parity.c", fixtures / "h264-luma-dc-abi.S"]
+    inputs = [fixtures / "h264-luma-dc-parity.c", fixtures / "h264-luma-dc-abi.S",
+              fixtures / "h264-luma-dc-platform.h"]
     objects = [o.resolve() for o in args.object] or [src / "libavcodec/libavcodec.a", src / "libavutil/libavutil.a"]
     commands = []
     metadata = {"target": args.target, "host": {"system": platform.system(), "machine": platform.machine(),
@@ -90,6 +91,7 @@ def main():
     if not cc:
         p.error("empty compiler command")
     try:
+        metadata["fixture_inputs_before"] = {str(path): sha(path) for path in inputs}
         metadata["compiler"] = run(cc + ["--version"])
         # Explicit compiler selection/flags are recorded; executable identity is independently checked below.
         common = cc + ["-O3", "-std=c11", "-D_GNU_SOURCE", "-I", str(src)] + args.cflag
@@ -107,10 +109,15 @@ def main():
         identities = inputs + objects + [src / name for name in PINS] + [src / "config.h", src / "ffbuild/config.mak", exe]
         identities += [src / "libavcodec/aarch64/h264idct_neon.o", src / "libavcodec/h264idct.o", src / "libavcodec/aarch64/h264dsp_init_aarch64.o"]
         metadata["inputs"] = {str(path): sha(path) for path in identities}
+        if any(metadata["inputs"][str(path)] != metadata["fixture_inputs_before"][str(path)] for path in inputs):
+            raise ValueError("private fixture changed during compilation")
         if args.execute:
             print(run([exe] + (["--benchmark"] if args.benchmark else [])), end="")
         else:
             print(f"compile-only: {exe}; no target process executed")
+        metadata["fixture_inputs_after"] = {str(path): sha(path) for path in inputs}
+        if metadata["fixture_inputs_after"] != metadata["fixture_inputs_before"]:
+            raise ValueError("private fixture changed during qualification")
         metadata["status"] = "passed" if args.execute else "compiled-only"
     except (RuntimeError, ValueError, OSError) as error:
         metadata["status"] = "failed"

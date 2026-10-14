@@ -462,7 +462,8 @@ def qualify(root, archive, source_api):
         inputs += [REPO / 'tools/verify-ffmpeg-h264-dc.py', Path(__file__).resolve(),
                    REPO / 'tools/qualify-linux-h264-recipe.sh',
                    REPO / 'third_party/ffmpeg/8.1.2/tests/h264-luma-dc-parity.c',
-                   REPO / 'third_party/ffmpeg/8.1.2/tests/h264-luma-dc-abi.S']
+                   REPO / 'third_party/ffmpeg/8.1.2/tests/h264-luma-dc-abi.S',
+                   REPO / 'third_party/ffmpeg/8.1.2/tests/h264-luma-dc-platform.h']
         before = snapshot(inputs)
         # 上游 prepare 后仍绑定最初验证的配置，不允许重新 snapshot 掩盖配置变化。
         before.update(configuration_before)
