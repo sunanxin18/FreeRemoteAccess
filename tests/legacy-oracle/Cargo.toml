@@ -3,6 +3,7 @@ name = "frd-legacy-original-oracle"
 version = "0.1.0"
 edition = "2021"
 publish = false
+default-run = "frd-legacy-original-oracle"
 
 [workspace]
 resolver = "2"

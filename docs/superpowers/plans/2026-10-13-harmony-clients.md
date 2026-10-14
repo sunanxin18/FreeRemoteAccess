@@ -90,6 +90,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4A2.8B `13f1bcc` rich session精确内容/输出索引、完整SW/SH裁剪、RFX实际交集与旧入口禁用collector经独立审查Approved；宿主37/default52/optional两profile和9故障变体通过，冻结实际OHOS source harness手机/PC各37项通过。Adapter完整首帧/恢复接线仍待完成，见[覆盖验证](../../validation/rdp-decoded-coverage-20261014.md)。
 - [x] Task 4A2.8C `fa825f1` adapter/baseline精确内容、实际图像借用/整批验证、完整知识恢复及EGFX闭合发布单元独立审查Approved；固定源码OHOS test ELF手机/PC各20+17项通过。其它架构/普通HAP/真实首帧与生产选择待完成，见[首帧覆盖验证](../../validation/rdp-baseline-coverage-20261014.md)。
 - [x] Task 4A2.9 `2015400` Compatibility默认与显式RequiredNative策略/实际factory-session-Stage及processor replacement接线独立审查Approved；固定OHOS ELF手机/PC各6项策略和20项编码覆盖通过。完整管线性能、其它架构、普通HAP及生产资格待完成，见[策略验证](../../validation/rdp-native-factory-20261014.md)。
+- [x] Task 4A2.10A作者宿主实现/独立原版整管线正确性与测量证据完成，最终独立Spec/QualityPASS；38项全链/35项Stage性能未达标保留。手机/PC O/C/N目标与优化、完整生产资格仍OPEN，见[整管线验证](../../validation/rdp-legacy-pipeline-20261014.md)。
 - [ ] Task 4A2.10 完成真实编码输入到Surface/mailbox/Startup的整管线原版对照与目标性能；补齐实际cursor像素热路径及按测量定位的瓶颈，解决SSE2 publication资格并保持默认与codec广告独立。
 - [ ] Task 4A2.7 完成八像素格式原生row与image/session接线，补Bitmap真实written计数、source stride/crop/padding和Set/Stream几何门，再验证每目标实际运行、性能、包与生产选择。
 - [x] Task 4B1 真实事务→原生呈现、统一视口与输入门接线完成（`87c829a`/`bccb321`），两台合成首帧、触点及本地重绘受限验证，跳帧重试修复经独立复审；不代表真实协议连接，见[呈现验证](../../validation/harmony-native-presentation-20261013.md)。

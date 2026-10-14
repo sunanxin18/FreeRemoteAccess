@@ -1200,6 +1200,10 @@ fn commit_reactivated_surface(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unexpected_cfgs)]
+    mod legacy_pipeline {
+        include!("legacy_pipeline.rs");
+    }
     use std::io::{self, Read, Write};
     use std::sync::{mpsc, Arc, Mutex};
 
