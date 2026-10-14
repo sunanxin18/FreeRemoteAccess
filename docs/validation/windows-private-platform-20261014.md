@@ -74,3 +74,27 @@ oracle 独立核对完整输入序列、整数结果、终止标记和 EOF。
 回溯、实际 kernel 的完整输出 oracle 及后续共享 parity/性能/包仍待完成。
 INT32 极值期望须绑定既有 normalized/dequant 的无符号模运算及 signed floor
 语义，不能用可能有 signed overflow 的原 C 极值结果替代独立期望。
+
+## 固定工具链 COFF 编译验证准备
+
+Task 4C5C3B2C 新增 `tools/compile-windows-private-abi.py`、对应窄测试和独立 CI
+工作流。初次独立源码审查发现候选拒绝分类过宽：工具或输出 I/O 故障可能被当成
+源候选拒绝；修复后未知非零默认保持失败，只有特定尾声长度诊断可记录为候选
+拒绝。源码修复复审的 StaticSpec/Quality 均通过；这些测试尚未执行。
+
+探针固定 Linux x86_64 构建主机、LLVM-MinGW 20250709 msvcrt archive 及既有
+SHA-256，不使用本机 Clang 替代。十一项已批准私有源码/头文件按固定指纹检查，
+普通 Windows C 使用真实工具链头文件。拟生成三个正确 ARM64 COFF 对象与五个
+错误 unwind 候选，保留每次实际参数、终态、stderr、对象、readobj 与反汇编；
+正确对象必须全部通过，候选未知错误不能变成成功。产物状态只允许 compiled-only
+或 failed，不授予原生 ABI、SEH 或数值资格。
+
+工作流保持手动触发，并仅在 `codex/rdp-egfx-hevc-preference` 分支修改该工作流
+文件时触发首次运行。新增工作流尚未进入默认分支，故本轮通过独立审查后的明确
+提交推送启动，不修改默认分支或既有包工作流。后续普通工具文件变更不会自动
+重复此专项。运行使用 Ubuntu24.04，不是 Windows 原生执行。
+
+截至本次源码提交，实际窄测试、下载/安装、编译及对象检查结果仍待取得。根代理
+仅放行远端这一有限验证，保留首次实际失败后再修复。正常 Windows 包 CI 不能
+替代它；成功 COFF 编译也不能替代后续 C driver、真实 Rtl* unwind、保护页/QPC、
+同 shipping 核 parity、基准、修改配方包或远程登录。
