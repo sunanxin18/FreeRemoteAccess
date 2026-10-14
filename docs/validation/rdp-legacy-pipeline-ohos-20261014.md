@@ -1,7 +1,7 @@
-# 鸿蒙 ARM64 整管线正确性：手机模拟器
+# 鸿蒙 ARM64 整管线正确性：手机与 PC 模拟器
 
-2026-10-14，Task 4A2.10A。状态为**开发中**。手机模拟器完成本页四项实际正确性
-测试；PC 模拟器已启动相同的独立验证，尚未取得完整结果。性能、普通 HAP
+2026-10-14，Task 4A2.10A。状态为**开发中**。手机与 PC 模拟器分别完成本页四项实际正确性
+测试。性能、普通 HAP
 协议注册和真实远程登录仍未完成。
 
 ## 冻结输入与执行层
@@ -49,12 +49,29 @@ baseline/Surface→mailbox/compiler/canvas 处理链路，并保留畸形输入�
 root 重新读取四项原始结果并重验当前日志身份与执行器的同实例前置门，没有
 重跑已通过项目。
 
+## PC 独立实际结果
+
+PC 实例为 API26 ARM64 模拟器 `127.0.0.1:5557`，在手机完成后串行执行。
+根执行工具 session 61707 最终 exit 0；四项均为精确 1 PASS、0 failed/ignored/
+measured，宿主 exit 0 和设备唯一 `FRD_EXIT=0`。
+
+| 测试 | 实际结果 | 测试程序报告耗时 |
+|---|---|---:|
+| `pipeline_original_checkpoints_real_factory_to_canvas` | 完整 74 workloads、两种 backend 对照通过，`subset=false` | 706.97 s |
+| `pipeline_regression_discriminators` | 回归判别通过 | 0.09 s |
+| `pipeline_steady_pointer_reference_gate` | 持续指针状态参考通过 | 112.44 s |
+| `pipeline_stage_steady_pointer_reference_gate` | Stage 持续指针参考通过 | 1.91 s |
+
+原始证据位于同级 `actual/pc/`。`correctness-complete.json` SHA-256：
+`fd3da87d10a0261321d76f56a426151c7693dbb638c8eb5bd1075ce59424e8a2`。
+root 独立重验四项原始日志、终态与同实例前置门。没有将手机结果代替 PC
+结果，也没有重跑已通过项目。
+
 ## 剩余验证
 
-PC 模拟器独立四项正确性、两实例 Stage 原版/兼容/NEON 对照、完整流水线
-性能及分配观察尚未完成。宿主已有的 38 项完整流水线和 35 项 Stage 性能
+两实例 Stage 原版/兼容/NEON 对照、完整流水线性能及分配观察尚未完成。宿主已有的 38 项完整流水线和 35 项 Stage 性能
 未达标记录保持，见[宿主整管线验证](rdp-legacy-pipeline-20261014.md)。
 
 cursor、SSE2 publication、bulk、正式解码器选择、普通 HAP 接线和真实 Windows/
-Mac 登录继续按完整计划推进。手机测试通过不代表 PC 通过，也不代表客户端
-已能远程控制 Windows 或 Mac。
+Mac 登录继续按完整计划推进。上述两个独立目标的处理链路测试通过，仍不代表客户端已能远程控制 Windows
+或 Mac。

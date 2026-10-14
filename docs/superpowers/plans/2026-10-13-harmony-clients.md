@@ -91,7 +91,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4A2.8C `fa825f1` adapter/baseline精确内容、实际图像借用/整批验证、完整知识恢复及EGFX闭合发布单元独立审查Approved；固定源码OHOS test ELF手机/PC各20+17项通过。其它架构/普通HAP/真实首帧与生产选择待完成，见[首帧覆盖验证](../../validation/rdp-baseline-coverage-20261014.md)。
 - [x] Task 4A2.9 `2015400` Compatibility默认与显式RequiredNative策略/实际factory-session-Stage及processor replacement接线独立审查Approved；固定OHOS ELF手机/PC各6项策略和20项编码覆盖通过。完整管线性能、其它架构、普通HAP及生产资格待完成，见[策略验证](../../validation/rdp-native-factory-20261014.md)。
 - [x] Task 4A2.10A作者宿主实现/独立原版整管线正确性与测量证据完成，最终独立Spec/QualityPASS；38项全链/35项Stage性能未达标保留。手机/PC O/C/N目标与优化、完整生产资格仍OPEN，见[整管线验证](../../validation/rdp-legacy-pipeline-20261014.md)。
-- [x] Task 4A2.10A 手机目标正确性子步骤：冻结618168c OHOS ARM64 release实际四项精确测试通过，完整74组两backend/回归判别/持续指针/Stage指针参考，root原始日志与宿主/设备终态复核通过。PC已启动独立验证未完成，目标测量与完整资格仍OPEN，见[鸿蒙目标记录](../../validation/rdp-legacy-pipeline-ohos-20261014.md)。
+- [x] Task 4A2.10A 手机/PC目标正确性子步骤：冻结618168c OHOS ARM64 release两实例分别实际四项精确测试通过，完整74组两backend/回归判别/持续指针/Stage指针参考，root分别复核原始日志与宿主/设备终态。目标测量与完整资格仍OPEN，见[鸿蒙目标记录](../../validation/rdp-legacy-pipeline-ohos-20261014.md)。
 - [ ] Task 4A2.10 完成真实编码输入到Surface/mailbox/Startup的整管线原版对照与目标性能；补齐实际cursor像素热路径及按测量定位的瓶颈，解决SSE2 publication资格并保持默认与codec广告独立。
 - [ ] Task 4A2.7 完成八像素格式原生row与image/session接线，补Bitmap真实written计数、source stride/crop/padding和Set/Stream几何门，再验证每目标实际运行、性能、包与生产选择。
 - [x] Task 4B1 真实事务→原生呈现、统一视口与输入门接线完成（`87c829a`/`bccb321`），两台合成首帧、触点及本地重绘受限验证，跳帧重试修复经独立复审；不代表真实协议连接，见[呈现验证](../../validation/harmony-native-presentation-20261013.md)。
@@ -111,6 +111,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4C5C3B2A 源码与宿主层：Windows ARM64 私有保护页/QPC及纯整数换算完成，独立源码和宿主执行复审通过；22锚点、10036完整输入、11拒绝负例、10注入逻辑案例通过。首记录脚本失败和仅补两项的续轮均保留。仅本子步骤完成，真实Windows编译/ABI/SEH/native/共享parity/性能/修改包仍待完成，见[Windows私有平台验证](../../validation/windows-private-platform-20261014.md)。
 - [x] Task 4C5C3B2B 源码准备子步骤：独立Windows ARM64 ABI/SEH helper、外层恢复与逐寄存器assembly负例完成并经静态Spec/Quality审查通过；仅源码提案，无编译或原生SEH结果。依赖Cdriver、固定工具链COFF/PE、真实Rtl*回溯/异常/完整输出oracle和全部生产资格仍待完成，见[Windows私有平台验证](../../validation/windows-private-platform-20261014.md)。
 - [x] Task 4C5D1A HEVC16原版C/独立floor模型119600 cases、完整context、精确原版selector RED及有限Mac保护页前置门完成，独立审查通过；不代表NEON或生产资格，见[原版参考验证](../../validation/hevc-intra16-reference-20261014.md)。
+- [x] Task 4C5D1B 源码与Mac私有正确性子步骤：两个8-bit HEVC16 NEON核、实际selector/119600数值/4800共用guard路径/1472最小guard/73600直接ABI、六类compiled负例及PRIVATE禁用header门经独立最终Spec/Quality审查通过；确定性取整负例P2以实际233/233/241配对控制关闭。仅本子步骤完成，性能/其它平台与容器/正式配方包/完整D1B仍OPEN，见[HEVC私有内核验证](../../validation/hevc-intra16-native-20261014.md)。
 - [ ] Task 4C5 优先补 AArch64 8-bit H264 luma DC 变换/反量化；维护显式补丁来源、C oracle、逐核 parity、目标基准和普通 HAP 同流验证。HEVC 16×16 planar/angular 与已识别的 32×32 angular 标量分支随后处理，避免重写已向量化分支。
 - [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。

@@ -1,0 +1,318 @@
+diff --git a/libavcodec/aarch64/hevcpred_neon.S b/libavcodec/aarch64/hevcpred_neon.S
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/aarch64/hevcpred_neon.S
+@@ -0,0 +1,236 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * 8-bit HEVC16 帧内预测；仅使用基线 AArch64 NEON。
++ * 私有 D1 prototype：Windows stack/unwind 资格仍是 OPEN 后继门。
++ */
++#include "libavutil/aarch64/asm.S"
++#include "neon.S"
++
++#ifndef _WIN32
++/* 仅读 top/left[0..16]，无对齐或额外 padding 假设；dst 不重叠。
++ * Leaf：仅 x0..x9、v0..v7/v16..v23；不写 stack/LR/nonvolatile。
++ * u16 分子舍入前最大 8160；唯一 rounding 加16后最大8176。
++ */
++function ff_hevc_pred_planar_16_8_neon, export=1
++        ldr q16, [x1]
++        ushll v0.8h, v16.8b, #0
++        ushll2 v1.8h, v16.16b, #0
++        movrel x8, Lplanar_weights
++        ldp q2, q3, [x8]
++        movi v21.8h, #16
++        sub v4.8h, v21.8h, v2.8h
++        sub v5.8h, v21.8h, v3.8h
++        ldrb w9, [x1, #16]
++        dup v22.8h, w9
++        mul v4.8h, v4.8h, v22.8h
++        mul v5.8h, v5.8h, v22.8h
++        ldrb w9, [x2, #16]
++        dup v23.8h, w9
++        mov w6, #1
++        mov w7, #15
++Lplanar_row:
++        ldrb w9, [x2], #1
++        dup v17.8h, w9
++        dup v19.8h, w7
++        dup v20.8h, w6
++        mul v6.8h, v2.8h, v17.8h
++        mul v7.8h, v3.8h, v17.8h
++        add v6.8h, v6.8h, v4.8h
++        add v7.8h, v7.8h, v5.8h
++        mla v6.8h, v0.8h, v19.8h
++        mla v7.8h, v1.8h, v19.8h
++        mla v6.8h, v23.8h, v20.8h
++        mla v7.8h, v23.8h, v20.8h
++        rshrn v6.8b, v6.8h, #5
++        rshrn2 v6.16b, v7.8h, #5
++        str q6, [x0]
++        add x0, x0, x3
++        add w6, w6, #1
++        subs w7, w7, #1
++        b.ge Lplanar_row
++        ret
++endfunc
++
++/* Leaf：x0..x17、v0..v7/v16..v17；不写 x18/nonvolatile/LR。
++ * SP 减320且16对齐：scratch[0..63]，ref=SP+16，tile[64..319]。
++ * 负角扩展初始化 ref[-16..16]，其余使用原 refs[-1..31]。
++ * 包含负 stride 在内，只存合法 dst rows。
++ * Windows 等待独立 SEH/ABI closure，当前 prototype 不输出其符号。
++ */
++function ff_hevc_pred_angular_16_8_neon, export=1
++        .cfi_startproc
++        sub sp, sp, #320
++        .cfi_def_cfa_offset 320
++        cmp w5, #18
++        csel x6, x1, x2, ge
++        csel x7, x2, x1, ge
++        sub x8, x6, #1
++        movrel x12, Langular_angles
++        sub w11, w5, #2
++        ldrsb w9, [x12, w11, uxtw]
++        asr w10, w9, #1
++        cmp w10, #-1
++        b.ge Langular_ready
++        add x8, sp, #16
++        sub x12, x6, #1
++        ldr q0, [x12]
++        str q0, [x8]
++        ldrb w14, [x6, #15]
++        strb w14, [x8, #16]
++        movrel x12, Langular_inverse
++        sub w11, w5, #11
++        ldr w13, [x12, w11, uxtw #2]
++        mov w11, w10
++Langular_extend:
++        mul w14, w11, w13
++        add w14, w14, #128
++        asr w14, w14, #8
++        sub w14, w14, #1
++        ldrb w14, [x7, w14, sxtw]
++        strb w14, [x8, w11, sxtw]
++        adds w11, w11, #1
++        b.lt Langular_extend
++Langular_ready:
++        cmp w5, #18
++        add x15, sp, #64
++        csel x15, x0, x15, ge
++        mov x13, #16
++        csel x13, x3, x13, ge
++        mov w16, #1
++Langular_row:
++        mul w17, w16, w9
++        asr w11, w17, #5
++        and w14, w17, #31
++        add w11, w11, #1
++        add x12, x8, w11, sxtw
++        ldr q0, [x12]
++        cbz w14, Langular_store
++        add x12, x12, #1
++        ldr q1, [x12]
++        mov w11, #32
++        sub w11, w11, w14
++        dup v2.16b, w11
++        dup v3.16b, w14
++        umull v4.8h, v0.8b, v2.8b
++        umull2 v5.8h, v0.16b, v2.16b
++        umlal v4.8h, v1.8b, v3.8b
++        umlal2 v5.8h, v1.16b, v3.16b
++        rshrn v0.8b, v4.8h, #5
++        rshrn2 v0.16b, v5.8h, #5
++Langular_store:
++        str q0, [x15]
++        add x15, x15, x13
++        add w16, w16, #1
++        cmp w16, #17
++        b.lt Langular_row
++        cmp w5, #18
++        b.ge Langular_correct
++        mov x10, #0
++Ltranspose_rows:
++        mov x11, #0
++Ltranspose_columns:
++        add x6, sp, #64
++        add x6, x6, x11, lsl #4
++        add x6, x6, x10
++        madd x7, x10, x3, x0
++        add x7, x7, x11
++        ldr d0, [x6, #0]
++        ldr d1, [x6, #16]
++        ldr d2, [x6, #32]
++        ldr d3, [x6, #48]
++        ldr d4, [x6, #64]
++        ldr d5, [x6, #80]
++        ldr d6, [x6, #96]
++        ldr d7, [x6, #112]
++        transpose_8x8B v0, v1, v2, v3, v4, v5, v6, v7, v16, v17
++        str d0, [x7]
++        add x7, x7, x3
++        str d1, [x7]
++        add x7, x7, x3
++        str d2, [x7]
++        add x7, x7, x3
++        str d3, [x7]
++        add x7, x7, x3
++        str d4, [x7]
++        add x7, x7, x3
++        str d5, [x7]
++        add x7, x7, x3
++        str d6, [x7]
++        add x7, x7, x3
++        str d7, [x7]
++        add x11, x11, #8
++        cmp x11, #16
++        b.lt Ltranspose_columns
++        add x10, x10, #8
++        cmp x10, #16
++        b.lt Ltranspose_rows
++Langular_correct:
++        cbnz w4, Langular_return
++        cmp w5, #26
++        b.eq Lcorrect_vertical
++        cmp w5, #10
++        b.ne Langular_return
++        mov x6, x1
++        mov x7, x2
++        b Lcorrect_vector
++Lcorrect_vertical:
++        mov x6, x2
++        mov x7, x1
++Lcorrect_vector:
++        ldr q0, [x6]
++        ushll v1.8h, v0.8b, #0
++        ushll2 v2.8h, v0.16b, #0
++        ldurb w9, [x6, #-1]
++        dup v3.8h, w9
++        sub v1.8h, v1.8h, v3.8h
++        sub v2.8h, v2.8h, v3.8h
++        sshr v1.8h, v1.8h, #1
++        sshr v2.8h, v2.8h, #1
++        ldrb w9, [x7]
++        dup v3.8h, w9
++        add v1.8h, v1.8h, v3.8h
++        add v2.8h, v2.8h, v3.8h
++        sqxtun v0.8b, v1.8h
++        sqxtun2 v0.16b, v2.8h
++        cmp w5, #10
++        b.eq Lcorrect_horizontal_store
++        mov x7, x0
++        st1 {v0.b}[0], [x7], x3
++        st1 {v0.b}[1], [x7], x3
++        st1 {v0.b}[2], [x7], x3
++        st1 {v0.b}[3], [x7], x3
++        st1 {v0.b}[4], [x7], x3
++        st1 {v0.b}[5], [x7], x3
++        st1 {v0.b}[6], [x7], x3
++        st1 {v0.b}[7], [x7], x3
++        st1 {v0.b}[8], [x7], x3
++        st1 {v0.b}[9], [x7], x3
++        st1 {v0.b}[10], [x7], x3
++        st1 {v0.b}[11], [x7], x3
++        st1 {v0.b}[12], [x7], x3
++        st1 {v0.b}[13], [x7], x3
++        st1 {v0.b}[14], [x7], x3
++        st1 {v0.b}[15], [x7], x3
++
++        b Langular_return
++Lcorrect_horizontal_store:
++        str q0, [x0]
++Langular_return:
++        add sp, sp, #320
++        .cfi_def_cfa_offset 0
++        ret
++        .cfi_endproc
++endfunc
++
++const Langular_angles
++        .byte 32,26,21,17,13,9,5,2,0,-2,-5,-9,-13,-17,-21,-26,-32
++        .byte -26,-21,-17,-13,-9,-5,-2,0,2,5,9,13,17,21,26,32
++endconst
++const Langular_inverse
++        .word -4096,-1638,-910,-630,-482,-390,-315,-256,-315,-390,-482
++        .word -630,-910,-1638,-4096
++endconst
++
++const Lplanar_weights
++        .hword 15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0
++endconst
++#endif
+diff --git a/libavcodec/aarch64/hevcpred_init_aarch64.c b/libavcodec/aarch64/hevcpred_init_aarch64.c
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/aarch64/hevcpred_init_aarch64.c
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * HEVC16 AArch64 私有 D1 分派；只替换两个16×16槽。
++ */
++#include "config.h"
++#include "config_components.h"
++#include "libavutil/attributes.h"
++#include "libavutil/cpu.h"
++#include "libavutil/aarch64/cpu.h"
++#include "libavcodec/hevc/pred.h"
++
++#if HAVE_NEON_EXTERNAL && CONFIG_HEVC_DECODER && !defined(_WIN32)
++void ff_hevc_pred_planar_16_8_neon(uint8_t *, const uint8_t *, const uint8_t *, ptrdiff_t);
++void ff_hevc_pred_angular_16_8_neon(uint8_t *, const uint8_t *, const uint8_t *, ptrdiff_t, int, int);
++#endif
++
++av_cold void ff_hevc_pred_init_aarch64(HEVCPredContext *hpc, int bit_depth)
++{
++/* Windows 是 OPEN 后继门，不是永久产品排除。
++ * 当前 prototype 不能取得 Windows 组合 recipe/广告资格。
++ */
++#if HAVE_NEON_EXTERNAL && CONFIG_HEVC_DECODER && !defined(_WIN32)
++    if (bit_depth == 8 && have_neon(av_get_cpu_flags())) {
++        hpc->pred_planar[2]  = ff_hevc_pred_planar_16_8_neon;
++        hpc->pred_angular[2] = ff_hevc_pred_angular_16_8_neon;
++    }
++#endif
++}
+diff --git a/libavcodec/hevc/pred.c b/libavcodec/hevc/pred.c
+--- a/libavcodec/hevc/pred.c
++++ b/libavcodec/hevc/pred.c
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "hevcdec.h"
++#include "config_components.h"
+ 
+ #include "pred.h"
+ 
+@@ -75,6 +76,10 @@
+         break;
+     }
+ 
++/* 私有 D1：Windows SEH/原生 ABI 门未闭合，不能作为组合 recipe 候选。 */
++#if ARCH_AARCH64 && HAVE_NEON_EXTERNAL && CONFIG_HEVC_DECODER && !defined(_WIN32)
++    ff_hevc_pred_init_aarch64(hpc, bit_depth);
++#endif
+ #if ARCH_MIPS
+     ff_hevc_pred_init_mips(hpc, bit_depth);
+ #endif
+diff --git a/libavcodec/hevc/pred.h b/libavcodec/hevc/pred.h
+--- a/libavcodec/hevc/pred.h
++++ b/libavcodec/hevc/pred.h
+@@ -43,6 +43,7 @@
+ } HEVCPredContext;
+ 
+ void ff_hevc_pred_init(HEVCPredContext *hpc, int bit_depth);
++void ff_hevc_pred_init_aarch64(HEVCPredContext *hpc, int bit_depth);
+ void ff_hevc_pred_init_mips(HEVCPredContext *hpc, int bit_depth);
+ 
+ #endif /* AVCODEC_HEVC_PRED_H */
+diff --git a/libavcodec/aarch64/Makefile b/libavcodec/aarch64/Makefile
+--- a/libavcodec/aarch64/Makefile
++++ b/libavcodec/aarch64/Makefile
+@@ -74,6 +74,8 @@
+                                            aarch64/vp9lpf_neon.o               \
+                                            aarch64/vp9mc_16bpp_neon.o          \
+                                            aarch64/vp9mc_neon.o
++NEON-OBJS-$(CONFIG_HEVC_DECODER)        += aarch64/hevcpred_neon.o             \
++                                           aarch64/hevcpred_init_aarch64.o
+ NEON-OBJS-$(CONFIG_HEVC_DECODER)        += aarch64/hevcdsp_deblock_neon.o      \
+                                            aarch64/hevcdsp_dequant_neon.o      \
+                                            aarch64/hevcdsp_idct_neon.o         \
