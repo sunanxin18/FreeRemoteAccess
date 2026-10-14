@@ -94,12 +94,49 @@ O/C/N 结果，没有重跑已完成的正确性或初始测量。
 `9c492a8fbafc694d2f00f2b5e80d971cbeaf02b92b9e91545e04c9d73ccf0d8b`，
 独立 root 核对记录 SHA-256 为
 `85237f1c3c367b3cead0f909c137a39e4c1c0cef454b54de5d4380c1f65af9d3`。
-PC Stage、完整管线和分配观察仍未完成。当前 native.rs 优化工作副本不属于
+PC Stage 的初始与顺序补充测量已完成，完整管线和分配观察仍未完成。当前 native.rs 优化候选不属于
 本次冻结程序，不将其源码变化归因于这些测量。
+
+## PC Stage 初始测量
+
+同一冻结 618168c 的 PC 初始阶段已实际结束。恢复工作时原执行工具句柄不再
+存在，宿主 PID 3357 也已退出；root 核对十二个实际任务的终态与原始日志，
+每项宿主 exit0、设备唯一 `FRD_EXIT=0`，六个当前程序测试各精确 1 PASS。
+没有因观察句柄消失而重新运行任务。
+
+六轮协调分别处理 174、21、7、3、2、1 组，按原固定规则保留全部记录，最终
+174 组计数、校验和、冷启动合计与实际工作量均一致。root 重验 124 个产物
+指纹，并从各轮原始记录重新组成最终结果。初始结果有 20 项 N/C p95 比值
+超过 1.25；原版 128 组不足 100 ms，129 组达到 4096 次上限，全部保留。
+这些是初始次序结果，尚未完成 window1 原版先行的顺序补充，不授予性能资格。
+
+`stage-initial-complete.json` SHA-256：
+`d3d12faf88b862514e0fe61fd1d5558e4799ed0c72d48d31b56fb19554d06bba`。
+阶段终态 SHA-256 为
+`ea74d5fb1caebb1a7a1f068e34cdd1619affa9752cc998ce5589de3f8e7cac84`；
+独立核对记录 `root-pc-stage-initial-verification.json` SHA-256 为
+`6abcc00d3e8278c02b72dd2d88476d5e3cb6b4d35eea5b6327e356099266b92a`。
+
+随后按原计划仅补充全部 58 个 workload 的 window1，原版先行、当前程序
+N/C 顺序，session42949 实际 exit0。两个任务分别正常结束，原版约 146.85 s、
+当前程序约 286.04 s；当前精确测试 1 PASS、0 ignored，均宿主 exit0 与设备
+唯一 `FRD_EXIT=0`。一轮接受全部 58 组，无重试；重启的是此前已关闭的专用
+模拟器，没有重复初始测量或正确性任务。
+
+root 核对 149 个新旧产物身份，确认初始 window0/2 的行和原版 JSON 不变，
+补充原始记录、实际计数、校验和、冷启动顺序与工作量组成最终 174 组。
+平衡结果保留 21 项 N/C p95 比值超过 1.25，原版 129 组不足 100 ms、129 组
+达到 4096 次上限，不授予性能资格。最终 receipt SHA-256 为
+`15fd290c345540d68c02f0bb260a7ce59a16b44d10cdd7d0d371003af13fac8b`，
+阶段终态为
+`c72a55b4ffd7108e4a12c9dac9b91acffeccbda5cf4047511fea1bb07eaf4ce9`；
+独立核对记录 `root-pc-stage-final-verification.json` SHA-256 为
+`23635b05d5a3a3052f73dea19a5f894e868de803bc6237914b29bb97a870b7c2`。
 
 ## 剩余验证
 
-两实例 Stage 原版/兼容/NEON 对照、完整流水线性能及分配观察尚未完成。宿主已有的 38 项完整流水线和 35 项 Stage 性能
+两实例 Stage 原版/兼容/NEON 测量过程完成，性能未达标及短测量限制保持。
+完整流水线性能及分配观察尚未完成。宿主已有的 38 项完整流水线和 35 项 Stage 性能
 未达标记录保持，见[宿主整管线验证](rdp-legacy-pipeline-20261014.md)。
 
 cursor、SSE2 publication、bulk、正式解码器选择、普通 HAP 接线和真实 Windows/

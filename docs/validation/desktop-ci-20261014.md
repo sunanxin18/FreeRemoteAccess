@@ -84,3 +84,43 @@ ignored 随后独立执行通过；Progressive 61 项通过，1 项 ignored 随�
 这补齐了本提交的既有 Windows 回归；上一提交 f475cf2 的记录及本提交 Windows
 私有对象专项结果仍各自保持验证范围。未提交的 C contract 驱动和色彩优化
 不属于本次源码，仍无它们的 Windows 原生或完整产品验证。
+
+## 冻结 8ea234d 与 f556b7b 的后续状态
+
+2026-10-14，提交 `8ea234d7cbd0b4ba5a41c3da673ab7c38924aee6` 的
+[通用CI38529778194](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38529778194)、
+[macOS38529778107](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38529778107)、
+[Linux38529778152](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38529778152)
+与 [Windows38529778085](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38529778085)
+均实际结束为 success。它们是该 head 的既有构建/包回归，不替代新色彩候选的
+OHOS 运行、完整性能资格或真实会话。
+
+下一提交 `f556b7b493d292a6e6c9b68c6a7776ed94246efc` 的
+[Windows38531352483](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38531352483)
+也成功结束：三架构包及原生 ARM64 job115767634407 全部 success；完整日志确认
+同 run 默认包 Main444 6 项、ClearCodec/NSCodec 39 项与独立 2 项基准、
+Progressive 61 项与独立 1 项基准通过。原生日志 SHA-256 为
+`0627346f6c36cdb4316a77679a2316135ef0c4236400fbc1a6c67f7ba39de7ec`。
+这仍是默认配方回归，不是 Windows 修改配方私有 C/ABI/SEH 资格。
+
+该 head 的 [通用CI38531352370](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38531352370)
+失败：格式与 Ubuntu 安全测试通过；macos-15 job115743825354 在 Apple crate
+`production_session_disconnect_interrupts_blocked_writer_and_runs_cleanup` 的
+“写入失败”字符串断言处失败，该 crate 为 507 passed、1 failed、9 ignored。
+实际错误链未打印，根因未知；不能记作无害调度波动，也没有通过重试覆盖失败。
+诊断源码切片仅为保留原条件并打印完整错误链，不修改生产代码或 3 秒清理边界。
+当前没有修复通过的执行结果。
+
+诊断切片经独立源码审查后，宿主固定 Rust1.96.0 单次聚焦运行实际通过：
+目标 unit test 精确 1 passed、0 failed/ignored，测试报告 0.90 s。
+调用使用 `rustup run 1.96.0-aarch64-apple-darwin cargo test --offline --locked`
+及原测试名；首次直接 cargo 的 `+toolchain` 入口不受支持，在编译前 exit101，
+该入口失败和修正后的实际运行分别保留于
+`target/apple-disconnect-diagnostic-20261014/`。此单次通过未复现 hosted macOS
+并发失败，仍不证明根因已修复；新提交的实际 CI 结果需另行取得。
+
+原始 Windows run/jobs 和两条完整日志保存于本地
+`target/desktop-ci-f556b7b-20261014/`；macOS 失败日志 SHA-256 为
+`57d2a79f9e654ff896097081f0151b85a9b10b121f8ddcc03107016728cc5b75`。
+同 head 的新私有 C/PE 专项也失败，原因及 partial 编译范围独立记录于
+[Windows私有平台验证](windows-private-platform-20261014.md)，不混入默认包结论。

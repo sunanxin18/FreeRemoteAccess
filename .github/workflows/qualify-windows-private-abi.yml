@@ -42,6 +42,7 @@ jobs:
             --source-root "$GITHUB_WORKSPACE" \
             --output "$GITHUB_WORKSPACE/target/task4c5c3b2c-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
+      # EXECFIX1 经独立复审：按实际 KERNEL32/MSVCRT 导入运行有限编译，保留首错材料。
       - name: Run narrow contract parser and orchestration checks
         shell: bash
         run: |

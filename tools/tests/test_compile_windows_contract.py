@@ -28,9 +28,13 @@ COFF = bytes.fromhex(
 )
 
 
-def container_pe():
+CONTRACT_APIS = ("RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind")
+DEFAULT_IMPORTS = (("KERNEL32.dll", CONTRACT_APIS), ("msvcrt.dll", ("__C_specific_handler",)))
+
+
+def container_pe(imports=DEFAULT_IMPORTS):
     """独立手写 PE32+ 数据表，没有程序/native 成功语义。"""
-    data = bytearray(0x800)
+    data = bytearray(0xC00)
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 60, 0x80)
     data[0x80:0x84] = b"PE\0\0"
@@ -41,17 +45,29 @@ def container_pe():
     struct.pack_into("<II", data, opt + 56, 0x2000, 0x200)
     struct.pack_into("<H", data, opt + 68, 3)
     struct.pack_into("<I", data, opt + 108, 16)
-    struct.pack_into("<II", data, opt + 112 + 8, 0x1200, 80)
+    struct.pack_into("<II", data, opt + 112 + 8, 0x1200, (len(imports) + 1) * 20)
     struct.pack_into("<II", data, opt + 112 + 24, 0x1000, 8)
-    struct.pack_into("<8sIIIIIIHHI", data, 0x188, b".text\0\0\0", 0x600, 0x1000, 0x600, 0x200, 0, 0, 0, 0, 0x60000020)
+    struct.pack_into("<8sIIIIIIHHI", data, 0x188, b".text\0\0\0", 0xA00, 0x1000, 0xA00, 0x200, 0, 0, 0, 0, 0x60000020)
     struct.pack_into("<II", data, 0x200, 0x1100, 0x1120)
     struct.pack_into("<II", data, 0x320, 4 | (1 << 27), 0xE4)
-    for index, dll in enumerate((b"kernel32.dll\0", b"ntdll.dll\0", b"msvcrt.dll\0")):
-        name = 0x1280 + index * 16
-        thunk = 0x12C0 + index * 16
+    hint_name = 0x1500
+    for index, (dll, symbols) in enumerate(imports):
+        dll = dll.encode("ascii") + b"\0"
+        name = 0x1280 + index * 32
+        thunk = 0x1300 + index * 64
         struct.pack_into("<IIIII", data, 0x400 + index * 20, thunk, 0, 0, name, thunk)
         data[name - 0xE00:name - 0xE00 + len(dll)] = dll
-        struct.pack_into("<QQ", data, thunk - 0xE00, (1 << 63) | 1, 0)
+        for position, symbol in enumerate(symbols):
+            if isinstance(symbol, int):
+                entry = (1 << 63) | symbol
+            else:
+                encoded = symbol.encode("ascii") + b"\0"
+                entry = hint_name
+                struct.pack_into("<H", data, hint_name - 0xE00, 0)
+                data[hint_name - 0xE00 + 2:hint_name - 0xE00 + 2 + len(encoded)] = encoded
+                hint_name += 2 + len(encoded)
+            struct.pack_into("<Q", data, thunk - 0xE00 + position * 8, entry)
+        struct.pack_into("<Q", data, thunk - 0xE00 + len(symbols) * 8, 0)
     return data
 
 
@@ -158,7 +174,8 @@ class BinaryAndRecordTests(TempTests):
         parsed = GATE.pe_admit(path)
         self.assertEqual(parsed["machine"], "0xAA64")
         self.assertEqual(parsed["pdata"][0]["length"], 16)
-        self.assertEqual({entry["dll"] for entry in parsed["imports"]}, {"kernel32.dll", "ntdll.dll", "msvcrt.dll"})
+        self.assertEqual({entry["dll"] for entry in parsed["imports"]}, {"KERNEL32.dll", "msvcrt.dll"})
+        self.assertEqual(parsed["imports"][0]["symbols"], [{"name": name} for name in CONTRACT_APIS])
         for offset, fmt, value in ((0x84, "<H", 0x8664), (0x84, "<H", 0xA641),
                                     (0x98, "<H", 0x10B), (0x98 + 68, "<H", 1),
                                     (0x84 + 18, "<H", 0x2002), (0x98 + 108, "<I", 15)):
@@ -183,10 +200,55 @@ class BinaryAndRecordTests(TempTests):
             elif kind == "clr":
                 struct.pack_into("<II", data, 0x98 + 112 + 112, 0x1400, 72)
             else:
-                data[0x4A0:0x4A0 + 10] = b"other.dll\0"
+                data = container_pe((DEFAULT_IMPORTS[0], ("other.dll", DEFAULT_IMPORTS[1][1])))
             path.write_bytes(data)
             with self.assertRaises(GATE.GateError):
                 GATE.pe_admit(path)
+
+    def test_exact_kernel32_named_apis_and_case_insensitive_dlls(self):
+        path = self.root / "container.exe"
+        for kernel, crt in (("KERNEL32.dll", "msvcrt.dll"), ("KeRnEl32.DlL", "MSVCRT.DLL")):
+            with self.subTest(kernel=kernel, crt=crt):
+                path.write_bytes(container_pe(((kernel, CONTRACT_APIS), (crt, ("__C_specific_handler",)))))
+                parsed = GATE.pe_admit(path)
+                self.assertEqual(parsed["imports"][0]["symbols"], [{"name": name} for name in CONTRACT_APIS])
+
+    def test_each_required_api_missing_changed_spelling_or_ordinal_rejected(self):
+        path = self.root / "container.exe"
+        for index, api in enumerate(CONTRACT_APIS):
+            for kind in ("missing", "spelling", "ordinal"):
+                symbols = list(CONTRACT_APIS)
+                if kind == "missing":
+                    del symbols[index]
+                else:
+                    symbols[index] = api.lower() if kind == "spelling" else 1
+                with self.subTest(api=api, kind=kind):
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), DEFAULT_IMPORTS[1])))
+                    with self.assertRaisesRegex(GATE.GateError, "KERNEL32 缺少精确命名"):
+                        GATE.pe_admit(path)
+
+    def test_each_required_api_from_wrong_provider_rejected_even_with_correct_duplicate(self):
+        path = self.root / "container.exe"
+        for api in CONTRACT_APIS:
+            for duplicate in (False, True):
+                symbols = CONTRACT_APIS if duplicate else tuple(name for name in CONTRACT_APIS if name != api)
+                with self.subTest(api=api, duplicate=duplicate):
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), ("msvcrt.dll", ("__C_specific_handler", api)))))
+                    error = "Rtl API 必须由 KERNEL32 提供" if duplicate else "KERNEL32 缺少精确命名"
+                    with self.assertRaisesRegex(GATE.GateError, error):
+                        GATE.pe_admit(path)
+
+    def test_unexpected_missing_or_duplicate_dll_closure_rejected(self):
+        path = self.root / "container.exe"
+        for imports in (DEFAULT_IMPORTS + (("NTDLL.dll", CONTRACT_APIS),),
+                        DEFAULT_IMPORTS + (("other.dll", ("OtherFunction",)),),
+                        (DEFAULT_IMPORTS[0],), (DEFAULT_IMPORTS[1],),
+                        (("other.dll", CONTRACT_APIS), DEFAULT_IMPORTS[1]),
+                        DEFAULT_IMPORTS + (("kernel32.DLL", ("OtherFunction",)),)):
+            with self.subTest(dlls=[item[0] for item in imports]):
+                path.write_bytes(container_pe(imports))
+                with self.assertRaisesRegex(GATE.GateError, "actual import closure 必须恰为"):
+                    GATE.pe_admit(path)
 
     def test_actual_input_missing_mutated_or_malformed_not_receipt_success(self):
         # trusted support COFF parser，手写容器只测试 bytes gate。

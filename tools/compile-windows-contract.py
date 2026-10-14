@@ -531,8 +531,17 @@ def pe_admit(path):
         else:
             raise GateError("PE import thunk 未终止")
         imports.append({"dll": cstring(name), "symbols": symbols})
-    if not terminated or not {"kernel32.dll", "ntdll.dll", "msvcrt.dll"}.issubset({item["dll"].lower() for item in imports}):
-        raise GateError("actual import closure 缺少 kernel32/ntdll/default MSVCRT")
+    dlls = [item["dll"].lower() for item in imports]
+    if not terminated or len(dlls) != 2 or set(dlls) != {"kernel32.dll", "msvcrt.dll"}:
+        raise GateError("actual import closure 必须恰为 KERNEL32/default MSVCRT")
+    required_apis = {"RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind"}
+    for item in imports:
+        names = {symbol["name"] for symbol in item["symbols"] if "name" in symbol}
+        if item["dll"].lower() == "kernel32.dll":
+            if not required_apis.issubset(names):
+                raise GateError("KERNEL32 缺少精确命名 RtlCaptureContext/RtlLookupFunctionEntry/RtlVirtualUnwind")
+        elif required_apis & names:
+            raise GateError("Rtl API 必须由 KERNEL32 提供")
     prva, psize = dirs[3]
     if not prva or not psize or psize % 8:
         raise GateError("ARM64 exception table 缺失/尺寸错误")

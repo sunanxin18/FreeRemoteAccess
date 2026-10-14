@@ -136,10 +136,41 @@ continue 成功且独立进程句柄等待得到 `WAIT_OBJECT_0` 才记录终态
 `e5ae7af8d9c7792bfecce5e876e92404331d6604820090dfc24212aecf7ccb6e`，
 README SHA-256 为
 `d67ea776ca6a5246f5ac0f8e0705d736e16bd5afdb7af5e7dc3f5bab4d3e44fb`。
-固定编译器尚未接受或链接新 C，真实 Windows API、异常事件、等待与进程清理
-均没有本轮执行结果。独立 C/PE 编译接口已经完成源码与两轮修复复审：固定
+独立 C/PE 编译接口已经完成源码与两轮修复复审：固定
 五个 variant，使用同次工具链与 helper 对象，保存真实 C/PE、符号、导入、帧和
-链接材料；全部接受检查完成后才原子发布唯一终态。25 项窄故障控制目前仅有
-源码，尚未运行。root 已放行提交后的有限托管编译验证，实际结果待取得；
+链接材料；全部接受检查完成后才原子发布唯一终态。后续实际运行见下节；
 不以源码复审替代编译或原生验证，也不以 ABI 测试回调替代真实 shipping kernel
 或 qmul 数学验证。
+
+## C/PE 首次实际执行与导入检查失败
+
+冻结 `f556b7b493d292a6e6c9b68c6a7776ed94246efc` 的
+[专项运行38531352368](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38531352368)
+实际失败。十九项原检查和二十五项新编排检查均通过，同次七个必需 COFF
+对象生成；variant0 新 C 的真实编译、链接和 readobj 均 exit0。随后验证器
+要求 PE 导入 NTDLL.dll 而拒绝实际产物，variants1–4 尚未运行。终态保持
+failed；归档完整性通过只表示失败材料完整，不表示编译门通过。
+
+实际 PE 只导入 KERNEL32.dll 与默认 msvcrt.dll，三个精确命名的
+RtlCaptureContext、RtlLookupFunctionEntry、RtlVirtualUnwind 均由 KERNEL32
+提供。这与 Microsoft 对这些 API 标明的 Kernel32.lib / Kernel32.dll 一致：
+[RtlCaptureContext](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlcapturecontext)、
+[RtlLookupFunctionEntry](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtllookupfunctionentry)、
+[RtlVirtualUnwind](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlvirtualunwind)。
+失败原因是验证器的导入假设，不是这次 C 编译或链接失败。修复只针对固定
+配方的精确 DLL 集合与三个 API 的名称/提供者检查，保持编译参数、实际 SDK
+声明和链接库不变；新执行结果须另行记录，不覆盖首次失败。
+
+原始失败材料位于 `target/windows-contract-f556b7b-38531352368/`，artifact
+11877688135。variant0 PE SHA-256 为
+`1a0958de3ae27da9d00073e6d260f09f0abc2a96636ca503778d6f1a66e4316a`；
+C 对象 SHA-256 为
+`fd4e98406360e7fd14a189fb9567eba7a0f7f0c59e67ba964fbdd08430c569a0`。
+尚未完成全部五个 variant 的编译接受，真实 Windows Rtl*、异常、等待、进程
+清理和后续 shipping 数值/性能/修改包/真实登录仍未验证。
+
+导入验证修复后的 29 项纯 Python 检查实际一次通过（含原 25 项和新增精确
+导入控制），独立 scoped StaticSpec/Quality 复审通过。对未改变的首次 variant0
+PE 进行纯字节 parser 观察也通过，未执行 PE，未补齐链接 ownership 检查。
+首次 CI 的 76 个原始文件保持字节身份和 failed 终态。root 只放行新提交上的
+同配方有限编译，仍不放行原生 ABI、异常、数值、基准或生产选择。
