@@ -98,3 +98,44 @@ SHA-256，不使用本机 Clang 替代。十一项已批准私有源码/头文�
 仅放行远端这一有限验证，保留首次实际失败后再修复。正常 Windows 包 CI 不能
 替代它；成功 COFF 编译也不能替代后续 C driver、真实 Rtl* unwind、保护页/QPC、
 同 shipping 核 parity、基准、修改配方包或远程登录。
+
+## 实际 COFF 编译结果
+
+后续冻结提交 `122f44e9a1c691a723cdb0229d7aa40b41ae123b` 的
+[专项运行38516856053](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38516856053)
+已成功结束。十九项窄检查实际通过；固定 archive 安装出的 clang20.1.8 在 Linux
+x86_64 主机交叉编译 Windows ARM64：platform C、正确 ABI helper、negative ASM
+三个必需对象均 exit0，bad-unwind1–4 也生成对象。bad5 实际 exit1，唯一诊断是
+尾声实际40字节与 SEH 描述44字节不符，未生成对象；这是编译拒绝，不能算原生
+负例成功。源码、工具、目标宏、真实头文件、七个 COFF 对象与全部原始检查路径
+已由独立 ExecutionSpec/Quality 复审通过，范围严格为 compiled-only。
+
+根代理下载 artifact11872184211，分别核对 installer30、compile130项严格成员及
+字节指纹。compile ZIP SHA-256 为
+`17c8ce32c22d39ef3e5f1bfc7c8b1bff1071e09c007316c1d283da5db8099732`；
+原始材料位于本地 `target/windows-private-coff-122f44e-38516856053/`。正确 helper
+实际 `.pdata/.xdata`、1088字节范围、192字节帧及 prologue/epilogue 与指令一致。
+链接后的地址、真实 Rtl* 行为和调用者状态尚未验证，下一步为独立 C contract
+驱动；保留旧源码准备文档作为该冻结输入的历史记录，不将当时的源码状态当作
+本次实际编译结果。
+
+这关闭了该有限编译子步骤，未关闭 Windows 原生 ABI/SEH、保护页/QPC、真实
+shipping kernel/qmul oracle、数值、基准、修改配方包或鸿蒙真实登录等后续门。
+
+## Windows 原生 ABI/SEH 驱动的源码准备
+
+2026-10-14，新增私有 `h264-luma-dc-windows-contract.c` 与
+`README-windows-contract.md`，按实际 COFF 指令和标签准备独立调用者上下文、
+真实 Rtl* 回溯、寄存器正负控制及受父进程持有的异常子进程。初轮独立审查
+发现两项问题：收到退出事件就记录已确认终态，以及静默忽略系统 RIP 调试
+错误。修复后，同一审查者的 scoped StaticSpec/Quality 均通过：只有 exit
+continue 成功且独立进程句柄等待得到 `WAIT_OBJECT_0` 才记录终态；RIP 和未知
+事件保存原始字段并永久失败，未确认终态不启动下一个子进程。
+
+该结论仅限源码。当前 C SHA-256 为
+`e5ae7af8d9c7792bfecce5e876e92404331d6604820090dfc24212aecf7ccb6e`，
+README SHA-256 为
+`d67ea776ca6a5246f5ac0f8e0705d736e16bd5afdb7af5e7dc3f5bab4d3e44fb`。
+固定编译器尚未接受或链接新 C，真实 Windows API、异常事件、等待与进程清理
+均没有本轮执行结果。正在准备独立 C/PE 编译接口；不以源码复审替代原生验证，
+也不以 ABI 测试回调替代真实 shipping kernel 或 qmul 数学验证。
