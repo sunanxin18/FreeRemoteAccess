@@ -238,6 +238,10 @@ impl LocalDisplay {
         self.reason = "本地显示消息队列已满";
         self.source = "unavailable";
     }
+    pub(crate) fn active_window(&self) -> Option<(u64, u64)> {
+        (self.geometry.is_some() && self.stage != 0 && self.window != 0)
+            .then_some((self.stage, self.window))
+    }
     pub fn evidence(&self) -> serde_json::Value {
         serde_json::json!({"stage": self.stage, "revision": self.revision, "windowId": self.window,
             "displayId": self.raw.map(|raw| raw.display_id), "rotation": self.raw.map(|raw| raw.rotation),

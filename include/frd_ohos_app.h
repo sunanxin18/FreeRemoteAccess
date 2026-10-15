@@ -34,6 +34,23 @@ typedef struct FrdOhosAppInput {
  * 系统 workArea 须非负且完全在 display 内；window/drawable 允许合法跨屏相交。像素已经是 px。
  * 不改变 FrdOhosAppGeometry 布局；该入口与 renderer/input viewport 独立。 */
 int32_t frd_ohos_app_local_display(uint64_t app, const uint8_t *json, size_t length);
+/* ABI1 增量 IME v1（不改变旧 POD）：严格 UTF-8 JSON，未知/重复字段拒绝。
+ * source <=4096 字节：{abiVersion:1,state:"attached"|"detached",ticket:T}。
+ * operation <=32768 字节：{abiVersion:1,ticket:T,serial:N,kind:"text",text:S}
+ * 或 {abiVersion:1,ticket:T,serial:N,kind:"keyPair",key:K}，不允许混合。
+ * T={windowStage:N,windowId:N,editorSerial:N,session:D,generation:D}。
+ * N 为 1..9007199254740991 整数；D 为无前导零的非零 u64 十进制字符串。
+ * S 为非空 UTF-8 字符串（<=16384 字节）；K 仅 Enter/Tab/Backspace/Delete/
+ * ArrowLeft/ArrowRight/ArrowUp/ArrowDown/Home/End/PageUp/PageDown，无修饰。
+ * serial 从 1 连续递增；editorSerial 在每个 stage/window 单调递增，不可复用。
+ * 指针仅借用至返回；0 仅本地接受（过时 detached 无操作），后续状态见 snapshot.ime。
+ * lastDispatchedSerial 仅表示 SessionHost command 通道接受，不是 wire/远端 ACK。
+ * adapter 须等待 snapshot.ime.sourceAvailable 及 localDisplayEvidence 的实际窗口身份；
+ * app_local_display 返回 0 仅表示排队，不表示 Owner 已接受或可以附着。
+ * 旧 composition 未安装 IME；显式安装时旧未带 ticket 的 app_text 通路拒绝。
+ * 不接收 preedit、几何 revision 或能力位；text/JSON/长度不进入快照或日志。 */
+int32_t frd_ohos_app_ime_source(uint64_t app, const uint8_t *json, size_t length);
+int32_t frd_ohos_app_ime_operation(uint64_t app, const uint8_t *json, size_t length);
 int32_t frd_ohos_app_geometry(uint64_t app, const FrdOhosAppGeometry *geometry);
 int32_t frd_ohos_app_input(uint64_t app, const FrdOhosAppInput *input);
 int32_t frd_ohos_app_text(uint64_t app, uint64_t session, uint64_t generation, uint64_t revision,

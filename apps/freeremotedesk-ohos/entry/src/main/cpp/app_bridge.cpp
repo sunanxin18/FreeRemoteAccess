@@ -112,6 +112,20 @@ napi_value LocalDisplay(napi_env env, napi_callback_info info) {
     // 原始有符号坐标/浮点 density 保留为 JSON；Rust 严格校验，不在 NAPI 截断。
     return Code(env, frd_ohos_app_local_display(application, t.bytes.data(), t.bytes.size()));
 }
+napi_value ImeSource(napi_env env, napi_callback_info info) {
+    napi_value a = nullptr;
+    Text t;
+    if (!Args(env, info, &a, 1) || !t.Read(env, a, 4096))
+        return Code(env, -2);
+    return Code(env, frd_ohos_app_ime_source(application, t.bytes.data(), t.bytes.size()));
+}
+napi_value ImeOperation(napi_env env, napi_callback_info info) {
+    napi_value a = nullptr;
+    Text t;
+    if (!Args(env, info, &a, 1) || !t.Read(env, a, 32768))
+        return Code(env, -2);
+    return Code(env, frd_ohos_app_ime_operation(application, t.bytes.data(), t.bytes.size()));
+}
 napi_value Password(napi_env env, napi_callback_info info) {
     napi_value a = nullptr;
     Text t;
@@ -202,6 +216,8 @@ void RegisterFrdApp(napi_env env, napi_value exports) {
         {"appAction", nullptr, Action, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appFocus", nullptr, Focus, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appLocalDisplay", nullptr, LocalDisplay, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"appImeSource", nullptr, ImeSource, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"appImeOperation", nullptr, ImeOperation, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appGeometry", nullptr, Geometry, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appInput", nullptr, Input, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"commitText", nullptr, CommitText, nullptr, nullptr, nullptr, napi_default, nullptr},

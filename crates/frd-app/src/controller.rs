@@ -790,6 +790,11 @@ impl AppController {
         Err(AppControllerError::InvalidSubmission(code))
     }
 
+    /// 仅返回协议已接受的协商值；不能替代平台、产品、焦点和完整呈现门。
+    pub fn negotiated_capabilities(&self) -> SessionCapabilities {
+        self.protocol_capabilities
+    }
+
     pub fn effective_capabilities(&self) -> SessionCapabilities {
         self.protocol_capabilities
             .intersection(platform_capabilities(self.platform_capabilities))

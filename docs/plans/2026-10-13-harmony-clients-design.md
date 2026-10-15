@@ -101,3 +101,13 @@ Mac目标使用带持久标签“连接模式”的正常选择控件，明确�
 
 2026-10-15核对[Material官方Select资料](https://github.com/material-components/material-web/blob/main/docs/components/select.md)的固定选项、label/supportingText/error状态；M3主站菜单正文仅返回JavaScript提示。
 [Apple HIG Pop-up buttons](https://developer.apple.com/design/human-interface-guidelines/pop-up-buttons)的官方搜索正文提供互斥选项、当前选择与引导标签依据（直接页/Markdown未读取成功）。[OpenHarmony官方Select API](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-arkui/arkui-ts/ts-basic-components-select.md)已读取，实施同时核对本机API26。没有GUI基线例外。
+
+## 正常会话输入法的来源与接线（2026-10-15）
+
+沿用系统输入法、XComponent真实焦点与实时提交路径。输入法来源固定为实际windowStage/windowId、单调editorSerial及远程session/generation；旧来源失焦、后台、断开或失代后不能改写身份继续提交。原生Owner只认可已接受LocalDisplay发布的当前窗口，窗口来源与editor高水位保持有界；后台恢复不得复用旧editorSerial。协议协商能力通过controller已有状态的只读视图取得，最终输入仍由协议、平台、产品能力交集及前台、焦点、完整首帧呈现共同裁决。
+
+独立版本化来源/操作ABI只承接已确认文字与有限平衡控制键，不承接中间拼音候选。普通文字与实体键的能力、来源及可用状态分别处理；Apple当前text=false不会因本地附着而提升。旧未绑定来源的文字入口保持ABI布局，但不得成为新输入法模式的第二条提交路径。单次入队成功只表示意图进入本地队列，后续接收/发送serial仅作本地状态，不是远端应用ACK，也不触发自动正文重发。
+
+文字/控制键没有本地指针坐标，因此同窗口、同焦点及同远端代际的短暂几何重建可使用有界FIFO等待新画面实际呈现，再经当前InputAdapter/revision发送。真正失焦、后台、来源撤销、窗口变化、协议文字能力丢失或会话失效会清空等待并撤销来源。不能在普通geometry release里撤销输入法；现有ArkUI尺寸回调中的focus(false)仍需在正式系统键盘接线时分离，不能仅由原生等待队列宣称键盘resize已经可用。
+
+先实现并验证Owner桥，再串行加入本地有界UTF-16预编辑、系统InputMethodController及浮动岛正式“键盘”动作。实际OHOS组合根在前端实现前继续保持输入法未安装；构建或主机consumer通过不等于系统附着、真实英文/中文/emoji、候选、软键盘布局或PC/手机运行资格。没有额外编辑器及手动发送流程。预编辑/finish依据[官方输入法合同](https://github.com/openharmony/docs/blob/f41b9345badd47c7ab0c263344cd7f4b5a549afb/zh-cn/application-dev/reference/apis-ime-kit/js-apis-inputmethodengine.md#finishtextpreview12)：有效finish保留最终预编辑，两个相同文字的合法提交必须分别保留，不用字符串或定时器去重。局部字素移动/删除优先采用[公开NDK ICU4C](https://github.com/openharmony/docs/blob/f41b9345badd47c7ab0c263344cd7f4b5a549afb/zh-cn/application-dev/reference/native-lib/icu4c.md)，其新增依赖与目标运行另行验证，不从SDK头文件存在推定实际运行成功。

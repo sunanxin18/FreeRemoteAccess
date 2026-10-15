@@ -25,10 +25,8 @@ impl OhosKeyboardQualification {
     }
     pub(crate) fn reason(self) -> &'static str {
         match self {
-            Self::Unavailable => "未安装实体键 backend；文本输入尚未实现",
-            Self::ArkUiLimited => {
-                "ArkUI 有限实体键 backend；设备、布局和锁定态待实测，文本输入尚未实现"
-            }
+            Self::Unavailable => "未安装实体键 backend",
+            Self::ArkUiLimited => "ArkUI 有限实体键 backend；设备、布局和锁定态待实测",
         }
     }
     pub(crate) fn configure(self, controller: &mut frd_app::AppController) {

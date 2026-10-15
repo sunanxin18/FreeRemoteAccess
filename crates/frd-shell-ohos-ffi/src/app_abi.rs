@@ -145,6 +145,23 @@ pub unsafe extern "C" fn frd_ohos_app_local_display(id: u64, p: *const u8, n: us
         app(id)?.send(Command::LocalDisplay(message))
     })
 }
+/// 版本化 IME 来源；仅借用调用期 JSON，固定错误，不导出输入内容。
+#[no_mangle]
+pub unsafe extern "C" fn frd_ohos_app_ime_source(id: u64, p: *const u8, n: usize) -> i32 {
+    boundary(|| {
+        let source = crate::ime_policy::Source::parse(unsafe { bytes(p, n, 4096)? })
+            .ok_or(INVALID_ARGUMENT)?;
+        app(id)?.ime_source(source)
+    })
+}
+#[no_mangle]
+pub unsafe extern "C" fn frd_ohos_app_ime_operation(id: u64, p: *const u8, n: usize) -> i32 {
+    boundary(|| {
+        let operation = crate::ime_policy::Operation::parse(unsafe { bytes(p, n, 32768)? })
+            .ok_or(INVALID_ARGUMENT)?;
+        app(id)?.ime_operation(operation)
+    })
+}
 #[repr(C)]
 pub struct AppGeometry {
     pub abi_version: u32,
@@ -298,17 +315,14 @@ pub unsafe extern "C" fn frd_ohos_app_text(
         if text.is_empty() {
             return Ok(());
         }
-        app(id)?.send(Command::Input(
+        app(id)?.legacy_text(
             InputEpoch {
                 session,
                 generation,
                 revision,
             },
-            InputEvent::Text {
-                utf8: text.to_owned(),
-            },
-            false,
-        ))
+            text,
+        )
     })
 }
 #[no_mangle]
@@ -540,6 +554,7 @@ mod keyboard_tests {
             ProtocolExit::Closed
         }
     }
+    #[track_caller]
     fn wait_snapshot(
         engine: &AppEngine,
         predicate: impl Fn(&serde_json::Value) -> bool,
@@ -559,14 +574,9 @@ mod keyboard_tests {
         use crate::app_adapter::Command;
         use crate::keyboard_policy::OhosKeyboardQualification;
         let (inputs, received) = std::sync::mpsc::channel();
-        let root = std::env::temp_dir().join(format!(
-            "frd-keyboard-consumer-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
         let engine = Arc::new(
             AppEngine::spawn_with_keyboard(
-                crate::app_adapter::Stores::at(root),
+                isolated_abi_stores(),
                 vec![Arc::new(CaptureFactory(inputs))],
                 Arc::new(|_| {
                     Err(frd_media_api::VideoDecodeError::new(
@@ -791,4 +801,5 @@ mod keyboard_tests {
         }
         assert!(received.try_recv().is_err());
     }
+    include!("ime_abi_tests.rs");
 }

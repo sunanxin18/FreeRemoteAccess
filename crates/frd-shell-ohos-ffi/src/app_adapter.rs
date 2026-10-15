@@ -1,4 +1,8 @@
 //! ArkUI 不拥有 controller/password/session；专用 owner 串行处理意图与真正的 runtime 事件。
+use crate::ime_policy::{
+    Ingress as ImeIngress, Installation as ImeInstallation, Operation as ImeOperation,
+    Source as ImeSource, SourceState as ImeSourceState, State as ImeState, Ticket as ImeTicket,
+};
 use crate::input_adapter::{InputAdapter, ViewGeometry};
 use crate::keyboard_policy::{qualified_physical_hid, OhosKeyboardQualification};
 use frd_app::{persist_profile_job, AppAction, AppController, AppIntent, AppPlatformStores};
@@ -136,6 +140,8 @@ pub struct InputEpoch {
 }
 pub enum Command {
     Queued(u64, Box<Command>),
+    ImeSource(u64, ImeSource),
+    ImeOperation(u64, ImeOperation),
     Edit(Edit),
     Password(SecretBuffer),
     Select(usize),
@@ -179,6 +185,8 @@ pub enum Command {
     Probed(i32),
 }
 pub struct AppEngine {
+    ime_installation: ImeInstallation,
+    ime_ingress: Arc<Mutex<ImeIngress>>,
     keyboard: OhosKeyboardQualification,
     sender: SyncSender<Command>,
     snapshot: Arc<Mutex<Value>>,
@@ -207,6 +215,26 @@ impl AppEngine {
         audio: Arc<dyn AudioOutputFactory>,
         keyboard: OhosKeyboardQualification,
     ) -> Result<Self, i32> {
+        Self::spawn_with_input(
+            stores,
+            factories,
+            loader,
+            audio,
+            keyboard,
+            ImeInstallation::Unavailable,
+        )
+    }
+    // 只供未来正常系统 IME adapter 显式安装；既有 composition 不调用此构造器。
+    pub(crate) fn spawn_with_input(
+        stores: Stores,
+        factories: Vec<Arc<dyn ProtocolFactory>>,
+        loader: StreamRegistryLoader,
+        audio: Arc<dyn AudioOutputFactory>,
+        keyboard: OhosKeyboardQualification,
+        ime_installation: ImeInstallation,
+    ) -> Result<Self, i32> {
+        let ime_ingress = Arc::new(Mutex::new(ImeIngress::default()));
+        let owner_ime_ingress = ime_ingress.clone();
         let (sender, receiver) = mpsc::sync_channel(64);
         let snapshot = Arc::new(Mutex::new(
             json!({"abiVersion":1,"page":0,"initialized":false,"available":false}),
@@ -231,6 +259,8 @@ impl AppEngine {
                 );
                 keyboard.configure(&mut controller);
                 let mut owner = Owner {
+                    ime: ImeState::new(ime_installation),
+                    ime_ingress: owner_ime_ingress,
                     keyboard,
                     controller,
                     renderer: owner_renderer,
@@ -246,6 +276,8 @@ impl AppEngine {
                     last_display_log: None,
                     #[cfg(test)]
                     sent_inputs: std::cell::RefCell::new(Vec::new()),
+                    #[cfg(test)]
+                    ime_admission_hook: None,
                     pending: BTreeMap::new(),
                     tx,
                     last_submit: 0,
@@ -256,6 +288,7 @@ impl AppEngine {
                     probe: 0,
                     control: flags.clone(),
                 };
+                owner.configure_ime();
                 #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
                 {
                     owner.command(Command::Edit(Edit {
@@ -332,6 +365,8 @@ impl AppEngine {
             })
             .map_err(|_| crate::WORKER_STOPPED)?;
         Ok(Self {
+            ime_installation,
+            ime_ingress,
             keyboard,
             sender,
             snapshot,
@@ -387,9 +422,69 @@ impl AppEngine {
     pub fn for_platform(root: PathBuf) -> Result<Self, i32> {
         crate::composition::spawn(root)
     }
+    pub(crate) fn ime_source(&self, source: ImeSource) -> Result<(), i32> {
+        if !self.ime_installation.installed() {
+            return Err(crate::UNSUPPORTED_PLATFORM);
+        }
+        let mut ingress = self.ime_ingress.lock().map_err(|_| crate::PANIC)?;
+        if !ingress.source(&source)? {
+            return Ok(());
+        }
+        let revision = ingress.revision;
+        self.enqueue_ime(&mut ingress, Command::ImeSource(revision, source))
+    }
+    pub(crate) fn ime_operation(&self, op: ImeOperation) -> Result<(), i32> {
+        if !self.ime_installation.installed() {
+            return Err(crate::UNSUPPORTED_PLATFORM);
+        }
+        if op.key.is_some() && !self.keyboard.installed() {
+            return Err(crate::UNSUPPORTED_PLATFORM);
+        }
+        let mut ingress = self.ime_ingress.lock().map_err(|_| crate::PANIC)?;
+        if ingress.active != Some(op.ticket) {
+            return Err(crate::INVALID_ARGUMENT);
+        }
+        let revision = ingress.revision;
+        self.enqueue_ime(&mut ingress, Command::ImeOperation(revision, op))
+    }
+    fn enqueue_ime(&self, ingress: &mut ImeIngress, command: Command) -> Result<(), i32> {
+        let control = self.control.load(Ordering::Acquire) / CONTROL_REVISION;
+        self.sender
+            .try_send(Command::Queued(control, Box::new(command)))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => {
+                    let _ = ingress.invalidate("queue_full");
+                    crate::QUEUE_FULL
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    let _ = ingress.invalidate("worker_stopped");
+                    crate::WORKER_STOPPED
+                }
+            })
+    }
+    pub(crate) fn legacy_text(&self, epoch: InputEpoch, utf8: &str) -> Result<(), i32> {
+        // 显式 IME 路径在复制旧 payload 之前拒绝；普通 send 和 Owner 仍保留二次防御。
+        if self.ime_installation.installed() {
+            return Err(crate::UNSUPPORTED_PLATFORM);
+        }
+        self.send(Command::Input(
+            epoch,
+            InputEvent::Text {
+                utf8: utf8.to_owned(),
+            },
+            false,
+        ))
+    }
     pub fn send(&self, command: Command) -> Result<(), i32> {
+        // 版本化来源必须经过专用 ingress；公开普通 sender 不能绕过 reservation/屏障。
+        if matches!(command, Command::ImeSource(..) | Command::ImeOperation(..)) {
+            return Err(crate::INVALID_ARGUMENT);
+        }
         // ABI 与普通 sender 共用入队前拒绝；不得返回 0 后才静默丢弃新 Down。
         if let Command::Input(_, event, _) = &command {
+            if self.ime_installation.installed() && matches!(event, InputEvent::Text { .. }) {
+                return Err(crate::UNSUPPORTED_PLATFORM);
+            }
             self.keyboard.validate_new_down(event)?;
         }
         let display = matches!(command, Command::LocalDisplay(_));
@@ -543,6 +638,8 @@ struct PendingLoad {
     timed_out: bool,
 }
 struct Owner {
+    ime: ImeState,
+    ime_ingress: Arc<Mutex<ImeIngress>>,
     keyboard: OhosKeyboardQualification,
     renderer: Arc<Mutex<Option<Arc<crate::presentation::Link>>>>,
     ready: Option<crate::presentation::Epoch>,
@@ -558,6 +655,8 @@ struct Owner {
     last_display_log: Option<Value>,
     #[cfg(test)]
     sent_inputs: std::cell::RefCell<Vec<frd_core::SessionInput>>,
+    #[cfg(test)]
+    ime_admission_hook: Option<Box<dyn FnOnce()>>,
     pending: BTreeMap<u64, PendingLoad>,
     tx: SyncSender<Command>,
     last_submit: u64,
@@ -569,12 +668,233 @@ struct Owner {
     control: Arc<AtomicU64>,
 }
 impl Owner {
+    fn configure_ime(&mut self) {
+        if !self.ime.installation.installed() {
+            return;
+        }
+        self.controller.set_product_policy(frd_app::ProductPolicy {
+            physical_key_input: self.keyboard.installed(),
+            text_input: true,
+            ..Default::default()
+        });
+        self.controller
+            .set_platform_capabilities(frd_platform_api::PlatformCapabilities {
+                physical_key_input: self.keyboard.installed(),
+                text_input: self.ime.ticket.is_some(),
+                ..Default::default()
+            });
+    }
+    fn ime_barrier(&mut self) {
+        let barrier = self.ime_ingress.lock().ok().map(|s| (s.revision, s.reason));
+        if let Some((revision, reason)) = barrier {
+            if self.ime.revision != revision || revision == u64::MAX {
+                self.ime.revision = revision;
+                self.ime.clear(reason);
+                self.configure_ime();
+            }
+        } else {
+            self.ime.clear("internal_failure");
+            self.configure_ime();
+        }
+    }
+    fn invalidate_ime(&mut self, reason: &'static str) {
+        // 清除待发文本且保留 editor high-water；新 editor 可以在屏障之后重新附着。
+        if let Ok(mut ingress) = self.ime_ingress.lock() {
+            let _ = ingress.invalidate(reason);
+            self.ime.revision = ingress.revision;
+        }
+        self.ime.clear(reason);
+        self.configure_ime();
+    }
+    fn ime_context_available(&self) -> bool {
+        self.ime.installation.installed()
+            && self.controller.negotiated_capabilities().text_input
+            && self.input.owns_remote_focus()
+            && self.remote_epoch.is_some()
+            && self.controller.interactive_input_epoch() == self.remote_epoch
+            && self
+                .renderer
+                .lock()
+                .ok()
+                .and_then(|r| r.clone())
+                .is_some_and(|link| {
+                    link.0
+                        .lock()
+                        .ok()
+                        .is_some_and(|s| s.surface.attached && s.surface.foreground)
+                })
+    }
+    fn valid_ime_ticket(&self, ticket: ImeTicket) -> bool {
+        self.ime_context_available()
+            && self.local_display.active_window() == Some((ticket.window_stage, ticket.window_id))
+            && self.remote_epoch.map(|(s, g)| (s.get(), g))
+                == Some((ticket.session, ticket.generation))
+    }
+    fn publish_ime_window(&self) {
+        let identity = self.local_display.active_window();
+        let available = self.ime_context_available();
+        if let Ok(mut ingress) = self.ime_ingress.lock() {
+            ingress.publish_window(identity, available);
+        }
+    }
+    fn check_ime(&mut self) {
+        self.publish_ime_window();
+        self.ime_barrier();
+        if self.ime.ticket.is_some_and(|t| !self.valid_ime_ticket(t)) {
+            self.invalidate_ime(if !self.controller.negotiated_capabilities().text_input {
+                "protocol_text_unavailable"
+            } else {
+                "source_invalidated"
+            });
+        }
+    }
+    fn source_ime(&mut self, revision: u64, source: ImeSource) {
+        self.ime_barrier();
+        if revision != self.ime.revision {
+            return;
+        }
+        match source.state {
+            ImeSourceState::Detached => {} // 入队前已可靠发布屏障。
+            ImeSourceState::Attached => {
+                if !self.valid_ime_ticket(source.ticket) {
+                    self.invalidate_ime("source_unavailable");
+                    return;
+                }
+                self.release();
+                self.ime.ticket = Some(source.ticket);
+                self.ime.ack_ticket = Some(source.ticket);
+                self.ime.accepted = 0;
+                self.ime.dispatched = 0;
+                self.ime.reason = "source_attached";
+                self.configure_ime();
+            }
+        }
+    }
+    fn operation_ime(&mut self, revision: u64, op: ImeOperation) {
+        self.check_ime();
+        if revision != self.ime.revision || self.ime.ticket != Some(op.ticket) {
+            return;
+        }
+        if self.ime.accepted.checked_add(1) != Some(op.serial) {
+            self.invalidate_ime("invalid_serial");
+            return;
+        }
+        if op.key.is_some()
+            && (!self.keyboard.installed()
+                || !self.controller.effective_capabilities().physical_key_input)
+        {
+            self.invalidate_ime("physical_unavailable");
+            return;
+        }
+        if self.ime.pending.len() >= 32 || self.ime.pending_bytes + op.text_bytes() > 16384 {
+            self.invalidate_ime("pending_full");
+            return;
+        }
+        self.ime.accepted = op.serial;
+        self.ime.pending_bytes += op.text_bytes();
+        self.ime.pending.push_back(op);
+        self.drain_ime();
+    }
+    fn send_ime_event(&mut self, ticket: ImeTicket, event: InputEvent, pressed: bool) -> bool {
+        let command = self.input.route(
+            &self.controller,
+            ticket.session,
+            ticket.generation,
+            self.input.revision,
+            event,
+            pressed,
+        );
+        command.is_some_and(|command| self.host.send_command(command).is_ok())
+    }
+    fn drain_ime(&mut self) {
+        self.check_ime();
+        if self.ime.ticket.is_none() || !self.input_ready() {
+            return;
+        }
+        while let Some(op) = self.ime.pending.pop_front() {
+            self.ime.pending_bytes -= op.text_bytes();
+            // 与 detach/overflow producer 的锁也是发送的线性化点，已发布屏障先获胜。
+            let ingress = self.ime_ingress.clone();
+            let Ok(guard) = ingress.lock() else {
+                self.invalidate_ime("internal_failure");
+                return;
+            };
+            if guard.revision != self.ime.revision || guard.active != Some(op.ticket) {
+                drop(guard);
+                self.check_ime();
+                return;
+            }
+            // 测试专用单次接缝：在真实 ingress 检查后、真实 atomic admission 前插入 producer 步骤。
+            #[cfg(test)]
+            if let Some(hook) = self.ime_admission_hook.take() {
+                hook();
+            }
+            // 与通用 control 的 CAS 是发送 admission 点；之前发布的后台/取消/窗口失效先清队列。
+            loop {
+                let control = self.control.load(Ordering::Acquire);
+                if control & (STOP | CANCEL | FOCUS_LOST | DISPLAY_INVALID) != 0 {
+                    drop(guard);
+                    self.apply_control();
+                    return;
+                }
+                if self
+                    .control
+                    .compare_exchange(control, control, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            let success = if let Some(text) = op.text.as_ref().and_then(SecretBuffer::expose_text) {
+                self.send_ime_event(
+                    op.ticket,
+                    InputEvent::Text {
+                        utf8: text.to_owned(),
+                    },
+                    false,
+                )
+            } else if let Some(key) = op.key {
+                if !self.input.ime_pair_available(key.hid()) {
+                    drop(guard);
+                    self.invalidate_ime("physical_source_busy");
+                    return;
+                }
+                let event = |state| InputEvent::PhysicalKey {
+                    code: frd_core::PhysicalKeyCode::from_usb_hid_usage(key.hid()),
+                    state,
+                    modifiers: frd_core::Modifiers::default(),
+                };
+                let down = self.send_ime_event(op.ticket, event(frd_core::KeyState::Pressed), true);
+                let up = down
+                    && self.send_ime_event(op.ticket, event(frd_core::KeyState::Released), false);
+                if !up {
+                    self.release();
+                    self.input.consume_quarantined_release(
+                        op.ticket.session,
+                        op.ticket.generation,
+                        &event(frd_core::KeyState::Released),
+                    );
+                }
+                up
+            } else {
+                false
+            };
+            drop(guard);
+            if !success {
+                self.invalidate_ime("dispatch_failed");
+                return;
+            }
+            self.ime.dispatched = op.serial;
+        }
+    }
     fn apply_control(&mut self) {
+        self.ime_barrier();
         let state = self.control.fetch_and(!CONTROL_MASK, Ordering::AcqRel);
         let flags = state & CONTROL_MASK;
         if flags & DISPLAY_INVALID != 0 {
             self.display_invalid_before = state / CONTROL_REVISION;
             self.local_display.invalidate();
+            self.invalidate_ime("window_invalidated");
         }
         if flags & FOCUS_LOST != 0 {
             self.focus(false, false, false);
@@ -605,10 +925,14 @@ impl Owner {
         self.send(c)
     }
     fn focus(&mut self, foreground: bool, focused: bool, remote: bool) {
+        if !foreground || !focused || !remote {
+            self.invalidate_ime("focus_lost");
+        }
         let c = self
             .input
             .focus(&self.controller, foreground, focused, remote);
-        self.send(c)
+        self.send(c);
+        self.check_ime()
     }
     fn cancel(&mut self) {
         self.release();
@@ -734,6 +1058,8 @@ impl Owner {
         }
         match c {
             Command::Queued(..) => {}
+            Command::ImeSource(revision, source) => self.source_ime(revision, source),
+            Command::ImeOperation(revision, op) => self.operation_ime(revision, op),
             Command::Edit(e) => {
                 let choice = if e.protocol == "auto" {
                     ProtocolChoice::Automatic
@@ -833,12 +1159,18 @@ impl Owner {
                 focused,
                 remote,
             } => self.focus(foreground, focused, remote),
-            Command::LocalDisplay(message) => self.local_display.accept(message),
+            Command::LocalDisplay(message) => {
+                self.local_display.accept(message);
+                self.check_ime();
+            }
             Command::Geometry(g) => {
                 let c = self.input.set_geometry(&self.controller, g);
                 self.send(c)
             }
             Command::Input(e, event, pressed) => {
+                if self.ime.installation.installed() && matches!(event, InputEvent::Text { .. }) {
+                    return;
+                }
                 if self.keyboard.validate_new_down(&event).is_err() {
                     return;
                 }
@@ -1011,6 +1343,7 @@ impl Owner {
         self.sync_presentation(true);
     }
     fn clear_remote(&mut self) {
+        self.invalidate_ime("session_ended");
         self.ready = None;
         self.remote_epoch = None;
         self.input.remote = None;
@@ -1022,6 +1355,7 @@ impl Owner {
                 state.busy = false;
             }
         }
+        self.publish_ime_window();
     }
     fn input_ready(&self) -> bool {
         let Some(ready) = self.ready else {
@@ -1042,6 +1376,7 @@ impl Owner {
             })
     }
     fn sync_presentation(&mut self, drain: bool) {
+        self.check_ime();
         let Some(link) = self.renderer.lock().ok().and_then(|r| r.clone()) else {
             return;
         };
@@ -1106,6 +1441,7 @@ impl Owner {
                 }
             }
         }
+        self.drain_ime();
         if !drain || eligible.is_none() {
             return;
         }
@@ -1177,6 +1513,7 @@ impl Owner {
                     .remote_epoch
                     .is_none_or(|(old, g)| old != s || *generation > g)
             {
+                self.invalidate_ime("generation_changed");
                 self.ready = None;
                 self.remote_epoch = Some((s, *generation));
                 self.input.remote = Some(*size);
@@ -1198,6 +1535,7 @@ impl Owner {
         );
         self.controller
             .handle_session_event_with_stores_deferred_profile(s, e, self.stores.borrow());
+        self.check_ime();
         let identity = self.controller.take_pending_server_identity_command();
         self.send(identity);
         if success {
@@ -1343,6 +1681,14 @@ impl Owner {
         let effective = self.controller.effective_capabilities();
         value["physicalKeyInput"] = json!(effective.physical_key_input);
         value["textInput"] = json!(effective.text_input);
+        value["ime"] = self
+            .ime
+            .snapshot(self.controller.negotiated_capabilities().text_input);
+        value["ime"]["sourceAvailable"] = json!(self
+            .ime_ingress
+            .lock()
+            .ok()
+            .is_some_and(|s| s.window_available && s.revision != u64::MAX));
         value["keyboardBackend"] = json!(self.keyboard.name());
         value["keyboardBackendReason"] = json!(self.keyboard.reason());
         value["statusCode"] = json!(status_code);
@@ -1472,6 +1818,8 @@ mod tests {
         );
         let (tx, _rx) = mpsc::sync_channel(64);
         Owner {
+            ime: ImeState::new(ImeInstallation::Unavailable),
+            ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
             renderer: Arc::new(Mutex::new(None)),
             ready: None,
@@ -1495,6 +1843,7 @@ mod tests {
             frozen_display: None,
             last_display_log: None,
             sent_inputs: std::cell::RefCell::new(Vec::new()),
+            ime_admission_hook: None,
             pending: BTreeMap::new(),
             tx,
             last_submit: 0,
@@ -1505,6 +1854,15 @@ mod tests {
             probe: 0,
             control: Arc::new(AtomicU64::new(0)),
         }
+    }
+    #[test]
+    fn ime_owner_uninstalled_projection_is_explicit_and_cannot_advertise_text() {
+        let o = owner();
+        let value = o.snapshot();
+        assert_eq!(value["ime"]["installed"], false);
+        assert_eq!(value["ime"]["state"], "unavailable");
+        assert_eq!(value["ime"]["protocolTextInput"], false);
+        assert_eq!(value["textInput"], false);
     }
     fn pending(o: &mut Owner) -> u64 {
         let ticket = o
@@ -1840,6 +2198,8 @@ mod tests {
         assert_eq!(o.last_submit, 1);
         let (tx, _rx) = mpsc::sync_channel(1);
         let e = AppEngine {
+            ime_installation: ImeInstallation::Unavailable,
+            ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
             sender: tx,
             renderer: Arc::new(Mutex::new(None)),
@@ -1874,6 +2234,8 @@ mod tests {
             }
             let (sender, receiver) = mpsc::sync_channel(4);
             let e = AppEngine {
+                ime_installation: ImeInstallation::Unavailable,
+                ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
                 keyboard: OhosKeyboardQualification::Unavailable,
                 sender,
                 renderer: Arc::new(Mutex::new(None)),
@@ -1905,6 +2267,8 @@ mod tests {
         let ticket = pending(&mut o);
         let (sender, receiver) = mpsc::sync_channel(4);
         let e = AppEngine {
+            ime_installation: ImeInstallation::Unavailable,
+            ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
             sender,
             renderer: Arc::new(Mutex::new(None)),
@@ -2315,6 +2679,8 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         (
             AppEngine {
+                ime_installation: o.ime.installation,
+                ime_ingress: o.ime_ingress.clone(),
                 keyboard: o.keyboard,
                 sender,
                 snapshot: Arc::new(Mutex::new(json!({}))),
@@ -2563,6 +2929,8 @@ mod tests {
         let mut o = owner();
         let (tx, rx) = mpsc::sync_channel(4);
         let e = AppEngine {
+            ime_installation: ImeInstallation::Unavailable,
+            ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
             sender: tx,
             renderer: Arc::new(Mutex::new(None)),
@@ -3242,4 +3610,5 @@ mod tests {
         assert_eq!(owner.input.geometry.unwrap().drawable.width, 100);
         assert!(owner.take_display_log(&owner.snapshot()).is_none());
     }
+    include!("ime_owner_tests.rs");
 }

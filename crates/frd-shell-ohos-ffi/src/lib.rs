@@ -84,6 +84,7 @@ mod codec_measurement;
 mod composition;
 #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
 mod fixture;
+mod ime_policy;
 pub mod input_adapter;
 mod keyboard_policy;
 #[cfg(any(test, target_env = "ohos"))]

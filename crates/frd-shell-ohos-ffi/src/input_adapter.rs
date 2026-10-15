@@ -304,6 +304,16 @@ impl InputAdapter {
         }
         c.route_input(event)
     }
+    pub(crate) fn ime_pair_available(&self, hid: u16) -> bool {
+        !self
+            .held_keys
+            .keys()
+            .chain(self.quarantined_keys.keys())
+            .any(|key| *key == hid || (0xe0..=0xe7).contains(key))
+    }
+    pub(crate) fn owns_remote_focus(&self) -> bool {
+        self.foreground && self.focused && self.remote_owned
+    }
     pub fn epoch(&self, c: &AppController) -> Option<(SessionId, u64)> {
         c.interactive_input_epoch()
     }
