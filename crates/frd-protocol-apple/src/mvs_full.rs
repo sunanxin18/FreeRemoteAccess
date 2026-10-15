@@ -385,6 +385,22 @@ pub(crate) struct PreparedMvsOpaqueState {
 }
 
 impl MvsFullDecoder {
+    // 精确测试快照不包含 Arc 地址；缺席 cache 槽由固定容量及索引补集定义。
+    #[cfg(test)]
+    pub(crate) fn pipeline_snapshot(&self) -> String {
+        let present: Vec<_> = self
+            .cache_state
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.as_ref().map(|value| (index, value.as_ref())))
+            .collect();
+        format!("records={};luma={:?};chroma={:?};surface={:?};cache_capacity={};cache_indices={:?};cache_present={:?}",
+            self.committed_records, self.tables.luminance, self.tables.chrominance,
+            self.surface_state, self.cache_state.entries.len(),
+            (self.cache_state.previous_cache_index, self.cache_state.last_insert_index, self.cache_state.population_count), present)
+    }
+
     pub fn new(tables: MvsTables) -> Self {
         Self {
             tables,
@@ -4422,5 +4438,9 @@ mod tests {
         assert_eq!(snapshot.records, 2);
         assert_eq!(snapshot.tiles, 5);
         assert_eq!(snapshot.render_tiles, 3);
+    }
+    mod pipeline_differential {
+        use super::*;
+        include!("mvs_pipeline_tests.rs");
     }
 }

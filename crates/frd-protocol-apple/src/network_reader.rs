@@ -6596,4 +6596,8 @@ mod migrated_runtime_tests {
             }
         }
     }
+    mod pipeline_differential {
+        use super::*;
+        include!("mvs_publication_pipeline_tests.rs");
+    }
 }

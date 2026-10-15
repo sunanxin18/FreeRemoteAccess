@@ -105,6 +105,16 @@ pub struct MvsDecodeState {
 }
 
 impl MvsDecodeState {
+    #[cfg(test)]
+    pub(crate) fn pipeline_snapshot(&self) -> String {
+        format!(
+            "generation={};awaiting={};decoder={:?}",
+            self.generation,
+            self.awaiting_full,
+            self.decoder.as_ref().map(MvsFullDecoder::pipeline_snapshot)
+        )
+    }
+
     pub fn new(generation: u64) -> Self {
         Self {
             generation,
@@ -853,5 +863,9 @@ mod tests {
             &[0; 7],
         )
         .is_err());
+    }
+    mod pipeline_differential {
+        use super::*;
+        include!("mvs_state_pipeline_tests.rs");
     }
 }

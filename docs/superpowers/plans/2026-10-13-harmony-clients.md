@@ -125,6 +125,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。
 - [x] Task 4D1 普通应用 RDP 组合源码/FFI子步骤：2026-10-15 显式默认关闭 `normal-hap-rdp-validation` 沿用同一 C ABI/AppEngine/SessionHost，OHOS ARM64 仅注入 Unix/RequiredNative/LegacyOnly factory；宿主回归、实际最终 FFI 链接与独立 Spec/Quality 审查通过，见[组合验证](../../validation/harmony-rdp-composition-20261015.md)。默认与生产广告没有提升。
 - [x] Task 4D2 普通 HAP/安装/表单子步骤：实际 strip 绑定失败经插件证据定位并修正、复审和真实重放通过；开发签名/签后身份检查及两台专用模拟器安装、普通表单、Windows/Mac目标选择和实际截图检查通过。仅本子步骤完成，真实认证、首帧、刷新、输入/IME、生命周期与重连仍未完成，见[包与运行验证](../../validation/harmony-rdp-normal-hap-20261015.md)。
+- [x] 手机普通HAP真实会话子步骤：2026-10-15 授权Windows恢复后真实桌面、保存/读取凭据后重连、数分钟刷新、横屏触控开始菜单和主动断开已观察；同进程主动断开后重连及新进程HUKS读取后登录、竖屏触控也已观察；首次短会话退出根因、键盘/IME、完整生命周期及PC独立验收未完成，见[真实会话记录](../../validation/harmony-rdp-live-20261015.md)。
 - [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、远程软键盘入口与 IME 提交、断开/重连与恢复。
 - [ ] AVC/HEVC广告继续受原精确门禁控制；未通过的 codec 不由新平台构建自动开放。
 
@@ -138,6 +139,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 5A1 OHOS目标执行子步骤：同一已审查最终ELF及官方SDK C++库在手机/PC各完成9项IDCT聚焦+6项full/type-1精确消费者，14条命令共30次通过且host/独有guest退出均0；两端28,800块差分及前后产物身份经root核对。权限观察与脚本空格误拒的先前失败保留，不代表性能、完整MVS、HAP或真实Mac会话完成，见[IDCT验证](../../validation/mvs-idct-arm64-20261015.md)。
 - [x] Task 5A2 色彩/像素源码/宿主/最终ELF子步骤：2026-10-15 默认关闭的ARM64小端NEON色彩和RGB/BGRX/u32路径接入full/type-1/surface；原标量oracle与默认分配策略保持，完整色域与mode-4全域、default/colors各519及aggregate522项回归通过，最终ELF/四个叶函数独立Spec/Quality通过。目标执行见下一行；完整整管线差分、性能、HAP/应用及真实Mac仍OPEN，见[色彩/像素验证](../../validation/mvs-pixels-arm64-20261015.md)。
 - [x] Task 5A2 OHOS目标执行子步骤：同一最终aggregate ELF在手机/PC各完成14项像素+3项精确消费者，8条命令共34次通过执行且实际host/独有guest退出均0；两端完整色域/mode-4与前后产物身份经root独立复核。CLI范围之外的完整MVS、性能、HAP/应用和真实会话仍OPEN，见[色彩/像素验证](../../validation/mvs-pixels-arm64-20261015.md)。
+- [x] Task 5A3 指定完整记录/状态/发布宿主差分子步骤：2026-10-15 三个测试专用序列的scalar/native38条70,802字节全值相等，cache/Cr19Cb14/代际owner/回滚和补丁覆盖；截断负例提前geometry拒绝的P2已用真实RED和精确parse链修正并复审通过，两份fix1 OHOS最终ELF链接成功。目标执行见下一行，其它计算热路径/性能、普通应用与真实Mac仍待完成，见[流水线验证](../../validation/mvs-pipeline-arm64-20261015.md)。
+- [x] Task 5A3 手机/PC固定产物执行子步骤：两端scalar/native各3项，4条命令共12次通过且实际host/独有guest退出均0；四份38条70,802字节与冻结宿主全部值及顺序精确相等，前后源/产物身份经root独立核对。仍不代表性能、全部MVS、HAP或真实Mac，见[流水线验证](../../validation/mvs-pipeline-arm64-20261015.md)。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
 - [ ] 授权Mac完成真实认证、首帧、持续更新、输入、重连；音频/剪贴板只报告已实现并验证的能力。
 - [ ] 跑Windows/macOS/Linux相关回归及包检查，记录本轮没有真机的平台。
