@@ -1,6 +1,7 @@
 """Host-only 生命周期控制；无 Win32/PE 执行或 native 收据。"""
 import ctypes as C
 import hashlib
+import json
 import importlib.util
 import struct
 import tempfile
@@ -102,10 +103,179 @@ class BoundedPostExitAPI(FakeAPI):
         return 258 if self.failure == 'overflow' and self.waits == 1 else 0
 
 
+class JointCompletionAPI(FakeAPI):
+    """可审核的host联合状态序列；counter/time都是人为输入，不是native证明。"""
+    def __init__(self, active=(1, 0), waits=(0,), *, code=0, terminate_clears=True,
+                 failure=None, streaming=False):
+        super().__init__(stream=b'joint-tail')
+        self.active_values, self.last_active = list(active), active[-1]
+        self.wait_values, self.last_wait = list(waits), waits[-1]
+        self.code, self.terminate_clears, self.failure, self.streaming = code, terminate_clears, failure, streaming
+        self.terminated = False
+        self.clock, self.events, self.exit_queries, self.active_queries, self.counter_queries = 0, [], 0, 0, 0
+        self.terminate_at = None
+    def now(self):
+        value = self.clock; self.clock += 0.03125
+        return value
+    def pause(self): self.clock += 0.25
+    def counter(self):
+        self.counter_queries += 1
+        if self.failure == 'observation-qpc' and self.counter_queries == 2: raise OSError('host QPC failure')
+        return 100000 + int(self.clock * 1000)
+    def read(self, stream, remaining):
+        self.action('read-' + stream)
+        if self.failure == 'read' and len(self.events) > 2: raise OSError('host pipe failure')
+        if self.streaming:
+            result = b'x' * min(4096, remaining + 1)
+        elif stream == 'stdout':
+            length = min(4096, remaining + 1, len(self.stream))
+            result, self.stream = self.stream[:length], self.stream[length:]
+        else: result = b''
+        self.events.append({'api': 'read-' + stream, 'remaining': remaining, 'size': len(result), 't': self.clock})
+        return result
+    def wait(self):
+        self.action('wait')
+        value = self.wait_values.pop(0) if self.wait_values else self.last_wait
+        self.events.append({'api': 'wait', 'value': value, 't': self.clock})
+        return value
+    def exit_code(self):
+        self.action('exit'); self.exit_queries += 1
+        self.events.append({'api': 'exit', 'value': self.code, 't': self.clock})
+        if self.failure == 'exit': raise OSError('host exit failure')
+        return self.code
+    def active(self):
+        self.action('active'); self.active_queries += 1
+        if self.failure == 'active' and self.active_queries == 1: raise OSError('host accounting failure')
+        value = 0 if self.terminated and self.terminate_clears else self.active_values.pop(0) if self.active_values else self.last_active
+        self.events.append({'api': 'active', 'value': value, 't': self.clock})
+        return value
+    def terminate(self):
+        self.action('terminate'); self.terminated = True; self.terminate_at = self.clock
+        self.events.append({'api': 'terminate', 't': self.clock})
+
+
 class OwnerControls(unittest.TestCase):
     def setUp(self): self.assertIsNotNone(m, 'missing process owner implementation')
     def run_case(self, api, timeout=30):
         return m.collect_owned(api, 'fixed.exe', ['fixed.exe', '--suite', 'register', '--expect-variant', '0'], 'cwd', {'SystemRoot': 'C:\\Windows'}, timeout)
+    def test_joint_wait0_active1_then0_keeps_pending_evidence_without_terminate(self):
+        api = JointCompletionAPI()
+        result = self.run_case(api)
+        self.assertIsNone(result['first_failure'])
+        self.assertEqual(result['wait'], 0)
+        self.assertEqual(result['exit_code'], 0)
+        self.assertTrue(result['exit_code_attempted'])
+        self.assertEqual(api.exit_queries, 1)
+        self.assertNotIn('terminate', api.log)
+        self.assertTrue(result['cleanup_confirmed'])
+        self.assertEqual(result['stdout'], b'joint-tail')
+        self.assertEqual(result['normal_active_processes'], 1, 'initial positive observation must remain intact')
+        self.assertEqual([row['active_processes'] for row in result['normal_observations']], [1, 0])
+        self.assertTrue(all(type(row['qpc']) is int for row in result['normal_observations']))
+        self.assertEqual(result['normal_observations'][0]['exit_code'], 0)
+        self.assertEqual(result['qpf'], 1000)
+        self.assertEqual(result['qpc_start'], 100000)
+        self.assertGreaterEqual(result['qpc_end'], result['normal_observations'][-1]['qpc'])
+        self.assertFalse(api.handles)
+
+    def test_joint_exit_query_follows_wait0_once_and_keeps_wait_timeout_observation(self):
+        api = JointCompletionAPI(waits=(258, 0, 0))
+        result = self.run_case(api)
+        self.assertIsNone(result['first_failure'])
+        self.assertEqual([row['wait'] for row in result['normal_observations']], [258, 0, 0])
+        self.assertEqual([row['active_processes'] for row in result['normal_observations']], [None, 1, 0])
+        exit_index = next(i for i, event in enumerate(api.events) if event['api'] == 'exit')
+        self.assertEqual([event['value'] for event in api.events[:exit_index] if event['api'] == 'wait'], [258, 0])
+        self.assertEqual(api.exit_queries, 1)
+        self.assertEqual([row['exit_code'] for row in result['normal_observations']], [None, 0, 0])
+        self.assertNotIn('terminate', api.log)
+
+    def test_joint_persistent_count_uses_original_30_and_120_deadlines_then_fails(self):
+        for timeout in (30, 120):
+            with self.subTest(timeout=timeout):
+                api = JointCompletionAPI(active=(1,))
+                result = self.run_case(api, timeout=timeout)
+                self.assertEqual(result['first_failure'], {'stage': 'timeout', 'type': 'ProcessError', 'code': 'completion-timeout'})
+                self.assertTrue(result['cleanup_confirmed'])
+                self.assertEqual(result['exit_code'], 0)
+                self.assertEqual(api.exit_queries, 1)
+                self.assertGreater(len(result['normal_observations']), 1)
+                self.assertEqual({row['active_processes'] for row in result['normal_observations']}, {1})
+                self.assertGreaterEqual(api.terminate_at, timeout)
+                self.assertLess(api.terminate_at, timeout + 1)
+                self.assertEqual(api.log.count('terminate'), 1)
+                self.assertEqual(result['normal_timeout_seconds'], timeout)
+                self.assertEqual(result['cleanup_timeout_seconds'], 10)
+                self.assertEqual(result['cleanup'][-1], {'wait': 0, 'active_processes': 0})
+                print(json.dumps({'scope': 'host joint persistent model only', 'normal_timeout': timeout,
+                                  'terminate_model_time': api.terminate_at, 'normal_samples': len(result['normal_observations']),
+                                  'first_failure': result['first_failure'], 'cleanup': result['cleanup'],
+                                  'qpc_start': result['qpc_start'], 'qpc_end': result['qpc_end'], 'qpf': result['qpf']}))
+
+    def test_joint_cleanup_unconfirmed_keeps_normal_timeout_first(self):
+        api = JointCompletionAPI(active=(1,), terminate_clears=False)
+        result = self.run_case(api)
+        self.assertEqual(result['first_failure'], {'stage': 'timeout', 'type': 'ProcessError', 'code': 'completion-timeout'})
+        self.assertFalse(result['cleanup_confirmed'])
+        self.assertEqual(api.log.count('terminate'), 1)
+        self.assertGreaterEqual(api.clock - api.terminate_at, 10)
+        self.assertLess(api.clock - api.terminate_at, 12)
+        self.assertEqual(result['cleanup'][-1], {'wait': 0, 'active_processes': 1})
+        self.assertFalse(api.handles)
+
+    def test_joint_nonzero_or_unknown_exit_is_never_replaced_by_zero_accounting(self):
+        for code in (7, None, False):
+            with self.subTest(code=code):
+                api = JointCompletionAPI(active=(0,), waits=(258, 0), code=code)
+                result = self.run_case(api)
+                self.assertEqual(result['first_failure']['stage'], 'exit')
+                self.assertIs(result['exit_code'], code)
+                self.assertTrue(result['exit_code_attempted'])
+                self.assertEqual(api.exit_queries, 1)
+                self.assertTrue(result['cleanup_confirmed'])
+                self.assertLess(api.terminate_at, 30)
+                index = next(i for i, event in enumerate(api.events) if event['api'] == 'exit')
+                self.assertEqual([event['value'] for event in api.events[:index] if event['api'] == 'wait'], [258, 0])
+                self.assertEqual(result['normal_observations'][-1]['exit_code'], code)
+
+    def test_joint_api_failure_or_invalid_query_never_becomes_pending_success(self):
+        for failure, stage in [('active', 'active'), ('exit', 'exit'), ('read', 'read-stdout'), ('observation-qpc', 'normal-observation-clock')]:
+            with self.subTest(failure=failure):
+                api = JointCompletionAPI(failure=failure)
+                result = self.run_case(api)
+                self.assertEqual(result['first_failure']['stage'], stage)
+                self.assertEqual(result['first_failure']['type'], 'OSError')
+                self.assertTrue(result['cleanup_confirmed'])
+                self.assertLess(api.terminate_at, 30)
+                self.assertEqual(api.log.count('terminate'), 1)
+        for count in (None, False, -1):
+            with self.subTest(count=count):
+                api = JointCompletionAPI(active=(count,))
+                result = self.run_case(api)
+                self.assertEqual(result['first_failure']['stage'], 'active')
+                self.assertEqual(result['normal_observations'][0]['active_processes'], count)
+                self.assertNotIn('normal_active_processes', result)
+                self.assertTrue(result['cleanup_confirmed'])
+        api = JointCompletionAPI(waits=(0xffffffff, 0))
+        result = self.run_case(api)
+        self.assertEqual(result['first_failure']['stage'], 'wait')
+        self.assertFalse(result['exit_code_attempted'])
+        self.assertTrue(result['cleanup_confirmed'])
+
+    def test_joint_flapping_count_and_continuous_stream_cannot_reset_deadline(self):
+        api = JointCompletionAPI(active=tuple([1, 0] * 100), streaming=True)
+        result = self.run_case(api)
+        self.assertEqual(result['first_failure'], {'stage': 'timeout', 'type': 'ProcessError', 'code': 'completion-timeout'})
+        self.assertEqual({row['active_processes'] for row in result['normal_observations']}, {0, 1})
+        self.assertGreaterEqual(api.terminate_at, 30)
+        self.assertLess(api.terminate_at, 31)
+        self.assertEqual(api.exit_queries, 1)
+        self.assertTrue(result['cleanup_confirmed'])
+        for stream in ('stdout', 'stderr'):
+            self.assertGreater(len(result[stream]), 0)
+            self.assertLessEqual(len(result[stream]), 1024 * 1024)
+        self.assertTrue(all(event['size'] <= min(4096, event['remaining'] + 1) for event in api.events if event['api'].startswith('read-')))
+
     def test_fixed_width_layout(self):
         self.assertEqual([C.sizeof(x) for x in (m.DWORD, m.BOOL, m.WORD, m.HANDLE)], [4, 4, 2, 8])
         self.assertEqual(C.sizeof(m.STARTUPINFOW), 104)
@@ -166,10 +336,12 @@ class OwnerControls(unittest.TestCase):
         self.assertEqual(result['first_failure']['stage'], 'timeout')
         self.assertTrue(result['cleanup_confirmed'])
         self.assertIn('terminate', api.log)
-    def test_job_active_after_parent_exit_is_terminated_and_rejected(self):
+    def test_persistent_job_active_until_deadline_is_terminated_and_rejected(self):
         api = FakeAPI(active=1)
         result = self.run_case(api)
         self.assertIsNotNone(result['first_failure'])
+        self.assertEqual(result['first_failure']['stage'], 'timeout')
+        self.assertGreater(api.log.count('active'), 1)
         self.assertTrue(result['cleanup_confirmed'])
     def test_cleanup_failure_does_not_replace_first_failure(self):
         for failure in ('terminate', 'cleanup'):

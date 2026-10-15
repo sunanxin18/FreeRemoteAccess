@@ -330,7 +330,8 @@ def collect_owned(api, exe, argv, cwd, env, timeout):
     """中立生命周期核心。返回观察；单凭此返回值不能创建 native 成功终态。"""
     require(type(timeout) is int and timeout in (30, 120), 'fixed-timeout')
     result = {'argv': argv, 'cwd': cwd, 'environment': env, 'first_failure': None,
-              'stdout': b'', 'stderr': b'', 'wait': None, 'exit_code': None,
+              'stdout': b'', 'stderr': b'', 'wait': None, 'exit_code': None, 'exit_code_attempted': False,
+              'normal_observations': [], 'normal_timeout_seconds': timeout, 'cleanup_timeout_seconds': 10,
               'wall_start_unix_ns': time.time_ns(), 'cleanup_confirmed': False, 'cleanup': [], 'qpc_start': None, 'qpc_end': None, 'qpf': None}
     def fail(stage, error=None):
         if result['first_failure'] is None:
@@ -361,30 +362,46 @@ def collect_owned(api, exe, argv, cwd, env, timeout):
         api.resume()
         deadline = api.now() + timeout
         while True:
+            stage = 'timeout'
+            require(api.now() < deadline, 'completion-timeout')
             for stream in ('stdout', 'stderr'):
                 capture(stream)
             stage = 'wait'
             result['wait'] = api.wait()
-            require(result['wait'] in (WAIT_OBJECT_0, WAIT_TIMEOUT), 'unexpected-wait')
+            observation = {'wait': result['wait'], 'active_processes': None,
+                           'exit_code': result['exit_code'], 'qpc': None}
+            result['normal_observations'].append(observation)
+            require(type(result['wait']) is int and result['wait'] in (WAIT_OBJECT_0, WAIT_TIMEOUT), 'unexpected-wait')
+            active = None  # 尚未查询保持unknown，不能复用上一轮或用默认0通过。
             if result['wait'] == WAIT_OBJECT_0:
+                if not result['exit_code_attempted']:
+                    stage = 'exit'
+                    result['exit_code_attempted'] = True
+                    result['exit_code'] = api.exit_code()
+                    observation['exit_code'] = result['exit_code']
+                    require(type(result['exit_code']) is int and 0 <= result['exit_code'] <= 0xffffffff, 'parent-exit-code')
+                    require(result['exit_code'] == 0, 'parent-nonzero')
                 stage = 'active'
                 active = api.active()
-                result['normal_active_processes'] = active
-                require(active == 0, 'descendants-still-active')
-                # 结束后继续有限 drain，直到两流本轮均无更多 bytes。
+                observation['active_processes'] = active
+                require(type(active) is int and 0 <= active <= 0xffffffff, 'job-active-count')
+                # 保留首次实际计数；后续pending/zero逐条记录，不覆盖初始证据。
+                if 'normal_active_processes' not in result:
+                    result['normal_active_processes'] = active
+            stage = 'normal-observation-clock'
+            observation['qpc'] = api.counter()
+            stage = 'timeout'
+            require(api.now() < deadline, 'completion-timeout')
+            if result['wait'] == WAIT_OBJECT_0 and active == 0:
+                # 联合收束后继续有限 drain；任何输出都不能重置原deadline。
                 drained = False
                 for stream in ('stdout', 'stderr'):
                     if capture(stream): drained = True
+                stage = 'timeout'
+                require(api.now() < deadline, 'completion-timeout')
                 if drained:
-                    stage = 'timeout'
-                    require(api.now() < deadline, 'drain-timeout')
                     continue
-                stage = 'exit'
-                result['exit_code'] = api.exit_code()
-                require(result['exit_code'] == 0, 'parent-nonzero')
                 break
-            stage = 'timeout'
-            require(api.now() < deadline, 'parent-timeout')
             api.pause()
     except Exception as error:
         fail(stage, error)

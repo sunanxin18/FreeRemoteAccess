@@ -305,6 +305,69 @@ class RunnerControls(unittest.TestCase):
                 self.assertEqual(archive.read('source-expected-pins.json'), expected_raw)
             print(json.dumps({'scope': 'host-only actual-main pin rejection fixture', 'actual': actual[changed_name], 'expected_sha256': expected[changed_name]}))
 
+    def test_joint_collect_transient_completes_seven_real_parser_pairs_without_native_authority(self):
+        owner_fixture_path = ROOT / 'tools/tests/test_windows_private_process.py'
+        spec = importlib.util.spec_from_file_location('fix3_joint_owner_fixture', owner_fixture_path)
+        fixture = importlib.util.module_from_spec(spec)
+        exec(compile(owner_fixture_path.read_bytes(), str(owner_fixture_path), 'exec'), fixture.__dict__)
+        fixture.m = m.source_module(ROOT, 'tools/windows-private-process.py', m.PINS['tools/windows-private-process.py'], 'fix3_pinned_owner')
+        transcript_path = ROOT / 'tools/tests/test_verify_windows_private_transcript.py'
+        spec = importlib.util.spec_from_file_location('fix3_joint_transcript_fixture', transcript_path)
+        transcripts = importlib.util.module_from_spec(spec)
+        exec(compile(transcript_path.read_bytes(), str(transcript_path), 'exec'), transcripts.__dict__)
+        parser = m.source_module(ROOT, 'tools/verify-windows-private-transcript.py', m.PINS['tools/verify-windows-private-transcript.py'], 'fix3_actual_parser')
+        apis, observations = [], []
+        def execute(exe, argv, timeout):
+            api = fixture.JointCompletionAPI()
+            api.stream = transcripts.transcript(argv[2], int(argv[4]))
+            apis.append(api)
+            return fixture.m.collect_owned(api, exe, argv, 'host-only', {}, timeout)
+        state = m.orchestrate(['pe0', 'pe1', 'pe2', 'pe3', 'pe4'], execute, lambda: {}, parser.parse_transcript,
+                              lambda index, item, observation: observations.append(observation))
+        self.assertIsNone(state['first_failure'])
+        self.assertEqual([item['status'] for item in state['commands']], ['observed-contract'] * 7)
+        self.assertEqual([item['normal_timeout_seconds'] for item in observations], [30, 30, 120, 30, 30, 30, 30])
+        for api, observation in zip(apis, observations):
+            self.assertNotIn('terminate', api.log)
+            self.assertEqual(api.exit_queries, 1)
+            self.assertTrue(observation['cleanup_confirmed'])
+            self.assertEqual(observation['exit_code'], 0)
+            self.assertEqual(observation['normal_active_processes'], 1)
+            active = [row['active_processes'] for row in observation['normal_observations']]
+            self.assertEqual(active[:2], [1, 0])
+            self.assertEqual(active[-1], 0)
+        self.assertNotIn('terminal-status.json', state)
+
+    def test_joint_collect_failure_or_unconfirmed_cleanup_stops_after_first_parent(self):
+        path = ROOT / 'tools/tests/test_windows_private_process.py'
+        spec = importlib.util.spec_from_file_location('fix3_joint_negative_fixture', path)
+        fixture = importlib.util.module_from_spec(spec)
+        exec(compile(path.read_bytes(), str(path), 'exec'), fixture.__dict__)
+        fixture.m = m.source_module(ROOT, 'tools/windows-private-process.py', m.PINS['tools/windows-private-process.py'], 'fix3_negative_pinned_owner')
+        cases = [('persistent', {'active': (1,)}, 'timeout', True),
+                 ('cleanup-unconfirmed', {'active': (1,), 'terminate_clears': False}, 'timeout', False),
+                 ('exit-nonzero', {'code': 7}, 'exit', True),
+                 ('exit-unknown', {'code': None}, 'exit', True),
+                 ('exit-query-error', {'failure': 'exit'}, 'exit', True),
+                 ('active-query-error', {'failure': 'active'}, 'active', True),
+                 ('wait-failed', {'waits': (0xffffffff, 0)}, 'wait', True)]
+        for label, options, stage, cleanup in cases:
+            with self.subTest(label=label):
+                api = fixture.JointCompletionAPI(**options)
+                launches, observations = [], []
+                def execute(exe, argv, timeout):
+                    launches.append(argv)
+                    return fixture.m.collect_owned(api, exe, argv, 'host-only', {}, timeout)
+                def parse(*args): raise AssertionError('failed joint completion cannot reach parser')
+                state = m.orchestrate(['pe0', 'pe1', 'pe2', 'pe3', 'pe4'], execute, lambda: {}, parse,
+                                      lambda index, item, observation: observations.append(observation))
+                self.assertEqual(len(launches), 1)
+                self.assertEqual([item['status'] for item in state['commands']], ['failed'] + ['not_attempted'] * 6)
+                self.assertEqual(state['first_failure']['process_first_failure'], observations[0]['first_failure'])
+                self.assertEqual(observations[0]['first_failure']['stage'], stage)
+                self.assertIs(observations[0]['cleanup_confirmed'], cleanup)
+                self.assertFalse(api.handles)
+
     def test_context_cannot_take_identity_from_artifact(self):
         self.assertEqual(m.expected_context(context())['run_attempt'], 2)
         for key in context():

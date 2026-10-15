@@ -30,7 +30,7 @@ WORKFLOW = '.github/workflows/qualify-windows-private-abi.yml'
 PINS = {
     'tools/verify-windows-private-transcript.py': 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db',
     'tools/admit-windows-private-artifact.py': '2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea',
-    'tools/windows-private-process.py': '447dbba607851e835f980a7c6651355433a75f86df5c4718b711b8e7944151ed',
+    'tools/windows-private-process.py': 'efe57549a64a3c7418002c97d81ddd9af293b86e4ebaf824bc0a88081d2f5fb0',
 }
 COMMANDS = (('register', 0), ('unwind', 0), ('isolated', 0), ('unwind', 1), ('unwind', 2), ('unwind', 3), ('unwind', 4))
 MAX_DOWNLOAD = 96 * 1024 * 1024

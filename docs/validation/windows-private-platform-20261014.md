@@ -313,3 +313,35 @@ native checkout过程环境同时指定 `core.autocrlf=false` 和 `core.eol=lf`�
 root核对Fix2的28项冻结材料、68项旧作者证据、12项首CI证据及15480-byte原作者报告前缀；同reviewer定向复审Spec PASS / Quality Approved，无未关闭Critical/Important/Minor。原审查15898-byte前缀保持；当前review SHA256 `3b47880adb2a181a92bc2f6f6fb5a91b19fd796a012b05117b9e22812b7ff2e3`。workflow SHA256 `3a2318bf94819b5c34c5aec0084441c33da997cf07393218d14e81a15d9429c2`，F2 `2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea`，runner `66314d1cdaeaf64994b5205aed29b3a30aeba7caeba3687327cc8a96cc273f38`；源副本与RED/GREEN位于 `target/windows-private-runner-20261016/fix2/`。
 
 Fix2仅是源码与宿主修复。实际Windows是否恢复精确字节、launcher machine/API、同轮artifact/F2、七命令和上传交付须在新commit的新run中验收；旧失配hash仍未知，不能用host控制补写首CI事实。首轮不重跑，原生和shipping门继续OPEN。
+
+
+### Fix2 原生结果：一项寄存器通过，Job 收束检查提前拒绝
+
+提交 `ff3042552b0b6a85945cd33ad08201b649dff02c` 的[原run38788965972](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38788965972) / attempt1 已失败。Linux编译job116608227927成功；Windows job116610218496的源码摘要门通过，实际Python3.13.16为AA64/PE32+，Windows build26200，IsWow64Process2、ProcessMachineTypeInfo及本机架构检查通过。实际运行结果只有以下有限范围：
+
+- `register/variant0`：PID2508/TID11012，独立wait0、真实GetExitCodeProcess返回exit0、JobActiveProcesses0，正常收束且未Terminate。root用固定F1重新解析实际原始输出，结果与运行记录一致。
+- `unwind/variant0`：PID11008/TID8636，wait0后第一次Job活动计数为1。旧owner立即报 `descendants-still-active` 并TerminateJob；随后cleanup wait0/active0。没有调用GetExitCodeProcess，故真实退出码未知，不能用C stdout成功文案补写exit0。
+- `isolated/variant0` 和 `unwind/variant1–4`：五项均未尝试。整轮仍失败，不授予完整nativehelper或shipping资格。
+
+native artifact12000490061共472060983 bytes，SHA256 `b2650eea8ac114024d54e03d6aaa2bd8e9440d17959b288cf51dcb5895ba960d`，与认证API一致。root核对531个外层和528个内层成员的CRC/长度/摘要、terminal/archive/manifest/summary及七份源副本与Git对象。初次600秒收集停止及336789504-byte前缀原样保留；随后按同一artifact的固定offset只续传余下135271479 bytes，完整摘要确认后又将原Range诊断字节与完整ZIP逐项比较。没有重跑CI或原生命令。
+
+同run input artifact11998669846共78612007 bytes，SHA256 `b9728722137ab2a3688b7eac881f1b884d892f276cf8ca263d11a1ec3ed7a6d3`。完整native包内保留其原ZIP；root比对独立认证API、caller context与实际字节，再用未改F2直接静态admit/revalidate通过七COFF/五PE。该seal仍为 `admitted-static-only`，root没有在Mac执行PE或编译器。接收记录位于 `target/windows-private-runner-root-20261016/fix2-ci/native-root-acceptance.json` 与 `root-static-acceptance.json`。
+
+C的unwind分支仅执行synthetic和live-walk，没有显式CreateProcess；CreateProcess位于isolated路径。这不识别实际Job计数1的进程，也不证明无干预时是否会清空。[Job计数合同](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)与[进程终止合同](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process)没有承诺parent wait0后的下一次Job查询必须为0；本记录只在Terminate之后观察到0，因此不能将OS计数滞后写成已证实根因。
+
+Fix3的最小裁定是：在原30/120秒执行期限内等待parent wait0、真实exit0、Job活动计数0及有界输出读取共同完成；单次正计数表示待收束，持续非零到原期限仍失败，再执行原10秒清理。实际非零exit/API/读取错误保持立即失败，Terminate后的零不升级为成功，不启动后续命令。成本是真实残留Job最多占用原正常预算；不增加宽限期、不重试或改变JOB_LIST所有权。源码与宿主修复已完成并通过下述独立复审，完整七命令原生验证、shipping数学/guard/性能/修改包仍OPEN。
+
+专项workflow的push过滤只匹配workflow自身。Fix3保持workflow/F2字节不变；独立复审并推送后，root应对精确feature ref启动一次新workflow_dispatch并绑定实际source SHA/run/attempt，不重跑旧失败run，不修改注释制造触发。此次没有观察或操作PC模拟器、HAP、凭据或远程会话。
+
+
+### Fix3：原期限内联合收束，源码与宿主修复通过
+
+owner在独立wait0之后实际查询一次退出码，要求DWORD整数0；非0、未知、API错误立即失败。正Job活动计数继续在同一原执行期限内逐流收取有界bytes并查询；只有wait0、实际exit0、JobActive0和drain完成共同成立才接受。每轮入口、查询后及drain后检查同一deadline，持续输出和计数波动不能延时；期限到则永久失败，再以原10秒cleanup确认，不因Terminate后清空而升级或继续下一项。
+
+正常材料新增逐条wait/actual active/actual exit/raw QPC观察；首次 `normal_active_processes` 保留初值1，后续归零另行记录。查询尚未发生或失败保持未知。原JOB_LIST所有权、挂起机器检查、原始输出上限及逐流prefix保存路径保持；runner产品源码只更新owner摘要。
+
+旧owner对人为1→0轨迹先RED，修复后GREEN。最终owner24项和runner26项合计50项通过；包括持续active的30/120秒模型、cleanup未确认、非0/未知exit、查询/读取错误、连续输出与计数波动不重置deadline，以及真实collect→orchestrate→固定F1 parser的七份合成日志。负向集成仅尝试首项，后六项未尝试。中途粗模型时钟导致一次断言失败的原日志保留；仅调整测试时钟采样粒度，产品预算未改。F1/F2/旧compiler suite未重跑。这些均为宿主控制，没有Windows原生或性能资格。
+
+同reviewer定向复审 **Spec PASS / Quality Approved**，无Critical/Important/Minor。root核对37项新冻结文件、99项旧作者证据、8份基线、13个producer pins、固定F1/F2/workflow与22491-byte旧报告前缀；报告和完整四文件diff已读。最终owner SHA256 `efe57549a64a3c7418002c97d81ddd9af293b86e4ebaf824bc0a88081d2f5fb0`，runner `b569117d7d75139d1a8d0337ee483aa4aba659d08d165636595468de72b540ba`；Fix3 manifest `fb1dc182c50f1d109b086d73c401a2b18929f842456640243217886b3747b9d6`，复审报告 `2785a1133f6825773ab463737c32af39e4e4a3663dfc087fe75f8a4b3827f818`。作者材料位于 `target/windows-private-runner-20261016/fix3/`，root接收为 `target/windows-private-runner-root-20261016/f3-fix3-root-acceptance.json`。
+
+原unwind actualexit、active1的身份和无干预是否自然收束仍未知。新原生运行须以审查后的精确新commit单独取得同run编译、输入及完整七项结果；旧run保持失败。完整helper、shipping数学/guard/性能/修改包和产品互操作仍OPEN。没有操作PC表单或其他设备。
