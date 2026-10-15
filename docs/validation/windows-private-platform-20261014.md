@@ -201,3 +201,33 @@ artifact11883052555 的 API/local ZIP SHA-256 一致：
 合计 210 个文件前后指纹保持；第二次终态 SHA-256 为
 `f030ef84e60c042197d593d903171afe80c542cb965088e9ac0c123071c9d936`，
 状态仍 failed，不覆盖首次失败或将源码复审替代执行。
+
+## 第三次 C/PE 编译及独立产物验收
+
+2026-10-15 核对冻结 `30189bf67ee2e9743045275969cdd039a8cdba50` 的
+[专项运行38548996801](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38548996801)。
+实际 job115802047112 / attempt1 已成功。原始日志中的 19+36 项窄检查通过，
+七个 COFF 对象与五个 C/PE 变体均完成；每个实际 C 编译、链接、object/PE
+readobj 均 exit0。bad5 仍是预期 MC exit1 且没有对象，不当作原生负例成功。
+
+独立审查从实际字节核对 18 份 source、固定工具 tar 的 8,123 项 inventory、
+117 条工具调用记录及原始输出、42 段已保存反汇编的 13,995 个指令字，以及
+36 条 owned full-xdata 绑定。五个实际 PE 均为 ARM64，导入闭包是精确
+KERNEL32/MSVCRT；variant1 只有前述两个必需 Rtl 名称，其余四个都有三个。
+summary 的 `packaging-pending` 不单独作为终态；独立终态为 `compiled-only`，
+正确绑定最终 summary 和已核验的完整 archive。
+
+artifact11885962816 为 80,618,176 bytes，API、本地 ZIP 和上传日志摘要一致：
+`ddf55493a5be7f5832fe368bdf190a6fc294428a53ac641ba87aed1d6a9c8d7f`。
+资料位于 `target/windows-contract-30189bf-38548996801/`，最终终态 SHA-256：
+`fb83041aea5406bcc86c8ec1a97fd8a74a3dde870c967ddb3a56eccbdefd51e4`。
+两个旧失败目录的全部 241 个文件保持不变，历史失败没有被覆盖。
+
+传输有一项非阻塞限制：上传工具默认排除隐藏文件，外层 loose 目录遗漏
+`inputs/.github/workflows/qualify-windows-private-abi.yml`；完整内层 ZIP 保留其
+正确字节和摘要，因此本次以该完整 ZIP 验收，不能声称外层镜像逐项闭合。
+
+本子步骤仅完成编译和静态产物验收。五个变体的 `isolated_child` 都没有独立
+符号或 frame，内联边界保持 OPEN；真正 Windows ARM64 的 Rtl/ABI/SEH、
+调试事件和独立进程退出确认、shipping 数值与保护页、性能和修改配方包仍未
+执行。它们不构成鸿蒙客户端真实 Windows/Mac 登录、画面或输入的证据。
