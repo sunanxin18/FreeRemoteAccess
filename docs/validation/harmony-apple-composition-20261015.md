@@ -2,6 +2,8 @@
 
 状态：**实验性**，本轮仅完成源码、宿主检查和官方 OHOS ARM64 最终 FFI 交叉链接。没有构建/签装本次组合 HAP；OHOS 正向用例仅编译，手机/PC 普通应用的 Mac 登录、帧、输入与重连仍未验证。
 
+后续模式选择与同组合真实 Release HAP 已另行完成源码/构建检查，尚未签装或完成手机/PC GUI 与真实 Mac 会话；见[后续记录](harmony-mode-selection-20261015.md)。以下保留组合根阶段的历史产物与验证范围。
+
 ## 行为与平台边界
 
 新增默认关闭的 `normal-hap-apple-mvs-validation`；Apple 可选依赖及类型引用均限 OHOS ARM64，选择既有 `mvs-native-arm64`（IDCT/colors/copy）。与 `normal-hap-rdp-validation` 可同时启用，真实组合根累加工厂，保留 RDP Unix/RequiredNative/LegacyOnly。默认无普通 feature 仍不注册协议。

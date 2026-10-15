@@ -3,7 +3,8 @@ import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { usbHid } from './InputMapping';
 
-interface ProfileSummary { address: string; username: string; port: number; }
+interface ProfileSummary { address: string; username: string; port: number; protocol: string; target: number; modeLabel: string; targetLabel: string; }
+interface ProtocolOption { id: string; label: string; shortLabel: string; available: boolean; targets: number[]; }
 interface FormErrors { address?: string; port?: string; username?: string; password?: string; protocol?: string; target?: string; profile?: string; }
 interface CertificateSummary { fingerprint: string; subject: string; issuer: string; }
 interface AppSnapshot {
@@ -11,6 +12,7 @@ interface AppSnapshot {
   target?: number; address?: string; port?: number; username?: string; protocol?: string;
   remember?: boolean; credentialLoaded?: boolean; loading?: string; profiles?: ProfileSummary[];
   selectedIndex?: number; errors?: FormErrors; notice?: string;
+  protocolOptions?: ProtocolOption[]; modeNotice?: string;
   session?: string; generation?: string; geometryRevision?: string; certificate?: CertificateSummary;
   persistenceWarning?: string; statusCode?: string; statusMessage?: string;
 }
@@ -78,6 +80,8 @@ struct Index {
       case 'username_required': return '请输入用户名';
       case 'password_required': return '请输入密码';
       case 'target_system_required': return '请选择目标系统';
+      case 'unregistered_protocol': return '所选连接模式当前不可用';
+      case 'unsupported_target_protocol': return '连接模式与目标系统不匹配';
       case 'saved_credential_unavailable': return '保存的密码不可用，请重新输入';
       case 'credential_load_failed': return '安全存储读取失败，请输入密码或稍后重试';
       default: return code ? '此选项当前不可用，请检查输入' : '';
@@ -138,8 +142,37 @@ struct Index {
   }
   private profileOptions(): SelectOption[] {
     return (this.model.profiles ?? []).map((profile: ProfileSummary): SelectOption => {
-      return { value: `${profile.address}:${profile.port} · ${profile.username}` };
+      return { value: `${profile.targetLabel} · ${profile.modeLabel} · ${profile.address}:${profile.port} · ${profile.username}` };
     });
+  }
+  private showMode(): boolean { return this.target === 2 || this.protocol !== 'auto'; }
+  private protocolChoices(): ProtocolOption[] {
+    return (this.model.protocolOptions ?? []).filter((option: ProtocolOption): boolean => {
+      return option.id === 'auto' || option.id === this.protocol || option.targets.includes(this.target);
+    });
+  }
+  private protocolOptions(): SelectOption[] {
+    return this.protocolChoices().map((option: ProtocolOption): SelectOption => {
+      return { value: option.available ? option.label : `${option.label}（不可用）` };
+    });
+  }
+  private protocolIndex(): number {
+    return this.protocolChoices().findIndex((option: ProtocolOption): boolean => option.id === this.protocol);
+  }
+  private protocolValue(): string {
+    return this.protocolChoices().find((option: ProtocolOption): boolean => option.id === this.protocol)?.shortLabel || '已保存';
+  }
+  private changeTarget(target: number): void {
+    if (target === this.target) { return; }
+    const selected = (this.model.protocolOptions ?? []).find((option: ProtocolOption): boolean => option.id === this.protocol);
+    if (this.protocol !== 'auto' && (!selected || !selected.targets.includes(target))) { this.protocol = 'auto'; }
+    this.target = target; this.port = target === 2 ? '5900' : '3389';
+    this.edit(); this.passwordEpoch++;
+  }
+  private changeProtocol(index: number): void {
+    const selected = this.protocolChoices()[index];
+    if (!selected || selected.id === this.protocol) { return; }
+    this.protocol = selected.id; this.edit(); this.passwordEpoch++;
   }
   @Builder
   fieldLabel(label: string) {
@@ -163,7 +196,7 @@ struct Index {
   }
   @Builder
   formMessages() {
-    if (!this.model.available) { Text('此设备尚无可用的远程连接协议').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').margin({ top: 4 }) }
+    if (this.model.modeNotice) { Text(this.model.modeNotice).fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').margin({ top: 4 }) }
     if (this.model.errors?.protocol) { Text(this.error(this.model.errors.protocol)).fontSize(14).width('100%').margin({ top: 4 }) }
     if (this.model.notice || this.bridgeNotice) { Text(this.bridgeNotice || this.model.notice || '').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 4 }) }
   }
@@ -200,15 +233,25 @@ struct Index {
               this.fieldLabel('目标系统')
               Select([{ value: 'Windows' }, { value: 'macOS' }, { value: 'Linux' }]).selected(this.target - 1).value(this.target === 1 ? 'Windows' : this.target === 2 ? 'macOS' : 'Linux')
                 .font({ size: 16 }).optionFont({ size: 16 }).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('目标系统')
-                .onSelect((index: number) => { this.target = index + 1; this.port = index === 1 ? '5900' : '3389'; this.edit(); })
+                .padding({ left: 8, right: 8 }).onSelect((index: number) => this.changeTarget(index + 1))
               if (this.model.errors?.target) { Text(this.error(this.model.errors.target)).fontSize(14).width('100%') }
-            }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+            }.layoutWeight(this.showMode() ? 1.2 : 1).alignItems(HorizontalAlign.Start)
+            if (this.showMode()) {
+              Column({ space: 6 }) {
+                this.fieldLabel('连接模式')
+                Select(this.protocolOptions()).selected(this.protocolIndex()).value(this.protocolValue())
+                  .font({ size: 16 }).optionFont({ size: 16 }).optionWidth(240)
+                  .width('100%').constraintSize({ minHeight: 48 }).padding({ left: 8, right: 8 })
+                  .accessibilityText(`连接模式：${this.protocolValue()}${this.model.available ? '' : '，当前不可用'}`)
+                  .onSelect((index: number) => this.changeProtocol(index))
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+            }
             Column({ space: 6 }) {
               this.fieldLabel('端口')
               TextInput({ text: this.port, placeholder: '端口' }).type(InputType.Number).fontSize(16).width('100%')
                 .constraintSize({ minHeight: 48 }).accessibilityText('端口').showError(this.error(this.model.errors?.port))
                 .onChange((v: string) => { this.port = v; this.edit(); })
-            }.width(96).alignItems(HorizontalAlign.Start)
+            }.width(this.showMode() ? 72 : 96).alignItems(HorizontalAlign.Start)
           }.width(this.formFieldWidth()).alignItems(VerticalAlign.Top).margin({ bottom: 12 })
           Column({ space: 6 }) {
             this.fieldLabel('主机地址')
@@ -266,7 +309,7 @@ struct Index {
     const certificate = this.model.certificate;
     const identity = certificate ? `服务器指纹：${certificate.fingerprint}\n主题：${certificate.subject}\n签发者：${certificate.issuer}` : '';
     const status = this.model.statusMessage || this.model.persistenceWarning || this.model.notice || (this.model.page === 1 ? '正在连接' : this.model.page === 2 ? '等待首个完整画面' : this.model.page === 3 ? '已连接' : this.model.page === 4 ? '正在断开' : '连接失败');
-    this.getUIContext().showAlertDialog({ title: '连接状态', message: `${status}\n${this.model.persistenceWarning || this.model.notice || ''}\n${identity}`, confirm: { value: '关闭', action: () => {} } });
+    this.getUIContext().showAlertDialog({ title: '连接状态', message: `${status}\n${this.model.modeNotice || ''}\n${this.model.persistenceWarning || this.model.notice || ''}\n${identity}`, confirm: { value: '关闭', action: () => {} } });
   }
   @Builder
   sessionChrome() {

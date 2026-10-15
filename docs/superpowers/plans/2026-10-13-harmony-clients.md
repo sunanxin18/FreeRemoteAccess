@@ -147,9 +147,10 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 5A5 手机/PC固定产物正确性：同一ELF两端各11项copy+3项pipeline，共4命令/28次通过，44源/输入前后身份、24实际HDC/20唯一guest退出及38条70,802字节全值顺序经root独立核对。性能、普通HAP Apple和真实Mac仍OPEN，见[精确拷贝验证](../../validation/mvs-copy-arm64-20261015.md)。
 - [ ] Task 5A6 有限MVS整管线性能：用真实wire构造的copy-heavy/IDCT/type-1局部工作集记录prepare/commit/发布耗时及独立完整输出；默认/原生对照，分别记录宿主与两个OHOS目标，不能由叶/单测总耗时宣称帧率。
 - [x] Task 5B1 标准MVS普通应用实验组合：独立默认关闭OHOS ARM64 feature，可与RDP共存；保持Mac自动HP语义/音视频不可用及既有输入门，真实最终FFI/架构/互斥/依赖及构建参数验证完成、独立Spec/Quality通过；root冻结后36项宿主与7脚本通过。OHOS正向用例只编译、不由宿主mock证明注册，见[组合验证](../../validation/harmony-apple-composition-20261015.md)。
-- [ ] Task 5B2 正常表单明确模式选择：显示标准MVS选项及可用边界，精确协议profile键/目标切换，保持横屏完整表单及PC交互；5B1审查后串行实施。
+- [ ] Task 5B2 正常表单明确模式选择：源码及双协议普通Release HAP构建完成，完整FFI 42通过/1既有ignored和精确strip包身份已核对；横屏完整表单、模式菜单/凭据交互及PC新包GUI仍待实测，不将构建计为完成，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
 - [ ] Task 5B3 同一组合HAP签前/签后身份和手机/PC普通应用及stockMac真实认证/首帧/刷新/指针/重连；不替代后续完整键盘/IME、音频、HP与性能资格。
 - [ ] Task 5C 中立物理键/提交文本能力分离与真实输入：修正Apple Text宣称与实际不处理的不一致，保留既有桌面/RDP行为，OHOS未满足门的输入明确不可用。
+- [ ] Task 5D 本地显示器几何接入：OHOS连接前为默认NativeDisplay补齐真实physical/workarea/content/scale快照，复用共享分辨率策略、保留Fixed/ServerManaged/协议动态能力门；当前壳直接传递geometry=None，不能声称已按手机/PC本地屏幕请求。模式选择scope完成后独立实现并实测实际协商尺寸。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
 - [ ] 授权Mac完成真实认证、首帧、持续更新、输入、重连；音频/剪贴板只报告已实现并验证的能力。
 - [ ] 跑Windows/macOS/Linux相关回归及包检查，记录本轮没有真机的平台。

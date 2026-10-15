@@ -363,6 +363,110 @@ impl Drop for AppEngine {
         self.stop()
     }
 }
+// 仅投影公开的模式信息；目标兼容与注册结果仍由实际 catalog 判定。
+fn target_number(target: TargetSystem) -> u32 {
+    match target {
+        TargetSystem::Windows => 1,
+        TargetSystem::MacOs => 2,
+        TargetSystem::Linux => 3,
+        TargetSystem::Custom => 0,
+    }
+}
+fn target_label(target: TargetSystem) -> &'static str {
+    match target {
+        TargetSystem::Windows => "Windows",
+        TargetSystem::MacOs => "macOS",
+        TargetSystem::Linux => "Linux",
+        TargetSystem::Custom => "其他系统",
+    }
+}
+fn mode_labels(protocol: &ProtocolId) -> (&'static str, &'static str) {
+    if *protocol == ProtocolId::apple_hpss_mvs() {
+        ("标准（MVS）", "标准")
+    } else if *protocol == ProtocolId::apple_high_performance() {
+        ("高性能", "高性能")
+    } else if *protocol == ProtocolId::rdp() {
+        ("RDP", "RDP")
+    } else if *protocol == ProtocolId::rfb() {
+        ("VNC", "VNC")
+    } else {
+        ("保存的连接模式", "已保存")
+    }
+}
+fn permitted_targets(catalog: &ProtocolCatalog, protocol: &ProtocolId) -> Vec<u32> {
+    [
+        TargetSystem::Windows,
+        TargetSystem::MacOs,
+        TargetSystem::Linux,
+    ]
+    .into_iter()
+    .filter(|target| {
+        !matches!(
+            catalog.select(
+                *target,
+                frd_protocol_api::ProtocolSelection::Explicit(protocol.clone())
+            ),
+            Err(ProtocolError::UnsupportedTargetProtocol)
+        )
+    })
+    .map(target_number)
+    .collect()
+}
+fn mode_options(catalog: &ProtocolCatalog, draft: &ConnectionDraft) -> Vec<Value> {
+    use frd_protocol_api::ProtocolSelection;
+    let target = draft.target_system.unwrap_or(TargetSystem::Custom);
+    let mut options = vec![json!({"id":"auto", "label":"自动", "shortLabel":"自动",
+        "available": catalog.select(target, ProtocolSelection::Automatic).is_ok(), "targets":[1,2,3]})];
+    let mut protocols = vec![
+        ProtocolId::rdp(),
+        ProtocolId::apple_hpss_mvs(),
+        ProtocolId::apple_high_performance(),
+        ProtocolId::rfb(),
+    ];
+    if let ProtocolChoice::Explicit(selected) = &draft.protocol {
+        if !protocols.contains(selected) {
+            protocols.push(selected.clone());
+        }
+    }
+    for protocol in protocols {
+        let result = catalog.select(target, ProtocolSelection::Explicit(protocol.clone()));
+        if matches!(result, Err(ProtocolError::UnsupportedTargetProtocol))
+            && draft.protocol != ProtocolChoice::Explicit(protocol.clone())
+        {
+            continue;
+        }
+        let (label, short_label) = mode_labels(&protocol);
+        options.push(
+            json!({"id":protocol.as_str(),"label":label,"shortLabel":short_label,
+            "available":result.is_ok(),"targets":permitted_targets(catalog, &protocol)}),
+        );
+    }
+    options
+}
+fn mode_notice(catalog: &ProtocolCatalog, draft: &ConnectionDraft) -> &'static str {
+    use frd_protocol_api::ProtocolSelection;
+    let target = draft.target_system.unwrap_or(TargetSystem::Custom);
+    match catalog.select(target, draft.protocol.clone().into()) {
+        Err(ProtocolError::UnsupportedTargetProtocol) => "此模式不适用于当前目标，请重新选择",
+        Err(_)
+            if target == TargetSystem::MacOs
+                && draft.protocol == ProtocolChoice::Automatic
+                && catalog
+                    .select(
+                        target,
+                        ProtocolSelection::Explicit(ProtocolId::apple_hpss_mvs()),
+                    )
+                    .is_ok() =>
+        {
+            "自动模式当前不可用，请选择标准（MVS）"
+        }
+        Err(_) => "此设备暂不支持所选连接模式",
+        Ok(_) if target == TargetSystem::MacOs => {
+            "当前暂支持画面与指针；键盘、文本、音频和剪贴板不可用"
+        }
+        Ok(_) => "",
+    }
+}
 struct PendingLoad {
     ticket: SavedPasswordLoadTicket,
     deadline: Instant,
@@ -1024,7 +1128,7 @@ impl Owner {
             Page::ConnectionForm(_) => ("connection_form", "准备连接"),
         };
         let d = self.controller.page().retained_draft();
-        let protocol = match d.protocol {
+        let protocol = match &d.protocol {
             ProtocolChoice::Automatic => "auto".into(),
             ProtocolChoice::Explicit(p) => p.as_str().to_owned(),
         };
@@ -1047,6 +1151,8 @@ impl Owner {
             )
             .is_ok();
         let mut value = json!({"abiVersion":1,"initialized":true,"page":page,"target":match d.target_system{Some(TargetSystem::Windows)=>1,Some(TargetSystem::MacOs)=>2,Some(TargetSystem::Linux)=>3,_=>0},"address":d.address,"port":d.port.unwrap_or(0),"username":d.username,"protocol":protocol,"available":available,"session":epoch.0,"generation":epoch.1,"geometryRevision":self.input.revision.to_string(),"notice":self.notice.unwrap_or(""),"probe":self.probe});
+        value["protocolOptions"] = json!(mode_options(&self.catalog, &d));
+        value["modeNotice"] = json!(mode_notice(&self.catalog, &d));
         #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
         {
             value["syntheticFixture"] = json!(true);
@@ -1076,7 +1182,11 @@ impl Owner {
             value["credentialLoaded"] =
                 json!(f.selected_profile.is_some() && !f.password_is_empty());
             value["loading"] = json!(f.password_load_status().unwrap_or(""));
-            value["profiles"]=json!(f.profiles.iter().map(|p|json!({"address":p.key.address(),"username":p.key.username(),"port":p.key.port()})).collect::<Vec<_>>());
+            value["profiles"] = json!(f.profiles.iter().map(|p| json!({
+                "address":p.key.address(), "username":p.key.username(), "port":p.key.port(),
+                "protocol":p.key.protocol().as_str(), "target":target_number(p.target_system),
+                "modeLabel":mode_labels(p.key.protocol()).0, "targetLabel":target_label(p.target_system)
+            })).collect::<Vec<_>>());
             let e = f.errors();
             value["errors"] = json!({"address":e.address,"port":e.port,"username":e.username,"password":e.password,"protocol":e.protocol,"target":e.target_system,"profile":e.profile});
             value["canConnect"] = json!(
@@ -1891,5 +2001,299 @@ mod tests {
                 Ok(Some(SecretBuffer::from_text("orphan-secret".into())))
             ))
             .is_err());
+    }
+
+    // 模式元数据必须反映真实 owner catalog；这些 fixture 不证明目标平台注册。
+    fn mode_edit(target: u32, protocol: &str) -> Command {
+        Command::Edit(Edit {
+            target,
+            address: "mode-fixture.invalid".into(),
+            port: 5900,
+            username: "mode-fixture".into(),
+            protocol: protocol.into(),
+            remember: false,
+        })
+    }
+    fn mode<'a>(snapshot: &'a Value, id: &str) -> &'a Value {
+        snapshot["protocolOptions"]
+            .as_array()
+            .expect("模式选项投影")
+            .iter()
+            .find(|option| option["id"] == id)
+            .expect("当前模式必须可见")
+    }
+    #[test]
+    fn mode_catalog_distinguishes_explicit_standard_from_unavailable_mac_auto() {
+        let mut o = owner();
+        o.catalog = ProtocolCatalog::new([ProtocolId::rdp(), ProtocolId::apple_hpss_mvs()]);
+        o.command(mode_edit(2, "auto"));
+        let snapshot = o.snapshot();
+        assert_eq!(snapshot["available"], false);
+        assert_eq!(mode(&snapshot, "auto")["available"], false);
+        assert_eq!(mode(&snapshot, "apple-hpss-mvs")["available"], true);
+        assert_eq!(mode(&snapshot, "apple-hpss-mvs")["targets"], json!([2]));
+        assert_eq!(
+            mode(&snapshot, "apple-high-performance")["available"],
+            false
+        );
+        assert!(!snapshot["modeNotice"].as_str().unwrap().is_empty());
+        assert_eq!(snapshot["protocol"], "auto");
+        o.command(mode_edit(2, "apple-hpss-mvs"));
+        let snapshot = o.snapshot();
+        assert_eq!(snapshot["protocol"], "apple-hpss-mvs");
+        assert_eq!(snapshot["available"], true);
+        assert!(!snapshot["modeNotice"].as_str().unwrap().is_empty());
+        o.catalog = ProtocolCatalog::new([]);
+        assert_eq!(mode(&o.snapshot(), "apple-hpss-mvs")["available"], false);
+    }
+    #[test]
+    fn mode_projection_keeps_wrong_target_and_unknown_profile_choices_unavailable() {
+        let mut o = owner();
+        o.catalog = ProtocolCatalog::new([ProtocolId::rdp(), ProtocolId::apple_hpss_mvs()]);
+        o.command(mode_edit(1, "apple-hpss-mvs"));
+        let snapshot = o.snapshot();
+        assert_eq!(snapshot["protocol"], "apple-hpss-mvs");
+        assert_eq!(snapshot["available"], false);
+        assert_eq!(mode(&snapshot, "apple-hpss-mvs")["available"], false);
+        assert_eq!(mode(&snapshot, "apple-hpss-mvs")["targets"], json!([2]));
+        assert!(!snapshot["modeNotice"].as_str().unwrap().is_empty());
+        o.command(mode_edit(2, "unknown-profile-mode"));
+        let snapshot = o.snapshot();
+        assert_eq!(snapshot["protocol"], "unknown-profile-mode");
+        assert_eq!(mode(&snapshot, "unknown-profile-mode")["available"], false);
+        assert_eq!(
+            mode(&snapshot, "unknown-profile-mode")["label"],
+            "保存的连接模式"
+        );
+        assert!(!snapshot["modeNotice"]
+            .as_str()
+            .unwrap()
+            .contains("unknown-profile-mode"));
+    }
+    fn mode_profiles() -> Vec<SavedConnectionProfile> {
+        [
+            ProtocolId::apple_hpss_mvs(),
+            ProtocolId::apple_high_performance(),
+            ProtocolId::rdp(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, protocol)| SavedConnectionProfile {
+            key: ConnectionProfileKey::new(protocol, "same-fixture.invalid", 5900, "same-fixture")
+                .unwrap(),
+            target_system: if i == 2 {
+                TargetSystem::Windows
+            } else {
+                TargetSystem::MacOs
+            },
+            last_success_order: i as u64,
+        })
+        .collect()
+    }
+    #[test]
+    fn mode_recent_profiles_show_protocol_identity_and_load_the_exact_selected_key() {
+        let mut o = owner();
+        let profiles = mode_profiles();
+        assert_ne!(profiles[0].key, profiles[1].key);
+        o.controller
+            .connection_form_mut()
+            .unwrap()
+            .set_profiles(profiles.clone());
+        let snapshot = o.snapshot();
+        for (i, (protocol, target, label)) in [
+            ("apple-hpss-mvs", 2, "标准（MVS）"),
+            ("apple-high-performance", 2, "高性能"),
+            ("rdp", 1, "RDP"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(snapshot["profiles"][i]["protocol"], protocol);
+            assert_eq!(snapshot["profiles"][i]["target"], target);
+            assert_eq!(snapshot["profiles"][i]["modeLabel"], label);
+        }
+        o.command(Command::Select(0));
+        let old = *o.pending.keys().next().unwrap();
+        o.command(Command::Select(1));
+        let current = *o.pending.keys().find(|id| **id != old).unwrap();
+        o.command(Command::Loaded(
+            old,
+            Ok(Some(SecretBuffer::from_text("old-mode-secret".into()))),
+        ));
+        assert!(o
+            .controller
+            .connection_form_mut()
+            .unwrap()
+            .password_is_empty());
+        assert_eq!(
+            o.controller
+                .connection_form_mut()
+                .unwrap()
+                .selected_profile
+                .as_ref(),
+            Some(&profiles[1].key)
+        );
+        o.command(Command::Loaded(
+            current,
+            Ok(Some(SecretBuffer::from_text("new-mode-secret".into()))),
+        ));
+        let snapshot = o.snapshot();
+        assert_eq!(snapshot["selectedIndex"], 1);
+        assert_eq!(snapshot["protocol"], "apple-high-performance");
+        assert_eq!(snapshot["target"], 2);
+        assert_eq!(snapshot["credentialLoaded"], true);
+        // 同一目标/同一模式的回传与状态读取不能清空已载入凭据。
+        o.command(Command::Edit(Edit {
+            target: 2,
+            address: profiles[1].key.address().into(),
+            port: 5900,
+            username: profiles[1].key.username().into(),
+            protocol: "apple-high-performance".into(),
+            remember: true,
+        }));
+        assert_eq!(o.snapshot()["credentialLoaded"], true);
+        assert_eq!(o.snapshot()["selectedIndex"], 1);
+        // 相同 endpoint/user 只改模式，也必须使原凭据身份失效。
+        o.command(Command::Edit(Edit {
+            target: 2,
+            address: profiles[1].key.address().into(),
+            port: 5900,
+            username: profiles[1].key.username().into(),
+            protocol: "apple-hpss-mvs".into(),
+            remember: true,
+        }));
+        assert_eq!(o.snapshot()["credentialLoaded"], false);
+        assert_eq!(o.snapshot()["selectedIndex"], Value::Null);
+        assert!(o
+            .controller
+            .connection_form_mut()
+            .unwrap()
+            .password_is_empty());
+        let text = snapshot.to_string();
+        assert!(!text.contains("old-mode-secret"));
+        assert!(!text.contains("new-mode-secret"));
+        assert!(!text.contains("passwordLength"));
+    }
+    #[test]
+    fn mode_target_edit_uses_projected_compatibility_and_invalidates_loaded_identity() {
+        let mut o = owner();
+        o.catalog = ProtocolCatalog::new([ProtocolId::rdp(), ProtocolId::apple_hpss_mvs()]);
+        let profiles = mode_profiles();
+        o.controller
+            .connection_form_mut()
+            .unwrap()
+            .set_profiles(profiles);
+        o.command(Command::Select(0));
+        let old = *o.pending.keys().next().unwrap();
+        let snapshot = o.snapshot();
+        // 与正常选择控件相同：目标不在此模式允许列表中，发起原 edit(auto)。
+        assert!(!mode(&snapshot, "apple-hpss-mvs")["targets"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(1)));
+        o.command(Command::Edit(Edit {
+            target: 1,
+            address: "same-fixture.invalid".into(),
+            port: 5900,
+            username: "same-fixture".into(),
+            protocol: "auto".into(),
+            remember: true,
+        }));
+        o.command(Command::Loaded(
+            old,
+            Ok(Some(SecretBuffer::from_text("late-target-secret".into()))),
+        ));
+        assert_eq!(o.snapshot()["protocol"], "auto");
+        assert_eq!(o.snapshot()["available"], true);
+        assert_eq!(o.snapshot()["credentialLoaded"], false);
+        assert_eq!(o.snapshot()["selectedIndex"], Value::Null);
+        assert!(o
+            .controller
+            .connection_form_mut()
+            .unwrap()
+            .password_is_empty());
+    }
+    #[test]
+    fn mode_rdp_auto_and_explicit_keep_original_submission_resolution() {
+        for protocol in ["auto", "rdp"] {
+            let mut o = owner();
+            o.catalog = ProtocolCatalog::new([ProtocolId::rdp(), ProtocolId::apple_hpss_mvs()]);
+            o.command(mode_edit(1, protocol));
+            o.command(Command::Password(SecretBuffer::from_text(
+                "rdp-mode-fixture".into(),
+            )));
+            let snapshot = o.snapshot();
+            assert_eq!(mode(&snapshot, "rdp")["available"], true);
+            assert_eq!(snapshot["canConnect"], true);
+            let submission = o
+                .controller
+                .connection_form_mut()
+                .unwrap()
+                .take_submission(&o.catalog)
+                .unwrap();
+            assert_eq!(submission.resolved_protocol, ProtocolId::rdp());
+            assert_eq!(submission.password.expose_text(), Some("rdp-mode-fixture"));
+        }
+    }
+    #[test]
+    fn mode_c_abi_ordinary_snapshot_reports_actual_platform_catalog_without_connecting() {
+        use crate::app_abi::*;
+        let root = std::env::temp_dir().join(format!(
+            "frd-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = root.to_str().unwrap().as_bytes();
+        let mut id = 0;
+        assert_eq!(
+            unsafe { frd_ohos_app_create(path.as_ptr(), path.len(), &mut id) },
+            crate::OK
+        );
+        struct App(u64);
+        impl Drop for App {
+            fn drop(&mut self) {
+                let code = frd_ohos_app_destroy(self.0);
+                if !std::thread::panicking() {
+                    assert_eq!(code, crate::OK);
+                }
+            }
+        }
+        let _app = App(id);
+        let edit = br#"{"target":2,"address":"mode-fixture.invalid","port":5900,"username":"fixture","protocol":"apple-hpss-mvs","remember":false}"#;
+        assert_eq!(
+            unsafe { frd_ohos_app_edit(id, edit.as_ptr(), edit.len()) },
+            crate::OK
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let snapshot = loop {
+            let mut p = std::ptr::null_mut();
+            let mut n = 0;
+            assert_eq!(
+                unsafe { frd_ohos_app_snapshot(id, &mut p, &mut n) },
+                crate::OK
+            );
+            let value: Value =
+                serde_json::from_slice(unsafe { std::slice::from_raw_parts(p, n) }).unwrap();
+            unsafe { frd_ohos_app_snapshot_free(p, n) };
+            if value["initialized"] == true && value["protocol"] == "apple-hpss-mvs" {
+                break value;
+            }
+            assert!(Instant::now() < deadline, "owner 未处理模式编辑");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let actual_standard = cfg!(all(
+            feature = "normal-hap-apple-mvs-validation",
+            target_env = "ohos",
+            target_arch = "aarch64"
+        ));
+        assert_eq!(
+            mode(&snapshot, "apple-hpss-mvs")["available"],
+            actual_standard
+        );
+        assert_eq!(mode(&snapshot, "auto")["available"], false);
+        assert_eq!(snapshot["page"], 0);
+        assert_eq!(snapshot["session"], "");
+        assert_eq!(snapshot["canConnect"], false);
+        assert!(snapshot.get("syntheticFixture").is_none());
     }
 }

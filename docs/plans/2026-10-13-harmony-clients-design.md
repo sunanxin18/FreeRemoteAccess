@@ -88,3 +88,16 @@ ARM64 正确性检查的 Apple 标准 MVS，可与 RDP 验证开关共同构建�
 手机/PC 真实 Mac 会话。保留音频/video loader 不可用及当前键盘/提交文本门；
 不把首个指针实验称作完整客户端。性能资格单独推进，不阻止明确默认关闭的
 实验接线，也不能由实验成功自动开放生产。原输入能力与提交文本分离另列任务。
+
+
+### 标准模式的正常表单入口
+
+Mac目标使用带持久标签“连接模式”的正常选择控件，明确选“标准（MVS）”才
+写入标准协议ID；“自动”保留共享HP语义。选项来自实际catalog的目标匹配和
+注册结果，未注册模式不能显示为可连接。最近连接显示非秘密的目标/模式以区分
+相同地址/账号，恢复精确profile协议键；目标切换走既有edit/凭据身份失效路径。
+手机短横屏优先在原目标/端口组内适配模式控件，不另增无条件整行；保持同一
+密码控件、48vp目标、原安全区/Scroll及明确错误。具体同页可见性仍须新包实测。
+
+2026-10-15核对[Material官方Select资料](https://github.com/material-components/material-web/blob/main/docs/components/select.md)的固定选项、label/supportingText/error状态；M3主站菜单正文仅返回JavaScript提示。
+[Apple HIG Pop-up buttons](https://developer.apple.com/design/human-interface-guidelines/pop-up-buttons)的官方搜索正文提供互斥选项、当前选择与引导标签依据（直接页/Markdown未读取成功）。[OpenHarmony官方Select API](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-arkui/arkui-ts/ts-basic-components-select.md)已读取，实施同时核对本机API26。没有GUI基线例外。
