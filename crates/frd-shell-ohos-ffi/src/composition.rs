@@ -44,11 +44,16 @@ fn video_loader() -> StreamRegistryLoader {
     })
 }
 pub(crate) fn spawn(root: PathBuf) -> Result<AppEngine, i32> {
-    AppEngine::spawn(
+    AppEngine::spawn_with_keyboard(
         Stores::at(root),
         factories_for_platform(cfg!(all(target_env = "ohos", target_arch = "aarch64"))),
         video_loader(),
         Arc::new(NoAudio),
+        if cfg!(all(target_env = "ohos", target_arch = "aarch64")) {
+            crate::keyboard_policy::OhosKeyboardQualification::ArkUiLimited
+        } else {
+            crate::keyboard_policy::OhosKeyboardQualification::Unavailable
+        },
     )
 }
 #[cfg(test)]

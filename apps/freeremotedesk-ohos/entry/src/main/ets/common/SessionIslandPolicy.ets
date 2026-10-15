@@ -157,9 +157,10 @@ export class QueuedRemoteKeys {
       hid: hid, isolated: false, released: false });
   }
   isolate(): void { this.entries.forEach((entry: QueuedKeyEntry) => { entry.isolated = true; }); }
-  tailUp(code: number): boolean {
+  tailUp(code: number, narrowed: boolean = false): boolean {
     const entry = this.entries.get(code);
-    if (!entry || !entry.isolated) { return false; }
+    if (!entry || (!entry.isolated && !narrowed)) { return false; }
+    entry.isolated = true;
     entry.released = true;
     return true;
   }

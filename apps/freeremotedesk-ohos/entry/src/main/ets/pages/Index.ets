@@ -1,7 +1,7 @@
 import native from 'libentry.so';
 import { KeyboardAvoidMode, LengthMetrics } from '@kit.ArkUI';
 import { deviceInfo, systemDateTime } from '@kit.BasicServicesKit';
-import { usbHid } from './InputMapping';
+import { usbHid, qualifiedPhysicalKey } from './InputMapping';
 import { PHONE_SESSION_ORIENTATION_EVENT } from '../common/PhoneOrientationPolicy';
 import { IslandInput, IslandPin, SessionIslandPolicy, ShellKeyboardOwnership, SurfaceTouchOwnership, SurfaceTouchPhase, SurfaceTouchDecision, DialogCallbackScope, DialogCallbackTicket, QueuedRemoteKeys, compactDetailsLines } from '../common/SessionIslandPolicy';
 import { SessionDetailsDialog } from '../components/SessionDetailsDialog';
@@ -299,7 +299,7 @@ struct Index {
     const isolated = this.keyboard.key(event.keyCode, down);
     const hid = usbHid(event.keyCode);
     this.syncQueuedKeyEpoch();
-    const cleanupTail = !down && this.queuedKeys.tailUp(event.keyCode);
+    const cleanupTail = !down && this.queuedKeys.tailUp(event.keyCode, !qualifiedPhysicalKey(event.keyCode));
     if (cleanupTail) { this.flushPendingKeyUps(); }
     if (this.model.page === 0) { return false; }
     this.pointerInput = false;
@@ -324,7 +324,7 @@ struct Index {
     // 无对应本轮down的孤立keyup（如后台丢失按下/旧会话尾键）不进入远程。
     if ((!down && !repeated) || isolated || !this.keyboard.canSend() || !this.shellActive || !this.remoteFocused || this.detailsOpen ||
       !this.model.session || !this.model.generation || !this.model.geometryRevision || this.model.page !== 3) { return true; }
-    if (hid === 0) { return true; }
+    if (!qualifiedPhysicalKey(event.keyCode)) { return true; }
     if (this.keyboard.systemModifierHeld() || event.metaKey !== 0) { return true; }
     if (event.getModifierKeyState?.(['Ctrl']) && event.getModifierKeyState?.(['Alt']) && event.keyCode === 2071) { return true; }
     const modifiers = (event.getModifierKeyState?.(['Shift']) ? 1 : 0) | (event.getModifierKeyState?.(['Ctrl']) ? 2 : 0) |

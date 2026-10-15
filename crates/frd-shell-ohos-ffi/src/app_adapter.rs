@@ -1,5 +1,6 @@
 //! ArkUI 不拥有 controller/password/session；专用 owner 串行处理意图与真正的 runtime 事件。
 use crate::input_adapter::{InputAdapter, ViewGeometry};
+use crate::keyboard_policy::{qualified_physical_hid, OhosKeyboardQualification};
 use frd_app::{persist_profile_job, AppAction, AppController, AppIntent, AppPlatformStores};
 use frd_core::{InputEvent, ProtocolId, SecretBuffer, TargetSystem};
 use frd_platform_api::{
@@ -178,6 +179,7 @@ pub enum Command {
     Probed(i32),
 }
 pub struct AppEngine {
+    keyboard: OhosKeyboardQualification,
     sender: SyncSender<Command>,
     snapshot: Arc<Mutex<Value>>,
     control: Arc<AtomicU64>,
@@ -189,6 +191,21 @@ impl AppEngine {
         factories: Vec<Arc<dyn ProtocolFactory>>,
         loader: StreamRegistryLoader,
         audio: Arc<dyn AudioOutputFactory>,
+    ) -> Result<Self, i32> {
+        Self::spawn_with_keyboard(
+            stores,
+            factories,
+            loader,
+            audio,
+            OhosKeyboardQualification::Unavailable,
+        )
+    }
+    pub(crate) fn spawn_with_keyboard(
+        stores: Stores,
+        factories: Vec<Arc<dyn ProtocolFactory>>,
+        loader: StreamRegistryLoader,
+        audio: Arc<dyn AudioOutputFactory>,
+        keyboard: OhosKeyboardQualification,
     ) -> Result<Self, i32> {
         let (sender, receiver) = mpsc::sync_channel(64);
         let snapshot = Arc::new(Mutex::new(
@@ -208,11 +225,13 @@ impl AppEngine {
                     frd_platform_ohos::initialize_context_storage(root).is_err()
                 });
                 let catalog = ProtocolCatalog::new(factories.iter().map(|f| f.descriptor().id));
-                let controller = AppController::connection_form_with_stores(
+                let mut controller = AppController::connection_form_with_stores(
                     ConnectionForm::new(ConnectionDraft::default()),
                     stores.borrow(),
                 );
+                keyboard.configure(&mut controller);
                 let mut owner = Owner {
+                    keyboard,
                     controller,
                     renderer: owner_renderer,
                     ready: None,
@@ -313,6 +332,7 @@ impl AppEngine {
             })
             .map_err(|_| crate::WORKER_STOPPED)?;
         Ok(Self {
+            keyboard,
             sender,
             snapshot,
             control,
@@ -368,6 +388,10 @@ impl AppEngine {
         crate::composition::spawn(root)
     }
     pub fn send(&self, command: Command) -> Result<(), i32> {
+        // ABI 与普通 sender 共用入队前拒绝；不得返回 0 后才静默丢弃新 Down。
+        if let Command::Input(_, event, _) = &command {
+            self.keyboard.validate_new_down(event)?;
+        }
         let display = matches!(command, Command::LocalDisplay(_));
         let recovery = match &command {
             Command::Edit(_) | Command::Password(_) => FORM_INVALID,
@@ -519,6 +543,7 @@ struct PendingLoad {
     timed_out: bool,
 }
 struct Owner {
+    keyboard: OhosKeyboardQualification,
     renderer: Arc<Mutex<Option<Arc<crate::presentation::Link>>>>,
     ready: Option<crate::presentation::Epoch>,
     remote_epoch: Option<(frd_core::SessionId, u64)>,
@@ -814,11 +839,32 @@ impl Owner {
                 self.send(c)
             }
             Command::Input(e, event, pressed) => {
+                if self.keyboard.validate_new_down(&event).is_err() {
+                    return;
+                }
                 if self
                     .input
                     .consume_quarantined_release(e.session, e.generation, &event)
                 {
                     return;
+                }
+                // 收窄后的真实 held Up 以 ReleaseAll 清理；孤立/未知 Up 不进入 consumer。
+                if let InputEvent::PhysicalKey {
+                    code,
+                    state: frd_core::KeyState::Released,
+                    ..
+                } = &event
+                {
+                    if !self.keyboard.installed() || !qualified_physical_hid(code.usb_hid_usage()) {
+                        let release = self.input.discard_released(
+                            &self.controller,
+                            e.session,
+                            e.generation,
+                            &event,
+                        );
+                        self.send(release);
+                        return;
+                    }
                 }
                 if !self.input_ready() {
                     let release = self.input.discard_released(
@@ -1294,6 +1340,11 @@ impl Owner {
             }
         }
         value["inputReady"] = json!(self.input_ready());
+        let effective = self.controller.effective_capabilities();
+        value["physicalKeyInput"] = json!(effective.physical_key_input);
+        value["textInput"] = json!(effective.text_input);
+        value["keyboardBackend"] = json!(self.keyboard.name());
+        value["keyboardBackendReason"] = json!(self.keyboard.reason());
         value["statusCode"] = json!(status_code);
         value["statusMessage"] = json!(status_message);
         if let Page::ConnectionForm(f) = self.controller.page() {
@@ -1421,6 +1472,7 @@ mod tests {
         );
         let (tx, _rx) = mpsc::sync_channel(64);
         Owner {
+            keyboard: OhosKeyboardQualification::Unavailable,
             renderer: Arc::new(Mutex::new(None)),
             ready: None,
             remote_epoch: None,
@@ -1788,6 +1840,7 @@ mod tests {
         assert_eq!(o.last_submit, 1);
         let (tx, _rx) = mpsc::sync_channel(1);
         let e = AppEngine {
+            keyboard: OhosKeyboardQualification::Unavailable,
             sender: tx,
             renderer: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(Mutex::new(json!({}))),
@@ -1821,6 +1874,7 @@ mod tests {
             }
             let (sender, receiver) = mpsc::sync_channel(4);
             let e = AppEngine {
+                keyboard: OhosKeyboardQualification::Unavailable,
                 sender,
                 renderer: Arc::new(Mutex::new(None)),
                 snapshot: Arc::new(Mutex::new(json!({}))),
@@ -1851,6 +1905,7 @@ mod tests {
         let ticket = pending(&mut o);
         let (sender, receiver) = mpsc::sync_channel(4);
         let e = AppEngine {
+            keyboard: OhosKeyboardQualification::Unavailable,
             sender,
             renderer: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(Mutex::new(json!({}))),
@@ -2075,6 +2130,134 @@ mod tests {
         assert!(o.controller.route_input(InputEvent::ReleaseAll).is_some());
     }
 
+    #[test]
+    fn limited_physical_profile_owner_rejects_unqualified_without_ending_session() {
+        let (mut o, epoch, _) = key_owner();
+        for hid in [0x32, 0x48, 0x64, 0x66, 0xe3, 0xe7] {
+            o.command(key_command(epoch, hid, true));
+            o.command(key_command(epoch, hid, false));
+        }
+        assert!(
+            o.sent_inputs.borrow().is_empty(),
+            "未资格键不得到达 SessionCommand"
+        );
+        assert!(matches!(o.controller.page(), Page::RemoteSession { .. }));
+        o.command(key_command(epoch, 4, true));
+        o.command(key_command(epoch, 4, false));
+        assert_key_sent(&o, 4, true);
+        assert_key_sent(&o, 4, false);
+    }
+
+    #[test]
+    fn limited_physical_profile_up_cleanup_precedes_backend_and_hid_filter() {
+        // 已持有的旧键以 ReleaseAll 清理，不把未资格 Up 交协议，也不留下隔离。
+        for old_hid in [0x48, 0x64] {
+            let (mut o, epoch, _) = key_owner();
+            let held = o.input.route(
+                &o.controller,
+                epoch.session,
+                epoch.generation,
+                epoch.revision,
+                key_event(old_hid, true),
+                true,
+            );
+            assert!(held.is_some(), "模拟收窄前真实来源 ledger");
+            o.sent_inputs.borrow_mut().clear();
+            o.keyboard = OhosKeyboardQualification::Unavailable;
+            o.command(key_command(epoch, old_hid, false));
+            assert_eq!(
+                o.sent_inputs
+                    .borrow()
+                    .iter()
+                    .map(|i| i.event.clone())
+                    .collect::<Vec<_>>(),
+                vec![InputEvent::ReleaseAll]
+            );
+            o.keyboard = OhosKeyboardQualification::ArkUiLimited;
+            o.command(key_command(epoch, 4, true));
+            assert_key_sent(&o, 4, true);
+        }
+        // 孤立未知 Up 不得借清理路径释放旁侧合法 held。
+        let (mut o, epoch, _) = key_owner();
+        o.command(key_command(epoch, 4, true));
+        o.sent_inputs.borrow_mut().clear();
+        for hid in [0x32, 0x48, 0x64, 0xe3] {
+            o.command(key_command(epoch, hid, false));
+        }
+        assert!(o.sent_inputs.borrow().is_empty());
+        o.command(key_command(epoch, 4, false));
+        assert_key_sent(&o, 4, false);
+    }
+
+    #[test]
+    fn limited_physical_profile_intersection_and_snapshot_keep_text_unavailable() {
+        let (mut o, epoch, _) = key_owner();
+        o.keyboard.configure(&mut o.controller);
+        assert_eq!(o.snapshot()["physicalKeyInput"], true);
+        assert_eq!(o.snapshot()["textInput"], false);
+        assert_eq!(o.snapshot()["keyboardBackend"], "arkui_limited");
+        for gate in 0..3 {
+            o.keyboard.configure(&mut o.controller);
+            o.controller.handle_session_event_with_stores(
+                o.remote_epoch.unwrap().0,
+                SessionEvent::CapabilitiesChanged(frd_protocol_api::SessionCapabilities {
+                    physical_key_input: gate != 0,
+                    text_input: true,
+                    ..Default::default()
+                }),
+                o.stores.borrow(),
+            );
+            if gate == 1 {
+                o.controller.set_platform_capabilities(Default::default());
+            }
+            if gate == 2 {
+                o.controller.set_product_policy(Default::default());
+            }
+            o.sent_inputs.borrow_mut().clear();
+            o.command(key_command(epoch, 4, true));
+            o.command(key_command(epoch, 4, false));
+            assert!(
+                o.sent_inputs.borrow().is_empty(),
+                "protocol/platform/product 独立拒绝"
+            );
+            assert_eq!(o.snapshot()["physicalKeyInput"], false);
+            assert_eq!(o.snapshot()["textInput"], false);
+        }
+    }
+
+    #[test]
+    fn limited_physical_profile_prequeue_rejection_does_not_poison_full_queue_or_focus() {
+        let (mut o, epoch, _) = key_owner();
+        let (engine, queue) = key_engine(&o, 1);
+        engine
+            .send(Command::Focus {
+                foreground: true,
+                focused: true,
+                remote: true,
+            })
+            .unwrap();
+        let control = o.control.load(Ordering::Acquire);
+        for hid in [0x32, 0x48, 0x64, 0xe3] {
+            assert_eq!(
+                engine.send(key_command(epoch, hid, true)),
+                Err(crate::INVALID_ARGUMENT)
+            );
+        }
+        assert_eq!(
+            o.control.load(Ordering::Acquire),
+            control,
+            "拒绝未资格 Down 不伪造 QueueFull/失焦"
+        );
+        o.command(queue.recv().unwrap());
+        assert!(queue.try_recv().is_err());
+        engine.send(key_command(epoch, 4, true)).unwrap();
+        o.command(queue.recv().unwrap());
+        engine.send(key_command(epoch, 4, false)).unwrap();
+        o.command(queue.recv().unwrap());
+        assert_key_sent(&o, 4, true);
+        assert_key_sent(&o, 4, false);
+    }
+
     fn key_event(hid: u16, down: bool) -> frd_core::InputEvent {
         frd_core::InputEvent::PhysicalKey {
             code: frd_core::PhysicalKeyCode::from_usb_hid_usage(hid),
@@ -2091,6 +2274,7 @@ mod tests {
     }
     fn key_owner() -> (Owner, InputEpoch, Arc<crate::presentation::Link>) {
         let (mut o, session, link) = presentation_owner();
+        o.keyboard = OhosKeyboardQualification::ArkUiLimited;
         o.controller
             .set_platform_capabilities(frd_platform_api::PlatformCapabilities {
                 physical_key_input: true,
@@ -2131,6 +2315,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         (
             AppEngine {
+                keyboard: o.keyboard,
                 sender,
                 snapshot: Arc::new(Mutex::new(json!({}))),
                 control: o.control.clone(),
@@ -2378,6 +2563,7 @@ mod tests {
         let mut o = owner();
         let (tx, rx) = mpsc::sync_channel(4);
         let e = AppEngine {
+            keyboard: OhosKeyboardQualification::Unavailable,
             sender: tx,
             renderer: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(Mutex::new(json!({}))),

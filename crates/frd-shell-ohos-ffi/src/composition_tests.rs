@@ -165,6 +165,19 @@ fn c_abi_normal_create_keeps_form_idle_and_exact_protocol_selection() {
         assert_eq!(value["statusCode"], "connection_form");
         assert_eq!(value["canConnect"], false);
         assert_eq!(value["inputReady"], false);
+        assert_eq!(value["physicalKeyInput"], false, "表单没有协议输入能力");
+        assert_eq!(value["textInput"], false);
+        assert_eq!(
+            value["keyboardBackend"],
+            if cfg!(all(target_env = "ohos", target_arch = "aarch64")) {
+                "arkui_limited"
+            } else {
+                "unavailable"
+            }
+        );
+        assert!(value["keyboardBackendReason"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
         assert!(value.get("syntheticFixture").is_none());
     }
     std::thread::sleep(Duration::from_millis(50));

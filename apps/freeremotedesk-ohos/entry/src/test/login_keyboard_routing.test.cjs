@@ -71,7 +71,7 @@ const sent = [], actions = [], timers = [];
 const native = { appInput: (...a) => { sent.push(a); return 0; }, appAction: (...a) => { actions.push(a); return 0; } };
 const extracted = ['dispatchKey', 'syncQueuedKeyEpoch', 'flushPendingKeyUps', 'submit'].map(n => methods.get(n).getText(ast)).join('\n');
 const { Harness } = compile(`class Harness { ${extracted}\n${callbackMethod('bubble', bubble)}\n${callbackMethod('passwordKey', passwordKey)}\n${callbackMethod('passwordSubmit', passwordSubmit)}\n}\nexports.Harness = Harness;`,
-  { native, usbHid: mapping.usbHid, KeyType: { Down: 0, Up: 1 }, IslandInput: { Keyboard: 2 }, setTimeout: cb => timers.push(cb) });
+  { native, usbHid: mapping.usbHid, qualifiedPhysicalKey: mapping.qualifiedPhysicalKey, KeyType: { Down: 0, Up: 1 }, IslandInput: { Keyboard: 2 }, setTimeout: cb => timers.push(cb) });
 function harness(page = 0) {
   const h = new Harness();
   Object.assign(h, { model: { page, canConnect: true, session: '101', generation: '1', geometryRevision: '2' },

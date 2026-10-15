@@ -4,6 +4,7 @@ export function usbHid(key: number): number {
   if (key >= 2001 && key <= 2009) { return key - 2001 + 30; }
   if (key === 2000) { return 39; }
   if (key >= 2090 && key <= 2101) { return key - 2090 + 58; }
+  if (key >= 2104 && key <= 2112) { return key - 2104 + 89; }
   switch (key) {
     case 2054: return 40; case 2070: return 41; case 2055: return 42;
     case 2049: return 43; case 2050: return 44; case 2056: return 53;
@@ -12,10 +13,22 @@ export function usbHid(key: number): number {
     case 2061: return 49; case 2043: return 54; case 2044: return 55;
     case 2064: return 56; case 2074: return 57; case 2071: return 76; case 2068: return 75; case 2069: return 78;
     case 2081: return 74; case 2082: return 77; case 2083: return 73;
-    case 2079: return 70; case 2080: return 72; case 2102: return 83;
+    case 2079: return 70; case 2075: return 71; case 2080: return 72; case 2102: return 83;
+    case 2103: return 98; case 2113: return 84; case 2114: return 85;
+    case 2115: return 86; case 2116: return 87; case 2117: return 99;
+    case 2119: return 88; case 2602: return 100; case 2067: return 101;
     case 2015: return 79; case 2014: return 80; case 2013: return 81; case 2012: return 82;
     case 2072: return 224; case 2047: return 225; case 2045: return 226;
     case 2076: return 227; case 2073: return 228; case 2048: return 229;
     case 2046: return 230; case 2077: return 231; default: return 0;
   }
+}
+
+// 有限实体键资格独立于规范码知识；Pause/ISO 扩展等待实际协议/布局资格。
+// 小键盘始终保留物理 usage，不根据 Unicode 或 NumLock 猜主键区数字。
+export function qualifiedPhysicalKey(key: number): boolean {
+  const hid = usbHid(key);
+  return (hid >= 4 && hid <= 49) || (hid >= 51 && hid <= 71) ||
+    (hid >= 73 && hid <= 99) || hid === 101 ||
+    (hid >= 224 && hid <= 226) || (hid >= 228 && hid <= 230);
 }
