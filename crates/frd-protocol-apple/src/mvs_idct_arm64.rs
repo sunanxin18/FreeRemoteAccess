@@ -7,7 +7,10 @@
 //! W = ceil((178_219 B + 1024) / 2048) = 727_133_521。
 //! 第二遍全部中间量（含最终加 131072）<= 178_219 W + 131072
 //! = 129_589_009_110_171 < 2^47。所有蝶形运算保留 i64，不窄化。
-//! 常量乘法的二进制移加中间项最多为 32768 * 4W，亦小于此界。
+//! 12 个常量的 CSD 绝对位权和最多 41_556；常量乘法输入 <= 4W。
+//! 降序 Horner 的每次移位、加减和负 C 最后取负均被绝对位权和覆盖：
+//! 41_556 * 4W = 120_867_042_394_704 < 上述蝶形界 < 2^47。
+//! 因而包括抵消前的部分和亦不溢出，不依赖 i32 截断或 i64 环绕。
 //!
 //! 不另走 DC 快捷路径：AC 为零时蝶形输出恰为 DC * 8192；第一遍
 //! descale(..., 11) 恰为 DC * 4，第二遍 descale(..., 18) 恰为
@@ -25,28 +28,64 @@ use std::arch::aarch64::*;
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn multiply<const C: i64>(value: int64x2_t) -> int64x2_t {
-    let mut result = vdupq_n_s64(0);
-    let mut term = value;
-    let mut bits = C.unsigned_abs();
-    while bits != 0 {
-        if bits & 1 != 0 {
-            // SAFETY: 只读写两个 NEON 寄存器；无内存、栈或标志寄存器副作用。
-            // LLVM 会把纯 intrinsic 移加重新合成为 i64 乘法，再拆成标量 MUL；
-            // 显式 2d ADD 保留双 lane 计算，避免目标代码抽取 lane 做变换乘法。
-            unsafe {
+    // |C| 的 canonical signed-digit（NAF）；只在编译期生成两个位掩码。
+    // 正数的最高非零 digit 恒为 +1，从 value 开始按降序 gap-shift Horner。
+    const fn digits(mut coefficient: u64) -> (u64, u64) {
+        let mut positive = 0;
+        let mut negative = 0;
+        let mut bit = 0;
+        while coefficient != 0 {
+            if coefficient & 1 != 0 {
+                if coefficient & 3 == 1 {
+                    positive |= 1u64 << bit;
+                } else {
+                    negative |= 1u64 << bit;
+                    // (coefficient + 1) / 2，不让编译期 u64 加法溢出。
+                    coefficient = (coefficient >> 1) + 1;
+                    bit += 1;
+                    continue;
+                }
+            }
+            coefficient >>= 1;
+            bit += 1;
+        }
+        (positive, negative)
+    }
+    let (positive, negative) = const { digits(C.unsigned_abs()) };
+    let mut remaining = positive | negative;
+    if remaining == 0 {
+        return vdupq_n_s64(0);
+    }
+    let mut previous = 63 - remaining.leading_zeros();
+    remaining ^= 1u64 << previous;
+    let mut result = value;
+    while remaining != 0 {
+        let bit = 63 - remaining.leading_zeros();
+        let gap = previous - bit;
+        result = vshlq_s64(result, vdupq_n_s64(i64::from(gap)));
+        // SAFETY: 只读写两个 NEON 寄存器；无内存、栈或标志寄存器副作用。
+        // 显式 2d ADD/SUB 防止 LLVM 重构为逐 lane 的标量 MUL。
+        unsafe {
+            if positive & (1u64 << bit) != 0 {
                 std::arch::asm!(
-                    "add {result:v}.2d, {result:v}.2d, {term:v}.2d",
+                    "add {result:v}.2d, {result:v}.2d, {value:v}.2d",
                     result = inout(vreg) result,
-                    term = in(vreg) term,
+                    value = in(vreg) value,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            } else {
+                std::arch::asm!(
+                    "sub {result:v}.2d, {result:v}.2d, {value:v}.2d",
+                    result = inout(vreg) result,
+                    value = in(vreg) value,
                     options(pure, nomem, nostack, preserves_flags),
                 );
             }
         }
-        bits >>= 1;
-        if bits != 0 {
-            term = vaddq_s64(term, term);
-        }
+        remaining ^= 1u64 << bit;
+        previous = bit;
     }
+    result = vshlq_s64(result, vdupq_n_s64(i64::from(previous)));
     if C < 0 {
         vnegq_s64(result)
     } else {
@@ -171,4 +210,142 @@ pub(super) unsafe fn range_limit_pair(value: int64x2_t) -> uint8x8_t {
     let words = vcombine_u32(vmovn_u64(mapped), vdup_n_u32(0));
     let halves = vcombine_u16(vmovn_u32(words), vdup_n_u16(0));
     vmovn_u16(halves)
+}
+
+#[cfg(test)]
+mod constant_multiply_tests {
+    use super::*;
+
+    const B: i128 = 8_355_840;
+    const W: i128 = 727_133_521;
+    const INPUT_BOUND: i128 = 4 * W;
+    const CSD_BOUND: i128 = 120_867_042_394_704;
+
+    // 独立整数模型：按奇偶和模 4 递推 NAF，不调用生产 helper 或 NEON。
+    fn signed_digits(mut coefficient: i128) -> Vec<(u32, i128)> {
+        let mut digits = Vec::new();
+        let mut bit = 0;
+        while coefficient != 0 {
+            let digit = if coefficient % 2 == 0 {
+                0
+            } else {
+                2 - coefficient.rem_euclid(4)
+            };
+            if digit != 0 {
+                digits.push((bit, digit));
+            }
+            coefficient = (coefficient - digit) / 2;
+            bit += 1;
+        }
+        digits
+    }
+
+    fn check_model(coefficient: i128, input: i128) {
+        let digits = signed_digits(coefficient);
+        assert_eq!(
+            digits
+                .iter()
+                .map(|&(bit, digit)| digit * (1i128 << bit))
+                .sum::<i128>(),
+            coefficient
+        );
+        assert!(digits.windows(2).all(|pair| pair[1].0 > pair[0].0 + 1));
+        let weight: i128 = digits.iter().map(|&(bit, _)| 1i128 << bit).sum();
+        assert!(weight <= 41_556);
+        assert!(weight * INPUT_BOUND <= CSD_BOUND);
+        let mut prefix = 0i128;
+        let mut partial = 0i128;
+        let mut previous = digits.last().unwrap().0;
+        for &(bit, digit) in digits.iter().rev() {
+            let gap = previous - bit;
+            partial <<= gap;
+            assert!(partial.abs() <= CSD_BOUND);
+            partial += digit * input;
+            prefix = (prefix << gap) + digit;
+            assert_eq!(partial, input * prefix);
+            assert!(partial.abs() <= CSD_BOUND);
+            previous = bit;
+        }
+        partial <<= previous;
+        assert!(partial.abs() <= CSD_BOUND);
+        assert_eq!(partial, coefficient * input);
+        // 生产实现以 |C| 构造序列，负 C 最后取负；两个符号都在同一界内。
+        assert!((-partial).abs() <= CSD_BOUND);
+    }
+
+    fn pairs() -> Vec<[i64; 2]> {
+        let edges = [
+            0,
+            1,
+            -1,
+            4 * B,
+            -4 * B,
+            INPUT_BOUND,
+            -INPUT_BOUND,
+            (1i128 << 31) - 1,
+            1i128 << 31,
+            (1i128 << 31) + 1,
+            -(1i128 << 31) - 1,
+            -(1i128 << 31),
+            -(1i128 << 31) + 1,
+        ];
+        let mut values = Vec::new();
+        for left in edges {
+            for right in edges {
+                values.push([i64::try_from(left).unwrap(), i64::try_from(right).unwrap()]);
+            }
+        }
+        let mut state = 0x5a7c_5d64_2026_1016u64;
+        for _ in 0..256 {
+            let pair = std::array::from_fn(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let random = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+                (i128::from(random) % (2 * INPUT_BOUND + 1) - INPUT_BOUND) as i64
+            });
+            values.push(pair);
+        }
+        values
+    }
+
+    fn check<const C: i64>() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        for pair in pairs() {
+            let expected = pair.map(|value| {
+                check_model(i128::from(C), i128::from(value));
+                i64::try_from(i128::from(value) * i128::from(C)).unwrap()
+            });
+            let mut actual = [0i64; 2];
+            // SAFETY: 上方检查 NEON；定长数组保证两 lane load/store 都有效。
+            unsafe {
+                vst1q_s64(actual.as_mut_ptr(), multiply::<C>(vld1q_s64(pair.as_ptr())));
+            }
+            assert_eq!(actual, expected, "常量 C={C}，独立 lane 输入={pair:?}");
+        }
+    }
+
+    #[test]
+    fn idct_constant_multiply_full_bound_i128_oracle_and_signed_digit_model() {
+        macro_rules! both_signs {
+            ($($constant:ident),+ $(,)?) => { $(
+                check::<$constant>();
+                check::<{ -$constant }>();
+            )+ };
+        }
+        both_signs!(
+            FIX_0_298631336,
+            FIX_0_390180644,
+            FIX_0_541196100,
+            FIX_0_765366865,
+            FIX_0_899976223,
+            FIX_1_175875602,
+            FIX_1_501321110,
+            FIX_1_847759065,
+            FIX_1_961570560,
+            FIX_2_053119869,
+            FIX_2_562915447,
+            FIX_3_072711026,
+        );
+    }
 }
