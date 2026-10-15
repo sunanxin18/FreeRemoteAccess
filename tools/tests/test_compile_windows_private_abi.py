@@ -47,6 +47,31 @@ class SourceGateTests(unittest.TestCase):
             with self.assertRaises(GATE.GateError):
                 GATE.source_snapshot(self.root)
 
+    def test_exact_diagnostic_header_admitted_and_mutation_rejected(self):
+        source_root=SCRIPT.parents[1]
+        # 完整真实 source inventory，只有副本被突变；不调用任何 compiler。
+        for name in [GATE.FIXTURE + '/' + n for n in GATE.SOURCE_PINS] + list(GATE.OWN_INPUTS):
+            target=self.root/name; target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((source_root/name).read_bytes())
+        name='h264-luma-dc-windows-diagnostics.h'
+        header=self.root/GATE.FIXTURE/name
+        header.write_bytes((source_root/GATE.FIXTURE/name).read_bytes())
+        snapshot=GATE.source_snapshot(self.root)
+        self.assertIn(GATE.FIXTURE+'/'+name, snapshot)
+        header.write_bytes(header.read_bytes()+b'/* mutation */')
+        with self.assertRaises(GATE.GateError): GATE.source_snapshot(self.root)
+
+    def test_unapproved_header_and_directory_remain_refused(self):
+        fixture=self.root/GATE.FIXTURE; fixture.mkdir(parents=True)
+        for name, directory in [('unapproved.h', False), ('nested', True)]:
+            path=fixture/name
+            if directory: path.mkdir()
+            else: path.write_bytes(b'unreviewed')
+            with self.assertRaisesRegex(GATE.GateError, '未授权 header/子目录'):
+                GATE.source_snapshot(self.root)
+            if directory: path.rmdir()
+            else: path.unlink()
+
     def test_symlink_source_cannot_supply_identical_bytes(self):
         name = "h264-luma-dc-clock-convert.h"
         source = self.root / GATE.FIXTURE / name
@@ -59,8 +84,8 @@ class SourceGateTests(unittest.TestCase):
                 GATE.source_snapshot(self.root)
 
     def test_all_included_headers_have_explicit_reviewed_pins(self):
-        self.assertEqual(len(GATE.SOURCE_PINS), 11)
-        self.assertTrue({"h264-luma-dc-platform.h", "h264-luma-dc-clock-convert.h", "h264-luma-dc-windows-clock-record.h"}.issubset(GATE.SOURCE_PINS))
+        self.assertEqual(len(GATE.SOURCE_PINS), 12)
+        self.assertTrue({"h264-luma-dc-platform.h", "h264-luma-dc-clock-convert.h", "h264-luma-dc-windows-clock-record.h", "h264-luma-dc-windows-diagnostics.h"}.issubset(GATE.SOURCE_PINS))
 
     def test_shadow_windows_header_is_rejected_before_compile(self):
         fixture = self.root / GATE.FIXTURE

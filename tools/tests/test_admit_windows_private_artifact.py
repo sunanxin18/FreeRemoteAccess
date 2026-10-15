@@ -246,11 +246,11 @@ class SealAndProducerControls(unittest.TestCase):
         struct.pack_into('<HHIIIHH', data, 132, 0xAA64, 1, 0, 0, 0, 240, 2)
         opt = 152; struct.pack_into('<H', data, opt, 0x20b); struct.pack_into('<Q', data, opt+24, 0x140000000)
         struct.pack_into('<II', data, opt+56, 8192, 512); struct.pack_into('<H', data, opt+68, 3); struct.pack_into('<I', data, opt+108, 16)
-        struct.pack_into('<II', data, opt+120, 0x1200, 60); struct.pack_into('<II', data, opt+136, 0x1000, 8)
+        struct.pack_into('<II', data, opt+120, 0x1200, 80); struct.pack_into('<II', data, opt+136, 0x1000, 8)
         struct.pack_into('<8sIIIIIIHHI', data, 392, b'.text\0\0\0', 3584, 4096, 3584, 512, 0, 0, 0, 0, 0x60000020)
         struct.pack_into('<II', data, 512, 0x1100, 0x1120); struct.pack_into('<II', data, 800, 4 | (1 << 27), 0xe4)
         nextname = 0x1600
-        for index, (dll, names) in enumerate((('KERNEL32.dll', ('RtlCaptureContext', 'RtlLookupFunctionEntry')), ('msvcrt.dll', ('exit',)))):
+        for index, (dll, names) in enumerate((('KERNEL32.dll', ('RtlCaptureContext', 'RtlLookupFunctionEntry', 'OpenThread', 'GetThreadContext')), ('msvcrt.dll', ('exit',)), ('bcrypt.dll', ('BCryptOpenAlgorithmProvider', 'BCryptCreateHash', 'BCryptHashData', 'BCryptFinishHash', 'BCryptDestroyHash', 'BCryptCloseAlgorithmProvider')))):
             dllrva, thunk = 0x1280 + index*32, 0x1300 + index*64
             struct.pack_into('<IIIII', data, 1024+index*20, thunk, 0, 0, dllrva, thunk)
             raw = dll.encode()+b'\0'; data[dllrva-3584:dllrva-3584+len(raw)] = raw
@@ -282,7 +282,7 @@ class PinnedSourceCacheControls(unittest.TestCase):
             'h264-luma-dc-windows-clock-record.h', 'h264-luma-dc-platform.h',
             'h264-luma-dc-abi-windows.S', 'h264-luma-dc-abi-windows-negative.S',
             'README-windows-abi.md', 'h264-luma-dc-windows-contract.c',
-            'README-windows-contract.md')}
+            'README-windows-contract.md', 'h264-luma-dc-windows-diagnostics.h')}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             expected = {}

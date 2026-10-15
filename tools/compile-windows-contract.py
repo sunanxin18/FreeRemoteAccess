@@ -15,17 +15,17 @@ import zipfile
 
 SCHEMA = "freeremotedesk.windows.private-contract-compile.v1"
 SUPPORT = "tools/compile-windows-private-abi.py"
-SUPPORT_SHA = "2285096dcc41c60b3b2853015f3ea135de1778f596ff893181593b632e5647e2"
+SUPPORT_SHA = "ada9eb8a3d714ffaee4396eb19e183bb2f2baf533da9970970043368112fe4ec"
 FIXTURE = "third_party/ffmpeg/8.1.2/tests"
 PINS = {
-    "h264-luma-dc-windows-contract.c": "4ec108a3674ee0b87adbe924cf6620b2a3fb6f41d0936947ea6aa1a2d6d28965",
-    "README-windows-contract.md": "258987788a61d7a73205b569ca8812cf12b3c061d75c57456ca64da683daa877",
+    "h264-luma-dc-windows-contract.c": "d3ec29318045300779d715467529b058403cd9cf3d28ccfe9da1fd638cdc95d6",
+    "README-windows-contract.md": "48ae0b450f82949a2f35f0676ff843f466d3507f52a2c2e76c70bc27f214cdd4",
 }
 OWN = ("tools/compile-windows-contract.py", "tools/tests/test_compile_windows_contract.py")
 VARIANTS = tuple(range(5))
 OBJECTS = ("platform", "abi", "negative") + tuple("bad-unwind-%d" % n for n in range(1, 5))
 CRT = ("crt2.o", "crtbegin.o", "crtend.o", "libmingw32.a", "libmingwex.a",
-       "libmsvcrt.a", "libkernel32.a", "libntdll.a")
+       "libmsvcrt.a", "libkernel32.a", "libntdll.a", "libbcrypt.a")
 FUNCTIONS = ("main", "capture_callback", "native_admission", "linked_admission",
              "child_main", "isolated_child", "isolated_suite")
 LABELS = ("frd_h264_dc_check_abi", "frd_h264_dc_abi_pc_after_alloc",
@@ -33,7 +33,7 @@ LABELS = ("frd_h264_dc_check_abi", "frd_h264_dc_abi_pc_after_alloc",
           "frd_h264_dc_abi_pc_return", "frd_h264_dc_abi_pc_epilogue",
           "frd_h264_dc_abi_pc_epilogue_after_d14", "frd_h264_dc_abi_pc_ret",
           "frd_h264_dc_outer_probe", "frd_h264_dc_outer_pc_return",
-          "frd_h264_dc_wrong_return")
+          "frd_h264_dc_wrong_return", "frd_diag_reference")
 MAX_FILE = 64 * 1024 * 1024
 FIXED_MEMBERS = {"summary.json", "source-inputs.json", "source-inputs-after.json", "tool-inputs.json", "tool-inputs-after.json",
                  "same-run-inputs.json", "authorization.json", "dependency-inputs.json", "actual-output-identities.json",
@@ -354,7 +354,7 @@ def admit_inputs(root, source, installation, support):
         if load_json(folder / "source-inputs.json") != old_sources:
             raise GateError("same-run inputs 不匹配当前 source/tool/workflow")
         if load_json(folder / "source-authorization.json") != {**support.AUTHORIZATION_PROVENANCE, "reviewed_source_pins": support.SOURCE_PINS}:
-            raise GateError("旧 11 pins/provenance 改变")
+            raise GateError("旧 source pins/provenance 改变")
         for name, item in old_sources.items():
             if sha(folder / "inputs" / name) != item["sha256"]:
                 raise GateError("archived source bytes 不匹配独立 snapshot")
@@ -535,14 +535,21 @@ def pe_admit(path, *, variant=0):
             raise GateError("PE import thunk 未终止")
         imports.append({"dll": cstring(name), "symbols": symbols})
     dlls = [item["dll"].lower() for item in imports]
-    if not terminated or len(dlls) != 2 or set(dlls) != {"kernel32.dll", "msvcrt.dll"}:
-        raise GateError("actual import closure 必须恰为 KERNEL32/default MSVCRT")
-    protected_apis = {"RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind"}
+    if not terminated or len(dlls) != 3 or set(dlls) != {"kernel32.dll", "msvcrt.dll", "bcrypt.dll"}:
+        raise GateError("actual import closure 必须恰为 KERNEL32/default MSVCRT/BCrypt")
+    protected_apis = {"RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind", "OpenThread", "GetThreadContext"}
+    bcrypt_apis = {"BCryptOpenAlgorithmProvider", "BCryptCreateHash", "BCryptHashData",
+                   "BCryptFinishHash", "BCryptDestroyHash", "BCryptCloseAlgorithmProvider"}
     # bad1 缺 nonleaf table 分支不会调用 unwind；正确 KERNEL32 第三名称可选。
     # 来源保护始终覆盖全部三个名称，不能随 required 集合一起缩小。
     required_apis = protected_apis - {"RtlVirtualUnwind"} if variant == 1 else protected_apis
     for item in imports:
         names = {symbol["name"] for symbol in item["symbols"] if "name" in symbol}
+        if item["dll"].lower() == "bcrypt.dll":
+            if names != bcrypt_apis or len(item["symbols"]) != len(bcrypt_apis):
+                raise GateError("BCrypt 必须为固定 SHA256 生命周期命名 imports")
+        elif bcrypt_apis & names:
+            raise GateError("BCrypt API 必须由 BCrypt 提供")
         if item["dll"].lower() == "kernel32.dll":
             if not required_apis.issubset(names):
                 raise GateError("KERNEL32 缺少精确命名 " + "/".join(sorted(required_apis - names)))
@@ -614,6 +621,19 @@ def bindings(pe, helper, negative):
             result["labels"][name] = {"rva": item["rva"], "section": item["section"]}
         else:
             result["open"].append("missing linked symbol: " + name)
+    # 独立 raw symbol 认证仅证明数据 RVA/尺寸/section，不证明 C callsite SP 连续性。
+    reference = symbols.get("frd_diag_reference")
+    if reference is None or reference["section"] < 1 or reference["section"] > len(pe["sections"]):
+        raise GateError("diagnostic reference data symbol missing")
+    section = pe["sections"][reference["section"] - 1]
+    rva = reference["rva"]
+    if (rva % 16 or rva < section["rva"] or rva + 944 > section["rva"] + section["virtual_size"] or
+            rva + 944 > pe["image_size"] or not section["flags"] & 0x80000000 or
+            not section["flags"] & 0x40000000 or section["flags"] & 0x20000000):
+        raise GateError("diagnostic reference aligned writable non-executable range")
+    reference_bytes = pe["at"](rva, 944)
+    if reference_bytes != bytes(912) + bytes.fromhex("3147414944445246") + bytes(24):
+        raise GateError("diagnostic reference fixed initial data binding")
     ranges = {}
     for obj, name in ((helper, "frd_h264_dc_check_abi"), (negative, "frd_h264_dc_outer_probe"),
                       (negative, "frd_h264_dc_wrong_return")):
@@ -685,7 +705,7 @@ def commands(root, source, out, support):
                         "-DFRD_DC_WINDOWS_ABI_CONTRACT=1", "-DFRD_CONTRACT_VARIANT=%d" % variant,
                         "-c", str(root / FIXTURE / "h264-luma-dc-windows-contract.c"), "-o", str(obj)]
         link_argv = [str(support.CC), "--target=" + support.TARGET, str(obj), str(helper), str(source / "negative.obj"),
-                     "-lkernel32", "-lntdll", "-Wl,--Map=" + str(out / ("abi-contract-%d.map" % variant)), "-o", str(exe)]
+                     "-lkernel32", "-lntdll", "-lbcrypt", "-Wl,--Map=" + str(out / ("abi-contract-%d.map" % variant)), "-o", str(exe)]
         for label, argv in (("compile", compile_argv), ("link", link_argv)):
             result[stem + "-" + label + "-expansion"] = argv[:1] + ["-###"] + argv[1:]
             result[stem + "-" + label] = argv

@@ -30,11 +30,12 @@ FIXTURE = "third_party/ffmpeg/8.1.2/tests"
 AUTHORIZATION_PROVENANCE = {
     "source_commit": "f475cf28ec6fcc65fd8c17984ee88b23a4a16fcd",
     "root_manifest_sha256": "2b4b20775ce15495bcce03cf930bfa11d71f3f0d95c858d809384c3a0342d667",
-    "scope": "root independently approved embedded 11-file pins; local planning manifest is provenance only, not a CI runtime dependency",
+    "scope": "root independently approved embedded 12-file pins; local planning manifest is provenance only, not a CI runtime dependency",
 }
 # Root-reviewed B2A fix1/report + B2B review package; not discovered authorization.
-# Root clarified the inventory to 7 B2A + frozen shared header + 3 B2B = 11.
+# Root clarified the inventory to 7 B2A + frozen shared header + 3 B2B + exact diagnostic header = 12.
 SOURCE_PINS = {
+    "h264-luma-dc-windows-diagnostics.h": "c3b4186d9b582ad29dce667f00974cb8364c998f3363828210afef181c62c13b",
     "h264-luma-dc-platform-windows.c": "29ec138f105dbfcf705239505eba2a7ba22bb27888d1ce2a4f9f33c24ec0836d",
     "h264-luma-dc-clock-convert.h": "235d633d2e99d18c438e142d96b9d797c16e14fd6bdc0da8f644231a3fc7647a",
     "h264-luma-dc-platform-windows-tests.c": "59e87c8c2f37ee09f9b1bba3985defaad0fbb67a9ed107703747639ae2f32993",
@@ -83,7 +84,7 @@ def ordinary(path):
 
 def source_snapshot(root):
     files = {}
-    expected_headers = {"h264-luma-dc-platform.h", "h264-luma-dc-clock-convert.h", "h264-luma-dc-windows-clock-record.h"}
+    expected_headers = {"h264-luma-dc-platform.h", "h264-luma-dc-clock-convert.h", "h264-luma-dc-windows-clock-record.h", "h264-luma-dc-windows-diagnostics.h"}
     # 唯一 -I 目录不允许 shadow SDK/CRT headers 或额外 header 子目录。
     fixture = root / FIXTURE
     if any(path.is_dir() or (path.suffix.lower() == ".h" and path.name not in expected_headers)

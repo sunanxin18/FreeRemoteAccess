@@ -215,3 +215,70 @@ schema只是待root绑定runner的提案，不是假称已经实现新的私有b
 独立oracle、high32坏wrapper拒绝、完整512-byte输出/32-byte输入/482-byte合法guard
 窗口、guard/QPC、共享5974518 fixture、nativePE/DLL/CRT/package/bench仍未实现或
 未执行。当前未引入fake qmul或独立替代生产kernel来求绿。
+
+
+## Failure-only bounded diagnostics v1（source/host，native 仍 OPEN）
+
+`h264-luma-dc-windows-diagnostics.h` 是此私有 driver 的 header-only helper。
+原 ASM、null-FP callback、三个 trap、normal stdout/F1、七条命令、异常
+Continue/exit/wait 和原 10 s watchdog 不变。诊断 API 失败只锁存最终失败，
+不接入提前 Terminate 的 infrastructure 分支；未知 AV 仍使原 isolated 合同失败。
+正常成功路径不增加 stdout/stderr 记录。
+
+父进程在每个非 loader 异常的停止点，以实际 event PID/TID 打开并独立关闭
+`THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION` handle；核验实际
+GetProcessIdOfThread/GetThreadId 后，读取 16 字节对齐的 ARM64
+CONTROL/INTEGER/FLOATING_POINT context。原 ExceptionAddress 和实际 Pc 分别
+保留，不调整任何寄存器，也不把二者相等当成先验。记录 PC/SP/FP/LR/PSTATE、
+x0..x28、d8..d15 低64位。BOOL 的任何非零值均表示成功；失败即时保存 GetLastError，
+失败 context 为 null，不能把清零缓存当 FP=0。
+
+child 在收到 GO 后、outer 调用前，用 RtlCaptureContext 写入独立的
+`frd_diag_reference` 全局记录（944 B，包含真实 caller context、magic、PID/TID、
+case、complete）。固定 compile gate 从实际 PE symbol/section/初始 bytes 独立
+认证其 RVA、16-byte 对齐、完整 writable/non-executable 数据范围。父进程只读
+同一 child image 对应 RVA，并核验身份和完整 RPM。此步骤**不证明** caller
+snapshot 到 outer call 期间 SP 不动，因此 H/O 仍为 `unknown-callsite-SP-proof`，
+本增量不执行任何栈 dump。后续必须检查固定构建 child_main 中实际 capture→outer
+callsite 的指令、控制流及 SP 调整，并结合两个192 B owned ASM frames，才可推导
+H/O、增加各192 B独立有界读取。不得根据 case、bad FP、trap PC 或 observed SP
+反推这些帧。
+
+最多32个 CREATE_PROCESS/LOAD_DLL module 记录。其 range 来自 child 实际 image
+header 的4096 B有界 RPM，保留 event base、PID/TID、load/unload序号。有效 hFile
+立即 DuplicateHandle；原 event hFile 恰关闭一次，副本在 unload 或 cleanup 关闭。
+缺 hFile、失效 range、多个匹配或已卸载均显式 unknown，不从父进程或 DLL 名称补值。
+只对异常停止点 AV 所属唯一实际 module 的 hFile 做文件诊断：canonical path
+上限1023 UTF16单元，前后 volume/file index/size/write-time，完整 BCrypt SHA256
+上限32 MiB。所有 AV 共用1 s工作预算，逐64 KiB块检查；同步 Win32 调用本身的耗时上限及原
+watchdog在真实主机上的相互作用仍需 native 验证。BCrypt 的 open/create/update/
+finish/destroy/close 的尝试位和结果保留；hash只在完整覆盖且身份稳定时公开。
+不归档完整 DLL。AV PC 周围至多256 B，记录 disk PE section映射算术、file offset、
+实际 remote/disk bytes 与匹配结果。失败或部分 RPM 明示 API result/length，不补零。
+读取和hash发生于 Continue之前，JSON缓存于每事件16 KiB buffer；退出后才输出，
+从而保留首断点/AV/二次断点各自序号，避免读取已退出进程。
+
+stderr 新块每行以 `FRDD1 ` 开头，后面为一个 JSON object；Windows CRT 的 CRLF
+与 LF 均可读取。唯一顺序为 begin、0..32 module、0..8 event（AV紧跟对应 av）、end。
+每 case最多一个块，总输出仍受原1 MiB stream限额约束。各记录字段由
+`tools/verify-windows-private-diagnostics.py` 的精确键集校验；没有额外字段、重复键、
+非整数布尔替代、NaN、无界raw或隐式默认值。
+
+- begin：version=1、case、PID、声明事件/模块数、overflow、独立 reference RVA。
+- module：index、event PID/TID、load/unload sequence、base/size/machine，remote
+  header RPM、hFile duplicate、原/副本 close 的 API 结果。
+- event：实际 seq/PID/TID/code/chance/ExceptionAddress、OpenThread、实际线程身份
+  查询结果、GetThreadContext、CloseHandle、context或null、baseline RPM/identity/
+  context或null、显式未知 frames。CPU context 与 exception PC 的不一致由 parser
+  作为观察计数保留，无修正、无推导成功。
+- av：对应 event身份、唯一 module index/base/RVA；或明确 module-or-file-unknown。
+  有文件时包含路径/identity及API结果、hash阶段/状态/覆盖字节数、PE映射、code读取
+  API/原始bytes。`api` 固定为 attempted/result/error_valid/error/got；NTSTATUS单独
+  使用32位unsigned数值，不冒充 Win32 GetLastError。header/code/最后hash读各自分开。GetFinalPathNameByHandleW 的实际 DWORD 返回长度同时保留；仅返回0时 error_valid=1，非零但超缓冲由 path_valid=0 明示界限拒绝，绝不伪造 GetLastError。
+- end：failed=1、diagnostic_failed、native=`unresolved`。原 `FRD1 failed` 行保留。
+
+纯 parser 仅接受 stdin bytes，拒绝地址、文件路径或模式参数；其 exit0 仅表示该失败
+诊断块结构/ownership/边界一致，输出始终 native=unresolved。它不接受 AV、不发
+native成功凭据、不调用 Win32，不证明 FP→virtual unwind context→读取0x90 的数据流。
+本观察增量仍需独立固定工具链编译/SDK/import检查、新一次same-run native失败或成功
+证据，以及独立H/O证明；任何一项都不能从 host手写bytes测试推出。

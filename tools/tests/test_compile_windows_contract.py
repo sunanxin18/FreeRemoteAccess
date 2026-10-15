@@ -28,8 +28,10 @@ COFF = bytes.fromhex(
 )
 
 
-CONTRACT_APIS = ("RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind")
-DEFAULT_IMPORTS = (("KERNEL32.dll", CONTRACT_APIS), ("msvcrt.dll", ("__C_specific_handler",)))
+CONTRACT_APIS = ("RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind", "OpenThread", "GetThreadContext")
+BCRYPT_APIS = ("BCryptOpenAlgorithmProvider", "BCryptCreateHash", "BCryptHashData",
+               "BCryptFinishHash", "BCryptDestroyHash", "BCryptCloseAlgorithmProvider")
+DEFAULT_IMPORTS = (("KERNEL32.dll", CONTRACT_APIS), ("msvcrt.dll", ("__C_specific_handler",)), ("bcrypt.dll", BCRYPT_APIS))
 
 
 def container_pe(imports=DEFAULT_IMPORTS):
@@ -96,7 +98,15 @@ class TrapBindingTests(TempTests):
                 if start <= rva and rva + size <= start + length:
                     return raw[name][rva-start:rva-start+size]
             raise AssertionError('fixture range')
-        pe = {'symbols': symbols, 'pdata': pdata, 'at': at}
+        symbols['frd_diag_reference'] = {'rva': 0x4000, 'section': 2, 'value': 0}
+        code_at=at
+        def with_data(rva, size):
+            if rva==0x4000 and size==944:
+                return bytes(912)+bytes.fromhex('3147414944445246')+bytes(24)
+            return code_at(rva, size)
+        pe = {'symbols': symbols, 'pdata': pdata, 'at': with_data, 'image_size': 0x5000,
+              'sections': [{'rva': 0x1000, 'virtual_size': 0x2010, 'flags': 0x60000020},
+                           {'rva': 0x4000, 'virtual_size': 944, 'flags': 0xc0000040}]}
         def object_range(path, name):
             return raw[name], {name: {'section': 1, 'value': 0}}
         return pe, object_range
@@ -107,6 +117,21 @@ class TrapBindingTests(TempTests):
                            ('frd_h264_dc_outer_probe', 0xd421e060)]:
             pe, reader = self.fixture(word, name)
             with self.subTest(name=name), mock.patch.object(GATE, 'object_range', side_effect=reader), mock.patch.object(GATE, 'sha', return_value='0'*64):
+                with self.assertRaises(GATE.GateError):
+                    GATE.bindings(pe, self.root/'helper.obj', self.root/'negative.obj')
+
+    def test_diagnostic_reference_requires_independent_aligned_data_binding(self):
+        for kind in ('missing', 'unaligned', 'short', 'executable', 'readonly', 'initial-bytes'):
+            pe, reader = self.fixture()
+            if kind=='missing': del pe['symbols']['frd_diag_reference']
+            elif kind=='unaligned': pe['symbols']['frd_diag_reference']['rva']+=1
+            elif kind=='short': pe['sections'][1]['virtual_size']=943
+            elif kind=='executable': pe['sections'][1]['flags']|=0x20000000
+            elif kind=='readonly': pe['sections'][1]['flags']&=~0x80000000
+            else:
+                original=pe['at']
+                pe['at']=lambda rva,n: bytes(n) if rva==0x4000 else original(rva,n)
+            with self.subTest(kind=kind), mock.patch.object(GATE, 'object_range', side_effect=reader), mock.patch.object(GATE, 'sha', return_value='0'*64):
                 with self.assertRaises(GATE.GateError):
                     GATE.bindings(pe, self.root/'helper.obj', self.root/'negative.obj')
 
@@ -141,6 +166,21 @@ class SourceAndPathTests(TempTests):
         for name, pin in GATE.PINS.items():
             self.assertEqual(GATE.sha(root/GATE.FIXTURE/name), pin)
         self.assertEqual(GATE.sha(root/GATE.SUPPORT), GATE.SUPPORT_SHA)
+
+    def test_diagnostic_header_is_in_real_source_snapshot(self):
+        root = SCRIPT.parents[1]
+        support = GATE.pinned_support(root)
+        actual = GATE.source_snapshot(root, support)
+        self.assertIn(GATE.FIXTURE + "/h264-luma-dc-windows-diagnostics.h", actual)
+
+    def test_private_link_has_fixed_bcrypt_dependency(self):
+        support = SimpleNamespace(CC=Path("/fixed/clang"), TARGET="aarch64-w64-mingw32",
+                                  READOBJ=Path("/fixed/readobj"))
+        commands = GATE.commands(Path("/source"), Path("/input"), Path("/out"), support)
+        self.assertIn("dependency-libbcrypt.a", commands)
+        for variant in range(5):
+            self.assertEqual(commands["variant-%d-link" % variant].count("-lbcrypt"), 1)
+            self.assertNotIn("-lbcrypt", commands["variant-%d-compile" % variant])
 
     def test_driver_pin_drift_and_symlink_rejected(self):
         source = self.root / GATE.FIXTURE / "driver.c"
@@ -237,7 +277,7 @@ class BinaryAndRecordTests(TempTests):
         parsed = GATE.pe_admit(path)
         self.assertEqual(parsed["machine"], "0xAA64")
         self.assertEqual(parsed["pdata"][0]["length"], 16)
-        self.assertEqual({entry["dll"] for entry in parsed["imports"]}, {"KERNEL32.dll", "msvcrt.dll"})
+        self.assertEqual({entry["dll"] for entry in parsed["imports"]}, {"KERNEL32.dll", "msvcrt.dll", "bcrypt.dll"})
         self.assertEqual(parsed["imports"][0]["symbols"], [{"name": name} for name in CONTRACT_APIS])
         for offset, fmt, value in ((0x84, "<H", 0x8664), (0x84, "<H", 0xA641),
                                     (0x98, "<H", 0x10B), (0x98 + 68, "<H", 1),
@@ -272,9 +312,22 @@ class BinaryAndRecordTests(TempTests):
         path = self.root / "container.exe"
         for kernel, crt in (("KERNEL32.dll", "msvcrt.dll"), ("KeRnEl32.DlL", "MSVCRT.DLL")):
             with self.subTest(kernel=kernel, crt=crt):
-                path.write_bytes(container_pe(((kernel, CONTRACT_APIS), (crt, ("__C_specific_handler",)))))
+                path.write_bytes(container_pe(((kernel, CONTRACT_APIS), (crt, ("__C_specific_handler",)), DEFAULT_IMPORTS[2])))
                 parsed = GATE.pe_admit(path)
                 self.assertEqual(parsed["imports"][0]["symbols"], [{"name": name} for name in CONTRACT_APIS])
+
+    def test_bcrypt_lifecycle_imports_are_fixed_and_provider_bound(self):
+        path=self.root/'diagnostic-container.exe'
+        for name in BCRYPT_APIS:
+            for kind in ('missing', 'ordinal', 'duplicate', 'wrong-provider'):
+                names=list(BCRYPT_APIS)
+                names[names.index(name)]=1 if kind=='ordinal' else name+'Changed'
+                imports=(DEFAULT_IMPORTS[0], DEFAULT_IMPORTS[1], ('bcrypt.dll', names))
+                if kind=='duplicate': imports=(DEFAULT_IMPORTS[0], DEFAULT_IMPORTS[1], ('bcrypt.dll', BCRYPT_APIS+(name,)))
+                if kind=='wrong-provider': imports=(DEFAULT_IMPORTS[0], ('msvcrt.dll', ('__C_specific_handler', name)), DEFAULT_IMPORTS[2])
+                path.write_bytes(container_pe(imports))
+                with self.subTest(name=name, kind=kind), self.assertRaises(GATE.GateError):
+                    GATE.pe_admit(path)
 
     def test_each_required_api_missing_changed_spelling_or_ordinal_rejected(self):
         path = self.root / "container.exe"
@@ -286,7 +339,7 @@ class BinaryAndRecordTests(TempTests):
                 else:
                     symbols[index] = api.lower() if kind == "spelling" else 1
                 with self.subTest(api=api, kind=kind):
-                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), DEFAULT_IMPORTS[1])))
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), DEFAULT_IMPORTS[1], DEFAULT_IMPORTS[2])))
                     with self.assertRaisesRegex(GATE.GateError, "KERNEL32 缺少精确命名"):
                         GATE.pe_admit(path)
 
@@ -296,7 +349,7 @@ class BinaryAndRecordTests(TempTests):
             for duplicate in (False, True):
                 symbols = CONTRACT_APIS if duplicate else tuple(name for name in CONTRACT_APIS if name != api)
                 with self.subTest(api=api, duplicate=duplicate):
-                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), ("msvcrt.dll", ("__C_specific_handler", api)))))
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), ("msvcrt.dll", ("__C_specific_handler", api)), DEFAULT_IMPORTS[2])))
                     error = "Rtl API 必须由 KERNEL32 提供" if duplicate else "KERNEL32 缺少精确命名"
                     with self.assertRaisesRegex(GATE.GateError, error):
                         GATE.pe_admit(path)
@@ -315,10 +368,10 @@ class BinaryAndRecordTests(TempTests):
 
     def test_variant_one_two_names_and_optional_kernel32_virtual_unwind(self):
         path = self.root / "container.exe"
-        for symbols in (CONTRACT_APIS[:2], CONTRACT_APIS):
+        for symbols in ((CONTRACT_APIS[:2] + CONTRACT_APIS[3:]), CONTRACT_APIS):
             for kernel, crt in (("KERNEL32.dll", "msvcrt.dll"), ("KeRnEl32.DlL", "MSVCRT.DLL")):
                 with self.subTest(symbols=symbols, kernel=kernel):
-                    path.write_bytes(container_pe(((kernel, symbols), (crt, ("__C_specific_handler",)))))
+                    path.write_bytes(container_pe(((kernel, symbols), (crt, ("__C_specific_handler",)), DEFAULT_IMPORTS[2])))
                     parsed = GATE.pe_admit(path, variant=1)
                     self.assertEqual(parsed["imports"][0]["symbols"], [{"name": name} for name in symbols])
 
@@ -329,7 +382,7 @@ class BinaryAndRecordTests(TempTests):
             with self.subTest(variant=variant):
                 path.write_bytes(container_pe())
                 GATE.pe_admit(path, variant=variant)
-                path.write_bytes(container_pe((("KERNEL32.dll", CONTRACT_APIS[:2]), DEFAULT_IMPORTS[1])))
+                path.write_bytes(container_pe((("KERNEL32.dll", (CONTRACT_APIS[:2] + CONTRACT_APIS[3:])), DEFAULT_IMPORTS[1], DEFAULT_IMPORTS[2])))
                 with self.assertRaisesRegex(GATE.GateError, "KERNEL32 缺少精确命名 RtlVirtualUnwind"):
                     GATE.pe_admit(path, variant=variant)
         # 私有默认值只保留 variant0 的完整 required 集合。
@@ -338,15 +391,15 @@ class BinaryAndRecordTests(TempTests):
 
     def test_variant_one_each_required_api_missing_spelling_or_ordinal_rejected(self):
         path = self.root / "container.exe"
-        for index, api in enumerate(CONTRACT_APIS[:2]):
+        for index, api in enumerate((CONTRACT_APIS[:2] + CONTRACT_APIS[3:])):
             for kind in ("missing", "spelling", "ordinal"):
-                symbols = list(CONTRACT_APIS[:2])
+                symbols = list((CONTRACT_APIS[:2] + CONTRACT_APIS[3:]))
                 if kind == "missing":
                     del symbols[index]
                 else:
                     symbols[index] = api.lower() if kind == "spelling" else 1
                 with self.subTest(api=api, kind=kind):
-                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), DEFAULT_IMPORTS[1])))
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), DEFAULT_IMPORTS[1], DEFAULT_IMPORTS[2])))
                     with self.assertRaisesRegex(GATE.GateError, "KERNEL32 缺少精确命名 " + api):
                         GATE.pe_admit(path, variant=1)
 
@@ -356,18 +409,18 @@ class BinaryAndRecordTests(TempTests):
             for duplicate in (False, True):
                 symbols = CONTRACT_APIS if duplicate else tuple(name for name in CONTRACT_APIS if name != api)
                 with self.subTest(api=api, duplicate=duplicate):
-                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), ("msvcrt.dll", ("__C_specific_handler", api)))))
+                    path.write_bytes(container_pe((("KERNEL32.dll", symbols), ("msvcrt.dll", ("__C_specific_handler", api)), DEFAULT_IMPORTS[2])))
                     error = "KERNEL32 缺少精确命名" if not duplicate and api != "RtlVirtualUnwind" else "Rtl API 必须由 KERNEL32 提供"
                     with self.assertRaisesRegex(GATE.GateError, error):
                         GATE.pe_admit(path, variant=1)
 
     def test_variant_one_dll_closure_is_unchanged(self):
         path = self.root / "container.exe"
-        minimal = (("KERNEL32.dll", CONTRACT_APIS[:2]), DEFAULT_IMPORTS[1])
+        minimal = (("KERNEL32.dll", (CONTRACT_APIS[:2] + CONTRACT_APIS[3:])), DEFAULT_IMPORTS[1], DEFAULT_IMPORTS[2])
         for imports in (minimal + (("NTDLL.dll", ("RtlVirtualUnwind",)),),
                         minimal + (("other.dll", ("OtherFunction",)),),
                         (minimal[0],), (minimal[1],),
-                        (("other.dll", CONTRACT_APIS[:2]), minimal[1]),
+                        (("other.dll", (CONTRACT_APIS[:2] + CONTRACT_APIS[3:])), minimal[1]),
                         minimal + (("kernel32.DLL", ("RtlVirtualUnwind",)),)):
             with self.subTest(dlls=[item[0] for item in imports]):
                 path.write_bytes(container_pe(imports))

@@ -86,6 +86,8 @@ static const uintptr_t pc_offsets[] = {0x000,0x004,0x030,0x1a0,0x1a4,0x410,0x414
 static const char *const pc_ids[] = {"entry","after_alloc","body","call","return",
                                     "epilogue","after_d14","ret"};
 
+#include "h264-luma-dc-windows-diagnostics.h"
+
 static int fail(const char *id)
 {
     fprintf(stderr, "FRD1 failed id=%s win32=%lu\n", id, (unsigned long)GetLastError());
@@ -540,6 +542,11 @@ static int child_main(child_id id)
     if(!ReadFile(GetStdHandle(STD_INPUT_HANDLE),&go,sizeof(go),&bytes,NULL) ||
        bytes!=sizeof(go) || go.magic!=GO_MAGIC || go.case_id!=(uint32_t)id)
         return fail("child_go_protocol");
+    frd_diag_reference.pid=GetCurrentProcessId();
+    frd_diag_reference.tid=GetCurrentThreadId();
+    frd_diag_reference.case_id=(DWORD)id;
+    RtlCaptureContext(&frd_diag_reference.context);
+    frd_diag_reference.complete=1;
     m=frd_h264_dc_outer_probe(input,output,1,children[id].callback,frd_h264_dc_check_abi);
     printf("FRD1 returned case=%s mask=%016" PRIx64 "\n",children[id].name,m);
     if(id!=CHILD_PRESERVE || m) return FAILED;
@@ -639,6 +646,7 @@ static int isolated_child(child_id id)
     wchar_t path[32768],cmd[33024];
     stream_capture out={0},err={0};
     child_observation o={0};
+    frdd_state diagnostics={0};
     uintptr_t child_base=0;
     ULONGLONG started=GetTickCount64(),cleanup_deadline=0;
     int infrastructure=0,created=0,job_assigned=0;
@@ -665,6 +673,7 @@ static int isolated_child(child_id id)
                        DEBUG_ONLY_THIS_PROCESS|CREATE_SUSPENDED|CREATE_NO_WINDOW,
                        NULL,NULL,&si,&pi)) {fail("create_debug_child"); goto cleanup;}
     created=1;
+    diagnostics.pid=pi.dwProcessId;
     /* 不依赖 ContinueDebugEvent 自动关闭的 debugger event handle 的生命期。 */
     if(!DuplicateHandle(GetCurrentProcess(),pi.hProcess,GetCurrentProcess(),&wait_process,
                         0,FALSE,DUPLICATE_SAME_ACCESS))
@@ -702,20 +711,26 @@ static int isolated_child(child_id id)
             if(GetLastError()!=ERROR_SEM_TIMEOUT) infrastructure=fail("wait_debug_event");
             continue;
         }
+        ++diagnostics.seq;
         if(ev.dwProcessId!=pi.dwProcessId) infrastructure=fail("foreign_debug_event");
         switch(ev.dwDebugEventCode) {
         case CREATE_PROCESS_DEBUG_EVENT:
             child_base=(uintptr_t)ev.u.CreateProcessInfo.lpBaseOfImage;
             printf("FRD1 child_image case=%s pid=%lu base=%" PRIxPTR "\n",
                    children[id].name,(unsigned long)ev.dwProcessId,child_base);
-            if(ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
+            frdd_module_load(&diagnostics,pi.hProcess,&ev,child_base,ev.u.CreateProcessInfo.hFile);
             break;
         case LOAD_DLL_DEBUG_EVENT:
-            if(ev.u.LoadDll.hFile) CloseHandle(ev.u.LoadDll.hFile);
+            frdd_module_load(&diagnostics,pi.hProcess,&ev,(uintptr_t)ev.u.LoadDll.lpBaseOfDll,ev.u.LoadDll.hFile);
+            break;
+        case UNLOAD_DLL_DEBUG_EVENT:
+            frdd_unload(&diagnostics,(uintptr_t)ev.u.UnloadDll.lpBaseOfDll);
+            printf("FRD1 debug_event case=%s pid=%lu tid=%lu event=%lu classification=ordinary\n",
+                   children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
+                   (unsigned long)ev.dwDebugEventCode);
             break;
         case CREATE_THREAD_DEBUG_EVENT:
         case EXIT_THREAD_DEBUG_EVENT:
-        case UNLOAD_DLL_DEBUG_EVENT:
         case OUTPUT_DEBUG_STRING_EVENT:
             /* 显式允许的普通事件；thread event handle 由 Windows debugger 关闭。 */
             printf("FRD1 debug_event case=%s pid=%lu tid=%lu event=%lu classification=ordinary\n",
@@ -745,6 +760,7 @@ static int isolated_child(child_id id)
                 (uintptr_t)e->ExceptionRecord.ExceptionAddress >= child_base+image_size))
                 o.initial_breakpoint=1;
             else {
+                frdd_capture(&diagnostics,pi.hProcess,&ev,child_base,image_base,image_size,(unsigned)id);
                 continuation=DBG_EXCEPTION_NOT_HANDLED;
                 if(!exact_trap(pi.hProcess,child_base,id,e,&o)) o.unexpected=1;
                 /* 不吞异常、不跳过 brk、不修改 child PC/SP。第二次交还 OS 终止。 */
@@ -817,6 +833,9 @@ static int isolated_child(child_id id)
            children[id].name,(uint64_t)started,(uint64_t)o.ready_ticks,(uint64_t)o.terminate_ticks,
            (uint64_t)o.exit_event_ticks,(uint64_t)o.terminal_ticks,o.designated_timeout);
 cleanup:
+    frdd_release(&diagnostics);
+    if(diagnostics.failed || diagnostics.overflow || o.unexpected)
+        frdd_emit(&diagnostics,children[id].name,(uintptr_t)&frd_diag_reference-image_base);
     /* 错误也拥有 child；job close 保证不会遗留后台进程。 */
     if(created && !o.terminal) {
         if(!o.forced) (void)TerminateProcess(pi.hProcess,FORCED_EXIT);
@@ -835,7 +854,7 @@ cleanup:
     if(stdout_read) CloseHandle(stdout_read); if(stdout_write) CloseHandle(stdout_write);
     if(stderr_read) CloseHandle(stderr_read); if(stderr_write) CloseHandle(stderr_write);
     if(go_read) CloseHandle(go_read); if(go_write) CloseHandle(go_write);
-    if(!created || infrastructure || !o.ready || !o.go || !o.terminal || o.unexpected) return FAILED;
+    if(!created || infrastructure || !o.ready || !o.go || !o.terminal || o.unexpected || diagnostics.failed || diagnostics.overflow) return FAILED;
     if(id==CHILD_PRESERVE) {
         if(o.exit_code || o.forced || o.first || o.second ||
            !strstr((const char *)out.bytes,"FRD1 result case=preserve outcome=normal-control\n")) return FAILED;

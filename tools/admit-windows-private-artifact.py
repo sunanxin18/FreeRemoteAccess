@@ -24,10 +24,10 @@ CONTRACT_SCHEMA = 'freeremotedesk.windows.private-contract-compile.v1'
 TERMINAL_AUTHORITY = 'terminal-status.json only; absent/pending is never success; terminal-precommit.json is not authority'
 COMPILER = 'tools/compile-windows-contract.py'
 CHECKOUT_PINS = {
-    COMPILER: '47ed1ac4c1be3c2b77a905cc6c2807b5d04125145aac3fd0fb046651fc161e97',
-    'tools/compile-windows-private-abi.py': '2285096dcc41c60b3b2853015f3ea135de1778f596ff893181593b632e5647e2',
-    'tools/tests/test_compile_windows_private_abi.py': 'c4aef0b5abb39e7840d93649bde24974ece337bb8a50ff1d7c4ac4a488cd7872',
-    'tools/tests/test_compile_windows_contract.py': 'efc6b51a616e383868fa46f885ab3e138e053ddc51139b2ad70be56dbbd01e3b',
+    COMPILER: '8d98d17ea4aa3f5c2781a76494cd0635435b3a2130f729e0facf2441aaadc0ee',
+    'tools/compile-windows-private-abi.py': 'ada9eb8a3d714ffaee4396eb19e183bb2f2baf533da9970970043368112fe4ec',
+    'tools/tests/test_compile_windows_private_abi.py': '9b19621a194d95c947adc86f1fd12c9419aa2244f75e333ada9f19a097a94a41',
+    'tools/tests/test_compile_windows_contract.py': '56cf7e57aad2fb0974ff4b4e857a7f8dd59507ef352968744d30137d2205b91c',
     '.github/workflows/qualify-windows-private-abi.yml': '3a2318bf94819b5c34c5aec0084441c33da997cf07393218d14e81a15d9429c2',
 }
 MAX_JSON = 8 * 1024 * 1024

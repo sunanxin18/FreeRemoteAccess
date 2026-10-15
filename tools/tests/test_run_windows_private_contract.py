@@ -168,7 +168,7 @@ class RunnerControls(unittest.TestCase):
                          {'raw_action_output': 'b' * 64, 'canonical_rest_digest': 'sha256:' + 'b' * 64,
                           'boundary': 'fixed upload-artifact output bare SHA256 to REST/F2 sha256 digest'})
         f2 = m.source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                             '844543036bf46f269f44e91b40a69978309281af665fdba59f2dc9269f3c1570', 'fix1_real_f2_digest')
+                             'bb87afb53d7fad941519470c9be1184576a225a64f37a8dcd7c8bfc833ab7689', 'fix1_real_f2_digest')
         trusted = {key: value for key, value in expected.items() if key != 'workflow_context'}
         trusted['artifact'] = {**expected['artifact'], 'size_in_bytes': 10}
         metadata = {**trusted['artifact'], 'expired': False,
@@ -191,7 +191,7 @@ class RunnerControls(unittest.TestCase):
                 return self.admission_observation
         actual_source_module = m.source_module
         f2 = actual_source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                                   '844543036bf46f269f44e91b40a69978309281af665fdba59f2dc9269f3c1570', 'fix1_main_real_f2')
+                                   'bb87afb53d7fad941519470c9be1184576a225a64f37a8dcd7c8bfc833ab7689', 'fix1_main_real_f2')
         modules = {'tools/admit-windows-private-artifact.py': f2,
                    'tools/verify-windows-private-transcript.py': SimpleNamespace(),
                    'tools/windows-private-process.py': SimpleNamespace(Win32=HostAdmission)}
