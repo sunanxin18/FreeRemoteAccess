@@ -1,5 +1,23 @@
 # Windows ARM64 私有 ABI/SEH 源码准备
 
+2026-10-16 当前实现状态：**开发中；C0 私有失败路径已实现，待独立实现审查及新的固定工具链/原生门。**
+下面 2026-10-14 的 source-only 及先前编译/失败记录是历史边界，不是当前源码的运行结论。
+`FRD_DC_WINDOWS_ABI_CONTRACT` 开启时，调用前固定 ADRP+ADD x9 / CMP x3,x9 / B.EQ
+绑定二指令 `corrupt_fp`，真实 BLR 在独占 32 B SP fragment 内执行。
+只有这个精确、不改 SP/保存区的 callback 闭包授予 SP=H；不是对齐判断、case 字符串或可配置布尔值。
+SP8/SP16 及其它回调保持主 helper 的 set_fp metadata 和原结构 guard。
+`wrong_return` 原 16 B 四指令完全保留，另用独占 SP phantom metadata 描述继承的 H。
+两个 raw records 各含 end_c、完整 192 B 保存布局及 end，不与主 helper/outer 共享 xdata。
+variant1 同时省略两个 helper tables；variant2/3 在 helper SP fragment 同步错误 allocate/offset；
+variant4 只改原主 epilogue 描述；wrong_return 的真实 H metadata 始终正确。原 bad5 精确拒绝门继续保留。
+
+本机官方 SDK Clang15 仅做 changed-ASM raw COFF sanity，独立模型覆盖 SP fragment 的全部8条指令、
+wrong_return 全部4条及明确元数据负控；generic macro-off 指令及正常 metadata 与旧 admitted object 逐字相同，
+不含 negative callback relocation 或新 fragment。Clang15 实际接受 bad5，不能替代固定 LLVM20.1.8 的历史/后继拒绝。
+当前没有新 pinned LLVM20 C/PE、Windows Rtl、isolated 或 shipping 资格。编译配方显式令私有 abi.obj 开启 C0；
+generic checker 对任意坏 callee 的安全展开仍未关闭。ARM64EC/其它架构拒绝，所有产品 decoder/defaults 不变。
+完整受审来源和本机输出见 `task-windows-failure-unwind-implementation-report.md`（SDD）。
+
 日期：2026-10-14。状态：**源码提案，未编译、未链接、未运行**。这些文件只用于
 Windows 原生 ARM64 私有控制台验证，不属于产品库、HAP、数值 GREEN 程序的
 contract 扩展或跨平台资格声明。`h264-luma-dc-abi-windows.S` 是共享数值程序的
@@ -59,7 +77,7 @@ child trap 表示失败；bits19/20 的可返回路径用预期快照注入测�
 
 outer 的 uint64 返回值低32=checker mask，高32=caller restoration mask，
 后者使用同一 bit 编号但独立常量/比较。外层结构失败 `brk #0xf000`。
-三个 Windows trap 均为 documented `0xd43e0000`，由 case-specific 实际 PC
+四处 Windows trap 均为 documented `0xd43e0000`，由 case-specific 实际 PC
 区分；共用指令字不允许把 outer failure 当作 child 的合格 probe。修正编码
 本身不是 Windows 原生异常生命周期已通过的证据。
 checker 参数允许用返回 0 却破坏单个寄存器的 fake checker，验证 outer 检测

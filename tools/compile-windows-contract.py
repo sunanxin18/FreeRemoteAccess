@@ -15,11 +15,11 @@ import zipfile
 
 SCHEMA = "freeremotedesk.windows.private-contract-compile.v1"
 SUPPORT = "tools/compile-windows-private-abi.py"
-SUPPORT_SHA = "ada9eb8a3d714ffaee4396eb19e183bb2f2baf533da9970970043368112fe4ec"
+SUPPORT_SHA = "8553432813c43231f2ffa0f5436c6f46960413f4ccabb6ea3b546d5738467efe"
 FIXTURE = "third_party/ffmpeg/8.1.2/tests"
 PINS = {
-    "h264-luma-dc-windows-contract.c": "d3ec29318045300779d715467529b058403cd9cf3d28ccfe9da1fd638cdc95d6",
-    "README-windows-contract.md": "48ae0b450f82949a2f35f0676ff843f466d3507f52a2c2e76c70bc27f214cdd4",
+    "h264-luma-dc-windows-contract.c": "f4d9800d493da50fe4e7a8c9a30c791a02d0a4048d94cf6552401d88796962cb",
+    "README-windows-contract.md": "07b43939261460a8025c45b3a95004b249e78706947c166c3df74c45a6cab4c3",
 }
 OWN = ("tools/compile-windows-contract.py", "tools/tests/test_compile_windows_contract.py")
 VARIANTS = tuple(range(5))
@@ -33,7 +33,12 @@ LABELS = ("frd_h264_dc_check_abi", "frd_h264_dc_abi_pc_after_alloc",
           "frd_h264_dc_abi_pc_return", "frd_h264_dc_abi_pc_epilogue",
           "frd_h264_dc_abi_pc_epilogue_after_d14", "frd_h264_dc_abi_pc_ret",
           "frd_h264_dc_outer_probe", "frd_h264_dc_outer_pc_return",
-          "frd_h264_dc_wrong_return", "frd_diag_reference")
+          "frd_h264_dc_wrong_return", "frd_diag_reference",
+          "frd_h264_dc_abi_sp_failure_fragment", "frd_h264_dc_abi_sp_failure_return",
+          "frd_h264_dc_abi_sp_failure_trap", "frd_h264_dc_abi_sp_failure_end",
+          "frd_h264_dc_wrong_return_trap", "frd_h264_dc_wrong_return_end",
+          "frd_h264_dc_private_children", "frd_h264_dc_preserve", "frd_h264_dc_corrupt_fp",
+          "frd_h264_dc_corrupt_sp16", "frd_h264_dc_corrupt_sp8", "frd_h264_dc_no_return")
 MAX_FILE = 64 * 1024 * 1024
 FIXED_MEMBERS = {"summary.json", "source-inputs.json", "source-inputs-after.json", "tool-inputs.json", "tool-inputs-after.json",
                  "same-run-inputs.json", "authorization.json", "dependency-inputs.json", "actual-output-identities.json",
@@ -458,7 +463,8 @@ def sections_at(data, pos, count):
         if rawpos:
             span(data, rawpos, rawsize)
         sections.append({"name": name.rstrip(b"\0").decode("ascii"), "virtual_size": vs,
-                         "rva": rva, "raw_size": rawsize, "raw_offset": rawpos, "flags": flags})
+                         "rva": rva, "raw_size": rawsize, "raw_offset": rawpos, "flags": flags,
+                         "reloc_offset": reloc, "reloc_count": nr})
     return sections
 
 
@@ -540,9 +546,8 @@ def pe_admit(path, *, variant=0):
     protected_apis = {"RtlCaptureContext", "RtlLookupFunctionEntry", "RtlVirtualUnwind", "OpenThread", "GetThreadContext"}
     bcrypt_apis = {"BCryptOpenAlgorithmProvider", "BCryptCreateHash", "BCryptHashData",
                    "BCryptFinishHash", "BCryptDestroyHash", "BCryptCloseAlgorithmProvider"}
-    # bad1 缺 nonleaf table 分支不会调用 unwind；正确 KERNEL32 第三名称可选。
-    # 来源保护始终覆盖全部三个名称，不能随 required 集合一起缩小。
-    required_apis = protected_apis - {"RtlVirtualUnwind"} if variant == 1 else protected_apis
+    # bad1 仍拒绝 helper 缺表；独立 wrong_return fragment oracle 必须实际调用 Rtl。
+    required_apis = protected_apis
     for item in imports:
         names = {symbol["name"] for symbol in item["symbols"] if "name" in symbol}
         if item["dll"].lower() == "bcrypt.dll":
@@ -588,11 +593,13 @@ def pe_admit(path, *, variant=0):
         if entry["length"] == 0:
             raise GateError("pdata zero length")
         at(begin, entry["length"])
+        if pdata and pdata[-1]["begin_rva"] + pdata[-1]["length"] > begin:
+            raise GateError("pdata owned ranges overlap")
         pdata.append(entry)
     return {"path": str(path), "sha256": sha(path), "size": len(data), "machine": "0xAA64",
             "optional_magic": "0x20B", "image_base": imagebase, "image_size": image_size,
             "sections": sections, "symbols": coff_symbols(data, header, sections), "imports": imports,
-            "pdata": pdata, "at": at}
+            "pdata": pdata, "at": at, "variant": variant}
 
 
 def object_range(path, symbol):
@@ -611,6 +618,209 @@ def object_range(path, symbol):
         raise GateError("actual owned function range 不明确")
     return span(data, section["raw_offset"] + item["value"], end - item["value"]), symbols
 
+
+
+SP_FRAGMENT = "frd_h264_dc_abi_sp_failure_fragment"
+CALLBACK_BYTES = {
+    "frd_h264_dc_preserve": "c0035fd6",
+    "frd_h264_dc_corrupt_fp": "fd031faac0035fd6",
+    "frd_h264_dc_corrupt_sp16": "ff430091c0035fd6",
+    "frd_h264_dc_corrupt_sp8": "ff230091c0035fd6",
+    "frd_h264_dc_wrong_return": "5e000010c0035fd600003ed4ffffff17",
+    "frd_h264_dc_no_return": "00000014",
+}
+
+
+def phantom_xdata(length, variant=0):
+    # 预先声明的 Microsoft end_c phantom frame；不从产物采纳 expected。
+    stream = bytes.fromhex("e5d992d910d88ed80ce6e6e6e6c802400ce4e3e3")
+    if variant == 2:
+        stream = stream[:16] + b"\x0d" + stream[17:]
+    if variant == 3:
+        stream = bytes.fromhex("e5d992d910d88ed80ce6e6e6c884c803400ce4e3")
+    return struct.pack("<I", 0x28200000 | (length // 4)) + stream
+
+
+
+def frame_xdata(length, variant=0):
+    raw = struct.pack("<I", 0x28600000 | (length // 4)) + bytes.fromhex("e1d992d910d88ed80ce6e6e6e6c802400ce4e3e3")
+    if variant == 2:
+        raw = raw[:20] + b"\x0d" + raw[21:]
+    elif variant == 3:
+        raw = raw[:4] + bytes.fromhex("e1d992d910d88ed80ce6e6e6c884c803400ce4e3")
+    elif variant == 4:
+        raw = struct.pack("<I", 0x4ca00000 | (length // 4)) + bytes.fromhex("e1d992d910d88ed80ce6e6e6e6c802400ce4e3d910d88ed80ce6e6e6e6c802400ce4e3e3")
+    return raw
+
+def object_layout(path):
+    """读取实际 COFF，包括 undefined/aux index；不以名字替代 relocation。"""
+    data = path.read_bytes()
+    machine, count, _, table, count_symbols, optional, _ = struct.unpack("<HHIIIHH", span(data, 0, 20))
+    if machine != 0xaa64 or optional:
+        raise GateError("C0 requires native ARM64 COFF")
+    sections = sections_at(data, 20, count)
+    strings_pos = table + count_symbols * 18
+    strings_size = struct.unpack("<I", span(data, strings_pos, 4))[0]
+    strings = span(data, strings_pos, strings_size)
+    symbols = {}
+    index = 0
+    while index < count_symbols:
+        name, value, section, typ, storage, aux = struct.unpack("<8sIhHBB", span(data, table + index * 18, 18))
+        if index + aux >= count_symbols:
+            raise GateError("C0 COFF aux bounds")
+        if name[:4] == bytes(4):
+            offset = struct.unpack_from("<I", name, 4)[0]
+            if offset < 4 or offset >= len(strings) or b"\0" not in strings[offset:]:
+                raise GateError("C0 COFF string bounds")
+            name = strings[offset:].split(b"\0", 1)[0]
+        else:
+            name = name.split(b"\0", 1)[0]
+        symbols[index] = {"name": name.decode("ascii"), "value": value, "section": section,
+                          "type": typ, "storage": storage}
+        index += 1 + aux
+    for section in sections:
+        relocations = []
+        for k in range(section["reloc_count"]):
+            offset, symbol_index, kind = struct.unpack("<IIH", span(data, section["reloc_offset"] + 10 * k, 10))
+            if symbol_index not in symbols or offset + 4 > section["raw_size"]:
+                raise GateError("C0 relocation symbol/offset bounds")
+            relocations.append({"offset": offset, "kind": kind, "symbol": symbols[symbol_index]})
+        section["relocations"] = relocations
+        section["bytes"] = span(data, section["raw_offset"], section["raw_size"])
+    return sections, symbols
+
+
+def relocated_helper(raw, relocations, start, target):
+    """只重建两个固定 word。所有 addend/opcode/register/目标必须精确。"""
+    if len(relocations) != 2:
+        raise GateError("C0 requires exactly two selector relocations")
+    expected = ((0x1a0, 4, 0x90000009), (0x1a4, 6, 0x91000129))
+    result = bytearray(raw)
+    for relocation, (offset, kind, opcode) in zip(sorted(relocations, key=lambda x: x["offset"]), expected):
+        symbol = relocation["symbol"]
+        if (relocation["offset"] != offset or relocation["kind"] != kind or
+                symbol != {"name": "frd_h264_dc_corrupt_fp", "value": 0, "section": 0, "type": 0, "storage": 2} or
+                struct.unpack_from("<I", raw, offset)[0] != opcode):
+            raise GateError("C0 selector relocation target/addend/opcode/register")
+        if offset == 0x1a0:
+            pages = (target >> 12) - ((start + offset) >> 12)
+            if not -(1 << 20) <= pages < (1 << 20):
+                raise GateError("C0 ADRP range")
+            immediate = pages & ((1 << 21) - 1)
+            word = opcode | ((immediate & 3) << 29) | ((immediate >> 2) << 5)
+        else:
+            word = opcode | ((target & 0xfff) << 10)
+        struct.pack_into("<I", result, offset, word)
+    return bytes(result)
+
+
+def object_metadata(path, expected_owners):
+    sections, symbols = object_layout(path)
+    by_name = {section["name"]: section for section in sections}
+    if len(by_name) != len(sections):
+        raise GateError("C0 duplicate object sections")
+    pdata = by_name.get(".pdata")
+    if pdata is None:
+        if expected_owners:
+            raise GateError("C0 missing object pdata")
+        return {}
+    if pdata["raw_size"] != 8 * len(expected_owners) or len(pdata["relocations"]) != 2 * len(expected_owners):
+        raise GateError("C0 object pdata inventory")
+    if any(section["relocations"] for section in sections if section["name"] not in (".text", ".pdata")):
+        raise GateError("C0 unexpected metadata relocation")
+    reloc = {item["offset"]: item for item in pdata["relocations"]}
+    if len(reloc) != len(pdata["relocations"]):
+        raise GateError("C0 duplicate pdata relocation")
+    owners = {item["value"]: name for item in symbols.values()
+              if item["name"] in expected_owners for name in (item["name"],)}
+    result, xdata_ranges = {}, []
+    for offset in range(0, pdata["raw_size"], 8):
+        targets = []
+        for field in (offset, offset + 4):
+            item = reloc.get(field)
+            if item is None or item["kind"] != 2:
+                raise GateError("C0 requires exact ADDR32NB pdata relocations")
+            sym = item["symbol"]
+            if not 1 <= sym["section"] <= len(sections):
+                raise GateError("C0 pdata target section")
+            addend = struct.unpack_from("<I", pdata["bytes"], field)[0]
+            targets.append((sections[sym["section"] - 1], sym["value"] + addend))
+        (text, begin), (xdata, index) = targets
+        if text["name"] != ".text" or xdata["name"] != ".xdata" or index % 4 or begin not in owners:
+            raise GateError("C0 pdata foreign owner/xdata target")
+        name = owners[begin]
+        if name in result:
+            raise GateError("C0 duplicate object owner")
+        header = struct.unpack("<I", span(xdata["bytes"], index, 4))[0]
+        codes, epilogues = (header >> 27) & 31, (header >> 22) & 31
+        if (header >> 18) & 7 or not codes:
+            raise GateError("C0 object xdata header/version/handler")
+        size = 4 * (1 + (0 if header & (1 << 21) else epilogues) + codes)
+        begin_reloc = reloc[offset]
+        xdata_reloc = reloc[offset + 4]
+        begin_sym, xdata_sym = begin_reloc["symbol"], xdata_reloc["symbol"]
+        direct = name in (SP_FRAGMENT, "frd_h264_dc_wrong_return")
+        expected_begin_name = name if direct else ".text"
+        expected_addend = 0 if direct else begin
+        if (begin_sym["name"] != expected_begin_name or
+                struct.unpack_from("<I", pdata["bytes"], offset)[0] != expected_addend or
+                xdata_sym["name"] != ".xdata" or xdata_sym["value"] != 0):
+            raise GateError("C0 exact pdata symbol/addend binding")
+        if any(index < end and start < index + size for start, end in xdata_ranges):
+            raise GateError("C0 distinct object xdata records overlap")
+        xdata_ranges.append((index, index + size))
+        result[name] = span(xdata["bytes"], index, size)
+    if xdata_ranges:
+        covered = sorted(xdata_ranges)
+        if covered[0][0] != 0 or covered[-1][1] != by_name[".xdata"]["raw_size"] or any(a[1] != b[0] for a,b in zip(covered,covered[1:])):
+            raise GateError("C0 exact object xdata inventory")
+    if set(result) != set(expected_owners):
+        raise GateError("C0 object metadata owners differ")
+    return result
+
+
+def closure_bytes(name, raw, helper_start=None):
+    if name in CALLBACK_BYTES and raw != bytes.fromhex(CALLBACK_BYTES[name]):
+        raise GateError("C0 actual fixed callback bytes")
+    if name == "frd_h264_dc_check_abi":
+        words = struct.unpack("<4I", span(raw, 0x1a0, 16))
+        if words != (0x90000009, 0x91000129, 0xeb09007f, 0x54001520) or span(raw, 0x1b0, 4) != bytes.fromhex("60003fd6"):
+            raise GateError("C0 exact pre-call selector/call path")
+    if name == SP_FRAGMENT:
+        # BLR/guards/conditional continuation/trap/backedge，全 word 精确。
+        words = (0xd63f0060, 0x910003e9, 0xf2400d3f, 0x54000001 | (3 << 5),
+                 0xeb0903bf, 0x54000000 | ((((0x1b4 - (0x450 + 20)) // 4) & 0x7ffff) << 5),
+                 0xd43e0000, 0x17ffffff)
+        if raw != struct.pack("<8I", *words):
+            raise GateError("C0 exact SP fragment machine closure")
+
+
+
+def fixed_labels(pe, helper, negative):
+    helper_offsets = {"frd_h264_dc_check_abi": 0, "frd_h264_dc_abi_pc_after_alloc": 4,
+        "frd_h264_dc_abi_pc_body": 0x30, "frd_h264_dc_abi_pc_call": 0x1b0,
+        "frd_h264_dc_abi_pc_return": 0x1b4, "frd_h264_dc_abi_pc_epilogue": 0x420,
+        "frd_h264_dc_abi_pc_epilogue_after_d14": 0x424, "frd_h264_dc_abi_pc_ret": 0x44c,
+        SP_FRAGMENT: 0x450, "frd_h264_dc_abi_sp_failure_return": 0x454,
+        "frd_h264_dc_abi_sp_failure_trap": 0x468, "frd_h264_dc_abi_sp_failure_end": 0x470}
+    for obj, owner, offsets in ((helper, "frd_h264_dc_check_abi", helper_offsets),
+        (negative, "frd_h264_dc_wrong_return", {"frd_h264_dc_wrong_return": 0,
+         "frd_h264_dc_wrong_return_trap": 8, "frd_h264_dc_wrong_return_end": 16}),
+        (negative, "frd_h264_dc_outer_probe", {"frd_h264_dc_outer_probe": 0,
+         "frd_h264_dc_outer_pc_return": 0x188})):
+        _, symbols = object_layout(obj)
+        by_name = {value["name"]: value for value in symbols.values()}
+        if owner not in by_name or owner not in pe["symbols"]:
+            raise GateError("C0 fixed input/linked owner missing")
+        if by_name[owner]["type"] != 32 or by_name[owner]["storage"] != 2:
+            raise GateError("C0 exact COFF function symbol type/storage")
+        for name, offset in offsets.items():
+            if (name not in by_name or name not in pe["symbols"] or
+                    by_name[name]["section"] != by_name[owner]["section"] or
+                    by_name[name]["value"] != by_name[owner]["value"] + offset or
+                    pe["symbols"][name]["section"] != pe["symbols"][owner]["section"] or
+                    pe["symbols"][name]["rva"] != pe["symbols"][owner]["rva"] + offset):
+                raise GateError("C0 predeclared object/linked PC label offsets")
 
 def bindings(pe, helper, negative):
     symbols = pe["symbols"]
@@ -635,28 +845,56 @@ def bindings(pe, helper, negative):
     if reference_bytes != bytes(912) + bytes.fromhex("3147414944445246") + bytes(24):
         raise GateError("diagnostic reference fixed initial data binding")
     ranges = {}
-    for obj, name in ((helper, "frd_h264_dc_check_abi"), (negative, "frd_h264_dc_outer_probe"),
-                      (negative, "frd_h264_dc_wrong_return")):
+    fixed_labels(pe, helper, negative)
+    variant = pe.get("variant", 0)
+    helper_tables = object_metadata(helper, () if variant == 1 else ("frd_h264_dc_check_abi", SP_FRAGMENT))
+    negative_tables = object_metadata(negative, ("frd_h264_dc_outer_probe", "frd_h264_dc_wrong_return"))
+    helper_sections, _ = object_layout(helper)
+    text_relocs = [item for section in helper_sections if section["name"] == ".text" for item in section["relocations"]]
+    negative_sections, _ = object_layout(negative)
+    if any(section["relocations"] for section in negative_sections if section["name"] == ".text"):
+        raise GateError("C0 negative text has unexpected relocations")
+    for obj, name in ((helper, "frd_h264_dc_check_abi"), (helper, SP_FRAGMENT),
+                      (negative, "frd_h264_dc_outer_probe")) + tuple((negative, name) for name in CALLBACK_BYTES):
         raw, input_symbols = object_range(obj, name)
         if name not in symbols:
             raise GateError("缺少固定 trap 的 linked owner")
         start = symbols[name]["rva"]
-        length, trap = {"frd_h264_dc_check_abi": (0x440, 0x408),
-                        "frd_h264_dc_outer_probe": (0x430, 0x3f8),
-                        "frd_h264_dc_wrong_return": (0x10, 8)}[name]
+        length, trap = {"frd_h264_dc_check_abi": (0x450, 0x418), SP_FRAGMENT: (32, 24),
+                        "frd_h264_dc_outer_probe": (0x430, 0x3f8)}.get(name, (len(bytes.fromhex(CALLBACK_BYTES.get(name, ""))), 8 if name == "frd_h264_dc_wrong_return" else None))
         if len(raw) != length or start <= 0 or start % 4 or start + length > 0xffffffff:
             raise GateError("固定 Windows trap owner/长度/范围 不符")
         linked = pe["at"](start, length)
         if (len(linked) != length or
-                struct.unpack_from("<I", raw, trap)[0] != 0xd43e0000 or
-                struct.unpack_from("<I", linked, trap)[0] != 0xd43e0000):
+                (trap is not None and (struct.unpack_from("<I", raw, trap)[0] != 0xd43e0000 or
+                struct.unpack_from("<I", linked, trap)[0] != 0xd43e0000))):
             raise GateError("固定 Windows trap owner/长度/offset/opcode 不符")
         if any(start < end and begin < start + length for begin, end in ranges.values()):
             raise GateError("固定 trap owned 函数范围重叠")
-        if raw != linked:
-            raise GateError("linked helper/outer text 与实际 input object 不同")
+        closure_bytes(name, raw)
+        expected_text = relocated_helper(raw, text_relocs, start, symbols["frd_h264_dc_corrupt_fp"]["rva"]) if name == "frd_h264_dc_check_abi" else raw
+        if expected_text != linked:
+            raise GateError("linked helper/outer/callback text 与精确重定位 input object 不同")
         ranges[name] = (start, start + len(raw))
-        owned = [entry for entry in pe["pdata"] if entry["begin_rva"] == start]
+        intersecting = [entry for entry in pe["pdata"] if entry["begin_rva"] < start + length and start < entry["begin_rva"] + entry["length"]]
+        owned = [entry for entry in intersecting if entry["begin_rva"] == start]
+        metadata = helper_tables.get(name) if obj == helper else negative_tables.get(name)
+        if metadata is None:
+            if intersecting:
+                raise GateError("C0 leaf/missing metadata has foreign owned range")
+        elif (len(intersecting) != 1 or len(owned) != 1 or owned[0]["length"] != length or
+              owned[0].get("xdata_hex") != metadata.hex()):
+            raise GateError("C0 unique exact object/PE owned metadata")
+        if name in ("frd_h264_dc_check_abi", "frd_h264_dc_outer_probe") and metadata is not None:
+            if metadata != frame_xdata(length, variant if obj == helper else 0):
+                raise GateError("C0 exact original frame metadata variant")
+        if name in (SP_FRAGMENT, "frd_h264_dc_wrong_return") and metadata is not None:
+            expected_meta = phantom_xdata(length, variant if name == SP_FRAGMENT else 0)
+            if metadata != expected_meta:
+                raise GateError("C0 exact phantom metadata header/codes/padding")
+            for pc in (start + trap, start + trap + 4):
+                if sum(entry["begin_rva"] <= pc < entry["begin_rva"] + entry["length"] for entry in pe["pdata"]) != 1:
+                    raise GateError("C0 trap and trap+4 unique coverage")
         label_offsets = {label: item["rva"] - start for label, item in symbols.items()
                          if label in LABELS and start <= item["rva"] < start + len(raw)}
         input_offsets = {label: item["value"] - input_symbols[name]["value"] for label, item in input_symbols.items()
@@ -668,10 +906,31 @@ def bindings(pe, helper, negative):
                                      "object_sha256": sha(obj), "label_offsets": label_offsets,
                                      "actual_input_label_offsets": input_offsets, "table_entries": owned}
         if not owned:
-            if name != "frd_h264_dc_wrong_return":
+            if name in ("frd_h264_dc_check_abi", SP_FRAGMENT):
                 result["open"].append("no owned pdata (bad1 expected helper omission): " + name)
         elif len(owned) != 1 or owned[0]["length"] != len(raw):
             raise GateError("linked owned pdata/range 不一致")
+    table = symbols.get("frd_h264_dc_private_children")
+    if table is None or not 1 <= table["section"] <= len(pe["sections"]):
+        raise GateError("C0 fixed linked child routing table missing")
+    table_section = pe["sections"][table["section"] - 1]
+    if (table["rva"] % 8 or table_section["flags"] & (0x80000000 | 0x20000000) or
+            not table_section["flags"] & 0x40000000):
+        raise GateError("C0 child routing table readonly data range")
+    table_raw = pe["at"](table["rva"], 96)
+    for index, name in enumerate(CALLBACK_BYTES):
+        name_va, callback_va = struct.unpack_from("<QQ", table_raw, 16 * index)
+        expected_name = name.removeprefix("frd_h264_dc_").encode("ascii") + b"\0"
+        if (callback_va != pe["image_base"] + symbols[name]["rva"] or
+                not pe["image_base"] < name_va < pe["image_base"] + pe["image_size"] or
+                pe["at"](name_va - pe["image_base"], len(expected_name)) != expected_name):
+            raise GateError("C0 exact fixed child enum/name/callback routing")
+    if symbols[SP_FRAGMENT]["rva"] != symbols["frd_h264_dc_check_abi"]["rva"] + 0x450:
+        raise GateError("C0 helper/fragment fixed adjacency")
+    result["private_callback_contract"] = {"id": "C0", "selector_offset": 0x1a0,
+        "target": "frd_h264_dc_corrupt_fp", "sp_authority": "bound-callback-preserves-sp",
+        "fragment_owner": SP_FRAGMENT, "trap_offset": 24,
+        "wrong_return_authority": "fixed-callback-inherits-H"}
     for name in FUNCTIONS:
         if name not in symbols:
             result["open"].append("compiler omitted/inlined symbol: " + name)

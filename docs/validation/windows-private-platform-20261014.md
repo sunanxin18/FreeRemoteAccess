@@ -434,3 +434,57 @@ GO后pre-call基线SP `0xb89853f840` 与first SP差384，仅为一致性观察�
 
 
 同一00b实际字节的后续只读审计及独立复审均已通过（Spec PASS / Quality Approved）。IAT RVA0x14c68确认为RtlCaptureContext，实际捕获PC RVA0x232c到outer BL0x2354前为连续10条无分支/调用/SP写入指令；outer与helper各减192。结合官方caller-context契约，现可独立推导outer位置O=0xb89853f780、helper位置H=0xb89853f6c0，与停止SP一致；未读取保存栈内容，原诊断parser的unknown标记和native失败保持原样。helper独占pdata [0x7a80,0x7ec0)，trap与trap+4均在epilogue0x7e90之前，完整body展开从e1(set_fp)开始，随后d992恢复d14/d15@144。`坏FP→虚拟SP=0→读取0x90`与实际metadata、w1=0x90、w2=14、w3=2及故障指令高度吻合，属于强推断；系统展开器前驱路径和virtual CONTEXT字段仍未捕获，完整因果和任何SP-based fragment修复未验证。审计报告SHA256 `5ce4a07484302079b3e2540a944ffde6586593d1ec63097c9ab359c8269068a5`，25项冻结清单 `9d7055278322d4710522b9879dbc92d05aeddab56e0a9991ef8b1c7c92437346`，独立复审 `c8aaef9d152a31d2b5e51b2efce412565d97a9be3542ccb4e2d7062cdf36d2bb`。不得仅删除整个helper的set_fp，因为bad-SP用例仍依赖有效FP。
+
+### 失败路径展开修复：架构已审查，实现与原生验收进行中
+
+2026-10-16，独立架构审查为 Spec PASS / Quality Approved。现有四参数 ABI
+不能通用区分“FP 已坏但 SP 有效”和“对齐的 SP 已坏”；只凭 FP 为零或 SP 对齐
+无法建立恢复权威。采用显式私有固定回调契约 C0：在调用前认证实际
+`corrupt_fp` 目标及其两条机器指令，为这次真实调用提供独立的 32 字节
+SP phantom fragment；其余回调保留原 FP 路径。另为指令保持不变的 16 字节
+`wrong_return` 增加描述仍存活 helper 保存区的独立展开记录。后者来自静态
+leaf 无前进反例，尚不是实际 Windows 第二项失败的观察。
+
+架构报告 SHA-256 为
+`e334ddac743da502598f3886ebcfabebdb17e3517378a50b49d17a85b1ec0c99`，
+15 项冻结清单为
+`053324c4e895ceb5f0e49467fad59e0bab6bb6a3d28c40e68182d1223065498d`，
+独立审查为
+`d68c7f56811f523fa09425816d3635c680c2727eb635feb48a7629f06aa9b980`。
+本阶段只有符号地址模型和一次 Clang15 独立 raw COFF 发射证据，未执行固定
+LLVM20.1.8、PE 链接或新 Windows 原生程序。
+
+实施必须逐项认证 selector 的两个地址重定位、实际回调闭包和每个片段唯一的
+pdata/xdata owner，覆盖 trap 与 trap+4；同时保留所有原变体、寄存器和异常负控。
+同进程存活保存区上的 CONTEXT 副本须经真实 RtlVirtualUnwind 核对完整原合约字段，
+再恢复外层 caller；这与真实 isolated 子进程的双机会 F000、无额外 AV 及正常清理
+分别验收。没有子进程寄存器修复或异常放行。C0 仅用于私有固定代码，不能授予
+通用 checker、shipping kernel、其它架构或客户端互操作资格。原失败记录与完整
+七命令未完成状态保持，后续修复不能改写它们。
+
+### C0 协调修复的源码与宿主验收
+
+上述修复已实现，并经独立 Spec PASS / Code Quality Approved；未发现需修复项。
+五个指定 Python suite 共 158 项，其中 157 项执行通过、1 项既有旧工件可选测试
+跳过。原隔离目录 Git 换行过滤控制实际通过，没有修改本仓库或用户配置。
+原八个 PC 和正常活栈回溯保留，新增两个片段共 12 个 PC 的完整原合约字段检查，
+以及逐项缺失即拒绝的严格日志消费。variant1 同时缺少两个 helper 表，但独立正确的
+wrong_return oracle 仍须实际调用系统展开器，因此五变体均要求该 API 导入。
+
+本机 Clang15 的实际 COFF 检查符合预声明的 0x450 主范围、32 字节片段和两条
+地址重定位；消费真实 xdata 的独立模型检查 36 个上下文及 7 项元数据负控。
+generic 指令与正常元数据、原 negative/outer 指令逐字保持。Clang15 接受 bad5 的
+实际工具差异已保留，不能替代固定 LLVM20 的严格拒绝门。
+
+实现报告 SHA-256 为
+`43e03049a6e6595506ba8ceb3698645aa0c7de88c87d4a7117df04d67cc8f477`，
+111 项冻结清单为
+`820ffaf97d21f5d1916e9ca84548297e79ab221a25120fcb778033b3f73d51c7`，
+独立实现审查为
+`f2fd62cc960452356ccae5abf2a785f25a69e5f2f75ccff53d9a74f490acd8cb`。
+两份私有指南是作者交付时冻结并被编译门固定的输入，其中“待审”描述该冻结时点；
+后续审查结论以本节为准。原 source00b 的实际失败证据保持原样。
+
+新 C driver 尚未在固定 Windows 工具链编译或链接，新增系统 Rtl 调用也尚未运行。
+完整七命令、真实异常派发无额外 AV、generic/shipping 数值与包、客户端互操作仍
+OPEN；源码审查和宿主模型不授予这些资格。

@@ -60,9 +60,10 @@ class RunnerControls(unittest.TestCase):
             root = Path(tmp).resolve()
             name = 'admitted/task4c5c3b2e-contract-123-2/variant-0-pe-bindings.json'
             path = root/name; path.parent.mkdir(parents=True)
-            functions = {'frd_h264_dc_check_abi': {'rva': 0x1000, 'length': 0x440},
+            functions = {'frd_h264_dc_check_abi': {'rva': 0x1000, 'length': 0x450},
                          'frd_h264_dc_wrong_return': {'rva': 0x3000, 'length': 0x10},
-                         'frd_h264_dc_outer_probe': {'rva': 0x2000, 'length': 0x430}}
+                         'frd_h264_dc_outer_probe': {'rva': 0x2000, 'length': 0x430},
+                         'frd_h264_dc_abi_sp_failure_fragment': {'rva': 0x1450, 'length': 32}}
             raw = m.encoded({'image_size': 0x5000, 'owned_bindings': {'functions': functions}})
             path.write_bytes(raw)
             seal = {'destination': str(root), 'output_tree': {name: {'kind': 'file', 'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}
@@ -168,7 +169,7 @@ class RunnerControls(unittest.TestCase):
                          {'raw_action_output': 'b' * 64, 'canonical_rest_digest': 'sha256:' + 'b' * 64,
                           'boundary': 'fixed upload-artifact output bare SHA256 to REST/F2 sha256 digest'})
         f2 = m.source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                             'bb87afb53d7fad941519470c9be1184576a225a64f37a8dcd7c8bfc833ab7689', 'fix1_real_f2_digest')
+                             '391e280f776f6567e56bc7a3d826e46aae468b3d4ebc08b3739e9a6b877d3c53', 'fix1_real_f2_digest')
         trusted = {key: value for key, value in expected.items() if key != 'workflow_context'}
         trusted['artifact'] = {**expected['artifact'], 'size_in_bytes': 10}
         metadata = {**trusted['artifact'], 'expired': False,
@@ -191,7 +192,7 @@ class RunnerControls(unittest.TestCase):
                 return self.admission_observation
         actual_source_module = m.source_module
         f2 = actual_source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                                   'bb87afb53d7fad941519470c9be1184576a225a64f37a8dcd7c8bfc833ab7689', 'fix1_main_real_f2')
+                                   '391e280f776f6567e56bc7a3d826e46aae468b3d4ebc08b3739e9a6b877d3c53', 'fix1_main_real_f2')
         modules = {'tools/admit-windows-private-artifact.py': f2,
                    'tools/verify-windows-private-transcript.py': SimpleNamespace(),
                    'tools/windows-private-process.py': SimpleNamespace(Win32=HostAdmission)}
@@ -277,7 +278,7 @@ class RunnerControls(unittest.TestCase):
         git = shutil.which('git')
         self.assertIsNotNone(git, 'host control requires installed Git')
         raw = (ROOT / 'tools/verify-windows-private-transcript.py').read_bytes()
-        self.assertEqual(hashlib.sha256(raw).hexdigest(), '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2')
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), '9860862c965d7ca11bf8b95d63b52c83a961b240accfa2c1301eec999fd58790')
         with tempfile.TemporaryDirectory() as tmp:
             temporary = Path(tmp).resolve(); repository = temporary / 'repository'; repository.mkdir()
             home = temporary / 'home'; home.mkdir()
@@ -301,9 +302,9 @@ class RunnerControls(unittest.TestCase):
             crlf = run_git(['cat-file', '--filters', ':' + name],
                            {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.autocrlf', 'GIT_CONFIG_VALUE_0': 'false'})
             restored = run_git(['cat-file', '--filters', ':' + name], checkout_environment)
-            self.assertEqual(hashlib.sha256(crlf).hexdigest(), '800c27773b67d9b1094af54ab03191d96dedffc1068f19893fd6c55e192c3021')
-            self.assertEqual(crlf.count(b'\r\n'), 394)
-            self.assertEqual(hashlib.sha256(restored).hexdigest(), '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2')
+            self.assertEqual(hashlib.sha256(crlf).hexdigest(), '3a43c8ef0f6dc44c149e4902448da77e5fc11c2a7ec0aef03593ff628e86a242')
+            self.assertEqual(crlf.count(b'\r\n'), 436)
+            self.assertEqual(hashlib.sha256(restored).hexdigest(), '9860862c965d7ca11bf8b95d63b52c83a961b240accfa2c1301eec999fd58790')
             self.assertEqual(restored, raw)
             self.assertEqual(source.read_bytes(), raw, 'filter observation must not rewrite fixture source')
             print(json.dumps({'scope': 'host-only real Git filter fixture; not failed Windows bytes',
@@ -340,7 +341,7 @@ class RunnerControls(unittest.TestCase):
             actual, expected = json.loads(actual_raw), json.loads(expected_raw)
             self.assertEqual(actual[changed_name], {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
             self.assertEqual(expected, m.PINS)
-            self.assertEqual(expected[changed_name], '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2')
+            self.assertEqual(expected[changed_name], '9860862c965d7ca11bf8b95d63b52c83a961b240accfa2c1301eec999fd58790')
             self.assertNotEqual(actual[changed_name]['sha256'], expected[changed_name])
             summary = json.loads((output / 'summary.json').read_bytes())
             first = {'stage': 'source-pins', 'type': 'RunnerError', 'code': 'runner-helper-source-pin:' + changed_name}

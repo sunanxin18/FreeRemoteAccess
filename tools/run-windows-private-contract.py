@@ -28,8 +28,8 @@ API_BASE = 'https://api.github.com/repos/' + REPOSITORY
 SCHEMA = 'freeremotedesk.windows.private-native.v1'
 WORKFLOW = '.github/workflows/qualify-windows-private-abi.yml'
 PINS = {
-    'tools/verify-windows-private-transcript.py': '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2',
-    'tools/admit-windows-private-artifact.py': 'bb87afb53d7fad941519470c9be1184576a225a64f37a8dcd7c8bfc833ab7689',
+    'tools/verify-windows-private-transcript.py': '9860862c965d7ca11bf8b95d63b52c83a961b240accfa2c1301eec999fd58790',
+    'tools/admit-windows-private-artifact.py': '391e280f776f6567e56bc7a3d826e46aae468b3d4ebc08b3739e9a6b877d3c53',
     'tools/windows-private-process.py': 'efe57549a64a3c7418002c97d81ddd9af293b86e4ebaf824bc0a88081d2f5fb0',
 }
 COMMANDS = (('register', 0), ('unwind', 0), ('isolated', 0), ('unwind', 1), ('unwind', 2), ('unwind', 3), ('unwind', 4))
@@ -331,7 +331,7 @@ def admitted_trap_sites(artifact_root, seal, expected, verify):
     functions = binding['owned_bindings']['functions']
     return {'image_size': binding['image_size'],
             'functions': {name: {key: functions[name][key] for key in ('rva', 'length')}
-                          for name in ('frd_h264_dc_check_abi', 'frd_h264_dc_wrong_return', 'frd_h264_dc_outer_probe')}}
+                          for name in ('frd_h264_dc_check_abi', 'frd_h264_dc_wrong_return', 'frd_h264_dc_outer_probe', 'frd_h264_dc_abi_sp_failure_fragment')}}
 
 
 def bound_transcript_parser(transcript, sites):

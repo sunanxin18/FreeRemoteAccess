@@ -116,6 +116,14 @@ class SourceGateTests(unittest.TestCase):
         with self.assertRaises(GATE.GateError):
             GATE.compile_argv(self.root, out, "invented")
 
+    def test_private_abi_compile_explicitly_specializes_C0_once(self):
+        out=self.root/'target/task4c5c3b2c-unit'
+        for case in ('abi','negative')+tuple('bad-unwind-%d'%n for n in range(1,6)):
+            argv=GATE.compile_argv(self.root,out,case)
+            self.assertEqual(argv.count('-DFRD_DC_WINDOWS_ABI_CONTRACT=1'),1)
+            self.assertIn('--target=aarch64-w64-mingw32',argv)
+            self.assertFalse(any('ARM64EC' in arg or 'authority' in arg or 'callback=' in arg for arg in argv))
+
     def test_wrong_checkout_and_existing_output_rejected(self):
         out = self.root / "target/task4c5c3b2c-unit"
         with self.assertRaises(GATE.GateError):

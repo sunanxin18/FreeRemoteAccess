@@ -13,8 +13,8 @@ import re
 MAX_STDOUT = 1024 * 1024
 MAX_CHILD_STREAM = 32767
 MAX_LINE = 4096
-_PC = (('entry', 0), ('after_alloc', 4), ('body', 0x30), ('call', 0x1a0),
-       ('return', 0x1a4), ('epilogue', 0x410), ('after_d14', 0x414), ('ret', 0x43c))
+_PC = (('entry', 0), ('after_alloc', 4), ('body', 0x30), ('call', 0x1b0),
+       ('return', 0x1b4), ('epilogue', 0x420), ('after_d14', 0x424), ('ret', 0x44c))
 _CASES = ('preserve', 'corrupt_fp', 'corrupt_sp16', 'corrupt_sp8', 'wrong_return', 'no_return')
 _PAIRS = frozenset([('register', 0), ('isolated', 0)] + [('unwind', v) for v in range(5)])
 _LIMITATIONS = (
@@ -161,14 +161,27 @@ def _admission(reader, variant):
         b = _fields(reader, 'binding', id=name, rva='hex', offset='hex', table='absent' if variant == 1 else 'present')
         if helper is None:
             helper = b['rva']
-        _require(0 < helper <= 0xffffffff - 0x440 and helper % 4 == 0, 'helper RVA range/alignment')
+        _require(0 < helper <= 0xffffffff - 0x450 and helper % 4 == 0, 'helper RVA range/alignment')
         _require(b['rva'] == helper + offset and b['offset'] == offset, 'binding PC offset/RVA')
         bindings.append(tuple(b.items()))
     b = _fields(reader, 'binding', outer_rva='hex', return_offset='188', epilogue_offset='400', length='430')
     outer = b['outer_rva']
     _require(0 < outer <= 0xffffffff - 0x430 and outer % 4 == 0, 'outer RVA range/alignment')
-    _require(outer + 0x430 <= helper or helper + 0x440 <= outer, 'overlapping helper/outer')
+    _require(outer + 0x430 <= helper or helper + 0x450 <= outer, 'overlapping helper/outer')
     bindings.append(tuple(b.items()))
+    previous = [(helper, helper + 0x450), (outer, outer + 0x430)]
+    for owner, length, trap in (('sp', 32, 24), ('wrong_return', 16, 8)):
+        f = _fields(reader, 'fragment', owner=owner, rva='hex', length='hex', trap_offset='hex',
+                    table='absent' if variant == 1 and owner == 'sp' else 'present',
+                    authority='bound-callback-preserves-sp')
+        _require(f['length'] == length and f['trap_offset'] == trap and
+                 0 < f['rva'] <= 0xffffffff - length and f['rva'] % 4 == 0,
+                 'fragment fixed range/trap')
+        _require(all(f['rva'] + length <= a or b <= f['rva'] for a, b in previous), 'fragment owner overlaps')
+        if owner == 'sp':
+            _require(f['rva'] == helper + 0x450, 'C0 fixed helper/fragment adjacency')
+        previous.append((f['rva'], f['rva'] + length))
+        bindings.append(tuple(f.items()))
     return tuple(d.items()), tuple(bindings)
 
 
@@ -218,8 +231,32 @@ def _unwind(reader, variant):
         rows.append(tuple(d.items()))
     if sps:
         _require(len(set(sps)) == 1 and len(set(pcs)) == 1, 'synthetic caller consistency')
+    # 独立 fragment saved-slot controls；不能用旧八 PC 代替。
+    fragment_sps, fragment_pcs = [], []
+    for owner, length in (('sp', 32), ('wrong_return', 16)):
+        for offset in range(0, length, 4):
+            if variant == 1 and owner == 'sp':
+                d = _fields(reader, 'fragment_unwind', owner=owner, offset='hex', outcome='expected-missing-nonleaf-table')
+            else:
+                rtl.append(_rtl(reader))
+                d = _fields(reader, 'fragment_unwind', owner=owner, offset='hex', diff='h64', expected='h64', caller_sp='h64', caller_pc='h64')
+                want = (1 << 20 if variant == 2 else 3 if variant == 3 else 0) if owner == 'sp' else 0
+                _require(d['diff'] == want and d['expected'] == want, 'fragment independent exact mask')
+                _require(d['caller_sp'] > 0 and d['caller_sp'] % 16 == 0 and d['caller_pc'] > 0 and d['caller_pc'] % 4 == 0,
+                         'fragment caller SP/PC alignment')
+                fragment_sps.append(d['caller_sp'] - (16 if want == 1 << 20 else 0))
+                fragment_pcs.append(d['caller_pc'])
+            _require(d['offset'] == offset, 'fragment every instruction order')
+            rows.append(tuple(d.items()))
+    _require(len(set(fragment_sps)) == 1 and len(set(fragment_pcs)) == 1, 'fragment synthetic caller consistency')
     if variant in (0, 4):
-        rtl.extend(_rtl(reader) for _ in range(3))
+        rtl.append(_rtl(reader))  # 原真实 callback → helper。
+        for owner, length in (('sp', 32), ('wrong_return', 16)):
+            for offset in range(0, length, 4):
+                rtl.extend(_rtl(reader) for _ in range(2))
+                d = _fields(reader, 'fragment_walk', owner=owner, offset='hex', outcome='matched')
+                _require(d['offset'] == offset, 'fragment live copy order')
+        rtl.extend(_rtl(reader) for _ in range(2))
         walk = 'callback-helper-outer-caller outcome=matched'
     else:
         walk = 'outcome=not-applicable-bad-body-metadata'
@@ -251,8 +288,8 @@ def _exception(reader, case, pid):
 
 def _trap_sites(value):
     """调用方持有的 F2 数据；固定 offset/opcode 不接受外部覆盖。"""
-    lengths = {'frd_h264_dc_check_abi': 0x440, 'frd_h264_dc_wrong_return': 0x10,
-               'frd_h264_dc_outer_probe': 0x430}
+    lengths = {'frd_h264_dc_check_abi': 0x450, 'frd_h264_dc_wrong_return': 0x10,
+               'frd_h264_dc_outer_probe': 0x430, 'frd_h264_dc_abi_sp_failure_fragment': 32}
     _require(type(value) is dict and set(value) == {'image_size', 'functions'}, 'expected trap sites schema')
     size, functions = value['image_size'], value['functions']
     _require(type(size) is int and 0 < size <= 0xffffffff, 'expected image size')
@@ -279,7 +316,9 @@ def _child(reader, case, parent_bindings, sites):
     image = _fields(reader, 'child_image', case=case, pid='pid', base='hex')
     _require(image['pid'] == pid and image['base'] > 0 and image['base'] % 4 == 0 and
              image['base'] + sites['image_size'] <= (1 << 64), 'child image ownership/base/range')
-    name, offset = ('frd_h264_dc_wrong_return', 8) if case == 'wrong_return' else ('frd_h264_dc_check_abi', 0x408)
+    name, offset = (('frd_h264_dc_wrong_return', 8) if case == 'wrong_return' else
+                    ('frd_h264_dc_abi_sp_failure_fragment', 24) if case == 'corrupt_fp' else
+                    ('frd_h264_dc_check_abi', 0x418))
     expected_pc = image['base'] + sites['functions'][name]['rva'] + offset
     events, probes = [Record('child_image', tuple(image.items()))], []
     created, loader, exited = False, False, False
@@ -378,8 +417,11 @@ def parse_transcript(stdout: bytes, stderr: bytes, suite: str, variant: int,
     if suite == 'isolated':
         sites = _trap_sites(expected_trap_sites)
         _require(dict(bindings[0])['rva'] == sites['functions']['frd_h264_dc_check_abi']['rva'] and
-                 dict(bindings[-1])['outer_rva'] == sites['functions']['frd_h264_dc_outer_probe']['rva'],
+                 dict(bindings[8])['outer_rva'] == sites['functions']['frd_h264_dc_outer_probe']['rva'],
                  'transcript/admitted helper and outer RVA')
+        _require(dict(bindings[9])['rva'] == sites['functions']['frd_h264_dc_abi_sp_failure_fragment']['rva'] and
+                 dict(bindings[10])['rva'] == sites['functions']['frd_h264_dc_wrong_return']['rva'],
+                 'transcript/admitted fragment RVAs')
     masks = [_mask(reader, 'baseline_return', 0)]
     unwind, rtl, children, walk = (), (), (), None
     if suite == 'register':

@@ -73,6 +73,44 @@ def container_pe(imports=DEFAULT_IMPORTS):
     return data
 
 
+
+def controlled_coff(functions, tables, selector=False, labels=()):
+    """独立手写实际 COFF bytes；只为 parser/机器字负控，不是 native 程序。"""
+    text = bytearray(); function_offsets = {}
+    for name, raw in functions:
+        function_offsets[name] = len(text); text.extend(raw)
+    xdata = bytearray(); pdata = bytearray(); pdata_relocs = []
+    for name, metadata in tables:
+        direct = name in ('frd_h264_dc_abi_sp_failure_fragment', 'frd_h264_dc_wrong_return')
+        pdata_relocs += [(len(pdata), name if direct else '.text', 2), (len(pdata)+4, '.xdata', 2)]
+        pdata.extend(struct.pack('<II', 0 if direct else function_offsets[name], len(xdata)))
+        xdata.extend(metadata)
+    names = [(name, offset, 1, 0x20, 2) for name, offset in function_offsets.items()]
+    names += [(name,value,1,0,2) for name,value in labels]
+    names += [('.text',0,1,0,3),('.xdata',0,2,0,3),('.pdata',0,3,0,3)]
+    if selector: names.append(('frd_h264_dc_corrupt_fp',0,0,0,2))
+    symbol_indices = {item[0]:index for index,item in enumerate(names)}
+    text_relocs = [(0x1a0,'frd_h264_dc_corrupt_fp',4),(0x1a4,'frd_h264_dc_corrupt_fp',6)] if selector else []
+    chunks=[]; section_headers=[]; cursor=20+3*40
+    for name, raw, relocs in [('.text',text,text_relocs),('.xdata',xdata,[]),('.pdata',pdata,pdata_relocs)]:
+        relocation_bytes=b''.join(struct.pack('<IIH',offset,symbol_indices[target],kind) for offset,target,kind in relocs)
+        section_headers.append(struct.pack('<8sIIIIIIHHI',name.encode(),0,0,len(raw),cursor,cursor+len(raw) if relocs else 0,0,len(relocs),0,0x60300020 if name=='.text' else 0x40300040))
+        chunks += [bytes(raw),relocation_bytes];cursor+=len(raw)+len(relocation_bytes)
+    strings=bytearray(bytes(4));symbol_bytes=bytearray()
+    for name,value,section,typ,storage in names:
+        encoded=name.encode()
+        if len(encoded)>8:
+            encoded=struct.pack('<II',0,len(strings));strings.extend(name.encode()+b'\0')
+        symbol_bytes.extend(struct.pack('<8sIhHBB',encoded,value,section,typ,storage,0))
+    struct.pack_into('<I',strings,0,len(strings))
+    return struct.pack('<HHIIIHH',0xaa64,3,0,cursor,len(names),0,0)+b''.join(section_headers)+b''.join(chunks)+symbol_bytes+strings
+
+
+GOOD_SP = bytes.fromhex('08002028e5d992d910d88ed80ce6e6e6e6c802400ce4e3e3')
+GOOD_MAIN = bytes.fromhex('14016028e1d992d910d88ed80ce6e6e6e6c802400ce4e3e3')
+GOOD_OUTER = bytes.fromhex('0c016028e1d992d910d88ed80ce6e6e6e6c802400ce4e3e3')
+GOOD_WRONG = bytes.fromhex('04002028e5d992d910d88ed80ce6e6e6e6c802400ce4e3e3')
+
 class TempTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="contract-container-only-")
@@ -83,33 +121,60 @@ class TempTests(unittest.TestCase):
 class TrapBindingTests(TempTests):
     # 手写函数范围与指令位置；object_range 仅替身读取，不运行任何程序。
     def fixture(self, word=0xd43e0000, changed=None):
-        definitions = [('frd_h264_dc_check_abi', 0x1000, 0x440, 0x408),
-                       ('frd_h264_dc_wrong_return', 0x3000, 0x10, 8),
-                       ('frd_h264_dc_outer_probe', 0x2000, 0x430, 0x3f8)]
-        raw, symbols, pdata = {}, {}, []
-        for name, rva, length, offset in definitions:
-            data = bytearray(length)
-            struct.pack_into('<I', data, offset, word if changed in (None, name) else 0xd43e0000)
-            raw[name] = bytes(data)
-            symbols[name] = {'rva': rva, 'section': 1, 'value': 0}
-            pdata.append({'begin_rva': rva, 'length': length})
-        def at(rva, size):
-            for name, start, length, _ in definitions:
-                if start <= rva and rva + size <= start + length:
-                    return raw[name][rva-start:rva-start+size]
+        sp = 'frd_h264_dc_abi_sp_failure_fragment'
+        definitions = [('frd_h264_dc_check_abi',0x1000,0x450,0x418), (sp,0x1450,32,24),
+                       ('frd_h264_dc_outer_probe',0x2000,0x430,0x3f8),
+                       ('frd_h264_dc_preserve',0x3000,4,None),('frd_h264_dc_corrupt_fp',0x3004,8,None),
+                       ('frd_h264_dc_corrupt_sp16',0x300c,8,None),('frd_h264_dc_corrupt_sp8',0x3014,8,None),
+                       ('frd_h264_dc_wrong_return',0x301c,16,8),('frd_h264_dc_no_return',0x302c,4,None)]
+        callbacks = {'frd_h264_dc_preserve':'c0035fd6','frd_h264_dc_corrupt_fp':'fd031faac0035fd6',
+            'frd_h264_dc_corrupt_sp16':'ff430091c0035fd6','frd_h264_dc_corrupt_sp8':'ff230091c0035fd6',
+            'frd_h264_dc_wrong_return':'5e000010c0035fd600003ed4ffffff17','frd_h264_dc_no_return':'00000014'}
+        raw,linked,symbols,pdata={},{},{},[]
+        metadata={'frd_h264_dc_check_abi':GOOD_MAIN,sp:GOOD_SP,'frd_h264_dc_outer_probe':GOOD_OUTER,'frd_h264_dc_wrong_return':GOOD_WRONG}
+        for name,rva,length,trap in definitions:
+            data=bytearray.fromhex(callbacks[name]) if name in callbacks else bytearray(length)
+            if name=='frd_h264_dc_check_abi':
+                struct.pack_into('<5I',data,0x1a0,0x90000009,0x91000129,0xeb09007f,0x54001520,0xd63f0060)
+            if name==sp:
+                data[:]=struct.pack('<8I',0xd63f0060,0x910003e9,0xf2400d3f,0x54000061,0xeb0903bf,0x54ffea80,0xd43e0000,0x17ffffff)
+            if trap is not None: struct.pack_into('<I',data,trap,word if changed in (None,name) else 0xd43e0000)
+            raw[name]=bytes(data);linked[name]=bytes(data)
+            symbols[name]={'rva':rva,'section':1,'value':0}
+            if name in metadata:pdata.append({'begin_rva':rva,'length':length,'xdata_hex':metadata[name].hex()})
+        # 独立 linker 算术：target=0x3004，selector PC=0x11a0。
+        data=bytearray(linked['frd_h264_dc_check_abi'])
+        struct.pack_into('<II',data,0x1a0,0xd0000009,0x91001129)
+        linked['frd_h264_dc_check_abi']=bytes(data)
+        helper_functions=[(name,raw[name]) for name in ('frd_h264_dc_check_abi',sp)]
+        negative_functions=[(name,raw[name]) for name,_,_,_ in definitions if name not in ('frd_h264_dc_check_abi',sp)]
+        helper_labels=[('frd_h264_dc_abi_pc_after_alloc',4),('frd_h264_dc_abi_pc_body',0x30),('frd_h264_dc_abi_pc_call',0x1b0),('frd_h264_dc_abi_pc_return',0x1b4),('frd_h264_dc_abi_pc_epilogue',0x420),('frd_h264_dc_abi_pc_epilogue_after_d14',0x424),('frd_h264_dc_abi_pc_ret',0x44c),('frd_h264_dc_abi_sp_failure_return',0x454),('frd_h264_dc_abi_sp_failure_trap',0x468),('frd_h264_dc_abi_sp_failure_end',0x470)]
+        for name,value in helper_labels:symbols[name]={'rva':0x1000+value,'section':1,'value':value}
+        negative_offsets={name:sum(len(r) for _,r in negative_functions[:i]) for i,(name,_) in enumerate(negative_functions)}
+        negative_labels=[('frd_h264_dc_outer_pc_return',0x188),('frd_h264_dc_wrong_return_trap',negative_offsets['frd_h264_dc_wrong_return']+8),('frd_h264_dc_wrong_return_end',negative_offsets['frd_h264_dc_wrong_return']+16)]
+        symbols['frd_h264_dc_outer_pc_return']={'rva':0x2188,'section':1,'value':0}
+        symbols['frd_h264_dc_wrong_return_trap']={'rva':0x3024,'section':1,'value':0}
+        symbols['frd_h264_dc_wrong_return_end']={'rva':0x302c,'section':1,'value':0}
+        (self.root/'helper.obj').write_bytes(controlled_coff(helper_functions,[(name,metadata[name]) for name,_ in helper_functions],True,helper_labels))
+        (self.root/'negative.obj').write_bytes(controlled_coff(negative_functions,[(name,metadata[name]) for name,_ in negative_functions if name in metadata],labels=negative_labels))
+        routing = bytearray(); strings = bytearray()
+        for name in callbacks:
+            routing.extend(struct.pack('<QQ',0x140005100+len(strings),0x140000000+symbols[name]['rva']))
+            strings.extend(name.removeprefix('frd_h264_dc_').encode()+b'\0')
+        def at(rva,size):
+            if 0x5000<=rva and rva+size<=0x5060:return bytes(routing[rva-0x5000:rva-0x5000+size])
+            if 0x5100<=rva and rva+size<=0x5100+len(strings):return bytes(strings[rva-0x5100:rva-0x5100+size])
+            if rva==0x4000 and size==944:return bytes(912)+bytes.fromhex('3147414944445246')+bytes(24)
+            for name,start,length,_ in definitions:
+                if start<=rva and rva+size<=start+length:return linked[name][rva-start:rva-start+size]
             raise AssertionError('fixture range')
-        symbols['frd_diag_reference'] = {'rva': 0x4000, 'section': 2, 'value': 0}
-        code_at=at
-        def with_data(rva, size):
-            if rva==0x4000 and size==944:
-                return bytes(912)+bytes.fromhex('3147414944445246')+bytes(24)
-            return code_at(rva, size)
-        pe = {'symbols': symbols, 'pdata': pdata, 'at': with_data, 'image_size': 0x5000,
-              'sections': [{'rva': 0x1000, 'virtual_size': 0x2010, 'flags': 0x60000020},
-                           {'rva': 0x4000, 'virtual_size': 944, 'flags': 0xc0000040}]}
-        def object_range(path, name):
-            return raw[name], {name: {'section': 1, 'value': 0}}
-        return pe, object_range
+        symbols['frd_diag_reference']={'rva':0x4000,'section':2,'value':0}
+        symbols['frd_h264_dc_private_children']={'rva':0x5000,'section':3,'value':0}
+        pe={'symbols':symbols,'pdata':pdata,'at':at,'image_size':0x6000,'image_base':0x140000000,
+            'sections':[{'rva':0x1000,'virtual_size':0x2030,'flags':0x60000020},{'rva':0x4000,'virtual_size':944,'flags':0xc0000040},{'rva':0x5000,'virtual_size':0x200,'flags':0x40000040}]}
+        def reader(path,name):
+            return raw[name], {name:{'section':1,'value':0}}
+        return pe,reader
 
     def test_matching_object_and_pe_with_old_trap_are_rejected(self):
         for name, word in [('frd_h264_dc_check_abi', 0xd421e020),
@@ -146,8 +211,8 @@ class TrapBindingTests(TempTests):
                 raw, symbols = original(path, name)
                 if name != 'frd_h264_dc_check_abi': return raw, symbols
                 if mode == 'neighbour':
-                    data = bytearray(raw); data[0x408:0x40c] = b'\0'*4
-                    data[0x40c:0x410] = bytes.fromhex('00003ed4')
+                    data = bytearray(raw); data[0x418:0x41c] = b'\0'*4
+                    data[0x41c:0x420] = bytes.fromhex('00003ed4')
                     return bytes(data), symbols
                 if mode == 'length': return raw+b'\0'*4, symbols
                 return raw, symbols
@@ -158,6 +223,130 @@ class TrapBindingTests(TempTests):
             with self.subTest(mode=mode), mock.patch.object(GATE, 'object_range', side_effect=changed), mock.patch.object(GATE, 'sha', return_value='0'*64):
                 with self.assertRaises(GATE.GateError):
                     GATE.bindings(pe, self.root/'helper.obj', self.root/'negative.obj')
+
+
+class C0MachineControls(TrapBindingTests):
+    def admit(self, pe):
+        return GATE.bindings(pe,self.root/'helper.obj',self.root/'negative.obj')
+
+    def object_patch(self, path, section_name, offset, replacement):
+        data=bytearray(path.read_bytes()); sections,_=GATE.object_layout(path)
+        section=next(item for item in sections if item['name']==section_name)
+        start=section['raw_offset']+offset;data[start:start+len(replacement)]=replacement;path.write_bytes(data)
+
+    def test_actual_coff_closure_and_two_relocations_bind_exact_linked_words(self):
+        pe,_=self.fixture();result,_=self.admit(pe)
+        self.assertEqual(result['private_callback_contract']['id'],'C0')
+        sections,_=GATE.object_layout(self.root/'helper.obj')
+        relocs=next(s for s in sections if s['name']=='.text')['relocations']
+        self.assertEqual([(r['offset'],r['kind']) for r in relocs],[(0x1a0,4),(0x1a4,6)])
+        raw,_=GATE.object_range(self.root/'helper.obj','frd_h264_dc_check_abi')
+        self.assertEqual(GATE.relocated_helper(raw,relocs,0x1000,0x3004),pe['at'](0x1000,0x450))
+        # 页差为负、页内低12位都由独立地址值确定。
+        linked=GATE.relocated_helper(raw,relocs,0x3000,0x1ffc)
+        self.assertEqual(struct.unpack_from('<II',linked,0x1a0),(0xd0ffffe9,0x913ff129))
+
+    def test_selector_relocation_field_addend_opcode_register_range_and_extra_refuse(self):
+        import copy
+        self.fixture();sections,_=GATE.object_layout(self.root/'helper.obj')
+        good=next(s for s in sections if s['name']=='.text')['relocations']
+        raw,_=GATE.object_range(self.root/'helper.obj','frd_h264_dc_check_abi')
+        mutations=[]
+        for index in (0,1):
+            for field,value in [('offset',0x1a8),('kind',3)]:
+                changed=copy.deepcopy(good);changed[index][field]=value;mutations.append((raw,changed,0x3004))
+            for field,value in [('name','frd_h264_dc_corrupt_sp16'),('value',4),('section',1),('type',32),('storage',3)]:
+                changed=copy.deepcopy(good);changed[index]['symbol'][field]=value;mutations.append((raw,changed,0x3004))
+            for bit in (0,5,10,22,29):
+                changed=bytearray(raw);word=struct.unpack_from('<I',changed,0x1a0+index*4)[0];struct.pack_into('<I',changed,0x1a0+index*4,word^(1<<bit))
+                mutations.append((bytes(changed),good,0x3004))
+        mutations += [(raw,good[:1],0x3004),(raw,good+good[:1],0x3004),(raw,good,1<<34)]
+        for data,relocs,target in mutations:
+            with self.subTest(relocs=relocs,target=target),self.assertRaises(GATE.GateError):
+                GATE.relocated_helper(data,relocs,0x1000,target)
+
+    def test_same_object_and_linked_callback_mutations_refuse_including_multiple_fault(self):
+        for name,offset in [('frd_h264_dc_corrupt_fp',0),('frd_h264_dc_corrupt_fp',4),
+                            ('frd_h264_dc_corrupt_sp16',0),('frd_h264_dc_wrong_return',0),('frd_h264_dc_no_return',0)]:
+            pe,_=self.fixture();path=self.root/'negative.obj';sections,symbols=GATE.object_layout(path)
+            symbol=next(item for item in symbols.values() if item['name']==name)
+            # 原二指令 FP callback 的 RET 改为 SP 写，产生明确 multi-fault 负控。
+            replacement=struct.pack('<I',0x910043ff if offset==4 else 0xd503201f)
+            self.object_patch(path,'.text',symbol['value']+offset,replacement)
+            original=pe['at'];rva=pe['symbols'][name]['rva'];raw=bytearray(original(rva,len(bytes.fromhex(GATE.CALLBACK_BYTES[name]))));raw[offset:offset+4]=replacement
+            pe['at']=lambda address,n,original=original,rva=rva,raw=bytes(raw): raw[address-rva:address-rva+n] if rva<=address and address+n<=rva+len(raw) else original(address,n)
+            with self.subTest(name=name,offset=offset),self.assertRaisesRegex(GATE.GateError,'fixed callback'):
+                self.admit(pe)
+
+    def test_same_object_and_linked_selector_guard_branch_mutations_refuse(self):
+        for offset in (0x1a8,0x1ac,0x1b0):
+            pe,_=self.fixture();replacement=struct.pack('<I',0xd503201f)
+            self.object_patch(self.root/'helper.obj','.text',offset,replacement)
+            old=pe['at'];raw=bytearray(old(0x1000,0x450));raw[offset:offset+4]=replacement
+            pe['at']=lambda address,n,old=old,raw=bytes(raw):raw[address-0x1000:address-0x1000+n] if 0x1000<=address and address+n<=0x1450 else old(address,n)
+            with self.subTest(offset=offset),self.assertRaisesRegex(GATE.GateError,'selector/call path'):
+                self.admit(pe)
+
+    def test_fragment_metadata_header_actions_padding_and_shared_records_refuse(self):
+        # object 与 linked xdata 同时变动；raw==linked 不能替代独立固定 frame oracle。
+        for name,index,value in [('frd_h264_dc_abi_sp_failure_fragment',4,0xe1),
+                                 ('frd_h264_dc_abi_sp_failure_fragment',20,0x0b),
+                                 ('frd_h264_dc_abi_sp_failure_fragment',19,0x41),
+                                 ('frd_h264_dc_abi_sp_failure_fragment',0,7),
+                                 ('frd_h264_dc_abi_sp_failure_fragment',2,0x60),
+                                 ('frd_h264_dc_abi_sp_failure_fragment',2,0x24),
+                                 ('frd_h264_dc_abi_sp_failure_fragment',23,0),
+                                 ('frd_h264_dc_wrong_return',4,0xe1)]:
+            pe,_=self.fixture();path=self.root/('helper.obj' if 'fragment' in name else 'negative.obj')
+            tables=GATE.object_metadata(path,('frd_h264_dc_check_abi',GATE.SP_FRAGMENT) if 'fragment' in name else ('frd_h264_dc_outer_probe','frd_h264_dc_wrong_return'))
+            sections,_=GATE.object_layout(path);xdata=next(s for s in sections if s['name']=='.xdata')['bytes'];base=xdata.index(tables[name])
+            self.object_patch(path,'.xdata',base+index,bytes([value]))
+            entry=next(e for e in pe['pdata'] if e['begin_rva']==pe['symbols'][name]['rva']);raw=bytearray.fromhex(entry['xdata_hex']);raw[index]=value;entry['xdata_hex']=raw.hex()
+            with self.subTest(name=name,index=index),self.assertRaises(GATE.GateError):self.admit(pe)
+
+    def test_missing_duplicate_overlap_foreign_owner_and_trap_plus4_truncation_refuse(self):
+        for mode in ('missing','duplicate','overlap','foreign','truncate','shared-xdata'):
+            pe,_=self.fixture();sp=next(e for e in pe['pdata'] if e['begin_rva']==0x1450)
+            if mode=='missing':pe['pdata'].remove(sp)
+            elif mode=='duplicate':pe['pdata'].append(dict(sp))
+            elif mode=='overlap':pe['pdata'].append({'begin_rva':0x144c,'length':40,'xdata_hex':GOOD_SP.hex()})
+            elif mode=='foreign':sp['begin_rva']=0x144c
+            elif mode=='truncate':sp['length']=28
+            else:sp['xdata_hex']=GOOD_MAIN.hex()
+            with self.subTest(mode=mode),self.assertRaises(GATE.GateError):self.admit(pe)
+
+    def test_fixed_child_table_and_all_linked_instruction_labels_are_bound(self):
+        for mode in ('missing-table','writable-table','callback-route','case-name','label-missing','label-offset','label-section'):
+            pe,_=self.fixture()
+            if mode=='missing-table':del pe['symbols']['frd_h264_dc_private_children']
+            elif mode=='writable-table':pe['sections'][2]['flags']|=0x80000000
+            elif mode in ('callback-route','case-name'):
+                previous=pe['at'];raw=bytearray(previous(0x5000,96))
+                struct.pack_into('<Q',raw,24 if mode=='callback-route' else 16,0x14000300c if mode=='callback-route' else 0x140005100)
+                pe['at']=lambda rva,n,previous=previous,raw=bytes(raw):raw if rva==0x5000 and n==96 else previous(rva,n)
+            else:
+                item=pe['symbols']['frd_h264_dc_abi_sp_failure_trap']
+                if mode=='label-missing':del pe['symbols']['frd_h264_dc_abi_sp_failure_trap']
+                elif mode=='label-offset':item['rva']+=4
+                else:item['section']=2
+            with self.subTest(mode=mode),self.assertRaises(GATE.GateError):self.admit(pe)
+
+    def test_actual_pdata_wrong_relocation_kind_symbol_addend_and_alias_refuse(self):
+        for mode in ('kind','symbol','addend','xdata-addend','alias'):
+            self.fixture();path=self.root/'helper.obj';data=bytearray(path.read_bytes())
+            sections,_=GATE.object_layout(path);pd=next(s for s in sections if s['name']=='.pdata')
+            if mode=='kind':struct.pack_into('<H',data,pd['reloc_offset']+8,4)
+            elif mode=='symbol':struct.pack_into('<I',data,pd['reloc_offset']+4,1)
+            elif mode=='addend':struct.pack_into('<I',data,pd['raw_offset']+8,4)
+            elif mode=='xdata-addend':struct.pack_into('<I',data,pd['raw_offset']+12,0)
+            else:
+                # 相同有效 begin、不同 symbol/addend，也拒绝为非声明 .rva。
+                symbols=GATE.object_layout(path)[1];text_index=next(i for i,v in symbols.items() if v['name']=='.text')
+                struct.pack_into('<I',data,pd['reloc_offset']+2*10+4,text_index)
+                struct.pack_into('<I',data,pd['raw_offset']+8,0x450)
+            path.write_bytes(data)
+            with self.subTest(mode=mode),self.assertRaises(GATE.GateError):
+                GATE.object_metadata(path,('frd_h264_dc_check_abi',GATE.SP_FRAGMENT))
 
 
 class SourceAndPathTests(TempTests):
@@ -366,19 +555,19 @@ class BinaryAndRecordTests(TempTests):
                 with self.assertRaisesRegex(GATE.GateError, "actual import closure 必须恰为"):
                     GATE.pe_admit(path)
 
-    def test_variant_one_two_names_and_optional_kernel32_virtual_unwind(self):
-        path = self.root / "container.exe"
-        for symbols in ((CONTRACT_APIS[:2] + CONTRACT_APIS[3:]), CONTRACT_APIS):
-            for kernel, crt in (("KERNEL32.dll", "msvcrt.dll"), ("KeRnEl32.DlL", "MSVCRT.DLL")):
-                with self.subTest(symbols=symbols, kernel=kernel):
-                    path.write_bytes(container_pe(((kernel, symbols), (crt, ("__C_specific_handler",)), DEFAULT_IMPORTS[2])))
-                    parsed = GATE.pe_admit(path, variant=1)
-                    self.assertEqual(parsed["imports"][0]["symbols"], [{"name": name} for name in symbols])
+    def test_variant_one_requires_native_unwinder_for_wrong_return_fragment(self):
+        path=self.root/'container.exe'
+        for kernel,crt in (('KERNEL32.dll','msvcrt.dll'),('KeRnEl32.DlL','MSVCRT.DLL')):
+            path.write_bytes(container_pe(((kernel,CONTRACT_APIS),(crt,('__C_specific_handler',)),DEFAULT_IMPORTS[2])))
+            GATE.pe_admit(path,variant=1)
+            path.write_bytes(container_pe(((kernel,CONTRACT_APIS[:2]+CONTRACT_APIS[3:]),(crt,('__C_specific_handler',)),DEFAULT_IMPORTS[2])))
+            with self.assertRaisesRegex(GATE.GateError,'KERNEL32 缺少精确命名 RtlVirtualUnwind'):
+                GATE.pe_admit(path,variant=1)
 
     def test_other_variants_require_virtual_unwind_regardless_of_filename(self):
         # 即使名称宣称 variant1，也只有显式可信 selector 可以选该规则。
         path = self.root / "abi-contract-1.exe"
-        for variant in (0, 2, 3, 4):
+        for variant in (0, 1, 2, 3, 4):
             with self.subTest(variant=variant):
                 path.write_bytes(container_pe())
                 GATE.pe_admit(path, variant=variant)
@@ -391,9 +580,9 @@ class BinaryAndRecordTests(TempTests):
 
     def test_variant_one_each_required_api_missing_spelling_or_ordinal_rejected(self):
         path = self.root / "container.exe"
-        for index, api in enumerate((CONTRACT_APIS[:2] + CONTRACT_APIS[3:])):
+        for index, api in enumerate(CONTRACT_APIS):
             for kind in ("missing", "spelling", "ordinal"):
-                symbols = list((CONTRACT_APIS[:2] + CONTRACT_APIS[3:]))
+                symbols = list(CONTRACT_APIS)
                 if kind == "missing":
                     del symbols[index]
                 else:
@@ -410,7 +599,7 @@ class BinaryAndRecordTests(TempTests):
                 symbols = CONTRACT_APIS if duplicate else tuple(name for name in CONTRACT_APIS if name != api)
                 with self.subTest(api=api, duplicate=duplicate):
                     path.write_bytes(container_pe((("KERNEL32.dll", symbols), ("msvcrt.dll", ("__C_specific_handler", api)), DEFAULT_IMPORTS[2])))
-                    error = "KERNEL32 缺少精确命名" if not duplicate and api != "RtlVirtualUnwind" else "Rtl API 必须由 KERNEL32 提供"
+                    error = "KERNEL32 缺少精确命名" if not duplicate else "Rtl API 必须由 KERNEL32 提供"
                     with self.assertRaisesRegex(GATE.GateError, error):
                         GATE.pe_admit(path, variant=1)
 

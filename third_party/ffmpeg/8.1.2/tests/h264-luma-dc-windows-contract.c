@@ -58,6 +58,15 @@ DECL_REG(x,19); DECL_REG(x,20); DECL_REG(x,21); DECL_REG(x,22); DECL_REG(x,23);
 DECL_REG(x,24); DECL_REG(x,25); DECL_REG(x,26); DECL_REG(x,27); DECL_REG(x,28);
 DECL_REG(d,8); DECL_REG(d,9); DECL_REG(d,10); DECL_REG(d,11);
 DECL_REG(d,12); DECL_REG(d,13); DECL_REG(d,14); DECL_REG(d,15);
+typedef enum { CHILD_PRESERVE, CHILD_FP, CHILD_SP16, CHILD_SP8, CHILD_LR,
+               CHILD_NO_RETURN, CHILD_COUNT } child_id;
+typedef struct {const char *name; frd_dc_kernel callback;} child_case;
+const child_case frd_h264_dc_private_children[CHILD_COUNT] = {
+    {"preserve",frd_h264_dc_preserve},{"corrupt_fp",frd_h264_dc_corrupt_fp},
+    {"corrupt_sp16",frd_h264_dc_corrupt_sp16},{"corrupt_sp8",frd_h264_dc_corrupt_sp8},
+    {"wrong_return",frd_h264_dc_wrong_return},{"no_return",frd_h264_dc_no_return}
+};
+
 /* 数据符号只取地址，不以错误 C 函数签名调用 PC label。 */
 extern const unsigned char frd_h264_dc_abi_pc_after_alloc[];
 extern const unsigned char frd_h264_dc_abi_pc_body[];
@@ -67,11 +76,17 @@ extern const unsigned char frd_h264_dc_abi_pc_epilogue[];
 extern const unsigned char frd_h264_dc_abi_pc_epilogue_after_d14[];
 extern const unsigned char frd_h264_dc_abi_pc_ret[];
 extern const unsigned char frd_h264_dc_outer_pc_return[];
+extern const unsigned char frd_h264_dc_abi_sp_failure_fragment[];
+extern const unsigned char frd_h264_dc_abi_sp_failure_return[];
+extern const unsigned char frd_h264_dc_abi_sp_failure_trap[];
+extern const unsigned char frd_h264_dc_abi_sp_failure_end[];
+extern const unsigned char frd_h264_dc_wrong_return_trap[];
+extern const unsigned char frd_h264_dc_wrong_return_end[];
 
 #define BIT(n) (UINT64_C(1) << (n))
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 #define FRAME 192u
-#define HELPER_LENGTH 0x440u
+#define HELPER_LENGTH 0x450u
 #define OUTER_LENGTH 0x430u
 #define WATCHDOG_MS 10000u
 #define NO_RETURN_MS 1500u
@@ -80,9 +95,9 @@ extern const unsigned char frd_h264_dc_outer_pc_return[];
 typedef enum { REFUSED = 2, FAILED = 1, ABI_ONLY = 0 } result_code;
 static uintptr_t image_base;
 static DWORD image_size, pdata_rva, pdata_size;
-static PRUNTIME_FUNCTION helper_entry, outer_entry;
+static PRUNTIME_FUNCTION helper_entry, outer_entry, sp_entry, wrong_entry;
 static int16_t input[16], output[256];
-static const uintptr_t pc_offsets[] = {0x000,0x004,0x030,0x1a0,0x1a4,0x410,0x414,0x43c};
+static const uintptr_t pc_offsets[] = {0x000,0x004,0x030,0x1b0,0x1b4,0x420,0x424,0x44c};
 static const char *const pc_ids[] = {"entry","after_alloc","body","call","return",
                                     "epilogue","after_d14","ret"};
 
@@ -193,7 +208,114 @@ static PRUNTIME_FUNCTION owned_entry(uintptr_t pc, uintptr_t begin, unsigned len
     /* 已观察 full xdata；不把内部 EpiloguePacked 当 pdata packed。 */
     if ((*(const DWORD *)(base + f->UnwindData) & 0x3ffffu) * 4u != length)
         return NULL;
+    /* 实际整张 pdata 中恰一个相交 owner；不能借邻居覆盖 trap/+4。 */
+    {
+        const RUNTIME_FUNCTION *all=(const RUNTIME_FUNCTION *)lo;
+        unsigned i, matches=0;
+        for(i=0;i<pdata_size/8;++i) {
+            DWORD n, u=all[i].UnwindData;
+            uintptr_t start=base+all[i].BeginAddress;
+            if(u&3) n=((u>>2)&0x7ffu)*4u;
+            else {
+                if(!range(u,4)) return NULL;
+                n=(*(const DWORD *)(base+u)&0x3ffffu)*4u;
+            }
+            if(start<begin+length && begin<start+n) ++matches;
+        }
+        if(matches!=1) return NULL;
+    }
     return f;
+}
+
+/* C0 固定机器闭包：地址来自静态 symbols；没有 CLI callback/authority。 */
+static int fragment_admission(void)
+{
+    static const uint32_t preserve_words[]={0xd65f03c0};
+    static const uint32_t no_return_words[]={0x14000000};
+    static const uint32_t fp_words[]={0xaa1f03fd,0xd65f03c0};
+    static const uint32_t sp16_words[]={0x910043ff,0xd65f03c0};
+    static const uint32_t sp8_words[]={0x910023ff,0xd65f03c0};
+    static const uint32_t wrong_words[]={0x1000005e,0xd65f03c0,0xd43e0000,0x17ffffff};
+    static const uint32_t fragment_words[]={0xd63f0060,0x910003e9,0xf2400d3f,0x54000061,
+                                          0xeb0903bf,0x54ffea80,0xd43e0000,0x17ffffff};
+    static const unsigned char phantom[]={0x08,0,0x20,0x28,0xe5,0xd9,0x92,0xd9,
+        0x10,0xd8,0x8e,0xd8,0x0c,0xe6,0xe6,0xe6,0xe6,0xc8,0x02,0x40,0x0c,0xe4,0xe3,0xe3};
+    static const unsigned char bad3[]={0x08,0,0x20,0x28,0xe5,0xd9,0x92,0xd9,
+        0x10,0xd8,0x8e,0xd8,0x0c,0xe6,0xe6,0xe6,0xc8,0x84,0xc8,0x03,0x40,0x0c,0xe4,0xe3};
+    const uintptr_t starts[]={(uintptr_t)frd_h264_dc_abi_sp_failure_fragment,(uintptr_t)frd_h264_dc_wrong_return};
+    const unsigned lengths[]={32,16}, traps[]={24,8};
+    const char *const owners[]={"sp","wrong_return"};
+    static const frd_dc_kernel callbacks[]={frd_h264_dc_preserve,frd_h264_dc_corrupt_fp,
+        frd_h264_dc_corrupt_sp16,frd_h264_dc_corrupt_sp8,frd_h264_dc_wrong_return,frd_h264_dc_no_return};
+    static const char *const names[]={"preserve","corrupt_fp","corrupt_sp16","corrupt_sp8","wrong_return","no_return"};
+    const volatile child_case *const fixed=frd_h264_dc_private_children;
+    unsigned i,k;
+    uint32_t selector[4], expected_selector[4];
+    intptr_t pages;
+    unsigned char expected[24];
+    for(i=0;i<COUNT(callbacks);++i)
+        if(fixed[i].callback!=callbacks[i] || strcmp(fixed[i].name,names[i]))
+            return fail("C0_fixed_child_routing");
+    if(starts[0]!=helper_va()+HELPER_LENGTH ||
+       (uintptr_t)frd_h264_dc_abi_sp_failure_return!=starts[0]+4 ||
+       (uintptr_t)frd_h264_dc_abi_sp_failure_trap!=starts[0]+24 ||
+       (uintptr_t)frd_h264_dc_abi_sp_failure_end!=starts[0]+32 ||
+       (uintptr_t)frd_h264_dc_wrong_return_trap!=starts[1]+8 ||
+       (uintptr_t)frd_h264_dc_wrong_return_end!=starts[1]+16)
+        return fail("C0_fragment_labels");
+#define FIXED_CALLBACK(fn,words) \
+    do {uintptr_t a=(uintptr_t)(fn); if(a<image_base || a-image_base>UINT32_MAX || \
+        !range((DWORD)(a-image_base),sizeof(words)) || memcmp((const void *)a,words,sizeof(words))) \
+        return fail("C0_fixed_callback_bytes");} while(0)
+    FIXED_CALLBACK(frd_h264_dc_preserve,preserve_words);
+    FIXED_CALLBACK(frd_h264_dc_no_return,no_return_words);
+    FIXED_CALLBACK(frd_h264_dc_corrupt_fp,fp_words);
+    FIXED_CALLBACK(frd_h264_dc_corrupt_sp16,sp16_words);
+    FIXED_CALLBACK(frd_h264_dc_corrupt_sp8,sp8_words);
+    FIXED_CALLBACK(frd_h264_dc_wrong_return,wrong_words);
+#undef FIXED_CALLBACK
+    if(*(const uint32_t *)(uintptr_t)frd_h264_dc_preserve!=0xd65f03c0 ||
+       *(const uint32_t *)(uintptr_t)frd_h264_dc_no_return!=0x14000000 ||
+       *(const uint32_t *)(helper_va()+0x1b0)!=0xd63f0060 ||
+       *(const uint32_t *)(outer_va()+0x184)!=0xd63f0080)
+        return fail("C0_fixed_call_path");
+    pages=(intptr_t)((uintptr_t)frd_h264_dc_corrupt_fp>>12)-(intptr_t)((helper_va()+0x1a0)>>12);
+    if(pages<-(1<<20) || pages>=(1<<20)) return fail("C0_selector_range");
+    expected_selector[0]=0x90000009 | (((uint32_t)pages&3)<<29) | ((((uint32_t)pages>>2)&0x7ffff)<<5);
+    expected_selector[1]=0x91000129 | (((uintptr_t)frd_h264_dc_corrupt_fp&0xfff)<<10);
+    expected_selector[2]=0xeb09007f;
+    expected_selector[3]=0x54001520;
+    memcpy(selector,(const void *)(helper_va()+0x1a0),sizeof(selector));
+    if(memcmp(selector,expected_selector,sizeof(selector)) ||
+       memcmp((const void *)starts[0],fragment_words,sizeof(fragment_words)))
+        return fail("C0_selector_fragment_closure");
+    for(i=0;i<2;++i) {
+        PRUNTIME_FUNCTION owner=NULL;
+        if(starts[i]<image_base || starts[i]-image_base>UINT32_MAX ||
+           !range((DWORD)(starts[i]-image_base),lengths[i])) return fail("C0_fragment_range");
+        for(k=0;k<lengths[i];k+=4) {
+            ULONG_PTR base=0;
+            PRUNTIME_FUNCTION f=RtlLookupFunctionEntry(starts[i]+k,&base,NULL);
+            if(i==0 && FRD_CONTRACT_VARIANT==1) {
+                if(f) return fail("C0_bad1_fragment_expected_absence");
+            } else {
+                PRUNTIME_FUNCTION owned=owned_entry(starts[i]+k,starts[i],lengths[i],0);
+                if(!owned || (owner && owner!=owned)) return fail("C0_fragment_unique_owner");
+                owner=owned;
+            }
+        }
+        memcpy(expected,phantom,sizeof(expected));
+        if(i==0 && FRD_CONTRACT_VARIANT==2) expected[20]=0x0d;
+        if(i==0 && FRD_CONTRACT_VARIANT==3) memcpy(expected,bad3,sizeof(expected));
+        if(i==1) expected[0]=4;
+        if(owner && (!range(owner->UnwindData,sizeof(expected)) ||
+           memcmp((const void *)(image_base+owner->UnwindData),expected,sizeof(expected))))
+            return fail("C0_fragment_metadata");
+        if(i==0) sp_entry=owner; else wrong_entry=owner;
+        printf("FRD1 fragment owner=%s rva=%" PRIxPTR " length=%x trap_offset=%x table=%s authority=bound-callback-preserves-sp\n",
+               owners[i],starts[i]-image_base,lengths[i],traps[i],owner?"present":"absent");
+    }
+    return ABI_ONLY;
 }
 
 static int linked_admission(void)
@@ -214,15 +336,15 @@ static int linked_admission(void)
         frd_h264_dc_abi_pc_ret
     };
     static const unsigned char good[] = {
-        0x10,0x01,0x60,0x28,0xe1,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,
+        0x14,0x01,0x60,0x28,0xe1,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,
         0x0c,0xe6,0xe6,0xe6,0xe6,0xc8,0x02,0x40,0x0c,0xe4,0xe3,0xe3
     };
     static const unsigned char bad3[] = {
-        0x10,0x01,0x60,0x28,0xe1,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,
+        0x14,0x01,0x60,0x28,0xe1,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,
         0x0c,0xe6,0xe6,0xe6,0xc8,0x84,0xc8,0x03,0x40,0x0c,0xe4,0xe3
     };
     static const unsigned char bad4[] = {
-        0x10,0x01,0xa0,0x4c,0xe1,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,
+        0x14,0x01,0xa0,0x4c,0xe1,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,
         0x0c,0xe6,0xe6,0xe6,0xe6,0xc8,0x02,0x40,0x0c,0xe4,0xe3,0xd9,
         0x10,0xd8,0x8e,0xd8,0x0c,0xe6,0xe6,0xe6,0xe6,0xc8,0x02,0x40,
         0x0c,0xe4,0xe3,0xe3
@@ -235,13 +357,13 @@ static int linked_admission(void)
         !range((DWORD)(outer_va()-image_base), OUTER_LENGTH)) return fail("label_range");
     if(memcmp((const void *)helper_va(),prologue,sizeof(prologue)) ||
        memcmp((const void *)outer_va(),prologue,sizeof(prologue)) ||
-       memcmp((const void *)(helper_va()+0x410),epilogue,sizeof(epilogue)) ||
+       memcmp((const void *)(helper_va()+0x420),epilogue,sizeof(epilogue)) ||
        memcmp((const void *)(outer_va()+0x400),epilogue,sizeof(epilogue)))
         return fail("actual_frame_instruction_binding");
     if((uintptr_t)frd_h264_dc_wrong_return < image_base ||
        (uintptr_t)frd_h264_dc_wrong_return-image_base > UINT32_MAX ||
        !range((DWORD)((uintptr_t)frd_h264_dc_wrong_return-image_base),16) ||
-       *(const uint32_t *)(helper_va()+0x408)!=UINT32_C(0xd43e0000) ||
+       *(const uint32_t *)(helper_va()+0x418)!=UINT32_C(0xd43e0000) ||
        *(const uint32_t *)((uintptr_t)frd_h264_dc_wrong_return+8)!=UINT32_C(0xd43e0000) ||
        *(const uint32_t *)(outer_va()+0x3f8)!=UINT32_C(0xd43e0000))
         return fail("actual_windows_breakpoint_binding");
@@ -279,7 +401,7 @@ static int linked_admission(void)
     }
     printf("FRD1 binding outer_rva=%" PRIxPTR " return_offset=188 epilogue_offset=400 length=430\n",
            outer_va()-image_base);
-    return ABI_ONLY;
+    return fragment_admission();
 }
 
 /* Expected 永远来自已知指令/saved slots；以下比较不读取 unwind metadata。 */
@@ -382,6 +504,78 @@ static int synthetic_suite(void)
     return ABI_ONLY;
 }
 
+/* 每条 fragment 指令单独测试；坏 metadata 只在独立安全 buffer 中展开。 */
+static int fragment_synthetic_suite(void)
+{
+    _Alignas(16) unsigned char stack[512];
+    const uintptr_t frame=(uintptr_t)(stack+128);
+    const uintptr_t starts[]={(uintptr_t)frd_h264_dc_abi_sp_failure_fragment,(uintptr_t)frd_h264_dc_wrong_return};
+    const unsigned lengths[]={32,16};
+    const char *const owners[]={"sp","wrong_return"};
+    CONTEXT expected,initial,actual,control;
+    unsigned i,k,n;
+    memset(&expected,0,sizeof(expected)); expected.ContextFlags=CONTEXT_FULL;
+    expected.Sp=frame+FRAME; expected.Fp=UINT64_C(0x1938576abcd00010);
+    expected.Lr=(uintptr_t)frd_h264_dc_outer_pc_return; expected.Pc=expected.Lr;
+    expected.X[18]=UINT64_C(0x1827364554637281);
+    for(n=19;n<=28;++n) expected.X[n]=UINT64_C(0x29384756abcd0100)+n;
+    for(n=8;n<=15;++n) expected.V[n].Low=UINT64_C(0x81726354fedc0100)+n;
+    memset(stack,0xa5,sizeof(stack));
+    store((unsigned char *)frame,0,expected.Fp); store((unsigned char *)frame,8,expected.Lr);
+    for(n=19;n<=28;++n) store((unsigned char *)frame,16+8*(n-19),expected.X[n]);
+    for(n=8;n<=15;++n) store((unsigned char *)frame,96+8*(n-8),expected.V[n].Low);
+    for(i=0;i<2;++i) for(k=0;k<lengths[i];k+=4) {
+        uint64_t want=0,got;
+        PRUNTIME_FUNCTION f=owned_entry(starts[i]+k,starts[i],lengths[i],0);
+        if(i==0 && FRD_CONTRACT_VARIANT==1) {
+            ULONG_PTR base=0;
+            if(f || RtlLookupFunctionEntry(starts[i]+k,&base,NULL)) return fail("fragment_bad1_table");
+            printf("FRD1 fragment_unwind owner=%s offset=%x outcome=expected-missing-nonleaf-table\n",owners[i],k);
+            continue;
+        }
+        initial=expected; initial.Sp=frame; initial.Fp=i?frame:0; initial.Pc=starts[i]+k;
+        initial.Lr=i?(k?starts[i]+8:(uintptr_t)frd_h264_dc_abi_pc_return):
+                       (k?starts[i]+4:(uintptr_t)frd_h264_dc_abi_pc_return);
+        for(n=19;n<=28;++n) initial.X[n]=pattern(n,0);
+        for(n=8;n<=15;++n) initial.V[n].Low=pattern(0x80+n,0);
+        actual=initial;
+        if(f!=(i?wrong_entry:sp_entry) || unwind_one(&actual,f)) return FAILED;
+        got=differences(&actual,&expected); control=expected;
+        if(i==0 && FRD_CONTRACT_VARIANT==2) {want=BIT(20);control.Sp+=16;}
+        if(i==0 && FRD_CONTRACT_VARIANT==3) {
+            want=BIT(0)|BIT(1);control.X[19]=expected.X[20];control.X[20]=expected.X[21];
+        }
+        printf("FRD1 fragment_unwind owner=%s offset=%x diff=%016" PRIx64 " expected=%016" PRIx64
+               " caller_sp=%016" PRIx64 " caller_pc=%016" PRIx64 "\n",owners[i],k,got,want,(uint64_t)actual.Sp,(uint64_t)actual.Pc);
+        if(got!=want || differences(&actual,&control)) return fail("fragment_exact_context");
+    }
+    return ABI_ONLY;
+}
+
+static int fragment_live_copies(const CONTEXT *helper,const CONTEXT *helper_expected,
+                                const CONTEXT *outer_expected,uintptr_t frame)
+{
+    const uintptr_t starts[]={(uintptr_t)frd_h264_dc_abi_sp_failure_fragment,(uintptr_t)frd_h264_dc_wrong_return};
+    const unsigned lengths[]={32,16};
+    const char *const owners[]={"sp","wrong_return"};
+    unsigned i,k;
+    for(i=0;i<2;++i) for(k=0;k<lengths[i];k+=4) {
+        CONTEXT copy=*helper;
+        PRUNTIME_FUNCTION f=owned_entry(starts[i]+k,starts[i],lengths[i],0);
+        copy.Pc=starts[i]+k;copy.Sp=frame;copy.Fp=i?frame:0;
+        /* LR 标记与 H 保存的 outer return 不同，不能靠预填掩盖漏恢复。 */
+        copy.Lr=i?(k?starts[i]+8:(uintptr_t)frd_h264_dc_abi_pc_return):
+                  (k?starts[i]+4:(uintptr_t)frd_h264_dc_abi_pc_return);
+        if(!f || f!=(i?wrong_entry:sp_entry) || unwind_one(&copy,f) || differences(&copy,helper_expected))
+            return fail("fragment_live_helper_to_outer");
+        if(owned_entry(copy.Pc,outer_va(),OUTER_LENGTH,0)!=outer_entry ||
+           unwind_one(&copy,outer_entry) || differences(&copy,outer_expected))
+            return fail("fragment_live_outer_to_caller");
+        printf("FRD1 fragment_walk owner=%s offset=%x outcome=matched\n",owners[i],k);
+    }
+    return ABI_ONLY;
+}
+
 /* 实际 callback 栈在其仍存活时回溯；C compiler frame 由真实 Rtl 解码，
  * helper/outer expected 从有效 FP 链和固定保存指令独立冻结，不从 Rtl 输出回推。 */
 static int walk_result=FAILED;
@@ -447,6 +641,8 @@ static __attribute__((noinline)) void capture_callback(int16_t *in,int16_t *out,
     }
     for(i=19;i<=28;++i) if(c.X[i]!=pattern(i,0)) {fail("callback_helper_gpr"); return;}
     for(i=8;i<=15;++i) if(c.V[i].Low!=pattern(0x80+i,0)) {fail("callback_helper_simd"); return;}
+    /* H/O 与 callback 此刻仍存活；仅修改本进程 CONTEXT 副本。 */
+    if(fragment_live_copies(&c,&helper_expected,&outer_expected,helper_frame)) return;
     if(owned_entry(c.Pc,helper_va(),HELPER_LENGTH,0)!=helper_entry ||
        unwind_one(&c,helper_entry) || differences(&c,&helper_expected)) {fail("live_helper_to_outer"); return;}
     if(owned_entry(c.Pc,outer_va(),OUTER_LENGTH,0)!=outer_entry ||
@@ -502,14 +698,6 @@ static int register_suite(void)
            masks("sp_snapshot",frd_h264_dc_fault_sp_snapshot,frd_h264_dc_check_abi,BIT(20));
 }
 
-typedef enum { CHILD_PRESERVE, CHILD_FP, CHILD_SP16, CHILD_SP8, CHILD_LR,
-               CHILD_NO_RETURN, CHILD_COUNT } child_id;
-typedef struct {const char *name; frd_dc_kernel callback;} child_case;
-static const child_case children[CHILD_COUNT] = {
-    {"preserve",frd_h264_dc_preserve},{"corrupt_fp",frd_h264_dc_corrupt_fp},
-    {"corrupt_sp16",frd_h264_dc_corrupt_sp16},{"corrupt_sp8",frd_h264_dc_corrupt_sp8},
-    {"wrong_return",frd_h264_dc_wrong_return},{"no_return",frd_h264_dc_no_return}
-};
 typedef struct {uint32_t magic,case_id;} go_message;
 #define GO_MAGIC UINT32_C(0x46524431)
 typedef struct {unsigned char bytes[32768]; size_t used; int closed;} stream_capture;
@@ -533,7 +721,7 @@ static int child_main(child_id id)
     char ready[96];
     int n;
     if(!IsDebuggerPresent()) return fail("child_requires_native_debugger_parent");
-    n=snprintf(ready,sizeof(ready),"FRD1 ready case=%s variant=%d\n",children[id].name,FRD_CONTRACT_VARIANT);
+    n=snprintf(ready,sizeof(ready),"FRD1 ready case=%s variant=%d\n",frd_h264_dc_private_children[id].name,FRD_CONTRACT_VARIANT);
     if(n<0 || (size_t)n>=sizeof(ready)) return fail("child_ready_format");
     if(fflush(stdout) || fflush(stderr)) return fail("ready_flush");
     /* WriteFile 避免 CRT text-mode 把协议 LF 改为 CRLF。 */
@@ -547,8 +735,8 @@ static int child_main(child_id id)
     frd_diag_reference.case_id=(DWORD)id;
     RtlCaptureContext(&frd_diag_reference.context);
     frd_diag_reference.complete=1;
-    m=frd_h264_dc_outer_probe(input,output,1,children[id].callback,frd_h264_dc_check_abi);
-    printf("FRD1 returned case=%s mask=%016" PRIx64 "\n",children[id].name,m);
+    m=frd_h264_dc_outer_probe(input,output,1,frd_h264_dc_private_children[id].callback,frd_h264_dc_check_abi);
+    printf("FRD1 returned case=%s mask=%016" PRIx64 "\n",frd_h264_dc_private_children[id].name,m);
     if(id!=CHILD_PRESERVE || m) return FAILED;
     {
         static const char result[]="FRD1 result case=preserve outcome=normal-control\n";
@@ -594,7 +782,7 @@ static int ready_message(child_id id,stream_capture *out,child_observation *o,HA
 {
     char line[96];
     const char *match;
-    int n=snprintf(line,sizeof(line),"FRD1 ready case=%s variant=%d\n",children[id].name,FRD_CONTRACT_VARIANT);
+    int n=snprintf(line,sizeof(line),"FRD1 ready case=%s variant=%d\n",frd_h264_dc_private_children[id].name,FRD_CONTRACT_VARIANT);
     if(n<0 || (size_t)n>=sizeof(line)) return fail("ready_format");
     match=strstr((const char *)out->bytes,line);
     if(!match) return ABI_ONLY;
@@ -618,7 +806,8 @@ static int exact_trap(HANDLE process,uintptr_t child_base,child_id id,
     uint32_t opcode=0;
     SIZE_T got=0;
     if(id==CHILD_LR) wanted=child_base+((uintptr_t)frd_h264_dc_wrong_return-image_base)+8;
-    else wanted=child_base+(helper_va()-image_base)+0x408;
+    else if(id==CHILD_FP) wanted=child_base+((uintptr_t)frd_h264_dc_abi_sp_failure_fragment-image_base)+24;
+    else wanted=child_base+(helper_va()-image_base)+0x418;
     if(!o->ready || !o->go || (id==CHILD_PRESERVE || id==CHILD_NO_RETURN) ||
        r->ExceptionCode!=EXCEPTION_BREAKPOINT || (uintptr_t)r->ExceptionAddress!=wanted ||
        !ReadProcessMemory(process,(const void *)wanted,&opcode,sizeof(opcode),&got) ||
@@ -684,7 +873,7 @@ static int isolated_child(child_id id)
     CloseHandle(stdout_write); stdout_write=NULL; CloseHandle(stderr_write); stderr_write=NULL;
     CloseHandle(go_read); go_read=NULL;
     if(!infrastructure && ResumeThread(pi.hThread)==(DWORD)-1) infrastructure=fail("resume_child");
-    printf("FRD1 child case=%s pid=%lu watchdog_ms=%u no_return_ms=%u\n",children[id].name,
+    printf("FRD1 child case=%s pid=%lu watchdog_ms=%u no_return_ms=%u\n",frd_h264_dc_private_children[id].name,
            (unsigned long)pi.dwProcessId,WATCHDOG_MS,id==CHILD_NO_RETURN ? NO_RETURN_MS:0);
     while(!o.exit_event_seen) {
         DEBUG_EVENT ev;
@@ -717,7 +906,7 @@ static int isolated_child(child_id id)
         case CREATE_PROCESS_DEBUG_EVENT:
             child_base=(uintptr_t)ev.u.CreateProcessInfo.lpBaseOfImage;
             printf("FRD1 child_image case=%s pid=%lu base=%" PRIxPTR "\n",
-                   children[id].name,(unsigned long)ev.dwProcessId,child_base);
+                   frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,child_base);
             frdd_module_load(&diagnostics,pi.hProcess,&ev,child_base,ev.u.CreateProcessInfo.hFile);
             break;
         case LOAD_DLL_DEBUG_EVENT:
@@ -726,7 +915,7 @@ static int isolated_child(child_id id)
         case UNLOAD_DLL_DEBUG_EVENT:
             frdd_unload(&diagnostics,(uintptr_t)ev.u.UnloadDll.lpBaseOfDll);
             printf("FRD1 debug_event case=%s pid=%lu tid=%lu event=%lu classification=ordinary\n",
-                   children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
+                   frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
                    (unsigned long)ev.dwDebugEventCode);
             break;
         case CREATE_THREAD_DEBUG_EVENT:
@@ -734,19 +923,19 @@ static int isolated_child(child_id id)
         case OUTPUT_DEBUG_STRING_EVENT:
             /* 显式允许的普通事件；thread event handle 由 Windows debugger 关闭。 */
             printf("FRD1 debug_event case=%s pid=%lu tid=%lu event=%lu classification=ordinary\n",
-                   children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
+                   frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
                    (unsigned long)ev.dwDebugEventCode);
             break;
         case EXCEPTION_DEBUG_EVENT: {
             const EXCEPTION_DEBUG_INFO *e=&ev.u.Exception;
             printf("FRD1 exception case=%s pid=%lu tid=%lu first=%lu code=%08lx flags=%08lx pc=%" PRIxPTR " ready=%d\n",
-                   children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
+                   frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
                    (unsigned long)e->dwFirstChance,(unsigned long)e->ExceptionRecord.ExceptionCode,
                    (unsigned long)e->ExceptionRecord.ExceptionFlags,(uintptr_t)e->ExceptionRecord.ExceptionAddress,o.ready);
             if(e->ExceptionRecord.NumberParameters>EXCEPTION_MAXIMUM_PARAMETERS) o.unexpected=1;
             else {
                 DWORD parameter;
-                printf("FRD1 exception_parameters case=%s count=%lu",children[id].name,
+                printf("FRD1 exception_parameters case=%s count=%lu",frd_h264_dc_private_children[id].name,
                        (unsigned long)e->ExceptionRecord.NumberParameters);
                 for(parameter=0;parameter<e->ExceptionRecord.NumberParameters;++parameter)
                     printf(" p%lu=%" PRIxPTR,(unsigned long)parameter,
@@ -771,20 +960,20 @@ static int isolated_child(child_id id)
             o.exit_code=ev.u.ExitProcess.dwExitCode;
             o.exit_event_seen=1; o.exit_event_ticks=GetTickCount64();
             printf("FRD1 exit_event case=%s pid=%lu tid=%lu event=%lu code=%08lx tick=%" PRIu64
-                   " terminal=0\n",children[id].name,(unsigned long)ev.dwProcessId,
+                   " terminal=0\n",frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,
                    (unsigned long)ev.dwThreadId,(unsigned long)ev.dwDebugEventCode,
                    (unsigned long)o.exit_code,(uint64_t)o.exit_event_ticks);
             break;
         case RIP_EVENT:
             printf("FRD1 debug_rip case=%s pid=%lu tid=%lu event=%lu error=%08lx type=%lu classification=failed\n",
-                   children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
+                   frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
                    (unsigned long)ev.dwDebugEventCode,(unsigned long)ev.u.RipInfo.dwError,
                    (unsigned long)ev.u.RipInfo.dwType);
             infrastructure=fail("debug_rip_event"); /* warning 也永久失败，不当 probe exception。 */
             break;
         default:
             printf("FRD1 debug_unknown case=%s pid=%lu tid=%lu event=%lu classification=failed\n",
-                   children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
+                   frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
                    (unsigned long)ev.dwDebugEventCode);
             infrastructure=fail("unknown_debug_event");
             break;
@@ -798,7 +987,7 @@ static int isolated_child(child_id id)
                 o.exit_continue_error=continue_error;
             }
             printf("FRD1 debug_continue case=%s pid=%lu tid=%lu event=%lu status=%08lx result=%d ok=%d error_valid=%d error=%08lx\n",
-                   children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
+                   frd_h264_dc_private_children[id].name,(unsigned long)ev.dwProcessId,(unsigned long)ev.dwThreadId,
                    (unsigned long)ev.dwDebugEventCode,(unsigned long)continuation,(int)continued,continued!=FALSE,
                    continued==FALSE,(unsigned long)continue_error);
             if(!continued) {
@@ -815,27 +1004,27 @@ static int isolated_child(child_id id)
         } else infrastructure=FAILED;
     }
     if(drain(stdout_read,&out) || drain(stderr_read,&err)) infrastructure=FAILED;
-    if(raw_stream(children[id].name,"stdout",&out) || raw_stream(children[id].name,"stderr",&err))
+    if(raw_stream(frd_h264_dc_private_children[id].name,"stdout",&out) || raw_stream(frd_h264_dc_private_children[id].name,"stderr",&err))
         infrastructure=FAILED;
     printf("FRD1 child_result case=%s ready=%d go=%d terminal=%d first=%d second=%d code=%08lx pc=%" PRIxPTR
            " brk=%08" PRIx32 " exit=%08lx timeout=%d forced=%d signal=not-applicable-win32\n",
-           children[id].name,o.ready,o.go,o.terminal,o.first,o.second,(unsigned long)o.exception_code,
+           frd_h264_dc_private_children[id].name,o.ready,o.go,o.terminal,o.first,o.second,(unsigned long)o.exception_code,
            o.exception_pc,o.instruction,(unsigned long)o.exit_code,o.timeout,o.forced);
     printf("FRD1 child_terminal case=%s exit_event_seen=%d exit_event_code=%08lx exit_continue_attempted=%d"
            " exit_continue_result=%d exit_continue_ok=%d exit_continue_error_valid=%d exit_continue_error=%08lx wait_attempted=%d"
            " wait_result_valid=%d wait_result=%08lx wait_error_valid=%d wait_error=%08lx terminal=%d\n",
-           children[id].name,o.exit_event_seen,(unsigned long)o.exit_code,o.exit_continue_attempted,
+           frd_h264_dc_private_children[id].name,o.exit_event_seen,(unsigned long)o.exit_code,o.exit_continue_attempted,
            (int)o.exit_continue_result,o.exit_continue_ok,o.exit_continue_attempted && !o.exit_continue_ok,
            (unsigned long)o.exit_continue_error,o.process_wait_attempted,o.process_wait_attempted,(unsigned long)o.process_wait_result,
            o.process_wait_attempted && o.process_wait_result==WAIT_FAILED,(unsigned long)o.process_wait_error,o.terminal);
     printf("FRD1 child_time case=%s start_tick=%" PRIu64 " ready_tick=%" PRIu64
            " terminate_tick=%" PRIu64 " exit_event_tick=%" PRIu64 " terminal_tick=%" PRIu64 " designated_timeout=%d\n",
-           children[id].name,(uint64_t)started,(uint64_t)o.ready_ticks,(uint64_t)o.terminate_ticks,
+           frd_h264_dc_private_children[id].name,(uint64_t)started,(uint64_t)o.ready_ticks,(uint64_t)o.terminate_ticks,
            (uint64_t)o.exit_event_ticks,(uint64_t)o.terminal_ticks,o.designated_timeout);
 cleanup:
     frdd_release(&diagnostics);
     if(diagnostics.failed || diagnostics.overflow || o.unexpected)
-        frdd_emit(&diagnostics,children[id].name,(uintptr_t)&frd_diag_reference-image_base);
+        frdd_emit(&diagnostics,frd_h264_dc_private_children[id].name,(uintptr_t)&frd_diag_reference-image_base);
     /* 错误也拥有 child；job close 保证不会遗留后台进程。 */
     if(created && !o.terminal) {
         if(!o.forced) (void)TerminateProcess(pi.hProcess,FORCED_EXIT);
@@ -908,7 +1097,8 @@ int main(int argc,char **argv)
     result=masks("baseline_return",frd_h264_dc_preserve,frd_h264_dc_check_abi,0);
     if(!result && (!strcmp(suite,"register") || !strcmp(suite,"all"))) result=register_suite();
     if(!result && (!strcmp(suite,"unwind") || !strcmp(suite,"all"))) {
-        result=synthetic_suite(); if(!result) result=live_walk_suite();
+        result=synthetic_suite(); if(!result) result=fragment_synthetic_suite();
+        if(!result) result=live_walk_suite();
     }
     if(!result && (!strcmp(suite,"isolated") || !strcmp(suite,"all"))) result=isolated_suite();
     printf("FRD1 final suite=%s variant=%d status=%s shipping_kernel=unimplemented qmul=unimplemented qualification=OPEN\n",

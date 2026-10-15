@@ -115,13 +115,34 @@
         add sp, sp, #8
         ret
         frd_probe_end
-        frd_probe_leaf frd_h264_dc_wrong_return
+        /* 此固定 callback 继承 H；没有自己的 SEH prologue。 */
+        .p2align 2
+        .globl frd_h264_dc_wrong_return
+        .def frd_h264_dc_wrong_return
+        .scl 2
+        .type 32
+        .endef
+frd_h264_dc_wrong_return:
         adr x30, .Lfrd_wrong_return_landing
         ret
+        .globl frd_h264_dc_wrong_return_trap
+frd_h264_dc_wrong_return_trap:
 .Lfrd_wrong_return_landing:
         brk #0xf000                   /* site 身份由实际 PC 区分。 */
         b .Lfrd_wrong_return_landing
-        frd_probe_end
+        .globl frd_h264_dc_wrong_return_end
+frd_h264_dc_wrong_return_end:
+        .section .xdata,"dr"
+        .p2align 2
+.Lfrd_wrong_return_xdata:
+        .long 0x28200004
+        .byte 0xe5,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,0x0c
+        .byte 0xe6,0xe6,0xe6,0xe6,0xc8,0x02,0x40,0x0c,0xe4,0xe3,0xe3
+        .section .pdata,"dr"
+        .p2align 2
+        .rva frd_h264_dc_wrong_return
+        .rva .Lfrd_wrong_return_xdata
+        .text
         frd_probe_leaf frd_h264_dc_no_return
 .Lfrd_no_return:
         b .Lfrd_no_return

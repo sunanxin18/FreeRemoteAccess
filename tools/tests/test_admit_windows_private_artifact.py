@@ -259,9 +259,9 @@ class SealAndProducerControls(unittest.TestCase):
                 struct.pack_into('<Q', data, thunk-3584+n*8, nextname); nextname += len(raw)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary).resolve()/'host-control.exe'; path.write_bytes(data)
-            compiler.pe_admit(path, variant=1)
-            with self.assertRaises(compiler.GateError):
-                compiler.pe_admit(path, variant=0)
+            for variant in range(5):
+                with self.assertRaisesRegex(compiler.GateError, 'KERNEL32 缺少精确命名 RtlVirtualUnwind'):
+                    compiler.pe_admit(path, variant=variant)
             data[132:134] = (0x8664).to_bytes(2, 'little'); path.write_bytes(data)
             with self.assertRaises(compiler.GateError):
                 compiler.pe_admit(path, variant=1)

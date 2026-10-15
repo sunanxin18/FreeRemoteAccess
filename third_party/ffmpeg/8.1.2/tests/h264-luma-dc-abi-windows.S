@@ -68,6 +68,14 @@
 #endif
         .endm
 
+/* 返回结构检查前四条在主路径与 C0 fragment 完全相同。 */
+        .macro frd_dc_return_guards failure
+        mov x9, sp
+        tst x9, #15
+        b.ne \failure
+        cmp x29, x9
+        .endm
+
         .seh_proc frd_h264_dc_check_abi
 frd_h264_dc_check_abi:
         sub sp, sp, #192
@@ -124,16 +132,20 @@ frd_h264_dc_abi_pc_body:
         frd_dc_pattern x9, (0x80+\n)
         fmov d\n, x9
 .endr
+#if defined(FRD_DC_WINDOWS_ABI_CONTRACT)
+        /* C0：调用前只绑定固定二指令 callback；不从损坏状态猜测 SP。 */
+        adrp x9, frd_h264_dc_corrupt_fp
+        add x9, x9, :lo12:frd_h264_dc_corrupt_fp
+        cmp x3, x9
+        b.eq .Lfrd_dc_sp_fragment
+#endif
         .globl frd_h264_dc_abi_pc_call
 frd_h264_dc_abi_pc_call:
         blr x3
         .globl frd_h264_dc_abi_pc_return
 frd_h264_dc_abi_pc_return:
         /* 先验结构检查：在任何返回后的栈读取之前；绝不恢复坏帧。 */
-        mov x9, sp
-        tst x9, #15
-        b.ne .Lfrd_dc_frame_failure
-        cmp x29, x9
+        frd_dc_return_guards .Lfrd_dc_frame_failure
         b.ne .Lfrd_dc_frame_failure
         mov w0, #0                    /* 被调用核是 void，不检查其 x0。 */
         ldr x10, [sp, #168]
@@ -217,3 +229,48 @@ frd_h264_dc_abi_pc_epilogue_after_d14:
 frd_h264_dc_abi_pc_ret:
         ret
         .seh_endproc
+
+#if defined(FRD_DC_WINDOWS_ABI_CONTRACT)
+/* 仅 C0 真实 callback 保证 SP=H；独占 32B，无真实 prologue/epilogue。 */
+        .globl frd_h264_dc_abi_sp_failure_fragment
+        .def frd_h264_dc_abi_sp_failure_fragment
+        .scl 2
+        .type 32
+        .endef
+frd_h264_dc_abi_sp_failure_fragment:
+.Lfrd_dc_sp_fragment:
+        blr x3
+        .globl frd_h264_dc_abi_sp_failure_return
+frd_h264_dc_abi_sp_failure_return:
+        frd_dc_return_guards frd_h264_dc_abi_sp_failure_trap
+        b.eq frd_h264_dc_abi_pc_return
+        .globl frd_h264_dc_abi_sp_failure_trap
+frd_h264_dc_abi_sp_failure_trap:
+        brk #0xf000
+        b frd_h264_dc_abi_sp_failure_trap
+        .globl frd_h264_dc_abi_sp_failure_end
+frd_h264_dc_abi_sp_failure_end:
+#if FRD_DC_WINDOWS_ABI_BAD_UNWIND != 1
+        .section .xdata,"dr"
+        .p2align 2
+.Lfrd_dc_sp_xdata:
+        .long 0x28200008
+        .byte 0xe5,0xd9,0x92,0xd9,0x10,0xd8,0x8e,0xd8,0x0c
+#if FRD_DC_WINDOWS_ABI_BAD_UNWIND == 3
+        .byte 0xe6,0xe6,0xe6,0xc8,0x84,0xc8,0x03,0x40,0x0c,0xe4,0xe3
+#else
+        .byte 0xe6,0xe6,0xe6,0xe6,0xc8,0x02,0x40
+#if FRD_DC_WINDOWS_ABI_BAD_UNWIND == 2
+        .byte 0x0d
+#else
+        .byte 0x0c
+#endif
+        .byte 0xe4,0xe3,0xe3
+#endif
+        .section .pdata,"dr"
+        .p2align 2
+        .rva frd_h264_dc_abi_sp_failure_fragment
+        .rva .Lfrd_dc_sp_xdata
+        .text
+#endif
+#endif

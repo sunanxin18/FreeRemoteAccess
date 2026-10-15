@@ -44,9 +44,9 @@ SOURCE_PINS = {
     "h264-luma-dc-clock-oracle.py": "2eca0534ddddc1b69f969524a3a46662e8a796390f5fafd632c8552e7a0465df",
     "h264-luma-dc-windows-clock-record.h": "e92e7c22bb0d5dd6cc2fe18cf14c3759ecb2da9b13159909bb45c99503aba370",
     "h264-luma-dc-platform.h": "2afd1fdc3126aae4bc0f7f86bf73cedabe6c821a88c0a8851ba087070547981e",
-    "h264-luma-dc-abi-windows.S": "a57797d56b3830b936eb58caa61fdbb6cff941fbbc9f6d20db26332f5cea4136",
-    "h264-luma-dc-abi-windows-negative.S": "751f98ac78fa0009027583b304028127e3976a44e88d56bba6ddb890f426c833",
-    "README-windows-abi.md": "af0e01a7eb0a79a64970efaff59129d277c541b8168cd4276310ad88b0a197e1",
+    "h264-luma-dc-abi-windows.S": "8998d8b6b5a83aa31625439e33e46355da64c4126dac65bc75f0e537d9d777d0",
+    "h264-luma-dc-abi-windows-negative.S": "f6ec49f8c2e8d9f202581463a5e16df7f7d2e380a02d3443457c1b801d6d4bbf",
+    "README-windows-abi.md": "7f556bc381df052f8d2af373b90d44e97c58e5019aeb0bf81cada9faa1b99110",
 }
 OWN_INPUTS = (
     "tools/compile-windows-private-abi.py",
@@ -249,9 +249,8 @@ def compile_argv(root, out, case):
     else:
         flags = ["-O3"]
         source = "h264-luma-dc-abi-windows-negative.S" if case == "negative" else "h264-luma-dc-abi-windows.S"
-        if case != "abi":
-            # 实际 ASM guard 要求 ABI_CONTRACT；brief 同时指定 PLATFORM_CONTRACT。
-            flags += ["-DFRD_DC_PLATFORM_CONTRACT=1", "-DFRD_DC_WINDOWS_ABI_CONTRACT=1"]
+        # 五份 private C/PE helper 均显式启用 C0；generic 另行保持 macro-off。
+        flags += ["-DFRD_DC_PLATFORM_CONTRACT=1", "-DFRD_DC_WINDOWS_ABI_CONTRACT=1"]
         if case.startswith("bad-unwind-"):
             flags += ["-DFRD_DC_WINDOWS_ABI_BAD_UNWIND=" + case.rsplit("-", 1)[1]]
     return base + flags + ["-c", str(fixture / source), "-o", str(out / (case + ".obj"))]

@@ -13,16 +13,17 @@ if PATH.exists():
     sys.modules[spec.name] = parser
     spec.loader.exec_module(parser)
 
-PCS = [('entry', 0), ('after_alloc', 4), ('body', 0x30), ('call', 0x1a0),
-       ('return', 0x1a4), ('epilogue', 0x410), ('after_d14', 0x414), ('ret', 0x43c)]
+PCS = [('entry', 0), ('after_alloc', 4), ('body', 0x30), ('call', 0x1b0),
+       ('return', 0x1b4), ('epilogue', 0x420), ('after_d14', 0x424), ('ret', 0x44c)]
 GROUPS = [('x19', 0), ('x20', 1), ('x21', 2), ('x22', 3), ('x23', 4),
           ('x24', 5), ('x25', 6), ('x26', 7), ('x27', 8), ('x28', 9),
           ('d8', 10), ('d9', 11), ('d10', 12), ('d11', 13), ('d12', 14),
           ('d13', 15), ('d14', 16), ('d15', 17)]
 TRAP_SITES = {'image_size': 0x5000, 'functions': {
-    'frd_h264_dc_check_abi': {'rva': 0x1000, 'length': 0x440},
+    'frd_h264_dc_check_abi': {'rva': 0x1000, 'length': 0x450},
     'frd_h264_dc_wrong_return': {'rva': 0x3000, 'length': 0x10},
-    'frd_h264_dc_outer_probe': {'rva': 0x2000, 'length': 0x430}}}
+    'frd_h264_dc_outer_probe': {'rva': 0x2000, 'length': 0x430},
+    'frd_h264_dc_abi_sp_failure_fragment': {'rva': 0x1450, 'length': 32}}}
 
 CASES = ('preserve', 'corrupt_fp', 'corrupt_sp16', 'corrupt_sp8', 'wrong_return', 'no_return')
 
@@ -35,7 +36,9 @@ def admission(v, nl=b'\n'):
     out = line(f'FRD1 admission native=aa64 process=0000 pe=aa64 pointer=64 sp_align=16 variant={v}', nl)
     for name, off in PCS:
         out += line(f'FRD1 binding id={name} rva={0x1000+off:x} offset={off:x} table={"absent" if v == 1 else "present"}', nl)
-    return out + line('FRD1 binding outer_rva=2000 return_offset=188 epilogue_offset=400 length=430', nl)
+    out += line('FRD1 binding outer_rva=2000 return_offset=188 epilogue_offset=400 length=430', nl)
+    out += line(f'FRD1 fragment owner=sp rva=1450 length=20 trap_offset=18 table={"absent" if v == 1 else "present"} authority=bound-callback-preserves-sp', nl)
+    return out + line('FRD1 fragment owner=wrong_return rva=3000 length=10 trap_offset=8 table=present authority=bound-callback-preserves-sp', nl)
 
 
 def mask(name, value):
@@ -55,7 +58,7 @@ def cont(case, pid, tid, event, status='00010002'):
     return line(f'FRD1 debug_continue case={case} pid={pid} tid={tid} event={event} status={status} result=1 ok=1 error_valid=0 error=00000000')
 
 
-def exception(case, pid, first, pc='80011408', ready=1, status='80010001'):
+def exception(case, pid, first, pc='80011468', ready=1, status='80010001'):
     return (line(f'FRD1 exception case={case} pid={pid} tid=22 first={first} code=80000003 flags=00000000 pc={pc} ready={ready}')
             + line(f'FRD1 exception_parameters case={case} count=0') + cont(case, pid, 22, 1, status))
 
@@ -67,7 +70,7 @@ def child(case, index, ordinary=0, loader=False):
     code = '80000003' if bad else ('e0f00101' if timeout else '00000000')
     out = line(f'FRD1 child case={case} pid={pid} watchdog_ms=10000 no_return_ms={1500 if timeout else 0}')
     base = 0x80000000 + index * 0x10000
-    pc = f'{base + (0x3008 if case == 'wrong_return' else 0x1408):x}' if bad else '0'
+    pc = f'{base + (0x3008 if case == 'wrong_return' else 0x1468 if case == 'corrupt_fp' else 0x1418):x}' if bad else '0'
     out += line(f'FRD1 child_image case={case} pid={pid} base={base:x}')
     out += cont(case, pid, 22, 3) + cont(case, pid, 22, 6)
     if loader:
@@ -111,8 +114,21 @@ def transcript(suite, v=0, ordinary=0, loader=False):
                         3 if v == 3 and 2 <= k <= 6 else 0x30000 if v == 4 and k == 5 else 0)
                 out += line('FRD1 rtl establisher=70001000 handler=absent')
                 out += line(f'FRD1 unwind id={name} diff={diff:016x} expected={diff:016x} caller_sp={0x70002010 if diff == 0x100000 else 0x70002000:016x} caller_pc=0000000080002188')
+        for owner,length in (('sp',32),('wrong_return',16)):
+            for offset in range(0,length,4):
+                if v==1 and owner=='sp':
+                    out += line(f'FRD1 fragment_unwind owner={owner} offset={offset:x} outcome=expected-missing-nonleaf-table')
+                else:
+                    diff=(0x100000 if v==2 else 3 if v==3 else 0) if owner=='sp' else 0
+                    out += line('FRD1 rtl establisher=70001000 handler=absent')
+                    out += line(f'FRD1 fragment_unwind owner={owner} offset={offset:x} diff={diff:016x} expected={diff:016x} caller_sp={0x70003010 if diff==0x100000 else 0x70003000:016x} caller_pc=0000000080002188')
         if v in (0, 4):
-            out += line('FRD1 rtl establisher=70001000 handler=absent') * 3
+            out += line('FRD1 rtl establisher=70001000 handler=absent')
+            for owner,length in (('sp',32),('wrong_return',16)):
+                for offset in range(0,length,4):
+                    out += line('FRD1 rtl establisher=70001000 handler=absent') * 2
+                    out += line(f'FRD1 fragment_walk owner={owner} offset={offset:x} outcome=matched')
+            out += line('FRD1 rtl establisher=70001000 handler=absent') * 2
             out += line('FRD1 walk callback-helper-outer-caller outcome=matched')
         else:
             out += line('FRD1 walk outcome=not-applicable-bad-body-metadata')
@@ -123,6 +139,38 @@ def transcript(suite, v=0, ordinary=0, loader=False):
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_all_fragment_records_are_mandatory_exact_and_ordered(self):
+        original=transcript('unwind')
+        records=original.splitlines(keepends=True)
+        for index,record in enumerate(records):
+            if record.startswith((b'FRD1 fragment_unwind ',b'FRD1 fragment_walk ')):
+                with self.subTest(record=record),self.assertRaises(parser.TranscriptError):
+                    self.parse(b''.join(records[:index]+records[index+1:]),'unwind')
+                for changed in (record.replace(b'owner=sp',b'owner=unknown'),record.replace(b'offset=0 ',b'offset=4 '),record.rstrip(b'\n')+b' extra=1\n'):
+                    if changed!=record:
+                        with self.subTest(changed=changed),self.assertRaises(parser.TranscriptError):
+                            self.parse(b''.join(records[:index]+[changed]+records[index+1:]),'unwind')
+        got=self.parse(original,'unwind')
+        self.assertEqual(len(got.unwind),20)
+        self.assertEqual(len(got.rtl),47)
+
+    def test_fragment_variant_differences_and_authority_cannot_be_self_reported(self):
+        for variant,want in ((2,b'0000000000100000'),(3,b'0000000000000003')):
+            data=transcript('unwind',variant)
+            prefix=b'FRD1 fragment_unwind owner=sp offset=0 diff='+want+b' expected='+want
+            self.assertIn(prefix,data)
+            with self.assertRaises(parser.TranscriptError):
+                self.parse(data.replace(prefix,prefix.replace(want,b'0000000000000000')),'unwind',variant)
+        for changed in (b'authority=aligned-sp',b'authority=case-name',b'authority=unknown'):
+            with self.assertRaises(parser.TranscriptError):
+                self.parse(transcript('register').replace(b'authority=bound-callback-preserves-sp',changed,1),'register')
+
+    def test_corrupt_fp_cannot_use_original_main_trap_or_wrong_return_owner(self):
+        data=transcript('isolated')
+        for other in (b'80011418',b'80013008',b'8001146c'):
+            with self.subTest(other=other),self.assertRaises(parser.TranscriptError):
+                self.parse(data.replace(b'pc=80011468',b'pc='+other))
+
     def test_isolated_without_independent_site_identity_is_rejected(self):
         with self.assertRaises(parser.TranscriptError):
             parser.parse_transcript(transcript('isolated'), b'', 'isolated', 0, 0)
@@ -131,11 +179,11 @@ class TranscriptTests(unittest.TestCase):
         got = self.parse(transcript('isolated'))
         self.assertEqual([dict(c.events[0].fields)['base'] for c in got.children],
                          [0x80000000, 0x80010000, 0x80020000, 0x80030000, 0x80040000, 0x80050000])
-        self.assertEqual(dict(got.children[1].result)['pc'], 0x80011408)
+        self.assertEqual(dict(got.children[1].result)['pc'], 0x80011468)
         self.assertEqual(dict(got.children[4].result)['pc'], 0x80043008)
         for case, old, alternatives in [
-                ('corrupt_fp', b'80011408', (b'80013008', b'800123f8', b'8001140c')),
-                ('wrong_return', b'80043008', (b'80041408', b'800423f8', b'8004300c'))]:
+                ('corrupt_fp', b'80011468', (b'80013008', b'800123f8', b'8001146c')),
+                ('wrong_return', b'80043008', (b'80041418', b'800423f8', b'8004300c'))]:
             for other in alternatives:
                 data = transcript('isolated')
                 self.assertEqual(data.count(b'pc='+old), 3)
@@ -180,7 +228,7 @@ class TranscriptTests(unittest.TestCase):
         data = transcript('isolated')
         self.reject(b'code=80000003 flags=', b'code=c000001d flags=', data=data)
         extra = exception('corrupt_fp', 101, 1, '7ffd18078150').replace(b'code=80000003', b'code=c0000005')
-        second = exception('corrupt_fp', 101, 0, '80011408')
+        second = exception('corrupt_fp', 101, 0, '80011468')
         with self.assertRaises(parser.TranscriptError):
             self.parse(data.replace(second, extra+second, 1))
 
@@ -294,8 +342,8 @@ class TranscriptTests(unittest.TestCase):
         for old, new in [(b'first=1 code=80000003', b'first=0 code=80000003'),
                          (b'first=0 code=80000003', b'first=1 code=80000003'),
                          (b'code=80000003 flags=', b'code=c0000005 flags='),
-                         (b'pc=80011408 ready=1', b'pc=8001140c ready=1'),
-                         (b'pc=80011408 ready=1', b'pc=80011408 ready=0'),
+                         (b'pc=80011468 ready=1', b'pc=8001146c ready=1'),
+                         (b'pc=80011468 ready=1', b'pc=80011468 ready=0'),
                          (b'brk=d43e0000', b'brk=d421e020'), (b'brk=d43e0000', b'brk=d421e040'),
                          (b'brk=d43e0000', b'brk=d421e060'),
                          (b'count=0', b'count=1'), (b'exit=80000003', b'exit=00000000'),

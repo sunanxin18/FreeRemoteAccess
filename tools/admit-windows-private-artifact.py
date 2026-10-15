@@ -24,10 +24,10 @@ CONTRACT_SCHEMA = 'freeremotedesk.windows.private-contract-compile.v1'
 TERMINAL_AUTHORITY = 'terminal-status.json only; absent/pending is never success; terminal-precommit.json is not authority'
 COMPILER = 'tools/compile-windows-contract.py'
 CHECKOUT_PINS = {
-    COMPILER: '8d98d17ea4aa3f5c2781a76494cd0635435b3a2130f729e0facf2441aaadc0ee',
-    'tools/compile-windows-private-abi.py': 'ada9eb8a3d714ffaee4396eb19e183bb2f2baf533da9970970043368112fe4ec',
-    'tools/tests/test_compile_windows_private_abi.py': '9b19621a194d95c947adc86f1fd12c9419aa2244f75e333ada9f19a097a94a41',
-    'tools/tests/test_compile_windows_contract.py': '56cf7e57aad2fb0974ff4b4e857a7f8dd59507ef352968744d30137d2205b91c',
+    COMPILER: '42e453a34178f4a998b99ebc8597582078f3e7fe63231fdbdc101dc3dc885347',
+    'tools/compile-windows-private-abi.py': '8553432813c43231f2ffa0f5436c6f46960413f4ccabb6ea3b546d5738467efe',
+    'tools/tests/test_compile_windows_private_abi.py': 'ca05b8f5a96afd63a7c00d3f37a2418954d093917c455b3d3db0b3f29e629499',
+    'tools/tests/test_compile_windows_contract.py': '958cd971168492b1cbad8cce308c4720bc44f914d444400ce8f1c416d4cd943f',
     '.github/workflows/qualify-windows-private-abi.yml': '3a2318bf94819b5c34c5aec0084441c33da997cf07393218d14e81a15d9429c2',
 }
 MAX_JSON = 8 * 1024 * 1024
@@ -442,7 +442,8 @@ def static_files(destination, files_by_role, prefixes, compiler, support, origin
         if variant in (1, 2, 3):
             expected_open.insert(0, 'compiler omitted/inlined symbol: capture_callback')
         if variant == 1:
-            expected_open.insert(0, 'no owned pdata (bad1 expected helper omission): frd_h264_dc_check_abi')
+            expected_open[:0] = ['no owned pdata (bad1 expected helper omission): frd_h264_dc_check_abi',
+                                'no owned pdata (bad1 expected helper omission): frd_h264_dc_abi_sp_failure_fragment']
         need(same(owned['open'], expected_open), 'only frozen frame omissions permitted')
         need(same(item.get('open'), owned['open']), 'owned frame diagnostics changed')
         # callback 实际 frame 在需要 live walk 的两个 variant 中必须归属唯一。

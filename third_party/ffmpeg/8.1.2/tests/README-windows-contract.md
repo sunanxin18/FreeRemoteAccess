@@ -1,5 +1,35 @@
 # Windows ARM64 私有 ABI/SEH contract driver
 
+2026-10-16 当前 C0 修复：**开发中；尚无新固定 LLVM20.1.8 C/PE 或 Windows native 结果。**
+旧 source `00b328c` / run `38812955596` 的 corrupt_fp 精确 F000 first/second 之间额外 AV、
+isolated parent exit1 和后四命令未尝试的实际失败不可变；以下历史输入 hash 不能充当当前源身份。
+新 helper 主范围 `0x450`，独立 SP fragment 紧随其后32B；固定 trap 分别为 corrupt_fp→fragment+24、
+SP8/SP16→main+0x418、wrong_return→原 callback+8。ExceptionAddress 与 Context.Pc 不合并，
+trap 和 trap+4 均须唯一 owned；所有 extra AV 仍拒绝。
+
+C0 admission 绑定实际六项只读 child enum/name/callback table、二指令 nullFP callback、outer BLR x4、
+helper 调用前 selector 和 fragment 全机器闭包。F2 只按实际符号、零 addend、linked RVA 重建
+0x1a0 PAGEBASE_REL21 /0x1a4 PAGEOFFSET_12A 两个 word，其他字节仍 exact object==linked；
+未知/多余/错 offset/type/target/opcode/register/range 全拒绝。独占 pdata 的两条 ADDR32NB 及 xdata
+header/version/index/length/padding/owner/不重叠必须精确，不能借邻居表或从日志 trap 反推 child base。
+这不是任意损坏 callback 的通用 frame authority；generic 未定义 CONTRACT 时保持原指令和 metadata。
+
+原八 PC synthetic、normal callback→helper→outer→caller 以及 GPR/SIMD/upper/snapshot/fake-checker/六 child 保留。
+新增 independent saved-slot synthetic 覆盖 SP8个PC、wrong_return4个PC；bad1 对 SP8个PC仍缺表拒绝，
+bad2 仅SP+16，bad3仅x19/x20，bad4 fragment应正确；wrong_return 在所有变体独立正确，
+因此 bad1 现在也实际调用 RtlVirtualUnwind 并强制 KERNEL32 精确命名 import。旧可选 import 记录仅是历史。
+在 variant0/4 的真实 capture_callback/H/O 仍存活时，另对每个新 PC 构造本进程 CONTEXT 副本：
+SP=独立定位H，SP fragment FP=0，wrong_return trap/+4 LR=landing；expected 先由已知保存槽冻结。
+每条实际 RtlLookupFunctionEntry/RtlVirtualUnwind 先匹配全部原 x18/x19–28/d8–15.low/FP/SP/PC/LR，
+再展开 outer 并比 caller expected。坏结果不继续走。只改副本，不改真实 CPU/debugger CONTEXT，
+不把 child 地址传给 parent，不代表真实故障 dispatch 已通过。
+
+F1 严格消费新增两项 fragment binding、12项 fragment_unwind 及 variant0/4 的12项 fragment_walk，
+缺项、乱序、未知字段和自报 authority 均拒绝；命令 exit 消费 oracle 失败。
+原七命令、first-failure stop、ready/go、原始流、Job/terminal/wait/exit 及 forced timeout 保持。
+本机 Clang15 raw COFF/有限模型只是实现证据；须新 reviewed commit/push、原 workflow、五PE admission、
+同run `register0,unwind0,isolated0,unwind1..4` 全部实际完成后才可讨论 private helper 资格。
+
 日期：2026-10-14。状态：**源码冻结候选；未编译、未链接、未执行**。
 `h264-luma-dc-windows-contract.c` 只准备原生 Windows ARM64 的 helper/outer ABI
 和 SEH 正负控制。独立源码审查及 root 放行是执行前置条件。代码没有数值核、
@@ -84,7 +114,7 @@ child 在读取 matching GO 之前不调用 probe。ready/result 协议用 Write
 
 parent 用 [WaitForDebugEvent](https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-waitfordebugevent)
 和 [EXCEPTION_DEBUG_INFO](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-exception_debug_info)
-采集实际异常。结构损坏必须是 helper 已绑定 RVA+0x408 的实际 `brk #0xf000`
+采集实际异常。结构损坏必须是 helper 已绑定 RVA+0x418（SP8/SP16；nullFP 用独立 fragment+24） 的实际 `brk #0xf000`
 (`0xd43e0000`)，错误 LR 必须是 wrong_return label+8 的 `brk #0xf000`
 (`0xd43e0000`)。要求 Windows EXCEPTION_BREAKPOINT、精确异常 PC、ReadProcessMemory
 读取的真实 instruction、一次 first chance 和一次 matching second chance，以及
@@ -136,8 +166,8 @@ Windows 没有 POSIX signal，记录 `signal=not-applicable-win32`。没有分�
 使用真实 [RtlCaptureContext](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlcapturecontext)、
 [RtlLookupFunctionEntry](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtllookupfunctionentry)
 和 [RtlVirtualUnwind](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlvirtualunwind)。
-helper 长0x440、实际 frame192。链接后的 helper VA 取真实符号，核对 labels 的
-0/4/0x30/0x1a0/0x1a4/0x410/0x414/0x43c 相对偏移、实际 prologue/epilogue
+helper 长0x450、实际 frame192。链接后的 helper VA 取真实符号，核对 labels 的
+0/4/0x30/0x1b0/0x1b4/0x420/0x424/0x44c 相对偏移、实际 prologue/epilogue
 instruction bytes、同一 `.pdata` 归属、full `.xdata` 长度和固定 variant bytes；
 object-relative offset 从不当 RVA。outer 从独立 outer symbol 取VA：长0x430、
 return 相对0x188、epilogue相对0x400，独立检查指令/table/xdata。
@@ -145,8 +175,8 @@ return 相对0x188、epilogue相对0x400，独立检查指令/table/xdata。
 
 synthetic suite 为8个已知 PC 构造独立 frame/context。caller 值包含独特 full64
 GPR、SIMD low64、FP/LR/SP/PC/x18。entry/after_alloc 的未保存槽为 poison；body
-全部 saved slots 已写但 pattern 尚未装入；call/return 的 patterns 已装入；0x410
-所有 callee regs 尚未恢复；0x414 的 d14/d15 在 context 已恢复；ret 所有寄存器/SP
+全部 saved slots 已写但 pattern 尚未装入；call/return 的 patterns 已装入；0x420
+所有 callee regs 尚未恢复；0x424 的 d14/d15 在 context 已恢复；ret 所有寄存器/SP
 已恢复。correct expected 从已审查实际指令/固定192-byte saved slots 形成，永不
 从 Rtl 输出或待测 metadata 计算。expected 本身不交给 Rtl*，每次只传 actual copy。
 
@@ -154,9 +184,9 @@ GPR、SIMD low64、FP/LR/SP/PC/x18。entry/after_alloc 的未保存槽为 poison
 | --- | --- | --- |
 | 0 | 所有8PC full caller comparison=0 | actual capture walk +正常 ABI返回 |
 | 1 | 所有PC lookup null，明确 missing-nonleaf-table；绝不 leaf unwind | 正常 ABI返回、outer 正确表 |
-| 2 | after_alloc/body/call/return/0x410/0x414 只 SP 错，恰好 callerSP+16 | entry/ret 精确零差异 |
-| 3 | body/call/return/0x410/0x414 只 x19/x20 错，分别等于独立 saved x20/x21 | entry/after_alloc/ret 零差异 |
-| 4 | 0x410 只 d14/d15 low64 错，恰好保留 callee patterns | body 和0x414精确零差异、actual walk |
+| 2 | after_alloc/body/call/return/0x420/0x424 只 SP 错，恰好 callerSP+16 | entry/ret 精确零差异 |
+| 3 | body/call/return/0x420/0x424 只 x19/x20 错，分别等于独立 saved x20/x21 | entry/after_alloc/ret 零差异 |
+| 4 | 0x420 只 d14/d15 low64 错，恰好保留 callee patterns | body 和0x424精确零差异、actual walk |
 
 1–4 的控制成功表示已精确辨认坏 helper，不能标记这些 helper 为 native qualified。
 正确0 baseline先运行是外部命令执行前置顺序，随后各坏 executable；一个坏 exe
@@ -200,7 +230,7 @@ compiler: archive_sha256, extracted_inventory_sha256, headers_manifest_sha256,
 inputs: variant, helper_object_sha256, negative_object_sha256
 pe: sha256, bytes, machine=0xaa64, optional_magic=0x20b, image_size,
     imports[{dll, symbols}], crt_dependency_hashes[], map_sha256,
-    helper{rva,length=0x440,labels[{name,rva,offset}],pdata_rva,xdata_rva,bytes_sha256},
+    helper{rva,length=0x450,labels[{name,rva,offset}],pdata_rva,xdata_rva,bytes_sha256},
     outer{rva,length=0x430,return_offset=0x188,epilogue_offset=0x400,pdata_rva,xdata_rva},
     callback{rva,pdata_rva,actual_frame_and_unwind_review}
 native: os_build, native_machine, wow_machine, process_machine, pointer_bits,
