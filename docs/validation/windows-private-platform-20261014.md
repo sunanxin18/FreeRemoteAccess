@@ -293,3 +293,23 @@ Win32实现使用固定宽度ctypes结构；实时核对Python原始PE、IsWow64
 修后runner SHA256 `0db22e25ce7074fb8493088f7f0a0105568590ccdd9d6414b84e6fa82e7563d0`，owner `447dbba607851e835f980a7c6651355433a75f86df5c4718b711b8e7944151ed`；workflow `c3cf5d6948ba14647f0b9d65352020bdfc7f704d48e1f90d4a520df55dbd56b2`，F2 `6e08a333aa62e1775156696f721ec900bf352d192e76369bdd2870e6c2f2be15`。作者材料位于 `target/windows-private-runner-20261016/`，root接收位于 `target/windows-private-runner-root-20261016/`；复审报告为计划SDD目录中的 `task-4c5c3b2f3-runner-review.md`，SHA256 `29cecd9f229e7c74703e1b1943e4931ae841bf22d4c9f9d72a12c8239d53267a`。
 
 以上只完成源码、宿主控制和CI接线。首次实际Windows ARM64 Python/ctypes/API、JOB_LIST/nested jobs、C debugger/child、pipe/wait/jobzero/cleanup、认证API下载及最终上传仍待验收。即使后续通过，范围也仅为 `ABI-contract-only/nativehelper-control`；外部完整contexts、child base/provider/loader身份、shipping数学/qmul/guard、解码性能、修改FFmpeg包及产品互操作仍OPEN。此次没有设备、PC表单、HAP、凭据或远程会话操作。
+
+### 首次真实 CI：源码摘要拒绝，原生检查未尝试
+
+提交 `8e2a3e8f4b97a06b4cce46e9142dcca2434d134b` 的[原run38785317016](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38785317016) / attempt1 已失败。Linux job116595688739的宿主控制、固定工具链安装、七COFF/五PE编译及精确七文件input上传全部成功；Windows job116599130157在 `source-pins` 阶段拒绝 `tools/verify-windows-private-transcript.py`。未执行launcher原生API admission，七条命令全部 `not_attempted`，没有PE/ABI/SEH结果。
+
+root从认证artifact API取得native失败包11997442880，4849 bytes，SHA256 `d7991431b5356e2110fef811b22eb66e7d6ce87fbc116dfea5db6fe37bdb377b`；核对外层精确六文件、内层evidence.zip、members/摘要及terminal→archive/summary绑定，首错一致且终态failed。input artifact11998610962为78614325 bytes，API digest `sha256:892b62e7c4c67a192483d8baf8ad48da1f86c59b6912915068d416a20b4b7d99`。root在Mac下载该大包达到原60秒上限，未运行F2静态验收；另一次job日志GET失败，均作为收集限制保留，不能算成Windows产品失败或放宽下载上限的依据。未重跑原run。
+
+旧入口在拒绝前没有落盘实际source-identities，故未观察到Windows失配文件的字节/摘要。现有证据支持CRLF检出推断：[Git属性规则](https://git-scm.com/docs/gitattributes#_eol)明确，`text=auto` 且eol未指定的文件仍受 `core.eol` 影响，[core.eol默认native](https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreeol)；仅 `core.autocrlf=false` 不等于强制LF。root只读Git filter控制在显式crlf时生成18728 bytes/361个CRLF/SHA256 `6b9da36ae6c28af0faef800157e0cb0535a8df19da8bb8b6bb66eb0286264d6c`，指定lf则精确恢复Git原18367 bytes/c7aa4466。该控制不是实际Windows文件证明。下一修复将只为CI checkout增加过程级 `core.eol=lf` 并提前保存actual/expected source身份，继续严格拒绝失配，不在落盘后重写源文件。
+
+原始metadata、native rawZIP/静态核验与收集限制位于 `target/windows-private-runner-root-20261016/first-ci/`。首次失败及全部宿主反例保留；实际Windows machine/API、运行与生产资格继续OPEN。没有观察或操作PC模拟器。
+
+### Fix2：检出配置与拒绝前身份材料
+
+native checkout过程环境同时指定 `core.autocrlf=false` 和 `core.eol=lf`；其余动作、Linux producer、运行/下载预算和属性文件不变，不做检出后的源文件改写。workflow摘要同步到F2唯一literal，再同步runner的F2 pin。runner在固定pin检查之前保存actual source-identities及独立expected-pins；仍按原失配代码拒绝，禁止加载未通过的私有模块或启动网络/PE。
+
+新增真实临时Git控制读取实际workflow环境，证明旧单key产生CRLF、双key精确恢复原LF字节；actual-main失配控制核对actual/expected JSON已经进入failed ZIP、同首错、七项未尝试，且native/network边界未调用。两个反例先RED后GREEN；runner24项通过，受影响F2 portable21pass/1可选skip，合计45pass/1skip。owner/F1及旧compiler整套未重跑。语法/YAML/pin检查通过，辅助AST检查器第一次读取Name失败的原日志保留。
+
+root核对Fix2的28项冻结材料、68项旧作者证据、12项首CI证据及15480-byte原作者报告前缀；同reviewer定向复审Spec PASS / Quality Approved，无未关闭Critical/Important/Minor。原审查15898-byte前缀保持；当前review SHA256 `3b47880adb2a181a92bc2f6f6fb5a91b19fd796a012b05117b9e22812b7ff2e3`。workflow SHA256 `3a2318bf94819b5c34c5aec0084441c33da997cf07393218d14e81a15d9429c2`，F2 `2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea`，runner `66314d1cdaeaf64994b5205aed29b3a30aeba7caeba3687327cc8a96cc273f38`；源副本与RED/GREEN位于 `target/windows-private-runner-20261016/fix2/`。
+
+Fix2仅是源码与宿主修复。实际Windows是否恢复精确字节、launcher machine/API、同轮artifact/F2、七命令和上传交付须在新commit的新run中验收；旧失配hash仍未知，不能用host控制补写首CI事实。首轮不重跑，原生和shipping门继续OPEN。

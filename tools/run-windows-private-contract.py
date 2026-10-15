@@ -29,7 +29,7 @@ SCHEMA = 'freeremotedesk.windows.private-native.v1'
 WORKFLOW = '.github/workflows/qualify-windows-private-abi.yml'
 PINS = {
     'tools/verify-windows-private-transcript.py': 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db',
-    'tools/admit-windows-private-artifact.py': '6e08a333aa62e1775156696f721ec900bf352d192e76369bdd2870e6c2f2be15',
+    'tools/admit-windows-private-artifact.py': '2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea',
     'tools/windows-private-process.py': '447dbba607851e835f980a7c6651355433a75f86df5c4718b711b8e7944151ed',
 }
 COMMANDS = (('register', 0), ('unwind', 0), ('isolated', 0), ('unwind', 1), ('unwind', 2), ('unwind', 3), ('unwind', 4))
@@ -449,12 +449,14 @@ def main():
         stage = 'source-pins'
         source_names = set(PINS) | {'tools/run-windows-private-contract.py', 'tools/tests/test_run_windows_private_contract.py', 'tools/tests/test_windows_private_process.py', WORKFLOW}
         sources = {name: file_identity(root / name) for name in source_names}
+        # pin 拒绝前保留固定非秘密源码的实际字节身份及独立预期，不重学/改写源文件。
+        ledger.write_json('source-identities.json', sources)
+        ledger.write_json('source-expected-pins.json', PINS)
         for name, pin in PINS.items(): need(sources[name]['sha256'] == pin, 'runner-helper-source-pin:' + name)
         for name in source_names:
             raw = (root / name).read_bytes()
             need(digest(raw) == sources[name]['sha256'], 'source-snapshot-race')
             ledger.write('sources/' + name, raw)
-        ledger.write_json('source-identities.json', sources)
         admission = source_module(root, 'tools/admit-windows-private-artifact.py', PINS['tools/admit-windows-private-artifact.py'], 'frd_native_admission')
         transcript = source_module(root, 'tools/verify-windows-private-transcript.py', PINS['tools/verify-windows-private-transcript.py'], 'frd_native_transcript')
         process = source_module(root, 'tools/windows-private-process.py', PINS['tools/windows-private-process.py'], 'frd_native_owner')

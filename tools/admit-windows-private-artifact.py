@@ -28,7 +28,7 @@ CHECKOUT_PINS = {
     'tools/compile-windows-private-abi.py': '8167c1d9413e58e6d1d948631863cc76c22b300ca7eb126b9807d1d5b0bbd3f5',
     'tools/tests/test_compile_windows_private_abi.py': 'bb67f72676e010986958c6105eaf54ba9c805c85da38cefe38b4669c7a22c168',
     'tools/tests/test_compile_windows_contract.py': '67e3ef57264475d2798a2766604fea86b906474efd335f4e973afcc55e470c9b',
-    '.github/workflows/qualify-windows-private-abi.yml': 'c3cf5d6948ba14647f0b9d65352020bdfc7f704d48e1f90d4a520df55dbd56b2',
+    '.github/workflows/qualify-windows-private-abi.yml': '3a2318bf94819b5c34c5aec0084441c33da997cf07393218d14e81a15d9429c2',
 }
 MAX_JSON = 8 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024

@@ -7,6 +7,8 @@ import json
 import os
 import marshal
 import struct
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -114,7 +116,7 @@ class RunnerControls(unittest.TestCase):
                          {'raw_action_output': 'b' * 64, 'canonical_rest_digest': 'sha256:' + 'b' * 64,
                           'boundary': 'fixed upload-artifact output bare SHA256 to REST/F2 sha256 digest'})
         f2 = m.source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                             '6e08a333aa62e1775156696f721ec900bf352d192e76369bdd2870e6c2f2be15', 'fix1_real_f2_digest')
+                             '2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea', 'fix1_real_f2_digest')
         trusted = {key: value for key, value in expected.items() if key != 'workflow_context'}
         trusted['artifact'] = {**expected['artifact'], 'size_in_bytes': 10}
         metadata = {**trusted['artifact'], 'expired': False,
@@ -137,7 +139,7 @@ class RunnerControls(unittest.TestCase):
                 return self.admission_observation
         actual_source_module = m.source_module
         f2 = actual_source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                                   '6e08a333aa62e1775156696f721ec900bf352d192e76369bdd2870e6c2f2be15', 'fix1_main_real_f2')
+                                   '2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea', 'fix1_main_real_f2')
         modules = {'tools/admit-windows-private-artifact.py': f2,
                    'tools/verify-windows-private-transcript.py': SimpleNamespace(),
                    'tools/windows-private-process.py': SimpleNamespace(Win32=HostAdmission)}
@@ -210,6 +212,98 @@ class RunnerControls(unittest.TestCase):
                 self.assertTrue(observation['cleanup_confirmed'])
                 self.assertEqual(state['first_failure']['process_first_failure'], observation['first_failure'])
                 self.assertEqual(observation['first_failure']['stage'], 'stream-overflow' if failure == 'overflow' else 'read-stderr')
+
+    def test_checkout_process_git_keys_restore_exact_lf_bytes_under_crlf_defaults(self):
+        # 读取实际 native checkout env，并用于真实临时 Git 过滤；不是字符串存在检查。
+        workflow = (ROOT / m.WORKFLOW).read_text()
+        native = workflow.split('  native-helper-contract:\n', 1)[1]
+        block = native.split('        env:\n', 1)[1].split('        with:\n', 1)[0]
+        checkout_environment = {}
+        for line in block.splitlines():
+            key, value = line.strip().split(':', 1)
+            checkout_environment[key] = value.strip().strip("'")
+        git = shutil.which('git')
+        self.assertIsNotNone(git, 'host control requires installed Git')
+        raw = (ROOT / 'tools/verify-windows-private-transcript.py').read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db')
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary = Path(tmp).resolve(); repository = temporary / 'repository'; repository.mkdir()
+            home = temporary / 'home'; home.mkdir()
+            defaults = temporary / 'fixture-defaults.config'
+            defaults.write_text('[core]\n    autocrlf = false\n    eol = crlf\n')
+            # fixture config 仅模拟 Windows native eol；不读取/改写用户或系统配置。
+            environment = {'PATH': os.defpath, 'HOME': str(home), 'XDG_CONFIG_HOME': str(home),
+                           'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': str(defaults),
+                           'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C', 'LANG': 'C'}
+            def run_git(arguments, extra=None):
+                result = subprocess.run([git, '-C', str(repository), *arguments], env={**environment, **(extra or {})},
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', 'replace'))
+                return result.stdout
+            run_git(['init', '--quiet'])  # 仅这个新临时fixture允许 Git 写操作。
+            name = 'tools/verify-windows-private-transcript.py'
+            source = repository / name; source.parent.mkdir(); source.write_bytes(raw)
+            (repository / '.gitattributes').write_text('*.py text=auto\n')
+            run_git(['add', '--', '.gitattributes', name])
+            self.assertEqual(run_git(['cat-file', 'blob', ':' + name]), raw)
+            crlf = run_git(['cat-file', '--filters', ':' + name],
+                           {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.autocrlf', 'GIT_CONFIG_VALUE_0': 'false'})
+            restored = run_git(['cat-file', '--filters', ':' + name], checkout_environment)
+            self.assertEqual(hashlib.sha256(crlf).hexdigest(), '6b9da36ae6c28af0faef800157e0cb0535a8df19da8bb8b6bb66eb0286264d6c')
+            self.assertEqual(crlf.count(b'\r\n'), 361)
+            self.assertEqual(hashlib.sha256(restored).hexdigest(), 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db')
+            self.assertEqual(restored, raw)
+            self.assertEqual(source.read_bytes(), raw, 'filter observation must not rewrite fixture source')
+            print(json.dumps({'scope': 'host-only real Git filter fixture; not failed Windows bytes',
+                              'crlf': {'size': len(crlf), 'sha256': hashlib.sha256(crlf).hexdigest()},
+                              'workflow_lf': {'size': len(restored), 'sha256': hashlib.sha256(restored).hexdigest()}}))
+
+    def test_main_pin_mismatch_saves_actual_and_expected_source_identities_before_rejecting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            names = set(m.PINS) | {'tools/run-windows-private-contract.py', 'tools/tests/test_run_windows_private_contract.py',
+                                   'tools/tests/test_windows_private_process.py', m.WORKFLOW}
+            for name in names:
+                destination = root / name; destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes((ROOT / name).read_bytes())
+            (root / 'target').mkdir()
+            changed_name = 'tools/verify-windows-private-transcript.py'
+            changed = root / changed_name
+            raw = changed.read_bytes().replace(b'\n', b'\r\n')  # 仅对测试fixture制造已知失配。
+            changed.write_bytes(raw)
+            environment = context()
+            output = root / 'target/task4c5c3b2f3-native-123-2'
+            argv = ['run-windows-private-contract.py', '--source-root', str(root), '--output', str(output)]
+            with patch.object(m, '__file__', str(root / 'tools/run-windows-private-contract.py')), patch.object(m.sys, 'argv', argv), \
+                    patch.dict(m.os.environ, environment, clear=True), \
+                    patch.object(m, 'source_module', side_effect=AssertionError('no private module or Win32 backend may be loaded')) as modules, \
+                    patch.object(m, 'Transport', side_effect=AssertionError('no network may start')) as transport:
+                returncode = m.main()
+            self.assertEqual(returncode, 1)
+            modules.assert_not_called()
+            transport.assert_not_called()
+            self.assertTrue((output / 'source-identities.json').exists(), 'actual main must save actual source bytes identity before pin rejection')
+            actual_raw = (output / 'source-identities.json').read_bytes()
+            expected_raw = (output / 'source-expected-pins.json').read_bytes()
+            actual, expected = json.loads(actual_raw), json.loads(expected_raw)
+            self.assertEqual(actual[changed_name], {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
+            self.assertEqual(expected, m.PINS)
+            self.assertEqual(expected[changed_name], 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db')
+            self.assertNotEqual(actual[changed_name]['sha256'], expected[changed_name])
+            summary = json.loads((output / 'summary.json').read_bytes())
+            first = {'stage': 'source-pins', 'type': 'RunnerError', 'code': 'runner-helper-source-pin:' + changed_name}
+            self.assertEqual(summary['first_failure'], first)
+            self.assertEqual([command['status'] for command in summary['commands']], ['not_attempted'] * 7)
+            self.assertFalse(summary['native_commands_complete'])
+            terminal = json.loads((output / 'terminal-status.json').read_bytes())
+            self.assertEqual(terminal['status'], 'failed')
+            self.assertEqual(terminal['first_failure'], first)
+            self.assertFalse((output / 'launcher-admission.json').exists())
+            self.assertFalse((output / 'input-outer.zip').exists())
+            with zipfile.ZipFile(output / 'evidence.zip') as archive:
+                self.assertEqual(archive.read('source-identities.json'), actual_raw)
+                self.assertEqual(archive.read('source-expected-pins.json'), expected_raw)
+            print(json.dumps({'scope': 'host-only actual-main pin rejection fixture', 'actual': actual[changed_name], 'expected_sha256': expected[changed_name]}))
 
     def test_context_cannot_take_identity_from_artifact(self):
         self.assertEqual(m.expected_context(context())['run_attempt'], 2)
