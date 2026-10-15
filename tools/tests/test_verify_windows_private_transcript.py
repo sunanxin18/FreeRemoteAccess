@@ -1,5 +1,6 @@
 """显式合成 host-only 字节控制；从未执行 Windows，也不是 native receipt。"""
 import importlib.util
+import copy
 from pathlib import Path
 import sys
 import unittest
@@ -18,6 +19,11 @@ GROUPS = [('x19', 0), ('x20', 1), ('x21', 2), ('x22', 3), ('x23', 4),
           ('x24', 5), ('x25', 6), ('x26', 7), ('x27', 8), ('x28', 9),
           ('d8', 10), ('d9', 11), ('d10', 12), ('d11', 13), ('d12', 14),
           ('d13', 15), ('d14', 16), ('d15', 17)]
+TRAP_SITES = {'image_size': 0x5000, 'functions': {
+    'frd_h264_dc_check_abi': {'rva': 0x1000, 'length': 0x440},
+    'frd_h264_dc_wrong_return': {'rva': 0x3000, 'length': 0x10},
+    'frd_h264_dc_outer_probe': {'rva': 0x2000, 'length': 0x430}}}
+
 CASES = ('preserve', 'corrupt_fp', 'corrupt_sp16', 'corrupt_sp8', 'wrong_return', 'no_return')
 
 
@@ -49,7 +55,7 @@ def cont(case, pid, tid, event, status='00010002'):
     return line(f'FRD1 debug_continue case={case} pid={pid} tid={tid} event={event} status={status} result=1 ok=1 error_valid=0 error=00000000')
 
 
-def exception(case, pid, first, pc='80001000', ready=1, status='80010001'):
+def exception(case, pid, first, pc='80011408', ready=1, status='80010001'):
     return (line(f'FRD1 exception case={case} pid={pid} tid=22 first={first} code=80000003 flags=00000000 pc={pc} ready={ready}')
             + line(f'FRD1 exception_parameters case={case} count=0') + cont(case, pid, 22, 1, status))
 
@@ -60,6 +66,9 @@ def child(case, index, ordinary=0, loader=False):
     timeout = case == 'no_return'
     code = '80000003' if bad else ('e0f00101' if timeout else '00000000')
     out = line(f'FRD1 child case={case} pid={pid} watchdog_ms=10000 no_return_ms={1500 if timeout else 0}')
+    base = 0x80000000 + index * 0x10000
+    pc = f'{base + (0x3008 if case == 'wrong_return' else 0x1408):x}' if bad else '0'
+    out += line(f'FRD1 child_image case={case} pid={pid} base={base:x}')
     out += cont(case, pid, 22, 3) + cont(case, pid, 22, 6)
     if loader:
         out += exception(case, pid, 1, '7fff00001000', 0, '00010002')
@@ -68,7 +77,7 @@ def child(case, index, ordinary=0, loader=False):
         out += line(f'FRD1 debug_event case={case} pid={pid} tid={30+n} event={event} classification=ordinary')
         out += cont(case, pid, 30+n, event)
     if bad:
-        out += exception(case, pid, 1) + exception(case, pid, 0)
+        out += exception(case, pid, 1, pc) + exception(case, pid, 0, pc)
     out += line(f'FRD1 exit_event case={case} pid={pid} tid=22 event=5 code={code} tick=3000 terminal=0')
     out += cont(case, pid, 22, 5)
     payload = admission(0, b'\r\n') + line(f'FRD1 ready case={case} variant=0')
@@ -76,8 +85,7 @@ def child(case, index, ordinary=0, loader=False):
         payload += line('FRD1 returned case=preserve mask=0000000000000000', b'\r\n')
         payload += line('FRD1 result case=preserve outcome=normal-control')
     out += raw(case, 'stdout', payload) + raw(case, 'stderr', b'')
-    pc = '80001000' if bad else '0'
-    brk = ('d421e040' if case == 'wrong_return' else 'd421e020') if bad else '00000000'
+    brk = 'd43e0000' if bad else '00000000'
     out += line(f'FRD1 child_result case={case} ready=1 go=1 terminal=1 first={int(bad)} second={int(bad)} code={"80000003" if bad else "00000000"} pc={pc} brk={brk} exit={code} timeout={int(timeout)} forced={int(timeout)} signal=not-applicable-win32')
     out += line(f'FRD1 child_terminal case={case} exit_event_seen=1 exit_event_code={code} exit_continue_attempted=1 exit_continue_result=1 exit_continue_ok=1 exit_continue_error_valid=0 exit_continue_error=00000000 wait_attempted=1 wait_result_valid=1 wait_result=00000000 wait_error_valid=0 wait_error=00000000 terminal=1')
     out += line(f'FRD1 child_time case={case} start_tick=1000 ready_tick=1100 terminate_tick={2600 if timeout else 0} exit_event_tick=3000 terminal_tick=3001 designated_timeout={int(timeout)}')
@@ -115,12 +123,73 @@ def transcript(suite, v=0, ordinary=0, loader=False):
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_isolated_without_independent_site_identity_is_rejected(self):
+        with self.assertRaises(parser.TranscriptError):
+            parser.parse_transcript(transcript('isolated'), b'', 'isolated', 0, 0)
+
+    def test_independent_sites_and_different_child_bases(self):
+        got = self.parse(transcript('isolated'))
+        self.assertEqual([dict(c.events[0].fields)['base'] for c in got.children],
+                         [0x80000000, 0x80010000, 0x80020000, 0x80030000, 0x80040000, 0x80050000])
+        self.assertEqual(dict(got.children[1].result)['pc'], 0x80011408)
+        self.assertEqual(dict(got.children[4].result)['pc'], 0x80043008)
+        for case, old, alternatives in [
+                ('corrupt_fp', b'80011408', (b'80013008', b'800123f8', b'8001140c')),
+                ('wrong_return', b'80043008', (b'80041408', b'800423f8', b'8004300c'))]:
+            for other in alternatives:
+                data = transcript('isolated')
+                self.assertEqual(data.count(b'pc='+old), 3)
+                with self.subTest(case=case, other=other), self.assertRaises(parser.TranscriptError):
+                    self.parse(data.replace(b'pc='+old, b'pc='+other))
+
+    def test_child_image_missing_duplicate_foreign_and_order_are_rejected(self):
+        data = transcript('isolated')
+        record = line('FRD1 child_image case=corrupt_fp pid=101 base=80010000')
+        for replacement in (b'', record*2, record.replace(b'pid=101', b'pid=102'),
+                            record.replace(b'corrupt_fp', b'wrong_return'),
+                            record.replace(b'base=80010000', b'base=80020000'),
+                            record.replace(b'base=80010000', b'base=0'),
+                            record.replace(b'base=80010000', b'base=fffffffffffffff0'),
+                            record.replace(b'base=80010000', b'base=080010000'),
+                            record.replace(b'base=80010000', b'base=8001000A')):
+            with self.subTest(replacement=replacement), self.assertRaises(parser.TranscriptError):
+                self.parse(data.replace(record, replacement, 1))
+        create = cont('corrupt_fp', 101, 22, 3)
+        with self.assertRaises(parser.TranscriptError):
+            self.parse(data.replace(record+create, create+record, 1))
+
+    def test_expected_site_schema_bounds_and_wrong_rva(self):
+        invalid = [None, {}, {'image_size': True, 'functions': TRAP_SITES['functions']}]
+        for function, key, value in [('frd_h264_dc_check_abi', 'rva', True),
+                                     ('frd_h264_dc_check_abi', 'rva', 0x1004),
+                                     ('frd_h264_dc_wrong_return', 'rva', 0x3004),
+                                     ('frd_h264_dc_wrong_return', 'rva', 0x1000),
+                                     ('frd_h264_dc_outer_probe', 'rva', 0x4f00),
+                                     ('frd_h264_dc_outer_probe', 'length', 0x434)]:
+            value_set = copy.deepcopy(TRAP_SITES)
+            value_set['functions'][function][key] = value
+            invalid.append(value_set)
+        extra = copy.deepcopy(TRAP_SITES); extra['opcode'] = 0xd43e0000; invalid.append(extra)
+        for sites in invalid:
+            with self.subTest(sites=sites), self.assertRaises(parser.TranscriptError):
+                parser.parse_transcript(transcript('isolated'), b'', 'isolated', 0, 0, expected_trap_sites=sites)
+        # 其它六个 pair 的行为不依赖这个 isolated-only 参数。
+        parser.parse_transcript(transcript('register'), b'', 'register', 0, 0)
+
+    def test_illegal_instruction_and_extra_av_remain_rejected(self):
+        data = transcript('isolated')
+        self.reject(b'code=80000003 flags=', b'code=c000001d flags=', data=data)
+        extra = exception('corrupt_fp', 101, 1, '7ffd18078150').replace(b'code=80000003', b'code=c0000005')
+        second = exception('corrupt_fp', 101, 0, '80011408')
+        with self.assertRaises(parser.TranscriptError):
+            self.parse(data.replace(second, extra+second, 1))
+
     def setUp(self):
         self.assertIsNotNone(parser, '待实现 strict bytes transcript parser')
 
     def parse(self, data, suite='isolated', v=0, stderr=b'', returncode=0):
         self.assertIsNotNone(parser, '待实现 strict bytes transcript parser')
-        return parser.parse_transcript(data, stderr, suite, v, returncode)
+        return parser.parse_transcript(data, stderr, suite, v, returncode, expected_trap_sites=TRAP_SITES)
 
     def reject(self, old, new, suite='isolated', v=0, data=None):
         original = transcript(suite, v) if data is None else data
@@ -225,9 +294,10 @@ class TranscriptTests(unittest.TestCase):
         for old, new in [(b'first=1 code=80000003', b'first=0 code=80000003'),
                          (b'first=0 code=80000003', b'first=1 code=80000003'),
                          (b'code=80000003 flags=', b'code=c0000005 flags='),
-                         (b'pc=80001000 ready=1', b'pc=80001004 ready=1'),
-                         (b'pc=80001000 ready=1', b'pc=80001000 ready=0'),
-                         (b'brk=d421e020', b'brk=d421e040'), (b'brk=d421e040', b'brk=d421e020'),
+                         (b'pc=80011408 ready=1', b'pc=8001140c ready=1'),
+                         (b'pc=80011408 ready=1', b'pc=80011408 ready=0'),
+                         (b'brk=d43e0000', b'brk=d421e020'), (b'brk=d43e0000', b'brk=d421e040'),
+                         (b'brk=d43e0000', b'brk=d421e060'),
                          (b'count=0', b'count=1'), (b'exit=80000003', b'exit=00000000'),
                          (b'flags=00000000', b'flags=000000000')]:
             self.reject(old, new)
@@ -239,7 +309,7 @@ class TranscriptTests(unittest.TestCase):
         self.reject(b'pc=7fff00001000 ready=0', b'pc=7fff00001000 ready=1', data=data)
         changed = data.replace(b'count=0', b'count=2 p0=123 p1=ffffffffffffffff', 1)
         got = self.parse(changed)
-        self.assertIn(('p1', 0xffffffffffffffff), got.children[0].events[2].parameters)
+        self.assertIn(('p1', 0xffffffffffffffff), got.children[0].events[3].parameters)
         self.reject(b'count=0', b'count=16', data=data)
 
     def test_no_return_exact_designated_ready_timing(self):
@@ -322,7 +392,7 @@ class TranscriptTests(unittest.TestCase):
         old = cont('preserve', 100, 22, 3)
         data = transcript('isolated').replace(old, old.replace(b'result=1 ', b'result=2 '), 1)
         got = self.parse(data)
-        self.assertEqual(dict(got.children[0].events[0].fields)['result'], 2)
+        self.assertEqual(dict(got.children[0].events[1].fields)['result'], 2)
         self.assertEqual(dict(got.children[0].terminal)['exit_continue_result'], 1)
 
     def test_raw_bool_zero_out_of_range_and_noncanonical_are_rejected(self):
@@ -375,7 +445,7 @@ class TranscriptTests(unittest.TestCase):
             with self.subTest(case=case):
                 got = self.parse(data)
                 events = got.children[index].events
-                self.assertEqual(dict(events[0].fields)['tid'], 22)
+                self.assertEqual(dict(events[1].fields)['tid'], 22)
                 self.assertEqual(dict(events[-2].fields)['tid'], 30)
                 self.assertEqual(dict(events[-1].fields)['tid'], 30)
                 # 改单个事件使相邻Continue不匹配，仍必须失败。

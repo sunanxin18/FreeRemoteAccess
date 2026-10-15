@@ -345,3 +345,31 @@ owner在独立wait0之后实际查询一次退出码，要求DWORD整数0；非0
 同reviewer定向复审 **Spec PASS / Quality Approved**，无Critical/Important/Minor。root核对37项新冻结文件、99项旧作者证据、8份基线、13个producer pins、固定F1/F2/workflow与22491-byte旧报告前缀；报告和完整四文件diff已读。最终owner SHA256 `efe57549a64a3c7418002c97d81ddd9af293b86e4ebaf824bc0a88081d2f5fb0`，runner `b569117d7d75139d1a8d0337ee483aa4aba659d08d165636595468de72b540ba`；Fix3 manifest `fb1dc182c50f1d109b086d73c401a2b18929f842456640243217886b3747b9d6`，复审报告 `2785a1133f6825773ab463737c32af39e4e4a3663dfc087fe75f8a4b3827f818`。作者材料位于 `target/windows-private-runner-20261016/fix3/`，root接收为 `target/windows-private-runner-root-20261016/f3-fix3-root-acceptance.json`。
 
 原unwind actualexit、active1的身份和无干预是否自然收束仍未知。新原生运行须以审查后的精确新commit单独取得同run编译、输入及完整七项结果；旧run保持失败。完整helper、shipping数学/guard/性能/修改包和产品互操作仍OPEN。没有操作PC表单或其他设备。
+
+
+### Fix3 原生结果：register/unwind 通过，isolated 的断点合同失败
+
+提交 `c973c66128d8e2efeddbdbcdd03b9810eb23fdda` 的[原run38795525333](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38795525333) / attempt1，以明确workflow_dispatch启动，Linux job116630778539成功，Windows job116634118705失败。实际source pins与原生ARM64 launcher门通过。register0 PID6548、unwind0 PID6752均独立wait0/实际exit0/JobActive0，未Terminate；root用Git固定c7aa4466 F1源码bytes重新解析实际stdout/stderr，结果逐项匹配parser记录。unwind本次首次活动计数就是0，**没有实测1→0自然收束**；前一run未查询的unwind退出码仍未知，不回填。
+
+isolated0父PID1380实际wait0/exit1，外层首错为 `parent-wait-exit-cleanup` / `exit:parent-nonzero`，清理wait0/active0。preserve child正常返回；corrupt_fp PID10528/TID7252在ready1后报告first `c000001d`（PC7ff7ff415690），再报告first `c0000005`（PC7ffd18078150，读取地址90），随后second `c000001d` 并以同码退出。ContinueDebugEvent均成功，exit-event continue和独立wait/terminal完成；C的合格probe first/second均为0、父exit1。F1未接收该失败case，后续四个unwind变体均未尝试，整轮仍失败。
+
+当前C exact_trap要求EXCEPTION_BREAKPOINT、case-specific地址与4字节opcode。非法指令在异常码条件就被拒绝，`child_result brk=0` 不表示实际读取到零字。尾部 `win32=109` 是未与失败条件绑定的GetLastError值；drain正常处理broken pipe后可能保留该值，不能把它当根因。实际debugger未输出child load base，按异常PC反推module基址不是独立地址证明。
+
+[Microsoft __debugbreak](https://learn.microsoft.com/en-us/cpp/intrinsics/debugbreak?view=msvc-170)的Windows ARM64编码为 `BRK #0xF000`；独立A64编码推导为 `0xD43E0000`。现有Windows helper、wrong-return、outer失败site分别为f01/f02/f03。root从旧已完整认证、且ASM与c973相同的真实PE独立读出helper+408/wrong_return+8/outer+3f8为d421e020/40/60，长度440/10/430；该静态记录不替代新run动态child内存或模块身份。修改编码有明确文档依据，但能否消除额外AV或满足完整first→second生命周期仍待新native；未知AV不得接受、吞掉或用恢复PC/SP/FP掩盖。
+
+完整native artifact12002103362为472087518 bytes，SHA256 `05dddd63a9187f6591898044df79603aab68ab27e793ce8650a007044f16295a`，与认证API一致。root核对535个外层/532个内层成员CRC/长度/hash、terminal/archive/members/summary、七source copies与Gitc973，并将最初21项Range材料及raw blocks逐字对照完整ZIP。原网络TimeoutError与292356096-byte前缀239040a7保留，固定offset只续传余下179731422 bytes；没有重跑CI或原生命令。首次root verifier错误要求launcher.first_failure字段而KeyError，原脚本/STOP保留；v2按固定runner实际三字段格式完成核对，该工具错误不是native首错。
+
+同run input12002133030为78613788 bytes，SHA256 `156ffc484c990344c7f615bb1d836ee76894a92608b5dd9090dbe1f4785904b9`。root核对独立API、callercontext、实际rawZIP，再用未改F2/固定源bytes static admit/revalidate通过七COFF/五PE；seal为 `admitted-static-only`，caller-held seal摘要82220a23。root未在Mac执行PE、compiler或Win32。完整接收为 `target/windows-private-runner-root-20261016/fix3-ci/native-root-acceptance.json` 和 `root-static-acceptance.json`。
+
+Fix4源码/host实现已完成并经独立复审批准：三个Windows fixture site统一documented F000；C新增独立CREATE_PROCESS_DEBUG_EVENT child_image基址观察，F1交叉使用F2已认证同run的RVA/owner/image范围，精确核对case-specific PC，保留全部严格异常/Continue/exit/wait与原30/120/10预算。代价是窄扩展C输出、F1私有期望数据和runner绑定适配；它仍不证明外部child模块文件/provider身份。两份私有指南及source pin链同步更新，原数学、process owner、workflow、生产默认和其它平台不变。新同run实际验证仍待完成，完整helper和shipping各门继续OPEN。PC人工表单未观察或操作。
+
+
+### Fix4 源码与宿主控制交付
+
+三个固定site改为F000，函数长度/offset/SEH/寄存器和原异常生命周期保持。C从实际CREATE_PROCESS_DEBUG_EVENT的PID与lpBaseOfImage记录child_image；F1严格检查唯一规范记录、64位映像范围与case-specific helper或wrong-return PC，三个first/second/result PC一起换到另一合法site、outer或相邻指令仍拒绝。runner只从caller-held F2 seal.output_tree固定的同run/attempt variant0绑定文件读取image_size与三函数RVA/length；读取前后核对身份，严格JSON，并把校验后的副本交五参数parser closure。无新增CLI地址入口或F2信任刷新。
+
+最终五个受影响宿主suite共137项，**136实际通过、1项旧compiled fixture未配置而可选跳过**，exit0。旧compiler同时接受object/PE错误字及旧F1缺独立site身份的语义RED共四个失败断言均已保留；中途旧pin/长度控制、证据JSON序列化exit1和旧CRLF预期失败同样保留，green5才是最终完整运行。原有隔离临时Git过滤fixture获root明确授权且通过，未操作项目Git。10份Python语法、全部pin链与固定workflow/process owner身份检查通过。没有C编译、PE执行或设备操作。
+
+独立定向复审 **Spec PASS / Quality Approved**，Critical/Important/Minor均0。root已读完整15文件变更及追加报告，核对75份冻结文件、20份当前源码/报告/brief身份、15份修改前源码与Gitc973、原31584-byte作者报告与30288-byte审查前缀。作者manifest为 `cfba8d969328b833490fa492761310553c9afbea691778760c0b05c8e5ca53c6`，审查报告为 `8a1ad90667cc9fd20d51d53f6dd973adda11fdf32163839dd5fdde7edae2d13b`。源码F1 `8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2`、F2 `844543036bf46f269f44e91b40a69978309281af665fdba59f2dc9269f3c1570`、runner `f5d9b2fbd2bd1dd316b3cedc91fe812f239ba6f4d156368304ab0c35b66f0eff`；root接收为 `target/windows-private-runner-root-20261016/f3-fix4-root-acceptance.json`。
+
+此批准仅覆盖源码及host controls。需要审查后精确新commit的新同run编译/输入/实际Windows七命令；不重跑或改写c973失败。若新编码后仍有额外AV或其它异常，保持失败并重新裁定，不放宽异常门。外部模块文件/provider、shipping数值/qmul/guard/性能/修改包和真实产品会话均未由本次关闭。

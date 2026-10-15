@@ -4,7 +4,7 @@
 parse_transcript(stdout, stderr, suite, variant, parent_returncode) 只返回观察。
 传入的退出码/bytes 都是数据；本库不能证明进程、host、PE、artifact 身份或
 native 执行，不能将合成测试提升为资格。C 内部 saved-slot/context oracle
-接受为有限控制，日志未提供 full contexts、child load base、loader 身份；
+接受为有限控制，日志未提供 full contexts、child 模块文件或 loader 身份；
 matched 不表示外部重建这些值。no_return 时间是 ready→terminate，非 GO 时钟。
 """
 from dataclasses import dataclass
@@ -20,7 +20,7 @@ _PAIRS = frozenset([('register', 0), ('isolated', 0)] + [('unwind', v) for v in 
 _LIMITATIONS = (
     '输入字节及 parent returncode 是调用方数据，并非进程/host/artifact admission',
     'full actual/expected contexts 仅由 C 内部 oracle 检查，外部未观察',
-    'child load base/module identity 未输出；不从 trap PC 推导基址',
+    'child base 为 C 记录的 OS create-event 字段；外部模块文件/provider 身份未关闭',
     'pre-ready external-PE breakpoint 仅为 C 分类，未独立证明 loader identity',
     'no_return >=1500ms 是 ready→terminate，不是 GO 后完整1500ms',
     'shipping kernel/qmul/native/runtime/package/benchmark 资格均未关闭',
@@ -249,13 +249,39 @@ def _exception(reader, case, pid):
     return d, Record('exception', tuple(d.items()), tuple(parameters))
 
 
-def _child(reader, case, parent_bindings):
+def _trap_sites(value):
+    """调用方持有的 F2 数据；固定 offset/opcode 不接受外部覆盖。"""
+    lengths = {'frd_h264_dc_check_abi': 0x440, 'frd_h264_dc_wrong_return': 0x10,
+               'frd_h264_dc_outer_probe': 0x430}
+    _require(type(value) is dict and set(value) == {'image_size', 'functions'}, 'expected trap sites schema')
+    size, functions = value['image_size'], value['functions']
+    _require(type(size) is int and 0 < size <= 0xffffffff, 'expected image size')
+    _require(type(functions) is dict and set(functions) == set(lengths), 'expected trap functions')
+    copied, ranges = {}, []
+    for name, length in lengths.items():
+        item = functions[name]
+        _require(type(item) is dict and set(item) == {'rva', 'length'}, 'expected trap function schema')
+        rva = item['rva']
+        _require(type(rva) is int and type(item['length']) is int and item['length'] == length and
+                 0 < rva and rva % 4 == 0 and rva + length <= size, 'expected trap function range/length')
+        _require(all(rva + length <= begin or end <= rva for begin, end in ranges), 'expected trap owners overlap')
+        ranges.append((rva, rva + length))
+        copied[name] = {'rva': rva, 'length': length}
+    return {'image_size': size, 'functions': copied}
+
+
+def _child(reader, case, parent_bindings, sites):
     header = _fields(reader, 'child', case=case, pid='pid', watchdog_ms='10000', no_return_ms='1500' if case == 'no_return' else '0')
     pid = header['pid']
     bad = case not in ('preserve', 'no_return')
     timeout = case == 'no_return'
     expected_exit = 0x80000003 if bad else (0xe0f00101 if timeout else 0)
-    events, probes = [], []
+    image = _fields(reader, 'child_image', case=case, pid='pid', base='hex')
+    _require(image['pid'] == pid and image['base'] > 0 and image['base'] % 4 == 0 and
+             image['base'] + sites['image_size'] <= (1 << 64), 'child image ownership/base/range')
+    name, offset = ('frd_h264_dc_wrong_return', 8) if case == 'wrong_return' else ('frd_h264_dc_check_abi', 0x408)
+    expected_pc = image['base'] + sites['functions'][name]['rva'] + offset
+    events, probes = [Record('child_image', tuple(image.items()))], []
     created, loader, exited = False, False, False
     exit_info = None
     main_tid = None
@@ -288,6 +314,7 @@ def _child(reader, case, parent_bindings):
             else:
                 _require(d['tid'] == main_tid, 'probe main-thread identity')
                 _require(bad and d['code'] == 0x80000003 and d['first'] == (1 if not probes else 0) and len(probes) < 2, 'probe exception code/chance/order')
+                _require(d['pc'] == expected_pc, 'probe independent case/site PC')
                 if probes:
                     _require(d['pc'] == probes[0]['pc'] and d['tid'] == probes[0]['tid'], 'probe exception PC/TID consistency')
                 probes.append(d)
@@ -320,7 +347,7 @@ def _child(reader, case, parent_bindings):
     result = _fields(reader, 'child_result', case=case, ready='1', go='1', terminal='1', first=str(int(bad)), second=str(int(bad)), code='h32', pc='hex', brk='h32', exit='h32', timeout=str(int(timeout)), forced=str(int(timeout)), signal='not-applicable-win32')
     _require(result['exit'] == expected_exit, 'child result exit consistency')
     if bad:
-        _require(result['code'] == 0x80000003 and result['pc'] == probes[0]['pc'] and result['brk'] == (0xd421e040 if case == 'wrong_return' else 0xd421e020), 'C internal exact trap outcome/opcode consistency')
+        _require(result['code'] == 0x80000003 and result['pc'] == expected_pc == probes[0]['pc'] and result['brk'] == 0xd43e0000, 'C internal exact trap outcome/opcode consistency')
         _require(result['pc'] % 4 == 0, 'trap PC alignment')
     else:
         _require(result['code'] == result['pc'] == result['brk'] == 0, 'unexpected non-probe exception result')
@@ -338,7 +365,7 @@ def _child(reader, case, parent_bindings):
 
 
 def parse_transcript(stdout: bytes, stderr: bytes, suite: str, variant: int,
-                     parent_returncode: int) -> TranscriptObservation:
+                     parent_returncode: int, *, expected_trap_sites=None) -> TranscriptObservation:
     """验证七个固定公开 pair 的日志；返回观察，不创建 native success receipt。"""
     _require(type(stdout) is bytes and type(stderr) is bytes, 'stdout/stderr must be bytes')
     _require(type(suite) is str and type(variant) is int and (suite, variant) in _PAIRS, 'unsupported public suite/variant')
@@ -347,6 +374,12 @@ def parse_transcript(stdout: bytes, stderr: bytes, suite: str, variant: int,
     _require(not stderr, 'unclassified parent stderr')
     reader = _Bytes(stdout)
     admission, bindings = _admission(reader, variant)
+    sites = None
+    if suite == 'isolated':
+        sites = _trap_sites(expected_trap_sites)
+        _require(dict(bindings[0])['rva'] == sites['functions']['frd_h264_dc_check_abi']['rva'] and
+                 dict(bindings[-1])['outer_rva'] == sites['functions']['frd_h264_dc_outer_probe']['rva'],
+                 'transcript/admitted helper and outer RVA')
     masks = [_mask(reader, 'baseline_return', 0)]
     unwind, rtl, children, walk = (), (), (), None
     if suite == 'register':
@@ -354,7 +387,7 @@ def parse_transcript(stdout: bytes, stderr: bytes, suite: str, variant: int,
     elif suite == 'unwind':
         unwind, rtl, walk = _unwind(reader, variant)
     else:
-        children = tuple(_child(reader, case, bindings) for case in _CASES)
+        children = tuple(_child(reader, case, bindings, sites) for case in _CASES)
     reader.literal(f'FRD1 final suite={suite} variant={variant} status=ABI-contract-only/nativehelper-control shipping_kernel=unimplemented qmul=unimplemented qualification=OPEN')
     reader.done()
     return TranscriptObservation(suite, variant, parent_returncode, len(stdout), admission, bindings,

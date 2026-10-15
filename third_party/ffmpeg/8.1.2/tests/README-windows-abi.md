@@ -41,7 +41,7 @@ expected FP；184 scratch。x29=SP，指向真实 caller FP/LR pair。
 
 checker 在实际 `blr x3` 前设置 10 个不同 full64 GPR pattern 和 8 个不同
 low64 SIMD pattern。x0/x1 保留，w2 不变，x2 高位固定为 `0xa19c7e35`。
-返回后的 SP 对齐和 x29=SP 检查先于任何栈读取。违反结构时 `brk #0xf01`
+返回后的 SP 对齐和 x29=SP 检查先于任何栈读取。违反结构时 `brk #0xf000`
 后永久 trap-loop，绝不借坏帧恢复。结构有效才比较快照与所有 pattern。
 
 | bit | 可恢复 mismatch |
@@ -58,7 +58,10 @@ child trap 表示失败；bits19/20 的可返回路径用预期快照注入测�
 整个保存区仍安全恢复。这里测试的是已知受控 ABI 破坏，不是 sandbox。
 
 outer 的 uint64 返回值低32=checker mask，高32=caller restoration mask，
-后者使用同一 bit 编号但独立常量/比较。外层结构失败 `brk #0xf03`。
+后者使用同一 bit 编号但独立常量/比较。外层结构失败 `brk #0xf000`。
+三个 Windows trap 均为 documented `0xd43e0000`，由 case-specific 实际 PC
+区分；共用指令字不允许把 outer failure 当作 child 的合格 probe。修正编码
+本身不是 Windows 原生异常生命周期已通过的证据。
 checker 参数允许用返回 0 却破坏单个寄存器的 fake checker，验证 outer 检测
 确实独立；不是只信任内层“0”返回值。
 
@@ -78,7 +81,7 @@ negative 文件强制 `FRD_DC_WINDOWS_ABI_CONTRACT`，两文件拒绝非 Windows
 | `frd_h264_dc_fault_x18_snapshot` | 只翻 caller frame+160 快照；checker=`1u<<18`，outer高32=0。没有 x18 写入。 |
 | `frd_h264_dc_fault_fp_snapshot/sp_snapshot` | 只翻 +176/+168 预期快照；checker bits19/20，outer高32=0，调用者状态恢复。 |
 | `frd_h264_dc_corrupt_fp/sp16/sp8` | child 必须 ready 后异常失败；SP+16仍对齐但FP关系错，SP+8不对齐。不得把 ordinary exit1、缺 ready 或任意 timeout 算结构 trap 通过。 |
-| `frd_h264_dc_wrong_return` | x30 跳到私有 controlled `brk #0xf02` landing；child 必须异常失败且无 PASS。 |
+| `frd_h264_dc_wrong_return` | x30 跳到私有 controlled `brk #0xf000` landing；child 必须异常失败且无 PASS。 |
 | `frd_h264_dc_no_return` | 专用 child 必须 ready 后超过明确 timeout，由 parent 终止并分类 expected timeout；不是正例成功。其它 probe timeout 是失败。 |
 | `frd_h264_dc_call_qmul_hi_a/hi_b` | 四参数真实 tail-call wrapper，高32分别 `0xa19c7e35/0x5e6381ca`；同 w2、同实际 kernel，与独立 C 全输出及输入不变期望一致。 |
 | `frd_h264_dc_call_qmul_bad_full_x2` | 将高32错误折入实际 qmul 后调用同 kernel；独立 oracle 必须拒绝至少一个明确 vector/qmul。不得只比较两次 wrapper 输出或只看 disassembly。 |

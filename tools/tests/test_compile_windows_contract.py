@@ -78,7 +78,70 @@ class TempTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
 
 
+class TrapBindingTests(TempTests):
+    # 手写函数范围与指令位置；object_range 仅替身读取，不运行任何程序。
+    def fixture(self, word=0xd43e0000, changed=None):
+        definitions = [('frd_h264_dc_check_abi', 0x1000, 0x440, 0x408),
+                       ('frd_h264_dc_wrong_return', 0x3000, 0x10, 8),
+                       ('frd_h264_dc_outer_probe', 0x2000, 0x430, 0x3f8)]
+        raw, symbols, pdata = {}, {}, []
+        for name, rva, length, offset in definitions:
+            data = bytearray(length)
+            struct.pack_into('<I', data, offset, word if changed in (None, name) else 0xd43e0000)
+            raw[name] = bytes(data)
+            symbols[name] = {'rva': rva, 'section': 1, 'value': 0}
+            pdata.append({'begin_rva': rva, 'length': length})
+        def at(rva, size):
+            for name, start, length, _ in definitions:
+                if start <= rva and rva + size <= start + length:
+                    return raw[name][rva-start:rva-start+size]
+            raise AssertionError('fixture range')
+        pe = {'symbols': symbols, 'pdata': pdata, 'at': at}
+        def object_range(path, name):
+            return raw[name], {name: {'section': 1, 'value': 0}}
+        return pe, object_range
+
+    def test_matching_object_and_pe_with_old_trap_are_rejected(self):
+        for name, word in [('frd_h264_dc_check_abi', 0xd421e020),
+                           ('frd_h264_dc_wrong_return', 0xd421e040),
+                           ('frd_h264_dc_outer_probe', 0xd421e060)]:
+            pe, reader = self.fixture(word, name)
+            with self.subTest(name=name), mock.patch.object(GATE, 'object_range', side_effect=reader), mock.patch.object(GATE, 'sha', return_value='0'*64):
+                with self.assertRaises(GATE.GateError):
+                    GATE.bindings(pe, self.root/'helper.obj', self.root/'negative.obj')
+
+    def test_three_documented_traps_and_neighbour_length_owner_mutations(self):
+        pe, reader = self.fixture()
+        with mock.patch.object(GATE, 'object_range', side_effect=reader), mock.patch.object(GATE, 'sha', return_value='0'*64):
+            result, _ = GATE.bindings(pe, self.root/'helper.obj', self.root/'negative.obj')
+        self.assertEqual(result['functions']['frd_h264_dc_wrong_return']['length'], 0x10)
+        for mode in ('neighbour', 'length', 'owner', 'linked-only'):
+            pe, original = self.fixture()
+            def changed(path, name):
+                raw, symbols = original(path, name)
+                if name != 'frd_h264_dc_check_abi': return raw, symbols
+                if mode == 'neighbour':
+                    data = bytearray(raw); data[0x408:0x40c] = b'\0'*4
+                    data[0x40c:0x410] = bytes.fromhex('00003ed4')
+                    return bytes(data), symbols
+                if mode == 'length': return raw+b'\0'*4, symbols
+                return raw, symbols
+            if mode == 'owner': pe['symbols'].pop('frd_h264_dc_check_abi')
+            if mode == 'linked-only':
+                before = pe['at']
+                pe['at'] = lambda start, size: before(start, size).replace(bytes.fromhex('00003ed4'), bytes.fromhex('200021d4'))
+            with self.subTest(mode=mode), mock.patch.object(GATE, 'object_range', side_effect=changed), mock.patch.object(GATE, 'sha', return_value='0'*64):
+                with self.assertRaises(GATE.GateError):
+                    GATE.bindings(pe, self.root/'helper.obj', self.root/'negative.obj')
+
+
 class SourceAndPathTests(TempTests):
+    def test_reviewed_driver_guide_and_support_pins_match_checkout(self):
+        root = SCRIPT.parents[1]
+        for name, pin in GATE.PINS.items():
+            self.assertEqual(GATE.sha(root/GATE.FIXTURE/name), pin)
+        self.assertEqual(GATE.sha(root/GATE.SUPPORT), GATE.SUPPORT_SHA)
+
     def test_driver_pin_drift_and_symlink_rejected(self):
         source = self.root / GATE.FIXTURE / "driver.c"
         source.parent.mkdir(parents=True)

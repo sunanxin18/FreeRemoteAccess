@@ -34,6 +34,10 @@ def encoded(value):
 
 
 class AdmissionControls(unittest.TestCase):
+    def test_reviewed_checkout_pins_match_current_bytes(self):
+        for name, pin in m.CHECKOUT_PINS.items():
+            self.assertEqual(hashlib.sha256((MODULE_PATH.parents[1]/name).read_bytes()).hexdigest(), pin)
+
     def test_json_strict(self):
         self.assertEqual(m.strict_json(b'{"x":1}'), {'x': 1})
         for data in (b'{"x":1,"x":2}', b'{"x":NaN}', b'{"x":Infinity}', b'{"x":1.0}', b'{"x":1e0}', b'[]', b'{"x":9223372036854775808}'):

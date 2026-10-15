@@ -54,6 +54,58 @@ def successful_observation():
 
 class RunnerControls(unittest.TestCase):
     def setUp(self): self.assertIsNotNone(m, 'missing native runner implementation')
+
+    def test_admitted_binding_read_is_held_identity_not_current_self_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            name = 'admitted/task4c5c3b2e-contract-123-2/variant-0-pe-bindings.json'
+            path = root/name; path.parent.mkdir(parents=True)
+            functions = {'frd_h264_dc_check_abi': {'rva': 0x1000, 'length': 0x440},
+                         'frd_h264_dc_wrong_return': {'rva': 0x3000, 'length': 0x10},
+                         'frd_h264_dc_outer_probe': {'rva': 0x2000, 'length': 0x430}}
+            raw = m.encoded({'image_size': 0x5000, 'owned_bindings': {'functions': functions}})
+            path.write_bytes(raw)
+            seal = {'destination': str(root), 'output_tree': {name: {'kind': 'file', 'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}
+            expected = {'run_id': 123, 'run_attempt': 2}
+            checks = []
+            sites = m.admitted_trap_sites(root, seal, expected, lambda: checks.append(1))
+            self.assertEqual(checks, [1, 1])
+            self.assertEqual(sites, {'image_size': 0x5000, 'functions': functions})
+            path.write_bytes(raw.replace(b'12288', b'12292'))
+            with self.assertRaises(m.RunnerError):
+                m.admitted_trap_sites(root, seal, expected, lambda: None)
+            path.write_bytes(raw)
+            with self.assertRaises((m.RunnerError, FileNotFoundError)):
+                m.admitted_trap_sites(root, seal, {**expected, 'run_attempt': 3}, lambda: None)
+            original = root/'original'; path.rename(original); path.symlink_to(original)
+            with self.assertRaises(m.RunnerError):
+                m.admitted_trap_sites(root, seal, expected, lambda: None)
+            path.unlink(); original.rename(path)
+            duplicate = b'{"image_size":20480,"image_size":20480}'
+            path.write_bytes(duplicate)
+            seal['output_tree'][name] = {'kind': 'file', 'size': len(duplicate), 'sha256': hashlib.sha256(duplicate).hexdigest()}
+            with self.assertRaises(m.RunnerError):
+                m.admitted_trap_sites(root, seal, expected, lambda: None)
+
+    def test_admitted_binding_read_race_and_post_verify_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            name = 'admitted/task4c5c3b2e-contract-123-2/variant-0-pe-bindings.json'
+            path = root/name; path.parent.mkdir(parents=True); path.write_bytes(b'{}')
+            seal = {'destination': str(root), 'output_tree': {name: {'kind': 'file', 'size': 2, 'sha256': hashlib.sha256(b'{}').hexdigest()}}}
+            expected = {'run_id': 123, 'run_attempt': 2}
+            real_identity = m.file_identity
+            def mutate_after_identity(p):
+                identity = real_identity(p); path.write_bytes(b'[]'); return identity
+            with patch.object(m, 'file_identity', side_effect=mutate_after_identity), self.assertRaises(m.RunnerError):
+                m.admitted_trap_sites(root, seal, expected, lambda: None)
+            path.write_bytes(b'{}'); calls = []
+            def verify():
+                calls.append(1)
+                if len(calls) == 2: raise m.RunnerError('post-read-mutation')
+            with self.assertRaisesRegex(m.RunnerError, 'post-read-mutation'):
+                m.admitted_trap_sites(root, seal, expected, verify)
+
     def test_fixed_seven_and_first_failure_stop(self):
         seen = []
         def execute(path, argv, timeout):
@@ -116,7 +168,7 @@ class RunnerControls(unittest.TestCase):
                          {'raw_action_output': 'b' * 64, 'canonical_rest_digest': 'sha256:' + 'b' * 64,
                           'boundary': 'fixed upload-artifact output bare SHA256 to REST/F2 sha256 digest'})
         f2 = m.source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                             '2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea', 'fix1_real_f2_digest')
+                             '844543036bf46f269f44e91b40a69978309281af665fdba59f2dc9269f3c1570', 'fix1_real_f2_digest')
         trusted = {key: value for key, value in expected.items() if key != 'workflow_context'}
         trusted['artifact'] = {**expected['artifact'], 'size_in_bytes': 10}
         metadata = {**trusted['artifact'], 'expired': False,
@@ -139,7 +191,7 @@ class RunnerControls(unittest.TestCase):
                 return self.admission_observation
         actual_source_module = m.source_module
         f2 = actual_source_module(ROOT, 'tools/admit-windows-private-artifact.py',
-                                   '2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea', 'fix1_main_real_f2')
+                                   '844543036bf46f269f44e91b40a69978309281af665fdba59f2dc9269f3c1570', 'fix1_main_real_f2')
         modules = {'tools/admit-windows-private-artifact.py': f2,
                    'tools/verify-windows-private-transcript.py': SimpleNamespace(),
                    'tools/windows-private-process.py': SimpleNamespace(Win32=HostAdmission)}
@@ -225,7 +277,7 @@ class RunnerControls(unittest.TestCase):
         git = shutil.which('git')
         self.assertIsNotNone(git, 'host control requires installed Git')
         raw = (ROOT / 'tools/verify-windows-private-transcript.py').read_bytes()
-        self.assertEqual(hashlib.sha256(raw).hexdigest(), 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db')
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2')
         with tempfile.TemporaryDirectory() as tmp:
             temporary = Path(tmp).resolve(); repository = temporary / 'repository'; repository.mkdir()
             home = temporary / 'home'; home.mkdir()
@@ -249,9 +301,9 @@ class RunnerControls(unittest.TestCase):
             crlf = run_git(['cat-file', '--filters', ':' + name],
                            {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.autocrlf', 'GIT_CONFIG_VALUE_0': 'false'})
             restored = run_git(['cat-file', '--filters', ':' + name], checkout_environment)
-            self.assertEqual(hashlib.sha256(crlf).hexdigest(), '6b9da36ae6c28af0faef800157e0cb0535a8df19da8bb8b6bb66eb0286264d6c')
-            self.assertEqual(crlf.count(b'\r\n'), 361)
-            self.assertEqual(hashlib.sha256(restored).hexdigest(), 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db')
+            self.assertEqual(hashlib.sha256(crlf).hexdigest(), '800c27773b67d9b1094af54ab03191d96dedffc1068f19893fd6c55e192c3021')
+            self.assertEqual(crlf.count(b'\r\n'), 394)
+            self.assertEqual(hashlib.sha256(restored).hexdigest(), '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2')
             self.assertEqual(restored, raw)
             self.assertEqual(source.read_bytes(), raw, 'filter observation must not rewrite fixture source')
             print(json.dumps({'scope': 'host-only real Git filter fixture; not failed Windows bytes',
@@ -288,7 +340,7 @@ class RunnerControls(unittest.TestCase):
             actual, expected = json.loads(actual_raw), json.loads(expected_raw)
             self.assertEqual(actual[changed_name], {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
             self.assertEqual(expected, m.PINS)
-            self.assertEqual(expected[changed_name], 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db')
+            self.assertEqual(expected[changed_name], '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2')
             self.assertNotEqual(actual[changed_name]['sha256'], expected[changed_name])
             summary = json.loads((output / 'summary.json').read_bytes())
             first = {'stage': 'source-pins', 'type': 'RunnerError', 'code': 'runner-helper-source-pin:' + changed_name}
@@ -322,7 +374,7 @@ class RunnerControls(unittest.TestCase):
             api.stream = transcripts.transcript(argv[2], int(argv[4]))
             apis.append(api)
             return fixture.m.collect_owned(api, exe, argv, 'host-only', {}, timeout)
-        state = m.orchestrate(['pe0', 'pe1', 'pe2', 'pe3', 'pe4'], execute, lambda: {}, parser.parse_transcript,
+        state = m.orchestrate(['pe0', 'pe1', 'pe2', 'pe3', 'pe4'], execute, lambda: {}, m.bound_transcript_parser(parser, transcripts.TRAP_SITES),
                               lambda index, item, observation: observations.append(observation))
         self.assertIsNone(state['first_failure'])
         self.assertEqual([item['status'] for item in state['commands']], ['observed-contract'] * 7)
@@ -495,12 +547,23 @@ class RunnerControls(unittest.TestCase):
         fixture = importlib.util.module_from_spec(spec)
         exec(compile(fixture_path.read_bytes(), str(fixture_path), 'exec'), fixture.__dict__)
         parser = m.source_module(ROOT, 'tools/verify-windows-private-transcript.py',
-                                 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db', 'f1_direct_bytes_controls')
+                                 m.PINS['tools/verify-windows-private-transcript.py'], 'f1_direct_bytes_controls')
         def execute(path, argv, timeout):
             result = successful_observation()
             result['stdout'] = fixture.transcript(argv[2], int(argv[4]))
             return result
-        observed = m.orchestrate(['a'] * 5, execute, lambda: {}, parser.parse_transcript, lambda *a: None)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            name = 'admitted/task4c5c3b2e-contract-123-2/variant-0-pe-bindings.json'
+            path = root/name; path.parent.mkdir(parents=True)
+            raw = m.encoded({'image_size': 0x5000, 'owned_bindings': {'functions': fixture.TRAP_SITES['functions']}})
+            path.write_bytes(raw)
+            seal = {'destination': str(root), 'output_tree': {name: {'kind': 'file', 'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}
+            sites = m.admitted_trap_sites(root, seal, {'run_id': 123, 'run_attempt': 2}, lambda: {})
+            parse = m.bound_transcript_parser(parser, sites)
+            sites['functions']['frd_h264_dc_wrong_return']['rva'] = 0x1000
+            # closure 持有已检查副本，不能从后来修改的输入学习期望。
+            observed = m.orchestrate(['a'] * 5, execute, lambda: {}, parse, lambda *a: None)
         self.assertIsNone(observed['first_failure'])
         rendered = json.loads(m.encoded(observed))
         child = rendered['commands'][2]['parser']['children'][0]

@@ -15,11 +15,11 @@ import zipfile
 
 SCHEMA = "freeremotedesk.windows.private-contract-compile.v1"
 SUPPORT = "tools/compile-windows-private-abi.py"
-SUPPORT_SHA = "8167c1d9413e58e6d1d948631863cc76c22b300ca7eb126b9807d1d5b0bbd3f5"
+SUPPORT_SHA = "2285096dcc41c60b3b2853015f3ea135de1778f596ff893181593b632e5647e2"
 FIXTURE = "third_party/ffmpeg/8.1.2/tests"
 PINS = {
-    "h264-luma-dc-windows-contract.c": "e5ae7af8d9c7792bfecce5e876e92404331d6604820090dfc24212aecf7ccb6e",
-    "README-windows-contract.md": "d67ea776ca6a5246f5ac0f8e0705d736e16bd5afdb7af5e7dc3f5bab4d3e44fb",
+    "h264-luma-dc-windows-contract.c": "4ec108a3674ee0b87adbe924cf6620b2a3fb6f41d0936947ea6aa1a2d6d28965",
+    "README-windows-contract.md": "258987788a61d7a73205b569ca8812cf12b3c061d75c57456ca64da683daa877",
 }
 OWN = ("tools/compile-windows-contract.py", "tools/tests/test_compile_windows_contract.py")
 VARIANTS = tuple(range(5))
@@ -619,10 +619,20 @@ def bindings(pe, helper, negative):
                       (negative, "frd_h264_dc_wrong_return")):
         raw, input_symbols = object_range(obj, name)
         if name not in symbols:
-            result["open"].append("cannot bind owned helper/outer: " + name)
-            continue
+            raise GateError("缺少固定 trap 的 linked owner")
         start = symbols[name]["rva"]
-        linked = pe["at"](start, len(raw))
+        length, trap = {"frd_h264_dc_check_abi": (0x440, 0x408),
+                        "frd_h264_dc_outer_probe": (0x430, 0x3f8),
+                        "frd_h264_dc_wrong_return": (0x10, 8)}[name]
+        if len(raw) != length or start <= 0 or start % 4 or start + length > 0xffffffff:
+            raise GateError("固定 Windows trap owner/长度/范围 不符")
+        linked = pe["at"](start, length)
+        if (len(linked) != length or
+                struct.unpack_from("<I", raw, trap)[0] != 0xd43e0000 or
+                struct.unpack_from("<I", linked, trap)[0] != 0xd43e0000):
+            raise GateError("固定 Windows trap owner/长度/offset/opcode 不符")
+        if any(start < end and begin < start + length for begin, end in ranges.values()):
+            raise GateError("固定 trap owned 函数范围重叠")
         if raw != linked:
             raise GateError("linked helper/outer text 与实际 input object 不同")
         ranges[name] = (start, start + len(raw))

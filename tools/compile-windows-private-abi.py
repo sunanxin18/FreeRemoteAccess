@@ -43,9 +43,9 @@ SOURCE_PINS = {
     "h264-luma-dc-clock-oracle.py": "2eca0534ddddc1b69f969524a3a46662e8a796390f5fafd632c8552e7a0465df",
     "h264-luma-dc-windows-clock-record.h": "e92e7c22bb0d5dd6cc2fe18cf14c3759ecb2da9b13159909bb45c99503aba370",
     "h264-luma-dc-platform.h": "2afd1fdc3126aae4bc0f7f86bf73cedabe6c821a88c0a8851ba087070547981e",
-    "h264-luma-dc-abi-windows.S": "3568fa9d35929cf05b5c2e5b13e0dff7b840ffba23a6864c6e9bda34e50c22f3",
-    "h264-luma-dc-abi-windows-negative.S": "a0f190242d9863ace83749cea918cb0cff91b7d3695d2ea45a7ffe91218b4db4",
-    "README-windows-abi.md": "7486bc1a0f94dbf905e5144b0b5dff355af2e2a522cc03c4376864518801bbfc",
+    "h264-luma-dc-abi-windows.S": "a57797d56b3830b936eb58caa61fdbb6cff941fbbc9f6d20db26332f5cea4136",
+    "h264-luma-dc-abi-windows-negative.S": "751f98ac78fa0009027583b304028127e3976a44e88d56bba6ddb890f426c833",
+    "README-windows-abi.md": "af0e01a7eb0a79a64970efaff59129d277c541b8168cd4276310ad88b0a197e1",
 }
 OWN_INPUTS = (
     "tools/compile-windows-private-abi.py",

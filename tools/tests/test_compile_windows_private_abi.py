@@ -25,6 +25,11 @@ COFF = bytes.fromhex(
 
 
 class SourceGateTests(unittest.TestCase):
+    def test_reviewed_windows_trap_and_guide_pins_match_checkout(self):
+        root = SCRIPT.parents[1]
+        for name in ('h264-luma-dc-abi-windows.S', 'h264-luma-dc-abi-windows-negative.S', 'README-windows-abi.md'):
+            self.assertEqual(GATE.digest(root / GATE.FIXTURE / name), GATE.SOURCE_PINS[name])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="private-compile-source-gate-")
         self.addCleanup(self.temp.cleanup)

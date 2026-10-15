@@ -84,15 +84,25 @@ child 在读取 matching GO 之前不调用 probe。ready/result 协议用 Write
 
 parent 用 [WaitForDebugEvent](https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-waitfordebugevent)
 和 [EXCEPTION_DEBUG_INFO](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-exception_debug_info)
-采集实际异常。结构损坏必须是 helper 已绑定 RVA+0x408 的实际 `brk #0xf01`
-(`0xd421e020`)，错误 LR 必须是 wrong_return label+8 的 `brk #0xf02`
-(`0xd421e040`)。要求 Windows EXCEPTION_BREAKPOINT、精确异常 PC、ReadProcessMemory
+采集实际异常。结构损坏必须是 helper 已绑定 RVA+0x408 的实际 `brk #0xf000`
+(`0xd43e0000`)，错误 LR 必须是 wrong_return label+8 的 `brk #0xf000`
+(`0xd43e0000`)。要求 Windows EXCEPTION_BREAKPOINT、精确异常 PC、ReadProcessMemory
 读取的真实 instruction、一次 first chance 和一次 matching second chance，以及
 同异常退出码。通过 [ContinueDebugEvent](https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-continuedebugevent)
 把真实 probe 异常交还 OS；不修改 PC/SP、不 swallow、不从 trap 恢复成正常 PASS。
 初始 loader debugger breakpoint 只允许 ready 前一个、在 child PE 之外；所有事件
 仍记录。任何其它异常、ordinary exit、missing ready、probe 返回或 timeout 都失败。
 实际 target 若报告其它 exception code，应保留失败，不静默扩大允许集。
+
+三个 Windows trap 统一使用 documented `brk #0xf000`（`0xd43e0000`）；outer
+frame failure 位于 outer+0x3f8，不是上述 child 的合格落点。C linked admission
+和编译门分别核对三处实际字节。CREATE_PROCESS_DEBUG_EVENT 输出唯一
+`FRD1 child_image case=... pid=... base=...`，base 来自 OS 的 lpBaseOfImage，
+并在该事件的 ContinueDebugEvent 前记录。F1 使用调用方持有的 F2 已认证同 run
+image_size、三函数 RVA/length 独立核对各 case 的 first/second/result PC；
+不得从 trap PC 反推 base。共用 opcode 不取消 site 区分。该字段不是外部 child
+模块文件或 provider 身份证明；编码修复是否消除额外 AV、通过原严格生命周期，
+仍须新同 run 编译和原生结果证明。
 
 no-return 是唯一指定超时：GO 后至少1500ms，没有 probe exception/result，parent
 TerminateProcess，实际 EXIT_PROCESS_DEBUG_EVENT+wait terminal，并核对 forced code。

@@ -236,6 +236,13 @@ static int linked_admission(void)
        memcmp((const void *)(helper_va()+0x410),epilogue,sizeof(epilogue)) ||
        memcmp((const void *)(outer_va()+0x400),epilogue,sizeof(epilogue)))
         return fail("actual_frame_instruction_binding");
+    if((uintptr_t)frd_h264_dc_wrong_return < image_base ||
+       (uintptr_t)frd_h264_dc_wrong_return-image_base > UINT32_MAX ||
+       !range((DWORD)((uintptr_t)frd_h264_dc_wrong_return-image_base),16) ||
+       *(const uint32_t *)(helper_va()+0x408)!=UINT32_C(0xd43e0000) ||
+       *(const uint32_t *)((uintptr_t)frd_h264_dc_wrong_return+8)!=UINT32_C(0xd43e0000) ||
+       *(const uint32_t *)(outer_va()+0x3f8)!=UINT32_C(0xd43e0000))
+        return fail("actual_windows_breakpoint_binding");
     for (i=0; i<COUNT(labels); ++i) {
         ULONG_PTR base=0;
         PRUNTIME_FUNCTION f;
@@ -608,7 +615,7 @@ static int exact_trap(HANDLE process,uintptr_t child_base,child_id id,
     if(!o->ready || !o->go || (id==CHILD_PRESERVE || id==CHILD_NO_RETURN) ||
        r->ExceptionCode!=EXCEPTION_BREAKPOINT || (uintptr_t)r->ExceptionAddress!=wanted ||
        !ReadProcessMemory(process,(const void *)wanted,&opcode,sizeof(opcode),&got) ||
-       got!=sizeof(opcode) || opcode!=(id==CHILD_LR ? UINT32_C(0xd421e040):UINT32_C(0xd421e020)))
+       got!=sizeof(opcode) || opcode!=UINT32_C(0xd43e0000))
         return 0;
     o->exception_code=r->ExceptionCode; o->exception_pc=wanted; o->instruction=opcode;
     if(e->dwFirstChance) {
@@ -699,6 +706,8 @@ static int isolated_child(child_id id)
         switch(ev.dwDebugEventCode) {
         case CREATE_PROCESS_DEBUG_EVENT:
             child_base=(uintptr_t)ev.u.CreateProcessInfo.lpBaseOfImage;
+            printf("FRD1 child_image case=%s pid=%lu base=%" PRIxPTR "\n",
+                   children[id].name,(unsigned long)ev.dwProcessId,child_base);
             if(ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
             break;
         case LOAD_DLL_DEBUG_EVENT:

@@ -119,7 +119,7 @@
         adr x30, .Lfrd_wrong_return_landing
         ret
 .Lfrd_wrong_return_landing:
-        brk #0xf02
+        brk #0xf000                   /* site 身份由实际 PC 区分。 */
         b .Lfrd_wrong_return_landing
         frd_probe_end
         frd_probe_leaf frd_h264_dc_no_return
@@ -244,7 +244,7 @@ frd_h264_dc_outer_pc_return:
         orr x0, x8, x0, lsl #32
         b .Lfrd_outer_epilogue
 .Lfrd_outer_frame_failure:
-        brk #0xf03
+        brk #0xf000                   /* outer failure 不是合格 child probe。 */
         b .Lfrd_outer_frame_failure
 .Lfrd_outer_epilogue:
         .seh_startepilogue

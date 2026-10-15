@@ -2,7 +2,7 @@
 """同 run Windows ARM64 nativehelper gate；唯一 CLI 不提供 mock/PE/argv 选择。
 
 固定七命令仅证明 ABI-contract-only/nativehelper-control。full contexts、child
-base/provider、shipping/qmul/codec/perf/package 仍未授予。调用者认证、原始 ZIP、
+模块文件/provider、shipping/qmul/codec/perf/package 仍未授予。调用者认证、原始 ZIP、
 F2 seal、真实 Win32 owner、F1 bytes 与封装终态在这里串联。
 """
 import argparse
@@ -28,8 +28,8 @@ API_BASE = 'https://api.github.com/repos/' + REPOSITORY
 SCHEMA = 'freeremotedesk.windows.private-native.v1'
 WORKFLOW = '.github/workflows/qualify-windows-private-abi.yml'
 PINS = {
-    'tools/verify-windows-private-transcript.py': 'c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db',
-    'tools/admit-windows-private-artifact.py': '2463ef67c7f7bca0ec33b6f22c5e0def64497584d22bb226a216adda2f04ecea',
+    'tools/verify-windows-private-transcript.py': '8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2',
+    'tools/admit-windows-private-artifact.py': '844543036bf46f269f44e91b40a69978309281af665fdba59f2dc9269f3c1570',
     'tools/windows-private-process.py': 'efe57549a64a3c7418002c97d81ddd9af293b86e4ebaf824bc0a88081d2f5fb0',
 }
 COMMANDS = (('register', 0), ('unwind', 0), ('isolated', 0), ('unwind', 1), ('unwind', 2), ('unwind', 3), ('unwind', 4))
@@ -307,6 +307,42 @@ class Ledger:
         return True
 
 
+def admitted_trap_sites(artifact_root, seal, expected, verify):
+    """只读取 caller-held F2 seal 固定的同 run variant0 数据；不解析/执行 PE。"""
+    verify()
+    root = ordinary(artifact_root, True)
+    need(seal['destination'] == str(root), 'trap-binding-destination')
+    run, attempt = expected['run_id'], expected['run_attempt']
+    need(type(run) is int and run > 0 and type(attempt) is int and attempt > 0, 'trap-binding-run')
+    name = 'admitted/task4c5c3b2e-contract-%d-%d/variant-0-pe-bindings.json' % (run, attempt)
+    identity = seal['output_tree'].get(name)
+    need(type(identity) is dict and set(identity) == {'kind', 'size', 'sha256'} and identity['kind'] == 'file' and
+         type(identity['size']) is int and 0 < identity['size'] <= MAX_JSON and
+         type(identity['sha256']) is str and re.fullmatch('[0-9a-f]{64}', identity['sha256']) is not None,
+         'trap-binding-held-identity')
+    pinned = {key: identity[key] for key in ('size', 'sha256')}
+    path = ordinary(root / name)
+    need(file_identity(path) == pinned, 'trap-binding-before-identity')
+    with path.open('rb') as stream: raw = stream.read(pinned['size'] + 1)
+    need(len(raw) == pinned['size'] and digest(raw) == pinned['sha256'], 'trap-binding-read-identity')
+    need(file_identity(path) == pinned, 'trap-binding-after-identity')
+    verify()
+    binding = strict_json(raw)
+    functions = binding['owned_bindings']['functions']
+    return {'image_size': binding['image_size'],
+            'functions': {name: {key: functions[name][key] for key in ('rva', 'length')}
+                          for name in ('frd_h264_dc_check_abi', 'frd_h264_dc_wrong_return', 'frd_h264_dc_outer_probe')}}
+
+
+def bound_transcript_parser(transcript, sites):
+    # F1 校验并复制纯数据；offset/opcode 只由受信 F1 源码固定。
+    held = transcript._trap_sites(sites)
+    def parse(stdout, stderr, suite, variant, returncode):
+        return transcript.parse_transcript(stdout, stderr, suite, variant, returncode,
+                                           expected_trap_sites=held if suite == 'isolated' else None)
+    return parse
+
+
 def orchestrate(pe_paths, execute, verify, parse, save):
     """中立串行核心；不会发布 native authority，注入界面不暴露到 CLI。"""
     need(type(pe_paths) is list and len(pe_paths) == 5, 'five-admitted-pe-paths')
@@ -539,8 +575,11 @@ def main():
                 ledger.write_json(prefix + '.receipt.json', receipt)
             ledger.write_json(prefix + '.parser.json', item)
         final_check = verify
+        stage = 'admitted-trap-binding'
+        sites = admitted_trap_sites(ledger.root / 'artifact', seal, expected, verify)
+        parse = bound_transcript_parser(transcript, sites)
         stage = 'fixed-seven-native-commands'
-        state = orchestrate(seal['pe_paths'], execute, verify, transcript.parse_transcript, save)
+        state = orchestrate(seal['pe_paths'], execute, verify, parse, save)
         first_failure = state['first_failure']
         stage = 'final-identity-check'
         verify()

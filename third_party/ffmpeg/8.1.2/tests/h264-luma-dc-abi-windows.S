@@ -165,7 +165,7 @@ frd_h264_dc_abi_pc_return:
 
 .Lfrd_dc_frame_failure:
         /* 父进程隔离此失败；不调用 C/SEH 恢复，也不读取潜在坏帧。 */
-        brk #0xf01
+        brk #0xf000                   /* Windows ARM64 documented breakpoint。 */
         b .Lfrd_dc_frame_failure
 
 .Lfrd_dc_epilogue:
