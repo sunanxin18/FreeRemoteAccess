@@ -2,6 +2,7 @@ import native from 'libentry.so';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { usbHid } from './InputMapping';
+import { PHONE_SESSION_ORIENTATION_EVENT } from '../common/PhoneOrientationPolicy';
 
 interface ProfileSummary { address: string; username: string; port: number; protocol: string; target: number; modeLabel: string; targetLabel: string; }
 interface ProtocolOption { id: string; label: string; shortLabel: string; available: boolean; targets: number[]; }
@@ -116,6 +117,10 @@ struct Index {
     this.timer = setInterval(() => {
       try {
         this.model = JSON.parse(native.appSnapshot()) as AppSnapshot;
+        if (deviceInfo.deviceType === 'phone' && this.model.initialized) {
+          // 只传公开生命周期；方向与窗口生命周期由 Ability owner 去重处理。
+          this.getUIContext().getHostContext()?.eventHub.emit(PHONE_SESSION_ORIENTATION_EVENT, this.model.page, this.model.session ?? '');
+        }
         if (this.selectPending && this.model.selectedIndex !== undefined && this.model.selectedIndex === this.selectedIndex) {
           this.target = this.model.target ?? 1; this.address = this.model.address ?? ''; this.port = `${this.model.port ?? 3389}`;
           this.username = this.model.username ?? ''; this.protocol = this.model.protocol ?? 'auto'; this.remember = this.model.remember ?? false;
@@ -251,7 +256,7 @@ struct Index {
               TextInput({ text: this.port, placeholder: '端口' }).type(InputType.Number).fontSize(16).width('100%')
                 .constraintSize({ minHeight: 48 }).accessibilityText('端口').showError(this.error(this.model.errors?.port))
                 .onChange((v: string) => { this.port = v; this.edit(); })
-            }.width(this.showMode() ? 72 : 96).alignItems(HorizontalAlign.Start)
+            }.width(deviceInfo.deviceType === 'phone' || !this.showMode() ? 96 : 72).alignItems(HorizontalAlign.Start)
           }.width(this.formFieldWidth()).alignItems(VerticalAlign.Top).margin({ bottom: 12 })
           Column({ space: 6 }) {
             this.fieldLabel('主机地址')

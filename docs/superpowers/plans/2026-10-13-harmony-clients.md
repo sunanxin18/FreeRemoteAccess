@@ -147,8 +147,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 5A5 手机/PC固定产物正确性：同一ELF两端各11项copy+3项pipeline，共4命令/28次通过，44源/输入前后身份、24实际HDC/20唯一guest退出及38条70,802字节全值顺序经root独立核对。性能、普通HAP Apple和真实Mac仍OPEN，见[精确拷贝验证](../../validation/mvs-copy-arm64-20261015.md)。
 - [ ] Task 5A6 有限MVS整管线性能：8真实wire工作集、宿主default/native完整32记录+8state差分和两个官方OHOS ELF及独立审查完成；host固定ABBA实际384条measured完成，copy有收益、dense-Y/refine原生较慢，保留共同libtest/后台负载限制。当前入口只准确计apply组合/publish/total，不伪拆prepare/commit；手机和PC分别完成两ELF各32条资格/三组完整值对比，两端正式计时仍OPEN，不由此宣称帧率，见[有限管线记录](../../validation/mvs-pipeline-measurement-20261015.md)。
 - [x] Task 5B1 标准MVS普通应用实验组合：独立默认关闭OHOS ARM64 feature，可与RDP共存；保持Mac自动HP语义/音视频不可用及既有输入门，真实最终FFI/架构/互斥/依赖及构建参数验证完成、独立Spec/Quality通过；root冻结后36项宿主与7脚本通过。OHOS正向用例只编译、不由宿主mock证明注册，见[组合验证](../../validation/harmony-apple-composition-20261015.md)。
-- [ ] Task 5B2 正常表单明确模式选择：源码及双协议普通Release HAP构建完成，完整FFI 42通过/1既有ignored和精确strip包身份已核对；横屏完整表单、模式菜单/凭据交互及PC新包GUI仍待实测，不将构建计为完成，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
-- [ ] Task 5B3 同一组合HAP：2026-10-15开发签名/官方验签/双参数精确checker及原28个条目逐字身份已完成，签名包3fbdd046；尚未安装，手机/PC普通应用及stockMac真实认证/首帧/刷新/指针/重连待验证，不替代完整键盘/IME、音频、HP与性能资格，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
+- [ ] Task 5B2 正常表单明确模式选择：源码及双协议普通Release HAP构建完成，完整FFI 42通过/1既有ignored和精确strip包身份已核对；手机横竖完整表单、模式菜单与五位端口显示已有限实测，全部凭据交互/深色大字及PC新包GUI仍待完成，不将构建计为完成，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
+- [ ] Task 5B3 同一组合HAP：2026-10-15开发签名/官方验签/双参数精确checker及原28个条目逐字身份已完成，签名包3fbdd046；手机已安装，随后方向纠正包539cf8ee也已真实Windows登录/旋转验证；PC新包GUI及stockMac真实认证/首帧/刷新/指针/重连待验证，不替代完整键盘/IME、音频、HP与性能资格，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
 - [ ] Task 5C 中立物理键/提交文本能力分离与真实输入：修正Apple Text宣称与实际不处理的不一致，保留既有桌面/RDP行为，OHOS未满足门的输入明确不可用。
 - [ ] Task 5D 本地显示器几何接入：OHOS连接前为默认NativeDisplay补齐真实physical/workarea/content/scale快照，复用共享分辨率策略、保留Fixed/ServerManaged/协议动态能力门；当前壳直接传递geometry=None，不能声称已按手机/PC本地屏幕请求。模式选择scope完成后独立实现并实测实际协商尺寸。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
@@ -165,8 +165,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [ ] 完成独立最终审查、格式、共享测试和受影响平台构建；commit/push按用户交付授权执行。
 
 
-### 手机横屏优先（2026-10-15 用户新增要求）
+### 手机登录成功后横屏（2026-10-15 用户纠正）
 
-- [x] 在手机EntryAbility窗口首次创建时设置USER_ROTATION_LANDSCAPE，保持PC与manifest现有策略；错误独立处理，不在foreground/resize重复设置。
-- [x] 独立源码审查，正常Release HAP构建/签名/安装手机；默认横屏、横竖/双向横屏、安全区、表单状态及真实Windows旋转/触控已受限验证，实际包身份和PC边界见[方向验证](../../validation/harmony-phone-orientation-20261015.md)。
+- [x] 手机登录前USER_ROTATION_PORTRAIT，真实page3+session成功后USER_ROTATION_LANDSCAPE一次，随后自动旋转；回登录竖屏，请求串行/窗口代际去重，PC和manifest保持。旧创建即横屏策略已取代。
+- [x] 新策略独立审查/11测试、普通双协议Release HAP构建签装、手机真实Windows登录后自动横屏、随后竖屏保持与断开回竖、五位端口完整显示已受限验证；历史包与当前包/PC边界分开记录，见[方向验证](../../validation/harmony-phone-orientation-20261015.md)。
 - [ ] 手机深色/最大字号复验、系统旋转锁切换、完整键盘/IME与真机方向验收。

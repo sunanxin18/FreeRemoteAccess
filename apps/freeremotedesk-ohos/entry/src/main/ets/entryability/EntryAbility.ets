@@ -3,12 +3,43 @@ import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libentry.so';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
+import { PhoneOrientation, PhoneOrientationPolicy, PHONE_SESSION_ORIENTATION_EVENT } from '../common/PhoneOrientationPolicy';
 
 export default class EntryAbility extends UIAbility {
   private mainWindow?: window.Window;
   private contentReady: boolean = false;
   private desktop: boolean = deviceInfo.deviceType === '2in1' || deviceInfo.deviceType === 'pc';
   private lastInsets: string = '';
+  private phoneOrientation: PhoneOrientationPolicy = new PhoneOrientationPolicy();
+  private orientationAvailable: boolean = false;
+  private sessionOrientationChanged = (page: number, session: string): void => {
+    this.phoneOrientation.observe(page, session);
+    this.applyPhoneOrientation();
+  };
+  private applyPhoneOrientation(): void {
+    if (deviceInfo.deviceType !== 'phone' || !this.mainWindow || !this.orientationAvailable) { return; }
+    const request = this.phoneOrientation.nextRequest();
+    if (!request) { return; }
+    const currentWindow = this.mainWindow;
+    const orientation = request.orientation === PhoneOrientation.Landscape ?
+      window.Orientation.USER_ROTATION_LANDSCAPE : window.Orientation.USER_ROTATION_PORTRAIT;
+    try {
+      // 同一窗口串行申请；只处理最新偏好，不因轮询、旋转或前后台通知重新强制方向。
+      currentWindow.setPreferredOrientation(orientation).then(() => {
+        if (this.phoneOrientation.complete(request)) { this.applyPhoneOrientation(); }
+      }).catch((error: BusinessError) => {
+        if (this.phoneOrientation.complete(request)) {
+          this.windowError('手机旋转', error);
+          this.applyPhoneOrientation();
+        }
+      });
+    } catch (e) {
+      if (this.phoneOrientation.complete(request)) {
+        this.windowError('手机旋转', e as BusinessError);
+        this.applyPhoneOrientation();
+      }
+    }
+  }
   private windowError(step: string, error: BusinessError): void {
     hilog.warn(0xFF00, 'FrdOhos', '窗口操作 %{public}s code=%{public}d', step, error.code);
   }
@@ -53,6 +84,9 @@ export default class EntryAbility extends UIAbility {
   }
   onCreate(): void {
     native.initializeApp(`${this.context.filesDir}/FreeRemoteDesk`);
+    if (deviceInfo.deviceType === 'phone') {
+      this.context.eventHub.on(PHONE_SESSION_ORIENTATION_EVENT, this.sessionOrientationChanged);
+    }
     AppStorage.setOrCreate('frd_cutout_left', 0); AppStorage.setOrCreate('frd_cutout_right', 0);
     AppStorage.setOrCreate('frd_cutout_top', 0); AppStorage.setOrCreate('frd_cutout_bottom', 0);
     AppStorage.setOrCreate('frd_native_buttons_width', 0);
@@ -63,15 +97,15 @@ export default class EntryAbility extends UIAbility {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
       this.mainWindow = windowStage.getMainWindowSync();
       if (deviceInfo.deviceType === 'phone') {
+        this.phoneOrientation.attachWindow();
         try {
-          if (canIUse('SystemCapability.Window.SessionManager')) {
-            // 首次横屏，随后遵循传感器与控制中心的旋转开关。
-            this.mainWindow.setPreferredOrientation(window.Orientation.USER_ROTATION_LANDSCAPE)
-              .catch((error: BusinessError) => { this.windowError('手机旋转', error); });
-          } else {
-            hilog.warn(0xFF00, 'FrdOhos', '手机旋转能力不可用');
-          }
-        } catch (e) { this.windowError('手机旋转', e as BusinessError); }
+          this.orientationAvailable = canIUse('SystemCapability.Window.SessionManager');
+          if (this.orientationAvailable) { this.applyPhoneOrientation(); }
+          else { hilog.warn(0xFF00, 'FrdOhos', '手机旋转能力不可用'); }
+        } catch (e) {
+          this.orientationAvailable = false;
+          this.windowError('手机旋转能力', e as BusinessError);
+        }
       }
       this.updateCutout();
       this.mainWindow.on('avoidAreaChange', () => { native.appFocus(false, false, false); this.updateCutout(); });
@@ -97,6 +131,8 @@ export default class EntryAbility extends UIAbility {
   onForeground(): void { native.setForeground(true); hilog.info(0xFF00, 'FrdOhos', '前台恢复'); }
   onBackground(): void { native.setForeground(false); hilog.info(0xFF00, 'FrdOhos', '后台暂停'); }
   onWindowStageDestroy(): void {
+    this.phoneOrientation.detachWindow();
+    this.orientationAvailable = false;
     native.setForeground(false);
     if (this.mainWindow) {
       try { this.mainWindow.off('avoidAreaChange'); this.mainWindow.off('windowSizeChange'); this.mainWindow.off('windowEvent'); if (this.desktop) { this.mainWindow.off('windowTitleButtonRectChange'); } }
@@ -105,5 +141,12 @@ export default class EntryAbility extends UIAbility {
     this.contentReady = false;
     this.mainWindow = undefined;
   }
-  onDestroy(): void { native.setForeground(false); native.shutdownApp(); }
+  onDestroy(): void {
+    if (deviceInfo.deviceType === 'phone') {
+      this.context.eventHub.off(PHONE_SESSION_ORIENTATION_EVENT, this.sessionOrientationChanged);
+    }
+    this.phoneOrientation.detachWindow();
+    this.orientationAvailable = false;
+    native.setForeground(false); native.shutdownApp();
+  }
 }
