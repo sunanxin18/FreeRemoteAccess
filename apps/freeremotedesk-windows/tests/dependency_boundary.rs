@@ -131,6 +131,7 @@ fn product_dependency_graph_preserves_protocol_and_legacy_boundaries() {
             "apps/freeremotedesk-linux/src/main.rs".to_owned(),
             "apps/freeremotedesk-macos/src/main.rs".to_owned(),
             "apps/freeremotedesk-windows/src/main.rs".to_owned(),
+            "crates/frd-shell-ohos-ffi/src/composition.rs".to_owned(),
         ],
         "only platform composition roots may import concrete protocol adapters"
     );

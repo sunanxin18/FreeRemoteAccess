@@ -52,3 +52,23 @@ Hvigor 对 Rust FFI 启用 strip，FFmpeg 三库是原有例外。初始独立�
 `02-composition-red` 首次测试编译因作者误用 `SessionId::new` 失败；改为现有 `allocate` 后重新运行，只有 `03` 的断言失败才计为语义 RED。初版脚本测试还保留 macOS `/var` 与 `/private/var` 路径规范化修正前的失败。`13/14` 原始 FFI 直接字节比较的 RED/GREEN 属于后来被修正的包假设；root 核对 Hvigor strip 配置后，`19-strip-binding-red` 确认直接比较会误拒合法派生物，`20` 按官方 SDK 独立 strip 规则通过。它们都不是实际 HAP 验证结果。协议 crate 现有四项 dead-code warnings 原样保留。
 
 源码/质量审查以及显式 HAP 的构建、签名、安装和普通表单子步骤已在后续独立记录完成。真实会话的生命周期/呈现/安全输入以及现有 TOFU/HUKS 路径仍需通过授权 Windows 登录、首帧、增量、输入、断开/重连验收。本文没有执行 profiler、benchmark、性能验收或生产资格提升。Apple 是另一任务；现有 native 核、wire、renderer/runtime、secure storage、ArkTS 和 native bridge 均不在本次修改范围。
+
+## Windows 依赖边界回归修复（2026-10-15）
+
+后续提交 `64d19d5` 的 Windows package run `38673701491` 在三个架构打包
+任务的宿主 Rust 测试步骤失败。原始日志一致指向
+`product_dependency_graph_preserves_protocol_and_legacy_boundaries`：递归扫描
+实际找到上述鸿蒙平台组合根，但测试允许清单仍只有三个桌面入口。
+这条断言没有证明 decoder 故障；原生 ARM64 runtime job 被跳过，不能计为通过。
+
+修复仅在 `apps/freeremotedesk-windows/tests/dependency_boundary.rs` 的精确清单
+加入 `crates/frd-shell-ohos-ffi/src/composition.rs`。递归收集、排序和完全相等
+检查不变，没有目录/前缀豁免；协议中立依赖边界、Windows安全存储顺序及
+工厂/EGFX门均保持。鸿蒙组合根的默认关闭、ARM64平台选择、Unix identity和
+RequiredNative/LegacyOnly行为没有修改。
+
+本机固定Rust1.96执行同一 `cargo test --locked --offline -p
+freeremotedesk-windows --test dependency_boundary`：先实际复现1通过/1失败
+（exit101），单行修复后2通过/0失败（exit0）；范围格式与diff检查通过。
+原始输出、命令和退出记录保存在 `target/ci-ohos-boundary-20261015/`。
+本机结果不替代修复提交的Windows CI、原生运行或鸿蒙真实会话验收。
