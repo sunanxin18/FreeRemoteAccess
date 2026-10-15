@@ -1,6 +1,6 @@
 # Apple 断开测试的请求归属（2026-10-15）
 
-本记录只涉及测试观察与回归，不改变生产超时、关闭、加密、wire、取消或错误合同。请求归属修复保留；前两版测试资格被CI反例否定，最新方案改为准确的会话清理合同并补强真实大写失败。新方案本机验证和独立复审通过，新CI结果待补。
+本记录只涉及测试观察与回归，不改变生产超时、关闭、加密、wire、取消或错误合同。请求归属修复保留；前两版测试资格被CI反例否定，最新方案改为准确的会话清理合同并补强真实大块写入失败。新方案本机验证、独立复审以及05d525的六类CI工作流均通过；具体目标和各阶段终态见末节。
 
 ## 原始失败和原因
 
@@ -58,6 +58,16 @@ connection的64MiB真实TCP用例仍严格要求失败，更名为`shutdown_fail
 
 最终绝对Rust1.96 cargo/RUSTC/RUSTDOC、新隔离target：四项focused各1通过；预定10组runtime与64MiB配对共20/20进程exit0；完整Apple540通过、11项原ignored、集成4+1通过、doc0。两文件生产前缀逐字比对一致，新增共享错误判据仅cfg(test)，Cargo.lock只撤Apple两条dev依赖边。当前connection SHA-256为`7344157eb0ab56715c22decd911e929ae139660ac83ef9322d7f9b0be63b607e`，runtime为`fb27a377617ed1688485509aa012ab743893c95ae5938a96847cb3fc9e351814`。完整源码、日志、负例、生产比对和三轮调查在`target/apple-writer-fix3-20261015/`及前述历史目录保留。
 
-独立最终审查Spec PASS（补强B合同）、Quality APPROVE，root另行核对四文件冻结、生产前缀、20份配对终态及完整测试。提交前diff检查曾发现Cargo.toml新增EOF空行，原作者仅移除该空行，最终diff检查通过；依赖语义及其余源码未变，没有重复已通过的同源测试。新CI尚未完成，不能提前宣称原macos-15场景已通过。
+独立最终审查Spec PASS（补强B合同）、Quality APPROVE，root另行核对四文件冻结、生产前缀、20份配对终态及完整测试。提交前diff检查曾发现Cargo.toml新增EOF空行，原作者仅移除该空行，最终diff检查通过；依赖语义及其余源码未变，没有重复已通过的同源测试。提交前新CI尚未完成，当时不能宣称原macos-15场景已通过；提交后的确切结果见末节。
 
-这些分层结果不证明特定加密runtime请求确定阻塞于内核时被取消，也不覆盖runtime同步等待writer而尚未dequeue Disconnect的路径，或其他系统相同负载的内核因果。真实TCP大写失败与生产session完整清理是独立证据，不能合称上述更强目标已完成。当前未改变生产取消语义；本机矩阵不等于新的macos-15或Windows/Linux原生CI通过。
+这些分层结果不证明特定加密runtime请求确定阻塞于内核时被取消，也不覆盖runtime同步等待writer而尚未dequeue Disconnect的路径，或其他系统相同负载的内核因果。真实TCP大块写入失败与生产session完整清理是独立证据，不能合称上述更强目标已完成。当前未改变生产取消语义；本机矩阵本身不等于macos-15或Windows/Linux原生CI通过，远端结果另见末节。
+
+## 05d525 的远端 CI 终态
+
+2026-10-15，提交 `05d525089323250363289ee32de6fa53cdd893d7` 的[通用 CI run38721492728](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38721492728) 已于10:42:52 UTC成功完成。Rust formatting job116376872870、macos-15 safe tests job116377000918、ubuntu-24.04 safe tests job116377000935 均为success；这是第三轮准确清理合同在这两个CI目标的通过记录，没有重跑前两轮失败任务。原始请求身份、迟到成功及背压反例全部保留，不被这次成功覆盖。
+
+同提交Linux GTK run38721492734及GL run38721492666成功；本次读取时Windows包38721492735、macOS包38721492653、Linux client/FFmpeg包38721492649仍在运行，不提前宣称完整打包通过。精确head/job终态保存在 `target/apple-writer-fix3-20261015/ci-followup-2.json`。这些CI结果不扩大上述未证明的加密阻塞取消、跨负载因果或真实设备互操作范围。
+
+后续同提交macOS ARM64 package run38721492653（job116376871652）于10:51:52 UTC成功；Linux client/FFmpeg run38721492649的i686 job116376903546、aarch64 job116376903600、x86_64 job116376903873均成功，run于10:54:38 UTC结束。Windows三架构包仍在运行。证据为 `ci-packages-followup-4.json`；macOS没有新增Intel目标。
+
+最终[Windows package run38721492735](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38721492735)于11:20:01 UTC成功：x86 job116378650504、x86_64 job116378650953、ARM64 job116378651092三个包任务，以及Windows ARM64 native decoder runtime job116390403259均为success。元数据保存在 `ci-windows-followup-6.json`。至此05d525的通用CI、Windows包、macOS ARM64包、Linux client/FFmpeg、Linux GTK及Linux GL六类工作流全部成功；这是该精确提交的自动检查，不代表随后开发的IME桥或鸿蒙真实输入验收。
