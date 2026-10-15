@@ -49,17 +49,18 @@ function lifecycleHarness() {
     require: name => name === './RemoteImePolicy' ? policy : { inputMethod }
   });
   const controller = {
-    on(name, listener) { listeners.set(name, listener); },
+    on(name, listener) { if(!controller.bound)throw {code:12800009}; listeners.set(name, listener); },
     off(name, listener) {
       assert.equal(listeners.get(name), listener);
       listeners.delete(name);
     },
-    attachWithUIContext() {
-      observations.attaches++;
-      return Promise.resolve();
+    attachWithUIContext(_context, _config, options) {
+      assert.equal(options.showKeyboard, false); observations.attaches++;
+      return Promise.resolve().then(() => { controller.bound = true; });
     },
     detach() { return Promise.resolve(); },
-    changeSelection() { return Promise.resolve(); }
+    changeSelection() { return Promise.resolve(); },
+    showTextInput() { assert.equal(listeners.size,14); return Promise.resolve(); }
   };
   const ime = new adapter.RemoteImeAdapter(
     () => controller,

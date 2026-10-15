@@ -88,11 +88,12 @@ function harness() {
     appInput() { return 0; }
   };
   const controller = {
-    on(name, listener) { listeners.set(name, listener); },
+    on(name, listener) { if(!controller.bound)throw {code:12800009}; listeners.set(name, listener); },
     off(name, listener) { assert.equal(listeners.get(name), listener); listeners.delete(name); },
-    attachWithUIContext() { events.attach++; return Promise.resolve(); },
+    attachWithUIContext(_context, _config, options) { assert.equal(options.showKeyboard, false); events.attach++; return Promise.resolve().then(() => { controller.bound = true; }); },
     detach() { events.detach++; return Promise.resolve(); },
-    changeSelection() { return Promise.resolve(); }
+    changeSelection() { return Promise.resolve(); },
+    showTextInput() { assert.equal(listeners.size,14); return Promise.resolve(); }
   };
   const inputMethod = { getController: () => controller, TextInputType: { TEXT: 0 }, EnterKeyType: { NEWLINE: 8 } };
   const adapter = moduleFile('common/RemoteImeAdapter.ets', {
@@ -163,7 +164,7 @@ function harness() {
       h.toggleKeyboard(); await settle();
       const source = events.sources.filter(source => source.state === 'attached').at(-1);
       assert.ok(source, 'actual adapter publishes source after SDK attach');
-      h.model.ime.state = 'attached'; h.model.ime.ticket = source.ticket; h.observeIme();
+      h.model.ime.state = 'attached'; h.model.ime.ticket = source.ticket; h.observeIme(); await settle();
       assert.equal(h.ime.loading(), false); return source.ticket;
     },
     async close() { h.ime.close(); await settle(); }

@@ -12,7 +12,7 @@ export interface ImeOwnerState {
 export interface ImeDisplaySource { stage: number; windowId: number; }
 export interface ImeSnapshot { page: number; session?: string; generation?: string; localDisplayEvidence?: ImeDisplaySource; ime?: ImeOwnerState; }
 export interface ImeBridge { source: (json: string) => number; operation: (json: string) => number; }
-// 固定数值阶段：1请求 2门 3控制器 4订阅 5附着 6来源 7Owner 8selection 9ready 10关闭 11清理。
+// 固定数值阶段：1请求 2门 3控制器 4订阅 5附着 6来源 7Owner 8selection 9ready 10关闭 11清理 12显示键盘。
 // outcome：0开始 1等待 2完成 3同步抛错 4异步拒绝 5非零 6超时 7失效 8进程封闭 9主动关闭 10上限。
 export interface ImeDiagnostic {
   attempt: number; stage: number; outcome: number; code: number; subscriptionIndex: number;
@@ -92,6 +92,9 @@ class ImeListeners {
   }
 }
 class ImeAttachment {
+  ownerConfirmed: boolean = false;
+  showStarted: boolean = false;
+  showCompleted: boolean = false;
   selectionStarted: boolean = false;
   selectionPending: boolean = false;
   pending: ImeProjection[] = [];
@@ -109,9 +112,10 @@ class ImeAttachment {
   readonly ticket: ImeTicket;
   readonly controller: inputMethod.InputMethodController;
   readonly deadline: number;
-  constructor(ticket: ImeTicket, controller: inputMethod.InputMethodController, deadline: number,
+  readonly showKeyboard: boolean;
+  constructor(ticket: ImeTicket, controller: inputMethod.InputMethodController, deadline: number, showKeyboard: boolean,
     grapheme: GraphemeProvider, output: (operation: ImeProjection) => boolean, unavailable: () => void, changed: () => void) {
-    this.ticket = ticket; this.controller = controller; this.deadline = deadline;
+    this.ticket = ticket; this.controller = controller; this.deadline = deadline; this.showKeyboard = showKeyboard;
     this.policy = new RemoteImePolicy(grapheme, output, unavailable); this.listeners = new ImeListeners(this.policy, changed);
   }
 }
@@ -207,18 +211,48 @@ export class RemoteImeAdapter {
     this.record(stage, outcome, code, index, true); this.close(); this.notice('系统输入法暂时不可用，请重新点击键盘');
   }
   private changed(a: ImeAttachment): void {
-    if (this.attachment !== a || !a.sdkAttached) { return; }
+    if (this.attachment !== a || !a.sdkAttached || !a.published) { return; }
     const initial = !a.selectionStarted;
     a.selectionStarted = true;
     if (initial) { a.selectionPending = true; this.record(8, 1); }
     try {
       const selection = a.policy.selection();
       a.controller.changeSelection(a.policy.context(), selection.start, selection.end).then(() => {
-        if (this.attachment === a && initial) { a.selectionPending = false; this.record(8, 2); }
+        if (this.attachment === a && initial) { a.selectionPending = false; this.record(8, 2); this.prepareReady(a); }
       }).catch((error: BusinessError) => {
         if (this.attachment === a) { this.fail(8, 4, imeErrorCode(error)); }
       });
     } catch (error) { this.fail(8, 3, imeErrorCode(error as BusinessError)); }
+  }
+  private prepareReady(a: ImeAttachment): void {
+    if (this.attachment !== a || a.ready || !a.published || !a.ownerConfirmed ||
+      !a.selectionStarted || a.selectionPending) { return; }
+    if (a.showKeyboard && !a.showCompleted) {
+      if (a.showStarted) { return; }
+      a.showStarted = true;
+      const showAttempt = this.attempt;
+      sdkWork = sdkWork.then(async (): Promise<void> => {
+        if (this.attachment !== a) { return; }
+        if (sdkBlocked.length > 0) { this.record(1, 8, IME_NO_CODE, 0, true); this.close(); this.notice(sdkBlocked); return; }
+        this.record(12, 0);
+        let showing: Promise<void>;
+        try { showing = a.controller.showTextInput(); }
+        catch (error) { this.fail(12, 3, imeErrorCode(error as BusinessError)); return; }
+        this.record(12, 1);
+        try { await this.waitForSdk(showing, 12, showAttempt); }
+        catch (error) {
+          if (this.attachment === a) { this.fail(12, 4, imeErrorCode(error as BusinessError)); }
+          return;
+        }
+        if (this.attachment !== a) { return; }
+        a.showCompleted = true; this.record(12, 2); this.prepareReady(a);
+      });
+      return;
+    }
+    a.ready = true; this.record(9, 2);
+    const pending = a.pending; a.pending = []; a.bytes = 0;
+    for (const operation of pending) { if (!this.project(a, operation)) { pending.length = 0; return; } }
+    pending.length = 0;
   }
   private project(a: ImeAttachment, operation: ImeProjection): boolean {
     if (this.attachment !== a) { return false; }
@@ -266,17 +300,15 @@ export class RemoteImeAdapter {
       let c: inputMethod.InputMethodController;
       this.record(3, 0);
       try { c = this.controller(); } catch (error) { this.fail(3, 3, imeErrorCode(error as BusinessError)); return; }
-      const next: ImeAttachment = new ImeAttachment(ticket, c, this.deadline, this.grapheme,
+      const next: ImeAttachment = new ImeAttachment(ticket, c, this.deadline, this.showKeyboard, this.grapheme,
         (operation: ImeProjection): boolean => this.project(next, operation), () => this.notice('该上下文编辑不可用，请重新输入'), () => this.changed(next));
-      this.attachment = next; const context = this.context; const show = this.showKeyboard; const attachAttempt = this.attempt;
+      this.attachment = next; const context = this.context; const attachAttempt = this.attempt;
       sdkWork = sdkWork.then(async (): Promise<void> => {
         if (this.attachment !== next) { return; }
         if (sdkBlocked.length > 0) { this.record(1, 8, IME_NO_CODE, 0, true); this.close(); this.notice(sdkBlocked); return; }
-        this.record(4, 0);
-        if (!next.listeners.on(c)) { this.fail(4, 3, next.listeners.subscriptionCode(), next.listeners.subscriptionIndex()); return; }
         const config: inputMethod.TextConfig = { inputAttribute: { textInputType: inputMethod.TextInputType.TEXT,
           enterKeyType: inputMethod.EnterKeyType.NEWLINE, consumeKeyEvents: false }, windowId: ticket.windowId };
-        const options: inputMethod.AttachOptions = { showKeyboard: show };
+        const options: inputMethod.AttachOptions = { showKeyboard: false };
         next.attaching = true; next.attachAttempted = true;
         this.record(5, 0);
         let attached: Promise<void>;
@@ -292,6 +324,9 @@ export class RemoteImeAdapter {
         next.attaching = false; next.sdkAttached = true;
         if (this.attachment !== next) { return; }
         this.record(5, 2);
+        this.record(4, 0);
+        if (!next.listeners.on(c)) { this.fail(4, 3, next.listeners.subscriptionCode(), next.listeners.subscriptionIndex()); return; }
+        if (this.attachment !== next) { return; }
         let sourceCode: number;
         try { sourceCode = this.source(ticket, 'attached'); }
         catch (error) { this.fail(6, 3, imeErrorCode(error as BusinessError)); return; }
@@ -301,13 +336,9 @@ export class RemoteImeAdapter {
       return;
     }
     if (a.published && s?.state === 'attached' && sameTicket(s.ticket, a.ticket)) {
-      if (!a.ready) {
-        this.record(7, 2);
-        a.ready = true; this.record(9, 2); const pending = a.pending; a.pending = []; a.bytes = 0;
-        for (const operation of pending) { if (!this.project(a, operation)) { pending.length = 0; return; } }
-        pending.length = 0;
-      }
-    } else if (a.ready) { this.fail(7, 7); return; }
+      if (!a.ownerConfirmed) { a.ownerConfirmed = true; this.record(7, 2); }
+      this.prepareReady(a);
+    } else if (a.ownerConfirmed) { this.fail(7, 7); return; }
     if (sameTicket(s?.ackTicket, a.ticket)) {
       const accepted = s?.lastAcceptedSerial ?? 0; const dispatched = s?.lastDispatchedSerial ?? 0;
       if (!Number.isSafeInteger(accepted) || !Number.isSafeInteger(dispatched) || accepted < a.accepted || dispatched < a.dispatched || dispatched > accepted || accepted > a.queued) { this.fail(7, 10); return; }

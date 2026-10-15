@@ -218,3 +218,40 @@ root使用既有SDK开发身份签名，官方验签及双normal精确checker全
 本地官方API26 @ohos.inputMethod.d.ts:997及[官方insertText API](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-ime-kit/js-apis-inputmethod.md#oninserttext10)均列12800009为client detached；[官方错误码](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-ime-kit/errorcode-inputmethod-framework.md#12800009-输入法客户端未绑定)要求先attach。[华为自绘编辑框指南](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides-V13/use-inputmethod-in-custom-edit-box-V13)也展示await attach后注册监听。当前adapter在attachWithUIContext之前调用14项listeners.on，第一项即失败，符合现场错误；下一子任务修正公开SDK顺序，保持来源/异步/清理门，不能用忽略错误继续或补权限替代。
 
 23:08:33首次标作disconnect的操作实际为action2收起，未断开；核对action映射后23:09:05用action1真正断开并回竖屏普通表单，IME旧提示消失。PC没有观察或操作，原表单草稿保持。真实系统键盘/候选/Windows文字尚未通过，继续OPEN。
+
+
+### SDK顺序候选冻结（待独立审查）
+
+Task5C2P3仅改adapter生产源与三个受影响测试。先隐藏attach并等待真正settle，再注册全部14项监听；source发布、初始selection成功与精确Owner确认后才串行showTextInput，显示成功才ready。show=false不调用显示API。stage12单独区分显示操作及SDK错误；原1..11、固定数字字段、firstterminal和模块级未知SDK操作poison保持，late show/attach不能复活旧来源。
+
+严格SDK模型在未attach时实际on抛12800009，旧生产/最终模型冻结重放均RED；最终70 adapter+30 surface+7 lifecycle共107项通过，包含显示/订阅/selection失败与关闭、旧Promise未settle、新请求及跨实例串行。初始夹具TypeError、一次旧终态诊断夹具、surface缺显示endpoint和lifecycle过早判断loading的失败均保留并明确与产品RED区分；初次同名RED日志被后次覆盖的事实披露，preliminary工具输出副本单列。
+
+官方API26 ARM64 Release BOTH和独立精确checker、SDK strip比较均exit0；四项既有Rust dead-code与两材料header/未签名提示保持。新unsigned9c8d1acc38fe45e09b3fb8c33da519af4356d373c69bf97eec99cf829b59bf2d相对642f的31payload只有modules.abc变化，其余30相同；所有native及未strip FFI5a4576保持，无旧库替换。Root核31源及Gitbase9dffe17、额外5消费者、165产物、源码拷贝与报告f5cfda67，root首个核验脚本将actualbase对象误当hash的夹具错误保留，修正schema后全部通过。完整4路径132911-byte/U500审查包f7bed723已交fresh独立reviewer；当前未签装，不授予真实IME/候选/文字资格。证据分别在target/harmony-ime-sdk-order-20261015/与target/harmony-ime-sdk-order-root-20261015/。
+
+### 实体键盘路由的独立只读边界澄清
+
+限定审计发现当前未注册Native key callback，但Index除XComponent自身dispatch外，Stack还有普通onKeyEvent。固定官方上游源码的Native handler在未消费时返回false、焦点树允许向祖先处理，因此不能从libraryname对自身组件事件的限制推断祖先必然收不到键；上游master控制流也不能证明当前API26运行时已通。当前先保留真实物理键资格OPEN，没有新增原生键桥。Root完整读审计并核16源/Git对象、8项本地API26 SDK及20项证据；报告6d78a06b，target/harmony-native-key-routing-audit{-root}-20261015/保留对应输入/官方pinned来源/核验。
+
+Root只执行官方Emulator -help，无instance或设备操作；当前公开scenario无通用key/down/up命令，fill不能证明真实物理键或IME。CUA先前无法选中独立Emulator且当前只获准官方CLI回退，不换HDC或AppleScript键注入。后续在正确聚焦surface实际敲键后，才区分平台事件、shell拦截、Owner拒绝与consumer；PC仍在填写，不观察或请求其现在敲键。这只是下一资格边界，不新增设备或目标输入通过结论。
+
+
+### SDK顺序独立审查与真实手机通过的有限范围
+
+Fresh reviewer Spec PASS / Quality Approved，无Critical/Important，既有构建warnings为披露的非阻断Minor。完整报告95d5854c08cc90a237d93f5d6d30a6539c10d73036223db82ffa12430bbc09b0经root完整读并核hash；跨文件31+5/165/Gitbase/包身份的cannot-verify由root先前独立receipt解决，设备项由下述新实测解决到其有限范围。没有重跑相同套件。
+
+Root以既有开发身份签名新unsigned9c8d，signed HAP b742c9287ed1bec43e8601cbdf4a294d8a8274dbf3ade8fb4938d346dda56985；官方验签、双normal精确checker及31项payload逐字比较通过，仅.pages.info新增。仅手机覆盖安装，新PID24390（首次立即pidof为空，稍后确认）、开始前FrdIme为空；PC未安装/读取/操作。23:30:53原HUKS密码实际载入，23:31:01再次进入2760×1256真实Windows桌面。
+
+23:31:37当前浮岛action4发起attempt1，新的严格数字记录明确：attach5成功→14订阅4无错误→source6成功→selection8成功→Owner7 exact=1→show12成功→ready9成功，原12800009未重现。request到ready本次601ms仅为有界时间观察，不是性能基准。23:31:54截图确认真实系统键盘，窗口避让至2760×479，原桌面按相同比例contain；不是由host或SDK返回值推定“显示”。
+
+首次“收键盘”脚本在reveal时已触发本地所有权并关闭IME，随后action4实际重新开启为attempt2；不能把这个脚本称为关闭失败。后来只用reveal关闭。CLI拒绝横屏x1700超出范围，两个按旋转猜测的坐标也未打开Start；使用当前横屏字面坐标1139,1233后23:35:23实际打开Windows开始菜单，故未将上述调用当作产品指针缺陷。为使全宽键盘按键都在CLI有效范围，使用官方rotation切为竖屏；此后点击与截图同坐标。
+
+实际打开Windows记事本，恢复旧标签时的“系统找不到指定的路径”提示被关闭；通过文件→新建窗口建立单独空白测试窗口，不在用户旧文档输入。23:40:29竖屏attempt3同样attach/Owner/show/ready全部通过，UI实高1661且系统键盘可见。仅使用官方Emulator CLI点击系统键盘真实键位，未用fill、HDC注入或直接调用adapter：
+
+- 23:41:04，输入ni后显示本地拼音和“你”等系统候选，远端此时尚未出现未提交拼音。
+- 分别提交两次“你”，23:42:35图像可见“你你”；点击系统退格，23:42:36回到单个“你”。
+- 点击换行、切换英文并按字母键，23:44:29关闭键盘后横屏原尺寸截图明确为第一行“你”、第二行“ABc”，记事本状态5个字符、行2列4。大小写按实际系统键盘状态记录，不把它改写为预设abc。
+- 当前attempt3最终日志为stage10/outcome9/code0正常关闭。点击远端菜单可继续操作，23:46:17关闭本次测试标签，在自己的保存提示选择“不保存”，23:47:16截图确认测试窗口/文字已移除，未创建测试文件。23:47:19正常断开回竖屏表单。
+
+完整签验、fresh-PID数值日志、各次命令/失败、原始截图与有界判断保存在target/harmony-ime-sdk-order-root-20261015/，主receipt为phone-validation.json，最终结果图为ui/phone/sdk-order-final-remote-text/Screenshot_2026-10-15T234429.png。这新增的是API26手机模拟器→Windows RDP系统IME的有限实际互操作证据。PC仍由用户填写且完全未观察/操作；实体键盘、硬件真机、非BMP真实输入、完整编辑/选择、前后台/重连长时及Mac目标仍不由此授予资格。
+
+桌面回归身份独立：原Apple tests-only71e实际5个workflow均成功；当前native焦点9df原始通用CI38758133053、macOS ARM6438758132773、Linux FFmpeg38758132894已成功，Windows38758133250仍运行（15:29UTC观察）。这些不证明本SDK顺序候选的设备行为，也不替换上面的真实输入证据。
