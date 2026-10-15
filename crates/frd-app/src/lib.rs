@@ -360,6 +360,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         };
         controller.set_platform_capabilities(PlatformCapabilities {
@@ -367,6 +368,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.set_product_policy(ProductPolicy {
@@ -374,6 +376,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(all));
@@ -518,6 +521,7 @@ mod tests {
                 clipboard_read: true,
                 clipboard_write: true,
                 remote_audio: true,
+                physical_key_input: true,
                 text_input: true,
             },
         ));
@@ -526,6 +530,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: false,
             remote_audio: true,
+            physical_key_input: false,
             text_input: false,
         });
         controller.set_product_policy(ProductPolicy {
@@ -533,6 +538,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
 
@@ -543,13 +549,14 @@ mod tests {
                 clipboard_read: false,
                 clipboard_write: false,
                 remote_audio: true,
+                physical_key_input: false,
                 text_input: false,
             }
         );
     }
 
     #[test]
-    fn presented_session_drops_physical_keys_and_text_when_text_input_is_not_negotiated() {
+    fn presented_session_drops_keys_and_text_when_both_are_unavailable() {
         let session_id = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
         controller.set_platform_capabilities(PlatformCapabilities {
@@ -557,6 +564,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.set_product_policy(ProductPolicy {
@@ -564,6 +572,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(
@@ -572,6 +581,7 @@ mod tests {
                 clipboard_read: false,
                 clipboard_write: false,
                 remote_audio: true,
+                physical_key_input: false,
                 text_input: false,
             },
         ));
@@ -598,6 +608,65 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_capabilities_intersect_each_layer_independently() {
+        // 三层各两位能力的全部组合，覆盖物理键与提交文本的正交路由。
+        for bits in 0u8..64 {
+            let enabled = |bit: u8| bits & (1u8 << bit) != 0;
+            let session_id = SessionId::allocate();
+            let mut controller = AppController::awaiting_first_frame(session_id, 1);
+            controller.set_platform_capabilities(PlatformCapabilities {
+                physical_key_input: enabled(0),
+                text_input: enabled(1),
+                ..PlatformCapabilities::default()
+            });
+            controller.set_product_policy(ProductPolicy {
+                physical_key_input: enabled(2),
+                text_input: enabled(3),
+                ..ProductPolicy::default()
+            });
+            controller.handle_session_event(SessionEvent::CapabilitiesChanged(
+                frd_protocol_api::SessionCapabilities {
+                    physical_key_input: enabled(4),
+                    text_input: enabled(5),
+                    ..frd_protocol_api::SessionCapabilities::default()
+                },
+            ));
+            controller.handle_presentation(PresentationEvent::FramePresented {
+                session_id,
+                generation: 1,
+                revision: 1,
+                completeness: FrameCompleteness::FullBaseline,
+            });
+            assert_eq!(
+                controller
+                    .route_input(InputEvent::PhysicalKey {
+                        code: PhysicalKeyCode::from_usb_hid_usage(30),
+                        state: KeyState::Pressed,
+                        modifiers: Modifiers::default(),
+                    })
+                    .is_some(),
+                enabled(0) && enabled(2) && enabled(4),
+                "bits={bits}"
+            );
+            assert_eq!(
+                controller
+                    .route_input(InputEvent::Text {
+                        utf8: "输入".into()
+                    })
+                    .is_some(),
+                enabled(1) && enabled(3) && enabled(5),
+                "bits={bits}"
+            );
+            assert!(controller.route_input(InputEvent::ReleaseAll).is_some());
+            assert!(controller
+                .route_input(InputEvent::PointerMove {
+                    remote: frd_core::PixelPoint { x: 0, y: 0 },
+                })
+                .is_some());
+        }
+    }
+
+    #[test]
     fn failed_audio_output_downgrades_the_presented_platform_capability() {
         let session_id = SessionId::allocate();
         let mut controller = AppController::awaiting_first_frame(session_id, 1);
@@ -606,6 +675,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: true,
+            physical_key_input: false,
             text_input: false,
         });
         controller.set_product_policy(ProductPolicy {
@@ -613,6 +683,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: true,
+            physical_key_input: false,
             text_input: false,
         });
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(
@@ -621,6 +692,7 @@ mod tests {
                 clipboard_read: false,
                 clipboard_write: false,
                 remote_audio: true,
+                physical_key_input: false,
                 text_input: false,
             },
         ));
@@ -651,6 +723,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         };
         controller.set_platform_capabilities(PlatformCapabilities {
@@ -658,6 +731,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.set_product_policy(ProductPolicy {
@@ -665,6 +739,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(all));
@@ -680,6 +755,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: false,
+            physical_key_input: true,
             text_input: true,
         });
         let AppPage::RemoteSession { capabilities, .. } = controller.page() else {
@@ -692,6 +768,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         let AppPage::RemoteSession { capabilities, .. } = controller.page() else {
@@ -941,6 +1018,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.set_product_policy(ProductPolicy {
@@ -948,6 +1026,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(
@@ -956,6 +1035,7 @@ mod tests {
                 clipboard_read: true,
                 clipboard_write: true,
                 remote_audio: true,
+                physical_key_input: true,
                 text_input: true,
             },
         ));
@@ -2481,6 +2561,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.set_product_policy(ProductPolicy {
@@ -2488,6 +2569,7 @@ mod tests {
             clipboard_read: true,
             clipboard_write: true,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
         controller.handle_session_event(SessionEvent::CapabilitiesChanged(
@@ -2496,6 +2578,7 @@ mod tests {
                 clipboard_read: true,
                 clipboard_write: true,
                 remote_audio: true,
+                physical_key_input: true,
                 text_input: true,
             },
         ));
@@ -2784,6 +2867,7 @@ mod tests {
                 clipboard_read: true,
                 clipboard_write: true,
                 remote_audio: true,
+                physical_key_input: true,
                 text_input: true,
             },
         ));

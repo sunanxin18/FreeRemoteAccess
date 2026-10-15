@@ -595,7 +595,8 @@ fn publish_transport_readiness(
         .publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
             dynamic_resolution: dynamic_resolution_enabled,
             remote_audio: udp_media_enabled,
-            text_input: true,
+            physical_key_input: true,
+            text_input: false,
             ..SessionCapabilities::default()
         }))
         .map_err(|error| anyhow::anyhow!(error.code()))?;
@@ -2054,6 +2055,7 @@ mod tests {
             harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),
             RuntimeTrace::Event(SessionEvent::CapabilitiesChanged(capabilities))
                 if !capabilities.remote_audio && !capabilities.dynamic_resolution
+                    && capabilities.physical_key_input && !capabilities.text_input
         ));
         assert!(matches!(
             harness.trace.recv_timeout(Duration::from_secs(1)).unwrap(),

@@ -51,6 +51,8 @@ pub struct InputRouter {
     remote_forward_pressed: bool,
     local_keys: BTreeSet<PhysicalKeyCode>,
     remote_keys: BTreeSet<PhysicalKeyCode>,
+    // 被禁用时按住的物理键，必须等真实 Up 后才允许新的 Down。
+    suppressed_keys: BTreeSet<PhysicalKeyCode>,
     pointer_armed: bool,
     keyboard_armed: bool,
     modifiers: Modifiers,
@@ -69,6 +71,7 @@ impl InputRouter {
         self.keyboard_domain = match gate {
             InputGate::Blocked => {
                 self.local_keys.clear();
+                self.suppressed_keys.clear();
                 KeyboardDomain::LocalChrome
             }
             InputGate::Interactive { .. } if self.focused => KeyboardDomain::RemoteSurface,
@@ -113,6 +116,7 @@ impl InputRouter {
         self.focused = false;
         self.keyboard_domain = KeyboardDomain::LocalChrome;
         self.local_keys.clear();
+        self.suppressed_keys.clear();
         self.modifiers = Modifiers::default();
         self.disarm_remote_ownership()
     }
@@ -123,7 +127,13 @@ impl InputRouter {
     }
 
     pub fn keyboard_capability_lost(&mut self) -> Option<InputEvent> {
-        self.disarm_remote_ownership()
+        self.suppressed_keys.extend(self.local_keys.iter().copied());
+        if self.remote_keys.is_empty() {
+            return None;
+        }
+        // ReleaseAll 同时释放指针；保留指针尾部屏障，但不撤销仍有效的文本域。
+        self.pointer_armed = false;
+        self.release_remote_state()
     }
 
     pub fn shutdown(&mut self) -> Option<InputEvent> {
@@ -220,8 +230,21 @@ impl InputRouter {
             && !enter_local_shortcut
             && !remote_allowed
         {
-            let _ = self.key(code, state, InputOwnership::Ui);
-            return KeyboardPreDispatch::Consume;
+            let release = self.keyboard_capability_lost();
+            match state {
+                KeyState::Pressed => {
+                    self.local_keys.insert(code);
+                    self.suppressed_keys.insert(code);
+                }
+                KeyState::Released => {
+                    self.local_keys.remove(&code);
+                    self.suppressed_keys.remove(&code);
+                }
+            }
+            return match release {
+                Some(release) => KeyboardPreDispatch::Remote(Some(release)),
+                None => KeyboardPreDispatch::Consume,
+            };
         }
         self.pre_dispatch_key(code, state, enter_local_shortcut)
     }
@@ -338,16 +361,21 @@ impl InputRouter {
         ownership: InputOwnership,
     ) -> Option<InputEvent> {
         let local_was_empty = self.local_keys.is_empty();
+        let suppressed = self.suppressed_keys.contains(&code);
         match state {
             KeyState::Pressed => {
                 self.local_keys.insert(code);
             }
             KeyState::Released => {
                 self.local_keys.remove(&code);
+                self.suppressed_keys.remove(&code);
             }
         }
         if ownership == InputOwnership::Ui || !self.is_interactive_and_focused() {
             return self.disarm_remote_ownership();
+        }
+        if suppressed {
+            return None;
         }
         if !self.keyboard_armed {
             if state == KeyState::Pressed && local_was_empty {
@@ -1122,6 +1150,71 @@ mod tests {
         input.focus_gained();
 
         assert_eq!(input.keyboard_domain(), KeyboardDomain::LocalChrome);
+    }
+
+    #[test]
+    fn denied_physical_event_returns_release_and_keeps_text_without_rearming_key_tail() {
+        let mut input = interactive_input();
+        let key = frd_core::PhysicalKeyCode::from_usb_hid_usage(4);
+        assert!(matches!(
+            input.dispatch_key_event(Some(key), KeyState::Pressed, false, true, false),
+            KeyboardPreDispatch::Remote(Some(InputEvent::PhysicalKey { .. }))
+        ));
+        assert_eq!(
+            input.dispatch_key_event(Some(key), KeyState::Pressed, false, false, false),
+            KeyboardPreDispatch::Remote(Some(InputEvent::ReleaseAll))
+        );
+        assert_eq!(
+            input.text("中".into(), InputOwnership::Remote),
+            Some(InputEvent::Text { utf8: "中".into() })
+        );
+        assert_eq!(
+            input.dispatch_key_event(Some(key), KeyState::Pressed, false, true, false),
+            KeyboardPreDispatch::Remote(None)
+        );
+        assert_eq!(
+            input.dispatch_key_event(Some(key), KeyState::Released, false, true, false),
+            KeyboardPreDispatch::Remote(None)
+        );
+        assert!(!input.has_remote_held_input());
+        assert!(matches!(
+            input.dispatch_key_event(Some(key), KeyState::Pressed, false, true, false),
+            KeyboardPreDispatch::Remote(Some(InputEvent::PhysicalKey { .. }))
+        ));
+    }
+
+    #[test]
+    fn physical_capability_loss_releases_keys_but_keeps_text_and_quarantines_tail() {
+        let mut input = interactive_input();
+        let key = frd_core::PhysicalKeyCode::from_usb_hid_usage(4);
+        assert!(matches!(
+            input.dispatch_key_event(Some(key), KeyState::Pressed, false, true, false),
+            KeyboardPreDispatch::Remote(Some(InputEvent::PhysicalKey { .. }))
+        ));
+        assert_eq!(
+            input.keyboard_capability_lost(),
+            Some(InputEvent::ReleaseAll)
+        );
+        assert_eq!(
+            input.text("输入".into(), InputOwnership::Remote),
+            Some(InputEvent::Text {
+                utf8: "输入".into()
+            })
+        );
+        assert_eq!(
+            input.dispatch_key_event(Some(key), KeyState::Pressed, false, true, false),
+            KeyboardPreDispatch::Remote(None)
+        );
+        assert_eq!(
+            input.dispatch_key_event(Some(key), KeyState::Released, false, true, false),
+            KeyboardPreDispatch::Remote(None)
+        );
+        assert!(matches!(
+            input.dispatch_key_event(Some(key), KeyState::Pressed, false, true, false),
+            KeyboardPreDispatch::Remote(Some(InputEvent::PhysicalKey { .. }))
+        ));
+        assert_eq!(input.focus_lost(), Some(InputEvent::ReleaseAll));
+        assert_eq!(input.text("失焦".into(), InputOwnership::Remote), None);
     }
 
     #[test]

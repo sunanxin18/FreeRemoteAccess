@@ -2177,7 +2177,7 @@ impl DesktopApplication {
             if matches!(
                 event,
                 SessionEvent::CapabilitiesChanged(frd_protocol_api::SessionCapabilities {
-                    text_input: false,
+                    physical_key_input: false,
                     ..
                 })
             ) {
@@ -3313,14 +3313,12 @@ impl DesktopApplication {
         } else {
             InputOwnership::Remote
         };
-        let keyboard_ownership = if consumed_by_egui
-            || self.input.keyboard_domain() == KeyboardDomain::LocalChrome
-            || !self.launch.controller().effective_capabilities().text_input
-        {
-            InputOwnership::Ui
-        } else {
-            InputOwnership::Remote
-        };
+        let keyboard_ownership =
+            if consumed_by_egui || self.input.keyboard_domain() == KeyboardDomain::LocalChrome {
+                InputOwnership::Ui
+            } else {
+                InputOwnership::Remote
+            };
         let input = match event {
             WindowEvent::CursorMoved { position, .. } => self.input.pointer_moved(
                 position.x as f32,
@@ -3347,6 +3345,14 @@ impl DesktopApplication {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
+                if !self
+                    .launch
+                    .controller()
+                    .effective_capabilities()
+                    .physical_key_input
+                {
+                    return;
+                }
                 hid_usage_from_key_code(code).and_then(|usage| {
                     self.input.key(
                         frd_core::PhysicalKeyCode::from_usb_hid_usage(usage),
@@ -3356,6 +3362,9 @@ impl DesktopApplication {
                 })
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                if !self.launch.controller().effective_capabilities().text_input {
+                    return;
+                }
                 self.input.text(text.clone(), keyboard_ownership)
             }
             _ => None,
@@ -3421,7 +3430,11 @@ impl DesktopApplication {
                 return true;
             }
         }
-        let remote_allowed = self.launch.controller().effective_capabilities().text_input;
+        let remote_allowed = self
+            .launch
+            .controller()
+            .effective_capabilities()
+            .physical_key_input;
         match self.input.dispatch_key_event(
             physical,
             key_state,
@@ -7504,6 +7517,59 @@ mod tests {
     }
 
     #[test]
+    fn text_only_physical_sequence_keeps_pointer_and_ime_commit() {
+        let mut input = crate::InputRouter::default();
+        input.focus_gained();
+        input.set_gate(crate::InputGate::Interactive {
+            session_id: SessionId::allocate(),
+            generation: 1,
+        });
+        let size = frd_core::PixelSize::new(100, 100).unwrap();
+        let viewport = frd_core::ContentViewport::fit(size, size);
+        input.pointer_moved(20.0, 20.0, viewport, crate::InputOwnership::Remote);
+        assert!(input
+            .pointer_button(
+                frd_core::PointerButton::Primary,
+                frd_core::ButtonState::Pressed,
+                viewport,
+                crate::InputOwnership::Remote
+            )
+            .is_some());
+        let key = frd_core::PhysicalKeyCode::from_usb_hid_usage(4);
+        for state in [frd_core::KeyState::Pressed, frd_core::KeyState::Released] {
+            assert_eq!(
+                input.dispatch_key_event(Some(key), state, false, false, false),
+                crate::KeyboardPreDispatch::Consume
+            );
+            assert!(
+                input.has_remote_held_input(),
+                "禁止物理键不得清空远端指针账本"
+            );
+        }
+        assert_eq!(input.keyboard_capability_lost(), None);
+        assert!(input.has_remote_held_input());
+        let ime = Ime::Commit("中".to_owned());
+        let super::ImePreDispatch::Commit(text) =
+            super::classify_ime_before_egui(input.keyboard_domain(), &ime, true)
+        else {
+            panic!("必须分发提交文本");
+        };
+        assert_eq!(
+            input.text(text.to_owned(), crate::InputOwnership::Remote),
+            Some(InputEvent::Text { utf8: "中".into() })
+        );
+        assert!(input
+            .pointer_button(
+                frd_core::PointerButton::Primary,
+                frd_core::ButtonState::Released,
+                viewport,
+                crate::InputOwnership::Remote
+            )
+            .is_some());
+        assert!(!input.has_remote_held_input());
+    }
+
+    #[test]
     fn remote_ime_commits_once_and_suppresses_non_commit_state_from_egui() {
         assert_eq!(
             super::classify_ime_before_egui(
@@ -8064,6 +8130,7 @@ mod tests {
                     clipboard_read: false,
                     clipboard_write: false,
                     remote_audio: false,
+                    physical_key_input: false,
                     text_input: false,
                 }))
                 .unwrap();
@@ -8459,6 +8526,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: false,
+            physical_key_input: true,
             text_input: true,
         });
         controller.set_product_policy(ProductPolicy {
@@ -8466,6 +8534,7 @@ mod tests {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: false,
+            physical_key_input: true,
             text_input: true,
         });
 

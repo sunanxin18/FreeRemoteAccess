@@ -27,7 +27,10 @@ pub struct ProductPolicy {
     pub clipboard_read: bool,
     pub clipboard_write: bool,
     pub remote_audio: bool,
+    /// 已提交文本；与物理键输入独立。
     pub text_input: bool,
+    /// 物理键输入；不得由文本能力推断。
+    pub physical_key_input: bool,
 }
 
 impl ProductPolicy {
@@ -37,6 +40,7 @@ impl ProductPolicy {
             clipboard_read: self.clipboard_read,
             clipboard_write: self.clipboard_write,
             remote_audio: self.remote_audio,
+            physical_key_input: self.physical_key_input,
             text_input: self.text_input,
         }
     }
@@ -48,6 +52,7 @@ fn platform_capabilities(capabilities: PlatformCapabilities) -> SessionCapabilit
         clipboard_read: capabilities.clipboard_read,
         clipboard_write: capabilities.clipboard_write,
         remote_audio: capabilities.remote_audio,
+        physical_key_input: capabilities.physical_key_input,
         text_input: capabilities.text_input,
     }
 }
@@ -1165,11 +1170,13 @@ impl AppController {
     /// AppIntent 不承载热路径输入；仅当前已呈现会话可路由 protocol-neutral 输入。
     pub fn route_input(&self, event: InputEvent) -> Option<SessionCommand> {
         let session_id = self.session_id?;
-        if matches!(
-            event,
-            InputEvent::PhysicalKey { .. } | InputEvent::Text { .. }
-        ) && !self.effective_capabilities().text_input
-        {
+        let capabilities = self.effective_capabilities();
+        let available = match &event {
+            InputEvent::PhysicalKey { .. } => capabilities.physical_key_input,
+            InputEvent::Text { .. } => capabilities.text_input,
+            _ => true,
+        };
+        if !available {
             return None;
         }
         matches!(self.page, Page::RemoteSession { .. }).then_some(SessionCommand::Input(

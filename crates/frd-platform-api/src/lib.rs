@@ -41,7 +41,10 @@ pub struct PlatformCapabilities {
     pub clipboard_read: bool,
     pub clipboard_write: bool,
     pub remote_audio: bool,
+    /// 已提交文本；与物理键输入独立。
     pub text_input: bool,
+    /// 物理键输入；不得由文本能力推断。
+    pub physical_key_input: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

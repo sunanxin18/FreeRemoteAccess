@@ -444,10 +444,12 @@ mod tests {
     fn active_fixture() -> (AppController, InputAdapter, SessionId) {
         let (mut c, i, s) = fixture();
         c.set_platform_capabilities(frd_platform_api::PlatformCapabilities {
+            physical_key_input: true,
             text_input: true,
             ..Default::default()
         });
         c.set_product_policy(frd_app::ProductPolicy {
+            physical_key_input: true,
             text_input: true,
             ..Default::default()
         });
@@ -457,6 +459,7 @@ mod tests {
             s,
             frd_protocol_api::SessionEvent::CapabilitiesChanged(
                 frd_protocol_api::SessionCapabilities {
+                    physical_key_input: true,
                     text_input: true,
                     ..Default::default()
                 },

@@ -242,6 +242,7 @@ fn run_winit(cli: Cli) -> RunnerOutcome {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: false,
+            physical_key_input: true,
             text_input: true,
         });
     launch.controller_mut().set_product_policy(ProductPolicy {
@@ -249,6 +250,7 @@ fn run_winit(cli: Cli) -> RunnerOutcome {
         clipboard_read: false,
         clipboard_write: false,
         remote_audio: false,
+        physical_key_input: true,
         text_input: true,
     });
     let mut application = DesktopApplication::new_product(
@@ -324,6 +326,7 @@ fn run_gtk(cli: Cli) -> RunnerOutcome {
         clipboard_read: false,
         clipboard_write: false,
         remote_audio: false,
+        physical_key_input: true,
         text_input: true,
     };
     launch
@@ -334,6 +337,7 @@ fn run_gtk(cli: Cli) -> RunnerOutcome {
         clipboard_read: false,
         clipboard_write: false,
         remote_audio: false,
+        physical_key_input: true,
         text_input: true,
     });
     let stores = GtkRunnerStores::new(server_identities, profiles, credentials);

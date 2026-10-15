@@ -208,6 +208,7 @@ fn run(cli: Cli) -> RunnerOutcome {
             clipboard_read: false,
             clipboard_write: false,
             remote_audio: true,
+            physical_key_input: true,
             text_input: true,
         });
     launch.controller_mut().set_product_policy(ProductPolicy {
@@ -215,6 +216,7 @@ fn run(cli: Cli) -> RunnerOutcome {
         clipboard_read: false,
         clipboard_write: false,
         remote_audio: true,
+        physical_key_input: true,
         text_input: true,
     });
     let mut application = DesktopApplication::new_product(

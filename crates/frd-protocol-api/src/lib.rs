@@ -78,7 +78,10 @@ pub struct SessionCapabilities {
     pub clipboard_read: bool,
     pub clipboard_write: bool,
     pub remote_audio: bool,
+    /// 已提交文本；与物理键输入独立。
     pub text_input: bool,
+    /// 物理键输入；不得由文本能力推断。
+    pub physical_key_input: bool,
 }
 
 impl SessionCapabilities {
@@ -88,6 +91,7 @@ impl SessionCapabilities {
             clipboard_read: self.clipboard_read && other.clipboard_read,
             clipboard_write: self.clipboard_write && other.clipboard_write,
             remote_audio: self.remote_audio && other.remote_audio,
+            physical_key_input: self.physical_key_input && other.physical_key_input,
             text_input: self.text_input && other.text_input,
         }
     }

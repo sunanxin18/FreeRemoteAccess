@@ -45,6 +45,7 @@ impl Session {
             .publish_event(SessionEvent::StageChanged(ConnectionStage::TransportReady))?;
         self.runtime
             .publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                physical_key_input: true,
                 text_input: true,
                 ..Default::default()
             }))?;

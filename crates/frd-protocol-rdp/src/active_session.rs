@@ -147,6 +147,7 @@ fn run_active_session_inner(
     let mut generation = 1;
     let mut display = DisplayControlAdapter::new(negotiated_size);
     let mut published_capabilities = SessionCapabilities {
+        physical_key_input: true,
         text_input: true,
         ..SessionCapabilities::default()
     };
@@ -470,7 +471,7 @@ fn refresh_optional_capabilities(
     audio_adapter: &RdpAudioAdapter,
     runtime: &mut ProtocolRuntime,
     published: &mut SessionCapabilities,
-    text_input: bool,
+    keyboard_input_ready: bool,
 ) -> Result<(), ProtocolError> {
     let display_max_monitor_area =
         current_display_max_monitor_area(active_stage, display_capabilities);
@@ -489,7 +490,8 @@ fn refresh_optional_capabilities(
         clipboard_read: clipboard_capabilities.clipboard_read,
         clipboard_write: clipboard_capabilities.clipboard_write,
         remote_audio: audio_capabilities.remote_audio,
-        text_input,
+        physical_key_input: keyboard_input_ready,
+        text_input: keyboard_input_ready,
     };
     if desired == *published {
         return Ok(());
@@ -1047,6 +1049,7 @@ fn apply_reactivation_outcome(
             retry.pending = false;
             resume_active_input_capabilities(runtime, input)?;
             *published_capabilities = SessionCapabilities {
+                physical_key_input: true,
                 text_input: true,
                 ..SessionCapabilities::default()
             };
@@ -1144,6 +1147,7 @@ fn publish_graphics_update(
 
 fn publish_active_input_capabilities(runtime: &mut ProtocolRuntime) -> Result<(), ProtocolError> {
     runtime.publish_event(SessionEvent::CapabilitiesChanged(SessionCapabilities {
+        physical_key_input: true,
         text_input: true,
         ..SessionCapabilities::default()
     }))
@@ -3247,7 +3251,7 @@ mod tests {
     }
 
     #[test]
-    fn active_rdp_input_publishes_only_text_input_capability() {
+    fn active_rdp_input_publishes_physical_and_text_capabilities() {
         let session_id = SessionId::allocate();
         let (_commands, command_rx) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
@@ -3269,6 +3273,7 @@ mod tests {
                 clipboard_read: false,
                 clipboard_write: false,
                 remote_audio: false,
+                physical_key_input: true,
                 text_input: true,
             })
         );
@@ -3364,11 +3369,13 @@ mod tests {
             event_rx.try_iter().collect::<Vec<_>>(),
             vec![
                 SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                    physical_key_input: true,
                     text_input: true,
                     ..SessionCapabilities::default()
                 }),
                 SessionEvent::CapabilitiesChanged(SessionCapabilities::default()),
                 SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                    physical_key_input: true,
                     text_input: true,
                     ..SessionCapabilities::default()
                 }),
@@ -3401,6 +3408,7 @@ mod tests {
                 event_rx.try_iter().collect::<Vec<_>>(),
                 vec![
                     SessionEvent::CapabilitiesChanged(SessionCapabilities {
+                        physical_key_input: true,
                         text_input: true,
                         ..SessionCapabilities::default()
                     }),

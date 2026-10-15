@@ -149,6 +149,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 5B1 标准MVS普通应用实验组合：独立默认关闭OHOS ARM64 feature，可与RDP共存；保持Mac自动HP语义/音视频不可用及既有输入门，真实最终FFI/架构/互斥/依赖及构建参数验证完成、独立Spec/Quality通过；root冻结后36项宿主与7脚本通过。OHOS正向用例只编译、不由宿主mock证明注册，见[组合验证](../../validation/harmony-apple-composition-20261015.md)。
 - [ ] Task 5B2 正常表单明确模式选择：源码及双协议普通Release HAP构建完成，完整FFI 42通过/1既有ignored和精确strip包身份已核对；手机横竖完整表单、模式菜单与五位端口显示已有限实测，全部凭据交互/深色大字及PC新包GUI仍待完成，不将构建计为完成，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
 - [ ] Task 5B3 同一组合HAP：2026-10-15开发签名/官方验签/双参数精确checker及原28个条目逐字身份已完成，签名包3fbdd046；手机已安装，随后方向纠正包539cf8ee也已真实Windows登录/旋转验证；PC新包GUI及stockMac真实认证/首帧/刷新/指针/重连待验证，不替代完整键盘/IME、音频、HP与性能资格，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
+- [x] Task 5C 共享接口/源码子步骤：physical_key_input与text_input三层独立交集、Apple truthful能力发布、RDP既有输入保持及桌面事件路由完成；真实InputRouter反例修复经独立复审PASS，宿主核心1056 unit/Apple5 integration/Platform doc、desktop171+2通过，23既有ignored保留。OHOS Release包签验通过；真实键盘/IME及各原生平台运行仍待验证，见[输入能力验证](../../validation/input-capabilities-20261015.md)。
 - [ ] Task 5C 中立物理键/提交文本能力分离与真实输入：修正Apple Text宣称与实际不处理的不一致，保留既有桌面/RDP行为，OHOS未满足门的输入明确不可用。
 - [ ] Task 5D 本地显示器几何接入：OHOS连接前为默认NativeDisplay补齐真实physical/workarea/content/scale快照，复用共享分辨率策略、保留Fixed/ServerManaged/协议动态能力门；当前壳直接传递geometry=None，不能声称已按手机/PC本地屏幕请求。模式选择scope完成后独立实现并实测实际协商尺寸。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。

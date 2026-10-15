@@ -1961,6 +1961,34 @@ mod tests {
             Page::AwaitingFirstFrame { .. } | Page::RemoteSession { .. }
         ));
     }
+    #[test]
+    fn unqualified_ohos_keyboard_stays_disabled_after_session_advertises_input() {
+        let (mut o, session, link) = presentation_owner();
+        o.controller.handle_session_event_with_stores(
+            session,
+            SessionEvent::CapabilitiesChanged(frd_protocol_api::SessionCapabilities {
+                physical_key_input: true,
+                text_input: true,
+                ..Default::default()
+            }),
+            o.stores.borrow(),
+        );
+        let epoch = link.0.lock().unwrap().epoch().unwrap();
+        feedback(&link, epoch, frd_frame::FrameCompleteness::FullBaseline);
+        o.sync_presentation(false);
+        let capabilities = o.controller.effective_capabilities();
+        assert!(!capabilities.physical_key_input);
+        assert!(!capabilities.text_input);
+        assert!(o.controller.route_input(key_event(4, true)).is_none());
+        assert!(o
+            .controller
+            .route_input(InputEvent::Text {
+                utf8: "输入".into()
+            })
+            .is_none());
+        assert!(o.controller.route_input(InputEvent::ReleaseAll).is_some());
+    }
+
     fn key_event(hid: u16, down: bool) -> frd_core::InputEvent {
         frd_core::InputEvent::PhysicalKey {
             code: frd_core::PhysicalKeyCode::from_usb_hid_usage(hid),
@@ -1979,16 +2007,19 @@ mod tests {
         let (mut o, session, link) = presentation_owner();
         o.controller
             .set_platform_capabilities(frd_platform_api::PlatformCapabilities {
+                physical_key_input: true,
                 text_input: true,
                 ..Default::default()
             });
         o.controller.set_product_policy(frd_app::ProductPolicy {
+            physical_key_input: true,
             text_input: true,
             ..Default::default()
         });
         o.controller.handle_session_event_with_stores(
             session,
             SessionEvent::CapabilitiesChanged(frd_protocol_api::SessionCapabilities {
+                physical_key_input: true,
                 text_input: true,
                 ..Default::default()
             }),
