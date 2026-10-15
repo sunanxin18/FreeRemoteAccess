@@ -3,6 +3,7 @@ import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libentry.so';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
+import { PhoneFullscreenPolicy, PhoneFullscreenRequest } from '../common/PhoneFullscreenPolicy';
 import { PhoneOrientation, PhoneOrientationPolicy, PHONE_SESSION_ORIENTATION_EVENT } from '../common/PhoneOrientationPolicy';
 
 export default class EntryAbility extends UIAbility {
@@ -15,10 +16,40 @@ export default class EntryAbility extends UIAbility {
   private lastInsets: string = '';
   private phoneOrientation: PhoneOrientationPolicy = new PhoneOrientationPolicy();
   private orientationAvailable: boolean = false;
+  private phoneFullscreen: PhoneFullscreenPolicy = new PhoneFullscreenPolicy();
   private sessionOrientationChanged = (page: number, session: string): void => {
+    this.phoneFullscreen.observe(page, session);
+    this.applyPhoneFullscreen();
     this.phoneOrientation.observe(page, session);
     this.applyPhoneOrientation();
   };
+  private applyPhoneFullscreen(): void {
+    if (deviceInfo.deviceType !== 'phone' || !this.mainWindow || !this.contentReady) { return; }
+    const request = this.phoneFullscreen.nextRequest();
+    if (!request) { return; }
+    this.setPhoneFullscreen(this.mainWindow, request);
+  }
+  private async setPhoneFullscreen(currentWindow: window.Window, request: PhoneFullscreenRequest): Promise<void> {
+    try {
+      native.appFocus(false, false, false);
+      await currentWindow.setWindowLayoutFullScreen(request.fullscreen);
+      if (this.mainWindow !== currentWindow) { return; }
+      // 即使请求在 await 期间过期，也先读取实际布局，再由最新请求恢复。
+      this.updateCutout();
+      if (!this.phoneFullscreen.isCurrent(request)) { return; }
+      await currentWindow.setWindowSystemBarEnable(request.fullscreen ? [] : ['status', 'navigation']);
+      if (this.mainWindow !== currentWindow || !this.phoneFullscreen.isCurrent(request)) { return; }
+      // 手势导航条不属于上面的 navigation（三键导航）；需独立处理。
+      if (canIUse('SystemCapability.Window.SessionManager')) {
+        await currentWindow.setSpecificSystemBarEnabled('navigationIndicator', !request.fullscreen, false);
+      }
+      if (this.mainWindow === currentWindow && this.phoneFullscreen.isCurrent(request)) { this.updateCutout(); }
+    } catch (e) {
+      if (this.mainWindow === currentWindow) { this.updateCutout(); this.windowError('手机会话全屏', e as BusinessError); }
+    } finally {
+      if (this.phoneFullscreen.complete(request)) { this.applyPhoneFullscreen(); }
+    }
+  }
   private applyPhoneOrientation(): void {
     if (deviceInfo.deviceType !== 'phone' || !this.mainWindow || !this.orientationAvailable) { return; }
     const request = this.phoneOrientation.nextRequest();
@@ -66,7 +97,17 @@ export default class EntryAbility extends UIAbility {
     try {
       const cutout = this.mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
       const system = this.mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
-      const rect = this.mainWindow.getWindowProperties().windowRect;
+      const properties = this.mainWindow.getWindowProperties();
+      const rect = properties.windowRect;
+      const immersive = deviceInfo.deviceType === 'phone' && properties.isLayoutFullScreen;
+      AppStorage.setOrCreate('frd_phone_fullscreen', immersive);
+      let navigationRight: number = 0;
+      let navigationBottom: number = 0;
+      if (immersive) {
+        const navigation = this.mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
+        navigationRight = navigation.rightRect.width > 0 ? rect.width - navigation.rightRect.left : 0;
+        navigationBottom = navigation.bottomRect.height > 0 ? rect.height - navigation.bottomRect.top : 0;
+      }
       // AvoidArea 与 windowRect 使用物理像素、窗口内坐标。默认内容已经避让 system；
       // 仅补 cutout 与剩余内容的交集，left/top 必须取远边，不能只取孔洞宽高。
       const left = cutout.leftRect.width > 0 ? cutout.leftRect.left + cutout.leftRect.width : 0;
@@ -77,6 +118,8 @@ export default class EntryAbility extends UIAbility {
       const systemRight = system.rightRect.width > 0 ? rect.width - system.rightRect.left : 0;
       const systemTop = system.topRect.height > 0 ? system.topRect.top + system.topRect.height : 0;
       const systemBottom = system.bottomRect.height > 0 ? rect.height - system.bottomRect.top : 0;
+      AppStorage.setOrCreate('frd_island_safe_right', immersive ? Math.max(right, systemRight, navigationRight) : 0);
+      AppStorage.setOrCreate('frd_island_safe_bottom', immersive ? Math.max(bottom, systemBottom, navigationBottom) : 0);
       AppStorage.setOrCreate('frd_cutout_left', Math.max(0, left - systemLeft));
       AppStorage.setOrCreate('frd_cutout_right', Math.max(0, right - systemRight));
       AppStorage.setOrCreate('frd_cutout_top', Math.max(0, top - systemTop));
@@ -92,6 +135,8 @@ export default class EntryAbility extends UIAbility {
     }
     AppStorage.setOrCreate('frd_cutout_left', 0); AppStorage.setOrCreate('frd_cutout_right', 0);
     AppStorage.setOrCreate('frd_cutout_top', 0); AppStorage.setOrCreate('frd_cutout_bottom', 0);
+    AppStorage.setOrCreate('frd_phone_fullscreen', false);
+    AppStorage.setOrCreate('frd_island_safe_right', 0); AppStorage.setOrCreate('frd_island_safe_bottom', 0);
     AppStorage.setOrCreate('frd_native_buttons_width', 0);
     AppStorage.setOrCreate('frd_native_chrome', false);
     AppStorage.setOrCreate('frd_window_active', false);
@@ -103,6 +148,7 @@ export default class EntryAbility extends UIAbility {
       this.windowActive = true; this.publishActive();
       if (deviceInfo.deviceType === 'phone') {
         this.phoneOrientation.attachWindow();
+        this.phoneFullscreen.attachWindow();
         try {
           this.orientationAvailable = canIUse('SystemCapability.Window.SessionManager');
           if (this.orientationAvailable) { this.applyPhoneOrientation(); }
@@ -122,6 +168,7 @@ export default class EntryAbility extends UIAbility {
       windowStage.loadContent('pages/Index', (error) => {
         if (error.code) { hilog.error(0xFF00, 'FrdOhos', '页面加载失败：%{public}d', error.code); return; }
         this.contentReady = true;
+        this.applyPhoneFullscreen();
         this.updateChrome();
         if (this.mainWindow && this.desktop) {
           this.mainWindow.on('windowTitleButtonRectChange', (updated: window.TitleButtonRect) => {
@@ -138,6 +185,7 @@ export default class EntryAbility extends UIAbility {
   onWindowStageDestroy(): void {
     this.windowActive = false; this.publishActive();
     this.phoneOrientation.detachWindow();
+    this.phoneFullscreen.detachWindow();
     this.orientationAvailable = false;
     native.setForeground(false);
     if (this.mainWindow) {
@@ -153,6 +201,7 @@ export default class EntryAbility extends UIAbility {
       this.context.eventHub.off(PHONE_SESSION_ORIENTATION_EVENT, this.sessionOrientationChanged);
     }
     this.phoneOrientation.detachWindow();
+    this.phoneFullscreen.detachWindow();
     this.orientationAvailable = false;
     native.setForeground(false); native.shutdownApp();
   }

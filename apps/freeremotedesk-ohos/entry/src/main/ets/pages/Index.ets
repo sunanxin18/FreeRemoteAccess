@@ -24,6 +24,9 @@ interface FormEdit { target: number; address: string; port: number; username: st
 @Component
 struct Index {
   @StorageLink('frd_window_active') @Watch('shellActivityChanged') private shellActive: boolean = false;
+  @StorageLink('frd_phone_fullscreen') private phoneFullscreen: boolean = false;
+  @StorageLink('frd_island_safe_right') private islandSafeRight: number = 0;
+  @StorageLink('frd_island_safe_bottom') private islandSafeBottom: number = 0;
   @StorageLink('frd_cutout_left') private cutoutLeft: number = 0;
   @StorageLink('frd_cutout_right') private cutoutRight: number = 0;
   @StorageLink('frd_cutout_top') private cutoutTop: number = 0;
@@ -625,7 +628,7 @@ struct Index {
         })
 
     }.alignItems(HorizontalAlign.End).constraintSize({ maxWidth: Math.max(56, this.windowWidth - 24) })
-      .margin({ right: 10, bottom: 10 }).hitTestBehavior(HitTestMode.None)
+      .margin({ right: 10 + this.getUIContext().px2vp(this.islandSafeRight), bottom: 10 + this.getUIContext().px2vp(this.islandSafeBottom) }).hitTestBehavior(HitTestMode.None)
   }
   build() {
     Stack({ alignContent: Alignment.BottomEnd }) {
@@ -636,8 +639,8 @@ struct Index {
         if (this.islandShown) { this.sessionIsland() }
       }
     }.width('100%').height('100%').clip(true)
-      .padding({ left: this.getUIContext().px2vp(this.cutoutLeft), right: this.getUIContext().px2vp(this.cutoutRight), top: this.getUIContext().px2vp(this.cutoutTop), bottom: this.getUIContext().px2vp(this.cutoutBottom) })
-      .backgroundColor($r('app.color.page_background'))
+      .padding({ left: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutLeft), right: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutRight), top: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutTop), bottom: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutBottom) })
+      .backgroundColor(this.model.page === 0 ? $r('app.color.page_background') : Color.Black)
       .onKeyEventDispatch((event: KeyEvent): boolean => this.dispatchKey(event))
       .onAreaChange((_, area) => { this.compact = Number(area.width) < 600 || Number(area.height) < 500; this.windowWidth = Number(area.width); this.windowHeight = Number(area.height); })
   }
