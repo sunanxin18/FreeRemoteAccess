@@ -72,3 +72,13 @@ freeremotedesk-windows --test dependency_boundary`：先实际复现1通过/1失
 （exit101），单行修复后2通过/0失败（exit0）；范围格式与diff检查通过。
 原始输出、命令和退出记录保存在 `target/ci-ohos-boundary-20261015/`。
 本机结果不替代修复提交的Windows CI、原生运行或鸿蒙真实会话验收。
+
+
+后续修复提交`91d4d9c`的Windows run `38676911648`已实际终态SUCCESS：
+x86/x64/ARM64三个打包任务和Windows ARM64原生decoder runtime四项均通过。
+root保存并读取原生job日志，包内DLL六项fixture、ClearCodec39项（2既有ignored）、
+两项有界benchmark、Progressive61项（1既有ignored）及一项有界benchmark通过。
+这确认该精确清单失败已经消失；不代表后续提交自动通过，也不是尚未完成的
+私有C ABI/SEH资格或远程桌面最大吞吐证明。终态及原始日志位于
+`target/ci-ohos-boundary-20261015/delivery/windows-final-success.json`和
+`windows-native-final.log`。
