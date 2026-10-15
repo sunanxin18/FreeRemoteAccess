@@ -255,3 +255,6 @@ Root以既有开发身份签名新unsigned9c8d，signed HAP b742c9287ed1bec43e86
 完整签验、fresh-PID数值日志、各次命令/失败、原始截图与有界判断保存在target/harmony-ime-sdk-order-root-20261015/，主receipt为phone-validation.json，最终结果图为ui/phone/sdk-order-final-remote-text/Screenshot_2026-10-15T234429.png。这新增的是API26手机模拟器→Windows RDP系统IME的有限实际互操作证据。PC仍由用户填写且完全未观察/操作；实体键盘、硬件真机、非BMP真实输入、完整编辑/选择、前后台/重连长时及Mac目标仍不由此授予资格。
 
 桌面回归身份独立：原Apple tests-only71e实际5个workflow均成功；当前native焦点9df原始通用CI38758133053、macOS ARM6438758132773、Linux FFmpeg38758132894已成功，Windows38758133250仍运行（15:29UTC观察）。这些不证明本SDK顺序候选的设备行为，也不替换上面的真实输入证据。
+
+
+2026-10-16后续CI观察：native焦点提交9dffe17的原Windows38758133250全部成功，含x86/x64/ARM64三个包及独立Windows ARM64 decoder runtime（16:07:39UTC完成）；此前其余三个原workflow已成功，因此该头实际触发的四个workflow均成功。SDK顺序提交c2e6f90仅触发原通用CI38763798663，现已成功（15:58:52UTC），含格式及Linux/macOS安全测试；没有给未触发的平台workflow补记成功，也不把host CI当作ArkTS/HAP/设备输入验收。原始完整metadata：target/task5a6-root-20261015/ci-final-20261016.json。

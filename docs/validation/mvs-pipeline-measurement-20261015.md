@@ -1,6 +1,6 @@
 # MVS 有限整管线工作集与测量（2026-10-15）
 
-状态：**实验性**。新增测试专用真实 wire 工作集和测量入口，默认/native 宿主资格与固定四轮有限计时完成，两个官方 OHOS ARM64 Release 测试程序已构建。手机和PC模拟器均已独立完成两份程序各32条资格，两端正式计时仍未完成。不能由本项宣称生产解码资格或鸿蒙真实 Mac 会话已完成。
+状态：**实验性**。新增测试专用真实 wire 工作集和测量入口，默认/native 宿主资格与固定四轮有限计时完成，两个官方 OHOS ARM64 Release 测试程序已构建。手机和PC模拟器均已独立完成两份程序各32条资格；2026-10-16手机固定ABBA计时完成，PC正式计时仍未完成。不能由本项宣称生产解码资格或鸿蒙真实 Mac 会话已完成。
 
 ## 入口、工作集与正确性
 
@@ -48,7 +48,7 @@
 
 独立审查为 Spec PASS / Quality PASS，无需修正源码；重新核对四个二进制、完整输出、45+76个源和实际native调用。审查确认现有测试唤醒跟踪也进入发布时钟，后续按上文共同测试开销披露。
 
-本地证据：`target/task5a6-mvs-pipeline-20261015/`；root接收与后续执行：`target/task5a6-root-20261015/`。新测试均显式ignored，普通cargo/CI不会触发性能或生成大文件。PC目标资格已由后续记录补充；手机资格、两端正式测量、HAP/真实Mac、其它架构和完整生产性能仍为独立未完成项。
+本地证据：`target/task5a6-mvs-pipeline-20261015/`；root接收与后续执行：`target/task5a6-root-20261015/`。新测试均显式ignored，普通cargo/CI不会触发性能或生成大文件。手机/PC目标资格及手机正式测量已由后续记录补充；PC正式测量、HAP/真实Mac、其它架构和完整生产性能仍为独立未完成项。
 
 ## macOS ARM64 固定四轮实际结果
 
@@ -91,4 +91,32 @@ PC default与PC native、PC default与宿主default、PC native与宿主native�
 
 实际24个command的host均0；14条guest shell有13条唯一guest0，以及保留的一条公开观察guest127。初次inventory helper误要求只出现手机、第二次公开内存观察误用guest不存在的awk，均立即STOP。root分别读取原始记录后只释放清单解析修正及新增一次`cat /proc/meminfo`；没有重发旧inventory/uname/params/df，没有覆盖原STOP/raw或把guest127改写为成功。启动前公开可用内存2,630,264KiB、可用磁盘1,808,680KiB满足资格前置阈值，不能视为进程RSS或分配实测。
 
-没有操作产品UI/账号/HUKS/网络或PC；没有构建、签装或执行正式计时。证据 `target/task5a6-mvs-pipeline-20261015/phone-runtime/`，root独立接收 `target/task5a6-root-20261015/phone-acceptance/acceptance.json`。手机和PC的有限CPU正确性现已分别通过，**两端正式计时、HAP/GPU/网络及真实Mac性能仍未完成**。
+没有操作产品UI/账号/HUKS/网络或PC；没有构建、签装或执行正式计时。证据 `target/task5a6-mvs-pipeline-20261015/phone-runtime/`，root独立接收 `target/task5a6-root-20261015/phone-acceptance/acceptance.json`。手机和PC的有限CPU正确性现已分别通过；本节当时尚未执行正式计时。手机计时见下节，PC计时、HAP/GPU/网络及真实Mac性能仍未完成。
+
+
+## 手机模拟器固定四轮计时（2026-10-16）
+
+root 在不操作PC的前提下，沿用已经分别完成正确性资格的两份原始OHOS ELF与官方SDK C++库，顺序实际执行 default-forward、native-forward、native-reverse、default-reverse。四个独立进程各仅运行一次指定测试，host与独有guest退出均0、各1passed，全部96条measured/32条warmup完成。合计384条measured、128条warmup；每backend192/64，每case/backend24条计时样本。没有增加样本或重跑计时进程。
+
+每条记录在计时后逐字比较完整输出，每cycle比较完整状态；四轮全部通过。执行前后guest两个ELF、SDK库和41个reference文件摘要不变；参考文件也与已接收phone native及host default全部41文件摘要一致。host保存的原始计时文件、DONE和所有命令/实际退出码均单独保留。下表是apply+publish总量中位数，单位µs；各段全部原始值及min/max保存在summary.json，不按结果删除慢记录。
+
+| case | default 中位µs | native 中位µs | native/default |
+|---|---:|---:|---:|
+| full-copy-720 | 3,533.229 | 2,523.334 | 0.714 |
+| full-copy-tail | 4,199.376 | 2,913.312 | 0.694 |
+| clipped-overlay | 6.125 | 5.458 | 0.891 |
+| local-copy | 27.145 | 22.271 | 0.820 |
+| local-miss | 64.667 | 63.124 | 0.976 |
+| local-type1-copy | 26.604 | 25.812 | 0.970 |
+| full-dense-y | 10,839.604 | 12,754.834 | 1.177 |
+| local-type1-refine | 114.854 | 140.438 | 1.223 |
+
+手机同样显示大画面copy收益，以及dense-Y/refine变慢，不能宣称NEON整体提速或由此启用生产后端。局部case含混合opcode、共同测试跟踪/断言开销，且为共享Mac上的模拟器；宿主DevEco、两个Emulator及Codex等后台CPU活动与load average约2.99–3.22被记录，没有停止其它任务或操作PC。没有本项目并行编译或UI测试，**不代表独占宿主、硬件手机表现或稳定尾延迟**。这仍是CPU apply/publish有限对照，不是实际FPS、HAP绘制、网络或远程延迟。
+
+### 原始候选与当前代码边界
+
+这些固定ELF来自 `fb78d4e4347464ee5e58e34d5ccb7fa74aa606d2`，不是当前 `c2e6f90` 重建。root重新逐项将原freeze中45个Apple与76个transitive条目同原Git对象比较，121次校验全部一致，**两组重叠45条，实际76个不同路径**。当前有5个原输入路径变化，且有后续新增文件；保存了实际diff和当前输入摘要，不假定变更与热路径无关。因此本节结果只归属原fb78候选，不授予后续当前源码、安装HAP或真实Mac性能资格。本次各命令前后同时核对当前76个输入及原二进制/参考文件，执行期间没有变化。
+
+本次root辅助脚本有三个执行前停止，均保留：最初误将121次校验当121个不同路径；随后小写文件名白名单误拒必需的DONE；两次均在任何设备命令前退出。修正后公开设备观察host0/guest0，ARM64/API26、MemAvailable2,473,376KiB、磁盘939,268KiB；脚本沿用资格阶段写出大文件的1GiB磁盘门槛再次停止，尚未运行测试。root明确按本阶段每process仅写records.txt和DONE改为128MiB余量，复用15分钟内已成功原始公开观察、不重发该命令。原脚本/STOP全部保留，新的execution-v4只执行剩余步骤；不删除或覆盖guest参考/旧工件，不以这些工具错误或门槛调整增加计时次数。
+
+证据根 `target/task5a6-root-20261015/phone-measurement-20261015/`：admission-ruling.json、current-input-drift.diff、两项工具修正与formal-output-budget-ruling.json；正式执行在execution-v4/{STARTED.json,*.invocation.json,*.result.json,*.stdout.log,*.stderr.log,*-data/,all-records.json,summary.json,COMPLETE.json}。手机只运行原生CLI，不访问产品UI、账号/HUKS、网络、HAP生命周期或PC。PC仍在用户填写阶段，未观察、重装、点击、连接或执行计时；Task5A6整体仍OPEN。
