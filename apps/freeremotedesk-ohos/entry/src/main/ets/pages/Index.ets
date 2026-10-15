@@ -500,7 +500,7 @@ struct Index {
           }.width(this.formFieldWidth()).alignItems(VerticalAlign.Top).margin({ bottom: 12 })
           Column({ space: 6 }) {
             this.fieldLabel('主机地址')
-            TextInput({ text: this.address, placeholder: '主机名或 IP 地址' }).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('主机地址')
+            TextInput({ text: this.address, placeholder: '主机名或 IP 地址' }).type(InputType.URL).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('主机地址')
               .showError(this.error(this.model.errors?.address)).onChange((v: string) => { this.address = v; this.edit(); })
           }.width(this.formFieldWidth()).margin({ bottom: 12 })
           Column({ space: 6 }) {
@@ -533,6 +533,8 @@ struct Index {
   remoteSurface() {
     XComponent({ id: 'frdRemoteSurface', type: XComponentType.SURFACE, libraryname: 'entry', controller: this.controller })
       .width('100%').height('100%').id('frdRemoteSurfaceFocus').focusable(true).accessibilityText('远程桌面')
+      // 下发拦截只属于远程画面；注册到表单祖先会阻断原生TextInput，即使回调返回false。
+      .onKeyEventDispatch((event: KeyEvent): boolean => this.dispatchKey(event))
       .onAreaChange((_, area) => { this.release(); this.surfaceWidth = Math.round(this.getUIContext().vp2px(Number(area.width))); this.surfaceHeight = Math.round(this.getUIContext().vp2px(Number(area.height))); this.geometry(); })
       .onFocus(() => { if (!this.keyboard.isLocal()) { this.focus(true); } }).onBlur(() => this.focus(false))
       // 仅观察所有权，不生产第二份触摸/鼠标意图；native down/press 仍负责唯一远程 pointer。
@@ -641,7 +643,8 @@ struct Index {
     }.width('100%').height('100%').clip(true)
       .padding({ left: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutLeft), right: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutRight), top: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutTop), bottom: this.phoneFullscreen && this.model.page !== 0 ? 0 : this.getUIContext().px2vp(this.cutoutBottom) })
       .backgroundColor(this.model.page === 0 ? $r('app.color.page_background') : Color.Black)
-      .onKeyEventDispatch((event: KeyEvent): boolean => this.dispatchKey(event))
+      // 普通冒泡保留岛操作和原来源尾Up清理，输入框先处理数字、IME和Enter。
+      .onKeyEvent((event: KeyEvent) => { if (this.dispatchKey(event)) { event.stopPropagation(); } })
       .onAreaChange((_, area) => { this.compact = Number(area.width) < 600 || Number(area.height) < 500; this.windowWidth = Number(area.width); this.windowHeight = Number(area.height); })
   }
 }
