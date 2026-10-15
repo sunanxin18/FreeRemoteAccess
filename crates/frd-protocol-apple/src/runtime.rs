@@ -2750,6 +2750,152 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    enum SocketWriteReadiness {
+        Writable,
+        Backpressured,
+        ClosedOrError { events: i16 },
+    }
+
+    // 只读零等待快照；不改变共享socket的阻塞模式、timeout或内容。
+    fn socket_write_readiness(stream: &TcpStream) -> std::io::Result<SocketWriteReadiness> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut pollfd = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // pollfd有效，socket借用覆盖调用，nfds与数组长度一致，timeout为零。
+            let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Ok(SocketWriteReadiness::ClosedOrError {
+                    events: pollfd.revents,
+                });
+            }
+            if pollfd.revents & libc::POLLOUT != 0 {
+                return Ok(SocketWriteReadiness::Writable);
+            }
+            if result == 0 {
+                return Ok(SocketWriteReadiness::Backpressured);
+            }
+            Err(std::io::Error::other("socket写就绪快照返回未知事件"))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{
+                WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLNVAL, POLLOUT, SOCKET, WSAPOLLFD,
+            };
+            let mut pollfd = WSAPOLLFD {
+                fd: SOCKET::try_from(stream.as_raw_socket()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "socket句柄超出平台ABI范围",
+                    )
+                })?,
+                events: POLLOUT,
+                revents: 0,
+            };
+            // 使用WinSock绑定的SOCKET及WSAPOLLFD布局，借用覆盖同步零等待调用。
+            let result = unsafe { WSAPoll(&mut pollfd, 1, 0) };
+            if result < 0 {
+                return Err(std::io::Error::from_raw_os_error(unsafe {
+                    WSAGetLastError()
+                }));
+            }
+            if pollfd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+                return Ok(SocketWriteReadiness::ClosedOrError {
+                    events: pollfd.revents,
+                });
+            }
+            if pollfd.revents & POLLOUT != 0 {
+                return Ok(SocketWriteReadiness::Writable);
+            }
+            if result == 0 {
+                return Ok(SocketWriteReadiness::Backpressured);
+            }
+            Err(std::io::Error::other("socket写就绪快照返回未知事件"))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = stream;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "此平台未实现只读socket写就绪观察",
+            ))
+        }
+    }
+
+    #[test]
+    fn socket_write_probe_distinguishes_writable_backpressure_and_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        socket2::SockRef::from(&stream)
+            .set_send_buffer_size(1024)
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let original_timeout = stream.write_timeout().unwrap();
+        #[cfg(unix)]
+        let original_flags = {
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+            flags
+        };
+        assert_eq!(
+            socket_write_readiness(&stream).unwrap(),
+            SocketWriteReadiness::Writable
+        );
+        let mut writer = stream.try_clone().unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            result_tx
+                .send(writer.write_all(&vec![0x5a; 64 * 1024 * 1024]))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(Instant::now() < deadline, "真实TCP未在准备界限内产生背压");
+            match socket_write_readiness(&stream).unwrap() {
+                SocketWriteReadiness::Writable => thread::yield_now(),
+                SocketWriteReadiness::Backpressured => break,
+                other => panic!("背压前socket异常: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(stream.write_timeout().unwrap(), original_timeout);
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            assert_eq!(
+                unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) },
+                original_flags
+            );
+        }
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(matches!(
+            socket_write_readiness(&stream).unwrap(),
+            SocketWriteReadiness::ClosedOrError { .. }
+        ));
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_err());
+        worker.join().unwrap();
+    }
+
     #[test]
     fn production_session_disconnect_interrupts_blocked_writer_and_runs_cleanup() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2784,13 +2930,14 @@ mod tests {
                 [3, 0, 0, 0, 0, 0, 0, 64, 0, 64]
             );
             high_performance_ready_tx.send(()).unwrap();
-            let _ = release_peer_rx.recv_timeout(Duration::from_secs(5));
+            let _ = release_peer_rx.recv();
             drop(stream);
         });
         let client = TcpStream::connect(address).unwrap();
         socket2::SockRef::from(&client)
             .set_send_buffer_size(1024)
             .unwrap();
+        let write_probe = client.try_clone().unwrap();
         peer_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let mut connection = crate::AppleConnection::new(client);
         connection
@@ -2855,19 +3002,75 @@ mod tests {
                 io_rx.recv_timeout(remaining).unwrap(),
                 crate::connection::WriterIoTestEvent::Started { wire_bytes: 60_034 }
             ));
-            match io_rx.recv_timeout(Duration::from_millis(150)) {
+            let mut result_received = false;
+            let finished_event = match io_rx.recv_timeout(Duration::from_millis(150)) {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    assert!(matches!(
-                        result_rx.try_recv(),
-                        Err(mpsc::TryRecvError::Empty)
-                    ));
-                    break (result_rx, io_rx);
+                    let result_before = result_rx.try_recv();
+                    let event_before = io_rx.try_recv();
+                    if matches!(result_before, Err(mpsc::TryRecvError::Empty))
+                        && matches!(event_before, Err(mpsc::TryRecvError::Empty))
+                    {
+                        let readiness = socket_write_readiness(&write_probe).unwrap();
+                        let result_after = result_rx.try_recv();
+                        let event_after = io_rx.try_recv();
+                        match readiness {
+                            SocketWriteReadiness::ClosedOrError { .. } => {
+                                panic!("Disconnect前socket已关闭或失败: {readiness:?}");
+                            }
+                            SocketWriteReadiness::Backpressured
+                                if matches!(result_after, Err(mpsc::TryRecvError::Empty))
+                                    && matches!(event_after, Err(mpsc::TryRecvError::Empty)) =>
+                            {
+                                eprintln!("同请求背压观察成立，已完成请求数: {completed_requests}");
+                                break (result_rx, io_rx);
+                            }
+                            _ => {}
+                        }
+                        // 可写或观察期间已完成：只能等待本请求结束，不发Disconnect或下一请求。
+                        if let Ok(result) = result_after {
+                            result.unwrap();
+                            result_received = true;
+                        }
+                        match event_after {
+                            Ok(event) => event,
+                            Err(mpsc::TryRecvError::Empty) => io_rx
+                                .recv_timeout(
+                                    write_block_deadline
+                                        .checked_duration_since(Instant::now())
+                                        .expect("writer preparation exceeded its 2s bound"),
+                                )
+                                .unwrap(),
+                            Err(other) => panic!("同请求观察通道异常: {other:?}"),
+                        }
+                    } else {
+                        if let Ok(result) = result_before {
+                            result.unwrap();
+                            result_received = true;
+                        }
+                        match event_before {
+                            Ok(event) => event,
+                            Err(mpsc::TryRecvError::Empty) => io_rx
+                                .recv_timeout(
+                                    write_block_deadline
+                                        .checked_duration_since(Instant::now())
+                                        .expect("writer preparation exceeded its 2s bound"),
+                                )
+                                .unwrap(),
+                            Err(other) => panic!("同请求观察通道异常: {other:?}"),
+                        }
+                    }
                 }
-                Ok(crate::connection::WriterIoTestEvent::Finished { succeeded: true }) => {
+                Ok(event) => event,
+                Err(other) => panic!("同请求观察通道异常: {other:?}"),
+            };
+            match finished_event {
+                crate::connection::WriterIoTestEvent::Finished { succeeded: true } => {
                     let remaining = write_block_deadline
                         .checked_duration_since(Instant::now())
                         .expect("writer preparation exceeded its 2s bound");
-                    result_rx.recv_timeout(remaining).unwrap().unwrap();
+                    if !result_received {
+                        result_rx.recv_timeout(remaining).unwrap().unwrap();
+                    }
                     let remaining = write_block_deadline
                         .checked_duration_since(Instant::now())
                         .expect("writer preparation exceeded its 2s bound");

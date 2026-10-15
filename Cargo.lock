@@ -2055,6 +2055,7 @@ dependencies = [
  "frd-wire-rfb",
  "getrandom 0.2.17",
  "hmac 0.12.1",
+ "libc",
  "md-5 0.10.6",
  "num-bigint 0.4.8",
  "pbkdf2 0.12.2",
@@ -2062,6 +2063,7 @@ dependencies = [
  "sha1 0.10.7",
  "sha2 0.10.9",
  "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
