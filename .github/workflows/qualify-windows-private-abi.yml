@@ -16,12 +16,26 @@ jobs:
   compile-objects:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      input-artifact-id: ${{ steps.native-input.outputs.artifact-id }}
+      input-artifact-digest: ${{ steps.native-input.outputs.artifact-digest }}
     steps:
       - name: Checkout exact dispatched revision
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Run native runner and affected portable controls before compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          mkdir "target/task4c5c3b2f3-controls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for suite in test_windows_private_process.py test_run_windows_private_contract.py test_admit_windows_private_artifact.py test_verify_windows_private_transcript.py; do
+            python3 -I -B -m unittest discover -s tools/tests -p "$suite" -v \
+              > "target/task4c5c3b2f3-controls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${suite}.log" 2>&1
+          done
 
       - name: Run narrow source and container checks
         shell: bash
@@ -71,12 +85,29 @@ jobs:
             --installation "$GITHUB_WORKSPACE/target/task4c5c3b2c-install-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --output "$GITHUB_WORKSPACE/target/task4c5c3b2e-contract-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
+      - name: Upload exact seven same-run native input files
+        id: native-input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: task4c5c3b2f2-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/task4c5c3b2c-install-${{ github.run_id }}-${{ github.run_attempt }}/evidence.zip
+            target/task4c5c3b2c-install-${{ github.run_id }}-${{ github.run_attempt }}/archive.json
+            target/task4c5c3b2c-compile-${{ github.run_id }}-${{ github.run_attempt }}/evidence.zip
+            target/task4c5c3b2c-compile-${{ github.run_id }}-${{ github.run_attempt }}/archive.json
+            target/task4c5c3b2e-contract-${{ github.run_id }}-${{ github.run_attempt }}/evidence.zip
+            target/task4c5c3b2e-contract-${{ github.run_id }}-${{ github.run_attempt }}/archive.json
+            target/task4c5c3b2e-contract-${{ github.run_id }}-${{ github.run_attempt }}/terminal-status.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Preserve exact checks and object evidence on success or failure
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-arm64-private-compile-v1-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            target/task4c5c3b2f3-controls-${{ github.run_id }}-${{ github.run_attempt }}/
             target/task4c5c3b2c-checks-${{ github.run_id }}-${{ github.run_attempt }}/stdout.txt
             target/task4c5c3b2c-checks-${{ github.run_id }}-${{ github.run_attempt }}/stderr.txt
             target/task4c5c3b2c-install-${{ github.run_id }}-${{ github.run_attempt }}/evidence.zip
@@ -87,5 +118,47 @@ jobs:
             target/task4c5c3b2c-compile-${{ github.run_id }}-${{ github.run_attempt }}/summary.json
             target/task4c5c3b2e-checks-${{ github.run_id }}-${{ github.run_attempt }}/
             target/task4c5c3b2e-contract-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  native-helper-contract:
+    needs: compile-objects
+    if: ${{ needs.compile-objects.result == 'success' }}
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout exact source bytes without autocrlf translation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Run fixed native ARM64 helper contracts with same-run input
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FRD_COMPILE_RESULT: ${{ needs.compile-objects.result }}
+          FRD_INPUT_ARTIFACT_ID: ${{ needs.compile-objects.outputs.input-artifact-id }}
+          FRD_INPUT_ARTIFACT_DIGEST: ${{ needs.compile-objects.outputs.input-artifact-digest }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath target)) { New-Item -ItemType Directory -Path target | Out-Null }
+          python -I -B tools/run-windows-private-contract.py --source-root "$env:GITHUB_WORKSPACE" --output "$env:GITHUB_WORKSPACE/target/task4c5c3b2f3-native-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Preserve native raw streams and final or partial evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: task4c5c3b2f3-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/task4c5c3b2f3-native-${{ github.run_id }}-${{ github.run_attempt }}/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14

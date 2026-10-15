@@ -273,3 +273,23 @@ seal发布前将全部落盘文件与原始内存bytes比较，保留完整树�
 最终验收源码SHA256 `d1b98c9fb15be28ce77200b5eaba56b50750c0672f5d4b6e4513f80f8410cc48`，测试 `df463a29330930f503c83baded60b9b09c868c179ef79c0cd68fe16a399c1c66`。作者证据 `target/windows-private-admission-20261016/`，Fix1冻结清单1010项（SHA256 `f3fc61793b7e3290bdbf33c984010426d4750a5a3d9c35fdfdc0f15e41d39be2`）；root核对所有新项、3514个旧target证据及原报告/审查前缀，接收材料在 `target/windows-private-admission-root-20261016/`。独立复审 `task-4c5c3b2f2-artifact-admission-review.md` 位于本计划SDD目录。
 
 下一阶段须完整接入Win32进程所有权、实时host/machine、七命令、实际wait/exit、有界tree清理、可信API下载、同workflow新upload与新run编译。workflow改动需要同步更新本模块的固定workflow pin并独立审查；不能放宽源码比较来沿用旧夹具。Windows路径实际运行、原生ABI/SEH、shipping数学/guard/QPC/性能/修改包及产品资格仍OPEN。本轮未观察或操作PC表单，也没有设备、HAP、账号或协议会话操作。
+
+## 同 run 原生验证工具：源码与宿主控制（2026-10-16，B2F3）
+
+状态：**开发中**。新增 `tools/run-windows-private-contract.py` 与 `tools/windows-private-process.py`，接入既有静态seal和bytes解析器。专项workflow增加精确七文件input上传、artifact ID/digest传递和依赖编译成功的 `windows-11-arm` job；原Linux编译配方、C/ASM、解析器及工具链不变。静态验收模块只同步workflow字节摘要，旧合成transport不能用于新workflow的原生验收。
+
+Win32实现使用固定宽度ctypes结构；实时核对Python原始PE、IsWow64Process2、ProcessMachineTypeInfo和本机系统架构。每条命令通过STARTUPINFOEX的JOB_LIST在创建时关联独立kill-on-close Job，只继承三个标准I/O句柄；父进程保持挂起直到独立机器检查通过。固定顺序为variant0的register/unwind/isolated和variant1–4的unwind；非isolated30秒、isolated120秒、清理10秒，stdout/stderr各1MiB。接受结果需要父进程独立wait、exit0、Job活动进程数为0和严格日志解析全部通过，首错后余项不启动。
+
+调用者使用同run/attempt上下文、编译job结果、固定repository ID、上传ID/digest与认证Actions API比对。下载禁止自动跳转和向存储域转发Authorization，保存原始ZIP bytes并核对API大小、摘要及源码身份；子进程只有公开系统路径的最小环境。每项执行前后重验caller持有seal、源码、PE与既有材料。封装后独立重读ZIP并再次重验输入，最后原子发布唯一terminal；QPC原整数只作为执行/超时记录，不是性能测量。
+
+初次独立审查发现三项Important，均保留实际宿主反例并经同reviewer复审关闭：
+
+- 固定上传action输出裸64hex，而入口错误要求 `sha256:`；现在只在action-output边界严格验证并规范化，分别保留原始值与REST/F2值，metadata不一致仍拒绝。
+- HTTP200提前EOF时丢失已下载前缀；现在沿实际main失败路径保存有界partial。测试核对失败目录、members及ZIP里的10字节原文/摘要、首错和七项not_attempted。
+- 退出后drain超限或第二流读错会丢失已读取的上限内字节；现在两处读取共用逐流保存逻辑。测试核对完整1MiB前缀、第二流失败仍保留第一流、清理状态与后续命令停止。
+
+原候选owner15、runner19、静态验收21pass/1可选skip及解析器22项，共77pass/1skip。Fix1只复跑受影响runner22和owner17，共39pass；语法/pins检查通过，F1/F2未重复跑整组。最终日志无warning。root核对初始50项、Fix1新增28项、未改45项及两个报告原前缀；旧失败材料和源副本保留。审查最终Spec PASS / Quality Approved，无未关闭Critical/Important/Minor。
+
+修后runner SHA256 `0db22e25ce7074fb8493088f7f0a0105568590ccdd9d6414b84e6fa82e7563d0`，owner `447dbba607851e835f980a7c6651355433a75f86df5c4718b711b8e7944151ed`；workflow `c3cf5d6948ba14647f0b9d65352020bdfc7f704d48e1f90d4a520df55dbd56b2`，F2 `6e08a333aa62e1775156696f721ec900bf352d192e76369bdd2870e6c2f2be15`。作者材料位于 `target/windows-private-runner-20261016/`，root接收位于 `target/windows-private-runner-root-20261016/`；复审报告为计划SDD目录中的 `task-4c5c3b2f3-runner-review.md`，SHA256 `29cecd9f229e7c74703e1b1943e4931ae841bf22d4c9f9d72a12c8239d53267a`。
+
+以上只完成源码、宿主控制和CI接线。首次实际Windows ARM64 Python/ctypes/API、JOB_LIST/nested jobs、C debugger/child、pipe/wait/jobzero/cleanup、认证API下载及最终上传仍待验收。即使后续通过，范围也仅为 `ABI-contract-only/nativehelper-control`；外部完整contexts、child base/provider/loader身份、shipping数学/qmul/guard、解码性能、修改FFmpeg包及产品互操作仍OPEN。此次没有设备、PC表单、HAP、凭据或远程会话操作。
