@@ -136,6 +136,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 
 - [x] Task 5A1 MVS IDCT 源码/宿主/最终ELF子步骤：2026-10-15 默认关闭的 ARM64 i64 NEON 变换，原标量 oracle 保持，28,800块差分和完整Apple feature512项回归通过；初版实际代码生成48条标量乘法的失败保留并修正，最终指令和源码独立Spec/Quality审查通过。目标执行见下一行；颜色、完整MVS、性能、应用组合及真实Mac会话仍OPEN，见[IDCT验证](../../validation/mvs-idct-arm64-20261015.md)。
 - [x] Task 5A1 OHOS目标执行子步骤：同一已审查最终ELF及官方SDK C++库在手机/PC各完成9项IDCT聚焦+6项full/type-1精确消费者，14条命令共30次通过且host/独有guest退出均0；两端28,800块差分及前后产物身份经root核对。权限观察与脚本空格误拒的先前失败保留，不代表性能、完整MVS、HAP或真实Mac会话完成，见[IDCT验证](../../validation/mvs-idct-arm64-20261015.md)。
+- [x] Task 5A2 色彩/像素源码/宿主/最终ELF子步骤：2026-10-15 默认关闭的ARM64小端NEON色彩和RGB/BGRX/u32路径接入full/type-1/surface；原标量oracle与默认分配策略保持，完整色域与mode-4全域、default/colors各519及aggregate522项回归通过，最终ELF/四个叶函数独立Spec/Quality通过。目标执行见下一行；完整整管线差分、性能、HAP/应用及真实Mac仍OPEN，见[色彩/像素验证](../../validation/mvs-pixels-arm64-20261015.md)。
+- [x] Task 5A2 OHOS目标执行子步骤：同一最终aggregate ELF在手机/PC各完成14项像素+3项精确消费者，8条命令共34次通过执行且实际host/独有guest退出均0；两端完整色域/mode-4与前后产物身份经root独立复核。CLI范围之外的完整MVS、性能、HAP/应用和真实会话仍OPEN，见[色彩/像素验证](../../validation/mvs-pixels-arm64-20261015.md)。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
 - [ ] 授权Mac完成真实认证、首帧、持续更新、输入、重连；音频/剪贴板只报告已实现并验证的能力。
 - [ ] 跑Windows/macOS/Linux相关回归及包检查，记录本轮没有真机的平台。

@@ -21,6 +21,7 @@ pub mod media_transport;
 pub mod mvs;
 pub mod mvs_bitstream;
 pub mod mvs_full;
+mod mvs_pixels;
 pub mod mvs_stream;
 pub mod mvs_wire;
 mod network_reader;

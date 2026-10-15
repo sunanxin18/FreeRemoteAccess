@@ -6,6 +6,8 @@ edition = "2021"
 [features]
 mvs-profile = []
 mvs-native-idct-arm64 = []
+mvs-native-colors-arm64 = []
+mvs-native-arm64 = ["mvs-native-idct-arm64", "mvs-native-colors-arm64"]
 
 [dependencies]
 anyhow = "1"

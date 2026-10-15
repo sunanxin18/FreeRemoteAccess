@@ -1380,12 +1380,7 @@ fn run_partial_idct_scratch(
         .context("MVS type-1 Cb IDCT scratch 失败")?;
     let cr = inverse_dct_8x8(&coefficients.cr, &tables.chrominance)
         .context("MVS type-1 Cr IDCT scratch 失败")?;
-    let mut scratch = [0u8; TILE_EDGE * TILE_EDGE * RGB_CHANNELS];
-    for index in 0..TILE_EDGE * TILE_EDGE {
-        let color = ycbcr_8_to_rgb(y[index], cb[index], cr[index]);
-        let offset = index * RGB_CHANNELS;
-        scratch[offset..offset + RGB_CHANNELS].copy_from_slice(&color);
-    }
+    let scratch = crate::mvs_pixels::tile_rgb(&y, &cb, &cr);
     record_partial_order_event(PartialOrderEvent::IdctScratch);
     Ok(scratch)
 }
@@ -1916,14 +1911,13 @@ fn render_mode_five_tile(
     let cr = inverse_dct_8x8(&coefficients.cr, &tables.chrominance)
         .context("MVS mode 5 Cr IDCT 失败")?;
 
-    for dy in 0..TILE_EDGE {
-        for dx in 0..TILE_EDGE {
-            let logical = dy * TILE_EDGE + dx;
-            let color = ycbcr_8_to_rgb(y[logical], cb[logical], cr[logical]);
-            if tile_x + dx < width && tile_y + dy < height {
-                write_pixel(rgb, width, tile_x + dx, tile_y + dy, color);
-            }
-        }
+    let tile = crate::mvs_pixels::tile_rgb(&y, &cb, &cr);
+    for dy in 0..TILE_EDGE.min(height - tile_y) {
+        let row_bytes = TILE_EDGE.min(width - tile_x) * RGB_CHANNELS;
+        let source = dy * TILE_EDGE * RGB_CHANNELS;
+        let destination = pixel_offset(width, tile_x, tile_y + dy);
+        rgb[destination..destination + row_bytes]
+            .copy_from_slice(&tile[source..source + row_bytes]);
     }
     Ok(())
 }
@@ -2326,6 +2320,18 @@ fn ycbcr_20_to_rgb(y: u8, cb_six: u8, cr_six: u8) -> [u8; 3] {
 }
 
 fn ycbcr_8_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    #[cfg(not(feature = "mvs-native-colors-arm64"))]
+    {
+        ycbcr_8_to_rgb_scalar(y, cb, cr)
+    }
+    #[cfg(all(feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+    {
+        crate::mvs_pixels::single_rgb(y, cb, cr)
+    }
+}
+
+#[cfg(any(test, not(feature = "mvs-native-colors-arm64")))]
+pub(crate) fn ycbcr_8_to_rgb_scalar(y: u8, cb: u8, cr: u8) -> [u8; 3] {
     let y = i32::from(y);
     let cb = i32::from(cb) - 128;
     let cr = i32::from(cr) - 128;
@@ -2339,6 +2345,7 @@ fn ycbcr_8_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
     ]
 }
 
+#[cfg(any(test, not(feature = "mvs-native-colors-arm64")))]
 fn clamp_channel(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
@@ -2933,6 +2940,27 @@ mod tests {
         assert_eq!(
             pixel(MvsFullDecoder::decoded(&prepared), 0, 0),
             [142, 123, 117]
+        );
+    }
+
+    #[test]
+    fn pixels_mode_four_domain_matches_unchanged_scalar() {
+        let step = if cfg!(debug_assertions) { 17 } else { 1 };
+        let mut count = 0;
+        for y in (0..=255u8).step_by(step) {
+            for cb in 0..64u8 {
+                for cr in 0..64u8 {
+                    assert_eq!(
+                        ycbcr_20_to_rgb(y, cb, cr),
+                        ycbcr_8_to_rgb_scalar(y, cb << 2, cr << 2)
+                    );
+                    count += 1;
+                }
+            }
+        }
+        eprintln!(
+            "mode4 triples={count} exhaustive={}",
+            !cfg!(debug_assertions)
         );
     }
 

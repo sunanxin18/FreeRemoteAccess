@@ -1146,16 +1146,25 @@ fn prepare_type_zero_patch(
     let mut bgrx = Vec::new();
     bgrx.try_reserve_exact(byte_count)
         .context("MVS type-0 BGRX payload 分配失败")?;
-    let mut contains_nonblack = false;
-    for rgb in decoded.rgb.chunks_exact(mvs::MVS_RGB_CHANNEL_BYTES) {
-        contains_nonblack |= rgb.iter().any(|component| *component != 0);
-        bgrx.extend_from_slice(&[
-            rgb[mvs::MVS_RGB_BLUE_OFFSET],
-            rgb[mvs::MVS_RGB_GREEN_OFFSET],
-            rgb[mvs::MVS_RGB_RED_OFFSET],
-            0,
-        ]);
-    }
+    #[cfg(not(feature = "mvs-native-colors-arm64"))]
+    let contains_nonblack = {
+        let mut contains_nonblack = false;
+        for rgb in decoded.rgb.chunks_exact(mvs::MVS_RGB_CHANNEL_BYTES) {
+            contains_nonblack |= rgb.iter().any(|component| *component != 0);
+            bgrx.extend_from_slice(&[
+                rgb[mvs::MVS_RGB_BLUE_OFFSET],
+                rgb[mvs::MVS_RGB_GREEN_OFFSET],
+                rgb[mvs::MVS_RGB_RED_OFFSET],
+                0,
+            ]);
+        }
+        contains_nonblack
+    };
+    #[cfg(feature = "mvs-native-colors-arm64")]
+    let contains_nonblack = {
+        bgrx.resize(byte_count, 0);
+        crate::mvs_pixels::rgb_to_bgrx(&decoded.rgb, &mut bgrx)
+    };
     debug_assert_eq!(bgrx.len(), byte_count);
     Ok(PreparedTypeZeroPublication {
         patch: PixelPatch {
@@ -1190,15 +1199,10 @@ fn apply_validated_bgrx_patch_to_framebuffer(framebuffer: &mut Framebuffer, patc
         let source_row = row * patch.stride_bytes as usize;
         let destination_row =
             (patch.rect.y as usize + row) * framebuffer.width + patch.rect.x as usize;
-        for column in 0..width {
-            let source_pixel = source_row + column * 4;
-            framebuffer.pixels_mut()[destination_row + column] = u32::from_le_bytes([
-                source[source_pixel],
-                source[source_pixel + 1],
-                source[source_pixel + 2],
-                source[source_pixel + 3],
-            ]);
-        }
+        crate::mvs_pixels::bytes_to_words(
+            &source[source_row..source_row + width * 4],
+            &mut framebuffer.pixels_mut()[destination_row..destination_row + width],
+        );
     }
 }
 
@@ -1568,13 +1572,10 @@ fn fill_type_one_patches_from_committed_surface(
         for row in patch.rect.y as usize..bottom as usize {
             let start = row * framebuffer.width + patch.rect.x as usize;
             let destination_row = (row - patch.rect.y as usize) * patch.stride_bytes as usize;
-            for (column, pixel) in framebuffer.pixels()[start..start + patch.rect.width as usize]
-                .iter()
-                .enumerate()
-            {
-                let destination = destination_row + column * 4;
-                patch.pixels[destination..destination + 4].copy_from_slice(&pixel.to_le_bytes());
-            }
+            crate::mvs_pixels::words_to_bytes(
+                &framebuffer.pixels()[start..start + patch.rect.width as usize],
+                &mut patch.pixels[destination_row..destination_row + patch.stride_bytes as usize],
+            );
         }
         plan.completed.push(PixelPatch {
             rect: patch.rect,
@@ -1607,14 +1608,12 @@ fn apply_validated_partial_pixels_to_framebuffer(
                 debug_assert!(*x + *width <= framebuffer.width);
                 debug_assert!(*y + *height <= framebuffer.height);
                 for row in 0..*height {
-                    for column in 0..*width {
-                        let source = (row * *width + column) * mvs::MVS_RGB_CHANNEL_BYTES;
-                        let destination = (*y + row) * framebuffer.width + *x + column;
-                        let red = u32::from(rgb[source + mvs::MVS_RGB_RED_OFFSET]);
-                        let green = u32::from(rgb[source + mvs::MVS_RGB_GREEN_OFFSET]);
-                        let blue = u32::from(rgb[source + mvs::MVS_RGB_BLUE_OFFSET]);
-                        framebuffer.pixels_mut()[destination] = (red << 16) | (green << 8) | blue;
-                    }
+                    let source = row * *width * mvs::MVS_RGB_CHANNEL_BYTES;
+                    let destination = (*y + row) * framebuffer.width + *x;
+                    crate::mvs_pixels::rgb_to_words(
+                        &rgb[source..source + *width * mvs::MVS_RGB_CHANNEL_BYTES],
+                        &mut framebuffer.pixels_mut()[destination..destination + *width],
+                    );
                 }
             }
             PartialPixelOperation::Copy {
@@ -6497,5 +6496,104 @@ mod migrated_runtime_tests {
         );
         assert_ne!(requests.last_full_request, Some(last_full_request));
         writer.shutdown().unwrap();
+    }
+    #[test]
+    fn pixels_type_zero_tail_nonblack_offset_rows_and_raw_high_byte() {
+        let rect = MvsRect {
+            x: 2,
+            y: 1,
+            width: 9,
+            height: 2,
+        };
+        let mut rgb = vec![0; 9 * 2 * 3];
+        rgb[51..].copy_from_slice(&[0x11, 0x22, 0x33]);
+        let decoded = crate::mvs_full::DecodedMvsRect {
+            width: 9,
+            height: 2,
+            rgb,
+        };
+        let mut prepared = prepare_type_zero_patch(&decoded, rect).unwrap();
+        assert!(prepared.contains_nonblack);
+        assert_eq!(
+            &prepared.patch.pixels.as_bytes()[68..],
+            &[0x33, 0x22, 0x11, 0]
+        );
+        let mut bytes = prepared.patch.pixels.as_bytes().to_vec();
+        bytes[3] = 0xa7;
+        bytes[71] = 0xb9;
+        prepared.patch.pixels = PixelBuffer::new(bytes);
+        let mut framebuffer = Framebuffer::new(13, 4).unwrap();
+        framebuffer.pixels_mut().fill(0xdeadbeef);
+        apply_validated_bgrx_patch_to_framebuffer(&mut framebuffer, &prepared.patch);
+        for row in 0..4 {
+            for column in 0..13 {
+                let expected = match (row, column) {
+                    (1, 2) => 0xa7000000,
+                    (2, 10) => 0xb9112233,
+                    (1..=2, 2..=10) => 0,
+                    _ => 0xdeadbeef,
+                };
+                assert_eq!(framebuffer.pixels()[row * 13 + column], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn pixels_type_one_replace_tail_and_copy_keep_order_stride_high_byte() {
+        use crate::mvs_full::{PartialPixelOperation, PreparedPartialPixels};
+        let mut framebuffer = Framebuffer::new(13, 5).unwrap();
+        framebuffer.pixels_mut().fill(0xab345678);
+        let rgb: Vec<u8> = (0..30).map(|x| (x * 7 + 1) as u8).collect();
+        let partial = PreparedPartialPixels {
+            operations: vec![
+                PartialPixelOperation::Replace {
+                    x: 3,
+                    y: 1,
+                    width: 5,
+                    height: 2,
+                    rgb: rgb.clone(),
+                },
+                PartialPixelOperation::Copy {
+                    source_x: 2,
+                    source_y: 1,
+                    destination_x: 3,
+                    destination_y: 2,
+                    width: 6,
+                    height: 2,
+                },
+            ],
+        };
+        validate_partial_pixels_for_framebuffer(&framebuffer, &partial).unwrap();
+        let plan = plan_type_one_patches(&framebuffer, &partial).unwrap();
+        let mut expected = framebuffer.pixels().to_vec();
+        for row in 0..2 {
+            for column in 0..5 {
+                let src = (row * 5 + column) * 3;
+                expected[(row + 1) * 13 + column + 3] =
+                    u32::from_le_bytes([rgb[src + 2], rgb[src + 1], rgb[src], 0]);
+            }
+        }
+        let copy_source = expected.clone();
+        for row in 0..2 {
+            expected[(row + 2) * 13 + 3..(row + 2) * 13 + 9]
+                .copy_from_slice(&copy_source[(row + 1) * 13 + 2..(row + 1) * 13 + 8]);
+        }
+        apply_validated_partial_pixels_to_framebuffer(&mut framebuffer, &partial);
+        assert_eq!(framebuffer.pixels(), expected);
+        let patches = fill_type_one_patches_from_committed_surface(&framebuffer, plan);
+        assert!(!patches.is_empty());
+        for patch in patches {
+            for row in 0..patch.rect.height as usize {
+                for column in 0..patch.rect.width as usize {
+                    let word = expected
+                        [(patch.rect.y as usize + row) * 13 + patch.rect.x as usize + column];
+                    let offset = row * patch.stride_bytes as usize + column * 4;
+                    assert_eq!(
+                        &patch.pixels.as_bytes()[offset..offset + 4],
+                        &word.to_le_bytes()
+                    );
+                }
+            }
+        }
     }
 }

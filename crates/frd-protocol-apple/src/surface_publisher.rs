@@ -146,6 +146,8 @@ impl DisplaySurface {
             .and_then(|stride| stride.checked_mul(rect.height as usize))
             .context("Apple surface dirty payload 溢出")?;
         let mut bytes = Vec::with_capacity(byte_count);
+        #[cfg(feature = "mvs-native-colors-arm64")]
+        bytes.resize(byte_count, 0);
         let surface_width = self.width();
         let x = rect.x as usize;
         let width = rect.width as usize;
@@ -154,8 +156,17 @@ impl DisplaySurface {
                 .checked_mul(surface_width)
                 .and_then(|offset| offset.checked_add(x))
                 .context("Apple surface dirty row 溢出")?;
+            #[cfg(not(feature = "mvs-native-colors-arm64"))]
             for pixel in &self.framebuffer.pixels()[start..start + width] {
                 bytes.extend_from_slice(&pixel.to_le_bytes());
+            }
+            #[cfg(feature = "mvs-native-colors-arm64")]
+            {
+                let destination = (row - rect.y as usize) * stride_bytes as usize;
+                crate::mvs_pixels::words_to_bytes(
+                    &self.framebuffer.pixels()[start..start + width],
+                    &mut bytes[destination..destination + stride_bytes as usize],
+                );
             }
         }
         Ok(PixelPatch {
@@ -627,14 +638,12 @@ pub(crate) fn apply_rgb_rect_for_generation(
     }
     let surface_width = surface.width();
     for row in 0..height {
-        for column in 0..width {
-            let source = (row * width + column) * 3;
-            let destination = (y + row) * surface_width + x + column;
-            let red = u32::from(rgb[source]);
-            let green = u32::from(rgb[source + 1]);
-            let blue = u32::from(rgb[source + 2]);
-            surface.pixels_mut()[destination] = (red << 16) | (green << 8) | blue;
-        }
+        let source = row * width * 3;
+        let destination = (y + row) * surface_width + x;
+        crate::mvs_pixels::rgb_to_words(
+            &rgb[source..source + width * 3],
+            &mut surface.pixels_mut()[destination..destination + width],
+        );
     }
     Ok(true)
 }
@@ -1943,5 +1952,40 @@ mod tests {
                 .unwrap(),
             PublicationOutcome::NeedsFullBaseline
         );
+    }
+    #[test]
+    fn pixels_surface_patch_crop_and_full_preserve_high_byte_and_tails() {
+        let mut surface = DisplaySurface::new(7, PixelSize::new(13, 4).unwrap()).unwrap();
+        for (index, word) in surface.pixels_mut().iter_mut().enumerate() {
+            *word = 0xb9000000 | (index as u32 * 0x010307);
+        }
+        for rect in [
+            PixelRect {
+                x: 2,
+                y: 1,
+                width: 9,
+                height: 2,
+            },
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 13,
+                height: 4,
+            },
+        ] {
+            let patch = surface.bgrx_patch(rect).unwrap();
+            assert_eq!(patch.stride_bytes, rect.width * 4);
+            assert_eq!(patch.pixels.len(), (rect.width * rect.height * 4) as usize);
+            for row in 0..rect.height as usize {
+                for column in 0..rect.width as usize {
+                    let index = (rect.y as usize + row) * 13 + rect.x as usize + column;
+                    let offset = (row * rect.width as usize + column) * 4;
+                    assert_eq!(
+                        &patch.pixels.as_bytes()[offset..offset + 4],
+                        &surface.framebuffer.pixels()[index].to_le_bytes()
+                    );
+                }
+            }
+        }
     }
 }
