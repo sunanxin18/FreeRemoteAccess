@@ -329,12 +329,19 @@ fn offscreen_smaller_replacement_keeps_old_background_restore_geometry() {
     assert_eq!(image.data(), background);
 }
 // 只在此 lib-test 二进制生效；失败条件为当前测试线程的精确一次尺寸，不影响其他线程。
+#[cfg(not(frd_decoded_coverage_optional_allocator))]
 struct CursorTestAllocator;
 std::thread_local! { static FAIL_CURSOR_ALLOCATION:std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
-fn allocation_is_denied(size: usize) -> bool {
+pub(super) fn fail_allocation(size: usize) {
+    FAIL_CURSOR_ALLOCATION.with(|v| v.set(size));
+}
+pub(super) fn allocation_failure_size() -> usize {
+    FAIL_CURSOR_ALLOCATION.with(|v| v.get())
+}
+pub(super) fn allocation_is_denied(size: usize) -> bool {
     FAIL_CURSOR_ALLOCATION
         .try_with(|v| {
-            if v.get() == size {
+            if v.get() != 0 && v.get() == size {
                 v.set(0);
                 true
             } else {
@@ -343,6 +350,7 @@ fn allocation_is_denied(size: usize) -> bool {
         })
         .unwrap_or(false)
 }
+#[cfg(not(frd_decoded_coverage_optional_allocator))]
 unsafe impl std::alloc::GlobalAlloc for CursorTestAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         if allocation_is_denied(layout.size()) {
@@ -360,6 +368,7 @@ unsafe impl std::alloc::GlobalAlloc for CursorTestAllocator {
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
     }
 }
+#[cfg(not(frd_decoded_coverage_optional_allocator))]
 #[global_allocator]
 static CURSOR_TEST_ALLOCATOR: CursorTestAllocator = CursorTestAllocator;
 #[test]
@@ -375,10 +384,10 @@ fn native_backbuffer_reserve_failure_preserves_image_position_shape_and_backgrou
     let new = pointer(17, 4, 0, 0);
     let before = format!("{image:?}");
     clear_calls();
-    FAIL_CURSOR_ALLOCATION.with(|v| v.set(17 * 4 * 4));
+    fail_allocation(17 * 4 * 4);
     let err = image.update_pointer_with_kernels(new, Some(&k)).unwrap_err();
     assert_eq!(
-        FAIL_CURSOR_ALLOCATION.with(|v| v.get()),
+        allocation_failure_size(),
         0,
         "实际 try_reserve 尺寸必须命中"
     );

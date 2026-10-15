@@ -41,6 +41,8 @@ unsafe impl GlobalAlloc for ProbeAllocator {
                 }
             })
             .unwrap_or(false);
+        #[cfg(frd_decoded_coverage_optional_allocator)]
+        let fail = fail || crate::image::coverage_allocation_is_denied(layout.size());
         if fail {
             core::ptr::null_mut()
         } else {
@@ -67,6 +69,8 @@ unsafe impl GlobalAlloc for ProbeAllocator {
                 }
             })
             .unwrap_or(false);
+        #[cfg(frd_decoded_coverage_optional_allocator)]
+        let fail = fail || crate::image::coverage_allocation_is_denied(size);
         if fail {
             core::ptr::null_mut()
         } else {

@@ -869,6 +869,7 @@ fn fallible_receipt_and_rectangle_reserve_fail_before_content_or_cursor_begin() 
         };
         crate::coverage_fail(size);
         let result = p.process_bitmap_update_collected(&mut im, update, &mut c);
+        assert_eq!(crate::coverage_failure_size(), 0, "实际 reserve 必须消费分配失败注入");
         crate::coverage_fail(0);
         let e = result.unwrap_err();
         let source = e.source().unwrap().downcast_ref::<CoverageError>().unwrap();
