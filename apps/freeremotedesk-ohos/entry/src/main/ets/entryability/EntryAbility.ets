@@ -8,6 +8,9 @@ import { PhoneOrientation, PhoneOrientationPolicy, PHONE_SESSION_ORIENTATION_EVE
 export default class EntryAbility extends UIAbility {
   private mainWindow?: window.Window;
   private contentReady: boolean = false;
+  private foreground: boolean = false;
+  private windowActive: boolean = true;
+  private publishActive(): void { AppStorage.setOrCreate('frd_window_active', this.foreground && this.windowActive); }
   private desktop: boolean = deviceInfo.deviceType === '2in1' || deviceInfo.deviceType === 'pc';
   private lastInsets: string = '';
   private phoneOrientation: PhoneOrientationPolicy = new PhoneOrientationPolicy();
@@ -46,8 +49,8 @@ export default class EntryAbility extends UIAbility {
   private updateChrome(): void {
     if (!this.mainWindow || !this.contentReady || !this.desktop) { return; }
     // UIContent 加载后按设备模式调用；首次布局前 button rect 可以暂时为零。
-    try { this.mainWindow.setWindowDecorVisible(false); } catch (e) { this.windowError('hide', e as BusinessError); }
-    try { this.mainWindow.setWindowDecorHeight(56); } catch (e) { this.windowError('height', e as BusinessError); }
+    // 会话动作改由右下浮动岛承载；系统标题栏保留原生三键、拖动和系统菜单。
+    try { this.mainWindow.setWindowDecorVisible(true); } catch (e) { this.windowError('decor', e as BusinessError); }
     try { this.mainWindow.setWindowTitleMoveEnabled(true); } catch (e) { this.windowError('move', e as BusinessError); }
     try {
       const visible = this.mainWindow.getWindowDecorVisible();
@@ -91,11 +94,13 @@ export default class EntryAbility extends UIAbility {
     AppStorage.setOrCreate('frd_cutout_top', 0); AppStorage.setOrCreate('frd_cutout_bottom', 0);
     AppStorage.setOrCreate('frd_native_buttons_width', 0);
     AppStorage.setOrCreate('frd_native_chrome', false);
+    AppStorage.setOrCreate('frd_window_active', false);
   }
   onWindowStageCreate(windowStage: window.WindowStage): void {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
       this.mainWindow = windowStage.getMainWindowSync();
+      this.windowActive = true; this.publishActive();
       if (deviceInfo.deviceType === 'phone') {
         this.phoneOrientation.attachWindow();
         try {
@@ -111,8 +116,8 @@ export default class EntryAbility extends UIAbility {
       this.mainWindow.on('avoidAreaChange', () => { native.appFocus(false, false, false); this.updateCutout(); });
       this.mainWindow.on('windowSizeChange', () => { native.appFocus(false, false, false); this.updateCutout(); });
       this.mainWindow.on('windowEvent', (event: window.WindowEventType) => {
-        if (event === window.WindowEventType.WINDOW_ACTIVE) { this.updateChrome(); }
-        if (event === window.WindowEventType.WINDOW_INACTIVE) { native.appFocus(false, false, false); }
+        if (event === window.WindowEventType.WINDOW_ACTIVE) { this.windowActive = true; this.publishActive(); this.updateChrome(); }
+        if (event === window.WindowEventType.WINDOW_INACTIVE) { this.windowActive = false; this.publishActive(); native.appFocus(false, false, false); }
       });
       windowStage.loadContent('pages/Index', (error) => {
         if (error.code) { hilog.error(0xFF00, 'FrdOhos', '页面加载失败：%{public}d', error.code); return; }
@@ -128,9 +133,10 @@ export default class EntryAbility extends UIAbility {
       hilog.error(0xFF00, 'FrdOhos', '窗口初始化失败');
     }
   }
-  onForeground(): void { native.setForeground(true); hilog.info(0xFF00, 'FrdOhos', '前台恢复'); }
-  onBackground(): void { native.setForeground(false); hilog.info(0xFF00, 'FrdOhos', '后台暂停'); }
+  onForeground(): void { this.foreground = true; this.publishActive(); native.setForeground(true); hilog.info(0xFF00, 'FrdOhos', '前台恢复'); }
+  onBackground(): void { this.foreground = false; this.publishActive(); native.setForeground(false); hilog.info(0xFF00, 'FrdOhos', '后台暂停'); }
   onWindowStageDestroy(): void {
+    this.windowActive = false; this.publishActive();
     this.phoneOrientation.detachWindow();
     this.orientationAvailable = false;
     native.setForeground(false);
@@ -142,6 +148,7 @@ export default class EntryAbility extends UIAbility {
     this.mainWindow = undefined;
   }
   onDestroy(): void {
+    this.foreground = false; this.publishActive();
     if (deviceInfo.deviceType === 'phone') {
       this.context.eventHub.off(PHONE_SESSION_ORIENTATION_EVENT, this.sessionOrientationChanged);
     }

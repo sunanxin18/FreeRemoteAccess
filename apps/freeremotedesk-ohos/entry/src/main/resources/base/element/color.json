@@ -15,6 +15,14 @@
     {
       "name": "surface",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "island_background",
+      "value": "#F5F5F7"
+    },
+    {
+      "name": "island_border",
+      "value": "#6674818F"
     }
   ]
 }

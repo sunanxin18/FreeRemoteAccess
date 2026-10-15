@@ -58,24 +58,84 @@ pub struct InputAdapter {
     focused: bool,
     foreground: bool,
     remote_owned: bool,
-    quarantined_keys: std::collections::BTreeSet<u16>,
+    quarantined_keys: std::collections::BTreeMap<u16, (u64, u64)>,
     quarantined_buttons: bool,
     owned_epoch: Option<(u64, u64, u64)>,
     last_pointer: Option<PixelPoint>,
-    held_keys: std::collections::BTreeSet<u16>,
+    held_keys: std::collections::BTreeMap<u16, (u64, u64)>,
     held_buttons: frd_core::PointerButtons,
 }
 impl InputAdapter {
-    /// 门关闭时仍消费本地物理释放，避免恢复后全新按键误留在隔离集。
-    pub fn observe_blocked(&mut self, event: &InputEvent) {
-        if let InputEvent::PhysicalKey { code, state, .. } = event {
-            let code = code.usb_hid_usage();
-            if *state == frd_core::KeyState::Released {
-                self.quarantined_keys.remove(&code);
-                self.held_keys.remove(&code);
+    /// 只按实际 Down 的会话来源清隔离，不使用当前画面几何或焦点。
+    /// 返回 true 表示已在本地消费；绝不产生远端按键，也不删除其它来源的同码状态。
+    pub fn consume_quarantined_release(
+        &mut self,
+        session: u64,
+        generation: u64,
+        event: &InputEvent,
+    ) -> bool {
+        let InputEvent::PhysicalKey {
+            code,
+            state: frd_core::KeyState::Released,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        let code = code.usb_hid_usage();
+        if self.quarantined_keys.get(&code) != Some(&(session, generation)) {
+            return false;
+        }
+        self.quarantined_keys.remove(&code);
+        true
+    }
+    /// 已接受的 Up 遇到屏障仍须消费。若匹配的 Down 尚未转隔离，先安全释放。
+    /// 旧来源不得释放当前新会话；ReleaseAll 仍使用 controller 的正常会话门。
+    pub fn discard_released(
+        &mut self,
+        c: &AppController,
+        session: u64,
+        generation: u64,
+        event: &InputEvent,
+    ) -> Option<SessionCommand> {
+        let InputEvent::PhysicalKey {
+            code,
+            state: frd_core::KeyState::Released,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let code = code.usb_hid_usage();
+        let origin = (session, generation);
+        let release = if self.held_keys.get(&code) == Some(&origin) {
+            if c.interactive_input_epoch().map(|(s, g)| (s.get(), g)) == Some(origin) {
+                self.release(c)
             } else {
-                self.quarantined_keys.insert(code);
+                self.held_keys.remove(&code);
+                self.quarantined_keys.entry(code).or_insert(origin);
+                None
             }
+        } else {
+            None
+        };
+        self.consume_quarantined_release(session, generation, event);
+        release
+    }
+    /// Owner 已核对当前 session/generation 后，门关闭时只记录本地隔离，不发输入。
+    pub fn observe_blocked(&mut self, session: u64, generation: u64, event: &InputEvent) {
+        if self.consume_quarantined_release(session, generation, event) {
+            return;
+        }
+        if let InputEvent::PhysicalKey {
+            code,
+            state: frd_core::KeyState::Pressed,
+            ..
+        } = event
+        {
+            self.quarantined_keys
+                .entry(code.usb_hid_usage())
+                .or_insert((session, generation));
         }
     }
     pub fn observe_blocked_pointer(&mut self, buttons: frd_core::PointerButtons) {
@@ -89,7 +149,9 @@ impl InputAdapter {
         c.route_input(InputEvent::ReleaseAll)
     }
     fn quarantine_owned(&mut self) {
-        self.quarantined_keys.append(&mut self.held_keys);
+        for (code, origin) in std::mem::take(&mut self.held_keys) {
+            self.quarantined_keys.entry(code).or_insert(origin);
+        }
         self.quarantined_buttons |= self.held_buttons.any_pressed();
         self.held_buttons = frd_core::PointerButtons::default();
         self.last_pointer = None;
@@ -186,11 +248,14 @@ impl InputAdapter {
         event: InputEvent,
         _pressed: bool,
     ) -> Option<SessionCommand> {
+        if self.consume_quarantined_release(session, generation, &event) {
+            return None;
+        }
         if revision != self.revision
             || c.interactive_input_epoch().map(|(s, g)| (s.get(), g)) != Some((session, generation))
             || self.viewport().is_none()
         {
-            return None;
+            return self.discard_released(c, session, generation, &event);
         }
         let epoch = (session, generation, revision);
         if self.owned_epoch != Some(epoch) {
@@ -202,20 +267,22 @@ impl InputAdapter {
             InputEvent::PhysicalKey { code, state, .. } => {
                 let code = code.usb_hid_usage();
                 if *state == frd_core::KeyState::Released {
-                    self.held_keys.remove(&code);
-                    if self.quarantined_keys.remove(&code) {
+                    if self.held_keys.get(&code) != Some(&(session, generation)) {
                         return None;
                     }
+                    self.held_keys.remove(&code);
                 } else {
                     // 旧物理按键的重复不重放；只隔离该键，不阻塞其他键/文本/指针。
                     if !enabled {
-                        self.quarantined_keys.insert(code);
+                        self.quarantined_keys
+                            .entry(code)
+                            .or_insert((session, generation));
                         return None;
                     }
-                    if self.quarantined_keys.contains(&code) {
+                    if self.quarantined_keys.contains_key(&code) {
                         return None;
                     }
-                    self.held_keys.insert(code);
+                    self.held_keys.insert(code, (session, generation));
                 }
             }
             InputEvent::PointerSample(sample) => {
@@ -474,7 +541,7 @@ mod tests {
         }
     }
     #[test]
-    fn missing_old_key_up_does_not_block_fresh_epoch_or_replay_old_repeat() {
+    fn old_key_quarantine_preserves_origin_without_blocking_other_fresh_keys() {
         let (c, mut i, s) = active_fixture();
         let revision = i.revision;
         assert!(i
@@ -547,6 +614,28 @@ mod tests {
                 false
             )
             .is_none());
+        // 新会话伪装的 Up 不能解除旧来源；壳必须保留并使用原 Down 来源送真实尾 Up。
+        assert_eq!(i.quarantined_keys.get(&4), Some(&(s.get(), 7)));
+        assert!(i
+            .route(
+                &next,
+                next_session.get(),
+                7,
+                revision,
+                key(4, frd_core::KeyState::Pressed),
+                true
+            )
+            .is_none());
+        assert!(i
+            .route(
+                &next,
+                s.get(),
+                7,
+                revision,
+                key(4, frd_core::KeyState::Released),
+                false
+            )
+            .is_none());
         assert!(i
             .route(
                 &next,
@@ -557,6 +646,32 @@ mod tests {
                 true
             )
             .is_some());
+    }
+    #[test]
+    fn key_cleanup_checks_generation_and_cannot_clear_a_new_held_key() {
+        let (c, mut i, session) = active_fixture();
+        let up = key(4, frd_core::KeyState::Released);
+        assert!(i
+            .route(
+                &c,
+                session.get(),
+                7,
+                i.revision,
+                key(4, frd_core::KeyState::Pressed),
+                true
+            )
+            .is_some());
+        assert!(i.discard_released(&c, session.get(), 6, &up).is_none());
+        assert_eq!(i.held_keys.get(&4), Some(&(session.get(), 7)));
+        assert!(!i.consume_quarantined_release(session.get(), 7, &up));
+        i.release(&c);
+        assert!(!i.consume_quarantined_release(session.get(), 6, &up));
+        assert_eq!(i.quarantined_keys.get(&4), Some(&(session.get(), 7)));
+        // cleanup 不需要画面、当前几何或当前 focus，也不产生 SessionCommand。
+        i.geometry = None;
+        assert!(i.consume_quarantined_release(session.get(), 7, &up));
+        assert!(i.quarantined_keys.is_empty());
+        assert!(!i.consume_quarantined_release(session.get(), 7, &up));
     }
     #[test]
     fn blocked_local_release_clears_quarantine_before_fresh_press() {
@@ -600,12 +715,12 @@ mod tests {
                 Default::default()
             )
             .is_some());
-        i.observe_blocked(&key(4, frd_core::KeyState::Pressed));
-        assert!(i.quarantined_keys.contains(&4));
-        i.observe_blocked(&key(4, frd_core::KeyState::Released));
-        assert!(!i.quarantined_keys.contains(&4));
-        i.observe_blocked(&key(5, frd_core::KeyState::Pressed));
-        assert!(i.quarantined_keys.contains(&5));
+        i.observe_blocked(session.get(), 7, &key(4, frd_core::KeyState::Pressed));
+        assert!(i.quarantined_keys.contains_key(&4));
+        i.observe_blocked(session.get(), 7, &key(4, frd_core::KeyState::Released));
+        assert!(!i.quarantined_keys.contains_key(&4));
+        i.observe_blocked(session.get(), 7, &key(5, frd_core::KeyState::Pressed));
+        assert!(i.quarantined_keys.contains_key(&5));
     }
     #[test]
     fn clip_panzoom_nonfinite_and_edges_share_transform() {

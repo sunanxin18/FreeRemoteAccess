@@ -188,6 +188,8 @@ impl AppEngine {
                     catalog,
                     stores,
                     input: InputAdapter::default(),
+                    #[cfg(test)]
+                    sent_inputs: std::cell::RefCell::new(Vec::new()),
                     pending: BTreeMap::new(),
                     tx,
                     last_submit: 0,
@@ -481,6 +483,8 @@ struct Owner {
     catalog: ProtocolCatalog,
     stores: Stores,
     input: InputAdapter,
+    #[cfg(test)]
+    sent_inputs: std::cell::RefCell<Vec<frd_core::SessionInput>>,
     pending: BTreeMap<u64, PendingLoad>,
     tx: SyncSender<Command>,
     last_submit: u64,
@@ -512,6 +516,10 @@ impl Owner {
     }
     fn send(&self, c: Option<SessionCommand>) {
         if let Some(c) = c {
+            #[cfg(test)]
+            if let SessionCommand::Input(input) = &c {
+                self.sent_inputs.borrow_mut().push(input.clone());
+            }
             let _ = self.host.send_command(c);
         }
     }
@@ -592,6 +600,18 @@ impl Owner {
             Err(_) => self.notice = Some("当前操作不可用"),
         }
     }
+    // 已入队的真实 Up 即使被 control 屏障作废，也只清匹配来源的物理账本。
+    fn discard_input_release(&mut self, command: &Command) {
+        if let Command::Input(epoch, event, _) = command {
+            let release = self.input.discard_released(
+                &self.controller,
+                epoch.session,
+                epoch.generation,
+                event,
+            );
+            self.send(release);
+        }
+    }
     fn command(&mut self, c: Command) {
         self.apply_control();
         self.sync_presentation(false);
@@ -604,6 +624,7 @@ impl Owner {
                 || (!form_edit
                     && (revision != control / CONTROL_REVISION || control & CONTROL_MASK != 0))
             {
+                self.discard_input_release(&command);
                 return;
             }
             *command
@@ -619,6 +640,7 @@ impl Owner {
                     | Command::Persisted(..)
             )
         {
+            self.discard_input_release(&c);
             return;
         }
         match c {
@@ -727,8 +749,27 @@ impl Owner {
                 self.send(c)
             }
             Command::Input(e, event, pressed) => {
+                if self
+                    .input
+                    .consume_quarantined_release(e.session, e.generation, &event)
+                {
+                    return;
+                }
                 if !self.input_ready() {
-                    self.input.observe_blocked(&event);
+                    let release = self.input.discard_released(
+                        &self.controller,
+                        e.session,
+                        e.generation,
+                        &event,
+                    );
+                    self.send(release);
+                    // 未呈现时也不能让旧来源的 Down 污染当前隔离账本。
+                    if self.remote_epoch.map(|(s, g)| (s.get(), g))
+                        == Some((e.session, e.generation))
+                        && e.revision == self.input.revision
+                    {
+                        self.input.observe_blocked(e.session, e.generation, &event);
+                    }
                     return;
                 }
                 let c = self.input.route(
@@ -1315,6 +1356,7 @@ mod tests {
             catalog: ProtocolCatalog::new([]),
             stores,
             input: InputAdapter::default(),
+            sent_inputs: std::cell::RefCell::new(Vec::new()),
             pending: BTreeMap::new(),
             tx,
             last_submit: 0,
@@ -1919,6 +1961,300 @@ mod tests {
             Page::AwaitingFirstFrame { .. } | Page::RemoteSession { .. }
         ));
     }
+    fn key_event(hid: u16, down: bool) -> frd_core::InputEvent {
+        frd_core::InputEvent::PhysicalKey {
+            code: frd_core::PhysicalKeyCode::from_usb_hid_usage(hid),
+            state: if down {
+                frd_core::KeyState::Pressed
+            } else {
+                frd_core::KeyState::Released
+            },
+            modifiers: Default::default(),
+        }
+    }
+    fn key_command(epoch: InputEpoch, hid: u16, down: bool) -> Command {
+        Command::Input(epoch, key_event(hid, down), down)
+    }
+    fn key_owner() -> (Owner, InputEpoch, Arc<crate::presentation::Link>) {
+        let (mut o, session, link) = presentation_owner();
+        o.controller
+            .set_platform_capabilities(frd_platform_api::PlatformCapabilities {
+                text_input: true,
+                ..Default::default()
+            });
+        o.controller.set_product_policy(frd_app::ProductPolicy {
+            text_input: true,
+            ..Default::default()
+        });
+        o.controller.handle_session_event_with_stores(
+            session,
+            SessionEvent::CapabilitiesChanged(frd_protocol_api::SessionCapabilities {
+                text_input: true,
+                ..Default::default()
+            }),
+            o.stores.borrow(),
+        );
+        let presented_epoch = link.0.lock().unwrap().epoch().unwrap();
+        feedback(
+            &link,
+            presented_epoch,
+            frd_frame::FrameCompleteness::FullBaseline,
+        );
+        o.sync_presentation(false);
+        assert!(o.input_ready());
+        o.focus(true, true, true);
+        let epoch = InputEpoch {
+            session: session.get(),
+            generation: 1,
+            revision: o.input.revision,
+        };
+        (o, epoch, link)
+    }
+    fn key_engine(o: &Owner, capacity: usize) -> (AppEngine, mpsc::Receiver<Command>) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        (
+            AppEngine {
+                sender,
+                snapshot: Arc::new(Mutex::new(json!({}))),
+                control: o.control.clone(),
+                renderer: o.renderer.clone(),
+            },
+            receiver,
+        )
+    }
+    fn assert_key_sent(o: &Owner, hid: u16, down: bool) {
+        assert!(
+            o.sent_inputs
+                .borrow()
+                .iter()
+                .any(|input| input.event == key_event(hid, down)),
+            "必须实际通过 Owner 发出此按键状态"
+        );
+    }
+    fn present_key_owner(o: &mut Owner, link: &crate::presentation::Link) {
+        o.sync_presentation(false);
+        let epoch = link.0.lock().unwrap().epoch().unwrap();
+        feedback(link, epoch, frd_frame::FrameCompleteness::FullBaseline);
+        o.sync_presentation(false);
+        assert!(o.input_ready());
+    }
+    #[test]
+    fn key_cleanup_accepted_up_survives_a_later_focus_barrier() {
+        let (mut o, epoch, _) = key_owner();
+        let (e, rx) = key_engine(&o, 8);
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert_key_sent(&o, 4, true);
+        e.lose_focus();
+        e.send(key_command(epoch, 4, false)).unwrap();
+        e.lose_focus();
+        o.command(rx.recv().unwrap());
+        assert!(!o
+            .sent_inputs
+            .borrow()
+            .iter()
+            .any(|i| i.event == key_event(4, false)));
+        o.focus(true, true, true);
+        o.sent_inputs.borrow_mut().clear();
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert_key_sent(&o, 4, true);
+    }
+    #[test]
+    fn key_cleanup_accepted_up_survives_new_geometry_and_presentation() {
+        let (mut o, epoch, link) = key_owner();
+        let (e, rx) = key_engine(&o, 8);
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        let mut geometry = o.input.geometry.unwrap();
+        geometry.scale = 2.0;
+        e.send(Command::Geometry(geometry)).unwrap();
+        e.send(key_command(epoch, 4, false)).unwrap();
+        o.command(rx.recv().unwrap());
+        present_key_owner(&mut o, &link);
+        o.command(rx.recv().unwrap());
+        o.sent_inputs.borrow_mut().clear();
+        let current = InputEpoch {
+            revision: o.input.revision,
+            ..epoch
+        };
+        e.send(key_command(epoch, 5, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert!(o.sent_inputs.borrow().is_empty(), "旧几何 Down 仍拒绝");
+        e.send(key_command(current, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert_key_sent(&o, 4, true);
+    }
+    #[test]
+    fn key_cleanup_stale_epoch_up_does_not_clear_current_quarantine_when_unready() {
+        let (mut o, epoch, link) = key_owner();
+        let (e, rx) = key_engine(&o, 8);
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        o.focus(false, false, false);
+        o.ready = None;
+        let stale = InputEpoch {
+            session: frd_core::SessionId::allocate().get(),
+            ..epoch
+        };
+        e.send(key_command(stale, 4, false)).unwrap();
+        o.command(rx.recv().unwrap());
+        present_key_owner(&mut o, &link);
+        o.focus(true, true, true);
+        o.sent_inputs.borrow_mut().clear();
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert!(
+            o.sent_inputs.borrow().is_empty(),
+            "旧 epoch Up 不得解封仍按住的新键"
+        );
+        e.send(key_command(epoch, 4, false)).unwrap();
+        o.command(rx.recv().unwrap());
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert_key_sent(&o, 4, true);
+    }
+    #[test]
+    fn key_cleanup_old_origin_can_clear_only_its_own_cross_session_quarantine() {
+        let (mut old, old_epoch, _) = key_owner();
+        let (e, rx) = key_engine(&old, 8);
+        e.send(key_command(old_epoch, 4, true)).unwrap();
+        old.command(rx.recv().unwrap());
+        old.focus(false, false, false);
+        let (mut current, epoch, link) = key_owner();
+        current.input = std::mem::take(&mut old.input);
+        current.input.remote = Some(frd_core::PixelSize {
+            width: 2,
+            height: 2,
+        });
+        present_key_owner(&mut current, &link);
+        current.focus(true, true, true);
+        let (e2, rx2) = key_engine(&current, 8);
+        e2.send(key_command(old_epoch, 4, false)).unwrap();
+        current.command(rx2.recv().unwrap());
+        current.sent_inputs.borrow_mut().clear();
+        e2.send(key_command(epoch, 4, true)).unwrap();
+        current.command(rx2.recv().unwrap());
+        assert_key_sent(&current, 4, true);
+        current.focus(false, false, false);
+        current.ready = None;
+        e2.send(key_command(old_epoch, 4, false)).unwrap();
+        current.command(rx2.recv().unwrap());
+        present_key_owner(&mut current, &link);
+        current.focus(true, true, true);
+        current.sent_inputs.borrow_mut().clear();
+        e2.send(key_command(epoch, 4, true)).unwrap();
+        current.command(rx2.recv().unwrap());
+        assert!(
+            current.sent_inputs.borrow().is_empty(),
+            "旧来源不得清除新来源的隔离"
+        );
+    }
+    #[test]
+    fn key_cleanup_queue_full_is_not_accepted_and_explicit_retry_survives_barrier() {
+        let (mut o, epoch, _) = key_owner();
+        let (e, rx) = key_engine(&o, 1);
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        e.send(Command::Focus {
+            foreground: true,
+            focused: true,
+            remote: true,
+        })
+        .unwrap();
+        assert_eq!(e.send(key_command(epoch, 4, false)), Err(crate::QUEUE_FULL));
+        o.command(rx.recv().unwrap());
+        assert!(rx.try_recv().is_err(), "失败 Up 不得伪装已排入队列");
+        o.focus(true, true, true);
+        o.sent_inputs.borrow_mut().clear();
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert!(o.sent_inputs.borrow().is_empty(), "真实 Up 未重试前仍隔离");
+        e.send(key_command(epoch, 4, false)).unwrap();
+        e.lose_focus();
+        o.command(rx.recv().unwrap());
+        o.focus(true, true, true);
+        o.sent_inputs.borrow_mut().clear();
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert_key_sent(&o, 4, true);
+    }
+    #[test]
+    fn key_cleanup_form_barrier_releases_matching_held_before_discarding_up() {
+        let (mut o, epoch, _) = key_owner();
+        let (e, rx) = key_engine(&o, 8);
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        o.sent_inputs.borrow_mut().clear();
+        e.send(key_command(epoch, 4, false)).unwrap();
+        // FORM_INVALID 增加 control 代际但本身不转移焦点，覆盖尚 held 的清理分支。
+        signal(&o.control, FORM_INVALID);
+        o.command(rx.recv().unwrap());
+        assert_eq!(o.sent_inputs.borrow().len(), 1);
+        assert_eq!(
+            o.sent_inputs.borrow()[0].event,
+            frd_core::InputEvent::ReleaseAll
+        );
+        o.sent_inputs.borrow_mut().clear();
+        e.send(key_command(epoch, 4, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert_key_sent(&o, 4, true);
+    }
+    #[test]
+    fn key_cleanup_unready_old_down_cannot_quarantine_a_new_epoch_key() {
+        for old_generation in [false, true] {
+            let (mut o, epoch, link) = key_owner();
+            let (e, rx) = key_engine(&o, 8);
+            o.ready = None;
+            let stale = if old_generation {
+                InputEpoch {
+                    generation: epoch.generation + 1,
+                    ..epoch
+                }
+            } else {
+                InputEpoch {
+                    session: frd_core::SessionId::allocate().get(),
+                    ..epoch
+                }
+            };
+            e.send(key_command(stale, 4, true)).unwrap();
+            o.command(rx.recv().unwrap());
+            present_key_owner(&mut o, &link);
+            o.sent_inputs.borrow_mut().clear();
+            e.send(key_command(epoch, 4, true)).unwrap();
+            o.command(rx.recv().unwrap());
+            assert_key_sent(&o, 4, true);
+        }
+    }
+    #[test]
+    fn key_cleanup_normal_remote_down_up_and_local_new_down_keep_their_gates() {
+        let (mut o, epoch, _) = key_owner();
+        let (e, rx) = key_engine(&o, 8);
+        for down in [true, false] {
+            e.send(key_command(epoch, 4, down)).unwrap();
+            o.command(rx.recv().unwrap());
+        }
+        let sent = o.sent_inputs.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].event, key_event(4, true));
+        assert_eq!(sent[1].event, key_event(4, false));
+        drop(sent);
+        o.focus(false, false, false);
+        o.sent_inputs.borrow_mut().clear();
+        for down in [true, false] {
+            e.send(key_command(epoch, 5, down)).unwrap();
+            o.command(rx.recv().unwrap());
+        }
+        assert!(
+            o.sent_inputs.borrow().is_empty(),
+            "本地新 Down/Up 不进入远端"
+        );
+        o.focus(true, true, true);
+        e.send(key_command(epoch, 5, true)).unwrap();
+        o.command(rx.recv().unwrap());
+        assert_key_sent(&o, 5, true);
+    }
+
     #[test]
     fn emergency_barrier_rejects_queued_submit_focus_but_preserves_accepted_edit_and_new_geometry()
     {

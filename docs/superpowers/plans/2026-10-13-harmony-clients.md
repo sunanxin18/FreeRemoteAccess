@@ -170,3 +170,13 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] 手机登录前USER_ROTATION_PORTRAIT，真实page3+session成功后USER_ROTATION_LANDSCAPE一次，随后自动旋转；回登录竖屏，请求串行/窗口代际去重，PC和manifest保持。旧创建即横屏策略已取代。
 - [x] 新策略独立审查/11测试、普通双协议Release HAP构建签装、手机真实Windows登录后自动横屏、随后竖屏保持与断开回竖、五位端口完整显示已受限验证；历史包与当前包/PC边界分开记录，见[方向验证](../../validation/harmony-phone-orientation-20261015.md)。
 - [ ] 手机深色/最大字号复验、系统旋转锁切换、完整键盘/IME与真机方向验收。
+
+### 鸿蒙右下角会话浮动岛（2026-10-15 用户新增要求）
+
+规格见[会话浮动岛](../specs/2026-10-15-harmony-session-island.md)。用户明确选择Harmony局部覆盖，释放额外56vp产品工具条；手机/PC分别验证，其他平台不改。
+
+- [x] 独立shell策略/固定Material glyph、右下局部命中岛、全尺寸XComponent、PC原生chrome；本地/远程输入来源合同及主机回归通过（真实键盘/IME不由此完成）。
+- [x] 独立审查、实际普通双协议HAP/签后资源身份检查、两端安装、本地PC窗口与手机Windows会话/浮动岛/触控验证。
+- [ ] PC真实会话浮动岛、完整键盘/IME、复杂多点/拖动和真机；等待安全密码框手动输入不阻塞已完成源与包交付。
+
+2026-10-15 浮动岛最终源与包：右下局部Stack释放56vp工具条，PC原生chrome恢复。独立Spec/Quality通过，23岛策略+11方向、root完整FFI51通过/1既有ignored，实际Release BOTH构建签验/两端覆盖安装完成（signed1bdf2007、packagedFFI2b4cad31）。手机真实Windows/HUKS、深色、成功后横屏、相同2652×1158画面矩形、自动收起/详情保持/关闭后与隐藏后首触控/断开通过；PC最终正常窗口已观察，真实登录仍等安全框手动输入。native尾Up原来源跨控制/几何屏障的源合同修复不等于真实键盘/IME验收；菜单局部刷新与比例黑边保留为独立graphics/resolution问题。详见[最终浮动岛验证](../../validation/harmony-session-island-20261015.md)。全路线图仍未完成。
