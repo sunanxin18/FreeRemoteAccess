@@ -33,3 +33,18 @@ OHOS片consumer到测试ProtocolSession队列边界。后续独立RDP tests-only
 ReleaseAll只解除已记录按住状态，不同步或重置Caps/Num/Scroll锁态。现有RDP根据远端布局/锁态解释物理位置，Apple小键盘固定KP数字keysym；不能宣称本地LED同步、NumLock两态远端结果、国际布局或锁键长按正确。
 
 仍需分别验证PC实体键、手机外接键盘（若宣称支持）、真实编辑、进岛/回surface、旋转/后台/断连重连无卡键。正常系统IME的attach、自绘预编辑事务、唯一实时提交和正式键盘入口属后续串行工作；text仍不可用。本片不证明Mac真实登录、完整Harmony客户端或所有架构完成。
+
+
+## Apple 101 HID 真实 writer 消费回归（2026-10-15）
+
+Task5C1A补齐本记录此前明确OPEN的Apple消费边界。仅在原runtime.rs测试模块末尾增加include子模块及446行独立测试源，原112286字节的生产和全部旧测试可逐字重建相等；Cargo.lock及76项Apple/共享依赖清单保持，唯一已有文件变化为测试模块追加。没有修改产品协议、decoder、OHOS、平台能力或实际键盘广告。
+
+固定101 HID的plain/shift keysym逐项列出，来源为USB HID Usage Tables 1.5键盘页、libxkbcommon 1.7.0正式X11兼容头和RFC6143 KeyEvent/PointerEvent布局；期望不从生产映射或encoder生成。真实InputEvent经PointerWireState、AppleWriterHandle与实际writer线程发送到127.0.0.1:0 TCP，Standard直接比较字节，HP读出真实密文帧后沿用现有SessionCrypto打开plaintext并比较同一手写字节oracle。该inverse不构成新的独立密码学证明。
+
+两模式各5项，共10项：101键plain/shift Down/Up共808个KeyEvent；held/repeat使用首次keysym、孤立Up；ReleaseAll的按usage顺序KeyUp及完整pointer尾包；modifier元数据不合成事件、六实体modifier及主键盘/小键盘和锁键边界；unknown/Text不污染旁侧held。真实writer等待write_all结果，负断言只接受实际TCP限时无字节，额外包/EOF/其它错误失败。没有给Pause、国际/ISO、Meta或Text增加资格。
+
+绝对Rust1.96、offline/locked、独立target实际运行：聚焦10通过；完整默认Apple包550 unit通过、11项既有ignored，auth integration4和session integration1通过，doc0。包格式与include源单独rustfmt检查通过。无编译/测试失败；原audio_video_port_announcement_message dead-code warning保持，资料获取失败与后续成功hash均保存。
+
+独立审查为Spec PASS / Quality APPROVE，无Critical/Important；审查报告SHA256为2b6b8f7e687636e9658ad88523a7b2d8a83553927972c618cf07fd4f0a578806。root完整读取两报告/测试diff并核对76源、原Git对象及旧代码完整保持、两冻结源和36证据索引。新测试源SHA256为a48d8b0ecf214e694b823fef3caf28913ef4a40d781d9db95d1eabc3977a131a，runtime为18f8672c3b055485b991dd6d5a6348a7d8b5e0b78e64e2e330a5d9e3bdba1ba9；完整作者与root证据位于target/harmony-apple-key-consumer-20261015/。
+
+本项只关闭Apple有限US样式keysym到本地writer/TCP的宿主回归缺口。SessionCommand/Owner/generation准入、真实Mac登录/执行、非loopback送达、设备键盘、国际布局、系统锁态/LED和IME仍需独立验收；没有观察或操作正在填写的PC。鸿蒙系统IME焦点桥的未提交修正独立跟踪，不由本测试或本提交授予资格。

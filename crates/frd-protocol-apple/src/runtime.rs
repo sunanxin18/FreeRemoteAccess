@@ -2936,4 +2936,8 @@ mod tests {
         release_peer_tx.send(()).unwrap();
         peer.join().unwrap();
     }
+
+    mod physical_key_consumer {
+        include!("physical_key_consumer_tests.rs");
+    }
 }
