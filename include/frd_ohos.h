@@ -30,6 +30,11 @@ int32_t frd_ohos_attach(uint64_t engine, void *window, uint32_t width, uint32_t 
 int32_t frd_ohos_resize(uint64_t engine, uint64_t surface_generation, uint32_t width, uint32_t height);
 /* 同 generation 的重复 detach 幂等。成功返回前 surface/access/ref 全部释放。 */
 int32_t frd_ohos_detach(uint64_t engine, uint64_t surface_generation);
+/* 只读同步查询：在唯一渲染 worker 上与呈现/生命周期串行读取自己的 window ref。
+ * 必须匹配当前 attached generation；所有失败将非空 out_surface_id 置 0。
+ * 返回值只证明查询时该 generation 的 surfaceId；后续生命周期变化使证据失效。
+ * 非 OHOS/backend 不支持时明确拒绝，不改变普通 status 或呈现 Link。 */
+int32_t frd_ohos_window_surface_id(uint64_t engine, uint64_t surface_generation, uint64_t *out_surface_id);
 int32_t frd_ohos_set_foreground(uint64_t engine, uint32_t foreground);
 /* 仅开发图形 POC。bounded 非阻塞 tick，无像素数组/协议/秘密。 */
 int32_t frd_ohos_poc_tick(uint64_t engine, uint64_t surface_generation);

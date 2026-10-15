@@ -23,6 +23,10 @@ interface AppSnapshot extends ImeSnapshot {
   session?: string; generation?: string; geometryRevision?: string; certificate?: CertificateSummary;
   persistenceWarning?: string; statusCode?: string; statusMessage?: string;
 }
+interface SurfaceReturnIntent {
+  focusTicket: number; islandEpoch: number; session: string; generation: string;
+  windowId: number; stage: number; surfaceId: string; nativeIdentity: string; previousToken: string; started: number; until: number;
+}
 interface FormEdit { target: number; address: string; port: number; username: string; protocol: string; remember: boolean; }
 @Entry
 @Component
@@ -56,6 +60,9 @@ struct Index {
   @State private imeLoading: boolean = false;
   private imeNotice: string = '';
   private surfaceHasFocus: boolean = false;
+  private surfaceFocusId: string = '';
+  private surfaceFocusToken: string = '';
+  private surfaceReturn?: SurfaceReturnIntent;
   private imeCloseIntent: boolean = false;
   private ime: RemoteImeAdapter = new RemoteImeAdapter(() => inputMethod.getController(),
     { source: (json: string): number => native.appImeSource(json), operation: (json: string): number => native.appImeOperation(json) },
@@ -153,13 +160,50 @@ struct Index {
     this.check(code); if (code !== 0) { this.remoteFocused = false; this.keyboard.enterLocal(); }
   }
   private observeIme(): void {
+    this.refreshSurfaceFocus();
     this.ime.observe(this.model, this.surfaceHasFocus && this.remoteFocused && !this.detailsOpen, this.shellActive, this.now());
     this.imeSelected = this.ime.mode(); this.imeLoading = this.ime.loading();
   }
-  private surfaceFocusChanged(focused: boolean): void {
+  private acceptSurfaceReturn(surfaceId: string, token: string): boolean {
+    const intent = this.surfaceReturn;
+    if (!intent) { return false; }
+    const display = this.model.localDisplayEvidence;
+    const valid = this.shellActive && this.model.page === 3 && !this.detailsOpen && !this.keyboard.isLocal() &&
+      intent.focusTicket === this.focusTicket && intent.islandEpoch === this.island.epoch() &&
+      intent.session === this.model.session && intent.generation === this.model.generation &&
+      !!display && intent.windowId === display.windowId && intent.stage === display.stage &&
+      surfaceId === intent.surfaceId && (token.length === 0 || token.startsWith(intent.nativeIdentity + ':')) && this.now() >= intent.started && this.now() <= intent.until;
+    if (!valid) {
+      this.surfaceReturn = undefined; this.keyboard.enterLocal(); this.release(1); return false;
+    }
+    return token.length > 0 && token !== intent.previousToken;
+  }
+  private refreshSurfaceFocus(): void {
+    let token: string = '';
+    let surfaceId: string = '';
+    if (this.model.page !== 0) {
+      try {
+        surfaceId = this.controller.getXComponentSurfaceId();
+        token = native.remoteSurfaceFocusToken(surfaceId);
+      } catch { token = ''; }
+    }
+    const returning = this.acceptSurfaceReturn(surfaceId, token);
+    const focused = token.length > 0;
+    const replaced = this.surfaceFocusToken.length > 0 &&
+      (surfaceId !== this.surfaceFocusId || (focused && token !== this.surfaceFocusToken));
+    this.surfaceFocusId = surfaceId; this.surfaceFocusToken = token;
+    if (replaced) { this.surfaceHasFocus = false; this.focus(false); this.imeCloseIntent = false; }
+    if (returning) {
+      this.surfaceReturn = undefined; this.surfaceHasFocus = focused; this.focus(true); return;
+    }
+    if (focused === this.surfaceHasFocus) { return; }
     this.surfaceHasFocus = focused;
     if (!focused) { this.focus(false); }
-    else { if (!this.keyboard.isLocal()) { this.focus(true); } this.observeIme(); }
+    else if (!this.surfaceReturn && !replaced && !this.keyboard.isLocal() && this.shellActive && !this.detailsOpen && this.model.page === 3) { this.focus(true); }
+  }
+  private surfaceFocusChanged(_focused: boolean): void {
+    // libraryname 的焦点来自 C API；ArkTS 回调自身不是焦点证明。
+    this.observeIme();
   }
   private surfaceAreaChanged(width: number, height: number): void {
     // 尺寸变化只清 held/隔离真实尾 Up；不伪造 blur，不撤销同焦点 IME ticket。
@@ -169,6 +213,7 @@ struct Index {
     this.surfaceHeight = Math.round(this.getUIContext().vp2px(height)); this.geometry();
   }
   private toggleKeyboard(): void {
+    this.refreshSurfaceFocus();
     const close = this.ime.mode() || this.imeCloseIntent;
     if (!close) { this.clearImeNotice(); }
     const released = this.localOwnership(); this.imeCloseIntent = false;
@@ -182,12 +227,14 @@ struct Index {
     this.ime.request(this.getUIContext(), deviceInfo.deviceType === 'phone', this.now());
     this.imeSelected = true; this.imeLoading = true;
     this.keyboard.enterRemote();
-    if (this.surfaceHasFocus) { this.focus(true); }
     try { this.getUIContext().getFocusController().requestFocus('frdRemoteSurfaceFocus'); }
     catch { this.ime.close(); this.imeSelected = false; this.imeLoading = false; this.setImeNotice('无法聚焦远程画面，请点击画面后重试'); }
+    this.refreshSurfaceFocus();
+    if (this.surfaceHasFocus && !this.remoteFocused) { this.focus(true); }
     this.observeIme();
   }
   private release(reason: number = 0): boolean {
+    if (reason !== 1) { this.surfaceReturn = undefined; }
     // 保存用户动作前的关闭意图：按钮取得真实焦点会先使 surface blur。
     if (this.ime.mode()) { this.imeCloseIntent = true; }
     this.ime.close(reason); this.imeSelected = false; this.imeLoading = false;
@@ -197,6 +244,7 @@ struct Index {
     return code === 0;
   }
   private localOwnership(): boolean {
+    this.surfaceReturn = undefined;
     this.keyboard.enterLocal();
     return this.release();
   }
@@ -235,13 +283,13 @@ struct Index {
   private syncIsland(): void {
     this.syncQueuedKeyEpoch();
     if (this.model.page !== 3) { this.clearImeNotice(); }
-    // 只记录 ArkUI 节点的真实焦点；窗口前后台/浮岛 epoch 另行撤销输入授权。
-    if (this.model.page === 0) { this.surfaceHasFocus = false; }
+    // 只记录原生节点焦点；窗口前后台/浮岛 epoch 另行撤销输入授权。
+    if (this.model.page === 0) { this.surfaceHasFocus = false; this.surfaceFocusId = ''; this.surfaceFocusToken = ''; }
     if (this.model.page !== this.actionPage) { this.actionBusy = false; this.actionPage = this.model.page; }
     const before = this.island.epoch();
     this.island.observe(this.model.page, this.model.session ?? '', this.shellActive, this.now());
     if (before !== this.island.epoch()) {
-      this.focusTicket++; this.closeDetails();
+      this.surfaceReturn = undefined; this.focusTicket++; this.closeDetails();
       this.ime.close(3); this.imeSelected = false; this.imeLoading = false; this.imeCloseIntent = false;
       this.tooltipText = ''; this.focusedAction = -1; this.hoveredAction = -1; this.islandHovered = false;
       this.pointerInput = false; this.keyboard.reset(); this.surfaceTouch.reset(); this.remoteFocused = false;
@@ -351,16 +399,34 @@ struct Index {
     // 关闭详情仍属于本地域；只有显式返回/真实 surface 交互才恢复远程输入。
   }
   private returnToSurface(): void {
+    this.surfaceReturn = undefined;
     this.closeDetails(); this.collapseIsland();
     if (!this.shellActive || this.model.page !== 3) { return; }
+    const display = this.model.localDisplayEvidence;
+    if (!display || !Number.isSafeInteger(display.windowId) || display.windowId <= 0 ||
+      !Number.isSafeInteger(display.stage) || display.stage <= 0 || !this.model.session || !this.model.generation) { return; }
     try {
-      // 先产生真实blur屏障，再按当前control/geometry入队尾Up，最后恢复远程focus。
+      const surfaceId = this.controller.getXComponentSurfaceId();
+      const nativeIdentity = native.remoteSurfaceIdentity(surfaceId);
+      if (nativeIdentity.length === 0) { this.keyboard.enterLocal(); this.release(1); return; }
+      const previousToken = native.remoteSurfaceFocusToken(surfaceId);
+      // 清焦点仍是实际原生屏障；返回意图只等待新的真实证明，不自行产生焦点。
       this.keyboard.enterLocal();
       this.getUIContext().getFocusController().clearFocus();
       if (!this.flushPendingKeyUps()) { return; }
       this.keyboard.enterRemote();
+      const started = this.now();
+      this.surfaceReturn = {
+        focusTicket: ++this.focusTicket, islandEpoch: this.island.epoch(), session: this.model.session,
+        generation: this.model.generation, windowId: display.windowId, stage: display.stage,
+        surfaceId: surfaceId, nativeIdentity: nativeIdentity, previousToken: previousToken, started: started, until: started + 2000
+      };
       this.getUIContext().getFocusController().requestFocus('frdRemoteSurfaceFocus');
-    } catch { this.keyboard.enterLocal(); this.bridgeNotice = '无法恢复远程画面焦点，请点击画面'; }
+      this.refreshSurfaceFocus();
+    } catch {
+      this.surfaceReturn = undefined; this.keyboard.enterLocal(); this.release(1);
+      this.bridgeNotice = '无法恢复远程画面焦点，请点击画面';
+    }
   }
   private pointer(x: number, y: number, buttons: number, wx: number = 0, wy: number = 0): void {
     if (!this.model.session || !this.model.generation || !this.model.geometryRevision) { return; }
@@ -436,7 +502,7 @@ struct Index {
     }, 100);
   }
   aboutToDisappear(): void {
-    clearInterval(this.timer); this.surfaceHasFocus = false; this.focusTicket++; this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release(4); this.clearImeNotice();
+    clearInterval(this.timer); this.surfaceHasFocus = false; this.surfaceFocusId = ''; this.surfaceFocusToken = ''; this.focusTicket++; this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release(4); this.clearImeNotice();
     this.island.observe(0, '', false, this.now()); this.refreshIsland();
   }
   onBackPress(): boolean {

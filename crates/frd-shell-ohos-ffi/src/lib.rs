@@ -277,6 +277,27 @@ pub extern "C" fn frd_ohos_detach(engine: u64, surface_generation: u64) -> i32 {
         Ok(())
     })
 }
+/// # Safety
+/// `out_surface_id` 必须指向调用期可写、对齐的 u64；所有失败清零。
+/// 查询经唯一 worker 串行执行，结果仅对查询时的精确 attached generation 有效。
+#[no_mangle]
+pub unsafe extern "C" fn frd_ohos_window_surface_id(
+    engine: u64,
+    surface_generation: u64,
+    out_surface_id: *mut u64,
+) -> i32 {
+    if out_surface_id.is_null() {
+        return INVALID_ARGUMENT;
+    }
+    // SAFETY: 调用方保证输出存储有效；在进入 panic 边界前清零，覆盖正在 unwind 的调用方。
+    unsafe { *out_surface_id = 0 };
+    boundary(|| {
+        let id = lookup(engine)?.call(Command::WindowSurfaceId(surface_generation))?;
+        // SAFETY: worker 已完成只读查询，不返回或保留 native 指针。
+        unsafe { *out_surface_id = id };
+        Ok(())
+    })
+}
 #[no_mangle]
 pub extern "C" fn frd_ohos_set_foreground(engine: u64, foreground: u32) -> i32 {
     boundary(|| {

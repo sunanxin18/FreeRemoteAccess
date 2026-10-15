@@ -21,6 +21,7 @@ std::unordered_map<OH_NativeXComponent *, std::unique_ptr<ComponentState>> compo
 std::unordered_set<napi_env> cleanupEnvironments;
 bool foreground = true;
 uint64_t remoteEngine = 0;
+uint64_t remoteSurfaceGeneration = 0;
 FrdOhosPocStatus lastStatus{};
 int32_t lastCode = FRD_OHOS_OK;
 void Log(const char *event, int32_t code, const ComponentState &state) {
@@ -64,6 +65,7 @@ void Created(OH_NativeXComponent *component, void *window) {
     lastCode=code; state->generation=generation;
     if (code == FRD_OHOS_OK) {
         state->borrowedWindow=window;
+        if (state->remote) remoteSurfaceGeneration=generation;
         state->FrameRegistrationCompleted(OH_NativeXComponent_RegisterOnFrameCallback(component, Frame) == OH_NATIVEXCOMPONENT_RESULT_SUCCESS);
         lastCode=state->StatusCode(FRD_OHOS_OK, FrdOhosPocStatus{});
     }
@@ -90,28 +92,43 @@ void Destroyed(OH_NativeXComponent *component, void *window) {
         Log("destroy", destroyCode, *state);
         state->engine=0;
     }
+    if (state->remote && state->generation == remoteSurfaceGeneration) remoteSurfaceGeneration=0;
+    state->nodeFocused=false; state->focusGeneration=0;
     state->generation=0; state->borrowedWindow=nullptr;
     state->bridgeError=FRD_OHOS_OK;
     // 同一 XComponent 在系统重建 Surface 时仍可再次 Created，保留已清零 POD。
 }
+bool CurrentRemote(const ComponentState &state) {
+    return state.remote && state.engine != 0 && state.engine == remoteEngine && state.generation != 0 &&
+        state.generation == remoteSurfaceGeneration && state.borrowedWindow != nullptr;
+}
+void CancelRemoteInput(ComponentState &state) {
+    if (!CurrentRemote(state)) return;
+    state.mouseButtons=0; FrdAppRemoteFocus(foreground,false);
+}
 void RemoteBlur(OH_NativeXComponent *component, void *window) {
     auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow) return;
-    state->mouseButtons=0; FrdAppRemoteFocus(foreground,false);
+    FrdOhosPocStatus current{};
+    const auto code=frd_ohos_poc_status(state->engine,&current);
+    // 旧组件的晚 blur 只清自己的证据，不能撤销新 renderer generation 的来源。
+    state->NativeBlur(window,code,current);
+    // 当前来源即使 status 查询失败也先撤销；本地 active generation 拒绝旧组件的晚事件。
+    CancelRemoteInput(*state);
 }
 void RemoteFocus(OH_NativeXComponent *component, void *window) {
     auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow) return;
     FrdOhosPocStatus current{};
-    if (frd_ohos_poc_status(state->engine,&current) != FRD_OHOS_OK || current.surface_generation != state->generation || !current.attached) return;
-    FrdAppRemoteFocus(foreground,true);
+    const auto code=frd_ohos_poc_status(state->engine,&current);
+    if (CurrentRemote(*state) && state->NativeFocus(window,code,current)) FrdAppRemoteFocus(foreground,true);
 }
 void Touch(OH_NativeXComponent *component, void *window) {
     auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow || !state->generation) return;
     OH_NativeXComponent_TouchEvent event{};
-    if (OH_NativeXComponent_GetTouchEvent(component,window,&event) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) { RemoteBlur(component,window); return; }
+    if (OH_NativeXComponent_GetTouchEvent(component,window,&event) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS) { CancelRemoteInput(*state); return; }
     if (event.numPoints > 1 || event.type == OH_NATIVEXCOMPONENT_CANCEL) {
-        state->touchBlocked=event.numPoints>1; RemoteBlur(component,window); return;
+        state->touchBlocked=event.numPoints>1; CancelRemoteInput(*state); return;
     }
-    if (event.type != OH_NATIVEXCOMPONENT_DOWN && event.type != OH_NATIVEXCOMPONENT_UP && event.type != OH_NATIVEXCOMPONENT_MOVE) { RemoteBlur(component,window); return; }
+    if (event.type != OH_NATIVEXCOMPONENT_DOWN && event.type != OH_NATIVEXCOMPONENT_UP && event.type != OH_NATIVEXCOMPONENT_MOVE) { CancelRemoteInput(*state); return; }
     if (state->touchBlocked) {
         if (event.type == OH_NATIVEXCOMPONENT_UP && event.numPoints <= 1) state->touchBlocked=false;
         return;
@@ -122,7 +139,7 @@ void Touch(OH_NativeXComponent *component, void *window) {
 void Mouse(OH_NativeXComponent *component, void *window) {
     auto *state=Find(component); if (!state || !state->remote || window != state->borrowedWindow || !state->generation) return;
     OH_NativeXComponent_MouseEvent event{};
-    if (OH_NativeXComponent_GetMouseEvent(component,window,&event) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS || event.action == OH_NATIVEXCOMPONENT_MOUSE_CANCEL) { RemoteBlur(component,window); return; }
+    if (OH_NativeXComponent_GetMouseEvent(component,window,&event) != OH_NATIVEXCOMPONENT_RESULT_SUCCESS || event.action == OH_NATIVEXCOMPONENT_MOUSE_CANCEL) { CancelRemoteInput(*state); return; }
     const auto button=event.button == OH_NATIVEXCOMPONENT_LEFT_BUTTON ? 1U : event.button == OH_NATIVEXCOMPONENT_MIDDLE_BUTTON ? 2U : event.button == OH_NATIVEXCOMPONENT_RIGHT_BUTTON ? 4U : 0U;
     if (event.action == OH_NATIVEXCOMPONENT_MOUSE_PRESS) state->mouseButtons |= button;
     if (event.action == OH_NATIVEXCOMPONENT_MOUSE_RELEASE) state->mouseButtons &= ~button;
@@ -157,6 +174,51 @@ void Counter(napi_env env, napi_value object, const char *key, uint64_t value) {
 void Bool(napi_env env, napi_value object, const char *key, bool value) {
     napi_value result=nullptr; napi_get_boolean(env, value, &result); napi_set_named_property(env, object, key, result);
 }
+struct RemoteSurfaceEvidence {
+    std::string identity;
+    std::string focusToken;
+};
+RemoteSurfaceEvidence ReadRemoteSurfaceEvidence(napi_env env, napi_callback_info info) {
+    size_t argc=2, length=0; napi_value arguments[2]{}; uint64_t requestedId=0;
+    char text[21]{};
+    RemoteSurfaceEvidence evidence;
+    if (napi_get_cb_info(env,info,&argc,arguments,nullptr,nullptr) == napi_ok && argc == 1 &&
+        napi_get_value_string_utf8(env,arguments[0],nullptr,0,&length) == napi_ok && length > 0 && length <= 20 &&
+        napi_get_value_string_utf8(env,arguments[0],text,sizeof(text),&length) == napi_ok &&
+        ComponentState::ParseSurfaceId(std::string_view(text,length),requestedId)) {
+        size_t matches=0; bool windowError=false;
+        for (const auto &item : components) {
+            const auto &state=*item.second;
+            if (!CurrentRemote(state)) continue;
+            uint64_t windowId=0;
+            const auto windowCode=frd_ohos_window_surface_id(state.engine,state.generation,&windowId);
+            if (windowCode != 0) { windowError=true; continue; }
+            if (windowId != requestedId) continue;
+            ++matches;
+            FrdOhosPocStatus current{};
+            const auto queryCode=frd_ohos_poc_status(state.engine,&current);
+            if (foreground && current.foreground != 0 && state.CurrentWindow(state.borrowedWindow,queryCode,current)) {
+                // 元数据不授予焦点；两个 getter 共用实际 worker/窗口/代际/唯一选择门。
+                evidence.identity=std::to_string(state.engine) + ":" + std::to_string(state.generation);
+                if (state.Focused(requestedId,windowId,windowCode,foreground,queryCode,current)) {
+                    evidence.focusToken=evidence.identity + ":" + std::to_string(state.focusEpoch);
+                }
+            }
+        }
+        if (matches != 1 || windowError) evidence={};
+    }
+    return evidence;
+}
+napi_value RemoteSurfaceFocusToken(napi_env env, napi_callback_info info) {
+    const auto evidence=ReadRemoteSurfaceEvidence(env,info);
+    napi_value result=nullptr;
+    napi_create_string_utf8(env,evidence.focusToken.c_str(),evidence.focusToken.size(),&result); return result;
+}
+napi_value RemoteSurfaceIdentity(napi_env env, napi_callback_info info) {
+    const auto evidence=ReadRemoteSurfaceEvidence(env,info);
+    napi_value result=nullptr;
+    napi_create_string_utf8(env,evidence.identity.c_str(),evidence.identity.size(),&result); return result;
+}
 napi_value Status(napi_env env, napi_callback_info) {
     auto snapshot=lastStatus; auto code=lastCode;
     const ComponentState *selected=nullptr;
@@ -179,7 +241,7 @@ void Cleanup(void *environment) {
     cleanupEnvironments.erase(static_cast<napi_env>(environment));
     // env 清理时不访问可能已失效的 XComponent，只 join native worker。
     for (auto &item : components) if (item.second->engine) frd_ohos_destroy(item.second->engine);
-    remoteEngine = 0;
+    remoteEngine = 0; remoteSurfaceGeneration = 0;
     components.clear();
 }
 napi_value Init(napi_env env, napi_value exports) {
@@ -188,6 +250,8 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor descriptors[]={{"abiVersion",nullptr,Abi,nullptr,nullptr,nullptr,napi_default,nullptr},
         {"pocAvailable",nullptr,PocAvailable,nullptr,nullptr,nullptr,napi_default,nullptr},
         {"setForeground",nullptr,Foreground,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"remoteSurfaceFocusToken",nullptr,RemoteSurfaceFocusToken,nullptr,nullptr,nullptr,napi_default,nullptr},
+        {"remoteSurfaceIdentity",nullptr,RemoteSurfaceIdentity,nullptr,nullptr,nullptr,napi_default,nullptr},
         {"pocStatus",nullptr,Status,nullptr,nullptr,nullptr,napi_default,nullptr}};
     napi_define_properties(env,exports,sizeof(descriptors)/sizeof(descriptors[0]),descriptors);
     bool has=false; napi_value object=nullptr; OH_NativeXComponent *component=nullptr;

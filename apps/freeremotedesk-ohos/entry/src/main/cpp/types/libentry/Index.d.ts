@@ -13,6 +13,8 @@ export interface PocStatus {
 export const pocAvailable: () => boolean;
 export const abiVersion: () => number;
 export const setForeground: (foreground: boolean) => number;
+export const remoteSurfaceIdentity: (surfaceId: string) => string;
+export const remoteSurfaceFocusToken: (surfaceId: string) => string;
 export const pocStatus: () => PocStatus;
 
 export const initializeApp: (sandbox: string) => number;

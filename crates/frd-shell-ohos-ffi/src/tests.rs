@@ -442,3 +442,308 @@ fn full_remote_feedback_slot_cannot_block_resize_detach_or_shutdown_ack() {
     rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
     join.join().unwrap();
 }
+
+fn register_query_engine(engine: Arc<Engine>) -> u64 {
+    let mut registry = registry().lock().unwrap();
+    registry.next = registry.next.checked_add(1).unwrap();
+    let id = registry.next;
+    registry.engines.insert(id, engine);
+    id
+}
+
+fn query_link_snapshot(engine: &Engine) -> impl std::fmt::Debug + PartialEq {
+    let s = engine.link.0.lock().unwrap();
+    (
+        (
+            s.surface.local,
+            s.surface.lifecycle,
+            s.surface.width,
+            s.surface.height,
+            s.surface.attached,
+            s.surface.foreground,
+        ),
+        (
+            s.bound,
+            s.session,
+            s.geometry,
+            s.geometry_revision,
+            s.remote_size,
+        ),
+        (
+            s.batch.is_some(),
+            s.feedback.is_some(),
+            s.busy,
+            s.failure,
+            s.applied,
+            s.presented,
+        ),
+    )
+}
+
+#[test]
+fn window_surface_id_abi_is_exact_generation_bound_and_readonly_even_on_backend_failure() {
+    struct QueryBackend(Arc<Mutex<Result<u64, i32>>>);
+    impl Backend for QueryBackend {
+        fn attach(&mut self, _: usize, _: u32, _: u32) -> Result<(), i32> {
+            Ok(())
+        }
+        fn resize(&mut self, _: u32, _: u32) -> Result<(), i32> {
+            Ok(())
+        }
+        fn pause(&mut self) {}
+        fn render_poc(&mut self) -> Result<bool, i32> {
+            Ok(false)
+        }
+        fn detach(&mut self) {}
+        fn window_surface_id(&mut self) -> Result<u64, i32> {
+            *self.0.lock().unwrap()
+        }
+    }
+    let result = Arc::new(Mutex::new(Ok(9_007_199_254_740_993)));
+    let owned = result.clone();
+    let engine = Arc::new(Engine::spawn(move || Box::new(QueryBackend(owned))).unwrap());
+    let id = register_query_engine(engine.clone());
+    let mut surface_id = 42;
+    assert_eq!(
+        unsafe { frd_ohos_window_surface_id(id, 0, &mut surface_id) },
+        STALE_GENERATION
+    );
+    assert_eq!(surface_id, 0);
+    let generation = engine
+        .call(Command::Attach {
+            window: 1,
+            width: 100,
+            height: 60,
+        })
+        .unwrap();
+    let status = format!("{:?}", engine.status().unwrap());
+    let link = query_link_snapshot(&engine);
+    for (reply, expected) in [
+        (Ok(9_007_199_254_740_993), OK),
+        (Ok(u64::MAX), OK),
+        (Ok(0), GPU_FAILED),
+        (Err(GPU_FAILED), GPU_FAILED),
+        (Err(WINDOW_REFERENCE_FAILED), WINDOW_REFERENCE_FAILED),
+        (Err(WORKER_STOPPED), WORKER_STOPPED),
+        (Err(PANIC), PANIC),
+    ] {
+        *result.lock().unwrap() = reply;
+        surface_id = 42;
+        assert_eq!(
+            unsafe { frd_ohos_window_surface_id(id, generation, &mut surface_id) },
+            expected
+        );
+        assert_eq!(surface_id, if expected == OK { reply.unwrap() } else { 0 });
+        assert_eq!(format!("{:?}", engine.status().unwrap()), status);
+        assert_eq!(query_link_snapshot(&engine), link);
+    }
+    surface_id = 42;
+    assert_eq!(
+        unsafe { frd_ohos_window_surface_id(id, generation + 1, &mut surface_id) },
+        STALE_GENERATION
+    );
+    assert_eq!(surface_id, 0);
+    assert_eq!(format!("{:?}", engine.status().unwrap()), status);
+    assert_eq!(query_link_snapshot(&engine), link);
+    engine.call(Command::Detach(generation)).unwrap();
+    let detached = format!("{:?}", engine.status().unwrap());
+    let detached_link = query_link_snapshot(&engine);
+    surface_id = 42;
+    assert_eq!(
+        unsafe { frd_ohos_window_surface_id(id, generation, &mut surface_id) },
+        NOT_ATTACHED
+    );
+    assert_eq!(surface_id, 0);
+    assert_eq!(format!("{:?}", engine.status().unwrap()), detached);
+    assert_eq!(query_link_snapshot(&engine), detached_link);
+    let second = engine
+        .call(Command::Attach {
+            window: 2,
+            width: 100,
+            height: 60,
+        })
+        .unwrap();
+    assert!(second > generation);
+    let replacement = format!("{:?}", engine.status().unwrap());
+    let replacement_link = query_link_snapshot(&engine);
+    surface_id = 42;
+    assert_eq!(
+        unsafe { frd_ohos_window_surface_id(id, generation, &mut surface_id) },
+        STALE_GENERATION
+    );
+    assert_eq!(surface_id, 0);
+    assert_eq!(format!("{:?}", engine.status().unwrap()), replacement);
+    assert_eq!(query_link_snapshot(&engine), replacement_link);
+    assert_eq!(frd_ohos_destroy(id), OK);
+}
+
+#[test]
+fn window_surface_id_abi_rejects_invalid_output_handle_and_unsupported_backend() {
+    let mut surface_id = 42;
+    assert_eq!(
+        unsafe { frd_ohos_window_surface_id(0, 1, &mut surface_id) },
+        INVALID_HANDLE
+    );
+    assert_eq!(surface_id, 0);
+    assert_eq!(
+        unsafe { frd_ohos_window_surface_id(0, 1, std::ptr::null_mut()) },
+        INVALID_ARGUMENT
+    );
+    let (engine, _) = probe(false); // 没有实现查询的 backend 必须明确不可用。
+    let engine = Arc::new(engine);
+    let generation = engine
+        .call(Command::Attach {
+            window: 1,
+            width: 10,
+            height: 10,
+        })
+        .unwrap();
+    let id = register_query_engine(engine.clone());
+    let before = format!("{:?}", engine.status().unwrap());
+    let link = query_link_snapshot(&engine);
+    surface_id = 42;
+    assert_eq!(
+        unsafe { frd_ohos_window_surface_id(id, generation, &mut surface_id) },
+        UNSUPPORTED_PLATFORM
+    );
+    assert_eq!(surface_id, 0);
+    assert_eq!(format!("{:?}", engine.status().unwrap()), before);
+    assert_eq!(query_link_snapshot(&engine), link);
+    assert_eq!(frd_ohos_destroy(id), OK);
+}
+
+#[test]
+fn window_surface_id_runs_on_unique_worker_after_background_remote_render() {
+    use std::{sync::mpsc, thread, time::Duration};
+    struct SerialBackend {
+        entered: mpsc::Sender<thread::ThreadId>,
+        release: mpsc::Receiver<()>,
+        events: Arc<Mutex<Vec<(&'static str, thread::ThreadId)>>>,
+        rendered: bool,
+    }
+    impl SerialBackend {
+        fn record(&self, name: &'static str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((name, thread::current().id()));
+        }
+    }
+    impl Backend for SerialBackend {
+        fn attach(&mut self, _: usize, _: u32, _: u32) -> Result<(), i32> {
+            self.record("attach");
+            Ok(())
+        }
+        fn resize(&mut self, _: u32, _: u32) -> Result<(), i32> {
+            self.record("resize");
+            Ok(())
+        }
+        fn pause(&mut self) {
+            self.record("pause");
+        }
+        fn render_poc(&mut self) -> Result<bool, i32> {
+            panic!("远端呈现不能使用 POC")
+        }
+        fn detach(&mut self) {
+            self.record("detach");
+        }
+        fn apply(&mut self, _: Vec<frd_frame::FrameTransaction>) -> Result<(), i32> {
+            Ok(())
+        }
+        fn render_remote(
+            &mut self,
+            _: frd_core::TransformedViewport,
+            _: bool,
+        ) -> Result<Option<frd_protocol_api::PresentationEvent>, i32> {
+            if !self.rendered {
+                self.rendered = true;
+                self.record("render-enter");
+                self.entered.send(thread::current().id()).unwrap();
+                self.release.recv().unwrap();
+                self.record("render-exit");
+            }
+            Ok(None)
+        }
+        fn window_surface_id(&mut self) -> Result<u64, i32> {
+            self.record("query");
+            Ok(u64::MAX)
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let owned = events.clone();
+    let engine = Arc::new(
+        Engine::spawn(move || {
+            Box::new(SerialBackend {
+                entered: entered_tx,
+                release: release_rx,
+                events: owned,
+                rendered: false,
+            })
+        })
+        .unwrap(),
+    );
+    let generation = engine
+        .call(Command::Attach {
+            window: 1,
+            width: 100,
+            height: 60,
+        })
+        .unwrap();
+    {
+        let mut link = engine.link.0.lock().unwrap();
+        link.bound = true;
+        link.session = Some((frd_core::SessionId::allocate(), 1));
+        link.remote_size = Some(frd_core::PixelSize {
+            width: 100,
+            height: 60,
+        });
+        link.geometry = Some(input_adapter::ViewGeometry {
+            drawable: frd_core::PixelSize {
+                width: 100,
+                height: 60,
+            },
+            bounds: frd_core::PixelRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 60,
+            },
+            scale: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+        });
+        let epoch = link.epoch().unwrap();
+        link.batch = Some((epoch, vec![]));
+    }
+    let worker = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_ne!(worker, thread::current().id());
+    let id = register_query_engine(engine.clone());
+    let (done_tx, done_rx) = mpsc::channel();
+    let query = thread::spawn(move || {
+        let mut surface_id = 0;
+        let code = unsafe { frd_ohos_window_surface_id(id, generation, &mut surface_id) };
+        done_tx.send((code, surface_id)).unwrap();
+    });
+    let pending = done_rx.recv_timeout(Duration::from_millis(40));
+    release_tx.send(()).unwrap(); // 失败时也先放行 worker，避免测试泄漏线程。
+    assert!(matches!(pending, Err(mpsc::RecvTimeoutError::Timeout)));
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        (OK, u64::MAX)
+    );
+    query.join().unwrap();
+    assert_eq!(frd_ohos_destroy(id), OK);
+    let events = events.lock().unwrap();
+    assert!(events.iter().all(|event| event.1 == worker));
+    let names: Vec<_> = events.iter().map(|event| event.0).collect();
+    assert!(
+        names
+            .iter()
+            .position(|name| *name == "render-exit")
+            .unwrap()
+            < names.iter().position(|name| *name == "query").unwrap()
+    );
+    assert_eq!(names.iter().filter(|name| **name == "query").count(), 1);
+}

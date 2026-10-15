@@ -146,3 +146,75 @@ Fix1清单SHA256 `d8bee56388f1ba23af1b98f349e2e9b2835cb4f6620fc55d9a1eb69a923f7e
 当前Index的surfaceHasFocus默认false，唯一路径由XComponent ArkTS onFocus置true；但该XComponent配置了libraryname=entry。[官方XComponent事件说明](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-arkui/arkui-ts/ts-basic-components-xcomponent.md#事件)明确该配置的焦点、按键、触摸等事件只响应C API。现有原生Focus/Blur已注册，却没有把真实焦点证据交回Index；这是与上述日志一致的接线缺陷。后续需用绑定实际surface/代际的原生焦点证据修正，不能设定焦点恒true或跳过门。按键等其它被抑制的ArkTS事件也需独立跟踪，不能由本次诊断授予物理键/多点资格。
 
 21:49:26使用当前浮动岛正常断开，21:49:28回普通表单且旧IME提示已消失，符合本轮notice清理行为。手机保留该正式包和原应用数据；真实系统键盘、候选与远端文字继续未通过。此处定位的是本次SDK调用前的阻塞点，后续SDK阶段尚未执行，不推定其一定成功。
+
+
+## 原生焦点桥候选与审查边界
+
+Task5C2P2限定鸿蒙窗口层7路径，新增只读remoteSurfaceFocusToken(surfaceId)，身份无损绑定实际window的surfaceId、engine、native generation和真实focus epoch。仅NativeFocus/Blur改变节点证据；同surfaceId重建和两次poll之间Blur→Focus均关闭旧ticket，普通poll/geometry保持同身份。原生失焦即时走原Owner撤销，旧component的迟到事件不撤销新来源；浮动岛/详情本地所有权与窗口前台保持独立。未改Rust/CABI/协议/decoder/adapter/EntryAbility。
+
+原native-only行为反例从真实Index attach0转GREEN；最终20项surface（含实际NAPI callback/getter生成的身份trace进入实际Index）、7生命周期、32adapter、8editor共67项通过，现有生产ComponentState及直接include生产napi_init.cpp的host callback/NAPI消费者通过。host SDK/worker/Owner为stub，不能视为设备SDK或Rust Owner执行。官方API26 ARM64 Release BOTH及独立精确checker均exit0；原有Rust/material/sign配置警告保持，无新增ArkTS警告。冻结脚本曾因两个payload预期顺序写反而exit1，修正后通过，原记录保留。
+
+Unsigned HAP为29cfd7a88d478dc7ae5910f86d87596abacfdde9f122badacb16e507d6cc3adf，相对P1 d11e31条目同名同序，仅libentry/modules.abc变化，其余29项逐字相同；FFI包内221cc401及未strip752100b身份保持。27源清单079c1598、122证据清单cb7f86f8、完整报告cb65131b经root独立逐项核对。root不可变7源完整审查包127827字节、SHA256 88570178e3b098b38838ded39eadc05680f0b3156a096bfef1c86d1a2e378bdc已交独立Spec/Quality审查；当前尚未签装，真实SDK/系统键盘/候选/远端文字仍OPEN，PC未观察或操作。证据在target/harmony-native-focus-20261015/和target/harmony-native-focus-root-20261015/。
+
+已提交P1的4c4bdc81ee23a03be98ef323bee9092e0dea393a正常推送到原feature分支并核对远端exact HEAD；该head实际触发的通用CI 38746662876于2026-10-15 14:03:07UTC成功。没有把未触发的其它平台workflow计作通过，也不把旧head CI授予本未提交候选资格。
+
+后续回读同一原始Windows run 38739750036，已于14:07:08UTC成功；因此2f0c85b实际触发的5个workflow现全部成功，未重启或替换run。终态metadata在target/harmony-rdp-text-wire-20261015/root-delivery/ci-followup-6.json。此结论限该tests-only提交及实际运行矩阵。
+
+
+### 原生焦点桥初审：两项Important，候选不签装
+
+独立报告7ec5ca0e5e8e769e7a57191efe39a05550173fe2d5aa6b6662ea931fb0bbafc0完整审查为Spec FAIL / Quality NEEDS_FIX，两项Important均由root接受。I1：UI getter调用非线程安全GetSurfaceId，现有worker仍持续呈现；poc_status仅复制状态，没有窗口串行屏障，违反NativeWindowLease既有所有权论证。root最初“UI线程+有效borrowedWindow”的设计没有提供并发安全前提，不能以指针有效或API只读豁免。没有声称已在设备观察到崩溃或数据竞争。
+
+I2：独立最小内存消费者纳入此前stub掉的真实returnToSurface，复现ready IME关闭→clearFocus/requestFocus真实焦点模拟→下一poll收到新epoch token后再次appFocus(false)。来源和remoteFocused由已恢复真变假，后续stablepoll不恢复。该问题是新桥主动撤销显式返回，不是已知的libraryname实体键缺口；反例完整命令和首个require.resolve夹具失败均保留在审查报告。
+
+Root已归档原27源/两报告/清单/HAP共33文件到review-fix1-base，原122证据及不可变完整审查包保持；候选29cfd7a8未签装，准备的sign.py未执行。原作者Fix1采用真正worker串行的只读generation-bound surfaceId查询，必要扩展仅OHOS renderer-shell C ABI/Rust/header/tests，不改协议/decoder/Owner/desktop或原64-byte状态布局。成功/失败查询均不得污染普通renderer/Link状态。显式返回意图须绑定当前shell生命周期，取得真实焦点后恢复shell授权，IME保持关闭，无任意token变化自动授权。新增真实returnToSurface和worker/API消费者、完整FFI宿主包测试及重新正式BOTH/checker后，必须交原reviewer限定复审。
+
+此时手机仍保留P1 signed2e338738、已断开普通表单；PC仍由用户填写，未读取或操作。真实SDK/系统键盘/候选/远端文字均未通过。Fix1的Rust FFI会产生真实新身份，后续不得沿用旧候选的FFI不变结论。
+
+
+### 原生焦点桥Fix1结果与复审新增I3
+
+Fix1增加版本1的generation-bound只读窗口身份C ABI，真正进入唯一renderer worker，在own lease上串行调用公开NativeWindow API。UI只读取数值，查询成功/普通错误不更改PocStatus或Link，实际Rust unwind仍保留原致命清理/停止。新完整FFI94通过/1既有ignored、surface23、lifecycle7、实际C++TU与helper、格式及官方BOTH/checker均通过；原adapter32/editor8源码及同轮证据未变，不重复无关大套件。
+
+Unsigned437fe1b70d96b2bb21f86ddb29aa4487e29970ea2ff30893ee42dd8e46f5b6b0相对旧29c包仅FFI/libentry/modules.abc变化，其余28payload相同。FFI packaged22afc297697025bcac89ed1e5fd9597aca548370063e1f169f6762d7c0a283a6，未strip2069fa1f24cda323be45fc89c9c091f80f1dd5fc935650008d3e680fe470e842；libentry不再导入GetSurfaceId，只导入新renderer query，FFI负责公开原生API。原31源/旧122与新128证据、报告原14102-byte前缀及两包差异经root逐项核对；作者报告e62f2596，清单3189b9de，root限定9路径delta135033字节/253c389b交原reviewer复审。
+
+完整复审afae3bd17a19a92a1fec6ba7b75ffd1aa7425895bca9e4b67424758dcd620bdb明确I1/I2 ADDRESSED，但新增Important I3 OPEN、Spec FAIL / Quality NEEDS_FIX。最小冻结源码内存消费者复现：pending return保存旧7:11:1，model.generation仍远程1，同surfaceId重建后取得当前7:12:1，却消费旧意图恢复shell。既有11种失效用例只改远程generation，没有覆盖native generation。root完整读取并接受，未将其解释为新节点的授权。
+
+Fix1的31源、两报告与HAP等38文件已归档fix1/review-fix2-base；437包未签装，准备的签名helper未执行。原作者Fix2仅5条C++/DTS/Index/测试路径：在focused token之外提供正交只读native identity（engine:generation，不要求节点聚焦），发起显式return前新鲜取得该身份，后续只允许同native身份的真实新Focus证明消费；metadata本身绝不授权，未知/错误关闭。同surfaceId跨native engine/generation必须撤销旧意图，新的显式请求才能恢复；previousToken为空的首次返回也须正确等待真实焦点。Rust/ABI/worker/Owner/协议/decoder及其它冻结依赖保持，官方包与受影响消费者需重新完成后限定复审。
+
+截至此阶段手机仍为P1 signed2e/PID20556断开表单，没有安装29或437候选；PC完全未观察或操作。真实SDK/系统键盘/候选/远端文字继续OPEN，不能由作者GREEN或关闭前两finding推定已可用。
+
+
+### 原生焦点桥Fix2冻结与限定复审
+
+Fix2仅修改允许的5路径，其余26条冻结源保持。新增正交只读remoteSurfaceIdentity与原focus token共用实际surface/worker安全门；身份在节点未聚焦时可用，但不能证明焦点或授权输入。实际returnToSurface在clearFocus之前取得新鲜native engine:generation，待返回意图只接受同一身份的真实新focus epoch；跨engine/generation永久撤销旧意图，新的显式请求才能恢复。额外RED显示generic false→true恢复可能绕过等待中的意图，现已关闭该旁路，旧IME不自动重附着。
+
+原I3 RED、30项surface、7项生命周期及直接include生产NAPI TU的消费者均通过，包括真实getter在未聚焦时产生metadata→实际Index等待Focus→拒绝engine变化→新显式请求成功。host SDK/worker/Owner仍为明确stub，不授予设备资格。官方API26 ARM64 Release BOTH与独立精确checker均exit0，无新增ArkTS警告；未改FFI94/worker/helper/adapter/editor不重复测试，沿用精确冻结证据。
+
+Root核31源与拷贝、原122/Fix1 128/Fix2 94项artifact及作者原26147-byte报告前缀，清单585765bf、报告02e5ccb2、限定5路径79805-byte审查包2935d04a已交原reviewer，只复审I3及新增getter直接风险。unsigned HAP642f101a相对437包仅libentry/modules.abc变化，其余29payload相同；FFI packaged22afc297保持，未strip变为5a4576d6，原因未证明，真实新文件及SDK strip匹配证据保留，无旧库替换。
+
+截至此阶段复审未出结论，未签装Fix2或前两候选。手机仍为P1 signed2e338738，root只确认现存PID20556及时间，未观察UI或开始新会话。PC仍按用户要求完全不观察或操作。真实系统IME/候选/远端文字仍OPEN。
+
+
+同一reviewer完成Fix2限定复审：I3 ADDRESSED / Spec PASS / Quality APPROVE，无新增阻断项，I1/I2保持关闭。完整报告40840-byte/SHA256 f688eead5a3332e8bceff748df186e0add51be506b860eb868b2bbbbc96d8c76，root完整读本轮追加并核旧29822-byte前缀afae3保持。该结论允许进入签验与手机实际阶段验证，不证明真实SDK或文字结果；未strip产物差异原因仍未证实。
+
+
+### Fix2签装与手机新失败：订阅早于SDK绑定
+
+root使用既有SDK开发身份签名，官方验签及双normal精确checker全部exit0；signed HAP6a7bce0a43f65623b39693a9524b9f386c21a4eed042f3f63e0b80b8e08f1d8d保留unsigned642f的全部31项payload，仅新增.pages.info。仅手机覆盖安装，未清数据。首次启动后立即pidof尚为空，稍后确认新PID1801，初始专用日志为空；不是复用旧PID20556结果。
+
+23:06:44安全存储原密码实际载入，23:06:52正在连接，23:07:01全屏2760×1256 Windows桌面已截图确认。首次自动脚本误查不存在的frdIslandKeyboard节点，断言停止且未点击键盘，不计作IME失败。随后核对实际action4为键盘，以新鲜layout→展开→新鲜action4 ID即时点击，23:07:55出现当前请求的暂不可用提示。本PID/本attempt的新数值日志为：
+
+```text
+1792076875.073 PID1801 attempt1 stage1 outcome0
+1792076875.074 PID1801 attempt1 stage2 outcome1 gates767
+1792076875.120 PID1801 attempt1 stage3 outcome0 gates1023
+1792076875.121 PID1801 attempt1 stage4 outcome0 gates1023
+1792076875.122 PID1801 attempt1 stage4 outcome3 code12800009 subscription1 gates1023
+```
+
+这次真实进入controller和订阅，前端focus门已经越过。失败在第一项insertText事件订阅，SDK attach尚未调用；不能称为键盘附着失败。安装、全屏画面与数值日志证据在target/harmony-native-focus-root-20261015/，strict过滤/判断见device/fix2-ime-first-verdict.json。
+
+本地官方API26 @ohos.inputMethod.d.ts:997及[官方insertText API](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-ime-kit/js-apis-inputmethod.md#oninserttext10)均列12800009为client detached；[官方错误码](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-ime-kit/errorcode-inputmethod-framework.md#12800009-输入法客户端未绑定)要求先attach。[华为自绘编辑框指南](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides-V13/use-inputmethod-in-custom-edit-box-V13)也展示await attach后注册监听。当前adapter在attachWithUIContext之前调用14项listeners.on，第一项即失败，符合现场错误；下一子任务修正公开SDK顺序，保持来源/异步/清理门，不能用忽略错误继续或补权限替代。
+
+23:08:33首次标作disconnect的操作实际为action2收起，未断开；核对action映射后23:09:05用action1真正断开并回竖屏普通表单，IME旧提示消失。PC没有观察或操作，原表单草稿保持。真实系统键盘/候选/Windows文字尚未通过，继续OPEN。

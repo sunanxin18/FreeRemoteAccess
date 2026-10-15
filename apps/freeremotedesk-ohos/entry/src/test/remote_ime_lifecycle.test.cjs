@@ -43,7 +43,7 @@ const callbackMethods = ['onFocus', 'onBlur', 'onAreaChange'].map(event => {
   return `${event}(${arrow.parameters.map(p => p.getText(indexAst)).join(',')})${ts.isBlock(arrow.body) ? arrow.body.getText(indexAst) : '{' + arrow.body.getText(indexAst) + ';}'}`;
 }).join('\n');
 const methodNames = ['geometry', 'focus', 'release', 'localOwnership', 'observeIme', 'toggleKeyboard',
-  'surfaceFocusChanged', 'surfaceAreaChanged', 'surfaceInteraction', 'syncQueuedKeyEpoch', 'flushPendingKeyUps',
+  'surfaceFocusChanged', 'acceptSurfaceReturn', 'refreshSurfaceFocus', 'surfaceAreaChanged', 'surfaceInteraction', 'syncQueuedKeyEpoch', 'flushPendingKeyUps',
   'syncIsland', 'shellActivityChanged', 'refreshIsland', 'closeDetails', 'collapseIsland', 'aboutToDisappear',
   'setImeNotice', 'clearImeNotice'];
 const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
@@ -53,8 +53,11 @@ function harness() {
   let h;
   let validDisplay = false;
   let nativeFocused = false;
+  let nodeFocused = true;
   const native = {
     initializeApp() {}, shutdownApp() {},
+    remoteSurfaceIdentity(surfaceId) { return surfaceId === '9007199254740993' ? '7:11' : ''; },
+    remoteSurfaceFocusToken(surfaceId) { return surfaceId === '9007199254740993' && nodeFocused ? '7:11:1' : ''; },
     appFocus(foreground, focused, remote) {
       events.focus.push([foreground, focused, remote]);
       nativeFocused = foreground && focused && remote;
@@ -112,7 +115,7 @@ function harness() {
     } },
     island: new island.SessionIslandPolicy(), keyboard: new island.ShellKeyboardOwnership(),
     queuedKeys: new island.QueuedRemoteKeys(), surfaceTouch: new island.SurfaceTouchOwnership(),
-    detailsScope: new island.DialogCallbackScope(), shellActive: false, surfaceHasFocus: false,
+    detailsScope: new island.DialogCallbackScope(), controller: { getXComponentSurfaceId: () => '9007199254740993' }, surfaceFocusId: '', surfaceFocusToken: '', shellActive: false, surfaceHasFocus: false,
     remoteFocused: false, detailsOpen: false, actionPage: 3, focusTicket: 0, actionBusy: false,
     bridgeNotice: '', imeNotice: '', imeCloseIntent: false, timer: -1, zoomScale: 1, panX: 0, panY: 0,
     surfaceWidth: 100, surfaceHeight: 60, now: () => 10,
@@ -155,6 +158,7 @@ function harness() {
   attachWindow(win);
   h.syncIsland(); h.onFocus(); h.surfaceInteraction();
   return { h, events, listeners, native, ability, win, makeWindow, attachWindow,
+    blur() { nodeFocused = false; native.appFocus(h.shellActive, false, false); h.observeIme(); },
     async open() {
       h.toggleKeyboard(); await settle();
       const source = events.sources.filter(source => source.state === 'attached').at(-1);
@@ -206,7 +210,7 @@ async function test(name, run) {
         if (kind === 'inactive') f.win.handlers.windowEvent(2);
         if (kind === 'background') f.ability.onBackground();
         if (kind === 'destroy') f.ability.onWindowStageDestroy();
-        if (kind === 'blur') f.h.onBlur();
+        if (kind === 'blur') f.blur();
         f.h.observeIme(); await settle();
         assert.equal(f.h.ime.mode(), false, kind); assert.equal(f.events.detach, 1, kind);
         assert.equal(f.events.sources.at(-1).state, 'detached', kind);
@@ -239,7 +243,7 @@ async function test(name, run) {
     for (const unrelated of [false, true]) {
       const f = harness();
       try {
-        f.h.surfaceHasFocus = false; f.h.remoteFocused = false;
+        f.blur(); f.h.remoteFocused = false;
         f.h.toggleKeyboard(); f.h.now = () => 2101; f.h.observeIme();
         assert.ok(f.h.bridgeNotice.includes('系统输入法'));
         if (unrelated) f.h.bridgeNotice = '持久连接错误';

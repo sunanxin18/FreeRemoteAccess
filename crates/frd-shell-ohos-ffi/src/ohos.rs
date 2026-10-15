@@ -18,6 +18,7 @@ use std::{
 
 #[link(name = "native_window")]
 extern "C" {
+    fn OH_NativeWindow_GetSurfaceId(window: *mut c_void, surface_id: *mut u64) -> i32;
     fn OH_NativeWindow_NativeObjectReference(object: *mut c_void) -> i32;
     fn OH_NativeWindow_NativeObjectUnreference(object: *mut c_void) -> i32;
 }
@@ -72,6 +73,19 @@ impl NativeWindowLease {
             pointer,
             worker: thread::current().id(),
         }))
+    }
+}
+impl NativeWindowLease {
+    fn surface_id(&self) -> Result<u64, i32> {
+        if self.worker != thread::current().id() {
+            return Err(WINDOW_REFERENCE_FAILED);
+        }
+        let mut id = 0;
+        // SAFETY: 唯一 worker 的串行命令在有效 own ref 上调用，与呈现/ref/unref 不并发。
+        if unsafe { OH_NativeWindow_GetSurfaceId(self.pointer.as_ptr(), &mut id) } != 0 || id == 0 {
+            return Err(GPU_FAILED);
+        }
+        Ok(id)
     }
 }
 impl HasDisplayHandle for NativeWindowLease {
@@ -276,6 +290,13 @@ impl Backend for OhosBackend {
             self.retained = graphics.resident.take();
             // surface 与 lease 在此线程销毁，保留的 context/texture 不持有 native window。
         }
+    }
+    fn window_surface_id(&mut self) -> Result<u64, i32> {
+        self.graphics
+            .as_ref()
+            .ok_or(crate::NOT_ATTACHED)?
+            .lease
+            .surface_id()
     }
     fn reset_remote(&mut self) {
         if let Some(resident) = self.resident_mut() {

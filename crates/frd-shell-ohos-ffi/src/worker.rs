@@ -15,6 +15,9 @@ pub(crate) trait Backend {
     fn pause(&mut self);
     fn render_poc(&mut self) -> Result<bool, i32>;
     fn detach(&mut self);
+    fn window_surface_id(&mut self) -> Result<u64, i32> {
+        Err(UNSUPPORTED_PLATFORM)
+    }
     fn reset_remote(&mut self) {}
     fn apply(&mut self, _: Vec<frd_frame::FrameTransaction>) -> Result<(), i32> {
         Err(UNSUPPORTED_PLATFORM)
@@ -57,6 +60,7 @@ pub(crate) enum Command {
     Detach(u64),
     Foreground(bool),
     Tick(u64),
+    WindowSurfaceId(u64),
     Shutdown,
 }
 struct Message {
@@ -107,7 +111,11 @@ impl Engine {
                                 Err(_) => break,
                             };
                         if let Some(message) = message {
-                            let lifecycle = !matches!(message.command, Command::Tick(_));
+                            let readonly = matches!(message.command, Command::WindowSurfaceId(_));
+                            let lifecycle = !matches!(
+                                message.command,
+                                Command::Tick(_) | Command::WindowSurfaceId(_)
+                            );
                             let shutdown = matches!(message.command, Command::Shutdown);
                             if lifecycle {
                                 if let Ok(mut shared) = worker_link.0.lock() {
@@ -132,12 +140,14 @@ impl Engine {
                                     shared.last_error = PANIC;
                                     shared.attached = 0;
                                 }
-                            } else if let Some(state) = &mut state {
-                                if let Err(code) = outcome {
-                                    state.status.last_error = code;
-                                }
-                                if let Ok(mut shared) = published.lock() {
-                                    *shared = state.status;
+                            } else if !readonly {
+                                if let Some(state) = &mut state {
+                                    if let Err(code) = outcome {
+                                        state.status.last_error = code;
+                                    }
+                                    if let Ok(mut shared) = published.lock() {
+                                        *shared = state.status;
+                                    }
                                 }
                             }
                             if lifecycle {
@@ -155,7 +165,9 @@ impl Engine {
                                 | WORKER_STOPPED),
                             ) = outcome
                             {
-                                worker_link.fail(code);
+                                if !readonly {
+                                    worker_link.fail(code);
+                                }
                             }
                             if let Some(reply) = message.reply {
                                 let _ = reply.send(outcome);
@@ -359,6 +371,17 @@ impl State {
                     self.status.presented_frames += 1;
                 }
                 Ok(generation)
+            }
+            Command::WindowSurfaceId(generation) => {
+                self.current(generation)?;
+                if self.status.attached == 0 {
+                    return Err(NOT_ATTACHED);
+                }
+                let id = self.backend.window_surface_id()?;
+                if id == 0 {
+                    return Err(GPU_FAILED);
+                }
+                Ok(id)
             }
             Command::Shutdown => {
                 self.detach();
