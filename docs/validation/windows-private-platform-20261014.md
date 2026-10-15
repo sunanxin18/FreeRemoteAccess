@@ -247,4 +247,29 @@ artifact11885962816 为 80,618,176 bytes，API、本地 ZIP 和上传日志摘�
 
 只读后继预检确认 `isolated_child` 是parent debugger loop，源码内联不参与callback→helper→outer的真实Rtl链；因此取消“该源函数必须有单独frame”的前置要求，不改O2/工具链/recipe或强加noinline。capture_callback/helper/outer实际frame、已编译PC和保存槽依然是原生门。本裁定取代前节单独frame的OPEN前置，**不等于任何compiler frame已原生通过**。
 
-尚未实现/执行的后继包括可信host/PE/artifact admission、真实父进程wait与进程树所有权/清理、Windows ARM64 Rtl/ABI/SEH/debugger七命令及同run CI接线。QPC、完整寄存器外部重建、系统DLL/API提供者身份、同shipping数值/guard/性能/修改包和产品互操作均保持各自边界；22项合成控制不关闭它们。下一步在这份冻结解析器上接独立原生runner，不能将供应的日志/退出值冒充真实运行。
+本节当时尚未实现的后继包括可信host/PE/artifact admission、真实父进程wait与进程树所有权/清理、Windows ARM64 Rtl/ABI/SEH/debugger七命令及同run CI接线。后续静态验收模块见下一节；QPC、完整寄存器外部重建、系统DLL/API提供者身份、同shipping数值/guard/性能/修改包和产品互操作仍保持各自边界，22项合成日志控制不关闭它们。
+
+## 同 run 静态产物验收模块（2026-10-16，B2F2）
+
+状态：**开发中**。`tools/admit-windows-private-artifact.py` 提供 `admit_artifact(outer_zip, checkout_root, expected, metadata, destination)` 和 `revalidate(seal)`。只返回数据型 `admitted-static-only` seal；不联网、不认证调用者提供的API信息、不执行PE或编译工具。未来可信runner负责独立取得GitHub上下文与artifact元数据，保存返回seal的独立身份，并在每次使用前重新核对。
+
+新transport精确包含本run/attempt的三个目录：installer和object各自的evidence.zip/archive.json，contract的evidence.zip/archive.json/terminal-status.json，共七文件。未来upload名称固定为 `task4c5c3b2f2-input-{run}-{attempt}`；当前workflow尚未接入该upload。保留完整inner源码及隐藏workflow，不复用旧combined外层不完整loose镜像。来源SHA/run/attempt、固定repository ID、artifact ID/name/size/digest与独立caller context/API数据逐项绑定。
+
+落盘前检查ZIP规范路径、Windows设备名/别名、成员类型/重复/CRC/长度、精确成员集、严格JSON与全部摘要；installer/outer上限96MiB、JSON8MiB、合并展开256MiB。各inner archive绑定manifest、源码副本及当前checkout；contract必须有唯一compiled-only terminal，准确绑定已有packaging-pending summary。随后使用固定源码中的静态检查重算七个COFF、五个AA64/PE32+、variant1导入区别、helper/outer指令归属、pdata/xdata与依赖闭包。platform.obj由实际source对象和same-run objects绑定，producer linker completed-identities没有消费它，不伪造该记录。
+
+seal发布前将全部落盘文件与原始内存bytes比较，保留完整树及源码/outer身份。失败保留首因和partial，不发布成功seal、不复用目录；`revalidate`检查caller持有的seal、源码、outer、全部输出与额外/别名文件。调用者不能从可写目录重新学习期望值作为权限依据。
+
+初次独立审查发现 **I1：源码pin正确仍可能通过SourceFileLoader读取未校验pyc**，同时影响compiler与nested support。审查者在源码pin全部不变时实际复现替代缓存执行。原作者分别加入完整18源文件checkout的compiler/support缓存控制：旧实现两项均RED；修复为直接编译执行通过pin的同一份源码bytes，避开两个缓存loader，两项均GREEN。固定producer、C/ASM、现有缓存及workflow均未修改；原失败材料保留。同一reviewer复审为Spec PASS / Quality Approved，无未关闭C/I/M。
+
+| 最终检查 | 结果与范围 |
+|---|---|
+| 新可移植定向suite | 22 discovered，21 PASS / 1 optional SKIP，不依赖本机target缓存 |
+| 两条源码缓存替代控制 | 实际RED两失败→GREEN两通过；合法源码snapshot仍完整正确，缓存未删除或改写 |
+| 显式历史产物静态回归 | 22 PASS；完整tar清单、七COFF/五PE身份、seal重验、PE变更拒绝及first-failure/no-seal |
+| 两文件语法 | 通过；最终日志无warning |
+
+显式静态夹具读取原 `30189bf` / run38548996801 / attempt1 的80,618,176字节外层ZIP，SHA256 `ddf55493a5be7f5832fe368bdf190a6fc294428a53ac641ba87aed1d6a9c8d7f`。七原始成员字节重新组成的transport、artifact ID1及元数据都明确标注为**合成宿主控制**；不是新同run CI产物、API实际观察或Windows执行。root重新核对七成员完整bytes与原件相等，原producer/pins及旧材料未变；本轮未运行旧19/36编译suite。
+
+最终验收源码SHA256 `d1b98c9fb15be28ce77200b5eaba56b50750c0672f5d4b6e4513f80f8410cc48`，测试 `df463a29330930f503c83baded60b9b09c868c179ef79c0cd68fe16a399c1c66`。作者证据 `target/windows-private-admission-20261016/`，Fix1冻结清单1010项（SHA256 `f3fc61793b7e3290bdbf33c984010426d4750a5a3d9c35fdfdc0f15e41d39be2`）；root核对所有新项、3514个旧target证据及原报告/审查前缀，接收材料在 `target/windows-private-admission-root-20261016/`。独立复审 `task-4c5c3b2f2-artifact-admission-review.md` 位于本计划SDD目录。
+
+下一阶段须完整接入Win32进程所有权、实时host/machine、七命令、实际wait/exit、有界tree清理、可信API下载、同workflow新upload与新run编译。workflow改动需要同步更新本模块的固定workflow pin并独立审查；不能放宽源码比较来沿用旧夹具。Windows路径实际运行、原生ABI/SEH、shipping数学/guard/QPC/性能/修改包及产品资格仍OPEN。本轮未观察或操作PC表单，也没有设备、HAP、账号或协议会话操作。
