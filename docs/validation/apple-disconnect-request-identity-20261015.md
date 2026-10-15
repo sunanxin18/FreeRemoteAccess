@@ -41,3 +41,9 @@ macOS ARM64、隔离target，原runtime聚焦1项、connection聚焦10项通过�
 Windows/Linux各i686、x86_64、ARM64的最终完整helper及probe测试源码通过隔离cfg/type检查，未链接或运行。完整Apple Windows跨检查被 `fdk-aac-sys` 的目标C++头文件缺失阻断；早期Windows SOCKET类型不匹配的RED和误用Homebrew sysroot的失败均保留。不能据隔离helper检查称完整Windows crate已通过。证据及全部29份日志在 `target/apple-writer-backpressure-20261015/`。独立审查读取完整差异及日志，Spec PASS、Quality APPROVE；root核对四文件冻结身份及实际结果，新CI尚待执行。
 
 零等待不可写仍不是原子证明writer已睡在内核：最后一批数据刚填满缓冲但Finished尚未发布的窗口仍可能存在。原迟成功失败断言继续捕获该反例；不通过放宽结果或重试至绿消除失败。本记录不证明真实Apple会话、Harmony键盘或PC登录已验收。
+
+### 背压候选的新 CI 反例
+
+`df0672b` 的 run38716468501、macos-15 job116360378045 于10:01:24 UTC结束失败：原断开回归在 `runtime.rs:3104` 再次触发同请求迟到成功，Apple539通过/1失败/11ignored。日志明确记录选中时“已完成请求数:0”；新socket probe测试通过仍不能证明这个60,034-byte请求有剩余数据尚未被内核接受。它进一步证实上述完成通知窗口仍会发生，不能把零poll资格当成测试问题已经解决。
+
+完整225851-byte失败日志保留为 `target/apple-writer-backpressure-20261015/ci-macos-failed-full.log`，步骤终态为 `ci-macos-job.json`。首次job logs API读取失败也已记录；随后按具体job读取成功，没有重跑CI。继续只读设计更强的真实I/O准备条件；本机通过与独立审查通过只对应其已声明的范围，不能覆盖此次CI失败。
