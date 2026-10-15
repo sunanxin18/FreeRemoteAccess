@@ -143,6 +143,9 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 5A3 手机/PC固定产物执行子步骤：两端scalar/native各3项，4条命令共12次通过且实际host/独有guest退出均0；四份38条70,802字节与冻结宿主全部值及顺序精确相等，前后源/产物身份经root独立核对。仍不代表性能、全部MVS、HAP或真实Mac，见[流水线验证](../../validation/mvs-pipeline-arm64-20261015.md)。
 - [x] Task 5A4 输出映射/位图行源码与最终ELF子步骤：2026-10-15 既有default-off后端补全NEON环绕范围映射及mode3/4/solid行；保留原oracle/数学/wire/cache/代际契约，独立Spec/Quality通过，default/aggregate完整包527/531及新聚焦5/6通过，官方OHOS最终ELF/实际指令通过；见[原生补全验证](../../validation/mvs-native-completion-arm64-20261015.md)。
 - [x] Task 5A4 手机/PC固定产物正确性子步骤：同一最终ELF两端各6项聚焦+3项pipeline，共4条实际命令/18次通过且host/独有guest均0；38条/70,802字节完整值与两份宿主及两端逐字相等，root独立核对43源/79运行证据及前后产物身份。raw copy资格、性能、普通HAP Apple和真实Mac仍OPEN，见[原生补全验证](../../validation/mvs-native-completion-arm64-20261015.md)。
+- [x] Task 5A5 type-0 RGB copy源码/宿主/实际ELF：两个helper接入精确ARM64 3..24字节copy叶，保留forward别名/混合来源、默认原循环与type-1完整快照；独立Spec/Quality通过，default/aggregate focused各11、完整包538/542及pipeline全值连续性通过，见[精确拷贝验证](../../validation/mvs-copy-arm64-20261015.md)。
+- [x] Task 5A5 手机/PC固定产物正确性：同一ELF两端各11项copy+3项pipeline，共4命令/28次通过，44源/输入前后身份、24实际HDC/20唯一guest退出及38条70,802字节全值顺序经root独立核对。性能、普通HAP Apple和真实Mac仍OPEN，见[精确拷贝验证](../../validation/mvs-copy-arm64-20261015.md)。
+- [ ] Task 5A6 有限MVS整管线性能：用真实wire构造的copy-heavy/IDCT/type-1局部工作集记录prepare/commit/发布耗时及独立完整输出；默认/原生对照，分别记录宿主与两个OHOS目标，不能由叶/单测总耗时宣称帧率。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
 - [ ] 授权Mac完成真实认证、首帧、持续更新、输入、重连；音频/剪贴板只报告已实现并验证的能力。
 - [ ] 跑Windows/macOS/Linux相关回归及包检查，记录本轮没有真机的平台。

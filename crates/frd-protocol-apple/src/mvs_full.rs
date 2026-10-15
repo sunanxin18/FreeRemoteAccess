@@ -1987,6 +1987,7 @@ fn copy_surface_tile_to_rect(
     {
         bail!("MVS type-0 copy source 超出 committed surface");
     }
+    #[cfg(not(feature = "mvs-native-colors-arm64"))]
     for dy in 0..copy_height {
         for dx in 0..copy_width {
             let source = pixel_offset(surface_width, source_x + dx, source_y + dy);
@@ -1996,6 +1997,17 @@ fn copy_surface_tile_to_rect(
                 surface_rgb[source + 2],
             ];
             write_pixel(rect_rgb, rect_width, tile_x + dx, tile_y + dy, color);
+        }
+    }
+    #[cfg(all(feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+    if copy_width != 0 {
+        for dy in 0..copy_height {
+            let source = pixel_offset(surface_width, source_x, source_y + dy);
+            let destination = pixel_offset(rect_width, tile_x, tile_y + dy);
+            crate::mvs_pixels::copy_rgb_nonoverlap(
+                &surface_rgb[source..source + copy_width * RGB_CHANNELS],
+                &mut rect_rgb[destination..destination + copy_width * RGB_CHANNELS],
+            );
         }
     }
     Ok(())
@@ -2027,6 +2039,7 @@ fn copy_overlay_or_committed_tile_to_rect(
     {
         bail!("MVS type-0 overlay copy source 超出 committed surface");
     }
+    #[cfg(not(feature = "mvs-native-colors-arm64"))]
     for dy in 0..copy_height {
         for dx in 0..copy_width {
             let source_global_x = source_x + dx;
@@ -2059,7 +2072,73 @@ fn copy_overlay_or_committed_tile_to_rect(
             );
         }
     }
+    #[cfg(all(feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+    for dy in 0..copy_height {
+        let source_global_y = source_y + dy;
+        let overlay_row = source_global_y >= rect_y && source_global_y < rect_y + rect_height;
+        let mut dx = 0;
+        // x 递增：committed 左段、live overlay 交集、committed 右段。
+        // 不按源 tile 的可见宽度裁剪，也不预读下一行，保留纵向传播。
+        while dx < copy_width {
+            let source_global_x = source_x + dx;
+            let in_overlay =
+                overlay_row && source_global_x >= rect_x && source_global_x < rect_x + rect_width;
+            let pixels = if in_overlay {
+                (rect_x + rect_width - source_global_x).min(copy_width - dx)
+            } else if overlay_row && source_global_x < rect_x {
+                (rect_x - source_global_x).min(copy_width - dx)
+            } else {
+                copy_width - dx
+            };
+            let destination = pixel_offset(rect_width, destination_x + dx, destination_y + dy);
+            if in_overlay {
+                let source = pixel_offset(
+                    rect_width,
+                    source_global_x - rect_x,
+                    source_global_y - rect_y,
+                );
+                copy_rgb_forward_span(rect_rgb, source, destination, pixels);
+            } else {
+                let source = pixel_offset(surface_width, source_global_x, source_global_y);
+                crate::mvs_pixels::copy_rgb_nonoverlap(
+                    &committed_rgb[source..source + pixels * RGB_CHANNELS],
+                    &mut rect_rgb[destination..destination + pixels * RGB_CHANNELS],
+                );
+            }
+            dx += pixels;
+        }
+    }
     Ok(())
+}
+
+#[cfg(any(test, feature = "mvs-native-colors-arm64"))]
+fn copy_rgb_forward_span(rgb: &mut [u8], src_byte: usize, dst_byte: usize, pixels: usize) {
+    assert!(pixels <= TILE_EDGE);
+    assert!(src_byte.is_multiple_of(RGB_CHANNELS) && dst_byte.is_multiple_of(RGB_CHANNELS));
+    let bytes = pixels * RGB_CHANNELS;
+    assert!(src_byte <= rgb.len() && bytes <= rgb.len() - src_byte);
+    assert!(dst_byte <= rgb.len() && bytes <= rgb.len() - dst_byte);
+    if pixels == 0 || src_byte == dst_byte {
+        return;
+    }
+    // 同一行重叠时，每次只搬运不超过起点距离的完整 RGB；每次叶调用
+    // 的源/目标不相交。递增 chunk 保留旧循环的右移传播和左移读取顺序。
+    let chunk_pixels = pixels.min(src_byte.abs_diff(dst_byte) / RGB_CHANNELS);
+    let ptr = rgb.as_mut_ptr();
+    let mut done = 0;
+    while done < pixels {
+        let count = chunk_pixels.min(pixels - done);
+        // SAFETY: 上面的全跨度边界检查保证两地址均有效；count*3 不超过
+        // 起点距离，故两范围不重叠。不创建同一 buffer 的交叠 Rust 引用。
+        unsafe {
+            crate::mvs_pixels::copy_rgb_nonoverlap_raw(
+                ptr.add(src_byte + done * RGB_CHANNELS),
+                ptr.add(dst_byte + done * RGB_CHANNELS),
+                count,
+            );
+        }
+        done += count;
+    }
 }
 
 fn apply_type_zero_patch_to_surface(
@@ -2389,6 +2468,7 @@ fn pixel_offset(width: usize, x: usize, y: usize) -> usize {
     (y * width + x) * RGB_CHANNELS
 }
 
+#[cfg(any(test, not(feature = "mvs-native-colors-arm64")))]
 fn write_pixel(rgb: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 3]) {
     let offset = pixel_offset(width, x, y);
     rgb[offset..offset + RGB_CHANNELS].copy_from_slice(&color);
@@ -4457,6 +4537,10 @@ mod tests {
         assert_eq!(snapshot.records, 2);
         assert_eq!(snapshot.tiles, 5);
         assert_eq!(snapshot.render_tiles, 3);
+    }
+    mod native_copy {
+        use super::*;
+        include!("mvs_copy_tests.rs");
     }
     mod pipeline_differential {
         use super::*;

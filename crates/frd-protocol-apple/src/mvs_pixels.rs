@@ -416,3 +416,30 @@ mod native_completion_row_bounds_tests {
         assert_eq!(cases, 13_056);
     }
 }
+
+/// 独立切片保证不重叠；只搬运已验证的 1..=8 个完整 RGB。
+#[cfg(any(test, feature = "mvs-native-colors-arm64"))]
+pub(crate) fn copy_rgb_nonoverlap(src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len());
+    assert!(src.len().is_multiple_of(3) && (3..=24).contains(&src.len()));
+    // SAFETY: 切片边界与唯一可变借用满足下层的精确大小/不重叠约束。
+    unsafe {
+        copy_rgb_nonoverlap_raw(src.as_ptr(), dst.as_mut_ptr(), src.len() / 3);
+    }
+}
+
+/// # Safety
+/// 两个范围均有 pixels*3 有效字节，互不重叠；pixels 为 1..=8，允许字节非对齐。
+#[cfg(any(test, feature = "mvs-native-colors-arm64"))]
+pub(crate) unsafe fn copy_rgb_nonoverlap_raw(src: *const u8, dst: *mut u8, pixels: usize) {
+    // SAFETY: 调用者保证两个精确跨度有效、不重叠；基线门保证小端 NEON。
+    #[cfg(all(feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+    unsafe {
+        native::copy_rgb_nonoverlap(src, dst, pixels);
+    }
+    // 默认生产 helper 仍使用原始循环；此分支仅供新 helper 的宿主 oracle 测试。
+    #[cfg(all(test, not(feature = "mvs-native-colors-arm64")))]
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, pixels * 3);
+    }
+}

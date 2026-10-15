@@ -122,3 +122,48 @@ pub(super) unsafe fn bitmap_rgb8(mask: u8, one: [u8; 3], zero: [u8; 3], rgb: *mu
         );
     }
 }
+
+/// # Safety
+/// pixels 为 1..=8；src/dst 分别有 pixels*3 可读/可写字节，范围不重叠。
+/// 允许任意字节对齐。精确分解 16/8/4/2/1 字节，绝不触碰尾后字节。
+#[inline(never)]
+pub(super) unsafe fn copy_rgb_nonoverlap(src: *const u8, dst: *mut u8, pixels: usize) {
+    // SAFETY: 调用者保证完整跨度。q/d 搬运使用 NEON；小尾用 ARM64
+    // 标量寄存器 ldr/str，仍是显式原生汇编，不回退 Rust 逐像素循环。
+    // 未使用 nomem/readonly/pure：编译器可见其读写内存；显式声明向量、
+    // 临时寄存器及指针/长度修改，默认条件码 clobber；不操作栈或手写 ABI。
+    unsafe {
+        core::arch::asm!(
+            "cmp {bytes}, #16",
+            "b.lo 2f",
+            "ldr q0, [{src}], #16",
+            "str q0, [{dst}], #16",
+            "sub {bytes}, {bytes}, #16",
+            "2:",
+            "cmp {bytes}, #8",
+            "b.lo 3f",
+            "ldr d0, [{src}], #8",
+            "str d0, [{dst}], #8",
+            "sub {bytes}, {bytes}, #8",
+            "3:",
+            "tbz {bytes}, #2, 4f",
+            "ldr {temp:w}, [{src}], #4",
+            "str {temp:w}, [{dst}], #4",
+            "4:",
+            "tbz {bytes}, #1, 5f",
+            "ldrh {temp:w}, [{src}], #2",
+            "strh {temp:w}, [{dst}], #2",
+            "5:",
+            "tbz {bytes}, #0, 6f",
+            "ldrb {temp:w}, [{src}]",
+            "strb {temp:w}, [{dst}]",
+            "6:",
+            src = inout(reg) src => _,
+            dst = inout(reg) dst => _,
+            bytes = inout(reg) (pixels * 3) => _,
+            temp = out(reg) _,
+            out("v0") _,
+            options(nostack),
+        );
+    }
+}
