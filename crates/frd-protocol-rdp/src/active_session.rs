@@ -4201,4 +4201,314 @@ mod tests {
             Ok(())
         }
     }
+
+    // 仅消费真实命令、固定 encoder 和 writer；oracle 不使用 IronRDP decoder。
+    mod text_wire_consumer {
+        use super::*;
+        use frd_core::SessionInput;
+        use frd_protocol_api::SessionCommand;
+
+        struct TextWriter {
+            session_id: SessionId,
+            commands: mpsc::Sender<SessionCommand>,
+            runtime: ProtocolRuntime,
+            input: RdpInputState,
+            drain: crate::runtime::ActiveCommandDrain,
+            stage: ironrdp::session::ActiveStage,
+            image: DecodedImage,
+            baseline: RdpBaseline,
+            writer: OrderedRdpWriter<RecordingIo>,
+        }
+
+        impl TextWriter {
+            fn new() -> Self {
+                let session_id = SessionId::allocate();
+                let (commands, command_rx) = mpsc::channel();
+                let mut runtime = ProtocolRuntime::new(
+                    session_id,
+                    command_rx,
+                    Box::new(NoopEvents),
+                    Box::new(RecordingFrames(Arc::new(Mutex::new(Vec::new())))),
+                    None,
+                    Box::new(NoopWake),
+                );
+                let baseline = RdpBaseline::begin(
+                    &mut runtime,
+                    session_id,
+                    PixelSize {
+                        width: 2,
+                        height: 2,
+                    },
+                )
+                .expect("真实 runtime generation 建立");
+                Self {
+                    session_id,
+                    commands,
+                    runtime,
+                    input: RdpInputState::new(),
+                    drain: crate::runtime::ActiveCommandDrain::new(),
+                    stage: stage(false, false),
+                    image: DecodedImage::new(IronPixelFormat::RgbA32, 2, 2),
+                    baseline,
+                    writer: OrderedRdpWriter::new(Framed::new(RecordingIo::default())),
+                }
+            }
+
+            fn send(&self, text: String) {
+                self.send_at(self.session_id, 1, text);
+            }
+
+            fn send_at(&self, session_id: SessionId, generation: u64, text: String) {
+                self.commands
+                    .send(SessionCommand::Input(SessionInput {
+                        session_id,
+                        generation,
+                        event: InputEvent::Text { utf8: text },
+                    }))
+                    .expect("合成 Text 命令入队");
+            }
+
+            fn drain_once(&mut self) -> (usize, bool) {
+                let crate::runtime::ActiveCommandBatch::Continue {
+                    events,
+                    optional_commands,
+                    pending,
+                } = crate::runtime::drain_active_commands(
+                    &mut self.runtime,
+                    &mut self.input,
+                    &mut self.drain,
+                )
+                .expect("真实命令 drain 不产生输入错误")
+                else {
+                    panic!("Text 不得结束会话");
+                };
+                assert!(optional_commands.is_empty());
+                assert!(events.len() <= 255);
+                let processed =
+                    super::super::process_input_batch(&mut self.stage, &mut self.image, 1, &events)
+                        .expect("固定 IronRDP encoder 接受实际 drain 批次");
+                assert_eq!(
+                    route_active_outputs(
+                        processed,
+                        &mut self.writer,
+                        &mut self.runtime,
+                        &mut self.baseline,
+                        true,
+                    )
+                    .expect("真实 ResponseFrame 写入 RecordingIo"),
+                    ActiveOutputControl::Continue,
+                );
+                assert!(!self.runtime.requires_shutdown());
+                (events.len(), pending)
+            }
+
+            fn drain_commit(&mut self) -> Vec<(usize, bool)> {
+                let mut batches = Vec::new();
+                // 有限循环让 pending 卡住成为明确失败，而非挂起测试。
+                for _ in 0..200 {
+                    let batch = self.drain_once();
+                    assert!(batch.0 > 0, "当前合成 commit 必须有事件");
+                    batches.push(batch);
+                    if !batch.1 {
+                        return batches;
+                    }
+                }
+                panic!("合成 commit 未排空 pending");
+            }
+
+            fn finish(mut self) -> Vec<u8> {
+                assert_eq!(self.drain_once(), (0, false), "末尾无多余事件或 pending");
+                assert!(self.runtime.try_next_command().is_none(), "所有命令已消费");
+                let releases = self.input.stop();
+                assert!(releases.is_empty(), "Text 后没有剩余 Unicode 释放");
+                let processed = super::super::process_input_batch(
+                    &mut self.stage,
+                    &mut self.image,
+                    1,
+                    &releases,
+                )
+                .expect("空 stop 批次可处理");
+                assert_eq!(
+                    route_active_outputs(
+                        processed,
+                        &mut self.writer,
+                        &mut self.runtime,
+                        &mut self.baseline,
+                        true,
+                    )
+                    .expect("stop 输出可路由"),
+                    ActiveOutputControl::Continue,
+                );
+                assert!(!self.runtime.requires_shutdown());
+                assert!(self.writer.is_writable());
+                self.writer.into_framed().into_inner_no_leftover().written
+            }
+        }
+
+        struct WireFrame<'a> {
+            raw: &'a [u8],
+            events: &'a [u8],
+            count: usize,
+        }
+
+        // MS-RDPBCGR 2.2.8.1.2 / 2.2.8.1.2.2.2 的独立字节检查器。
+        // 不调用生产 translate、UTF16 转换、encoder 或同库 decoder 生成预期。
+        fn inspect_wire(mut wire: &[u8]) -> Vec<WireFrame<'_>> {
+            let mut frames = Vec::new();
+            while !wire.is_empty() {
+                assert!(wire.len() >= 2, "完整 FastPath header");
+                assert_eq!(wire[0] & 0xc3, 0, "action/保留位/内部加密标志为零");
+                let mut cursor = 2;
+                let length = if wire[1] & 0x80 == 0 {
+                    usize::from(wire[1])
+                } else {
+                    assert!(wire.len() >= 3, "完整双字节 length");
+                    cursor = 3;
+                    let length = (usize::from(wire[1] & 0x7f) << 8) | usize::from(wire[2]);
+                    assert!(length > 127, "双字节 length 必须必要");
+                    length
+                };
+                assert!((cursor..=wire.len()).contains(&length), "声明 length 有界");
+                let raw = &wire[..length];
+                let inline_count = usize::from((wire[0] >> 2) & 0x0f);
+                let count = if inline_count == 0 {
+                    assert!(cursor < raw.len(), "显式 numEvents 存在");
+                    let count = usize::from(raw[cursor]);
+                    cursor += 1;
+                    assert!(count >= 16, "大批次才使用显式 numEvents");
+                    count
+                } else {
+                    inline_count
+                };
+                assert!((1..=255).contains(&count));
+                assert_eq!(length, cursor + count * 3, "固定 Unicode 事件且无尾随字节");
+                let events = &raw[cursor..];
+                for event in events.chunks_exact(3) {
+                    assert!(matches!(event[0], 0x80 | 0x81), "仅 Unicode down/up");
+                }
+                if count == 255 {
+                    assert_eq!(length, 769, "255 Unicode 满包的独立长度 oracle");
+                    assert_eq!(&raw[..4], &[0x00, 0x83, 0x01, 0xff]);
+                }
+                frames.push(WireFrame { raw, events, count });
+                wire = &wire[length..];
+            }
+            frames
+        }
+
+        #[test]
+        fn text_wire_consumer_fixed_ascii_cjk_surrogates_reaches_writer() {
+            let mut h = TextWriter::new();
+            h.send_at(SessionId::allocate(), 1, "x".to_owned());
+            h.send_at(h.session_id, 2, "y".to_owned());
+            h.send("A中😀".to_owned());
+            assert_eq!(h.drain_once(), (8, false));
+            let wire = h.finish();
+            assert_eq!(
+                wire,
+                [
+                    0x20, 0x1a, // 八事件，整包 26 bytes。
+                    0x80, 0x41, 0x00, 0x81, 0x41, 0x00, // A
+                    0x80, 0x2d, 0x4e, 0x81, 0x2d, 0x4e, // 中
+                    0x80, 0x3d, 0xd8, 0x80, 0x00, 0xde, // high down, low down
+                    0x81, 0x3d, 0xd8, 0x81, 0x00, 0xde, // high up, low up
+                ]
+            );
+            assert_eq!(inspect_wire(&wire).len(), 1);
+        }
+
+        #[test]
+        fn text_wire_consumer_distinct_repeats_empty_and_controls_keep_unicode_values() {
+            let mut h = TextWriter::new();
+            h.send(String::new());
+            assert_eq!(h.drain_once(), (0, false));
+            h.send("a".to_owned());
+            h.send("a".to_owned());
+            assert_eq!(h.drain_once(), (4, false));
+            h.send("\0\t\r\n".to_owned());
+            assert_eq!(h.drain_once(), (8, false));
+            let wire = h.finish();
+            assert_eq!(
+                wire,
+                [
+                    0x10, 0x0e, // 两个独立相同 Text，各自 down/up。
+                    0x80, 0x61, 0x00, 0x81, 0x61, 0x00, 0x80, 0x61, 0x00, 0x81, 0x61, 0x00, 0x20,
+                    0x1a, // 控制字符保持原值 Unicode，不转换物理键。
+                    0x80, 0x00, 0x00, 0x81, 0x00, 0x00, 0x80, 0x09, 0x00, 0x81, 0x09, 0x00, 0x80,
+                    0x0d, 0x00, 0x81, 0x0d, 0x00, 0x80, 0x0a, 0x00, 0x81, 0x0a, 0x00,
+                ]
+            );
+            assert_eq!(inspect_wire(&wire).len(), 2);
+        }
+
+        #[test]
+        fn text_wire_consumer_command_limits_and_surrogate_split_have_exact_pdus() {
+            let mut h = TextWriter::new();
+            let texts = [
+                "a".repeat(16384),
+                "中".repeat(5461),
+                "😀".repeat(4096),
+                format!("{}😀", "a".repeat(127)),
+            ];
+            assert_eq!(
+                texts.each_ref().map(|text| text.len()),
+                [16384, 16383, 16384, 131]
+            );
+            // 所有命令先入队，证明前一 commit 的 pending 不吞掉或重排后续命令。
+            for text in texts {
+                h.send(text);
+            }
+            let packet_counts = [129, 43, 65, 2];
+            let last_counts = [128, 212, 64, 3];
+            for (packets, last) in packet_counts.into_iter().zip(last_counts) {
+                let batches = h.drain_commit();
+                assert_eq!(batches.len(), packets);
+                assert_eq!(batches.last(), Some(&(last, false)));
+                assert!(batches[..batches.len() - 1]
+                    .iter()
+                    .all(|batch| *batch == (255, true)));
+            }
+            let wire = h.finish();
+            let frames = inspect_wire(&wire);
+            assert_eq!(frames.len(), 239);
+            // 固定小端码元/flags pattern；不从输入 String 或生产转换构造 expected。
+            let ascii = [0x80, 0x61, 0x00, 0x81, 0x61, 0x00];
+            let cjk = [0x80, 0x2d, 0x4e, 0x81, 0x2d, 0x4e];
+            let emoji = [
+                0x80, 0x3d, 0xd8, 0x80, 0x00, 0xde, 0x81, 0x3d, 0xd8, 0x81, 0x00, 0xde,
+            ];
+            let mut boundary = ascii.repeat(127);
+            boundary.extend_from_slice(&emoji);
+            let expected = [
+                ascii.repeat(16384),
+                cjk.repeat(5461),
+                emoji.repeat(4096),
+                boundary,
+            ];
+            let mut offset = 0;
+            for ((packets, last), expected) in
+                packet_counts.into_iter().zip(last_counts).zip(expected)
+            {
+                let current = &frames[offset..offset + packets];
+                assert_eq!(current.last().unwrap().count, last);
+                assert!(current[..packets - 1]
+                    .iter()
+                    .all(|frame| frame.count == 255));
+                let actual: Vec<u8> = current
+                    .iter()
+                    .flat_map(|frame| frame.events.iter().copied())
+                    .collect();
+                assert_eq!(actual, expected, "writer 字节保持全部码元和顺序");
+                offset += packets;
+            }
+            assert_eq!(offset, frames.len());
+            let boundary = &frames[237..];
+            assert_eq!(&boundary[0].raw[766..], &[0x80, 0x3d, 0xd8]);
+            assert_eq!(
+                boundary[1].raw,
+                &[0x0c, 0x0b, 0x80, 0x00, 0xde, 0x81, 0x3d, 0xd8, 0x81, 0x00, 0xde],
+                "跨 PDU 的 low down/high up/low up 保持顺序",
+            );
+        }
+    }
 }

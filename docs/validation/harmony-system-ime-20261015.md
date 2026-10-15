@@ -79,3 +79,12 @@ Fix1只修改Index与实际surface consumer，其余16项冻结源保持。原18
 当前提示合并多个失败分支，尚无SDK数值错误或阶段证据，不能将其直接归因于ICU、真实焦点、SDK订阅/附着或Owner来源确认。已转入只读审计以确定最小无正文诊断，禁止凭猜测放宽输入来源门或增加私有API。现存界面记录位于`root-app-context/ui/phone/`的`ime-open-*`和`ime-retry-*`；PC没有观察、点击或安装。
 
 20:58:30通过当前浮动岛断开动作主动结束手机会话，20:58:32已回普通表单。既有generic输入法提示仍留在表单，后续重试是否产生新的失败不能单凭相同旧文案判断；真实候选与文字结果仍未通过。
+
+
+## RDP真实文字序列化与writer回归
+
+Task5C2R仅在既有`active_session.rs`测试模块追加310行，生产前缀和全部原测试字节保持。独立Spec PASS / Quality APPROVE，三组新consumer实际经过SessionCommand、ProtocolRuntime身份门、command drain、固定IronRDP FastPath encoder、output router及OrderedRdpWriter，最终检查RecordingIo字节，expected不使用同库decoder或生产UTF16转换。
+
+固定`A中😀`、两个相同独立提交、空串和NUL/Tab/CR/LF保持预期Unicode字节；长ASCII/CJK/emoji及127ASCII+emoji四命令FIFO分别129/43/65/2PDU，255事件满包769字节，所有码元顺序、声明长度、pending排空及空stop无额外释放均验证。另一session及不匹配generation被拒；该负例实际generation2、当前1，不称为“旧generation”，作者冻结报告原措辞作为非阻塞Minor保留并在此澄清。
+
+Rust1.96 macOS ARM64离线聚焦3项、完整RDP362项通过，11项既有ignored未启用；限定格式及root Git diff检查通过。最初新增夹具导入SessionInput错误E0603保留，修正后通过，无生产缺陷修复。冻结源码SHA256 `49592625f89d8d7fb25347a9ab34b0cc7192300c65efaf625637f4bb2a5e6857`，证据在`target/harmony-rdp-text-wire-20261015/`；root与独立reviewer分别核19项artifact、真实base及原源码字节重建。这只增加宿主序列化/writer层证据，不证明HAP/native、真实socket、系统IME、服务端Unicode能力或Windows应用文字结果。
