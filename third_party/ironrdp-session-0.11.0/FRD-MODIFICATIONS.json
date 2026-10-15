@@ -9,18 +9,18 @@
     },
     "src/fast_path.rs": {
       "upstream_sha256": "6f617adab8e20101c93226b649ab90ba927f54305f741635412975211bade8d3",
-      "post_sha256": "5a94025297abc93cdffc76377a76689810a46d207d8717a918e0364855c8cf16",
-      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection"
+      "post_sha256": "766299c0df8438dbc793207aaeaf68aa69f8514ccec64a5080ed470975b8a6ee",
+      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection; A2.10B2 retained native cursor decode/composite/copy consumers, preflighted geometry/storage and shared transitions; cursor remains empty decoded-content coverage"
     },
     "src/active_stage.rs": {
       "upstream_sha256": "e16cf3d0eadf92c9803fadca39efad540e0d6eb8a19902ed0143175b7e24b97a",
-      "post_sha256": "59c2c50f7db940fe5ff12dd16390d2205647a7a67f8c875707c1e6f6ac342672",
-      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection"
+      "post_sha256": "0aa2f768183f69d811fe9e4a26de8ea9a5052642a151ed168c5c3ec8cd16fcdb",
+      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection; A2.10B2 retained native cursor decode/composite/copy consumers, preflighted geometry/storage and shared transitions; cursor remains empty decoded-content coverage"
     },
     "src/image.rs": {
       "upstream_sha256": "61cb9451695daa51e4e9bfe05ee7fae3faf746ae5275cb178b8a1f09c5cb5499",
-      "post_sha256": "c4a26906263a368115871c10d2a07286ba5d17e11dbb31850b0182906d6ba248",
-      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection"
+      "post_sha256": "5c27ad16c071feabedd483a8ea5002515facaabde385defa292541fc9692b4d2",
+      "reason": "A2.8B additive rich session receipts with collector-off old wrappers; checked portable complete-source crop and exact successful tile/content coverage, bounded call-wide metadata; no production selection; A2.10B2 retained native cursor decode/composite/copy consumers, preflighted geometry/storage and shared transitions; cursor remains empty decoded-content coverage"
     }
   },
   "added_files": {
@@ -49,7 +49,9 @@
     "tests/test_image_optional_mutations.py": "c2161661abd20fc116270a4052ac8f09fc0edc0e8f5b0ff26eb025536de56828",
     "tests/decoded_coverage.rs": "58abb78ee6e736d9a9487c181b2d44376e1253c1074a694bf8418c6d662fc273",
     "tests/run_decoded_coverage_tests.py": "a781ef986c663335281aa2fdeb0ce8f2b7ef489fcb3c30cca3e7c95e97ead96a",
-    "tests/test_decoded_coverage_mutations.py": "ed5bce3a150323372151da31d09dd16c27f53fd5510d234d49f4d42d6dc3663b"
+    "tests/test_decoded_coverage_mutations.py": "ed5bce3a150323372151da31d09dd16c27f53fd5510d234d49f4d42d6dc3663b",
+    "tests/cursor_consumers.rs": "d5f5dea337d0571605cc23f20d1fde071ce91c35798eda1181d4532ed923f553",
+    "tests/cursor_image_consumers.rs": "32b3df56c643bdb53f569cdfd68d4071f42cccb67a7f76b26432d37909e0229e"
   },
   "image_consumer_fixture_sha256": "c90e24ae846f89aabe58eebbfd2b9daa552b6787506c95a4db9d3fdb9743ec80"
 }

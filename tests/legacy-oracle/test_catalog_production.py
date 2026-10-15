@@ -35,6 +35,24 @@ class ProductionInventoryTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_production_copy(self.base, 'ironrdp-graphics-0.9.0')
 
+    def test_graphics_cursor_mutation_without_matching_posthash_is_rejected(self):
+        path = self.base / 'src/pointer.rs'
+        path.write_bytes(path.read_bytes() + b'\n// unrecorded cursor mutation\n')
+        with self.assertRaises(AssertionError):
+            validate_production_copy(self.base, 'ironrdp-graphics-0.9.0')
+
+    def test_graphics_cursor_posthash_and_original_identity_are_exact(self):
+        path = self.base / 'FRD-MODIFICATIONS.json'
+        original = path.read_text()
+        for key in ['post_sha256', 'upstream_sha256']:
+            with self.subTest(key=key):
+                data = json.loads(original)
+                data['modified_originals']['src/pointer.rs'][key] = '0' * 64
+                path.write_text(json.dumps(data))
+                with self.assertRaises(AssertionError):
+                    validate_production_copy(self.base, 'ironrdp-graphics-0.9.0')
+        path.write_text(original)
+
     def test_planar_mutation_without_matching_posthash_is_rejected(self):
         for relative in ['src/rdp6/rle.rs', 'src/rdp6/bitmap_stream/decoder.rs']:
             with self.subTest(relative=relative):

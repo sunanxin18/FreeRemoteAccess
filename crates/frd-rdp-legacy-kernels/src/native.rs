@@ -10,6 +10,8 @@ mod arch;
 use arch::*;
 #[path = "bitmap.rs"]
 mod bitmap;
+#[path = "cursor.rs"]
+mod cursor;
 #[path = "pixel.rs"]
 mod pixel;
 #[path = "planar.rs"]
@@ -45,6 +47,8 @@ pub(super) fn kernels() -> NativeKernels {
         planar_rgb: planar::rgb,
         planar_ycocg: planar::ycocg,
         pixel_row: pixel::row,
+        cursor_decode: cursor::decode,
+        cursor_composite: cursor::composite,
     }
 }
 

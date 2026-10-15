@@ -24,7 +24,7 @@ def validate_production_copy(base, name):
         assert inventory['upstream_archive_sha256'] == 'c7493e426b6a8104cd497e518ba7781a9c7fc9a5f58a9cc0c1111e6d66f63bcc'
         modifications = inventory['modified_originals']
         # 显式窄边界：不能通过向 inventory 添加其他源路径来扩大豁免。
-        assert set(modifications) == {'Cargo.toml', 'src/rle.rs', 'src/rdp6/rle.rs', 'src/rdp6/bitmap_stream/decoder.rs', 'src/rlgr.rs', 'src/lib.rs'}, set(modifications)
+        assert set(modifications) == {'Cargo.toml', 'src/rle.rs', 'src/rdp6/rle.rs', 'src/rdp6/bitmap_stream/decoder.rs', 'src/rlgr.rs', 'src/lib.rs', 'src/pointer.rs'}, set(modifications)
     elif name == 'ironrdp-session-0.11.0':
         inventory = json.loads((base / 'FRD-MODIFICATIONS.json').read_text())
         assert inventory['schema'] == 1

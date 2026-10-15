@@ -88,7 +88,7 @@ impl Processor {
                 coverage.reserve_entry()?;
             }
             if let Some((x, y)) = self.mouse_pos_update.take() {
-                if let Some(rect) = image.move_pointer(x, y)? {
+                if let Some(rect) = image.move_pointer_with_kernels(x, y, self.native_legacy_kernels.as_ref())? {
                     processor_updates.push(UpdateKind::Region(rect));
                 }
             }
@@ -135,10 +135,11 @@ impl Processor {
             if self.mouse_pos_update.is_some() {
                 coverage.reserve_entries(1 + updates.iter().filter(|u| matches!(u, UpdateKind::Region(_))).count())?;
             }
-            if let Some((x, y)) = self.mouse_pos_update.take() {
-                if let Some(rect) = image.move_pointer(x, y)? {
+            if let Some((x, y)) = self.mouse_pos_update {
+                if let Some(rect) = image.move_pointer_with_kernels(x, y, self.native_legacy_kernels.as_ref())? {
                     updates.push(UpdateKind::Region(rect));
                 }
+                self.mouse_pos_update = None;
             }
         }
         Ok(())
@@ -620,7 +621,7 @@ impl Processor {
                             .filter(|u| matches!(u, UpdateKind::Region(_)))
                             .count(),
                     )?;
-                    if let Some(rect) = image.hide_pointer()? {
+                    if let Some(rect) = image.hide_pointer_with_kernels(self.native_legacy_kernels.as_ref())? {
                         processor_updates.push(UpdateKind::Region(rect));
                     }
                 }
@@ -636,7 +637,7 @@ impl Processor {
                             .filter(|u| matches!(u, UpdateKind::Region(_)))
                             .count(),
                     )?;
-                    if let Some(rect) = image.hide_pointer()? {
+                    if let Some(rect) = image.hide_pointer_with_kernels(self.native_legacy_kernels.as_ref())? {
                         processor_updates.push(UpdateKind::Region(rect));
                     }
                 }
@@ -654,7 +655,9 @@ impl Processor {
                             .filter(|u| matches!(u, UpdateKind::Region(_)))
                             .count(),
                     )?;
-                    if let Some(rect) = image.move_pointer(position.x, position.y)? {
+                    if let Some(rect) =
+                        image.move_pointer_with_kernels(position.x, position.y, self.native_legacy_kernels.as_ref())?
+                    {
                         processor_updates.push(UpdateKind::Region(rect));
                     }
                 }
@@ -662,10 +665,14 @@ impl Processor {
             PointerUpdateData::Color(pointer) => {
                 let cache_index = pointer.cache_index;
 
-                let decoded_pointer = Arc::new(
-                    DecodedPointer::decode_color_pointer_attribute(&pointer, bitmap_target)
+                let decoded_pointer = Arc::new(match self.native_legacy_kernels.as_ref() {
+                    Some(kernels) => {
+                        DecodedPointer::decode_color_pointer_attribute_native(&pointer, bitmap_target, kernels)
+                            .map_err(|e| SessionError::custom("failed to decode color pointer attribute", e))?
+                    }
+                    None => DecodedPointer::decode_color_pointer_attribute(&pointer, bitmap_target)
                         .map_err(|e| SessionError::custom("failed to decode color pointer attribute", e))?,
-                );
+                });
 
                 self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 let _ = self
@@ -682,7 +689,9 @@ impl Processor {
                 }
                 if !self.pointer_software_rendering {
                     processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&decoded_pointer)));
-                } else if let Some(rect) = image.update_pointer(decoded_pointer)? {
+                } else if let Some(rect) =
+                    image.update_pointer_with_kernels(decoded_pointer, self.native_legacy_kernels.as_ref())?
+                {
                     processor_updates.push(UpdateKind::Region(rect));
                 }
             }
@@ -705,11 +714,13 @@ impl Processor {
                     }
                     if !self.pointer_software_rendering {
                         processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&cached_pointer)));
-                    } else if let Some(rect) = image.update_pointer(cached_pointer)? {
+                    } else if let Some(rect) =
+                        image.update_pointer_with_kernels(cached_pointer, self.native_legacy_kernels.as_ref())?
+                    {
                         processor_updates.push(UpdateKind::Region(rect));
                     } else {
                         // In case pointer was hidden previously
-                        if let Some(rect) = image.show_pointer()? {
+                        if let Some(rect) = image.show_pointer_with_kernels(self.native_legacy_kernels.as_ref())? {
                             processor_updates.push(UpdateKind::Region(rect));
                         }
                     }
@@ -720,10 +731,12 @@ impl Processor {
             PointerUpdateData::New(pointer) => {
                 let cache_index = pointer.color_pointer.cache_index;
 
-                let decoded_pointer = Arc::new(
-                    DecodedPointer::decode_pointer_attribute(&pointer, bitmap_target)
+                let decoded_pointer = Arc::new(match self.native_legacy_kernels.as_ref() {
+                    Some(kernels) => DecodedPointer::decode_pointer_attribute_native(&pointer, bitmap_target, kernels)
                         .map_err(|e| SessionError::custom("failed to decode pointer attribute", e))?,
-                );
+                    None => DecodedPointer::decode_pointer_attribute(&pointer, bitmap_target)
+                        .map_err(|e| SessionError::custom("failed to decode pointer attribute", e))?,
+                });
 
                 self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 let _ = self
@@ -740,17 +753,23 @@ impl Processor {
                 }
                 if !self.pointer_software_rendering {
                     processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&decoded_pointer)));
-                } else if let Some(rect) = image.update_pointer(decoded_pointer)? {
+                } else if let Some(rect) =
+                    image.update_pointer_with_kernels(decoded_pointer, self.native_legacy_kernels.as_ref())?
+                {
                     processor_updates.push(UpdateKind::Region(rect));
                 }
             }
             PointerUpdateData::Large(pointer) => {
                 let cache_index = pointer.cache_index;
 
-                let decoded_pointer: Arc<DecodedPointer> = Arc::new(
-                    DecodedPointer::decode_large_pointer_attribute(&pointer, bitmap_target)
+                let decoded_pointer: Arc<DecodedPointer> = Arc::new(match self.native_legacy_kernels.as_ref() {
+                    Some(kernels) => {
+                        DecodedPointer::decode_large_pointer_attribute_native(&pointer, bitmap_target, kernels)
+                            .map_err(|e| SessionError::custom("failed to decode large pointer attribute", e))?
+                    }
+                    None => DecodedPointer::decode_large_pointer_attribute(&pointer, bitmap_target)
                         .map_err(|e| SessionError::custom("failed to decode large pointer attribute", e))?,
-                );
+                });
 
                 self.flush_native_mouse(image, &mut processor_updates, coverage)?;
                 let _ = self
@@ -767,7 +786,9 @@ impl Processor {
                 }
                 if !self.pointer_software_rendering {
                     processor_updates.push(UpdateKind::PointerBitmap(Arc::clone(&decoded_pointer)));
-                } else if let Some(rect) = image.update_pointer(decoded_pointer)? {
+                } else if let Some(rect) =
+                    image.update_pointer_with_kernels(decoded_pointer, self.native_legacy_kernels.as_ref())?
+                {
                     processor_updates.push(UpdateKind::Region(rect));
                 }
             }
@@ -1401,3 +1422,7 @@ impl FrameMarkerProcessor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/cursor_consumers.rs"]
+mod cursor_consumers;

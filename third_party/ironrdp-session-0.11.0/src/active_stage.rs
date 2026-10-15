@@ -186,7 +186,7 @@ impl ActiveStage {
 
         // Graphics update is only sent when update is visually changed the framebuffer
         coverage.reserve_entry()?;
-        if let Some(rect) = image.move_pointer(mouse_x, mouse_y)? {
+        if let Some(rect) = image.move_pointer_with_kernels(mouse_x, mouse_y, self.native_legacy_kernels.as_ref())? {
             if coverage.enabled {
                 coverage.receipts.push(crate::image::DecodedCoverageReceipt {
                     graphics_output_index: output.len(),

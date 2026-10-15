@@ -96,6 +96,7 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 4A2.10A PC Stage初始过程子步骤：同冻结618168c的六轮/12任务实际结束，root复核124产物身份及174组原始计数/校验和/终态；保留20项比值未达标、128组原版不足100ms。后续window1原版先行/N-C一轮58组补充也实际结束，root复核149产物及window0/2保持，最终21项比值未达标、129组原版不足100ms；完整性能及资格仍OPEN，见[鸿蒙目标记录](../../validation/rdp-legacy-pipeline-ohos-20261014.md)。
 - [x] Task 4A2.10F 色彩预检优化源码、宿主聚焦正确性及实际Mac ARM64对象复审通过；固定六次微测量保留全部短测量与不利样本，未认定稳定性能收益。OHOS/SSE2/fullpipeline/包与生产资格仍OPEN，见[预检验证](../../validation/rfx-color-preflight-20261014.md)。
 - [x] Task 4A2.10A 手机完整流水线测量过程子步骤：冻结618168c的控制和全链实际进程已结束，root从原始日志核对50workloads/300组/150比值及18控制记录；保留9项比值、14项warm预算未达标及174组不足100ms的限制。仅测量过程完成，PC全链/两端分配观察及生产性能仍OPEN，见[鸿蒙目标记录](../../validation/rdp-legacy-pipeline-ohos-20261014.md)。
+- [x] Task 4A2.10B1/B2 宿主子步骤：checked NEON/SSE2 cursor行叶子与真实fast/slow/cache/pending/input/content/replacement接线完成，独立Spec/Quality审查通过；固定Rust1.96行parity/432原版记录/保护页及最终Mac ARM64直接ABI通过，consumer debug8/release9、graphics5、adapter筛选5、来源14项通过。固定微基准保留短测量和多数decode慢项；当前OHOS RDP release库编译通过，但目标运行/ABI/性能/普通HAP/live及规范alpha仍OPEN，见[光标验证](../../validation/rdp-cursor-native-20261015.md)。
 - [ ] Task 4A2.10 完成真实编码输入到Surface/mailbox/Startup的整管线原版对照与目标性能；补齐实际cursor像素热路径及按测量定位的瓶颈，解决SSE2 publication资格并保持默认与codec广告独立。
 - [ ] Task 4A2.7 完成八像素格式原生row与image/session接线，补Bitmap真实written计数、source stride/crop/padding和Set/Stream几何门，再验证每目标实际运行、性能、包与生产选择。
 - [x] Task 4B1 真实事务→原生呈现、统一视口与输入门接线完成（`87c829a`/`bccb321`），两台合成首帧、触点及本地重绘受限验证，跳帧重试修复经独立复审；不代表真实协议连接，见[呈现验证](../../validation/harmony-native-presentation-20261013.md)。

@@ -555,3 +555,7 @@ pub(crate) mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cursor_consumer_tests.rs"]
+mod cursor_consumer_tests;

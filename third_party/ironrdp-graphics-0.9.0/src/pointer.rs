@@ -23,6 +23,7 @@ use ironrdp_core::ReadCursor;
 use ironrdp_pdu::pointer::{ColorPointerAttribute, LargePointerAttribute, PointerAttribute};
 
 use crate::color_conversion::rdp_16bit_to_rgb;
+use crate::legacy_native::{CursorBitmapMode, CursorXorFormat, KernelError, NativeKernels};
 
 const SUPPORTED_COLOR_BPP: [u16; 4] = [1, 16, 24, 32];
 
@@ -71,6 +72,42 @@ impl core::error::Error for PointerError {
 impl From<ironrdp_pdu::PduError> for PointerError {
     fn from(error: ironrdp_pdu::PduError) -> Self {
         PointerError::Pdu(error)
+    }
+}
+
+/// 显式原生 materialization 的错误；Compatibility 的公开错误类型保持原样。
+#[derive(Debug)]
+pub enum NativePointerError {
+    Pointer(PointerError),
+    Kernel(KernelError),
+    Allocation(std::collections::TryReserveError),
+}
+impl core::fmt::Display for NativePointerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Pointer(e) => e.fmt(f),
+            Self::Kernel(e) => e.fmt(f),
+            Self::Allocation(e) => e.fmt(f),
+        }
+    }
+}
+impl core::error::Error for NativePointerError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Pointer(e) => Some(e),
+            Self::Kernel(e) => Some(e),
+            Self::Allocation(e) => Some(e),
+        }
+    }
+}
+impl From<PointerError> for NativePointerError {
+    fn from(e: PointerError) -> Self {
+        Self::Pointer(e)
+    }
+}
+impl From<KernelError> for NativePointerError {
+    fn from(e: KernelError) -> Self {
+        Self::Kernel(e)
     }
 }
 
@@ -130,54 +167,115 @@ impl DecodedPointer {
         src: &PointerAttribute<'_>,
         target: PointerBitmapTarget,
     ) -> Result<Self, PointerError> {
-        Self::decode_pointer(
-            PointerData {
-                width: src.color_pointer.width,
-                height: src.color_pointer.height,
-                xor_bpp: src.xor_bpp,
-                xor_mask: src.color_pointer.xor_mask,
-                and_mask: src.color_pointer.and_mask,
-                hot_spot_x: src.color_pointer.hot_spot.x,
-                hot_spot_y: src.color_pointer.hot_spot.y,
-            },
-            target,
-        )
+        Self::decode_pointer(PointerData::from(src), target)
+    }
+
+    /// 使用调用方保留的真实 ISA 能力；失败时不重试 Compatibility。
+    pub fn decode_pointer_attribute_native(
+        src: &PointerAttribute<'_>,
+        target: PointerBitmapTarget,
+        kernels: &NativeKernels,
+    ) -> Result<Self, NativePointerError> {
+        Self::decode_pointer_native(PointerData::from(src), target, kernels)
     }
 
     pub fn decode_color_pointer_attribute(
         src: &ColorPointerAttribute<'_>,
         target: PointerBitmapTarget,
     ) -> Result<Self, PointerError> {
-        Self::decode_pointer(
-            PointerData {
-                width: src.width,
-                height: src.height,
-                xor_bpp: 24,
-                xor_mask: src.xor_mask,
-                and_mask: src.and_mask,
-                hot_spot_x: src.hot_spot.x,
-                hot_spot_y: src.hot_spot.y,
-            },
-            target,
-        )
+        Self::decode_pointer(PointerData::from(src), target)
+    }
+
+    /// 使用调用方保留的真实 ISA 能力；失败时不重试 Compatibility。
+    pub fn decode_color_pointer_attribute_native(
+        src: &ColorPointerAttribute<'_>,
+        target: PointerBitmapTarget,
+        kernels: &NativeKernels,
+    ) -> Result<Self, NativePointerError> {
+        Self::decode_pointer_native(PointerData::from(src), target, kernels)
     }
 
     pub fn decode_large_pointer_attribute(
         src: &LargePointerAttribute<'_>,
         target: PointerBitmapTarget,
     ) -> Result<Self, PointerError> {
-        Self::decode_pointer(
-            PointerData {
-                width: src.width,
-                height: src.height,
-                xor_bpp: src.xor_bpp,
-                xor_mask: src.xor_mask,
-                and_mask: src.and_mask,
-                hot_spot_x: src.hot_spot.x,
-                hot_spot_y: src.hot_spot.y,
-            },
-            target,
-        )
+        Self::decode_pointer(PointerData::from(src), target)
+    }
+
+    /// 使用调用方保留的真实 ISA 能力；失败时不重试 Compatibility。
+    pub fn decode_large_pointer_attribute_native(
+        src: &LargePointerAttribute<'_>,
+        target: PointerBitmapTarget,
+        kernels: &NativeKernels,
+    ) -> Result<Self, NativePointerError> {
+        Self::decode_pointer_native(PointerData::from(src), target, kernels)
+    }
+
+    fn decode_pointer_native(
+        data: PointerData<'_>,
+        target: PointerBitmapTarget,
+        kernels: &NativeKernels,
+    ) -> Result<Self, NativePointerError> {
+        // 直接 API 的空尺寸优先于 bpp/mask 检查，且清除 hotspot。
+        if data.width == 0 || data.height == 0 {
+            return Ok(Self::new_invisible());
+        }
+        data.validate_bpp()?;
+        let width = usize::from(data.width);
+        let height = usize::from(data.height);
+        let xor_bits = width
+            .checked_mul(usize::from(data.xor_bpp))
+            .ok_or(KernelError::InvalidDimensions)?;
+        let xor_stride = Stride::checked_from_bits(xor_bits)?;
+        let and_stride = Stride::checked_from_bits(width)?;
+        data.validate_xor(
+            xor_stride
+                .length
+                .checked_mul(height)
+                .ok_or(KernelError::InvalidDimensions)?,
+        )?;
+        data.validate_and(
+            and_stride
+                .length
+                .checked_mul(height)
+                .ok_or(KernelError::InvalidDimensions)?,
+        )?;
+        let (row_bytes, bytes) = checked_bitmap_size(width, height)?;
+        let format = match data.xor_bpp {
+            1 => CursorXorFormat::Mono1,
+            16 => CursorXorFormat::Rgb565,
+            24 => CursorXorFormat::Bgr24,
+            32 => CursorXorFormat::Bgra32,
+            _ => unreachable!("validated pointer bpp"),
+        };
+        let mut bitmap_data = Vec::new();
+        bitmap_data
+            .try_reserve_exact(bytes)
+            .map_err(NativePointerError::Allocation)?;
+        bitmap_data.resize(bytes, 0);
+        for (row, out) in bitmap_data.chunks_exact_mut(row_bytes).enumerate() {
+            let wire_row = if data.xor_bpp == 1 { row } else { height - row - 1 };
+            let x = wire_row * xor_stride.length;
+            let a = wire_row * and_stride.length;
+            let and = if data.and_mask.is_empty() {
+                None
+            } else {
+                Some(&data.and_mask[a..a + and_stride.data_bytes])
+            };
+            let mode = match target {
+                PointerBitmapTarget::Software => CursorBitmapMode::Software,
+                PointerBitmapTarget::Accelerated => CursorBitmapMode::Accelerated { odd_row: row % 2 != 0 },
+            };
+            // padding 不进入叶子；两种 mask 使用同一 wire 行，checker 仅取输出行奇偶。
+            kernels.decode_cursor_row(format, mode, &data.xor_mask[x..x + xor_stride.data_bytes], and, out)?;
+        }
+        Ok(Self {
+            width: data.width,
+            height: data.height,
+            hotspot_x: data.hot_spot_x,
+            hotspot_y: data.hot_spot_y,
+            bitmap_data,
+        })
     }
 
     fn decode_pointer(data: PointerData<'_>, target: PointerBitmapTarget) -> Result<Self, PointerError> {
@@ -185,33 +283,21 @@ impl DecodedPointer {
             return Ok(Self::new_invisible());
         }
 
-        if !SUPPORTED_COLOR_BPP.contains(&data.xor_bpp) {
-            // 8bpp indexed colors are not supported yet (palette messages are not implemented)
-            // Other unknown bpps are not supported either
-            return Err(PointerError::NotSupportedBpp { bpp: data.xor_bpp });
-        }
+        data.validate_bpp()?;
 
         let flip_vertical = data.xor_bpp != 1;
 
         let and_stride = Stride::from_bits(data.width.into());
         let xor_stride = Stride::from_bits(usize::from(data.width) * usize::from(data.xor_bpp));
 
-        if data.xor_mask.len() != xor_stride.length * usize::from(data.height) {
-            return Err(PointerError::InvalidXorMaskSize {
-                expected: xor_stride.length * usize::from(data.height),
-                actual: data.xor_mask.len(),
-            });
-        }
+        data.validate_xor(xor_stride.length * usize::from(data.height))?;
 
         let default_and_mask = vec![0x00; and_stride.length * usize::from(data.height)];
         let mut and_mask = data.and_mask;
         if and_mask.is_empty() {
             and_mask = &default_and_mask;
-        } else if and_mask.len() != and_stride.length * usize::from(data.height) {
-            return Err(PointerError::InvalidAndMaskSize {
-                expected: and_stride.length * usize::from(data.height),
-                actual: data.and_mask.len(),
-            });
+        } else {
+            data.validate_and(and_stride.length * usize::from(data.height))?;
         }
 
         let mut bitmap_data = Vec::new();
@@ -285,6 +371,16 @@ impl DecodedPointer {
     }
 }
 
+// 256 MiB 是既有 legacy 资源策略，绝不是 pointer wire 尺寸上限。
+fn checked_bitmap_size(width: usize, height: usize) -> Result<(usize, usize), KernelError> {
+    let row_bytes = width.checked_mul(4).ok_or(KernelError::InvalidDimensions)?;
+    let bytes = row_bytes.checked_mul(height).ok_or(KernelError::InvalidDimensions)?;
+    if bytes > crate::rle::MAX_NATIVE_BITMAP_BYTES || bytes > isize::MAX as usize {
+        return Err(KernelError::InvalidDimensions);
+    }
+    Ok((row_bytes, bytes))
+}
+
 #[derive(Clone, Copy)]
 struct Stride {
     length: usize,
@@ -293,6 +389,17 @@ struct Stride {
 }
 
 impl Stride {
+    fn checked_from_bits(bits: usize) -> Result<Self, KernelError> {
+        let data_bytes = bits.checked_add(7).ok_or(KernelError::InvalidDimensions)? / 8;
+        let length = (bits.checked_add(15).ok_or(KernelError::InvalidDimensions)? / 16)
+            .checked_mul(2)
+            .ok_or(KernelError::InvalidDimensions)?;
+        Ok(Self {
+            length,
+            data_bytes,
+            padding: length - data_bytes,
+        })
+    }
     fn from_bits(bits: usize) -> Stride {
         let length = bit_stride_size_align_u16(bits);
         let data_bytes = bit_stride_size_align_u8(bits);
@@ -435,3 +542,67 @@ struct PointerData<'a> {
     hot_spot_x: u16,
     hot_spot_y: u16,
 }
+
+impl PointerData<'_> {
+    fn validate_bpp(&self) -> Result<(), PointerError> {
+        if !SUPPORTED_COLOR_BPP.contains(&self.xor_bpp) {
+            return Err(PointerError::NotSupportedBpp { bpp: self.xor_bpp });
+        }
+        Ok(())
+    }
+    fn validate_xor(&self, expected: usize) -> Result<(), PointerError> {
+        if self.xor_mask.len() != expected {
+            return Err(PointerError::InvalidXorMaskSize {
+                expected,
+                actual: self.xor_mask.len(),
+            });
+        }
+        Ok(())
+    }
+    fn validate_and(&self, expected: usize) -> Result<(), PointerError> {
+        if !self.and_mask.is_empty() && self.and_mask.len() != expected {
+            return Err(PointerError::InvalidAndMaskSize {
+                expected,
+                actual: self.and_mask.len(),
+            });
+        }
+        Ok(())
+    }
+}
+impl<'a> From<&PointerAttribute<'a>> for PointerData<'a> {
+    fn from(src: &PointerAttribute<'a>) -> Self {
+        Self {
+            xor_bpp: src.xor_bpp,
+            ..Self::from(&src.color_pointer)
+        }
+    }
+}
+impl<'a> From<&ColorPointerAttribute<'a>> for PointerData<'a> {
+    fn from(src: &ColorPointerAttribute<'a>) -> Self {
+        Self {
+            width: src.width,
+            height: src.height,
+            xor_bpp: 24,
+            xor_mask: src.xor_mask,
+            and_mask: src.and_mask,
+            hot_spot_x: src.hot_spot.x,
+            hot_spot_y: src.hot_spot.y,
+        }
+    }
+}
+impl<'a> From<&LargePointerAttribute<'a>> for PointerData<'a> {
+    fn from(src: &LargePointerAttribute<'a>) -> Self {
+        Self {
+            width: src.width,
+            height: src.height,
+            xor_bpp: src.xor_bpp,
+            xor_mask: src.xor_mask,
+            and_mask: src.and_mask,
+            hot_spot_x: src.hot_spot.x,
+            hot_spot_y: src.hot_spot.y,
+        }
+    }
+}
+#[cfg(test)]
+#[path = "../tests/cursor_consumers.rs"]
+mod cursor_consumers;

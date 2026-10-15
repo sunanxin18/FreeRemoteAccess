@@ -185,8 +185,100 @@ enum PointerLayer {
 }
 
 struct PointerRenderingState {
+    kernels: Option<NativeKernels>,
     redraw: bool,
     update_rectangle: InclusiveRectangle,
+}
+
+// 仅几何小值；预检不克隆 framebuffer，也不建立第二套 cursor 状态机。
+#[derive(Clone)]
+struct PointerGeometry {
+    src: InclusiveRectangle,
+    draw_x: u16,
+    draw_y: u16,
+    visible: bool,
+}
+
+/// 调用者已对整个操作预检；叶子不解析坐标，且所有合法 byte 的合成都是 total。
+#[expect(clippy::too_many_arguments)]
+fn copy_cursor_data_with_kernels(
+    from: &[u8],
+    from_pos: (usize, usize),
+    from_stride: usize,
+    to: &mut [u8],
+    to_stride: usize,
+    to_pos: (usize, usize),
+    size: (usize, usize),
+    dst_size: (usize, usize),
+    composite: bool,
+    kernels: Option<&NativeKernels>,
+) -> SessionResult<()> {
+    let Some(kernels) = kernels else {
+        copy_cursor_data(
+            from,
+            from_pos,
+            from_stride,
+            to,
+            to_stride,
+            to_pos,
+            size,
+            dst_size,
+            composite,
+        );
+        return Ok(());
+    };
+    if to_pos.0.checked_add(size.0).is_none_or(|x| x > dst_size.0)
+        || to_pos.1.checked_add(size.1).is_none_or(|y| y > dst_size.1)
+    {
+        return Ok(());
+    }
+    let bytes = size
+        .0
+        .checked_mul(4)
+        .ok_or_else(|| custom_err!("native cursor geometry", KernelError::InvalidDimensions))?;
+    // 所有行在首行写入前预检，不能在第二行错误后留下半张 cursor。
+    cursor_span(from.len(), from_pos, from_stride, size)?;
+    cursor_span(to.len(), to_pos, to_stride, size)?;
+    for row in 0..size.1 {
+        let a = (from_pos.1 + row) * from_stride + from_pos.0 * 4;
+        let b = (to_pos.1 + row) * to_stride + to_pos.0 * 4;
+        if composite {
+            // background/output 借用不重叠。固定四像素小 staging 包含短尾，
+            // 像素运算仍全部进入同一 checked SIMD row/core，不 clone 整行或整帧。
+            for (source, destination) in from[a..a + bytes].chunks(16).zip(to[b..b + bytes].chunks_mut(16)) {
+                let mut background = [0u8; 16];
+                kernels
+                    .copy_u8(destination, &mut background[..destination.len()])
+                    .map_err(|e| custom_err!("native cursor background", e))?;
+                kernels
+                    .composite_cursor_row(source, &background[..destination.len()], destination)
+                    .map_err(|e| custom_err!("native cursor composite", e))?;
+            }
+            #[cfg(test)]
+            NATIVE_CURSOR_CALLS.with(|v| v.borrow_mut().push(("cursor_composite", bytes)));
+        } else {
+            kernels
+                .copy_u8(&from[a..a + bytes], &mut to[b..b + bytes])
+                .map_err(|e| custom_err!("native cursor copy", e))?;
+            #[cfg(test)]
+            NATIVE_CURSOR_CALLS.with(|v| v.borrow_mut().push(("cursor_copy", bytes)));
+        }
+    }
+    Ok(())
+}
+fn cursor_span(length: usize, pos: (usize, usize), stride: usize, size: (usize, usize)) -> SessionResult<()> {
+    let end = size
+        .1
+        .checked_sub(1)
+        .and_then(|last| pos.1.checked_add(last))
+        .and_then(|y| y.checked_mul(stride))
+        .and_then(|n| pos.0.checked_mul(4).and_then(|x| n.checked_add(x)))
+        .and_then(|n| size.0.checked_mul(4).and_then(|w| n.checked_add(w)))
+        .ok_or_else(|| custom_err!("native cursor geometry", KernelError::InvalidDimensions))?;
+    if end > length {
+        return Err(custom_err!("native cursor span", KernelError::Length));
+    }
+    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -292,6 +384,7 @@ fn native_rect_size(rect: &InclusiveRectangle) -> Result<(usize, usize), KernelE
 }
 #[cfg(test)]
 std::thread_local! {
+    static NATIVE_CURSOR_CALLS: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     static NATIVE_IMAGE_CALLS: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -358,7 +451,11 @@ impl DecodedImage {
         rect.right < self.width && rect.bottom < self.height
     }
 
-    fn apply_pointer_layer(&mut self, layer: PointerLayer) -> SessionResult<Option<InclusiveRectangle>> {
+    fn apply_pointer_layer_with_kernels(
+        &mut self,
+        layer: PointerLayer,
+        kernels: Option<&NativeKernels>,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
         // Pointer is not hidden, but its texture is not visible on the screen, so we don't
         // need to render it
         if layer == PointerLayer::Pointer && !self.pointer_visible_on_screen {
@@ -404,7 +501,7 @@ impl DecodedImage {
                     return Ok(None);
                 }
 
-                copy_cursor_data(
+                copy_cursor_data_with_kernels(
                     &self.pointer_backbuffer,
                     (0, 0),
                     pointer_src_rect_width * 4,
@@ -414,7 +511,8 @@ impl DecodedImage {
                     (pointer_src_rect_width, pointer_src_rect_height),
                     (width, height),
                     false,
-                );
+                    kernels,
+                )?;
             }
             PointerLayer::Pointer => {
                 // Copy current background to backbuffer
@@ -424,7 +522,7 @@ impl DecodedImage {
                     .max(pointer_src_rect_width * pointer_src_rect_height * 4);
                 self.pointer_backbuffer.resize(buffer_size, 0);
 
-                copy_cursor_data(
+                copy_cursor_data_with_kernels(
                     &self.data,
                     (pointer_draw_x, pointer_draw_y),
                     width * 4,
@@ -434,10 +532,11 @@ impl DecodedImage {
                     (pointer_src_rect_width, pointer_src_rect_height),
                     (width, height),
                     false,
-                );
+                    kernels,
+                )?;
 
                 // Draw pointer (with compositing)
-                copy_cursor_data(
+                copy_cursor_data_with_kernels(
                     pointer.bitmap_data.as_slice(),
                     (
                         usize::from(self.pointer_src_rect.left),
@@ -450,7 +549,8 @@ impl DecodedImage {
                     (pointer_src_rect_width, pointer_src_rect_height),
                     (width, height),
                     true,
-                );
+                    kernels,
+                )?;
             }
         }
 
@@ -458,33 +558,167 @@ impl DecodedImage {
         Ok(Some(dest_rect))
     }
 
+    #[allow(dead_code)] // Compatibility 入口保持原语义。
     pub(crate) fn show_pointer(&mut self) -> SessionResult<Option<InclusiveRectangle>> {
+        self.show_pointer_with_kernels(None)
+    }
+
+    pub(crate) fn show_pointer_with_kernels(
+        &mut self,
+        kernels: Option<&NativeKernels>,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
         if !self.show_pointer {
+            if kernels.is_some() {
+                self.preflight_pointer_layers(None, None)?;
+            }
             self.show_pointer = true;
-            self.apply_pointer_layer(PointerLayer::Pointer)
+            self.apply_pointer_layer_with_kernels(PointerLayer::Pointer, kernels)
         } else {
             Ok(None)
         }
     }
 
+    #[allow(dead_code)] // Compatibility 入口保持原语义。
     pub(crate) fn hide_pointer(&mut self) -> SessionResult<Option<InclusiveRectangle>> {
+        self.hide_pointer_with_kernels(None)
+    }
+
+    pub(crate) fn hide_pointer_with_kernels(
+        &mut self,
+        kernels: Option<&NativeKernels>,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
         if self.show_pointer {
+            if kernels.is_some() {
+                self.preflight_pointer_layers(None, None)?;
+            }
             self.show_pointer = false;
-            self.apply_pointer_layer(PointerLayer::Background)
+            self.apply_pointer_layer_with_kernels(PointerLayer::Background, kernels)
         } else {
             Ok(None)
         }
     }
 
-    fn recalculate_pointer_geometry(&mut self) {
-        let x = self.pointer_x;
-        let y = self.pointer_y;
-
-        let pointer = match &self.pointer {
-            Some(pointer) if self.show_pointer => pointer,
-            _ => return,
+    /// 检查整个旧 restore 和未来 save/composite 的行范围，再预留所需 backbuffer。
+    /// 合法合成采用 wrapping total 算术，因此无需像素预演/overflow scratch。
+    fn preflight_pointer_layers(
+        &mut self,
+        future: Option<PointerGeometry>,
+        new_pointer: Option<&DecodedPointer>,
+    ) -> SessionResult<()> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let old = self.pointer_geometry();
+        if let Some(pointer) = self.pointer.as_deref() {
+            self.check_pointer_shape(pointer)?;
+            if !self.pointer_backbuffer.is_empty() {
+                let bytes = self.check_pointer_destination(&old)?;
+                if self.pointer_backbuffer.len() < bytes {
+                    return Err(custom_err!("native cursor background", KernelError::Length));
+                }
+            }
+        }
+        let pointer = new_pointer.or(self.pointer.as_deref());
+        let geometry = future.as_ref().unwrap_or(&old);
+        let required = if let Some(pointer) = pointer {
+            self.check_pointer_shape(pointer)?;
+            if geometry.visible {
+                self.check_pointer_spans(pointer, geometry)?
+            } else {
+                0
+            }
+        } else {
+            0
         };
+        self.pointer_backbuffer
+            .try_reserve_exact(required.saturating_sub(self.pointer_backbuffer.len()))
+            .map_err(|e| custom_err!("native cursor allocation", e))?;
+        Ok(())
+    }
+    fn check_pointer_shape(&self, pointer: &DecodedPointer) -> SessionResult<()> {
+        let bytes = usize::from(pointer.width)
+            .checked_mul(usize::from(pointer.height))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| custom_err!("native cursor geometry", KernelError::InvalidDimensions))?;
+        if bytes == 0 || bytes > MAX_NATIVE_BITMAP_BYTES || bytes > isize::MAX as usize {
+            return Err(custom_err!(
+                "native cursor resource limit",
+                KernelError::InvalidDimensions
+            ));
+        }
+        if bytes != pointer.bitmap_data.len() {
+            return Err(custom_err!("native cursor bitmap", KernelError::Length));
+        }
+        Ok(())
+    }
+    fn check_pointer_spans(&self, pointer: &DecodedPointer, geometry: &PointerGeometry) -> SessionResult<usize> {
+        let bytes = self.check_pointer_destination(geometry)?;
+        let size = native_rect_size(&geometry.src).map_err(|e| custom_err!("native cursor geometry", e))?;
+        let src = (usize::from(geometry.src.left), usize::from(geometry.src.top));
+        if src.0.checked_add(size.0).is_none_or(|v| v > usize::from(pointer.width))
+            || src
+                .1
+                .checked_add(size.1)
+                .is_none_or(|v| v > usize::from(pointer.height))
+        {
+            return Err(custom_err!("native cursor geometry", KernelError::InvalidDimensions));
+        }
+        cursor_span(pointer.bitmap_data.len(), src, usize::from(pointer.width) * 4, size)?;
+        Ok(bytes)
+    }
+    fn check_pointer_destination(&self, geometry: &PointerGeometry) -> SessionResult<usize> {
+        let size = native_rect_size(&geometry.src).map_err(|e| custom_err!("native cursor geometry", e))?;
+        let dst = (usize::from(geometry.draw_x), usize::from(geometry.draw_y));
+        if dst.0.checked_add(size.0).is_none_or(|v| v > usize::from(self.width))
+            || dst.1.checked_add(size.1).is_none_or(|v| v > usize::from(self.height))
+        {
+            return Err(custom_err!("native cursor geometry", KernelError::InvalidDimensions));
+        }
+        cursor_span(self.data.len(), dst, usize::from(self.width) * 4, size)?;
+        size.0
+            .checked_mul(size.1)
+            .and_then(|n| n.checked_mul(4))
+            .filter(|n| *n <= MAX_NATIVE_BITMAP_BYTES && *n <= isize::MAX as usize)
+            .ok_or_else(|| custom_err!("native cursor resource limit", KernelError::InvalidDimensions))
+    }
 
+    fn pointer_geometry(&self) -> PointerGeometry {
+        PointerGeometry {
+            src: self.pointer_src_rect.clone(),
+            draw_x: self.pointer_draw_x,
+            draw_y: self.pointer_draw_y,
+            visible: self.pointer_visible_on_screen,
+        }
+    }
+    fn set_pointer_geometry(&mut self, geometry: PointerGeometry) {
+        self.pointer_src_rect = geometry.src;
+        self.pointer_draw_x = geometry.draw_x;
+        self.pointer_draw_y = geometry.draw_y;
+        self.pointer_visible_on_screen = geometry.visible;
+    }
+    fn calculate_pointer_geometry(
+        &self,
+        pointer: Option<&DecodedPointer>,
+        x: u16,
+        y: u16,
+        show: bool,
+        checked: bool,
+    ) -> SessionResult<PointerGeometry> {
+        let mut geometry = self.pointer_geometry();
+        let pointer = match pointer {
+            Some(pointer) if show => pointer,
+            _ => return Ok(geometry),
+        };
+        if checked
+            && (self.width == 0
+                || self.height == 0
+                || pointer.width == 0
+                || pointer.height == 0
+                || (x >= pointer.hotspot_x && x - pointer.hotspot_x == u16::MAX)
+                || (y >= pointer.hotspot_y && y - pointer.hotspot_y == u16::MAX))
+        {
+            return Err(custom_err!("native cursor geometry", KernelError::InvalidDimensions));
+        }
         let left_virtual = i32::from(x) - i32::from(pointer.hotspot_x);
         let top_virtual = i32::from(y) - i32::from(pointer.hotspot_y);
         let right_virtual = left_virtual + i32::from(pointer.width) - 1;
@@ -508,8 +742,8 @@ impl DecodedImage {
         let right = if right_virtual >= i32::from(self.width - 1) {
             if draw_x + 1 >= self.width {
                 // Pointer is completely out of bounds horizontally
-                self.pointer_visible_on_screen = false;
-                return;
+                geometry.visible = false;
+                return Ok(geometry);
             } else {
                 self.width - (draw_x + 1)
             }
@@ -521,8 +755,8 @@ impl DecodedImage {
         let bottom = if bottom_virtual >= i32::from(self.height - 1) {
             if (draw_y + 1) >= self.height {
                 // Pointer is completely out of bounds vertically
-                self.pointer_visible_on_screen = false;
-                return;
+                geometry.visible = false;
+                return Ok(geometry);
             } else {
                 self.height - (draw_y + 1)
             }
@@ -530,7 +764,7 @@ impl DecodedImage {
             pointer.height - 1
         };
 
-        self.pointer_visible_on_screen = true;
+        geometry.visible = true;
 
         let pointer_src_rect = InclusiveRectangle {
             left,
@@ -539,19 +773,44 @@ impl DecodedImage {
             bottom,
         };
 
-        self.pointer_src_rect = pointer_src_rect;
-        self.pointer_draw_x = draw_x;
-        self.pointer_draw_y = draw_y;
+        geometry.src = pointer_src_rect;
+        geometry.draw_x = draw_x;
+        geometry.draw_y = draw_y;
+        if checked {
+            native_rect_size(&geometry.src).map_err(|e| custom_err!("native cursor geometry", e))?;
+        }
+        Ok(geometry)
     }
 
+    #[allow(dead_code)] // Compatibility 入口保持原语义。
     pub(crate) fn move_pointer(&mut self, x: u16, y: u16) -> SessionResult<Option<InclusiveRectangle>> {
+        self.move_pointer_with_kernels(x, y, None)
+    }
+
+    pub(crate) fn move_pointer_with_kernels(
+        &mut self,
+        x: u16,
+        y: u16,
+        kernels: Option<&NativeKernels>,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        if kernels.is_some() {
+            let geometry = self.calculate_pointer_geometry(self.pointer.as_deref(), x, y, self.show_pointer, true)?;
+            self.preflight_pointer_layers(Some(geometry), None)?;
+        }
         self.pointer_x = x;
         self.pointer_y = y;
 
         if self.pointer.is_some() && self.show_pointer {
-            let old_rect = self.apply_pointer_layer(PointerLayer::Background)?;
-            self.recalculate_pointer_geometry();
-            let new_rect = self.apply_pointer_layer(PointerLayer::Pointer)?;
+            let old_rect = self.apply_pointer_layer_with_kernels(PointerLayer::Background, kernels)?;
+            let geometry = self.calculate_pointer_geometry(
+                self.pointer.as_deref(),
+                self.pointer_x,
+                self.pointer_y,
+                self.show_pointer,
+                kernels.is_some(),
+            )?;
+            self.set_pointer_geometry(geometry);
+            let new_rect = self.apply_pointer_layer_with_kernels(PointerLayer::Pointer, kernels)?;
 
             match (old_rect, new_rect) {
                 (None, None) => Ok(None),
@@ -564,21 +823,42 @@ impl DecodedImage {
         }
     }
 
+    #[allow(dead_code)] // Compatibility 入口保持原语义。
     pub(crate) fn update_pointer(&mut self, pointer: Arc<DecodedPointer>) -> SessionResult<Option<InclusiveRectangle>> {
+        self.update_pointer_with_kernels(pointer, None)
+    }
+
+    pub(crate) fn update_pointer_with_kernels(
+        &mut self,
+        pointer: Arc<DecodedPointer>,
+        kernels: Option<&NativeKernels>,
+    ) -> SessionResult<Option<InclusiveRectangle>> {
+        if kernels.is_some() {
+            let geometry =
+                self.calculate_pointer_geometry(Some(&pointer), self.pointer_x, self.pointer_y, true, true)?;
+            self.preflight_pointer_layers(Some(geometry), Some(&pointer))?;
+        }
         self.show_pointer = true;
 
         // Remove old pointer from frame buffer
         let old_rect = if self.pointer.is_some() {
-            self.apply_pointer_layer(PointerLayer::Background)?
+            self.apply_pointer_layer_with_kernels(PointerLayer::Background, kernels)?
         } else {
             None
         };
 
         self.pointer = Some(pointer);
-        self.recalculate_pointer_geometry();
+        let geometry = self.calculate_pointer_geometry(
+            self.pointer.as_deref(),
+            self.pointer_x,
+            self.pointer_y,
+            self.show_pointer,
+            kernels.is_some(),
+        )?;
+        self.set_pointer_geometry(geometry);
 
         // Draw new pointer
-        let new_rect = self.apply_pointer_layer(PointerLayer::Pointer)?;
+        let new_rect = self.apply_pointer_layer_with_kernels(PointerLayer::Pointer, kernels)?;
 
         match (old_rect, new_rect) {
             (None, None) => Ok(None),
@@ -605,20 +885,33 @@ impl DecodedImage {
         &mut self,
         update_rectangle: &InclusiveRectangle,
     ) -> SessionResult<PointerRenderingState> {
+        self.pointer_rendering_begin_with_kernels(update_rectangle, None)
+    }
+    fn pointer_rendering_begin_with_kernels(
+        &mut self,
+        update_rectangle: &InclusiveRectangle,
+        kernels: Option<&NativeKernels>,
+    ) -> SessionResult<PointerRenderingState> {
+        if kernels.is_some() {
+            self.preflight_pointer_layers(None, None)?;
+        }
         if !self.is_pointer_redraw_required(update_rectangle) || self.pointer.is_none() {
             return Ok(PointerRenderingState {
+                kernels: kernels.copied(),
                 redraw: false,
                 update_rectangle: update_rectangle.clone(),
             });
         }
 
         let state = self
-            .apply_pointer_layer(PointerLayer::Background)?
+            .apply_pointer_layer_with_kernels(PointerLayer::Background, kernels)?
             .map(|cursor_erase_rect| PointerRenderingState {
+                kernels: kernels.copied(),
                 redraw: true,
                 update_rectangle: cursor_erase_rect.union(update_rectangle),
             })
             .unwrap_or_else(|| PointerRenderingState {
+                kernels: kernels.copied(),
                 redraw: false,
                 update_rectangle: update_rectangle.clone(),
             });
@@ -630,12 +923,13 @@ impl DecodedImage {
         &mut self,
         pointer_rendering_state: PointerRenderingState,
     ) -> SessionResult<InclusiveRectangle> {
+        let kernels = pointer_rendering_state.kernels.as_ref();
         if !pointer_rendering_state.redraw {
             return Ok(pointer_rendering_state.update_rectangle);
         }
 
         let update_rectangle = self
-            .apply_pointer_layer(PointerLayer::Pointer)?
+            .apply_pointer_layer_with_kernels(PointerLayer::Pointer, kernels)?
             .map(|pointer_draw_rectangle| pointer_draw_rectangle.union(&pointer_rendering_state.update_rectangle))
             .unwrap_or_else(|| pointer_rendering_state.update_rectangle);
 
@@ -722,7 +1016,7 @@ impl DecodedImage {
         }
         #[cfg(test)]
         NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("begin", 0)));
-        let state = self.pointer_rendering_begin(rectangle)?;
+        let state = self.pointer_rendering_begin_with_kernels(rectangle, Some(kernels))?;
         let stride = self.stride();
         for y in 0..height {
             let source_y = if bottom_up { source_height - 1 - y } else { y };
@@ -890,7 +1184,7 @@ impl DecodedImage {
         }
         #[cfg(test)]
         NATIVE_IMAGE_CALLS.with(|v| v.borrow_mut().push(("begin", 0)));
-        let state = self.pointer_rendering_begin(&region.extents)?;
+        let state = self.pointer_rendering_begin_with_kernels(&region.extents, kernels)?;
         let stride = self.stride();
         for rect in &region.rectangles {
             let x = usize::from(rect.left - update.left);
@@ -1393,3 +1687,7 @@ impl DecodedImage {
         Ok(update_rectangle)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/cursor_image_consumers.rs"]
+mod cursor_consumers;

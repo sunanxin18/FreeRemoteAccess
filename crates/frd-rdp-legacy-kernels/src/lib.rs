@@ -124,6 +124,35 @@ pub struct PlanarLayout {
     pub has_alpha: bool,
 }
 
+/// Cursor XOR 的封闭字节布局；RGBA 输出固定，不接受 framebuffer 通道偏移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorXorFormat {
+    Mono1,
+    Rgb565,
+    Bgr24,
+    Bgra32,
+}
+impl CursorXorFormat {
+    fn data_bytes(self, pixels: usize) -> Option<usize> {
+        match self {
+            Self::Mono1 => Some(pixels.div_ceil(8)),
+            Self::Rgb565 => pixels.checked_mul(2),
+            Self::Bgr24 => pixels.checked_mul(3),
+            Self::Bgra32 => pixels.checked_mul(4),
+        }
+    }
+}
+/// Accelerated 的奇偶行来自输出行；row 叶子从 column 0 开始。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorBitmapMode {
+    Software,
+    Accelerated { odd_row: bool },
+}
+
+type CursorDecodeKernel =
+    unsafe fn(CursorXorFormat, CursorBitmapMode, &[u8], Option<&[u8]>, &mut [u8]);
+type CursorCompositeKernel = unsafe fn(&[u8], &[u8], &mut [u8]);
+
 type XorKernel = unsafe fn(&[u8], &[u8], &mut [u8]);
 type MaskKernel = unsafe fn(Option<&[u8]>, &[u8], u8, u8, &mut [u8]);
 type DitherKernel = unsafe fn(&[u8], &[u8], bool, &mut [u8]);
@@ -156,8 +185,51 @@ pub struct NativeKernels {
     planar_rgb: RgbPlanarKernel,
     planar_ycocg: YcocgKernel,
     pixel_row: PixelRowKernel,
+    cursor_decode: CursorDecodeKernel,
+    cursor_composite: CursorCompositeKernel,
 }
 impl NativeKernels {
+    /// 精确 XOR/AND 数据行展开为 RGBA；Software 保留原版 c*c>>8 数值语义。
+    /// 所有长度先检验；空输出只接受空源，不消费 padding，不分配。
+    pub fn decode_cursor_row(
+        &self,
+        format: CursorXorFormat,
+        mode: CursorBitmapMode,
+        xor: &[u8],
+        and: Option<&[u8]>,
+        rgba: &mut [u8],
+    ) -> Result<(), KernelError> {
+        if !rgba.len().is_multiple_of(4) {
+            return Err(KernelError::Length);
+        }
+        let pixels = rgba.len() / 4;
+        if format.data_bytes(pixels) != Some(xor.len())
+            || and.is_some_and(|mask| mask.len() != pixels.div_ceil(8))
+        {
+            return Err(KernelError::Length);
+        }
+        // SAFETY: 真实 detect 验证 ISA；精确行长度及 checked arithmetic 先于任何写入。
+        unsafe { (self.cursor_decode)(format, mode, xor, and, rgba) };
+        Ok(())
+    }
+    /// 原版 release 的 byte 合成：普通 RGB 加法显式模 256；保留背景 byte3。
+    /// 合法 byte 行是 total，不返回 ColorOverflow；invert sentinel 将 byte3 设 255。
+    pub fn composite_cursor_row(
+        &self,
+        rgba: &[u8],
+        background: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), KernelError> {
+        if !rgba.len().is_multiple_of(4)
+            || rgba.len() != background.len()
+            || rgba.len() != output.len()
+        {
+            return Err(KernelError::Length);
+        }
+        // SAFETY: 真实 ISA、完整像素、相等 slice 长度与不重叠借用已验证。
+        unsafe { (self.cursor_composite)(rgba, background, output) };
+        Ok(())
+    }
     /// 转换恰好一行；不消费 padding、stride、rect 或协议状态，不分配内存。
     pub fn convert_pixel_row(
         &self,
@@ -398,5 +470,18 @@ impl NativeKernels {
         }
         // SAFETY: ISA 和全部输入输出长度已检查；后端预检全部算术再写输出。
         unsafe { (self.color)(y, cb, cr, out) }
+    }
+}
+
+#[cfg(test)]
+mod cursor_length_tests {
+    use super::CursorXorFormat as F;
+    #[test]
+    fn cursor_encoded_lengths_use_checked_multiply_and_overflow_free_ceil() {
+        assert_eq!(F::Mono1.data_bytes(usize::MAX), Some(usize::MAX / 8 + 1));
+        for f in [F::Rgb565, F::Bgr24, F::Bgra32] {
+            assert_eq!(f.data_bytes(usize::MAX), None);
+            assert_eq!(f.data_bytes(0), Some(0));
+        }
     }
 }
