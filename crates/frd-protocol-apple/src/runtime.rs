@@ -2800,10 +2800,7 @@ mod tests {
             .unwrap();
         let (session_trace_tx, session_trace_rx) = mpsc::channel();
         connection.set_session_runtime_test_events(session_trace_tx);
-        let (writer_io_tx, writer_io_rx) = mpsc::channel();
-        let writer = connection
-            .writer_handle_with_io_events(writer_io_tx)
-            .unwrap();
+        let writer = connection.writer_handle().unwrap();
         let session_id = frd_core::SessionId::allocate();
         let (commands, command_rx) = mpsc::channel();
         let (events_tx, events_rx) = mpsc::channel();
@@ -2843,44 +2840,49 @@ mod tests {
                 .unwrap(),
             crate::connection::SessionRuntimeTestEvent::LoopEntered
         );
-        while writer_io_rx.try_recv().is_ok() {}
-
-        let active_writer = writer.clone();
-        let (blocked_send_tx, blocked_send_rx) = mpsc::channel();
-        let blocked_sender = thread::spawn(move || {
-            let payload = vec![0x5a; 60_000];
-            loop {
-                if let Err(error) = active_writer.send_private_message(&payload) {
-                    blocked_send_tx.send(error).unwrap();
-                    break;
-                }
-            }
-        });
-
+        // 每次请求独占结果与观察通道；成功消费完整轨迹后才允许下一次入队。
+        // 150ms pending仅为在途观察，不声称线程已经睡在内核write syscall。
         let write_block_deadline = Instant::now() + Duration::from_secs(2);
-        loop {
+        let mut completed_requests = 0;
+        let (blocked_result_rx, blocked_io_rx) = loop {
+            let (result_rx, io_rx) = writer
+                .enqueue_private_message_observed(vec![0x5a; 60_000])
+                .unwrap();
             let remaining = write_block_deadline
                 .checked_duration_since(Instant::now())
-                .expect("production writer never entered a blocked write_all");
-            match writer_io_rx.recv_timeout(remaining).unwrap() {
-                crate::connection::WriterIoTestEvent::Started { wire_bytes }
-                    if wire_bytes >= 60_000 =>
-                {
-                    match writer_io_rx.recv_timeout(Duration::from_millis(150)) {
-                        Err(mpsc::RecvTimeoutError::Timeout) => break,
-                        Ok(crate::connection::WriterIoTestEvent::Finished { .. }) => continue,
-                        Ok(other) => panic!("unexpected writer event after start: {other:?}"),
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            panic!("writer exited before Disconnect")
-                        }
-                    }
+                .expect("production writer never left a request pending");
+            assert!(matches!(
+                io_rx.recv_timeout(remaining).unwrap(),
+                crate::connection::WriterIoTestEvent::Started { wire_bytes: 60_034 }
+            ));
+            match io_rx.recv_timeout(Duration::from_millis(150)) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(matches!(
+                        result_rx.try_recv(),
+                        Err(mpsc::TryRecvError::Empty)
+                    ));
+                    break (result_rx, io_rx);
                 }
-                crate::connection::WriterIoTestEvent::Started { .. }
-                | crate::connection::WriterIoTestEvent::Finished { .. }
-                | crate::connection::WriterIoTestEvent::ResultDelivered
-                | crate::connection::WriterIoTestEvent::InputDiagnosticQueued => {}
+                Ok(crate::connection::WriterIoTestEvent::Finished { succeeded: true }) => {
+                    let remaining = write_block_deadline
+                        .checked_duration_since(Instant::now())
+                        .expect("writer preparation exceeded its 2s bound");
+                    result_rx.recv_timeout(remaining).unwrap().unwrap();
+                    let remaining = write_block_deadline
+                        .checked_duration_since(Instant::now())
+                        .expect("writer preparation exceeded its 2s bound");
+                    assert_eq!(
+                        io_rx.recv_timeout(remaining).unwrap(),
+                        crate::connection::WriterIoTestEvent::ResultDelivered
+                    );
+                    completed_requests += 1;
+                }
+                other => panic!(
+                    "同请求在Disconnect前出现异常轨迹（已完成{completed_requests}次）: {other:?}"
+                ),
             }
-        }
+        };
+        // pending请求被冻结：此后没有sender线程或任何自动续发请求。
 
         let cleanup_deadline = Instant::now() + Duration::from_secs(3);
         commands.send(SessionCommand::Disconnect).unwrap();
@@ -2893,16 +2895,24 @@ mod tests {
         let exit = exit_rx
             .recv_timeout(cleanup_deadline.duration_since(Instant::now()))
             .expect("production session cleanup must return within 3s");
-        let blocked_error = blocked_send_rx
+        let blocked_error = blocked_result_rx
             .recv_timeout(cleanup_deadline.duration_since(Instant::now()))
-            .expect("blocked production sender must receive the shutdown error within 3s");
+            .expect("同一在途请求必须在3s内收到shutdown结果")
+            .expect_err("同一在途请求在Disconnect后不应迟到成功");
         session.join().unwrap();
-        blocked_sender.join().unwrap();
 
         assert!(matches!(exit, frd_protocol_api::ProtocolExit::Closed));
         assert!(
             blocked_error.to_string().contains("写入失败"),
-            "阻塞发送应返回写入失败，实际错误链：{blocked_error:#}"
+            "阻塞发送应返回写入失败，实际错误链：{blocked_error:#}；已完成请求数：{completed_requests}"
+        );
+        assert_eq!(
+            blocked_io_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                crate::connection::WriterIoTestEvent::Finished { succeeded: false },
+                crate::connection::WriterIoTestEvent::ResultDelivered,
+            ],
+            "冻结请求的失败与结果交付必须来自同一观察通道"
         );
         assert!(writer.send_private_message(b"after-cleanup").is_err());
         assert!(matches!(

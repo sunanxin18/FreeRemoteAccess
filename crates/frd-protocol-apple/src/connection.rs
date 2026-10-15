@@ -320,6 +320,8 @@ enum WriterCommand {
     Message {
         plaintext: Vec<u8>,
         result: SyncSender<Result<()>>,
+        #[cfg(test)]
+        io_events: Option<Sender<WriterIoTestEvent>>,
     },
     HighPerformanceKeyEvent {
         down: bool,
@@ -419,9 +421,30 @@ impl AppleWriterHandle {
             .send(WriterCommand::Message {
                 plaintext,
                 result: result_tx,
+                #[cfg(test)]
+                io_events: None,
             })
             .map_err(|_| anyhow!("Apple writer 已关闭"))?;
         Ok(result_rx)
+    }
+
+    // 结果与观察通道均只属于本次请求；测试线程决定何时允许下一次入队。
+    #[cfg(test)]
+    pub(crate) fn enqueue_private_message_observed(
+        &self,
+        plaintext: Vec<u8>,
+    ) -> Result<(Receiver<Result<()>>, Receiver<WriterIoTestEvent>)> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let (events_tx, events_rx) = mpsc::channel();
+        self.control
+            .commands
+            .send(WriterCommand::Message {
+                plaintext,
+                result: result_tx,
+                io_events: Some(events_tx),
+            })
+            .map_err(|_| anyhow!("Apple writer 已关闭"))?;
+        Ok((result_rx, events_rx))
     }
 
     pub(crate) fn send_high_performance_key_event(&self, down: bool, keysym: u32) -> Result<()> {
@@ -500,8 +523,19 @@ fn writer_loop(
     while let Ok(command) = commands.recv() {
         let diagnostic_key_event = hooks.input_diagnostics.is_some()
             && matches!(&command, WriterCommand::HighPerformanceKeyEvent { .. });
+        #[cfg(test)]
+        let mut request_hooks = WriterHooks::default();
         let (wire_result, result) = match command {
-            WriterCommand::Message { plaintext, result } => {
+            WriterCommand::Message {
+                plaintext,
+                result,
+                #[cfg(test)]
+                io_events,
+            } => {
+                #[cfg(test)]
+                {
+                    request_hooks.io_events = io_events;
+                }
                 let wire_result = match crypto {
                     Some(crypto) => crypto.seal(&plaintext),
                     None => Ok(plaintext),
@@ -539,13 +573,19 @@ fn writer_loop(
                 .context("设置 Apple writer 写超时失败")?;
             let wire = wire_result?;
             hooks.notify_write_started(wire.len());
+            #[cfg(test)]
+            request_hooks.notify_write_started(wire.len());
             let write_result = stream.write_all(&wire).context("写入失败（连接中断？）");
             hooks.notify_write_finished(write_result.is_ok());
+            #[cfg(test)]
+            request_hooks.notify_write_finished(write_result.is_ok());
             write_result
         })();
         let failed = send_result.is_err();
         let _ = result.send(send_result);
         hooks.notify_result_delivered();
+        #[cfg(test)]
+        request_hooks.notify_result_delivered();
         if diagnostic_key_event && !failed {
             if let Some(diagnostics) = &hooks.input_diagnostics {
                 diagnostics.observe_writer_completed(Instant::now());
@@ -1239,6 +1279,55 @@ mod tests {
         assert!(read_timeout <= Duration::from_secs(30));
         assert!(write_timeout <= Duration::from_secs(30));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn observed_requests_keep_results_and_io_events_separate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut connection = AppleConnection::new(stream);
+        let writer = connection.writer_handle().unwrap();
+        let (first_result, first_events) =
+            writer.enqueue_private_message_observed(vec![0x11]).unwrap();
+        let (second_result, second_events) = writer
+            .enqueue_private_message_observed(vec![0x22; 2])
+            .unwrap();
+
+        for (result, events, wire_bytes) in [
+            (first_result, &first_events, 1),
+            (second_result, &second_events, 2),
+        ] {
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(1)).unwrap(),
+                WriterIoTestEvent::Started { wire_bytes }
+            );
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(1)).unwrap(),
+                WriterIoTestEvent::Finished { succeeded: true }
+            );
+            result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(1)).unwrap(),
+                WriterIoTestEvent::ResultDelivered
+            );
+        }
+        // 普通请求不会泄漏到已经完成的请求专属观察通道。
+        writer.send_private_message(&[0x33]).unwrap();
+        writer.shutdown().unwrap();
+        for events in [first_events, second_events] {
+            assert!(matches!(
+                events.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        }
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x11, 0x22, 0x22, 0x33]);
     }
 
     #[test]
