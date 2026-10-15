@@ -27,3 +27,9 @@ OHOS当前生产平台/产品键盘能力继续不可用；协议单独宣称支
 ## 最终手机有界互操作
 
 官方HDC覆盖安装/启动成功并保留数据。2026-10-15 16:18，正常登录表单选择既有HUKS记录显示已载入密码并提交；16:18:30初始截图是Windows锁屏画面，不能算已出现桌面。后续原始截图显示完整PowerShell桌面与开始菜单，已观察到2760×1256全屏和右下收起浮动岛，期间发送一次开始位置触控；随后关闭菜单并显式断开。此结果只确认本次能力接口变更没有破坏保存凭据连接/画面/有界pointer，不证明OHOS物理键或Text可用。PC表单正在由用户填写，因此本轮未停止/安装/输入或接管PC；该端仍待单独验收。
+
+## 后续CI结果
+
+提交 `6636020` 的CI `38704986760` 在macos-15安全测试失败：Apple断开回归 `production_session_disconnect_interrupts_blocked_writer_and_runs_cleanup` 的完整错误链为“设置 Apple writer 写超时失败: Invalid argument (os error 22)”，Apple537通过/1失败/11ignored。此前增加的诊断现已取得真实错误，不能以本机538通过将CI失败称为无害或直接归类flaky。问题需进一步按writer/deadline/shutdown路径定位；本次能力字段与wire实现分别审计，不把新commit标记为完整CI通过。失败原始日志为 `target/harmony-input-capabilities-20261015/fix1/ci-failed-full.log`；其他包job当次读取仍在执行，Linux GTK已通过。
+
+后续按同一提交句柄复查：macOS package `38704986589`、Linux client/FFmpeg `38704986546`、Linux GTK `38704986509`均terminal success；Windows package `38704986611`当次仍in_progress，通用CI失败保持。结果保存在`fix1/ci-followup.json`，不外推为当前Task5D源码的包通过。
