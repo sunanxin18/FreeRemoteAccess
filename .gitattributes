@@ -28,3 +28,6 @@ tools/verify-windows-package.ps1 text eol=lf
 # Shared Windows/macOS Progressive attribution bytes are hash-pinned.
 packaging/windows/licenses/FreeRDP-APACHE-2.0.txt text eol=lf
 packaging/windows/licenses/FreeRDP-NOTICE.txt text eol=lf
+
+# FDK 上游许可逐字保留；仅豁免其原文末尾空行并固定 LF。
+apps/freeremotedesk-ohos/entry/src/main/resources/rawfile/fdk-aac/NOTICE text eol=lf whitespace=-blank-at-eof

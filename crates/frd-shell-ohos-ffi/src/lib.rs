@@ -5,7 +5,10 @@
 //! 引用取得和初始化结果；没有超时后仍访问借用窗口的路径。
 
 #[cfg(all(
-    feature = "normal-hap-rdp-validation",
+    any(
+        feature = "normal-hap-rdp-validation",
+        feature = "normal-hap-apple-mvs-validation"
+    ),
     any(
         feature = "native-presentation-fixture",
         feature = "normal-hap-codec-fixture",
@@ -14,7 +17,7 @@
         feature = "normal-hap-hevc444-profile"
     )
 ))]
-compile_error!("普通 RDP 验证与合成/codec 测量模式必须分别构建，包括 release");
+compile_error!("普通协议验证与合成/codec 测量模式必须分别构建，包括 release");
 
 #[cfg(all(
     debug_assertions,

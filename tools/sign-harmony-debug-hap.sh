@@ -5,14 +5,20 @@ usage() {
     cat <<'USAGE'
 用法：tools/sign-harmony-debug-hap.sh --hap 未签HAP --output 签名HAP \
   --cert 签名证书链.cer --profile 已签profile.p7b --keystore 密钥库.p12 --alias 别名 \
-  --ffmpeg-bundle OHOS包目录 --ffmpeg-manifest-sha256 独立接收摘要
+  --ffmpeg-bundle OHOS包目录 --ffmpeg-manifest-sha256 独立接收摘要 [--normal-hap-rdp-validation] [--normal-hap-apple-mvs-validation]
+--normal-hap-rdp-validation：RDP 普通验证；与 Apple 同开时核验实际 zlib 合同。
+--normal-hap-apple-mvs-validation：签前/签后均核验显式标准 MVS 的精确依赖与 FDK 材料合同。
 只用于合法开发签名。profile 必须已由正常开发流程签名、权限为 normal，
 有效期/设备绑定/应用标识由调用方确认。密码由官方工具交互读取。
 USAGE
 }
+apple_validation=0
+rdp_validation=0
 hap=''; output=''; cert=''; profile=''; keystore=''; alias=''; bundle=''; manifest_sha=''
 while (($#)); do
     case "$1" in
+        --normal-hap-rdp-validation) rdp_validation=1; shift ;;
+        --normal-hap-apple-mvs-validation) apple_validation=1; shift ;;
         --hap) hap="${2:?需要 HAP}"; shift 2 ;;
         --output) output="${2:?需要输出 HAP}"; shift 2 ;;
         --cert) cert="${2:?需要证书链}"; shift 2 ;;
@@ -34,6 +40,8 @@ if [[ "$studio" == *.app ]]; then studio="$studio/Contents"; fi
 sdk="${DEVECO_SDK_HOME:-$studio/sdk}"
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 checker_args=(--readelf "$sdk/default/openharmony/native/llvm/bin/llvm-readelf" --ffmpeg-bundle "$bundle" --ffmpeg-manifest-sha256 "$manifest_sha")
+if ((rdp_validation)); then checker_args+=(--normal-hap-rdp-validation); fi
+if ((apple_validation)); then checker_args+=(--normal-hap-apple-mvs-validation); fi
 python3 "$repository_root/tools/check-harmony-hap.py" --hap "$hap" "${checker_args[@]}"
 "$studio/jbr/Contents/Home/bin/java" -jar "$sdk/default/openharmony/toolchains/lib/hap-sign-tool.jar" sign-app \
     -mode localSign -keyAlias "$alias" -appCertFile "$cert" -profileFile "$profile" \

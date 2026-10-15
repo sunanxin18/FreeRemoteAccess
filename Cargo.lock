@@ -2197,6 +2197,7 @@ dependencies = [
  "frd-platform-api",
  "frd-platform-ohos",
  "frd-protocol-api",
+ "frd-protocol-apple",
  "frd-protocol-rdp",
  "frd-render-wgpu",
  "frd-shell-runtime",

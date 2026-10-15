@@ -11,7 +11,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 
 class RdpBuildArgs(unittest.TestCase):
-    def test_rust_builder_forwards_exact_feature(self):
+    FLAGS = ('--normal-hap-rdp-validation', '--normal-hap-apple-mvs-validation')
+
+    def test_rust_builder_forwards_exact_features(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
             sdk = root / 'sdk'
@@ -26,28 +28,22 @@ class RdpBuildArgs(unittest.TestCase):
             cargo = root / 'capture-cargo'
             cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
             cargo.chmod(0o755)
-            result = subprocess.run([str(ROOT / 'tools/build-harmony.sh'), '--sdk', str(sdk),
-                '--build', '--release', '-p', 'frd-shell-ohos-ffi',
-                '--normal-hap-rdp-validation'], env={**os.environ, 'CARGO': str(cargo)},
-                text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), ['build', '--locked', '--target',
-                'aarch64-unknown-linux-ohos', '--release', '--features',
-                'frd-shell-ohos-ffi/normal-hap-rdp-validation', '-p', 'frd-shell-ohos-ffi'])
-            result = subprocess.run([str(ROOT / 'tools/build-harmony.sh'), '--sdk', str(sdk),
-                '--normal-hap-rdp-validation'], env={**os.environ, 'CARGO': str(cargo)},
-                text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), ['check', '--locked', '--target',
-                'aarch64-unknown-linux-ohos', '--features',
-                'frd-shell-ohos-ffi/normal-hap-rdp-validation', '-p', 'frd-shell-ohos-ffi'])
-            result = subprocess.run([str(ROOT / 'tools/build-harmony.sh'), '--sdk', str(sdk)],
-                env={**os.environ, 'CARGO': str(cargo)}, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), ['check', '--locked', '--target',
-                'aarch64-unknown-linux-ohos', '-p', 'frd-core', '-p', 'frd-frame',
-                '-p', 'frd-app', '-p', 'frd-shell-runtime'])
-
+            for flags in ((), self.FLAGS[:1], self.FLAGS[1:], self.FLAGS):
+                for explicit in (False, True):
+                    with self.subTest(flags=flags, explicit=explicit):
+                        args = ['--build', '--release', '-p', 'frd-shell-ohos-ffi'] if explicit else []
+                        result = subprocess.run([str(ROOT / 'tools/build-harmony.sh'), '--sdk', str(sdk),
+                            *args, *flags], env={**os.environ, 'CARGO': str(cargo)},
+                            text=True, capture_output=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        expected = ['build' if explicit else 'check', '--locked', '--target',
+                                    'aarch64-unknown-linux-ohos']
+                        if explicit: expected += ['--release']
+                        for flag in flags:
+                            expected += ['--features', 'frd-shell-ohos-ffi/' + flag[2:]]
+                        expected += ['-p', 'frd-shell-ohos-ffi'] if explicit or flags else [
+                            '-p', 'frd-core', '-p', 'frd-frame', '-p', 'frd-app', '-p', 'frd-shell-runtime']
+                        self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_missing_value_options_are_rejected(self):
         for name, options in (('build-harmony.sh', ('--sdk', '-p')),
@@ -58,6 +54,11 @@ class RdpBuildArgs(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
 
     def test_hap_builder_forwards_to_rust_builder_and_keeps_checker(self):
+        for flags in ((), self.FLAGS[:1], self.FLAGS[1:], self.FLAGS):
+            with self.subTest(flags=flags):
+                self.check_hap_builder(flags)
+
+    def check_hap_builder(self, flags):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
             (root / 'tools').mkdir()
@@ -103,20 +104,24 @@ class RdpBuildArgs(unittest.TestCase):
                    'FRD_ARGS_TEST_LOG': str(log), 'FRD_ARGS_TEST_PYTHON': sys.executable,
                    'CARGO_TARGET_DIR': str(root / 'target'),
                    'DEVECO_SDK_HOME': str(root / 'studio/sdk')}
-            result = subprocess.run([str(script), '--normal-hap-rdp-validation',
+            result = subprocess.run([str(script), *flags,
                 '--ffmpeg-bundle', str(root / 'accepted-bundle'),
                 '--ffmpeg-manifest-sha256', 'a' * 64], env=env,
                 capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = log.read_text().splitlines()
             index = calls.index(str(root / 'tools/build-harmony.sh'))
-            self.assertEqual(calls[index+1:index+7], ['--sdk', str(root / 'studio/sdk/default/openharmony'),
-                '--build', '-p', 'frd-shell-ohos-ffi', '--normal-hap-rdp-validation'])
+            self.assertEqual(calls[index+1:index+6+len(flags)], ['--sdk', str(root / 'studio/sdk/default/openharmony'),
+                '--build', '-p', 'frd-shell-ohos-ffi', *flags])
             self.assertIn(str(root / 'tools/stage-harmony-ffmpeg.py'), calls)
-            self.assertIn(str(root / 'tools/check-harmony-hap.py'), calls)
+            self.assertIn(str(root / 'tools/check-harmony-hap.py'), calls, repr(calls) + result.stderr)
+            checker_index = calls.index(str(root / 'tools/check-harmony-hap.py'))
+            checker_call = calls[checker_index:checker_index+11]
+            for flag in self.FLAGS:
+                self.assertEqual(flag in checker_call, flag in flags)
             self.assertIn('assembleHap', calls)
             self.assertEqual(library.read_bytes(), b'actual-rdp-build')
-            argv = [str(script), '--normal-hap-rdp-validation', '--ffmpeg-bundle',
+            argv = [str(script), *flags, '--ffmpeg-bundle',
                     str(root / 'accepted-bundle'), '--ffmpeg-manifest-sha256', 'a' * 64]
             with self.subTest(release=True):
                 release_library = root / 'target/aarch64-unknown-linux-ohos/release/libfrd_shell_ohos_ffi.so'
@@ -130,6 +135,8 @@ class RdpBuildArgs(unittest.TestCase):
                 result = subprocess.run(argv, env={**env, 'CARGO_TARGET_DIR': str(root / 'target/../target')},
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
+            if not flags:
+                return  # 默认包不执行普通验证的额外 strip 身份门。
             for payload, duplicate in ((b'STRIPPED:stale-default-or-fixture', False),
                                        (b'actual-rdp-build', False),
                                        (b'STRIPPED:actual-rdp-build', True)):
@@ -148,12 +155,51 @@ class RdpBuildArgs(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(log.exists(), '必须在暂存之前拒绝目录不匹配')
 
+    def test_signer_keeps_apple_contract_in_both_checks(self):
+        for flags in ((), self.FLAGS[:1], self.FLAGS[1:], self.FLAGS):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                script = root / 'tools/sign-harmony-debug-hap.sh'
+                script.parent.mkdir()
+                script.write_bytes((ROOT / 'tools/sign-harmony-debug-hap.sh').read_bytes())
+                script.chmod(0o755)
+                log = root / 'calls'
+                stub = '#!/bin/sh\nprintf "%s\\n" BEGIN "$0" "$@" END >> "$FRD_ARGS_TEST_LOG"\n'
+                for path in (root / 'bin/python3', root / 'studio/jbr/Contents/Home/bin/java'):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(stub)
+                    path.chmod(0o755)
+                args = []
+                for option in ('hap', 'cert', 'profile', 'keystore'):
+                    file = root / option
+                    file.write_text('non-secret fixture')
+                    args += ['--' + option, str(file)]
+                args += ['--output', str(root / 'signed.hap'), '--alias', 'test-alias',
+                         '--ffmpeg-bundle', str(root / 'bundle'), '--ffmpeg-manifest-sha256', 'a' * 64]
+                args += list(flags)
+                result = subprocess.run([str(script), *args], env={**os.environ,
+                    'DEVECO_HOME': str(root / 'studio'), 'DEVECO_SDK_HOME': str(root / 'studio/sdk'),
+                    'PATH': str(root / 'bin') + ':' + os.environ['PATH'], 'FRD_ARGS_TEST_LOG': str(log)},
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [c.splitlines() for c in log.read_text().split('BEGIN\n')[1:]]
+                self.assertEqual(len(calls), 4)
+                for index in (0, 3):
+                    self.assertIn(str(root / 'tools/check-harmony-hap.py'), calls[index])
+                    for flag in self.FLAGS:
+                        self.assertEqual(flag in calls[index], flag in flags)
+                self.assertIn('--unsigned-hap', calls[3])
+                self.assertIn('sign-app', calls[1])
+                self.assertIn('verify-app', calls[2])
+                self.assertIn('-pwdInputMode', calls[1])
+
     def test_help_documents_both_entrypoints_and_unknown_options_fail(self):
         for name in ('build-harmony.sh', 'build-harmony-hap.sh'):
             script = str(ROOT / 'tools' / name)
             result = subprocess.run([script, '--help'], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0)
-            self.assertIn('--normal-hap-rdp-validation', result.stdout)
+            for flag in self.FLAGS:
+                self.assertIn(flag, result.stdout)
             result = subprocess.run([script, '--unknown-mode'], capture_output=True, text=True)
             self.assertEqual(result.returncode, 2)
 

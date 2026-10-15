@@ -25,6 +25,33 @@ checker = load('hap_checker', 'check-harmony-hap.py')
 stager = load('hap_stager', 'stage-harmony-ffmpeg.py')
 
 
+class AppleMvsContract(unittest.TestCase):
+    def test_dependencies_are_exact_and_opt_in(self):
+        name = 'libfrd_shell_ohos_ffi.so'
+        base = checker.BASE_DEPS[name]
+        for apple_mvs, rdp in [(False, False), (False, True), (True, False), (True, True)]:
+            expected = base | ({'libc++_shared.so'} if apple_mvs else set()) | ({'libz.so'} if apple_mvs and rdp else set())
+            for ability in (set(), {'libability_runtime.so'}):
+                checker.check_native_dependencies(name, expected | ability, apple_mvs, rdp)
+                for actual in [expected | ability | {'libavcodec.so'}, (expected | ability) - {'libc.so'},
+                               (expected | ability) ^ {'libc++_shared.so'}, (expected | ability) ^ {'libz.so'}]:
+                    with self.subTest(actual=actual, apple=apple_mvs, rdp=rdp), self.assertRaisesRegex(ValueError, '依赖合同'):
+                        checker.check_native_dependencies(name, actual, apple_mvs, rdp)
+        for name in ('libentry.so', 'libc++_shared.so'):
+            checker.check_native_dependencies(name, checker.BASE_DEPS[name], True, True)
+            with self.assertRaisesRegex(ValueError, '依赖合同'):
+                checker.check_native_dependencies(name, checker.BASE_DEPS[name] | {'libz.so'}, True, True)
+
+    def test_fdk_materials_are_required_exact_bytes(self):
+        data = checker.fdk_materials()
+        checker.check_fdk_materials(data, True)
+        checker.check_fdk_materials({}, False)
+        for mutation in ({}, {**data, checker.FDK_PREFIX + 'NOTICE': b'changed'},
+                         {**data, checker.FDK_PREFIX + 'unknown': b'x'}):
+            with self.subTest(mutation=list(mutation)), self.assertRaisesRegex(ValueError, 'FDK'):
+                checker.check_fdk_materials(mutation, True)
+
+
 class HapMutations(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -192,6 +219,25 @@ class HapMutations(unittest.TestCase):
         self.extra.append(('META-INF/controlled-signature', b'test-only signature metadata'))
         self.write()
         checker.compare_signed(self.good, self.path, self.recipe)
+
+    def test_signature_fdk_addition_or_removal_rejected(self):
+        # 基准普通包可能已有分发材料；有则移除，无则加入完整已审查材料。
+        names = checker.fdk_materials()
+        if set(names) <= self.data.keys():
+            for name in names: del self.data[name]
+        else:
+            self.extra += list(names.items())
+        self.write()
+        with self.assertRaisesRegex(ValueError, '签名改变'):
+            checker.compare_signed(self.good, self.path, self.recipe)
+
+    def test_changed_fdk_material_is_rejected(self):
+        names = checker.fdk_materials()
+        changed = {**names, checker.FDK_PREFIX + 'NOTICE': b'changed'}
+        for name, content in changed.items():
+            if name in self.data: self.data[name] = content
+            else: self.extra.append((name, content))
+        self.rejected('FDK 来源/许可材料字节')
 
     def test_signature_native_change_rejected(self):
         self.mutate_elf('libentry.so', lambda b: b.extend(b'changed'))

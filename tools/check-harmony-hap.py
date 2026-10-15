@@ -36,13 +36,40 @@ BASE_DEPS = {
 }
 
 
+FDK_PREFIX = 'resources/rawfile/fdk-aac/'
+FDK_SOURCE = Path(__file__).resolve().parents[1] / 'apps/freeremotedesk-ohos/entry/src/main/resources/rawfile/fdk-aac'
+
+
+def fdk_materials():
+    return {FDK_PREFIX + name: (FDK_SOURCE / name).read_bytes() for name in ('NOTICE', 'SOURCE.json')}
+
+
+def check_fdk_materials(data, apple_mvs=False):
+    present = {name for name in data if name.startswith(FDK_PREFIX) and not name.endswith('/')}
+    if apple_mvs or present:
+        expected = fdk_materials()
+        require(present == set(expected), 'FDK 来源/许可材料集合不匹配')
+        require(all(data[name] == content for name, content in expected.items()), 'FDK 来源/许可材料字节改变')
+
+
+def check_native_dependencies(basename, actual, apple_mvs=False, rdp_validation=False):
+    allowed = BASE_DEPS[basename]
+    if apple_mvs and basename == 'libfrd_shell_ohos_ffi.so':
+        # 实际标准 MVS+RDP 最终 FFI 的新增依赖：FDK C++ 与 flate2/libz-sys。
+        allowed = allowed | {'libc++_shared.so'}
+        if rdp_validation:
+            allowed = allowed | {'libz.so'}
+    require(actual == allowed or (basename == 'libfrd_shell_ohos_ffi.so' and
+            actual == allowed | {'libability_runtime.so'}), f'既有 native 依赖合同改变：{basename}')
+
+
 def accepted_bundle(bundle: Path, sdk: Path, manifest_sha256: str):
     require(re.fullmatch('[0-9a-f]{64}', manifest_sha256) is not None, '需要独立接收的 manifest SHA256')
     require(ffmpeg.sha(bundle / 'manifest.json') == manifest_sha256, '接收的 manifest SHA256 不匹配')
     return ffmpeg.verify_bundle(bundle, sdk)
 
 
-def entries(package, recipe="upstream"):
+def entries(package, recipe="upstream", apple_mvs=False):
     raw = raw_files(recipe)
     result = {}
     for item in package.infolist():
@@ -68,25 +95,28 @@ def entries(package, recipe="upstream"):
     require(raw <= result.keys(), 'HAP 缺少 FFmpeg 来源/许可材料')
     require({n for n in result if n.startswith(RAW_PREFIX) and not n.endswith('/')} == raw,
             'FFmpeg rawfile 文件集合不匹配')
+    check_fdk_materials(result, apple_mvs)
     return result
 
 
 def relevant_bytes(hap, recipe="upstream"):
     with zipfile.ZipFile(hap) as package:
         data = entries(package, recipe)
-        return {name: data[name] for name in NATIVE | raw_files(recipe) | {'module.json'}}
+        selected = NATIVE | raw_files(recipe) | {'module.json'} | (set(data) & set(fdk_materials()))
+        return {name: data[name] for name in selected}
 
 
 def compare_signed(unsigned, signed, recipe="upstream"):
     require(relevant_bytes(unsigned, recipe) == relevant_bytes(signed, recipe), '签名改变了 native/来源材料/模块清单字节')
 
 
-def check(hap: Path, readelf: Path, bundle: Path, manifest_sha256: str) -> dict:
+def check(hap: Path, readelf: Path, bundle: Path, manifest_sha256: str, apple_mvs=False, rdp_validation=False) -> dict:
     sdk = readelf.parent.parent.parent.parent
     expected = accepted_bundle(bundle, sdk, manifest_sha256)
     recipe = ffmpeg.recipes.identify(ffmpeg.read_json(bundle / "manifest.json"))
+    public = PUBLIC | ({'libz.so'} if apple_mvs and rdp_validation else set())
     with zipfile.ZipFile(hap) as package, tempfile.TemporaryDirectory(prefix='frd-hap-check-') as temporary:
-        data = entries(package, recipe)
+        data = entries(package, recipe, apple_mvs)
         module = json.loads(data['module.json'])
         require(module['app']['bundleName'] == 'org.freeremotedesk.client', '应用标识不符')
         require(module['module']['deviceTypes'] == ['phone', '2in1'], '需要真正 phone/2in1 清单')
@@ -104,16 +134,12 @@ def check(hap: Path, readelf: Path, bundle: Path, manifest_sha256: str) -> dict:
             extracted.write_bytes(data[name])
             info = ffmpeg.elf(extracted)
             require(info['soname'] == basename, f'SONAME 不匹配：{name}')
-            require(set(info['needed']) <= BASE_LIBS | set(ffmpeg.LIBS) | PUBLIC, f'未批准依赖：{name}')
+            require(set(info['needed']) <= BASE_LIBS | set(ffmpeg.LIBS) | public, f'未批准依赖：{name}')
             if basename in ffmpeg.LIBS:
                 require(data[name] == (bundle / basename).read_bytes(), f'已接收 FFmpeg artifact 字节改变：{name}')
                 require(info == expected[basename], f'FFmpeg ELF 合同不匹配：{name}')
             else:
-                allowed = BASE_DEPS[basename]
-                # loader composition 可增加唯一已审查的公开 AbilityKit 依赖。
-                actual = set(info['needed'])
-                require(actual == allowed or (basename == 'libfrd_shell_ohos_ffi.so' and
-                        actual == allowed | {'libability_runtime.so'}), f'既有 native 依赖合同改变：{name}')
+                check_native_dependencies(basename, set(info['needed']), apple_mvs, rdp_validation)
                 if basename == 'libfrd_shell_ohos_ffi.so':
                     require({'frd_ohos_abi_version', 'frd_ohos_create', 'frd_ohos_destroy'} <= set(info['exports']),
                             'Rust FFI 导出身份不匹配')
@@ -125,7 +151,7 @@ def check(hap: Path, readelf: Path, bundle: Path, manifest_sha256: str) -> dict:
                     stripped = Path(temporary) / 'sdk-cpp-stripped.so'
                     subprocess.run([str(readelf.with_name('llvm-strip')), '--strip-unneeded', '-o', str(stripped), str(sdk_cpp)], check=True)
                     require(data[name] == stripped.read_bytes(), 'C++ 运行库不是所选 SDK strip 产物')
-            for dependency in set(info['needed']) & PUBLIC:
+            for dependency in set(info['needed']) & public:
                 sdk_lib = sdk / 'native/sysroot/usr/lib/aarch64-linux-ohos' / dependency
                 require(sdk_lib.is_file() and ffmpeg.elf(sdk_lib)['soname'] == dependency,
                         f'所选 SDK 无公开依赖：{dependency}')
@@ -136,7 +162,8 @@ def check(hap: Path, readelf: Path, bundle: Path, manifest_sha256: str) -> dict:
             summaries[basename] = hashlib.sha256(data[name]).hexdigest()
         return {'bundle': module['app']['bundleName'], 'deviceTypes': module['module']['deviceTypes'],
                 'nativeDependencies': dependencies, 'nativeSha256': summaries,
-                'ffmpegManifestSha256': manifest_sha256, 'permissions': permissions}
+                'ffmpegManifestSha256': manifest_sha256, 'permissions': permissions,
+                'appleMvsValidation': apple_mvs, 'rdpValidation': rdp_validation}
 
 
 def main():
@@ -145,9 +172,11 @@ def main():
     parser.add_argument('--readelf', type=Path, required=True)
     parser.add_argument('--ffmpeg-bundle', type=Path, required=True, help='显式接收的 OHOS 三库 bundle 目录')
     parser.add_argument('--ffmpeg-manifest-sha256', required=True, help='独立接收报告中的 manifest SHA256')
+    parser.add_argument('--normal-hap-rdp-validation', action='store_true', help='RDP 普通验证；与 Apple 同开时要求实际 zlib 精确依赖')
+    parser.add_argument('--normal-hap-apple-mvs-validation', action='store_true', help='显式标准 MVS 的精确 C++/zlib 依赖及 FDK 材料合同')
     parser.add_argument('--unsigned-hap', type=Path, help='签名后同时比较此原包的相关条目字节')
     args = parser.parse_args()
-    print(json.dumps(check(args.hap, args.readelf, args.ffmpeg_bundle, args.ffmpeg_manifest_sha256), ensure_ascii=False, indent=2))
+    print(json.dumps(check(args.hap, args.readelf, args.ffmpeg_bundle, args.ffmpeg_manifest_sha256, args.normal_hap_apple_mvs_validation, args.normal_hap_rdp_validation), ensure_ascii=False, indent=2))
     if args.unsigned_hap:
         compare_signed(args.unsigned_hap, args.hap, ffmpeg.recipes.identify(ffmpeg.read_json(args.ffmpeg_bundle / "manifest.json")))
 

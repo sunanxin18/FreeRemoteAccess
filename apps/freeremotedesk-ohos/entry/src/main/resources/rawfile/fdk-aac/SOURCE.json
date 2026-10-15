@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "crate": "fdk-aac-sys",
+  "version": "0.5.0",
+  "registrySource": "registry+https://github.com/rust-lang/crates.io-index",
+  "crateChecksum": "24516d2611506d5cb1833555adc75f6baf9fe2706b9c13e6fc33a6b22c51ca83",
+  "upstreamRepository": "https://github.com/haileys/fdk-aac-rs",
+  "crateVcsCommit": "e3ca3de45aac24d15eb611ce627fee4d5733c1fc",
+  "upstreamSourceArchive": "https://crates.io/api/v1/crates/fdk-aac-sys/0.5.0/download",
+  "sourcePath": "aac/",
+  "changes": "FDK AAC 源码未修改；沿用锁定 crate 的 build.rs，经官方 OHOS ARM64 编译器生成静态 archive 并链接到 Rust FFI。",
+  "distribution": "仅在显式标准 MVS 实验编译中链接；保留许可材料不代表音频播放可用或已获得专利许可。",
+  "noticeSha256": "95ec80da40b4af12ad4c4f3158c9cfb80f2479f3246e4260cb600827cc8c7836",
+  "buildScriptSha256": "c0a1d406c37c4bf4f67ce0db067402f83b811a105aa6f68fc54320695f10b19b"
+}

@@ -9,6 +9,8 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # 普通 HAP 的有界 RDP 互操作验证；默认不注册协议。
 normal-hap-rdp-validation = ["dep:frd-protocol-rdp"]
+# 普通 OHOS ARM64 标准 MVS 实验；不注册 HP，默认关闭。
+normal-hap-apple-mvs-validation = ["dep:frd-protocol-apple", "frd-protocol-apple/mvs-native-arm64"]
 native-presentation-fixture = []
 normal-hap-codec-fixture = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
 
@@ -43,3 +45,6 @@ pollster = "0.4"
 [dev-dependencies]
 frd-shell-runtime = { path = "../frd-shell-runtime", features = ["test-support"] }
 wgpu.workspace = true
+
+[target.'cfg(all(target_env = "ohos", target_arch = "aarch64"))'.dependencies]
+frd-protocol-apple = { path = "../frd-protocol-apple", optional = true }

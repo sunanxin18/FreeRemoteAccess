@@ -124,3 +124,19 @@ Progressive 61 项与独立 1 项基准通过。原生日志 SHA-256 为
 `57d2a79f9e654ff896097081f0151b85a9b10b121f8ddcc03107016728cc5b75`。
 同 head 的新私有 C/PE 专项也失败，原因及 partial 编译范围独立记录于
 [Windows私有平台验证](windows-private-platform-20261014.md)，不混入默认包结论。
+
+
+## 2026-10-15 后续源提交的精确 CI 观察
+
+`91490b9d8af46e7a9870515d9f73450bfb3426d3` 的 Windows workflow `38681087740`
+已完成 success：x86、x86_64、ARM64 三个 package job 与原生 ARM64 runtime
+job `116254718309` 均成功。root实际下载该job完整日志（本地
+`target/task5a5-root-20261015/windows-91490-native.log`），核对六项随包DLL像素
+fixture通过、ClearCodec/NSCodec聚焦39通过（2既有ignored）及有界2通过、
+Progressive聚焦61通过（1既有ignored）及有界1通过。不是私有C ABI/SEH或
+完整桌面性能资格。该源提交的macOS/Linux/GTK包也已完成success，通用CI旧run
+因后续推送cancelled，不能写为同一SHA五条全绿。
+
+后续 native-copy 提交 `4f7d6e6b7a0353b29e3badc3ae787538e8876758` 的通用CI
+`38683917249` 当前已完成success（format/macOS/Ubuntu），Windows package
+`38683917232`仍在执行。本段不是待提交普通Apple组合或真实HAP/Mac会话的证据。
