@@ -2137,12 +2137,14 @@ const FIX_2_053119869: i64 = 16_819;
 const FIX_2_562915447: i64 = 20_995;
 const FIX_3_072711026: i64 = 25_172;
 
+#[cfg(any(test, not(feature = "mvs-native-idct-arm64")))]
 fn dequantize(coefficient: i16, quantization: u8) -> Result<i64> {
     i64::from(coefficient)
         .checked_mul(i64::from(quantization))
         .context("MVS mode 5 反量化乘法溢出")
 }
 
+#[cfg(any(test, not(feature = "mvs-native-idct-arm64")))]
 fn descale(value: i64, shift: u32) -> i64 {
     (value + (1i64 << (shift - 1))) >> shift
 }
@@ -2158,8 +2160,41 @@ fn apple_idct_range_limit(value: i64) -> u8 {
     }
 }
 
-/// Apple `_jpeg_idct_islow` 的 13 位定点、两遍 8x8 逐字面转译。
+#[cfg(all(feature = "mvs-native-idct-arm64", not(target_arch = "aarch64")))]
+compile_error!("mvs-native-idct-arm64 仅支持具有 NEON 的 ARM64 目标");
+
+#[cfg(all(feature = "mvs-native-idct-arm64", target_arch = "aarch64"))]
+#[path = "mvs_idct_arm64.rs"]
+mod idct_arm64;
+
 fn inverse_dct_8x8(coefficients: &[i16; 64], quantization: &[u8; 64]) -> Result<[u8; 64]> {
+    #[cfg(not(feature = "mvs-native-idct-arm64"))]
+    {
+        inverse_dct_8x8_scalar(coefficients, quantization)
+    }
+    #[cfg(all(feature = "mvs-native-idct-arm64", target_arch = "aarch64"))]
+    {
+        anyhow::ensure!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "mvs-native-idct-arm64 需要 ARM64 NEON，禁止回退到标量 IDCT"
+        );
+        // SAFETY: 上方检查 NEON；输入和输出都是完整的定长数组。
+        Ok(unsafe { idct_arm64::inverse_dct_8x8_neon(coefficients, quantization) })
+    }
+    #[cfg(all(feature = "mvs-native-idct-arm64", not(target_arch = "aarch64")))]
+    {
+        let _ = (coefficients, quantization);
+        anyhow::bail!("mvs-native-idct-arm64 不支持当前架构")
+    }
+}
+
+#[cfg(test)]
+#[path = "mvs_idct_tests.rs"]
+mod idct_foundation_tests;
+
+/// Apple `_jpeg_idct_islow` 的 13 位定点、两遍 8x8 逐字面转译。
+#[cfg(any(test, not(feature = "mvs-native-idct-arm64")))]
+fn inverse_dct_8x8_scalar(coefficients: &[i16; 64], quantization: &[u8; 64]) -> Result<[u8; 64]> {
     let mut workspace = [0i64; 64];
 
     for column in 0..8 {

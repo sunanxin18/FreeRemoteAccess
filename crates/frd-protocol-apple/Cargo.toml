@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 mvs-profile = []
+mvs-native-idct-arm64 = []
 
 [dependencies]
 anyhow = "1"
