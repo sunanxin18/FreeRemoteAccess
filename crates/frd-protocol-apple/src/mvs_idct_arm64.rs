@@ -12,10 +12,12 @@
 //! 41_556 * 4W = 120_867_042_394_704 < 上述蝶形界 < 2^47。
 //! 因而包括抵消前的部分和亦不溢出，不依赖 i32 截断或 i64 环绕。
 //!
-//! 不另走 DC 快捷路径：AC 为零时蝶形输出恰为 DC * 8192；第一遍
-//! descale(..., 11) 恰为 DC * 4，第二遍 descale(..., 18) 恰为
-//! descale(DC, 5)。量化零使原始系数非零也不影响这个恒等式。
-//! 这保证语义相同；稀疏块性能需要独立测量，当前不作加速声明。
+//! 整块 effective AC 为零时，原反量化 DC 为 D = i64(c[0]) * i64(q[0])。
+//! 第一遍 Wdc = (8192D + 1024) >> 11 = 4D；第二遍
+//! S = (8192Wdc + 131072) >> 18 = (Wdc + 16) >> 5 = (D + 4) >> 3。
+//! 负半数向上舍入，完整 D 域 [-8_355_840, 8_355_585] 在 i64 内精确。
+//! 仅在每个 AC 的系数或量化为零时早返；仍使用原 Apple 10 位环绕表。
+//! 非 DC 块保持完整 CSD 蝶形；新增检测成本与稀疏块性能须独立测量。
 use super::{
     FIX_0_298631336, FIX_0_390180644, FIX_0_541196100, FIX_0_765366865, FIX_0_899976223,
     FIX_1_175875602, FIX_1_501321110, FIX_1_847759065, FIX_1_961570560, FIX_2_053119869,
@@ -134,6 +136,55 @@ unsafe fn transform<const SHIFT: i32>(input: [int64x2_t; 8]) -> [int64x2_t; 8] {
     }
 }
 
+// 每组八 lane，偏移 0..56 覆盖完整数组；仅首组清除自然序 DC 的 lane0。
+// AND 的是独立非零比较掩码，不是原系数/量化位值或截断乘积。
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn effective_ac_is_zero(coefficients: &[i16; 64], quantization: &[u8; 64]) -> bool {
+    unsafe {
+        let mut any = vdupq_n_u16(0);
+        for offset in (0..64).step_by(8) {
+            let c = vld1q_s16(coefficients.as_ptr().add(offset));
+            let q = vmovl_u8(vld1_u8(quantization.as_ptr().add(offset)));
+            let mut active = vandq_u16(
+                vmvnq_u16(vceqq_s16(c, vdupq_n_s16(0))),
+                vmvnq_u16(vceqq_u16(q, vdupq_n_u16(0))),
+            );
+            if offset == 0 {
+                active = vsetq_lane_u16::<0>(0, active);
+            }
+            any = vorrq_u16(any, active);
+        }
+        vmaxvq_u16(any) == 0
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn effective_dc_sample(coefficients: int16x8_t, quantization: uint8x8_t) -> int64x2_t {
+    let c = vget_low_s32(vmovl_s16(vget_low_s16(coefficients)));
+    let q = vget_low_u32(vmovl_u16(vget_low_u16(vmovl_u8(quantization))));
+    // c 符号扩展，q 无符号扩展至 0..255，随后 signed widening multiply 安全。
+    let sample: int64x2_t;
+    // SAFETY: 仅操作声明的向量寄存器，无内存/栈/标志副作用。
+    // 实际 LLVM 曾利用后续 10 位 mask 消去符号扩展并改为 UMLAL/USHR。
+    // 此最小屏障保留原 D 的 signed widening、i64 舍入与 SSHR 契约。
+    unsafe {
+        std::arch::asm!(
+            "smull {sample:v}.2d, {c:v}.2s, {q:v}.2s",
+            "dup {sample:v}.2d, {sample:v}.d[0]",
+            "add {sample:v}.2d, {sample:v}.2d, {round:v}.2d",
+            "sshr {sample:v}.2d, {sample:v}.2d, #3",
+            sample = out(vreg) sample,
+            c = in(vreg) c,
+            q = in(vreg) q,
+            round = in(vreg) vdupq_n_s64(4),
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    sample
+}
+
 /// # Safety
 /// 调用者须先确认 ARM64 NEON 可用；定长引用保证全部 load/store 范围有效。
 #[inline(never)]
@@ -144,6 +195,20 @@ pub(super) unsafe fn inverse_dct_8x8_neon(
 ) -> [u8; 64] {
     // SAFETY: NEON 前置条件由调用者保证；每次两个元素只访问有效相邻列/行。
     unsafe {
+        if effective_ac_is_zero(coefficients, quantization) {
+            let sample = effective_dc_sample(
+                vld1q_s16(coefficients.as_ptr()),
+                vld1_u8(quantization.as_ptr()),
+            );
+            let bytes = vdupq_lane_u8::<0>(range_limit_pair(sample));
+            let mut output = [0u8; 64];
+            // 四次有界 16-byte 写入，不要求额外对齐或数组尾部 padding。
+            vst1q_u8(output.as_mut_ptr(), bytes);
+            vst1q_u8(output.as_mut_ptr().add(16), bytes);
+            vst1q_u8(output.as_mut_ptr().add(32), bytes);
+            vst1q_u8(output.as_mut_ptr().add(48), bytes);
+            return output;
+        }
         let mut workspace = [0i64; 64];
         for column in (0..8).step_by(2) {
             let mut input = [vdupq_n_s64(0); 8];
@@ -347,5 +412,231 @@ mod constant_multiply_tests {
             FIX_2_562915447,
             FIX_3_072711026,
         );
+    }
+}
+
+#[cfg(test)]
+mod effective_dc_shared_tests {
+    use super::*;
+
+    fn table(sample: i128) -> u8 {
+        match sample.rem_euclid(1024) {
+            k @ 0..=127 => (k + 128) as u8,
+            128..=383 => 255,
+            384..=895 => 0,
+            k => (k - 896) as u8,
+        }
+    }
+
+    fn check_entry(c: &[i16; 64], q: &[u8; 64]) {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        let expected = super::super::inverse_dct_8x8_scalar(c, q).unwrap();
+        // SAFETY: 已检查 NEON，定长输入输出。
+        assert_eq!(unsafe { inverse_dct_8x8_neon(c, q) }, expected);
+    }
+
+    #[test]
+    fn idct_dc_full_domain_premap_two_pass_i128() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        let mut count = 0;
+        // 每个 i16×u8 组合；两个 lane 的系数/量化独立、符号相反。
+        for q in 0..=255i32 {
+            for c in i32::from(i16::MIN)..=i32::from(i16::MAX) {
+                let cs = [c, -1 - c];
+                let qs = [q, 255 - q];
+                unsafe {
+                    let d = vmull_s32(vld1_s32(cs.as_ptr()), vld1_s32(qs.as_ptr()));
+                    let mut input = [vdupq_n_s64(0); 8];
+                    input[0] = std::hint::black_box(d);
+                    let w = transform::<11>(input);
+                    let mut second = [vdupq_n_s64(0); 8];
+                    second[0] = w[0];
+                    let s = transform::<18>(second);
+                    let mut actual_d = [0i64; 2];
+                    vst1q_s64(actual_d.as_mut_ptr(), d);
+                    for lane in 0..2 {
+                        let expected_d = i128::from(cs[lane]) * i128::from(qs[lane]);
+                        let expected_w = (8192 * expected_d + 1024).div_euclid(2048);
+                        let expected_s = (8192 * expected_w + 131072).div_euclid(262144);
+                        assert_eq!(i128::from(actual_d[lane]), expected_d);
+                        assert_eq!(expected_w, 4 * expected_d);
+                        assert_eq!(expected_s, (expected_d + 4).div_euclid(8));
+                        for column in 0..8 {
+                            let mut actual_w = [0i64; 2];
+                            let mut actual_s = [0i64; 2];
+                            vst1q_s64(actual_w.as_mut_ptr(), w[column]);
+                            vst1q_s64(actual_s.as_mut_ptr(), s[column]);
+                            assert_eq!(i128::from(actual_w[lane]), expected_w);
+                            assert_eq!(i128::from(actual_s[lane]), expected_s);
+                        }
+                    }
+                }
+                count += 1;
+            }
+        }
+        assert_eq!(count, 16_777_216);
+    }
+
+    #[test]
+    fn idct_dc_entry_table_periods_effective_zero_and_all_ac_positions() {
+        for period in -3..=3 {
+            for index in 0..1024 {
+                let sample = period * 1024 + index;
+                let mut c = [0i16; 64];
+                let q = [1u8; 64];
+                c[0] = (sample * 8) as i16;
+                check_entry(&c, &q);
+                assert_eq!(
+                    unsafe { inverse_dct_8x8_neon(&c, &q) },
+                    [table(sample.into()); 64]
+                );
+            }
+        }
+        for dc in [i16::MIN, -8192, -12, -5, -4, -1, 0, 4, 12, 8192, i16::MAX] {
+            for dq in [0, 1, 2, 127, 128, 255] {
+                for style in 0..3 {
+                    let mut c = [0i16; 64];
+                    let mut q = [0u8; 64];
+                    c[0] = dc;
+                    q[0] = dq;
+                    for i in 1..64 {
+                        if style == 0 || (style == 2 && i % 2 == 0) {
+                            c[i] = if i % 3 == 0 { i16::MIN } else { i16::MAX };
+                        } else {
+                            q[i] = 255;
+                        }
+                    }
+                    check_entry(&c, &q);
+                    let s = (i128::from(dc) * i128::from(dq) + 4).div_euclid(8);
+                    assert_eq!(unsafe { inverse_dct_8x8_neon(&c, &q) }, [table(s); 64]);
+                }
+            }
+        }
+        for position in 1..64 {
+            for (ac, aq) in [
+                (2, 1),
+                (-32768, 128),
+                (-32768, 2),
+                (32767, 255),
+                (-1, 1),
+                (1, 1),
+            ] {
+                for dq in [0, 255] {
+                    let mut c = [0i16; 64];
+                    let mut q = [0u8; 64];
+                    c[0] = -12;
+                    q[0] = dq;
+                    c[position] = ac;
+                    q[position] = aq;
+                    check_entry(&c, &q);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn idct_dc_mutant_arithmetic_and_predicate_controls_are_rejected() {
+        // 真实执行错误控制，并要求同一精确相等断言失败；不修改旧 oracle。
+        fn rejected<T: std::fmt::Debug + PartialEq + std::panic::RefUnwindSafe>(a: T, b: T) {
+            assert!(std::panic::catch_unwind(|| assert_eq!(a, b)).is_err());
+        }
+        rejected((-5i128 + 4) / 8, (-5i128 + 4).div_euclid(8));
+        rejected((12i128 + 16) >> 5, (12i128 + 4) >> 3);
+        rejected(
+            (8192i128 + 4).div_euclid(8).clamp(-128, 127) as i16 + 128,
+            i16::from(table(1024)),
+        );
+        for (c, q) in [(2i16, 1u8), (-32768, 128), (-32768, 2)] {
+            let expected = i64::from(c) * i64::from(q) != 0;
+            let mutant = if c == 2 {
+                (c as u16 & u16::from(q)) != 0
+            } else if q == 128 {
+                c as u8 != 0 && q != 0
+            } else {
+                (i64::from(c) * i64::from(q)) as i16 != 0
+            };
+            rejected(mutant, expected);
+        }
+        for (d, s) in [(-4, 0), (-5, -1), (-12, -1), (4, 1)] {
+            assert_eq!((d + 4i128).div_euclid(8), s);
+        }
+    }
+}
+
+#[cfg(test)]
+mod effective_dc_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn idct_dc_candidate_exact_predicate_all_positions_and_unique_exclusion() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        for position in 0..64 {
+            for (value, quant) in [
+                (2, 1),
+                (-32768, 128),
+                (-32768, 2),
+                (32767, 255),
+                (-1, 1),
+                (1, 1),
+            ] {
+                let mut c = [0i16; 64];
+                let mut q = [0u8; 64];
+                c[position] = value;
+                q[position] = quant;
+                assert_eq!(unsafe { effective_ac_is_zero(&c, &q) }, position == 0);
+                q[position] = 0;
+                assert!(unsafe { effective_ac_is_zero(&c, &q) });
+                q[position] = quant;
+                c[position] = 0;
+                assert!(unsafe { effective_ac_is_zero(&c, &q) });
+            }
+        }
+        let mut c = [i16::MIN; 64];
+        let mut q = [0u8; 64];
+        q[0] = 255;
+        assert!(unsafe { effective_ac_is_zero(&c, &q) });
+        for position in 1..64 {
+            if position % 2 == 0 {
+                c[position] = 0;
+                q[position] = 255;
+            }
+        }
+        assert!(unsafe { effective_ac_is_zero(&c, &q) });
+        q[0] = 0;
+        c[63] = 1;
+        q[63] = 1;
+        assert!(!unsafe { effective_ac_is_zero(&c, &q) });
+        // 小 AC 经过最终舍入可能同色，仍必须判定为非 DC。
+        c.fill(0);
+        q.fill(0);
+        c[1] = 1;
+        q[1] = 1;
+        assert_eq!(unsafe { inverse_dct_8x8_neon(&c, &q) }, [128; 64]);
+        assert!(!unsafe { effective_ac_is_zero(&c, &q) });
+    }
+
+    #[test]
+    fn idct_dc_candidate_full_domain_actual_sample_before_table() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        for q in 0..=255u16 {
+            for c in i32::from(i16::MIN)..=i32::from(i16::MAX) {
+                let mut cs = [0i16; 8];
+                let mut qs = [0u8; 8];
+                cs[0] = c as i16;
+                cs[1] = (-1 - c) as i16;
+                qs[0] = q as u8;
+                qs[1] = (255 - q) as u8;
+                let expected = (i128::from(c) * i128::from(q) + 4).div_euclid(8);
+                let mut actual = [0i64; 2];
+                unsafe {
+                    let sample = effective_dc_sample(
+                        std::hint::black_box(vld1q_s16(cs.as_ptr())),
+                        std::hint::black_box(vld1_u8(qs.as_ptr())),
+                    );
+                    vst1q_s64(actual.as_mut_ptr(), sample);
+                }
+                assert_eq!(actual.map(i128::from), [expected; 2]);
+            }
+        }
     }
 }

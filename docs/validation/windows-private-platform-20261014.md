@@ -408,3 +408,26 @@ Fix1 manifest为9a188a9808c2ba683c2947d94481aafef7538a6df7557695ab4decab54bab979
 
 
 失败专用观察增量定向复审现已批准：Spec PASS / Quality APPROVE，I1 ADDRESSED，新增Critical/Important/Minor均0。完整审查报告SHA256 d0de0c5fb8f84449a781ab8d5f0940935106973c7009f8b7fc11ede10733be94，原9059B首轮FAIL前缀保留。root重新逐字核对最终13源码、新32项材料与报告前缀，接收为failure-diagnostics-root-acceptance.json。该批准只关闭source/host观察增量；新的固定C/SDK/import/布局和同run Windows七命令尚待执行，H/O/SP/provider/dataflow与完整产品目标仍OPEN。后续以审查后新commit正常推送并单独启动新的原workflow_dispatch，不重跑或替换旧失败。
+
+
+### 00b328c 新诊断原生运行：实际上下文与模块已取得，整轮仍失败
+
+2026-10-16，观察增量以 `00b328cd51a96d2a47a54301a14dc99773a811ba` 正常推送同一feature分支后，仅发起一次原workflow_dispatch：[run38812955596](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38812955596)，attempt1。compile job116690482176成功，native job116693486868失败；未重跑或改写旧失败。普通CI、macOS ARM64包、Linux包另已成功，Windows包在本次最后观察时仍运行，不能当作private native资格。
+
+native artifact12009851903完整473080815B，SHA256 `3ccc6973b881c2a7aa83164c2e556b26ba711f47a0b61179ce1978ed4a33d3e5` 与认证API一致。root核对541outer/538inner全部CRC/长度/摘要、manifest/terminal/summary及七份源副本与Git00b。首轮收集在48个完整8MiB段后、402653184B处RuntimeError退出；原因未确定，不声称URL过期。原receipt/前缀保留，续传前重新核对所有48段prefix hash，仅请求剩余字节，仍使用原1800秒收集期限；没有重跑native或更改产品预算。早期21份冻结文件、17个成员和3个raw Range块全部与完整包逐字匹配。
+
+同run input12010230889完整78777260B，SHA256 `da40bd621cc07c6a2f5a462cbf8fea859628afb37919c07d95ff2031b9c2e73a`；root固定F2源码 `bb87afb5...` 独立认证run/compile job/caller context、静态admit/revalidate 7COFF/5PE，seal `94ebda6c0d87c5109bdafa9415b6ace5551157e9699099ef88b8321e85598a09`，仅admitted-static-only。未在Mac执行PE或Windows API。
+
+register0（PID8932）和unwind0（PID11220）实际wait0/exit0/jobzero，固定F1独立重解析一致。isolated parentPID8264实际wait0/exit1、first_failure=parent-nonzero，随后按原owner失败清理策略TerminateJobObject并确认wait0/jobzero；终止发生在已观察原exit1之后，不能把它说成原父进程被清理杀死。root初版审计错误地禁止失败路径的cleanup terminate，第一次拒绝及脚本保留；核对原owner与实际API顺序后仅修正root审计，不改产品。严格F1仍拒绝actual parent exit1。后四个unwind变体未尝试，完整七项仍未通过。
+
+纯诊断parser对完整stderr（13423B，SHA256 `7424646d13029b4b35edb72165f1068a0edfc17dbf58120de1d836e7ecc82cee`）解析成功，与早期Range结果完全相同，输出native=unresolved。`corrupt_fp` 子PID10096/TID11044有三份实际停止点context，diagnostic_failed=0：
+
+- first breakpoint ExceptionPC `0x7ff7f7747e88`，实际ContextPC `0x7ff7f7747e8c`（+4），SP `0xb89853f6c0`、FP=0、LR `0x7ff7f7747c24`；两种PC独立保留。
+- 中间额外AV `0xc0000005`，实际PC `0x7ffba7b78150`，x9=`0x90`。
+- second breakpoint实际PC回到 `0x7ff7f7747e88`，SP同前、FP=0。原unexpected AV继续导致失败，不作豁免。
+
+额外AV模块由该子进程实际LOAD_DLL hFile归属为 `C:\Windows\System32\ntdll.dll`，base `0x7ffba7b30000`、RVA `0x48150`，AA64、SizeOfImage4419584，完整文件4359168B SHA256 `60ef561645b50dce71ad0919dbbef3ad334a0489432cde718e75b73b558c7997`。有界256B实际remote与disk code一致。官方SDK llvm-objdump对这些精确字节的独立解码确认故障word `0xf8408528` 为 `ldr x8,[x9],#8`；实际x9=0x90，与异常读地址一致。用于解码的ELF仅是承载该256B的合成容器，不是完整ntdll或原函数元数据。
+
+GO后pre-call基线SP `0xb89853f840` 与first SP差384，仅为一致性观察。H/O暂仍unknown-callsite-SP-proof；独立审查正在用同run PE核对捕获点到outer call的实际SP连续性及helper/outer元数据。前述实际模块/指令已不再是unknown provider，但虚拟CONTEXT来源、FP到低地址的完整因果链、可行fragment修复及恢复oracle尚未授予证明；不能从256B代码窗口推断未捕获的内存或给出函数名。Microsoft规定展开按元数据逆转prologue、独立函数fragment必须各有pdata/xdata；后继方案须据此独立验证，见[官方ARM64展开规则](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170)。
+
+证据目录 `target/windows-private-runner-root-20261016/failure-diagnostics-ci/`：native-envelope-acceptance、root-static-acceptance、native-root-acceptance、range-full-match、diagnostic-whole-parser-acceptance、diagnostic-observations-whole-verified及preliminary-isa。完整七项nativehelper、shipping数值/保护页/性能/修改包、真实产品和全平台目标继续OPEN。PC人工填写hold保持，未观察或操作设备。
