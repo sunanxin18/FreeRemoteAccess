@@ -31,9 +31,3 @@ frd-frame = { path = "../frd-frame" }
 frd-media-api = { path = "../frd-media-api" }
 frd-protocol-api = { path = "../frd-protocol-api" }
 frd-wire-rfb = { path = "../frd-wire-rfb" }
-
-[target.'cfg(unix)'.dev-dependencies]
-libc = "=0.2.189"
-
-[target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Networking_WinSock"] }

@@ -969,6 +969,24 @@ impl Drop for AppleConnection {
     }
 }
 
+// 测试判据：只接受实际write_all错误，拒绝自然timeout冒充shutdown效果。
+#[cfg(test)]
+pub(crate) fn is_shutdown_write_error(error: &anyhow::Error) -> bool {
+    if error.to_string() != "写入失败（连接中断？）" {
+        return false;
+    }
+    let mut io_causes = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>());
+    let Some(cause) = io_causes.next() else {
+        return false;
+    };
+    !matches!(
+        cause.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) && io_causes.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,7 +1349,29 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_interrupts_in_flight_write_and_disconnects_queued_callers() {
+    fn shutdown_write_error_requires_io_cause_and_rejects_setup_and_timeouts() {
+        use anyhow::Context;
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let error = Err::<(), _>(std::io::Error::from(kind))
+                .context("写入失败（连接中断？）")
+                .unwrap_err();
+            assert!(!super::is_shutdown_write_error(&error));
+        }
+        let setup = Err::<(), _>(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("设置 Apple writer 写超时失败")
+            .unwrap_err();
+        assert!(!super::is_shutdown_write_error(&setup));
+        assert!(!super::is_shutdown_write_error(&anyhow::anyhow!(
+            "写入失败（连接中断？）"
+        )));
+        let write = Err::<(), _>(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("写入失败（连接中断？）")
+            .unwrap_err();
+        assert!(super::is_shutdown_write_error(&write));
+    }
+
+    #[test]
+    fn shutdown_fails_large_tcp_write_and_releases_queued_callers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (peer_ready_tx, peer_ready_rx) = mpsc::channel();
@@ -1345,19 +1385,18 @@ mod tests {
         let stream = TcpStream::connect(address).unwrap();
         peer_ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let mut connection = AppleConnection::new(stream);
-        let (writer_io_tx, writer_io_rx) = mpsc::channel();
-        let writer = connection
-            .writer_handle_with_io_events(writer_io_tx)
+        let writer = connection.writer_handle().unwrap();
+        let (active_result_rx, active_io_rx) = writer
+            .enqueue_private_message_observed(vec![0x5a; 64 * 1024 * 1024])
             .unwrap();
-
-        let active_writer = writer.clone();
-        let active_send = thread::spawn(move || {
-            active_writer.send_private_message(&vec![0x5a; 64 * 1024 * 1024])
-        });
-        let event = writer_io_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("writer must enter write_all before shutdown");
-        assert!(matches!(event, WriterIoTestEvent::Started { .. }));
+        assert_eq!(
+            active_io_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("大写请求必须在shutdown前Started"),
+            WriterIoTestEvent::Started {
+                wire_bytes: 64 * 1024 * 1024
+            }
+        );
 
         let queued_one = writer.enqueue_private_message(vec![0x11; 8]).unwrap();
         let queued_two = writer.enqueue_private_message(vec![0x22; 8]).unwrap();
@@ -1374,17 +1413,20 @@ mod tests {
                 })
             })
             .collect();
+        let cleanup_deadline = Instant::now() + Duration::from_secs(3);
         barrier.wait();
         drop(shutdown_tx);
 
         let shutdown_results = (0..2)
             .map(|_| {
                 shutdown_rx
-                    .recv_timeout(Duration::from_secs(3))
+                    .recv_timeout(cleanup_deadline.duration_since(Instant::now()))
                     .expect("shutdown must be bounded")
             })
             .collect::<Vec<_>>();
-        let active_result = active_send.join().unwrap();
+        let active_result = active_result_rx
+            .recv_timeout(cleanup_deadline.duration_since(Instant::now()))
+            .expect("大写请求必须有界返回结果");
         let queued_results =
             [queued_one, queued_two].map(AppleWriterHandle::receive_message_result);
         for thread in shutdown_threads {
@@ -1398,12 +1440,31 @@ mod tests {
 
         assert!(shutdown_results.into_iter().all(|result| result.is_ok()));
         let active_error = active_result.unwrap_err();
-        assert_eq!(active_error.to_string(), "写入失败（连接中断？）");
+        assert!(
+            super::is_shutdown_write_error(&active_error),
+            "大写请求必须返回真实非timeout写入错误: {active_error:#}"
+        );
+        assert_eq!(
+            active_io_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                WriterIoTestEvent::Finished { succeeded: false },
+                WriterIoTestEvent::ResultDelivered,
+            ]
+        );
+        assert!(matches!(
+            active_io_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            active_result_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
         for queued_result in queued_results {
             let queued_error = queued_result.unwrap_err();
             assert_eq!(queued_error.to_string(), "Apple writer 未返回发送结果");
         }
         assert!(repeated_writer_shutdown.is_ok());
+        assert!(writer.send_private_message(b"after-cleanup").is_err());
         if let Err(error) = connection_shutdown {
             assert!(
                 error

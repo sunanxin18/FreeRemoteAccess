@@ -1,6 +1,6 @@
 # Apple 断开测试的请求归属（2026-10-15）
 
-本记录只涉及测试观察与回归，不改变生产超时、关闭、加密、wire、取消或错误合同。请求归属修复已通过本机测试及独立复审，但新CI给出了同一请求迟到成功的反例，背压判定修复仍在验证。
+本记录只涉及测试观察与回归，不改变生产超时、关闭、加密、wire、取消或错误合同。请求归属修复保留；前两版测试资格被CI反例否定，最新方案改为准确的会话清理合同并补强真实大写失败。新方案本机验证和独立复审通过，新CI结果待补。
 
 ## 原始失败和原因
 
@@ -47,3 +47,17 @@ Windows/Linux各i686、x86_64、ARM64的最终完整helper及probe测试源码�
 `df0672b` 的 run38716468501、macos-15 job116360378045 于10:01:24 UTC结束失败：原断开回归在 `runtime.rs:3104` 再次触发同请求迟到成功，Apple539通过/1失败/11ignored。日志明确记录选中时“已完成请求数:0”；新socket probe测试通过仍不能证明这个60,034-byte请求有剩余数据尚未被内核接受。它进一步证实上述完成通知窗口仍会发生，不能把零poll资格当成测试问题已经解决。
 
 完整225851-byte失败日志保留为 `target/apple-writer-backpressure-20261015/ci-macos-failed-full.log`，步骤终态为 `ci-macos-job.json`。首次job logs API读取失败也已记录；随后按具体job读取成功，没有重跑CI。继续只读设计更强的真实I/O准备条件；本机通过与独立审查通过只对应其已声明的范围，不能覆盖此次CI失败。
+
+## 第三轮：修正测试预期并保留严格的真实 I/O 回归
+
+源码及独立策略审查确认：生产writer没有追溯取消已经成功的`write_all`的合同。Started在syscall之前，Finished在其后，完成通知可能晚于Disconnect；无条件要求这个请求Err是过强的测试预期。root撤回此前“不接受同请求迟到Ok”的要求，并同步撤回runtime已证明内核阻塞取消的表述。Darwin独立实验还观察到SO_RCVBUF请求1024会增长到523648，瞬时poll或窗口/MSS快照均未给出未来全链路容量上界；这些调查未成为新生产依赖或固定五帧规则。
+
+runtime回归更名为`production_session_started_request_disconnect_race_runs_bounded_cleanup`，单条60000-byte合法加密请求在同请求Started后提交Disconnect。结果为Ok时必须配对唯一Finished(true)，Err则必须是外层精确“写入失败（连接中断？）”、唯一真实I/O cause，且排除TimedOut/WouldBlock，并配对Finished(false)。两支均要求ResultDelivered、两个通道最终断开及完整共同清理，无提前返回。原2秒准备、同一3秒绝对清理界限、Closed、唯一退出、清理顺序、状态事件顺序及关闭后发送拒绝全部保留；peer只由显式释放/drop结束。
+
+connection的64MiB真实TCP用例仍严格要求失败，更名为`shutdown_fails_large_tcp_write_and_releases_queued_callers`；增加请求独立结果/事件匹配，并同样拒绝无I/O cause、设置超时失败、TimedOut/WouldBlock。它保留两个queued callers、并发/重复shutdown和关闭后拒绝，接收结果共用三秒界限。自然2秒写超时不能冒充shutdown影响。成功隔离用例保留；新增错误判据负例测试，移除无consumer的poll helper/probe及其两条测试依赖边。删除1个probe、增加1个负例测试，单测总数净变化0。
+
+最终绝对Rust1.96 cargo/RUSTC/RUSTDOC、新隔离target：四项focused各1通过；预定10组runtime与64MiB配对共20/20进程exit0；完整Apple540通过、11项原ignored、集成4+1通过、doc0。两文件生产前缀逐字比对一致，新增共享错误判据仅cfg(test)，Cargo.lock只撤Apple两条dev依赖边。当前connection SHA-256为`7344157eb0ab56715c22decd911e929ae139660ac83ef9322d7f9b0be63b607e`，runtime为`fb27a377617ed1688485509aa012ab743893c95ae5938a96847cb3fc9e351814`。完整源码、日志、负例、生产比对和三轮调查在`target/apple-writer-fix3-20261015/`及前述历史目录保留。
+
+独立最终审查Spec PASS（补强B合同）、Quality APPROVE，root另行核对四文件冻结、生产前缀、20份配对终态及完整测试。提交前diff检查曾发现Cargo.toml新增EOF空行，原作者仅移除该空行，最终diff检查通过；依赖语义及其余源码未变，没有重复已通过的同源测试。新CI尚未完成，不能提前宣称原macos-15场景已通过。
+
+这些分层结果不证明特定加密runtime请求确定阻塞于内核时被取消，也不覆盖runtime同步等待writer而尚未dequeue Disconnect的路径，或其他系统相同负载的内核因果。真实TCP大写失败与生产session完整清理是独立证据，不能合称上述更强目标已完成。当前未改变生产取消语义；本机矩阵不等于新的macos-15或Windows/Linux原生CI通过。
