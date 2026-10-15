@@ -179,9 +179,25 @@ impl DecodingContext {
         trace!(?region);
 
         let clipping_rectangles = if coverage.enabled {
-            checked_clipping_rectangles(region.rectangles.as_slice(), destination, width, height, true)?
+            checked_clipping_rectangles(
+                region.rectangles.as_slice(),
+                destination,
+                width,
+                height,
+                image.width(),
+                image.height(),
+                true,
+            )?
         } else if self.native_legacy_kernels.is_some() {
-            native_clipping_rectangles(region.rectangles.as_slice(), destination, width, height)?
+            checked_clipping_rectangles(
+                region.rectangles.as_slice(),
+                destination,
+                width,
+                height,
+                image.width(),
+                image.height(),
+                false,
+            )?
         } else {
             clipping_rectangles(region.rectangles.as_slice(), destination, width, height)
         };
@@ -357,22 +373,23 @@ fn decode_component(
     Ok(())
 }
 
-fn native_clipping_rectangles(
-    rectangles: &[RfxRectangle],
-    destination: &InclusiveRectangle,
-    width: u16,
-    height: u16,
-) -> SessionResult<Region> {
-    checked_clipping_rectangles(rectangles, destination, width, height, false)
-}
+#[expect(clippy::too_many_arguments)]
 fn checked_clipping_rectangles(
     rectangles: &[RfxRectangle],
     destination: &InclusiveRectangle,
     width: u16,
     height: u16,
+    image_width: u16,
+    image_height: u16,
     exact: bool,
 ) -> SessionResult<Region> {
-    if width == 0 || height == 0 {
+    if width == 0
+        || height == 0
+        || image_width == 0
+        || image_height == 0
+        || destination.left > destination.right
+        || destination.top > destination.bottom
+    {
         return Err(custom_err!(
             "native RFX geometry",
             legacy_native::KernelError::InvalidDimensions
@@ -392,20 +409,31 @@ fn checked_clipping_rectangles(
                 legacy_native::KernelError::InvalidDimensions
             ));
         }
-        let left = u32::from(destination.left) + u32::from(rect.x);
-        let top = u32::from(destination.top) + u32::from(rect.y);
-        let right = left + u32::from(rect.width) - 1;
-        let bottom = top + u32::from(rect.height) - 1;
-        // 不把空交集夹成画面边缘的一个像素。
-        if left >= u32::from(width) || top >= u32::from(height) {
+        // channel 尺寸属于编码帧的局部坐标，不能拿来裁剪偏移后的桌面坐标。
+        // 先限定局部帧，再平移并限定 destination/实际图像；宽算术保留空交集。
+        let local_left = u32::from(rect.x);
+        let local_top = u32::from(rect.y);
+        if local_left >= u32::from(width) || local_top >= u32::from(height) {
+            continue;
+        }
+        let local_right = (local_left + u32::from(rect.width) - 1).min(u32::from(width) - 1);
+        let local_bottom = (local_top + u32::from(rect.height) - 1).min(u32::from(height) - 1);
+        let left = u32::from(destination.left) + local_left;
+        let top = u32::from(destination.top) + local_top;
+        let right = (u32::from(destination.left) + local_right)
+            .min(u32::from(destination.right))
+            .min(u32::from(image_width) - 1);
+        let bottom = (u32::from(destination.top) + local_bottom)
+            .min(u32::from(destination.bottom))
+            .min(u32::from(image_height) - 1);
+        if left > right || top > bottom {
             continue;
         }
         let rectangle = InclusiveRectangle {
             left: u16::try_from(left).map_err(|e| custom_err!("native RFX geometry", e))?,
             top: u16::try_from(top).map_err(|e| custom_err!("native RFX geometry", e))?,
-            right: u16::try_from(right.min(u32::from(width) - 1)).map_err(|e| custom_err!("native RFX geometry", e))?,
-            bottom: u16::try_from(bottom.min(u32::from(height) - 1))
-                .map_err(|e| custom_err!("native RFX geometry", e))?,
+            right: u16::try_from(right).map_err(|e| custom_err!("native RFX geometry", e))?,
+            bottom: u16::try_from(bottom).map_err(|e| custom_err!("native RFX geometry", e))?,
         };
         if exact {
             // 上游 union 的半开 band 比较可丢单行。rich 保留精确 checked 列表；允许重叠。
@@ -493,8 +521,8 @@ fn tiles_to_rectangles<'a>(
     tiles.iter().map(|t| InclusiveRectangle {
         left: destination.left + t.x * TILE_SIZE,
         top: destination.top + t.y * TILE_SIZE,
-        right: destination.left + t.x * TILE_SIZE + TILE_SIZE - 1,
-        bottom: destination.top + t.y * TILE_SIZE + TILE_SIZE - 1,
+        right: destination.left + t.x * TILE_SIZE + (TILE_SIZE - 1),
+        bottom: destination.top + t.y * TILE_SIZE + (TILE_SIZE - 1),
     })
 }
 
