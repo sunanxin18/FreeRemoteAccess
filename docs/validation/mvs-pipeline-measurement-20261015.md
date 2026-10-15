@@ -1,6 +1,6 @@
 # MVS 有限整管线工作集与测量（2026-10-15）
 
-状态：**实验性**。新增测试专用真实 wire 工作集和测量入口，默认/native 宿主资格与固定四轮有限计时完成，两个官方 OHOS ARM64 Release 测试程序已构建。PC模拟器已完成两份程序各32条资格，手机尚未执行、两端正式计时仍未完成。不能由本项宣称生产解码资格或鸿蒙真实 Mac 会话已完成。
+状态：**实验性**。新增测试专用真实 wire 工作集和测量入口，默认/native 宿主资格与固定四轮有限计时完成，两个官方 OHOS ARM64 Release 测试程序已构建。手机和PC模拟器均已独立完成两份程序各32条资格，两端正式计时仍未完成。不能由本项宣称生产解码资格或鸿蒙真实 Mac 会话已完成。
 
 ## 入口、工作集与正确性
 
@@ -78,8 +78,17 @@ root 在源码/工件冻结、独立审查之后，顺序执行 default-forward�
 
 PC default与PC native、PC default与宿主default、PC native与宿主native三组各32完整输出+8state、386,897,350字节逐字一致。root重新执行三组完整比较及各自4负对照，均通过；含patch每行与committed framebuffer相等、消息顺序、实际dense-Y seed等检查。这是目标正确性，未执行PC正式计时。
 
-只在独立0700临时目录使用CLI程序，没有网络、输入注入、HAP安装/启动/停止、界面截图或密码/HUKS访问。原等待人工安全输入的PC表单保持。本次没有启动phone；host Mac再次被工具确认仍锁屏，手机资格与新包GUI继续待条件恢复。
+只在独立0700临时目录使用CLI程序，没有网络、输入注入、HAP安装/启动/停止、界面截图或密码/HUKS访问。原等待人工安全输入的PC表单保持。该PC步骤当时没有启动phone，Mac当时锁屏。用户随后手动解锁，后续phone独立资格见下节；这些历史状态不代表当前仍锁屏。
 
 首次公开参数检查因系统返回boot/API尾空格而触发本地helper断言STOP；两条实际公开命令的host/guest已成功。root读取原始输出后，只允许按位置strip并严格白名单核对公开字段，从已有成功receipt接续未执行步骤，未重复原命令、未覆盖STOP或更改产品源码。该历史失败不是客户端或设备加载失败。
 
-实际证据 `target/task5a6-mvs-pipeline-20261015/pc-runtime/`，root接收 `target/task5a6-root-20261015/pc-acceptance/`。正式PC计时、phone资格/计时仍保留OPEN，不能由其中一个实例推定另一个通过。
+实际证据 `target/task5a6-mvs-pipeline-20261015/pc-runtime/`，root接收 `target/task5a6-root-20261015/pc-acceptance/`。正式PC计时仍保留OPEN，不能由其中一个实例推定另一个通过。
+
+
+## 手机模拟器独立有限目标正确性
+
+用户手动解锁Mac并恢复API26 ARM64手机实例后，使用与上节相同冻结ELF/官方SDK库，严格通过官方HDC指定手机目标。default/native各仅执行一次精确资格测试，各1passed/0failed、32record+8state+DONE，host0和各唯一guest0。各取回41文件；root另行重新核对82文件身份、45+76源及四工件/SDK输入，重新执行三组完整比较与每组4负对照：phone default/native、phone default/host default、phone native/host native，**每组386,897,350字节逐字相同**，14,400个dense-Y seed检查通过。
+
+实际24个command的host均0；14条guest shell有13条唯一guest0，以及保留的一条公开观察guest127。初次inventory helper误要求只出现手机、第二次公开内存观察误用guest不存在的awk，均立即STOP。root分别读取原始记录后只释放清单解析修正及新增一次`cat /proc/meminfo`；没有重发旧inventory/uname/params/df，没有覆盖原STOP/raw或把guest127改写为成功。启动前公开可用内存2,630,264KiB、可用磁盘1,808,680KiB满足资格前置阈值，不能视为进程RSS或分配实测。
+
+没有操作产品UI/账号/HUKS/网络或PC；没有构建、签装或执行正式计时。证据 `target/task5a6-mvs-pipeline-20261015/phone-runtime/`，root独立接收 `target/task5a6-root-20261015/phone-acceptance/acceptance.json`。手机和PC的有限CPU正确性现已分别通过，**两端正式计时、HAP/GPU/网络及真实Mac性能仍未完成**。
