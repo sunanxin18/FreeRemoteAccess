@@ -14,9 +14,9 @@
 //! descale(DC, 5)。量化零使原始系数非零也不影响这个恒等式。
 //! 这保证语义相同；稀疏块性能需要独立测量，当前不作加速声明。
 use super::{
-    apple_idct_range_limit, FIX_0_298631336, FIX_0_390180644, FIX_0_541196100, FIX_0_765366865,
-    FIX_0_899976223, FIX_1_175875602, FIX_1_501321110, FIX_1_847759065, FIX_1_961570560,
-    FIX_2_053119869, FIX_2_562915447, FIX_3_072711026, IDCT_CONST_BITS, IDCT_PASS1_BITS,
+    FIX_0_298631336, FIX_0_390180644, FIX_0_541196100, FIX_0_765366865, FIX_0_899976223,
+    FIX_1_175875602, FIX_1_501321110, FIX_1_847759065, FIX_1_961570560, FIX_2_053119869,
+    FIX_2_562915447, FIX_3_072711026, IDCT_CONST_BITS, IDCT_PASS1_BITS,
 };
 use std::arch::aarch64::*;
 
@@ -139,12 +139,36 @@ pub(super) unsafe fn inverse_dct_8x8_neon(
             });
             let values = transform::<{ (IDCT_CONST_BITS + IDCT_PASS1_BITS + 3) as i32 }>(input);
             for column in 0..8 {
-                output[row * 8 + column] =
-                    apple_idct_range_limit(vgetq_lane_s64::<0>(values[column]));
-                output[(row + 1) * 8 + column] =
-                    apple_idct_range_limit(vgetq_lane_s64::<1>(values[column]));
+                let bytes = range_limit_pair(values[column]);
+                // 向量已完成环绕表与窄化；仅把两个字节散写到相邻输出行。
+                output[row * 8 + column] = vget_lane_u8::<0>(bytes);
+                output[(row + 1) * 8 + column] = vget_lane_u8::<1>(bytes);
             }
         }
         output
     }
+}
+
+/// Apple 的 10 位环绕表；全部 i64（包括负数和极值）先按位掩码。
+/// 两个输出均处于 0..255，窄化不丢失有效位；其余字节固定为零。
+/// # Safety
+/// 调用者须先确认 ARM64 NEON 可用。
+#[inline]
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn range_limit_pair(value: int64x2_t) -> uint8x8_t {
+    let index = vandq_u64(vreinterpretq_u64_s64(value), vdupq_n_u64(0x3ff));
+    let high_ramp = vaddq_u64(index, vdupq_n_u64(128));
+    let low_ramp = vsubq_u64(index, vdupq_n_u64(896));
+    let mapped = vbslq_u64(
+        vcltq_u64(index, vdupq_n_u64(128)),
+        high_ramp,
+        vbslq_u64(
+            vcltq_u64(index, vdupq_n_u64(384)),
+            vdupq_n_u64(255),
+            vbslq_u64(vcgeq_u64(index, vdupq_n_u64(896)), low_ramp, vdupq_n_u64(0)),
+        ),
+    );
+    let words = vcombine_u32(vmovn_u64(mapped), vdup_n_u32(0));
+    let halves = vcombine_u16(vmovn_u32(words), vdup_n_u16(0));
+    vmovn_u16(halves)
 }

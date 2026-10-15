@@ -103,3 +103,22 @@ pub(super) unsafe fn words_bytes4(words: *const u32, bytes: *mut u8) {
         vst1q_u8(bytes, vreinterpretq_u8_u32(vld1q_u32(words)));
     }
 }
+
+/// # Safety
+/// rgb 至少 24 可写字节；颜色按值传入，无输入内存或重叠约束。
+#[inline(never)]
+pub(super) unsafe fn bitmap_rgb8(mask: u8, one: [u8; 3], zero: [u8; 3], rgb: *mut u8) {
+    // SAFETY: 固定 8 像素，st3 只写 24 字节；无标量逐像素颜色选择。
+    unsafe {
+        let bits = [0x80, 0x40, 0x20, 0x10, 8, 4, 2, 1];
+        let selected = vtst_u8(vdup_n_u8(mask), vld1_u8(bits.as_ptr()));
+        vst3_u8(
+            rgb,
+            uint8x8x3_t(
+                vbsl_u8(selected, vdup_n_u8(one[0]), vdup_n_u8(zero[0])),
+                vbsl_u8(selected, vdup_n_u8(one[1]), vdup_n_u8(zero[1])),
+                vbsl_u8(selected, vdup_n_u8(one[2]), vdup_n_u8(zero[2])),
+            ),
+        );
+    }
+}

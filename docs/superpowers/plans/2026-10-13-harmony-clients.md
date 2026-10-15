@@ -141,6 +141,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 5A2 OHOS目标执行子步骤：同一最终aggregate ELF在手机/PC各完成14项像素+3项精确消费者，8条命令共34次通过执行且实际host/独有guest退出均0；两端完整色域/mode-4与前后产物身份经root独立复核。CLI范围之外的完整MVS、性能、HAP/应用和真实会话仍OPEN，见[色彩/像素验证](../../validation/mvs-pixels-arm64-20261015.md)。
 - [x] Task 5A3 指定完整记录/状态/发布宿主差分子步骤：2026-10-15 三个测试专用序列的scalar/native38条70,802字节全值相等，cache/Cr19Cb14/代际owner/回滚和补丁覆盖；截断负例提前geometry拒绝的P2已用真实RED和精确parse链修正并复审通过，两份fix1 OHOS最终ELF链接成功。目标执行见下一行，其它计算热路径/性能、普通应用与真实Mac仍待完成，见[流水线验证](../../validation/mvs-pipeline-arm64-20261015.md)。
 - [x] Task 5A3 手机/PC固定产物执行子步骤：两端scalar/native各3项，4条命令共12次通过且实际host/独有guest退出均0；四份38条70,802字节与冻结宿主全部值及顺序精确相等，前后源/产物身份经root独立核对。仍不代表性能、全部MVS、HAP或真实Mac，见[流水线验证](../../validation/mvs-pipeline-arm64-20261015.md)。
+- [x] Task 5A4 输出映射/位图行源码与最终ELF子步骤：2026-10-15 既有default-off后端补全NEON环绕范围映射及mode3/4/solid行；保留原oracle/数学/wire/cache/代际契约，独立Spec/Quality通过，default/aggregate完整包527/531及新聚焦5/6通过，官方OHOS最终ELF/实际指令通过；见[原生补全验证](../../validation/mvs-native-completion-arm64-20261015.md)。
+- [x] Task 5A4 手机/PC固定产物正确性子步骤：同一最终ELF两端各6项聚焦+3项pipeline，共4条实际命令/18次通过且host/独有guest均0；38条/70,802字节完整值与两份宿主及两端逐字相等，root独立核对43源/79运行证据及前后产物身份。raw copy资格、性能、普通HAP Apple和真实Mac仍OPEN，见[原生补全验证](../../validation/mvs-native-completion-arm64-20261015.md)。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
 - [ ] 授权Mac完成真实认证、首帧、持续更新、输入、重连；音频/剪贴板只报告已实现并验证的能力。
 - [ ] 跑Windows/macOS/Linux相关回归及包检查，记录本轮没有真机的平台。

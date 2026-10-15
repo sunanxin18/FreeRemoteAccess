@@ -358,3 +358,61 @@ mod differential_tests {
         }
     }
 }
+
+/// 定长 8 像素 RGB 行，位 0x80 对应最左像素。
+#[cfg(any(test, feature = "mvs-native-colors-arm64"))]
+pub(crate) fn bitmap_rgb_row(mask: u8, one: [u8; 3], zero: [u8; 3]) -> [u8; 24] {
+    let mut rgb = [0; 24];
+    #[cfg(not(feature = "mvs-native-colors-arm64"))]
+    for (pixel, output) in rgb.chunks_exact_mut(3).enumerate() {
+        output.copy_from_slice(if mask & (0x80 >> pixel) != 0 {
+            &one
+        } else {
+            &zero
+        });
+    }
+    #[cfg(all(feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+    // SAFETY: 定长 scratch 提供完整 24 字节；编译基线保证 NEON。
+    unsafe {
+        native::bitmap_rgb8(mask, one, zero, rgb.as_mut_ptr());
+    }
+    rgb
+}
+
+#[cfg(all(test, feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+mod native_completion_row_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn native_completion_bitmap_raw_leaf_unaligned_canaries_and_solid_rows() {
+        let mut cases = 0;
+        for offset in 0..=16 {
+            for mask in 0..=255u8 {
+                for (one, zero) in [
+                    ([0x11, 0x82, 0xf3], [0xe4, 0x65, 0x26]),
+                    ([0, 255, 1], [255, 0, 254]),
+                    ([0x49; 3], [0x49; 3]),
+                ] {
+                    let mut actual = [0xac; 64];
+                    let mut expected = actual;
+                    for pixel in 0..8 {
+                        let color = if (u16::from(mask) >> (7 - pixel)) % 2 == 1 {
+                            one
+                        } else {
+                            zero
+                        };
+                        expected[offset + pixel * 3..offset + pixel * 3 + 3]
+                            .copy_from_slice(&color);
+                    }
+                    // SAFETY: offset <= 16，完整 24 字节写入均在 64 字节数组内。
+                    unsafe {
+                        native::bitmap_rgb8(mask, one, zero, actual.as_mut_ptr().add(offset));
+                    }
+                    assert_eq!(actual, expected, "offset={offset}, mask={mask}");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 13_056);
+    }
+}

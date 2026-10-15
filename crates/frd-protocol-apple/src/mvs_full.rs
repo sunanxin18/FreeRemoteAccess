@@ -1946,9 +1946,19 @@ fn fill_tile(
     tile_y: usize,
     color: [u8; 3],
 ) {
+    #[cfg(not(feature = "mvs-native-colors-arm64"))]
     for dy in 0..TILE_EDGE.min(height - tile_y) {
         for dx in 0..TILE_EDGE.min(width - tile_x) {
             write_pixel(rgb, width, tile_x + dx, tile_y + dy, color);
+        }
+    }
+    #[cfg(all(feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+    {
+        let row = crate::mvs_pixels::bitmap_rgb_row(0xff, color, color);
+        let row_bytes = TILE_EDGE.min(width - tile_x) * RGB_CHANNELS;
+        for dy in 0..TILE_EDGE.min(height - tile_y) {
+            let destination = pixel_offset(width, tile_x, tile_y + dy);
+            rgb[destination..destination + row_bytes].copy_from_slice(&row[..row_bytes]);
         }
     }
 }
@@ -2100,6 +2110,14 @@ fn decode_bitmap_tile(
                 .read_u8()
                 .context("MVS type-0 bitmap 缺少像素掩码")?
         };
+        #[cfg(all(feature = "mvs-native-colors-arm64", target_arch = "aarch64"))]
+        if tile_x < width && tile_y + dy < height {
+            let row = crate::mvs_pixels::bitmap_rgb_row(pixel_mask, one, zero);
+            let row_bytes = TILE_EDGE.min(width - tile_x) * RGB_CHANNELS;
+            let destination = pixel_offset(width, tile_x, tile_y + dy);
+            rgb[destination..destination + row_bytes].copy_from_slice(&row[..row_bytes]);
+        }
+        #[cfg(not(feature = "mvs-native-colors-arm64"))]
         for dx in 0..TILE_EDGE {
             if tile_x + dx >= width || tile_y + dy >= height {
                 continue;
@@ -2159,6 +2177,7 @@ fn descale(value: i64, shift: u32) -> i64 {
     (value + (1i64 << (shift - 1))) >> shift
 }
 
+#[cfg(any(test, not(feature = "mvs-native-idct-arm64")))]
 fn apple_idct_range_limit(value: i64) -> u8 {
     let index = usize::try_from(value & 0x3ff).expect("10-bit mask always fits usize");
     match index {
@@ -4444,3 +4463,7 @@ mod tests {
         include!("mvs_pipeline_tests.rs");
     }
 }
+
+#[cfg(test)]
+#[path = "mvs_native_completion_tests.rs"]
+mod native_completion_tests;

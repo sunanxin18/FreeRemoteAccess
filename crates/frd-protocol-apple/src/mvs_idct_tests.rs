@@ -193,3 +193,70 @@ fn idct_foundation_simd_reproducible_dense_sparse_and_zero_quantization() {
         assert_parity(&coefficients, &quantization, case);
     }
 }
+
+#[test]
+fn native_completion_range_fixed_answers() {
+    let values = [
+        0,
+        127,
+        128,
+        383,
+        384,
+        895,
+        896,
+        1023,
+        -1,
+        -128,
+        -129,
+        -1024,
+        i64::MIN,
+        i64::MAX,
+    ];
+    let expected = [128, 255, 255, 255, 0, 0, 0, 127, 127, 0, 0, 128, 128, 127];
+    for (pair, expected) in values.chunks_exact(2).zip(expected.chunks_exact(2)) {
+        assert_eq!(completion_range_pair([pair[0], pair[1]]), expected);
+    }
+}
+
+fn completion_range_pair(values: [i64; 2]) -> [u8; 2] {
+    #[cfg(not(feature = "mvs-native-idct-arm64"))]
+    {
+        values.map(super::apple_idct_range_limit)
+    }
+    #[cfg(feature = "mvs-native-idct-arm64")]
+    {
+        use std::arch::aarch64::*;
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        // SAFETY: 两个有效 i64；上方检查 NEON，抽取的是已完成映射的字节。
+        unsafe {
+            let bytes = super::idct_arm64::range_limit_pair(vld1q_s64(values.as_ptr()));
+            [vget_lane_u8::<0>(bytes), vget_lane_u8::<1>(bytes)]
+        }
+    }
+}
+
+#[test]
+fn native_completion_range_all_indices_periods_signs_and_extrema() {
+    let mut cases = 0;
+    for period in [
+        i64::MIN,
+        -1_048_576,
+        -2048,
+        -1024,
+        0,
+        1024,
+        2048,
+        i64::MAX - 1023,
+    ] {
+        for index in (0..1024).step_by(2) {
+            let values = [period + index, period + index + 1];
+            assert_eq!(
+                completion_range_pair(values),
+                values.map(super::apple_idct_range_limit),
+                "{values:?}"
+            );
+            cases += 2;
+        }
+    }
+    assert_eq!(cases, 8192);
+}
