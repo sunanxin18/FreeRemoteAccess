@@ -1,8 +1,6 @@
 # Windows ARM64 私有保护页与 QPC 接口：源码和宿主验证
 
-2026-10-14，Task 4C5C3B2A。实现状态为**开发中**。本次完成 Windows ARM64
-私有数值测试接口的源码与 macOS 宿主算术/注入逻辑验证；没有取得真实 Windows
-编译、原生执行或修改配方包资格。
+实现状态为**开发中**。本文从2026-10-14 Task4C5C3B2A开始按时间记录。后续固定COFF/C-PE编译和静态产物验收已完成；2026-10-16严格日志解析器的源码/宿主控制也完成。真实Windows原生执行、私有ABI/SEH、同shipping数值与修改配方包资格仍未取得；各步骤证据和范围见下文。
 
 ## 实现与范围
 
@@ -231,3 +229,22 @@ artifact11885962816 为 80,618,176 bytes，API、本地 ZIP 和上传日志摘�
 符号或 frame，内联边界保持 OPEN；真正 Windows ARM64 的 Rtl/ABI/SEH、
 调试事件和独立进程退出确认、shipping 数值与保护页、性能和修改配方包仍未
 执行。它们不构成鸿蒙客户端真实 Windows/Mac 登录、画面或输入的证据。
+
+
+## Task4C5C3B2F1：严格日志解析器，源码/宿主控制完成（2026-10-16）
+
+新增 `tools/verify-windows-private-transcript.py` 纯bytes接口及独立手写合成测试。它只接受variant0 register/unwind/isolated与variant1–4 unwind七个组合，解析原始长度分隔的child stdout/stderr，严格隔离parent/child命名空间，验证独立60项寄存器掩码、8个PC变体差值、六个child及exception→continue→exit→独立wait→terminal链。输入raw/line/stdout有界，未知/额外/重复/截断/字段错序、非零parent exit和stderr拒绝；不执行任何程序，不生成native-qualified receipt。
+
+`parse_transcript(stdout, stderr, suite, variant, parent_returncode)` 中的退出码与字节均是调用方提供的数据，**不是实际Windows进程退出的证据**。本次全部控制为明确的synthetic host-only，最终22个测试方法及语法检查通过。测试包括七种合法组合、逐寄存器高低位、两字段一起伪造expected/actual、raw长度和嵌套final、异常机会/opcode、事件归属/continue/wait、指定1500ms强制终止以及失败/格式边界。没有重跑未改动的19/36编译测试，没有执行PE、修改C/ASM、重编译或发起CI/native job。 聚焦复现命令为 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools/tests/test_verify_windows_private_transcript.py -v`。
+
+首次独立审查确认两项Important：原始Win32 BOOL被误固定为1、EXIT_PROCESS的TID被全局绑定最初主线程。冻结C与[ContinueDebugEvent官方合同](https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-continuedebugevent)仅要求BOOL非零，[进程调试事件官方语义](https://learn.microsoft.com/en-us/windows/win32/debug/debugging-events)将最终退出事件绑定最后退出线程。原实现的拒绝反例和日志保留。Fix1按规范signed32保存非零原始BOOL，并要求exit Continue与terminal摘要精确重复；六case取消全局exit==main/probe约束，继续核对当前PID、正TID、相邻Continue精确配对、独立wait及终态，受控主线程probe关系保留。新增合法非1/负BOOL/边界与不同last-thread正例，另保留零返回/越界/不规范数字/摘要不一致/单处TID破坏的负例。原17项变为最终22项全部通过；原审查五个合成控制由拒绝变为接受。首次RED、实现raw framing错误、自审与Fix1失败均单独保留。
+
+同一独立reviewer完整复审Fix1后 **Spec PASS / Quality APPROVE**，I1/I2均关闭，无新增Critical/Important/Minor。root核对11项Fix1材料、6个原C/ASM/header pins、旧17份归档、8份旧证据和报告前10909bytes不变，完整阅读两轮报告与全部源码diff；没有重复测试代替审查。最终parser SHA256为 `c7aa44665a765679006174267be34b27f4dcb4fabe5fa84a3103815b45f918db`，test SHA256为 `306c522dbe3df4176dc40c0d31949ea9dd11744ffc78be4bb33555b442951429`；Fix1 manifest `ffc40d9f53ec1e00e12837ad5ced47624851b07ff7fa141c92f28e098f50bae0`，复审报告 `4165348cfabbb6de5aa558025c96198880173d10587a5ffc5ed0b6c532baf3ce`。证据分别为 `target/windows-private-transcript-20261016/` 与 `target/windows-private-transcript-root-20261016/`。
+
+### 本门采用的有限oracle与后续原生边界
+
+本门接受已审阅C内部独立saved-slot/context oracle，外部只核对实际发出的精确掩码/PC-ID/顺序/生命周期及未来真实parent exit0。C没有发出完整actual/expected contexts、child加载基址/模块身份或loader来源；parser不从trap PC减RVA循环推导基址，也不把matched当外部完整寄存器重建。初始pre-ready breakpoint只核对C的分类一致性，未独立确认loader身份。no_return计时是ready→terminate至少1500ms且go=1，没有GO时间戳。
+
+只读后继预检确认 `isolated_child` 是parent debugger loop，源码内联不参与callback→helper→outer的真实Rtl链；因此取消“该源函数必须有单独frame”的前置要求，不改O2/工具链/recipe或强加noinline。capture_callback/helper/outer实际frame、已编译PC和保存槽依然是原生门。本裁定取代前节单独frame的OPEN前置，**不等于任何compiler frame已原生通过**。
+
+尚未实现/执行的后继包括可信host/PE/artifact admission、真实父进程wait与进程树所有权/清理、Windows ARM64 Rtl/ABI/SEH/debugger七命令及同run CI接线。QPC、完整寄存器外部重建、系统DLL/API提供者身份、同shipping数值/guard/性能/修改包和产品互操作均保持各自边界；22项合成控制不关闭它们。下一步在这份冻结解析器上接独立原生runner，不能将供应的日志/退出值冒充真实运行。
