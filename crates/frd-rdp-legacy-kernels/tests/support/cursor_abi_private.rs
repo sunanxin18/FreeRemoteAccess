@@ -1,4 +1,4 @@
-//! macOS ARM64 精确 Rust fnpointer：真实 target 返回后立即检查，尚未编译/运行。
+//! macOS/Linux（含 OHOS）ARM64 精确 Rust fnpointer：真实 target 返回后立即检查。
 //! 执行前必须反汇编核对各签名的寄存器和 stack args，其他目标 ABI 仍 OPEN。
 use super::arch;
 use crate::{CursorBitmapMode as M, CursorXorFormat as F, NativeKernels};
@@ -16,6 +16,35 @@ static D4_STATUS: AtomicU64 = AtomicU64::new(0);
 static C4_STATUS: AtomicU64 = AtomicU64::new(0);
 static DR_STATUS: AtomicU64 = AtomicU64::new(0);
 static CR_STATUS: AtomicU64 = AtomicU64::new(0);
+// 只适配目标文件格式的地址重定位；下方完整 probe 和数值合同共用。
+#[cfg(target_os = "macos")]
+macro_rules! cursor_probe_address {
+    ($instruction:literal, $symbol:literal) => {
+        concat!(
+            "adrp x16, ",
+            $symbol,
+            "@PAGE\n",
+            $instruction,
+            " [x16, ",
+            $symbol,
+            "@PAGEOFF]"
+        )
+    };
+}
+#[cfg(target_os = "linux")]
+macro_rules! cursor_probe_address {
+    ($instruction:literal, $symbol:literal) => {
+        concat!(
+            "adrp x16, ",
+            $symbol,
+            "\n",
+            $instruction,
+            " [x16, :lo12:",
+            $symbol,
+            "]"
+        )
+    };
+}
 macro_rules! cursor_probe_body {
     ($entry:ident,$target:ident,$status:ident)=>{
         global_asm!(
@@ -53,8 +82,7 @@ macro_rules! cursor_probe_body {
             "fmov d13, x24",
             "fmov d14, x25",
             "fmov d15, x26",
-            "adrp x16, {target}@PAGE",
-            "ldr x16, [x16, {target}@PAGEOFF]",
+            cursor_probe_address!("ldr x16,", "{target}"),
             "blr x16",
             "mov x11, #0",
             "cmp x19, #19",
@@ -123,8 +151,7 @@ macro_rules! cursor_probe_body {
             "cmp x29, x9",
             "cset x12, ne",
             "orr x11, x11, x12, lsl #18",
-            "adrp x16, {status}@PAGE",
-            "str x11, [x16, {status}@PAGEOFF]",
+            cursor_probe_address!("str x11,", "{status}"),
             "ldp d8, d9, [sp, #128]",
             "ldp d10, d11, [sp, #144]",
             "ldp d12, d13, [sp, #160]",

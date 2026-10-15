@@ -85,11 +85,45 @@ release 库通过，原始日志 SHA-256 为
 `target/task4a210b1-final-execution-20261015/` 和
 `target/task4a210b2-consumers/`。此前失败日志保持原样。
 
+## 鸿蒙 ARM64 的实际执行
+
+同日增加测试专用 ELF 地址重定位宏，完整探针仍共用一份；macOS 保持
+Mach-O 地址拼写，ARM64 Linux/OHOS 使用 ELF。所有 probe 仍默认 ignored，
+不影响生产数值代码。该两文件改动与最终 ELF 经独立 Spec/Quality 审查通过。
+
+固定 Rust1.96 和官方 SDK 完成 K/RDP 两个 release libtest 的最终链接，实际
+CargoJSON、编译器命令及原始退出记录位于
+`target/task4a210b3-ohos-20261015/`。两个新 target 目录没有生成
+`.rustc_info.json`，采用实际绝对路径 `-Vv/-vv` 证据，未借用旧缓存或重跑来
+补造该文件。两程序均为 AArch64 ELF64 PIE，直接动态依赖精确只有 `libc.so`。
+
+| 实际程序 | SHA-256 |
+|---|---|
+| K release libtest | `4753d0028ad130ae751ae8dbdc1be3dbd7f90627a2fdf3738c73e959f8bc49c1` |
+| RDP release libtest | `488ce2b6e9f6a51dac5016415e6919d6367d0832959c411d10945d8d8f0c2a56` |
+
+执行前对该 K ELF 重新检查四个实际签名、隐藏结果 x8、八处 helper 调用者、
+1200字节固定栈帧内32字节转发可读区，以及全部寄存器检查早于恢复。手机和
+PC 分别核对上传指纹、精确测试清单和默认 ignored，再执行有界测试：
+
+| 测试 | 手机模拟器 | PC 模拟器 |
+|---|---|---|
+| 四个实际 core/table 目标直接 ABI，含 x25/x29 故障负控制 | 1 PASS | 1 PASS |
+| 真实 RequiredNative factory/Stage：fast/slow、New/Color/Large、cache、input 和 processor replacement | 1 PASS | 1 PASS |
+| 禁用指针和停止输入时保持图像 | 1 PASS | 1 PASS |
+| 光标/本地输入 damage 不建立桌面内容知识或完整基线 | 1 PASS | 1 PASS |
+
+每项均为精确单个测试、无失败/跳过，并具有独有 guest `FRD_EXIT=0` 和实际
+HDC host exit0。两台串行执行，无重试、重启、联网认证或基准测量。
+`runtime-preflight-step1/`、`runtime-step2-abi/` 和 `runtime-step3-consumers/`
+分别保留装载/默认忽略、实际 ABI 和消费者原始记录，不覆盖初始静态报告。
+这些结果证明指定程序在两台模拟器上的接口和离线会话行为，不代表正常 HAP
+已接通远程 Windows/Mac，也不是鸿蒙真机或目标性能验收。
+
 ## 剩余工作
 
-OHOS 手机/PC 的同源运行验收继续独立推进。Windows/Linux 各架构、OHOS 的实际 ABI/ISA/性能和
-软件光标规范数学尚未因此完成；测试专用 library `.o` 是 LTO bitcode，不能
-当作已审原生机器码对象。
+Windows/Linux 各架构的实际运行、OHOS 性能和软件光标规范数学尚未因此
+完成；此前测试专用 library `.o` 是 LTO bitcode，不能当作已审原生机器码对象。
 
 真实编码到显示的目标性能、bulk/ZGFX、SSE2 publication、普通 HAP 协议与
 解码器注册，以及手机/PC 真实登录、首帧、持续刷新、输入和重连仍按完整计划

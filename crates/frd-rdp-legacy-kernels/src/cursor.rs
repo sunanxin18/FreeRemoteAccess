@@ -63,6 +63,10 @@ pub(super) unsafe fn composite(src: &[u8], background: &[u8], output: &mut [u8])
     }
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux"),
+    target_arch = "aarch64"
+))]
 #[path = "../tests/support/cursor_abi_private.rs"]
 mod abi;
