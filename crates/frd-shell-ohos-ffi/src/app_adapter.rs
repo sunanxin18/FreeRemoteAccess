@@ -30,11 +30,43 @@ use std::{
     },
     time::{Duration, Instant},
 };
+// 仅接收 Owner 从同次 snapshot 挑选的三项显示证据；禁止传入通用应用快照。
+#[cfg(target_env = "ohos")]
+fn emit_display_log(payload: &Value) {
+    #[link(name = "hilog_ndk.z")]
+    extern "C" {
+        fn OH_LOG_Print(
+            t: u32,
+            l: u32,
+            d: u32,
+            tag: *const std::ffi::c_char,
+            fmt: *const std::ffi::c_char,
+            ...
+        ) -> i32;
+    }
+    if let Ok(text) = std::ffi::CString::new(payload.to_string()) {
+        // 固定公开格式与标签；JSON只含尺寸/内部会话代际/封闭枚举原因。
+        unsafe {
+            OH_LOG_Print(
+                0,
+                4,
+                0xFF00,
+                c"FrdDisplay".as_ptr(),
+                c"%{public}s".as_ptr(),
+                text.as_ptr(),
+            );
+        }
+    }
+}
+#[cfg(not(target_env = "ohos"))]
+fn emit_display_log(_: &Value) {}
+
 const STOP: u64 = 1;
 const CANCEL: u64 = 2;
 const FOCUS_LOST: u64 = 4;
 const FORM_INVALID: u64 = 8;
-const CONTROL_MASK: u64 = STOP | CANCEL | FOCUS_LOST | FORM_INVALID;
+const DISPLAY_INVALID: u64 = 16;
+const CONTROL_MASK: u64 = STOP | CANCEL | FOCUS_LOST | FORM_INVALID | DISPLAY_INVALID;
 const CONTROL_REVISION: u64 = 1 << 32;
 // 标志与代际同时发布，队列满也不会丢失取消/失焦，旧 UI 意图不跨此屏障。
 fn signal(control: &AtomicU64, flags: u64) {
@@ -118,6 +150,7 @@ pub enum Command {
         remote: bool,
     },
     Geometry(ViewGeometry),
+    LocalDisplay(crate::local_display::Message),
     Input(InputEpoch, InputEvent, bool),
     NativePointer(
         u64,
@@ -188,6 +221,10 @@ impl AppEngine {
                     catalog,
                     stores,
                     input: InputAdapter::default(),
+                    local_display: crate::local_display::LocalDisplay::default(),
+                    display_invalid_before: 0,
+                    frozen_display: None,
+                    last_display_log: None,
                     #[cfg(test)]
                     sent_inputs: std::cell::RefCell::new(Vec::new()),
                     pending: BTreeMap::new(),
@@ -262,6 +299,9 @@ impl AppEngine {
                     }
                     owner.poll();
                     let next_snapshot = owner.snapshot();
+                    if let Some(evidence) = owner.take_display_log(&next_snapshot) {
+                        emit_display_log(&evidence);
+                    }
                     if let Ok(mut value) = published.lock() {
                         *value = next_snapshot;
                     }
@@ -328,6 +368,7 @@ impl AppEngine {
         crate::composition::spawn(root)
     }
     pub fn send(&self, command: Command) -> Result<(), i32> {
+        let display = matches!(command, Command::LocalDisplay(_));
         let recovery = match &command {
             Command::Edit(_) | Command::Password(_) => FORM_INVALID,
             Command::Input(..) | Command::Pointer(..) | Command::NativePointer(..) => FOCUS_LOST,
@@ -340,6 +381,9 @@ impl AppEngine {
                 mpsc::TrySendError::Full(_) => {
                     if recovery != 0 {
                         signal(&self.control, recovery);
+                    }
+                    if display {
+                        signal(&self.control, DISPLAY_INVALID);
                     }
                     crate::QUEUE_FULL
                 }
@@ -483,6 +527,10 @@ struct Owner {
     catalog: ProtocolCatalog,
     stores: Stores,
     input: InputAdapter,
+    local_display: crate::local_display::LocalDisplay,
+    display_invalid_before: u64,
+    frozen_display: Option<Value>,
+    last_display_log: Option<Value>,
     #[cfg(test)]
     sent_inputs: std::cell::RefCell<Vec<frd_core::SessionInput>>,
     pending: BTreeMap<u64, PendingLoad>,
@@ -499,6 +547,10 @@ impl Owner {
     fn apply_control(&mut self) {
         let state = self.control.fetch_and(!CONTROL_MASK, Ordering::AcqRel);
         let flags = state & CONTROL_MASK;
+        if flags & DISPLAY_INVALID != 0 {
+            self.display_invalid_before = state / CONTROL_REVISION;
+            self.local_display.invalidate();
+        }
         if flags & FOCUS_LOST != 0 {
             self.focus(false, false, false);
         }
@@ -580,7 +632,16 @@ impl Owner {
                 self.send(Some(c));
                 self.cleanup()
             }
-            Ok(Some(AppAction::StartSession(request, permit))) => {
+            Ok(Some(AppAction::StartSession(mut request, permit))) => {
+                self.local_display.freeze(&mut request.display_intent);
+                let planned =
+                    frd_core::DisplayPlanner::plan(request.display_intent, Default::default()).ok();
+                self.frozen_display = Some(json!({"session":request.session_id.get().to_string(),
+                    "localSnapshot": self.local_display.evidence(),
+                    "mode":format!("{:?}",request.display_intent.mode),
+                    "orientation":format!("{:?}",request.display_intent.orientation),
+                    "projectedSize":planned.and_then(|plan|plan.requested_size).map(|s| json!({"width":s.width,"height":s.height})),
+                    "note":"投影意图；协议仍执行自身约束，非服务端确认"}));
                 self.cancelled_launch = false;
                 let target = self
                     .controller
@@ -620,8 +681,11 @@ impl Owner {
             // 已接受的身份/密码编辑按 FIFO 落实；远程焦点屏障不能丢弃用户输入。
             // 仅显式表单溢出屏障作废旧编辑，同时已清除旧密码及 load ticket。
             let form_edit = matches!(*command, Command::Edit(_) | Command::Password(_));
-            if (form_edit && revision < self.form_invalid_before)
+            let display = matches!(*command, Command::LocalDisplay(_));
+            if (display && revision < self.display_invalid_before)
+                || (form_edit && revision < self.form_invalid_before)
                 || (!form_edit
+                    && !display
                     && (revision != control / CONTROL_REVISION || control & CONTROL_MASK != 0))
             {
                 self.discard_input_release(&command);
@@ -744,6 +808,7 @@ impl Owner {
                 focused,
                 remote,
             } => self.focus(foreground, focused, remote),
+            Command::LocalDisplay(message) => self.local_display.accept(message),
             Command::Geometry(g) => {
                 let c = self.input.set_geometry(&self.controller, g);
                 self.send(c)
@@ -1122,6 +1187,19 @@ impl Owner {
             self.cleanup()
         }
     }
+    fn take_display_log(&mut self, snapshot: &Value) -> Option<Value> {
+        // 与发布给 UI 的同次 Owner snapshot 共用对象；明确 allowlist，不复制另一套状态。
+        let evidence = json!({
+            "localDisplayEvidence": snapshot["localDisplayEvidence"],
+            "frozenDisplayIntent": snapshot["frozenDisplayIntent"],
+            "acceptedSurface": snapshot["acceptedSurface"],
+        });
+        if self.last_display_log.as_ref() == Some(&evidence) {
+            return None;
+        }
+        self.last_display_log = Some(evidence.clone());
+        Some(evidence)
+    }
     fn snapshot(&self) -> Value {
         let page = match self.controller.page() {
             Page::ConnectionForm(_) => 0,
@@ -1191,7 +1269,11 @@ impl Owner {
                 },
             )
             .is_ok();
-        let mut value = json!({"abiVersion":1,"initialized":true,"page":page,"target":match d.target_system{Some(TargetSystem::Windows)=>1,Some(TargetSystem::MacOs)=>2,Some(TargetSystem::Linux)=>3,_=>0},"address":d.address,"port":d.port.unwrap_or(0),"username":d.username,"protocol":protocol,"available":available,"session":epoch.0,"generation":epoch.1,"geometryRevision":self.input.revision.to_string(),"notice":self.notice.unwrap_or(""),"probe":self.probe});
+        let mut value = json!({"localDisplaySource":self.local_display.source,"localDisplayReason":if self.local_display.reason.is_empty() && self.local_display.geometry.is_none() { "尚无有效本地显示快照" } else { self.local_display.reason },"localDisplay":self.local_display.geometry.map(|g| json!({"width":g.physical_size.width,"height":g.physical_size.height,"densityMilli":g.scale_factor_milli})),"abiVersion":1,"initialized":true,"page":page,"target":match d.target_system{Some(TargetSystem::Windows)=>1,Some(TargetSystem::MacOs)=>2,Some(TargetSystem::Linux)=>3,_=>0},"address":d.address,"port":d.port.unwrap_or(0),"username":d.username,"protocol":protocol,"available":available,"session":epoch.0,"generation":epoch.1,"geometryRevision":self.input.revision.to_string(),"notice":self.notice.unwrap_or(""),"probe":self.probe});
+        value["localDisplayEvidence"] = self.local_display.evidence();
+        value["frozenDisplayIntent"] = json!(self.frozen_display);
+        value["acceptedSurface"] = json!(self.remote_epoch.zip(self.input.remote).map(|((session,generation),size)|
+            json!({"session":session.get().to_string(),"generation":generation.to_string(),"width":size.width,"height":size.height,"source":"protocol_SurfaceGenerationChanged"})));
         value["protocolOptions"] = json!(mode_options(&self.catalog, &d));
         value["modeNotice"] = json!(mode_notice(&self.catalog, &d));
         #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
@@ -1356,6 +1438,10 @@ mod tests {
             catalog: ProtocolCatalog::new([]),
             stores,
             input: InputAdapter::default(),
+            local_display: crate::local_display::LocalDisplay::default(),
+            display_invalid_before: 0,
+            frozen_display: None,
+            last_display_log: None,
             sent_inputs: std::cell::RefCell::new(Vec::new()),
             pending: BTreeMap::new(),
             tx,
@@ -2662,5 +2748,312 @@ mod tests {
         assert_eq!(snapshot["session"], "");
         assert_eq!(snapshot["canConnect"], false);
         assert!(snapshot.get("syntheticFixture").is_none());
+    }
+    struct CaptureDisplay(mpsc::Sender<frd_core::DisplayIntent>);
+    impl ProtocolFactory for CaptureDisplay {
+        fn descriptor(&self) -> frd_protocol_api::ProtocolDescriptor {
+            frd_protocol_api::ProtocolDescriptor {
+                id: ProtocolId::rdp(),
+                display_name: "测试 RDP".into(),
+                default_port: 3389,
+                credential_requirements:
+                    frd_protocol_api::CredentialRequirements::username_password(),
+            }
+        }
+        fn create(
+            &self,
+            request: frd_protocol_api::ConnectRequest,
+            _runtime: frd_protocol_api::ProtocolRuntime,
+        ) -> Result<Box<dyn frd_protocol_api::ProtocolSession>, ProtocolError> {
+            self.0.send(request.display_intent).unwrap();
+            Err(ProtocolError::Terminal)
+        }
+    }
+    fn capture_display_launch(
+        mode: frd_core::ResolutionMode,
+        messages: Vec<crate::local_display::Message>,
+        focus_barrier: bool,
+    ) -> frd_core::DisplayIntent {
+        capture_display_owner(mode, messages, focus_barrier).0
+    }
+    fn capture_display_owner(
+        mode: frd_core::ResolutionMode,
+        messages: Vec<crate::local_display::Message>,
+        focus_barrier: bool,
+    ) -> (frd_core::DisplayIntent, Owner, AppEngine) {
+        let mut o = owner();
+        let (captured, rx) = mpsc::channel();
+        o.host = SessionHost::new(
+            vec![Arc::new(CaptureDisplay(captured)) as Arc<dyn ProtocolFactory>],
+            Arc::new(Wake),
+            Arc::new(NoAudio),
+            Arc::new(|_| {
+                Err(frd_media_api::VideoDecodeError::new(
+                    frd_media_api::VideoDecodeErrorCode::BackendUnavailable,
+                ))
+            }),
+        );
+        o.catalog = ProtocolCatalog::new([ProtocolId::rdp()]);
+        o.controller
+            .connection_form_mut()
+            .unwrap()
+            .draft
+            .resolution_mode = mode;
+        let (engine, queue) = key_engine(&o, 16);
+        engine
+            .send(Command::Edit(Edit {
+                target: 1,
+                address: "fixture.invalid".into(),
+                port: 3389,
+                username: "synthetic".into(),
+                protocol: "auto".into(),
+                remember: false,
+            }))
+            .unwrap();
+        engine
+            .send(Command::Password(SecretBuffer::from_text(
+                "in-memory-display-fixture".into(),
+            )))
+            .unwrap();
+        let count = messages.len();
+        for message in messages {
+            engine.send(Command::LocalDisplay(message)).unwrap();
+        }
+        if focus_barrier {
+            engine.lose_focus();
+        }
+        // 真实队列依 FIFO 消费，焦点屏障不丢失 local-display；Submit 在屏障后排入。
+        for _ in 0..count + 2 {
+            o.command(queue.recv().unwrap());
+        }
+        engine
+            .send(Command::Submit {
+                event: 1,
+                composition: false,
+                repeat: false,
+            })
+            .unwrap();
+        o.command(queue.recv().unwrap());
+        let intent = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            o.snapshot()["frozenDisplayIntent"]["projectedSize"].is_object()
+                || mode == frd_core::ResolutionMode::ServerManaged
+                || intent.geometry.is_none()
+        );
+        (intent, o, engine)
+    }
+    fn display_message(value: Value) -> crate::local_display::Message {
+        crate::local_display::Message::parse(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+    #[test]
+    fn local_display_owner_fifo_freezes_actual_connect_request_and_phone_projection() {
+        let intent = capture_display_launch(
+            frd_core::ResolutionMode::NativeDisplay,
+            vec![display_message(crate::local_display::sample_message(
+                1, 1, 11, true,
+            ))],
+            true,
+        );
+        assert_eq!(intent.mode, frd_core::ResolutionMode::NativeDisplay);
+        assert_eq!(
+            intent.geometry.unwrap().physical_size,
+            frd_core::PixelSize::new(1260, 2720).unwrap()
+        );
+        assert_eq!(
+            intent.orientation,
+            frd_core::DisplayOrientationPreference::Landscape
+        );
+        assert_eq!(
+            frd_core::DisplayPlanner::plan(intent, Default::default())
+                .unwrap()
+                .remote_size,
+            frd_core::PixelSize::new(2720, 1260)
+        );
+        let desktop = capture_display_launch(
+            frd_core::ResolutionMode::NativeDisplay,
+            vec![display_message(crate::local_display::sample_message(
+                1, 1, 11, false,
+            ))],
+            false,
+        );
+        assert_eq!(
+            desktop.orientation,
+            frd_core::DisplayOrientationPreference::Preserve
+        );
+    }
+    #[test]
+    fn local_display_owner_keeps_fixed_server_managed_and_rejects_late_destroyed_window() {
+        for mode in [
+            frd_core::ResolutionMode::Fixed(frd_core::PixelSize::new(900, 1600).unwrap()),
+            frd_core::ResolutionMode::ServerManaged,
+        ] {
+            let intent = capture_display_launch(
+                mode,
+                vec![display_message(crate::local_display::sample_message(
+                    1, 1, 11, true,
+                ))],
+                false,
+            );
+            assert_eq!(intent.mode, mode);
+            assert!(intent.geometry.is_none());
+            assert_eq!(
+                intent.orientation,
+                frd_core::DisplayOrientationPreference::Preserve
+            );
+        }
+        let intent = capture_display_launch(
+            frd_core::ResolutionMode::NativeDisplay,
+            vec![
+                display_message(crate::local_display::sample_message(1, 1, 11, true)),
+                display_message(
+                    json!({"abiVersion":1,"stage":2,"revision":2,"windowId":0,"phone":true,"geometry":null,"reason":"window_destroyed"}),
+                ),
+                display_message(crate::local_display::sample_message(1, 3, 11, true)),
+            ],
+            false,
+        );
+        assert!(intent.geometry.is_none());
+    }
+    #[test]
+    fn local_display_queue_overflow_invalidates_cache_and_older_queued_snapshot() {
+        let mut o = owner();
+        o.command(Command::LocalDisplay(display_message(
+            crate::local_display::sample_message(1, 1, 11, true),
+        )));
+        assert!(o.local_display.geometry.is_some());
+        let (engine, queue) = key_engine(&o, 1);
+        engine
+            .send(Command::LocalDisplay(display_message(
+                crate::local_display::sample_message(1, 2, 11, true),
+            )))
+            .unwrap();
+        assert_eq!(
+            engine.send(Command::LocalDisplay(display_message(
+                crate::local_display::sample_message(1, 3, 11, true)
+            ))),
+            Err(crate::QUEUE_FULL)
+        );
+        o.command(queue.recv().unwrap());
+        assert!(o.local_display.geometry.is_none());
+        assert_eq!(o.local_display.reason, "本地显示消息队列已满");
+        engine
+            .send(Command::LocalDisplay(display_message(
+                crate::local_display::sample_message(1, 4, 11, true),
+            )))
+            .unwrap();
+        o.command(queue.recv().unwrap());
+        assert!(o.local_display.geometry.is_some());
+    }
+    #[test]
+    fn local_display_fix1_owner_rejects_malformed_system_area_without_polluting_snapshot() {
+        let mut o = owner();
+        let (engine, queue) = key_engine(&o, 8);
+        engine
+            .send(Command::LocalDisplay(display_message(
+                crate::local_display::sample_message(1, 1, 11, true),
+            )))
+            .unwrap();
+        o.command(queue.recv().unwrap());
+        let original = o.local_display.evidence();
+        for (index, area) in [
+            json!({"left":-1,"top":0,"width":1260,"height":2720}),
+            json!({"left":0,"top":-1,"width":1260,"height":2720}),
+            json!({"left":0,"top":0,"width":1261,"height":2720}),
+            json!({"left":0,"top":0,"width":1260,"height":2721}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut raw = crate::local_display::sample_message(1, index as u64 + 2, 11, true);
+            raw["geometry"]["workArea"] = area;
+            // 防御性覆盖真实Owner消费者，绕开ABI parse以证明缓存本身也拒绝畸形更新。
+            let message = serde_json::from_value(raw).unwrap();
+            engine.send(Command::LocalDisplay(message)).unwrap();
+            o.command(queue.recv().unwrap());
+            assert_eq!(o.local_display.evidence(), original);
+        }
+        let mut full = crate::local_display::sample_message(1, 6, 11, true);
+        full["geometry"]["workArea"] = json!({"left":0,"top":0,"width":1260,"height":2720});
+        engine
+            .send(Command::LocalDisplay(display_message(full)))
+            .unwrap();
+        o.command(queue.recv().unwrap());
+        assert_eq!(o.local_display.source, "system_available_area");
+        let mut fallback = crate::local_display::sample_message(1, 7, 11, true);
+        fallback["reason"] = "invalid_work_area".into();
+        engine
+            .send(Command::LocalDisplay(display_message(fallback)))
+            .unwrap();
+        o.command(queue.recv().unwrap());
+        assert_eq!(o.local_display.source, "drawable_conservative_fallback");
+        assert_eq!(o.local_display.reason, "系统工作区越界，使用可绘制内容区");
+    }
+    #[test]
+    fn local_display_fix1_owner_log_uses_same_snapshot_allowlist_and_only_changes() {
+        let (_, mut owner, _engine) = capture_display_owner(
+            frd_core::ResolutionMode::NativeDisplay,
+            vec![display_message(crate::local_display::sample_message(
+                1, 1, 11, true,
+            ))],
+            false,
+        );
+        owner.notice = Some("private-profile-notice");
+        let snapshot = owner.snapshot();
+        assert_eq!(snapshot["address"], "fixture.invalid");
+        assert_eq!(snapshot["username"], "synthetic");
+        let payload = owner.take_display_log(&snapshot).unwrap();
+        let fields = payload.as_object().unwrap();
+        assert_eq!(fields.len(), 3);
+        for field in [
+            "localDisplayEvidence",
+            "frozenDisplayIntent",
+            "acceptedSurface",
+        ] {
+            assert_eq!(payload[field], snapshot[field]);
+        }
+        let text = payload.to_string();
+        for secret in [
+            "fixture.invalid",
+            "synthetic",
+            "in-memory-display-fixture",
+            "private-profile-notice",
+            "credentials",
+            "username",
+            "address",
+            "profile",
+        ] {
+            assert!(!text.contains(secret), "日志不得含表单身份/秘密字段");
+        }
+        assert!(owner.take_display_log(&snapshot).is_none());
+        owner.notice = Some("another-private-notice");
+        assert!(owner.take_display_log(&owner.snapshot()).is_none());
+        owner.command(Command::LocalDisplay(display_message(
+            crate::local_display::sample_message(1, 2, 11, true),
+        )));
+        let changed = owner.snapshot();
+        assert_eq!(
+            owner.take_display_log(&changed).unwrap()["localDisplayEvidence"],
+            changed["localDisplayEvidence"]
+        );
+        assert!(owner.take_display_log(&changed).is_none());
+    }
+
+    #[test]
+    fn local_display_fix1_owner_log_surface_evidence_is_not_viewport_geometry() {
+        let (mut owner, session, _link) = presentation_owner();
+        let snapshot = owner.snapshot();
+        let evidence = owner.take_display_log(&snapshot).unwrap();
+        assert_eq!(evidence["acceptedSurface"], snapshot["acceptedSurface"]);
+        assert_eq!(
+            evidence["acceptedSurface"]["session"],
+            session.get().to_string()
+        );
+        assert_eq!(evidence["acceptedSurface"]["width"], 2);
+        assert_eq!(
+            evidence["acceptedSurface"]["source"],
+            "protocol_SurfaceGenerationChanged"
+        );
+        assert_eq!(owner.input.geometry.unwrap().drawable.width, 100);
+        assert!(owner.take_display_log(&owner.snapshot()).is_none());
     }
 }

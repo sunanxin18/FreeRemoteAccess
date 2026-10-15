@@ -151,7 +151,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [ ] Task 5B3 同一组合HAP：2026-10-15开发签名/官方验签/双参数精确checker及原28个条目逐字身份已完成，签名包3fbdd046；手机已安装，随后方向纠正包539cf8ee也已真实Windows登录/旋转验证；PC新包GUI及stockMac真实认证/首帧/刷新/指针/重连待验证，不替代完整键盘/IME、音频、HP与性能资格，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
 - [x] Task 5C 共享接口/源码子步骤：physical_key_input与text_input三层独立交集、Apple truthful能力发布、RDP既有输入保持及桌面事件路由完成；真实InputRouter反例修复经独立复审PASS，宿主核心1056 unit/Apple5 integration/Platform doc、desktop171+2通过，23既有ignored保留。OHOS Release包签验通过；真实键盘/IME及各原生平台运行仍待验证，见[输入能力验证](../../validation/input-capabilities-20261015.md)。
 - [ ] Task 5C 中立物理键/提交文本能力分离与真实输入：修正Apple Text宣称与实际不处理的不一致，保留既有桌面/RDP行为，OHOS未满足门的输入明确不可用。
-- [ ] Task 5D 本地显示器几何接入：OHOS连接前为默认NativeDisplay补齐真实physical/workarea/content/scale快照，复用共享分辨率策略、保留Fixed/ServerManaged/协议动态能力门；当前壳直接传递geometry=None，不能声称已按手机/PC本地屏幕请求。模式选择scope完成后独立实现并实测实际协商尺寸。
+- [x] Task 5D共享接口/OHOS接线及手机有界尺寸证据：真实physical/workarea/content/scale经独立消息与Owner FIFO进入NativeDisplay；手机真实竖屏1256×2760以Landscape投影2760×1256，实际RDP协议surface及完整桌面同尺寸。Fixed/ServerManaged/其他模式与动态门保持；初审ArkTS/工作区边界问题修复后独立复审及最终Release签验通过，见[显示几何验证](../../validation/harmony-display-geometry-20261015.md)。本项仅关闭该实现与手机观察子步骤。
+- [ ] Task 5D剩余验收：PC实际包/会话/搬窗/外接屏、协议请求与服务端ACK直接证据、真机与完整多显示器场景仍需分别验证，不由手机投影/surface匹配视作完成。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。
 - [ ] 授权Mac完成真实认证、首帧、持续更新、输入、重连；音频/剪贴板只报告已实现并验证的能力。
 - [ ] 跑Windows/macOS/Linux相关回归及包检查，记录本轮没有真机的平台。

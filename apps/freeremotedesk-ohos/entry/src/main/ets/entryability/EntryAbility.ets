@@ -1,12 +1,108 @@
 import { ConfigurationConstant, UIAbility } from '@kit.AbilityKit';
-import { window } from '@kit.ArkUI';
+import { window, display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libentry.so';
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { PhoneFullscreenPolicy, PhoneFullscreenRequest } from '../common/PhoneFullscreenPolicy';
 import { PhoneOrientation, PhoneOrientationPolicy, PHONE_SESSION_ORIENTATION_EVENT } from '../common/PhoneOrientationPolicy';
 
+import { LocalDisplayPolicy, LocalDisplayGeometry, DisplayTicket, makeDisplayRect, validDisplayWorkArea } from '../common/LocalDisplayPolicy';
+
 export default class EntryAbility extends UIAbility {
+  private localDisplay: LocalDisplayPolicy = new LocalDisplayPolicy();
+  private observedDisplay?: display.Display;
+  private localDisplayChanged = (): void => { this.refreshLocalDisplay(); };
+  private systemDisplayChanged = (_id: number): void => { this.refreshLocalDisplay(); };
+  private sendLocalDisplay(ticket: DisplayTicket, geometry: LocalDisplayGeometry | null, reason: string | null): void {
+    if (!this.localDisplay.isCurrent(ticket)) { return; }
+    const result = native.appLocalDisplay(JSON.stringify(this.localDisplay.message(ticket, deviceInfo.deviceType === 'phone', geometry, reason)));
+    if (result !== 0) {
+      hilog.warn(0xFF00, 'FrdOhos', '本地显示消息失败 code=%{public}d', result);
+      if (geometry !== null) {
+        const invalid = this.localDisplay.begin(ticket.windowId);
+        native.appLocalDisplay(JSON.stringify(this.localDisplay.message(invalid, deviceInfo.deviceType === 'phone', null, 'invalid_geometry')));
+      }
+    }
+  }
+  private clearLocalDisplay(reason: string): void {
+    const ticket = this.localDisplay.begin(0);
+    this.sendLocalDisplay(ticket, null, reason);
+  }
+  private observeDisplay(current: display.Display): void {
+    if (this.observedDisplay && this.observedDisplay.id === current.id) { return; }
+    this.unobserveDisplay();
+    this.observedDisplay = current;
+    try { current.on('availableAreaChange', this.localDisplayChanged); }
+    catch (e) { this.windowError('工作区监听', e as BusinessError); }
+  }
+  private unobserveDisplay(): void {
+    if (this.observedDisplay) {
+      try { this.observedDisplay.off('availableAreaChange', this.localDisplayChanged); }
+      catch (e) { this.windowError('撤销工作区监听', e as BusinessError); }
+    }
+    this.observedDisplay = undefined;
+  }
+  private refreshLocalDisplay(): void {
+    const currentWindow = this.mainWindow;
+    if (!currentWindow || !this.contentReady) { this.clearLocalDisplay('window_not_ready'); return; }
+    if (!this.foreground) { this.clearLocalDisplay('background'); return; }
+    // 每次先失效旧 revision，即使本轮同步 API 失败也不能残留旧显示器快照。
+    let ticket = this.localDisplay.begin(0);
+    try {
+      const properties = currentWindow.getWindowProperties();
+      if (properties.displayId === undefined || !Number.isSafeInteger(properties.displayId) || properties.displayId < 0) {
+        this.sendLocalDisplay(ticket, null, 'display_unavailable'); return;
+      }
+      const currentDisplay = display.getDisplayByIdSync(properties.displayId);
+      this.observeDisplay(currentDisplay);
+      ticket = this.localDisplay.begin(properties.id);
+      const geometry: LocalDisplayGeometry = {
+        displayId: currentDisplay.id, width: currentDisplay.width, height: currentDisplay.height,
+        density: currentDisplay.densityPixels, rotation: currentDisplay.rotation,
+        window: makeDisplayRect(properties.windowRect.left, properties.windowRect.top, properties.windowRect.width, properties.windowRect.height),
+        drawable: makeDisplayRect(properties.drawableRect.left, properties.drawableRect.top, properties.drawableRect.width, properties.drawableRect.height), workArea: null,
+        fullscreen: properties.isLayoutFullScreen
+      };
+      // 先发布真实屏幕及保守 drawable 工作区，不让可选异步 API 阻塞首次连接。
+      this.sendLocalDisplay(ticket, geometry, null);
+      try {
+        currentDisplay.getAvailableArea().then((area: display.Rect) => {
+          if (this.mainWindow !== currentWindow || !this.localDisplay.isCurrent(ticket)) { return; }
+          // 回调期间系统属性可能先变、通知后到；再核对所属屏、方向、尺寸及窗口。
+          try {
+            const latest = currentWindow.getWindowProperties();
+            const latestDisplay = display.getDisplayByIdSync(currentDisplay.id);
+            if (latest.displayId !== properties.displayId || latest.id !== properties.id ||
+              latestDisplay.width !== geometry.width || latestDisplay.height !== geometry.height ||
+              latestDisplay.rotation !== geometry.rotation || latestDisplay.densityPixels !== geometry.density ||
+              latest.windowRect.left !== geometry.window.left || latest.windowRect.top !== geometry.window.top ||
+              latest.windowRect.width !== geometry.window.width || latest.windowRect.height !== geometry.window.height ||
+              latest.drawableRect.left !== geometry.drawable.left || latest.drawableRect.top !== geometry.drawable.top ||
+              latest.drawableRect.width !== geometry.drawable.width || latest.drawableRect.height !== geometry.drawable.height) {
+              this.refreshLocalDisplay(); return;
+            }
+            const workArea = makeDisplayRect(area.left, area.top, area.width, area.height);
+            if (!validDisplayWorkArea(workArea, geometry.width, geometry.height)) {
+              const fallback = this.localDisplay.begin(properties.id);
+              this.sendLocalDisplay(fallback, geometry, 'invalid_work_area');
+              return;
+            }
+            geometry.workArea = workArea;
+            const completed = this.localDisplay.begin(properties.id);
+            this.sendLocalDisplay(completed, geometry, null);
+          } catch (e) {
+            this.clearLocalDisplay('display_unavailable');
+            this.windowError('工作区完成时读取窗口', e as BusinessError);
+          }
+        }).catch((error: BusinessError) => {
+          if (this.mainWindow === currentWindow && this.localDisplay.isCurrent(ticket)) { this.windowError('读取工作区（使用保守内容区）', error); }
+        });
+      } catch (e) { this.windowError('读取工作区（使用保守内容区）', e as BusinessError); }
+    } catch (e) {
+      this.sendLocalDisplay(ticket, null, 'display_unavailable');
+      this.windowError('读取本地显示', e as BusinessError);
+    }
+  }
   private mainWindow?: window.Window;
   private contentReady: boolean = false;
   private foreground: boolean = false;
@@ -93,6 +189,7 @@ export default class EntryAbility extends UIAbility {
     } catch (e) { this.windowError('readback', e as BusinessError); }
   }
   private updateCutout(): void {
+    this.refreshLocalDisplay();
     if (!this.mainWindow) { return; }
     try {
       const cutout = this.mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
@@ -144,7 +241,11 @@ export default class EntryAbility extends UIAbility {
   onWindowStageCreate(windowStage: window.WindowStage): void {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      this.contentReady = false;
+      this.localDisplay.attach();
       this.mainWindow = windowStage.getMainWindowSync();
+      const createdWindow = this.mainWindow;
+      const createdStage = this.localDisplay.stageId();
       this.windowActive = true; this.publishActive();
       if (deviceInfo.deviceType === 'phone') {
         this.phoneOrientation.attachWindow();
@@ -165,9 +266,15 @@ export default class EntryAbility extends UIAbility {
         if (event === window.WindowEventType.WINDOW_ACTIVE) { this.windowActive = true; this.publishActive(); this.updateChrome(); }
         if (event === window.WindowEventType.WINDOW_INACTIVE) { this.windowActive = false; this.publishActive(); native.appFocus(false, false, false); }
       });
+      try { this.mainWindow.on('windowRectChange', this.localDisplayChanged); } catch (e) { this.windowError('窗口几何监听', e as BusinessError); }
+      try { this.mainWindow.on('displayIdChange', this.localDisplayChanged); } catch (e) { this.windowError('窗口显示器监听', e as BusinessError); }
+      try { display.on('change', this.systemDisplayChanged); display.on('add', this.systemDisplayChanged); display.on('remove', this.systemDisplayChanged); }
+      catch (e) { this.windowError('显示器监听', e as BusinessError); }
       windowStage.loadContent('pages/Index', (error) => {
+        if (this.mainWindow !== createdWindow || this.localDisplay.stageId() !== createdStage) { return; }
         if (error.code) { hilog.error(0xFF00, 'FrdOhos', '页面加载失败：%{public}d', error.code); return; }
         this.contentReady = true;
+        this.refreshLocalDisplay();
         this.applyPhoneFullscreen();
         this.updateChrome();
         if (this.mainWindow && this.desktop) {
@@ -180,9 +287,22 @@ export default class EntryAbility extends UIAbility {
       hilog.error(0xFF00, 'FrdOhos', '窗口初始化失败');
     }
   }
-  onForeground(): void { this.foreground = true; this.publishActive(); native.setForeground(true); hilog.info(0xFF00, 'FrdOhos', '前台恢复'); }
-  onBackground(): void { this.foreground = false; this.publishActive(); native.setForeground(false); hilog.info(0xFF00, 'FrdOhos', '后台暂停'); }
+  onForeground(): void { this.foreground = true; this.publishActive(); native.setForeground(true); this.refreshLocalDisplay(); hilog.info(0xFF00, 'FrdOhos', '前台恢复'); }
+  onBackground(): void { this.foreground = false; this.publishActive(); this.clearLocalDisplay('background'); native.setForeground(false); hilog.info(0xFF00, 'FrdOhos', '后台暂停'); }
+  private detachLocalDisplay(): void {
+    this.localDisplay.detach();
+    this.clearLocalDisplay('window_destroyed');
+    this.unobserveDisplay();
+    try { display.off('change', this.systemDisplayChanged); } catch (e) { this.windowError('撤销显示器变化监听', e as BusinessError); }
+    try { display.off('add', this.systemDisplayChanged); } catch (e) { this.windowError('撤销显示器新增监听', e as BusinessError); }
+    try { display.off('remove', this.systemDisplayChanged); } catch (e) { this.windowError('撤销显示器移除监听', e as BusinessError); }
+    if (this.mainWindow) {
+      try { this.mainWindow.off('windowRectChange', this.localDisplayChanged); } catch (e) { this.windowError('撤销窗口几何监听', e as BusinessError); }
+      try { this.mainWindow.off('displayIdChange', this.localDisplayChanged); } catch (e) { this.windowError('撤销窗口显示器监听', e as BusinessError); }
+    }
+  }
   onWindowStageDestroy(): void {
+    this.detachLocalDisplay();
     this.windowActive = false; this.publishActive();
     this.phoneOrientation.detachWindow();
     this.phoneFullscreen.detachWindow();
@@ -196,6 +316,7 @@ export default class EntryAbility extends UIAbility {
     this.mainWindow = undefined;
   }
   onDestroy(): void {
+    this.detachLocalDisplay();
     this.foreground = false; this.publishActive();
     if (deviceInfo.deviceType === 'phone') {
       this.context.eventHub.off(PHONE_SESSION_ORIENTATION_EVENT, this.sessionOrientationChanged);

@@ -24,6 +24,7 @@ const Entry = load('entryability/EntryAbility.ets', {
   '@kit.ArkUI': { window: {} }, '@kit.PerformanceAnalysisKit': { hilog: { warn() {} } },
   '@kit.BasicServicesKit': { deviceInfo }, 'libentry.so': { default: { appFocus() {} } },
   '../common/PhoneFullscreenPolicy': policyModule,
+  '../common/LocalDisplayPolicy': load('common/LocalDisplayPolicy.ets'),
   '../common/PhoneOrientationPolicy': load('common/PhoneOrientationPolicy.ets')
 }, { canIUse: () => true }).default;
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }

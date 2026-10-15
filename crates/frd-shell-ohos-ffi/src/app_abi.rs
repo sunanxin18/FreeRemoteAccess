@@ -136,6 +136,15 @@ pub extern "C" fn frd_ohos_app_focus(id: u64, foreground: u32, focused: u32, rem
         })
     })
 }
+/// ABI1 增量入口；不改变旧 POD 布局。JSON 不含凭据，最大 4096 字节。
+#[no_mangle]
+pub unsafe extern "C" fn frd_ohos_app_local_display(id: u64, p: *const u8, n: usize) -> i32 {
+    boundary(|| {
+        let message = crate::local_display::Message::parse(unsafe { bytes(p, n, 4096)? })
+            .ok_or(INVALID_ARGUMENT)?;
+        app(id)?.send(Command::LocalDisplay(message))
+    })
+}
 #[repr(C)]
 pub struct AppGeometry {
     pub abi_version: u32,

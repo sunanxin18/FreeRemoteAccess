@@ -665,6 +665,7 @@ impl AppController {
                 ResolutionMode::ServerManaged => DisplayIntent::server_managed(),
                 mode => DisplayIntent {
                     mode,
+                    orientation: Default::default(),
                     geometry: None,
                 },
             },

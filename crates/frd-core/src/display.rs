@@ -94,9 +94,18 @@ impl DisplayGeometry {
     }
 }
 
+/// 请求方向独立于实际显示器/窗口几何；仅 NativeDisplay 采用该投影。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DisplayOrientationPreference {
+    #[default]
+    Preserve,
+    Landscape,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayIntent {
     pub mode: ResolutionMode,
+    pub orientation: DisplayOrientationPreference,
     pub geometry: Option<DisplayGeometry>,
 }
 
@@ -105,6 +114,7 @@ impl DisplayIntent {
         Self {
             mode: ResolutionMode::ServerManaged,
             geometry: None,
+            orientation: DisplayOrientationPreference::Preserve,
         }
     }
 
@@ -112,6 +122,7 @@ impl DisplayIntent {
         Self {
             mode: ResolutionMode::NativeDisplay,
             geometry: Some(geometry),
+            orientation: DisplayOrientationPreference::Preserve,
         }
     }
 
@@ -119,6 +130,7 @@ impl DisplayIntent {
         Self {
             mode: ResolutionMode::DisplayWorkArea,
             geometry: Some(geometry),
+            orientation: DisplayOrientationPreference::Preserve,
         }
     }
 
@@ -126,6 +138,7 @@ impl DisplayIntent {
         Self {
             mode: ResolutionMode::WindowContent,
             geometry: Some(geometry),
+            orientation: DisplayOrientationPreference::Preserve,
         }
     }
 
@@ -133,6 +146,7 @@ impl DisplayIntent {
         Self {
             mode: ResolutionMode::Fixed(size),
             geometry: None,
+            orientation: DisplayOrientationPreference::Preserve,
         }
     }
 
@@ -272,6 +286,16 @@ impl DisplayPlanner {
             });
         };
 
+        let requested_size = if intent.mode == ResolutionMode::NativeDisplay
+            && intent.orientation == DisplayOrientationPreference::Landscape
+        {
+            PixelSize {
+                width: requested_size.width.max(requested_size.height),
+                height: requested_size.width.min(requested_size.height),
+            }
+        } else {
+            requested_size
+        };
         let report = DisplayLimitReport::for_candidate(requested_size, constraints);
         if !report.any() {
             return Ok(DisplayPlan {
@@ -326,8 +350,8 @@ fn fits(size: PixelSize, constraints: DisplayConstraints) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DisplayConstraints, DisplayGeometry, DisplayIntent, DisplayLimitReport, DisplayPlanReason,
-        DisplayPlanner, ResolutionMode,
+        DisplayConstraints, DisplayGeometry, DisplayIntent, DisplayLimitReport,
+        DisplayOrientationPreference, DisplayPlanReason, DisplayPlanner, ResolutionMode,
     };
     use crate::{PixelRect, PixelSize};
 
@@ -479,11 +503,67 @@ mod tests {
                     height: 1,
                 }),
                 geometry: None,
+                orientation: DisplayOrientationPreference::Preserve,
             },
             DisplayConstraints::default(),
         )
         .unwrap();
         assert_eq!(plan.remote_size, None);
         assert_eq!(plan.reason, DisplayPlanReason::NoUsableSize);
+    }
+    #[test]
+    fn landscape_projection_only_changes_native_request_and_precedes_limits() {
+        let geometry =
+            DisplayGeometry::from_physical(PixelSize::new(1260, 2720).unwrap(), 3500).unwrap();
+        for mode in [
+            ResolutionMode::NativeDisplay,
+            ResolutionMode::DisplayWorkArea,
+            ResolutionMode::WindowContent,
+            ResolutionMode::Fixed(PixelSize::new(900, 1600).unwrap()),
+            ResolutionMode::ServerManaged,
+        ] {
+            let intent = DisplayIntent {
+                mode,
+                geometry: Some(geometry),
+                orientation: DisplayOrientationPreference::Landscape,
+            };
+            let plan = DisplayPlanner::plan(intent, DisplayConstraints::default()).unwrap();
+            assert_eq!(
+                intent.geometry.unwrap().physical_size,
+                PixelSize::new(1260, 2720).unwrap()
+            );
+            let expected = match mode {
+                ResolutionMode::NativeDisplay => PixelSize::new(2720, 1260),
+                ResolutionMode::ServerManaged => None,
+                ResolutionMode::Fixed(size) => Some(size),
+                _ => PixelSize::new(1260, 2720),
+            };
+            assert_eq!(plan.remote_size, expected);
+        }
+        let desktop = DisplayIntent::native_display(geometry);
+        assert_eq!(desktop.orientation, DisplayOrientationPreference::Preserve);
+        assert_eq!(
+            DisplayPlanner::plan(desktop, DisplayConstraints::default())
+                .unwrap()
+                .remote_size,
+            Some(geometry.physical_size)
+        );
+        let landscape = DisplayIntent {
+            orientation: DisplayOrientationPreference::Landscape,
+            ..desktop
+        };
+        let plan = DisplayPlanner::plan(
+            landscape,
+            DisplayConstraints {
+                max_width: Some(2000),
+                frame_budget_bytes: Some(4 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.requested_size, PixelSize::new(2720, 1260));
+        let size = plan.remote_size.unwrap();
+        assert!(size.width <= 2000);
+        assert!(u64::from(size.width) * u64::from(size.height) * 4 <= 4 * 1024 * 1024);
     }
 }

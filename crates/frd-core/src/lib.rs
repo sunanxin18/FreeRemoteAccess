@@ -9,7 +9,8 @@ pub mod viewport;
 pub use connection::{CredentialProviderId, Endpoint, ProtocolId, TargetSystem};
 pub use display::{
     DisplayConstraints, DisplayGeometry, DisplayIntent, DisplayLimit, DisplayLimitReport,
-    DisplayPlan, DisplayPlanError, DisplayPlanReason, DisplayPlanner, ResolutionMode,
+    DisplayOrientationPreference, DisplayPlan, DisplayPlanError, DisplayPlanReason, DisplayPlanner,
+    ResolutionMode,
 };
 pub use geometry::{PhysicalViewport, PixelPoint, PixelRect, PixelSize};
 pub use input::{

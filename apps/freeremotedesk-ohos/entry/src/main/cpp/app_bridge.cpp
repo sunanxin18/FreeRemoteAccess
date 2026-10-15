@@ -104,6 +104,14 @@ napi_value Edit(napi_env env, napi_callback_info info) {
         return Code(env, -2);
     return Code(env, frd_ohos_app_edit(application, t.bytes.data(), t.bytes.size()));
 }
+napi_value LocalDisplay(napi_env env, napi_callback_info info) {
+    napi_value a = nullptr;
+    Text t;
+    if (!Args(env, info, &a, 1) || !t.Read(env, a, 4096))
+        return Code(env, -2);
+    // 原始有符号坐标/浮点 density 保留为 JSON；Rust 严格校验，不在 NAPI 截断。
+    return Code(env, frd_ohos_app_local_display(application, t.bytes.data(), t.bytes.size()));
+}
 napi_value Password(napi_env env, napi_callback_info info) {
     napi_value a = nullptr;
     Text t;
@@ -193,6 +201,7 @@ void RegisterFrdApp(napi_env env, napi_value exports) {
         {"editPassword", nullptr, Password, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appAction", nullptr, Action, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appFocus", nullptr, Focus, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"appLocalDisplay", nullptr, LocalDisplay, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appGeometry", nullptr, Geometry, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appInput", nullptr, Input, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"commitText", nullptr, CommitText, nullptr, nullptr, nullptr, napi_default, nullptr},

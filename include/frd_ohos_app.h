@@ -28,6 +28,12 @@ typedef struct FrdOhosAppInput {
     uint32_t hid, modifiers;
     int32_t wheel_x, wheel_y;
 } FrdOhosAppInput;
+/* ABI1 增量：严格 JSON（abiVersion/stage/revision/windowId/phone/geometry/reason），
+ * 上限 4096 字节；通常 geometry 与 reason 恰有一个非 null。
+ * 唯一例外：geometry.workArea=null 且 reason="invalid_work_area" 明示工作区回退。
+ * 系统 workArea 须非负且完全在 display 内；window/drawable 允许合法跨屏相交。像素已经是 px。
+ * 不改变 FrdOhosAppGeometry 布局；该入口与 renderer/input viewport 独立。 */
+int32_t frd_ohos_app_local_display(uint64_t app, const uint8_t *json, size_t length);
 int32_t frd_ohos_app_geometry(uint64_t app, const FrdOhosAppGeometry *geometry);
 int32_t frd_ohos_app_input(uint64_t app, const FrdOhosAppInput *input);
 int32_t frd_ohos_app_text(uint64_t app, uint64_t session, uint64_t generation, uint64_t revision,

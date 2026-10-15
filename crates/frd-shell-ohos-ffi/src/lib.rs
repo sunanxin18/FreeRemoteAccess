@@ -87,6 +87,7 @@ mod fixture;
 pub mod input_adapter;
 #[cfg(any(test, target_env = "ohos"))]
 mod limits;
+mod local_display;
 #[cfg(target_env = "ohos")]
 mod ohos;
 mod panic_scope;
