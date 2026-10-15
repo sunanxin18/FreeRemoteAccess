@@ -373,3 +373,20 @@ Fix4源码/host实现已完成并经独立复审批准：三个Windows fixture s
 独立定向复审 **Spec PASS / Quality Approved**，Critical/Important/Minor均0。root已读完整15文件变更及追加报告，核对75份冻结文件、20份当前源码/报告/brief身份、15份修改前源码与Gitc973、原31584-byte作者报告与30288-byte审查前缀。作者manifest为 `cfba8d969328b833490fa492761310553c9afbea691778760c0b05c8e5ca53c6`，审查报告为 `8a1ad90667cc9fd20d51d53f6dd973adda11fdf32163839dd5fdde7edae2d13b`。源码F1 `8045ed01f408bd448755e9008783f0dfbda6d0ba27a91d0cb731e351a438e1d2`、F2 `844543036bf46f269f44e91b40a69978309281af665fdba59f2dc9269f3c1570`、runner `f5d9b2fbd2bd1dd316b3cedc91fe812f239ba6f4d156368304ab0c35b66f0eff`；root接收为 `target/windows-private-runner-root-20261016/f3-fix4-root-acceptance.json`。
 
 此批准仅覆盖源码及host controls。需要审查后精确新commit的新同run编译/输入/实际Windows七命令；不重跑或改写c973失败。若新编码后仍有额外AV或其它异常，保持失败并重新裁定，不放宽异常门。外部模块文件/provider、shipping数值/qmul/guard/性能/修改包和真实产品会话均未由本次关闭。
+
+
+### Fix4 原生结果：正确断点已观察，坏FP负例仍出现额外AV
+
+提交 `19b24c93ff96ccc2a5863fec93c91c2cd66f5cc0` 的[原run38803454974](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38803454974) / attempt1 / workflow_dispatch已结束。compile job116658146601成功，native-helper-contract job116661525320失败。实际launcher为AA64原生Python3.13.16/Windows26200，source pins通过；register0 PID1056、unwind0 PID8116均独立wait0/actualexit0/JobActive0、无Terminate，root用固定F1源码重新解析真实stdout/stderr并与已封存parser记录完全匹配。两者首次active均0，仍不是旧1→0自然收束证据。
+
+isolated0父PID10852实际wait0/exit1，首错parent-nonzero，cleanupwait0/active0；后四个unwind变体未尝试。preserve PID8292正常返回，root以实际认证RVA数据独立通过其child grammar。corrupt_fp PID8020/TID7988的OS childbase为7ff6a6c20000，认证helperRVA52f4，独立目标PC=base+RVA+408=7ff6a6c256fc。真实first与second均为EXCEPTION_BREAKPOINT/80000003，C读取字为D43E0000、first1/second1；exit-event同码，continue与独立wait/terminal均完成。**因此本轮已观察到编码修复生效，但整个isolated用例仍失败。**
+
+两次断点之间实际出现first-chance AV/c0000005，PC7fff6acb8150、读取地址90；parent继续NOT_HANDLED，C记录该额外异常并永久失败。root直接运行严格child grammar同样在corrupt_fp以 `probe exception code/chance/order` 拒绝，没有把修改parent退出码或删掉AV后的合成字节作为原生通过。`win32=109`仍是未与失败绑定的尾部值，不能当实际根因。
+
+[Microsoft ARM64 exception handling](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170)规定专用FP及unwind记录的栈恢复语义；[Debugger Exception Handling](https://learn.microsoft.com/en-us/windows/win32/debug/debugger-exception-handling)说明首次NOT_HANDLED后系统会搜索frame-based handler，再产生second chance。这与故意破坏x29后在分派/回溯阶段发生二次访问异常的假设相容。当前没有实际异常CPU context、AV所在模块文件/映像基址、指令字或其读取来源，**不得据地址90或PC猜测把它确认为ntdll某条指令，也不得泛化接受AV**。后续先取得因果观测；保留原null-FP负例、first/second/NOT_HANDLED/samePC/exit/wait门，不恢复PC/SP/FP、不吞异常或强制退出冒充通过。
+
+完整native artifact12006435552为472132395B，SHA256 `6b4b91ec1afbf7582711ca05c2581be2d42889d35c5de43926c84edd1ce3bb3e`，与认证API一致。root固定57个连续Range、无段重试，约422.225秒完成；预先固定1800秒仅本机只读归档收集预算，产品60/30/120/10秒均未改。535outer/532inner全部CRC/长度/hash、manifest/terminal/summary与七源码副本/Git19b24c9一致。早期Range冻结22文件、17个成员及4个raw block均已逐字与完整ZIP匹配，保留其原preliminary表述。
+
+同run input12005837149为78620409B，SHA256 `9b181bd12a67b2a4b4601982bccd29f85332ee57814efdf5959a6d3853d8d7f2`。root独立认证API/run/compile job/callercontext后，从完整nativeZIP恢复其rawZIP，用固定84454303 F2源bytes静态admit/revalidate通过7COFF/5PE；caller-held seal为 `2cccbf50ce7c961755d29a9f5b0669feaf514c937f301b3d35029ff0bd94da49`，状态admitted-static-only。未在Mac执行PE/Win32或编译器。证据位于 `target/windows-private-runner-root-20261016/fix4-ci/` 的native-envelope-acceptance、root-static-acceptance、native-root-acceptance、range-full-match和actual-child-diagnostic。
+
+整轮仍失败、完整七项nativehelper未完成。后继shipping构建/同对象数值/受信修改包方案仅已预检，尚未实施或授予资格。PC人工表单未观察/操作，客户端生产默认及其它平台代码没有由本次改变。
