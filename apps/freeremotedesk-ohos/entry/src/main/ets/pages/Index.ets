@@ -1,5 +1,6 @@
 import native from 'libentry.so';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { usbHid } from './InputMapping';
 
 interface ProfileSummary { address: string; username: string; port: number; }
@@ -32,6 +33,7 @@ struct Index {
   @State private remember: boolean = false;
   @State private compact: boolean = false;
   @State private windowWidth: number = 500;
+  @State private windowHeight: number = 800;
   @State private passwordEpoch: number = 0;
   @State private bridgeNotice: string = '';
   private controller: XComponentController = new XComponentController();
@@ -143,24 +145,56 @@ struct Index {
   fieldLabel(label: string) {
     Text(label).fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
   }
+  private widePhoneForm(): boolean {
+    return deviceInfo.deviceType === 'phone' && this.windowWidth >= 600 && this.windowHeight < 500;
+  }
+  private formFieldWidth(): string { return this.widePhoneForm() ? 'calc(50% - 6vp)' : '100%'; }
+  @Builder
+  rememberAction() {
+    // 整行只由一个原生按钮接收点击；复选框仅绘制状态，避免父子重复切换。
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 12 }) {
+        Checkbox().select(this.remember).width(24).height(24).hitTestBehavior(HitTestMode.None).focusable(false).accessibilityLevel('no')
+        Text('在此设备安全保存登录信息').fontSize(14).fontColor($r('app.color.text_primary')).layoutWeight(1).textAlign(TextAlign.Start)
+      }.width('100%')
+    }.buttonStyle(ButtonStyleMode.TEXTUAL).padding({ left: 0, right: 0, top: 8, bottom: 8 }).width('100%').constraintSize({ minHeight: 48 })
+      .focusable(true).accessibilityText('在此设备安全保存登录信息').accessibilityRole(AccessibilityRoleType.CHECKBOX).accessibilityChecked(this.remember)
+      .onClick(() => { this.remember = !this.remember; this.edit(); }).margin({ top: 8 })
+  }
+  @Builder
+  formMessages() {
+    if (!this.model.available) { Text('此设备尚无可用的远程连接协议').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').margin({ top: 4 }) }
+    if (this.model.errors?.protocol) { Text(this.error(this.model.errors.protocol)).fontSize(14).width('100%').margin({ top: 4 }) }
+    if (this.model.notice || this.bridgeNotice) { Text(this.bridgeNotice || this.model.notice || '').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 4 }) }
+  }
+  @Builder
+  connectAction() {
+    Button('连接').fontSize(16).constraintSize({ minHeight: 48 }).width('100%').enabled(this.model.canConnect ?? false).focusable(true)
+      .accessibilityText('连接远程桌面').onClick(() => this.submit()).margin({ top: 8 })
+  }
   @Builder
   connectionForm() {
     Scroll() {
       Column() {
-        Column({ space: 4 }) {
-          Text('连接远程桌面').fontSize(this.compact ? 24 : 28).fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.text_primary')).width('100%').textAlign(TextAlign.Start)
-          Text('FreeRemoteDesk').fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
-        }.width('100%').constraintSize({ minHeight: 48 }).alignItems(HorizontalAlign.Start).margin({ bottom: this.compact ? 16 : 24 })
-        if ((this.model.profiles?.length ?? 0) > 0) {
-          Select(this.profileOptions()).selected(this.model.selectedIndex ?? -1).value('最近连接')
-            .font({ size: 14 }).optionFont({ size: 16 }).optionWidth(OptionWidthMode.FIT_TRIGGER)
-            .width('100%').constraintSize({ minHeight: 48 }).accessibilityText('选择最近连接')
-            .onSelect((index: number) => { this.selectedIndex = index; this.selectPending = true; this.check(native.appAction(4, '0', 0, index)); })
-            .margin({ bottom: 12 })
-          if (this.model.errors?.profile) { Text(this.error(this.model.errors.profile)).fontSize(14).width('100%').margin({ bottom: 8 }) }
-        }
-        Column({ space: 12 }) {
+        Flex({ direction: this.widePhoneForm() ? FlexDirection.Row : FlexDirection.Column, justifyContent: FlexAlign.SpaceBetween, alignItems: ItemAlign.Start }) {
+          Column({ space: 4 }) {
+            Text('连接远程桌面').fontSize(this.compact ? 24 : 28).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary')).width('100%').textAlign(TextAlign.Start)
+            Text('FreeRemoteDesk').fontSize(12).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
+          }.width(this.widePhoneForm() && (this.model.profiles?.length ?? 0) > 0 ? this.formFieldWidth() : '100%').constraintSize({ minHeight: 48 }).alignItems(HorizontalAlign.Start).margin({ bottom: this.compact ? 16 : 24 })
+          if ((this.model.profiles?.length ?? 0) > 0) {
+            Column() {
+              Select(this.profileOptions()).selected(this.model.selectedIndex ?? -1).value('最近连接')
+                .font({ size: 14 }).optionFont({ size: 16 }).optionWidth(OptionWidthMode.FIT_TRIGGER)
+                .width('100%').constraintSize({ minHeight: 48 }).accessibilityText('选择最近连接')
+                .onSelect((index: number) => { this.selectedIndex = index; this.selectPending = true; this.check(native.appAction(4, '0', 0, index)); })
+                .margin({ bottom: 12 })
+              if (this.model.errors?.profile) { Text(this.error(this.model.errors.profile)).fontSize(14).width('100%').margin({ bottom: 8 }) }
+            }.width(this.formFieldWidth())
+          }
+        }.width('100%')
+        // 同一组输入控件仅调整宽度和换行，旋转时不重建密码控件。
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.SpaceBetween, alignItems: ItemAlign.Start, alignContent: FlexAlign.Start }) {
           Row({ space: 12 }) {
             Column({ space: 6 }) {
               this.fieldLabel('目标系统')
@@ -175,39 +209,36 @@ struct Index {
                 .constraintSize({ minHeight: 48 }).accessibilityText('端口').showError(this.error(this.model.errors?.port))
                 .onChange((v: string) => { this.port = v; this.edit(); })
             }.width(96).alignItems(HorizontalAlign.Start)
-          }.width('100%').alignItems(VerticalAlign.Top)
+          }.width(this.formFieldWidth()).alignItems(VerticalAlign.Top).margin({ bottom: 12 })
           Column({ space: 6 }) {
             this.fieldLabel('主机地址')
             TextInput({ text: this.address, placeholder: '主机名或 IP 地址' }).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('主机地址')
               .showError(this.error(this.model.errors?.address)).onChange((v: string) => { this.address = v; this.edit(); })
-          }.width('100%')
+          }.width(this.formFieldWidth()).margin({ bottom: 12 })
           Column({ space: 6 }) {
             this.fieldLabel('用户名')
             TextInput({ text: this.username, placeholder: '远程计算机账户' }).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('用户名')
               .showError(this.error(this.model.errors?.username)).onChange((v: string) => { this.username = v; this.edit(); })
-          }.width('100%')
+          }.width(this.formFieldWidth()).margin({ bottom: this.widePhoneForm() ? 0 : 12 })
           Column({ space: 6 }) {
             this.fieldLabel('密码')
             ForEach([this.passwordEpoch], (_epoch: number) => { this.passwordInput() }, (epoch: number) => `${epoch}`)
-          }.width('100%')
+          }.width(this.formFieldWidth())
         }.width('100%')
         if (this.model.loading) { Text(this.model.loading).fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 8 }) }
         if (this.model.credentialLoaded) { Text('已从系统安全存储载入密码').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 8 }) }
-        // 整行只由一个原生按钮接收点击；复选框仅绘制状态，避免父子重复切换。
-        Button({ type: ButtonType.Normal }) {
+        if (this.widePhoneForm()) {
           Row({ space: 12 }) {
-            Checkbox().select(this.remember).width(24).height(24).hitTestBehavior(HitTestMode.None).focusable(false).accessibilityLevel('no')
-            Text('在此设备安全保存登录信息').fontSize(14).fontColor($r('app.color.text_primary')).layoutWeight(1).textAlign(TextAlign.Start)
-          }.width('100%')
-        }.buttonStyle(ButtonStyleMode.TEXTUAL).padding({ left: 0, right: 0, top: 8, bottom: 8 }).width('100%').constraintSize({ minHeight: 48 })
-          .focusable(true).accessibilityText('在此设备安全保存登录信息').accessibilityRole(AccessibilityRoleType.CHECKBOX).accessibilityChecked(this.remember)
-          .onClick(() => { this.remember = !this.remember; this.edit(); }).margin({ top: 8 })
-        if (!this.model.available) { Text('此设备尚无可用的远程连接协议').fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').margin({ top: 4 }) }
-        if (this.model.errors?.protocol) { Text(this.error(this.model.errors.protocol)).fontSize(14).width('100%').margin({ top: 4 }) }
-        if (this.model.notice || this.bridgeNotice) { Text(this.bridgeNotice || this.model.notice || '').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 4 }) }
-        Button('连接').fontSize(16).constraintSize({ minHeight: 48 }).width('100%').enabled(this.model.canConnect ?? false).focusable(true)
-          .accessibilityText('连接远程桌面').onClick(() => this.submit()).margin({ top: 8 })
-      }.width('100%').constraintSize({ maxWidth: 440 }).padding({ top: this.compact ? 16 : 24, bottom: this.compact ? 16 : 24 }).alignItems(HorizontalAlign.Center)
+            Column() { this.rememberAction() }.layoutWeight(1)
+            Column() { this.connectAction() }.width('32%')
+          }.width('100%').alignItems(VerticalAlign.Top)
+          this.formMessages()
+        } else {
+          this.rememberAction()
+          this.formMessages()
+          this.connectAction()
+        }
+      }.width('100%').constraintSize({ maxWidth: this.widePhoneForm() ? 880 : 440 }).padding({ top: this.compact ? 16 : 24, bottom: this.compact ? 16 : 24 }).alignItems(HorizontalAlign.Center)
     }.width('100%').layoutWeight(1).clip(true).scrollBar(BarState.Auto).padding({ left: this.compact ? 16 : 24, right: this.compact ? 16 : 24 })
   }
   @Builder
@@ -276,6 +307,6 @@ struct Index {
       .padding({ left: this.getUIContext().px2vp(this.cutoutLeft), right: this.getUIContext().px2vp(this.cutoutRight), top: this.getUIContext().px2vp(this.cutoutTop), bottom: this.getUIContext().px2vp(this.cutoutBottom) })
       .backgroundColor($r('app.color.page_background'))
       .onKeyEvent((event: KeyEvent) => this.remoteKey(event))
-      .onAreaChange((_, area) => { this.compact = Number(area.width) < 600 || Number(area.height) < 500; this.windowWidth = Number(area.width); })
+      .onAreaChange((_, area) => { this.compact = Number(area.width) < 600 || Number(area.height) < 500; this.windowWidth = Number(area.width); this.windowHeight = Number(area.height); })
   }
 }

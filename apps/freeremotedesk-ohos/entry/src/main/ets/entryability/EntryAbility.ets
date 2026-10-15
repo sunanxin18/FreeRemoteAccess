@@ -62,6 +62,17 @@ export default class EntryAbility extends UIAbility {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
       this.mainWindow = windowStage.getMainWindowSync();
+      if (deviceInfo.deviceType === 'phone') {
+        try {
+          if (canIUse('SystemCapability.Window.SessionManager')) {
+            // 首次横屏，随后遵循传感器与控制中心的旋转开关。
+            this.mainWindow.setPreferredOrientation(window.Orientation.USER_ROTATION_LANDSCAPE)
+              .catch((error: BusinessError) => { this.windowError('手机旋转', error); });
+          } else {
+            hilog.warn(0xFF00, 'FrdOhos', '手机旋转能力不可用');
+          }
+        } catch (e) { this.windowError('手机旋转', e as BusinessError); }
+      }
       this.updateCutout();
       this.mainWindow.on('avoidAreaChange', () => { native.appFocus(false, false, false); this.updateCutout(); });
       this.mainWindow.on('windowSizeChange', () => { native.appFocus(false, false, false); this.updateCutout(); });

@@ -51,3 +51,28 @@ PC 标题栏采用[华为官方自由多窗沉浸式方案](https://developer.hu
 ## 保留的未决门
 
 被控鸿蒙手机的系统原生远程服务尚未确认；不会以自建 server、HDC、修改系统权限或注入服务替代。Mac/Windows 授权目标的地址和密码从本机安全提供者读取，不进入工程。HAP 签名若需要用户账号认证，保留已构建产物并通过正常开发签名流程完成，不伪造系统权限。
+
+
+## 手机横屏优先与自动旋转（2026-10-15 用户要求）
+
+手机窗口首次创建时使用官方`window.Orientation.USER_ROTATION_LANDSCAPE`：
+先横屏显示，随后按传感器和系统旋转锁定切换方向。该API从12起提供，本工程
+最低API26；不使用只允许横屏/反向横屏的`AUTO_ROTATION_LANDSCAPE`系列。
+仅`deviceInfo.deviceType === 'phone'`分支设置，保留共享manifest的原策略与
+PC原生自由窗口行为；不改Windows/macOS/Linux壳或协议/解码器。策略只在窗口
+创建时设置，不在前台恢复或每次resize时强制重设，避免把用户转回竖屏的选择覆盖。
+失败只记录既有窗口错误，不中断加载。旋转继续走原有安全区、geometry及焦点释放。
+
+按[华为横竖屏开发指南](https://developer.huawei.com/consumer/cn/doc/best-practices/bpta-landscape-and-portrait-development)、本机正式SDK Orientation枚举，结合
+[Apple HIG Layout](https://developer.apple.com/design/human-interface-guidelines/layout)与
+[Material官方自适应布局](https://github.com/material-components/material-components-android/blob/master/docs/adaptive/CanonicalLayouts.md)核对。
+M3主站的相关布局路径仍不可直接读取，以官方组件库的自适应资料补充；本项不改变
+控件/信息架构，不增加GUI基线例外。验收分别记录实际HAP构建、手机启动默认横屏、
+自动切回竖屏及再次横屏、安全区/表单输入保持；PC新包实际执行若未进行必须明确。
+
+
+首次手机实测确认横屏策略生效，但旧单列表单超出横屏首屏，因此手机宽而矮的
+内容区（宽≥600vp且高<500vp）采用两行双列字段：目标/端口与地址、用户名与
+密码；标题与最近连接、保存选项与连接按钮分别并排。普通字号完整显示主要
+登录信息，错误、大字或键盘弹出仍可滚动；PC及手机竖屏保持既有布局。字段
+复用同一状态、验证和安全密码控件，不改变48vp触控目标、Enter/IME和凭据边界。
