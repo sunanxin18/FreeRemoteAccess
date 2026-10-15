@@ -4,9 +4,10 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-用法：tools/build-harmony.sh [--sdk SDK根目录] [--check|--build] [--release] [-p crate]...
+用法：tools/build-harmony.sh [--sdk SDK根目录] [--check|--build] [--release] [-p crate]... [--normal-hap-rdp-validation]
 默认检查 frd-core/frd-frame/frd-app/frd-shell-runtime 的 aarch64-unknown-linux-ohos。
 SDK 根目录可由 OHOS_SDK_ROOT、DEVECO_HOME 或已安装的 DevEco Studio 提供。
+--normal-hap-rdp-validation：仅普通 OHOS ARM64 应用的 RDP 有界验证，默认关闭；未指定 -p 时选择 frd-shell-ohos-ffi，不代表互操作通过。
 可用 CARGO、RUSTC、PATH 选择安装了 OHOS 标准库的 Rust 工具链。
 USAGE
 }
@@ -14,6 +15,7 @@ USAGE
 sdk_root="${OHOS_SDK_ROOT:-}"
 action=check
 release=0
+rdp_validation=0
 package_args=()
 while (($#)); do
     case "$1" in
@@ -21,6 +23,7 @@ while (($#)); do
         --check) action=check; shift ;;
         --build) action=build; shift ;;
         --release) release=1; shift ;;
+        --normal-hap-rdp-validation) rdp_validation=1; shift ;;
         -p|--package) package_args+=(-p "${2:?需要 crate 名称}"); shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) printf '未知参数：%s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -68,12 +71,19 @@ export CFLAGS_aarch64_unknown_linux_ohos="--sysroot=$native_root/sysroot ${CFLAG
 export CXXFLAGS_aarch64_unknown_linux_ohos="--sysroot=$native_root/sysroot ${CXXFLAGS_aarch64_unknown_linux_ohos:-}"
 export CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_ohos="$native_root/build/cmake/ohos.toolchain.cmake"
 if ((${#package_args[@]} == 0)); then
-    package_args=(-p frd-core -p frd-frame -p frd-app -p frd-shell-runtime)
+    if ((rdp_validation)); then
+        package_args=(-p frd-shell-ohos-ffi)
+    else
+        package_args=(-p frd-core -p frd-frame -p frd-app -p frd-shell-runtime)
+    fi
 fi
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$repository_root"
 cargo_args=("$action" --locked --target aarch64-unknown-linux-ohos)
 if ((release)); then
     cargo_args+=(--release)
+fi
+if ((rdp_validation)); then
+    cargo_args+=(--features frd-shell-ohos-ffi/normal-hap-rdp-validation)
 fi
 "${CARGO:-cargo}" "${cargo_args[@]}" "${package_args[@]}"

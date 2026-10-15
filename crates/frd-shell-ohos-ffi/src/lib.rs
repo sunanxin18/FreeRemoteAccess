@@ -5,6 +5,18 @@
 //! 引用取得和初始化结果；没有超时后仍访问借用窗口的路径。
 
 #[cfg(all(
+    feature = "normal-hap-rdp-validation",
+    any(
+        feature = "native-presentation-fixture",
+        feature = "normal-hap-codec-fixture",
+        feature = "normal-hap-codec-benchmark",
+        feature = "normal-hap-avc444-profile",
+        feature = "normal-hap-hevc444-profile"
+    )
+))]
+compile_error!("普通 RDP 验证与合成/codec 测量模式必须分别构建，包括 release");
+
+#[cfg(all(
     debug_assertions,
     feature = "normal-hap-codec-fixture",
     feature = "native-presentation-fixture"
@@ -66,6 +78,7 @@ mod codec_fixture_common;
     )
 ))]
 mod codec_measurement;
+mod composition;
 #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
 mod fixture;
 pub mod input_adapter;

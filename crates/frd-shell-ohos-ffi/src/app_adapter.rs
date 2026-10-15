@@ -77,7 +77,9 @@ impl WakeSink for Wake {
         Ok(())
     }
 }
+#[cfg(test)]
 struct NoAudio;
+#[cfg(test)]
 impl AudioOutputFactory for NoAudio {
     fn open(&self) -> Result<Box<dyn frd_media_api::AudioOutput>, frd_media_api::AudioOutputError> {
         Err(frd_media_api::AudioOutputError::Unavailable)
@@ -320,26 +322,8 @@ impl AppEngine {
         *current = Some(link);
         Ok(())
     }
-    pub fn unregistered(root: PathBuf) -> Result<Self, i32> {
-        Self::spawn(
-            Stores::at(root),
-            {
-                #[cfg(all(debug_assertions, feature = "native-presentation-fixture"))]
-                {
-                    vec![Arc::new(crate::fixture::Factory) as Arc<dyn ProtocolFactory>]
-                }
-                #[cfg(not(all(debug_assertions, feature = "native-presentation-fixture")))]
-                {
-                    vec![]
-                }
-            },
-            Arc::new(|_| {
-                Err(frd_media_api::VideoDecodeError::new(
-                    frd_media_api::VideoDecodeErrorCode::BackendUnavailable,
-                ))
-            }),
-            Arc::new(NoAudio),
-        )
+    pub fn for_platform(root: PathBuf) -> Result<Self, i32> {
+        crate::composition::spawn(root)
     }
     pub fn send(&self, command: Command) -> Result<(), i32> {
         let recovery = match &command {

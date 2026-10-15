@@ -51,7 +51,7 @@ pub unsafe extern "C" fn frd_ohos_app_create(path: *const u8, len: usize, out: *
         {
             return Err(INVALID_ARGUMENT);
         }
-        let engine = Arc::new(AppEngine::unregistered(root)?);
+        let engine = Arc::new(AppEngine::for_platform(root)?);
         let mut a = apps().lock().map_err(|_| PANIC)?;
         a.0 = a.0.checked_add(1).ok_or(EXHAUSTED)?;
         let id = a.0;

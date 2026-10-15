@@ -123,6 +123,8 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [ ] Task 4C5 优先补 AArch64 8-bit H264 luma DC 变换/反量化；维护显式补丁来源、C oracle、逐核 parity、目标基准和普通 HAP 同流验证。HEVC 16×16 planar/angular 与已识别的 32×32 angular 标量分支随后处理，避免重写已向量化分支。
 - [ ] 优先完成 AVCodec Kit 逐设备能力与精确 fixture 验证、系统硬解/软解 adapter 和生命周期接线；软解保留 SIMD 证据要求。系统后端未覆盖的格式再使用经过 OHOS ABI/parity 验证的 FFmpeg 后备。
 - [ ] 确认 ARM64 Bitmap/RemoteFX/像素转换及生产 dispatch 满足现有 SIMD gate；独立叶子不能替代完整解码路径。
+- [x] Task 4D1 普通应用 RDP 组合源码/FFI子步骤：2026-10-15 显式默认关闭 `normal-hap-rdp-validation` 沿用同一 C ABI/AppEngine/SessionHost，OHOS ARM64 仅注入 Unix/RequiredNative/LegacyOnly factory；宿主回归、实际最终 FFI 链接与独立 Spec/Quality 审查通过，见[组合验证](../../validation/harmony-rdp-composition-20261015.md)。默认与生产广告没有提升。
+- [x] Task 4D2 普通 HAP/安装/表单子步骤：实际 strip 绑定失败经插件证据定位并修正、复审和真实重放通过；开发签名/签后身份检查及两台专用模拟器安装、普通表单、Windows/Mac目标选择和实际截图检查通过。仅本子步骤完成，真实认证、首帧、刷新、输入/IME、生命周期与重连仍未完成，见[包与运行验证](../../validation/harmony-rdp-normal-hap-20261015.md)。
 - [ ] 模拟器连接授权 Windows：保存/读取凭据、首帧、增量、触控/键鼠、远程软键盘入口与 IME 提交、断开/重连与恢复。
 - [ ] AVC/HEVC广告继续受原精确门禁控制；未通过的 codec 不由新平台构建自动开放。
 

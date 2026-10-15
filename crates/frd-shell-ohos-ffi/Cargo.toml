@@ -7,6 +7,8 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# 普通 HAP 的有界 RDP 互操作验证；默认不注册协议。
+normal-hap-rdp-validation = ["dep:frd-protocol-rdp"]
 native-presentation-fixture = []
 normal-hap-codec-fixture = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
 
@@ -17,6 +19,7 @@ normal-hap-avc444-profile = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmp
 normal-hap-hevc444-profile = ["dep:frd-video-ffmpeg", "dep:sha2", "frd-video-ffmpeg/ohos-loader-diagnostics"]
 
 [dependencies]
+frd-protocol-rdp = { path = "../frd-protocol-rdp", optional = true }
 frd-video-ffmpeg = { path = "../frd-video-ffmpeg", optional = true }
 sha2 = { version = "0.10", optional = true }
 frd-core = { path = "../frd-core" }
