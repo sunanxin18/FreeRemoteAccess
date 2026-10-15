@@ -26,7 +26,9 @@ ArkUI KeyCode通过本机正式SDK定义归一为USB HID，补齐小键盘0–9�
 
 ## 后续门
 
-本片consumer到测试ProtocolSession队列边界，未新增或运行真实RDP Set-1/Database、Apple keysym wire的完整固定oracle回归。源码只读审计已用于收窄profile，不能代替真实协议/远端编辑观察。
+OHOS片consumer到测试ProtocolSession队列边界。后续独立RDP tests-only子步骤追加7项固定oracle回归，实际通过`translate_input`/`RdpInputState`进入IronRDP Database，精确比较101个HID的最终FastPath code/EXTENDED/RELEASE、孤立Up、独立held/ReleaseAll、重复Down、stop/resume、modifier不自动合成及锁键无Synchronize。0x32/0x48仍InvalidScancode，测试证明本地Database不污染，不证明active session遇错仍存活；0x64只保留RDP0056合同。
+
+该子步骤绝对Rust1.96 focused7通过、完整RDP359通过/11项既有ignored、doc0；独立Spec/Quality复审通过。生产前缀及原测试逐字节不变，新增仅`crates/frd-protocol-rdp/src/input.rs`测试区338行；最终源码SHA-256为`08939d5760851c2ebe65432d80f05e0531141f55903110a70c48e583fe0dd6aa`，完整日志在上述证据目录的`rdp-consumer/`。固定expected不从OHOS或生产映射生成。Apple keysym完整固定oracle、其他架构执行及真实远端编辑仍未验证；RDP事件consumer通过也不等于网络送达或设备输入验收。
 
 ReleaseAll只解除已记录按住状态，不同步或重置Caps/Num/Scroll锁态。现有RDP根据远端布局/锁态解释物理位置，Apple小键盘固定KP数字keysym；不能宣称本地LED同步、NumLock两态远端结果、国际布局或锁键长按正确。
 

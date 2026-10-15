@@ -693,4 +693,342 @@ mod tests {
             Err(RdpInputError::Stopped)
         );
     }
+
+    // 独立 oracle：task-5c-protocol-key-consumer-audit.md 的固定 literal 表。
+    // 每行是 HID、最终 set1 字节、FastPath down flags；不调用生产映射生成期望。
+    // 仅含本片开放的 101 键；ISO102ND 的既有合同单独测试。
+    const KEY_CONSUMER_101: [(u16, u8, u8); 101] = [
+        (0x04, 0x1e, 0x00),
+        (0x05, 0x30, 0x00),
+        (0x06, 0x2e, 0x00),
+        (0x07, 0x20, 0x00),
+        (0x08, 0x12, 0x00),
+        (0x09, 0x21, 0x00),
+        (0x0a, 0x22, 0x00),
+        (0x0b, 0x23, 0x00),
+        (0x0c, 0x17, 0x00),
+        (0x0d, 0x24, 0x00),
+        (0x0e, 0x25, 0x00),
+        (0x0f, 0x26, 0x00),
+        (0x10, 0x32, 0x00),
+        (0x11, 0x31, 0x00),
+        (0x12, 0x18, 0x00),
+        (0x13, 0x19, 0x00),
+        (0x14, 0x10, 0x00),
+        (0x15, 0x13, 0x00),
+        (0x16, 0x1f, 0x00),
+        (0x17, 0x14, 0x00),
+        (0x18, 0x16, 0x00),
+        (0x19, 0x2f, 0x00),
+        (0x1a, 0x11, 0x00),
+        (0x1b, 0x2d, 0x00),
+        (0x1c, 0x15, 0x00),
+        (0x1d, 0x2c, 0x00),
+        (0x1e, 0x02, 0x00),
+        (0x1f, 0x03, 0x00),
+        (0x20, 0x04, 0x00),
+        (0x21, 0x05, 0x00),
+        (0x22, 0x06, 0x00),
+        (0x23, 0x07, 0x00),
+        (0x24, 0x08, 0x00),
+        (0x25, 0x09, 0x00),
+        (0x26, 0x0a, 0x00),
+        (0x27, 0x0b, 0x00),
+        (0x28, 0x1c, 0x00),
+        (0x29, 0x01, 0x00),
+        (0x2a, 0x0e, 0x00),
+        (0x2b, 0x0f, 0x00),
+        (0x2c, 0x39, 0x00),
+        (0x2d, 0x0c, 0x00),
+        (0x2e, 0x0d, 0x00),
+        (0x2f, 0x1a, 0x00),
+        (0x30, 0x1b, 0x00),
+        (0x31, 0x2b, 0x00),
+        (0x33, 0x27, 0x00),
+        (0x34, 0x28, 0x00),
+        (0x35, 0x29, 0x00),
+        (0x36, 0x33, 0x00),
+        (0x37, 0x34, 0x00),
+        (0x38, 0x35, 0x00),
+        (0x39, 0x3a, 0x00),
+        (0x3a, 0x3b, 0x00),
+        (0x3b, 0x3c, 0x00),
+        (0x3c, 0x3d, 0x00),
+        (0x3d, 0x3e, 0x00),
+        (0x3e, 0x3f, 0x00),
+        (0x3f, 0x40, 0x00),
+        (0x40, 0x41, 0x00),
+        (0x41, 0x42, 0x00),
+        (0x42, 0x43, 0x00),
+        (0x43, 0x44, 0x00),
+        (0x44, 0x57, 0x00),
+        (0x45, 0x58, 0x00),
+        (0x46, 0x37, 0x02),
+        (0x47, 0x46, 0x00),
+        (0x49, 0x52, 0x02),
+        (0x4a, 0x47, 0x02),
+        (0x4b, 0x49, 0x02),
+        (0x4c, 0x53, 0x02),
+        (0x4d, 0x4f, 0x02),
+        (0x4e, 0x51, 0x02),
+        (0x4f, 0x4d, 0x02),
+        (0x50, 0x4b, 0x02),
+        (0x51, 0x50, 0x02),
+        (0x52, 0x48, 0x02),
+        (0x53, 0x45, 0x00),
+        (0x54, 0x35, 0x02),
+        (0x55, 0x37, 0x00),
+        (0x56, 0x4a, 0x00),
+        (0x57, 0x4e, 0x00),
+        (0x58, 0x1c, 0x02),
+        (0x59, 0x4f, 0x00),
+        (0x5a, 0x50, 0x00),
+        (0x5b, 0x51, 0x00),
+        (0x5c, 0x4b, 0x00),
+        (0x5d, 0x4c, 0x00),
+        (0x5e, 0x4d, 0x00),
+        (0x5f, 0x47, 0x00),
+        (0x60, 0x48, 0x00),
+        (0x61, 0x49, 0x00),
+        (0x62, 0x52, 0x00),
+        (0x63, 0x53, 0x00),
+        (0x65, 0x5d, 0x02),
+        (0xe0, 0x1d, 0x00),
+        (0xe1, 0x2a, 0x00),
+        (0xe2, 0x38, 0x00),
+        (0xe4, 0x1d, 0x02),
+        (0xe5, 0x36, 0x00),
+        (0xe6, 0x38, 0x02),
+    ];
+
+    fn consumer_key(usage: u16, state: KeyState) -> InputEvent {
+        InputEvent::PhysicalKey {
+            code: PhysicalKeyCode::from_usb_hid_usage(usage),
+            state,
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    fn consumer_wire_key(code: u8, flags: u8) -> FastPathInputEvent {
+        FastPathInputEvent::KeyboardEvent(
+            KeyboardFlags::from_bits(flags).expect("固定 FastPath flags 有效"),
+            code,
+        )
+    }
+
+    // 比较完整事件集合而不约束 Database 的内部遍历顺序；非键盘事件直接失败。
+    fn consumer_keyboard_set(events: Vec<FastPathInputEvent>) -> Vec<(u8, u8)> {
+        let mut keys: Vec<_> = events
+            .into_iter()
+            .map(|event| match event {
+                FastPathInputEvent::KeyboardEvent(flags, code) => (code, flags.bits()),
+                other => panic!("物理键不能产生其他 wire 事件：{other:?}"),
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn key_consumer_fixed_101_oracle_checks_final_down_up_and_orphan_up() {
+        let mut database = Database::new();
+        for (usage, code, flags) in KEY_CONSUMER_101 {
+            let up = consumer_key(usage, KeyState::Released);
+            assert!(translate_input(&mut database, up.clone())
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                translate_input(&mut database, consumer_key(usage, KeyState::Pressed)).unwrap(),
+                vec![consumer_wire_key(code, flags)],
+                "HID {usage:#04x} down"
+            );
+            assert_eq!(
+                translate_input(&mut database, up.clone()).unwrap(),
+                vec![consumer_wire_key(code, flags | 0x01)],
+                "HID {usage:#04x} up"
+            );
+            assert!(translate_input(&mut database, up).unwrap().is_empty());
+        }
+        assert!(translate_input(&mut database, InputEvent::ReleaseAll)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn key_consumer_release_all_balances_101_distinct_held_keys_and_is_idempotent() {
+        let mut state = RdpInputState::new();
+        let mut expected = Vec::new();
+        // 同时按住可区分主键区/小键盘和左右修饰键，避免逐键清账掩盖别名。
+        for (usage, code, flags) in KEY_CONSUMER_101 {
+            assert_eq!(
+                state
+                    .translate(consumer_key(usage, KeyState::Pressed))
+                    .unwrap(),
+                vec![consumer_wire_key(code, flags)],
+                "HID {usage:#04x} 必须拥有独立 held 状态"
+            );
+            expected.push((code, flags | 0x01));
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            consumer_keyboard_set(state.translate(InputEvent::ReleaseAll).unwrap()),
+            expected
+        );
+        assert!(state.translate(InputEvent::ReleaseAll).unwrap().is_empty());
+        for (usage, _, _) in KEY_CONSUMER_101 {
+            assert!(state
+                .translate(consumer_key(usage, KeyState::Released))
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn key_consumer_repeat_down_emits_release_then_press_with_exact_e0_flags() {
+        for (usage, code, down_flags, up_flags) in
+            [(0x04, 0x1e, 0x00, 0x01), (0xe4, 0x1d, 0x02, 0x03)]
+        {
+            let mut database = Database::new();
+            let down = consumer_key(usage, KeyState::Pressed);
+            assert_eq!(
+                translate_input(&mut database, down.clone()).unwrap(),
+                vec![consumer_wire_key(code, down_flags)]
+            );
+            assert_eq!(
+                translate_input(&mut database, down).unwrap(),
+                vec![
+                    consumer_wire_key(code, up_flags),
+                    consumer_wire_key(code, down_flags),
+                ]
+            );
+            assert_eq!(
+                translate_input(&mut database, consumer_key(usage, KeyState::Released)).unwrap(),
+                vec![consumer_wire_key(code, up_flags)]
+            );
+            assert!(translate_input(&mut database, InputEvent::ReleaseAll)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn key_consumer_invalid_pause_and_non_us_hash_preserve_other_held_keys() {
+        let mut database = Database::new();
+        for (usage, code, flags) in [(0x04, 0x1e, 0x00), (0xe4, 0x1d, 0x02)] {
+            assert_eq!(
+                translate_input(&mut database, consumer_key(usage, KeyState::Pressed)).unwrap(),
+                vec![consumer_wire_key(code, flags)]
+            );
+        }
+        for usage in [0x32, 0x48] {
+            for state in [KeyState::Pressed, KeyState::Released] {
+                assert_eq!(
+                    translate_input(&mut database, consumer_key(usage, state)),
+                    Err(RdpInputError::InvalidScancode),
+                    "HID {usage:#04x} {state:?}"
+                );
+            }
+        }
+        assert_eq!(
+            consumer_keyboard_set(translate_input(&mut database, InputEvent::ReleaseAll).unwrap()),
+            vec![(0x1d, 0x03), (0x1e, 0x01)]
+        );
+        assert!(translate_input(&mut database, InputEvent::ReleaseAll)
+            .unwrap()
+            .is_empty());
+
+        // 仅回归 RDP 现有 0056 合同，不授予 OHOS/Apple 的 ISO 物理位置资格。
+        assert_eq!(
+            translate_input(&mut database, consumer_key(0x64, KeyState::Pressed)).unwrap(),
+            vec![consumer_wire_key(0x56, 0x00)]
+        );
+        assert_eq!(
+            translate_input(&mut database, consumer_key(0x64, KeyState::Released)).unwrap(),
+            vec![consumer_wire_key(0x56, 0x01)]
+        );
+    }
+
+    #[test]
+    fn key_consumer_stop_rejects_keys_until_resume_without_retaining_rejected_downs() {
+        let mut state = RdpInputState::new();
+        assert_eq!(
+            state
+                .translate(consumer_key(0xe6, KeyState::Pressed))
+                .unwrap(),
+            vec![consumer_wire_key(0x38, 0x02)]
+        );
+        assert_eq!(state.stop(), vec![consumer_wire_key(0x38, 0x03)]);
+        assert!(state.stop().is_empty());
+        for event in [
+            consumer_key(0x04, KeyState::Pressed),
+            consumer_key(0xe6, KeyState::Released),
+            InputEvent::ReleaseAll,
+        ] {
+            assert_eq!(state.translate(event), Err(RdpInputError::Stopped));
+        }
+        state.resume();
+        assert!(state
+            .translate(consumer_key(0x04, KeyState::Released))
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .translate(consumer_key(0xe6, KeyState::Released))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state
+                .translate(consumer_key(0x04, KeyState::Pressed))
+                .unwrap(),
+            vec![consumer_wire_key(0x1e, 0x00)]
+        );
+        assert_eq!(state.stop(), vec![consumer_wire_key(0x1e, 0x01)]);
+    }
+
+    #[test]
+    fn key_consumer_modifier_metadata_does_not_synthesize_control_or_other_keys() {
+        let mut database = Database::new();
+        for (state, flags) in [(KeyState::Pressed, 0x00), (KeyState::Released, 0x01)] {
+            assert_eq!(
+                translate_input(
+                    &mut database,
+                    InputEvent::PhysicalKey {
+                        code: PhysicalKeyCode::from_usb_hid_usage(0x04),
+                        state,
+                        modifiers: Modifiers {
+                            control: true,
+                            shift: true,
+                            alt: true,
+                            ..Modifiers::default()
+                        },
+                    },
+                )
+                .unwrap(),
+                vec![consumer_wire_key(0x1e, flags)]
+            );
+        }
+        assert!(translate_input(&mut database, InputEvent::ReleaseAll)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn key_consumer_lock_keys_emit_only_physical_events_without_synchronize_or_reset() {
+        let mut state = RdpInputState::new();
+        for (usage, code) in [(0x39, 0x3a), (0x47, 0x46), (0x53, 0x45)] {
+            let down = consumer_key(usage, KeyState::Pressed);
+            assert_eq!(
+                state.translate(down.clone()).unwrap(),
+                vec![consumer_wire_key(code, 0x00)]
+            );
+            assert_eq!(
+                state.translate(down).unwrap(),
+                vec![consumer_wire_key(code, 0x01), consumer_wire_key(code, 0x00),]
+            );
+        }
+        assert_eq!(
+            consumer_keyboard_set(state.translate(InputEvent::ReleaseAll).unwrap()),
+            vec![(0x3a, 0x01), (0x45, 0x01), (0x46, 0x01)]
+        );
+        assert!(state.translate(InputEvent::ReleaseAll).unwrap().is_empty());
+    }
 }
