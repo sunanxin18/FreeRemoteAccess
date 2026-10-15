@@ -1,5 +1,6 @@
 // UI 线程只导入调用期密码；临时复制 volatile wipe，不保留/打印 NAPI payload。
 #include "app_bridge.h"
+#include "ime_grapheme.h"
 #include "frd_ohos_app.h"
 #include "frd_ohos.h"
 #include <charconv>
@@ -126,6 +127,28 @@ napi_value ImeOperation(napi_env env, napi_callback_info info) {
         return Code(env, -2);
     return Code(env, frd_ohos_app_ime_operation(application, t.bytes.data(), t.bytes.size()));
 }
+struct Utf16Text {
+    std::vector<char16_t> units;
+    ~Utf16Text() { for (auto &unit : units) *static_cast<volatile char16_t *>(&unit) = 0; }
+};
+napi_value ImeGrapheme(napi_env env, napi_callback_info info) {
+    napi_value args[2]; uint32_t cursor = 0; size_t length = 0; Utf16Text text;
+    if (!Args(env, info, args, 2) || !U32(env, args[1], cursor) ||
+        napi_get_value_string_utf16(env, args[0], nullptr, 0, &length) != napi_ok || length > 4096 || cursor > length) {
+        napi_throw_error(env, nullptr, "ime_context_unavailable"); return nullptr;
+    }
+    text.units.resize(length + 1); size_t copied = 0;
+    if (napi_get_value_string_utf16(env, args[0], text.units.data(), text.units.size(), &copied) != napi_ok || copied != length) {
+        napi_throw_error(env, nullptr, "ime_context_unavailable"); return nullptr;
+    }
+    const auto result = FrdImeGraphemeNeighbors(text.units.data(), static_cast<int32_t>(length), static_cast<int32_t>(cursor));
+    if (!result.valid) { napi_throw_error(env, nullptr, "ime_context_unavailable"); return nullptr; }
+    napi_value object = nullptr, boundary = nullptr, previous = nullptr, next = nullptr;
+    napi_create_object(env, &object); napi_get_boolean(env, result.is_boundary, &boundary);
+    napi_create_int32(env, result.previous, &previous); napi_create_int32(env, result.next, &next);
+    napi_set_named_property(env, object, "isBoundary", boundary); napi_set_named_property(env, object, "previous", previous);
+    napi_set_named_property(env, object, "next", next); return object;
+}
 napi_value Password(napi_env env, napi_callback_info info) {
     napi_value a = nullptr;
     Text t;
@@ -218,6 +241,7 @@ void RegisterFrdApp(napi_env env, napi_value exports) {
         {"appLocalDisplay", nullptr, LocalDisplay, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appImeSource", nullptr, ImeSource, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appImeOperation", nullptr, ImeOperation, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"imeGraphemeNeighbors", nullptr, ImeGrapheme, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appGeometry", nullptr, Geometry, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"appInput", nullptr, Input, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"commitText", nullptr, CommitText, nullptr, nullptr, nullptr, napi_default, nullptr},

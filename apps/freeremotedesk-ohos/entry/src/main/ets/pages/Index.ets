@@ -1,4 +1,7 @@
 import native from 'libentry.so';
+import { inputMethod } from '@kit.IMEKit';
+import { RemoteImeAdapter, ImeSnapshot } from '../common/RemoteImeAdapter';
+import { imeOwnsKeyProducer } from '../common/RemoteImePolicy';
 import { KeyboardAvoidMode, LengthMetrics } from '@kit.ArkUI';
 import { deviceInfo, systemDateTime } from '@kit.BasicServicesKit';
 import { usbHid, qualifiedPhysicalKey } from './InputMapping';
@@ -10,7 +13,7 @@ interface ProfileSummary { address: string; username: string; port: number; prot
 interface ProtocolOption { id: string; label: string; shortLabel: string; available: boolean; targets: number[]; }
 interface FormErrors { address?: string; port?: string; username?: string; password?: string; protocol?: string; target?: string; profile?: string; }
 interface CertificateSummary { fingerprint: string; subject: string; issuer: string; }
-interface AppSnapshot {
+interface AppSnapshot extends ImeSnapshot {
   initialized: boolean; page: number; available: boolean; canConnect?: boolean;
   target?: number; address?: string; port?: number; username?: string; protocol?: string;
   remember?: boolean; credentialLoaded?: boolean; loading?: string; profiles?: ProfileSummary[];
@@ -48,6 +51,14 @@ struct Index {
   @State private tooltipText: string = '';
   @State private iconsReady: boolean = false;
   @State private actionBusy: boolean = false;
+  @State private imeSelected: boolean = false;
+  @State private imeLoading: boolean = false;
+  private surfaceHasFocus: boolean = false;
+  private imeCloseIntent: boolean = false;
+  private ime: RemoteImeAdapter = new RemoteImeAdapter(() => inputMethod.getController(),
+    { source: (json: string): number => native.appImeSource(json), operation: (json: string): number => native.appImeOperation(json) },
+    (text: string, cursor: number) => native.imeGraphemeNeighbors(text, cursor),
+    (message: string): void => { this.bridgeNotice = message; });
   private actionPage: number = 0;
   private island: SessionIslandPolicy = new SessionIslandPolicy();
   private keyboard: ShellKeyboardOwnership = new ShellKeyboardOwnership();
@@ -126,7 +137,44 @@ struct Index {
     const code = native.appFocus(this.shellActive, this.remoteFocused, this.remoteFocused);
     this.check(code); if (code !== 0) { this.remoteFocused = false; this.keyboard.enterLocal(); }
   }
+  private observeIme(): void {
+    this.ime.observe(this.model, this.surfaceHasFocus && this.remoteFocused && !this.detailsOpen, this.shellActive, this.now());
+    this.imeSelected = this.ime.mode(); this.imeLoading = this.ime.loading();
+  }
+  private surfaceFocusChanged(focused: boolean): void {
+    this.surfaceHasFocus = focused;
+    if (!focused) { this.focus(false); }
+    else { if (!this.keyboard.isLocal()) { this.focus(true); } this.observeIme(); }
+  }
+  private surfaceAreaChanged(width: number, height: number): void {
+    // 尺寸变化只清 held/隔离真实尾 Up；不伪造 blur，不撤销同焦点 IME ticket。
+    this.queuedKeys.isolate();
+    this.keyboard.enterLocal(); if (this.remoteFocused) { this.keyboard.enterRemote(); }
+    this.surfaceWidth = Math.round(this.getUIContext().vp2px(width));
+    this.surfaceHeight = Math.round(this.getUIContext().vp2px(height)); this.geometry();
+  }
+  private toggleKeyboard(): void {
+    const close = this.ime.mode() || this.imeCloseIntent;
+    const released = this.localOwnership(); this.imeCloseIntent = false;
+    this.imeSelected = false; this.imeLoading = false;
+    if (!released) { return; }
+    if (close) { this.returnToSurface(); return; }
+    if (this.model.page !== 3 || !this.model.ime?.installed || !this.model.ime.protocolTextInput) {
+      this.bridgeNotice = '当前协议尚不支持系统输入法'; return;
+    }
+    this.closeDetails(); this.collapseIsland();
+    this.ime.request(this.getUIContext(), deviceInfo.deviceType === 'phone', this.now());
+    this.imeSelected = true; this.imeLoading = true;
+    this.keyboard.enterRemote();
+    if (this.surfaceHasFocus) { this.focus(true); }
+    try { this.getUIContext().getFocusController().requestFocus('frdRemoteSurfaceFocus'); }
+    catch { this.ime.close(); this.imeSelected = false; this.imeLoading = false; this.bridgeNotice = '无法聚焦远程画面，请点击画面后重试'; }
+    this.observeIme();
+  }
   private release(): boolean {
+    // 保存用户动作前的关闭意图：按钮取得真实焦点会先使 surface blur。
+    if (this.ime.mode()) { this.imeCloseIntent = true; }
+    this.ime.close(); this.imeSelected = false; this.imeLoading = false;
     this.remoteFocused = false; this.queuedKeys.isolate();
     const code = native.appFocus(this.shellActive, false, false);
     this.check(code);
@@ -162,6 +210,7 @@ struct Index {
     return true;
   }
   private surfaceInteraction(): void {
+    this.imeCloseIntent = false;
     if (!this.shellActive || this.detailsOpen || this.model.page !== 3 || !this.flushPendingKeyUps()) { return; }
     // 仅同步 shell 所有权；真实 pointer 仍由 native XComponent 唯一发送。
     this.keyboard.enterRemote();
@@ -169,11 +218,14 @@ struct Index {
   }
   private syncIsland(): void {
     this.syncQueuedKeyEpoch();
+    // 只记录 ArkUI 节点的真实焦点；窗口前后台/浮岛 epoch 另行撤销输入授权。
+    if (this.model.page === 0) { this.surfaceHasFocus = false; }
     if (this.model.page !== this.actionPage) { this.actionBusy = false; this.actionPage = this.model.page; }
     const before = this.island.epoch();
     this.island.observe(this.model.page, this.model.session ?? '', this.shellActive, this.now());
     if (before !== this.island.epoch()) {
       this.focusTicket++; this.closeDetails();
+      this.ime.close(); this.imeSelected = false; this.imeLoading = false; this.imeCloseIntent = false;
       this.tooltipText = ''; this.focusedAction = -1; this.hoveredAction = -1; this.islandHovered = false;
       this.pointerInput = false; this.keyboard.reset(); this.surfaceTouch.reset(); this.remoteFocused = false;
     }
@@ -209,6 +261,7 @@ struct Index {
     this.island.pin(IslandPin.Tooltip, this.tooltipText.length > 0, this.now());
   }
   private actionLabel(action: number): string {
+    if (action === 4) { return !this.model.ime?.protocolTextInput ? '当前协议尚不支持系统输入法' : this.imeLoading ? '正在连接系统输入法' : this.imeSelected || this.imeCloseIntent ? '关闭系统输入法，返回实体键模式' : '打开系统输入法（文字与编辑键）'; }
     if (action === 0) { return '连接状态与服务器身份详情'; }
     if (action === 1) { return this.model.page === 3 ? '断开远程连接' : this.model.page === 5 ? '返回连接表单' : this.model.page === 4 ? '正在断开，不能重复提交' : '取消连接'; }
     return action === 2 ? '收起会话控制' : '展开会话控制';
@@ -245,7 +298,10 @@ struct Index {
     this.island.collapse(); this.refreshIsland();
   }
   private islandAction(action: number): void {
+    if (action === 4) { this.toggleKeyboard(); return; }
+    this.imeCloseIntent = false;
     if (!this.localOwnership()) { this.island.reveal(this.islandInput, this.now()); this.refreshIsland(); return; }
+    this.imeCloseIntent = false;
     if (action === 3) { this.revealIsland(this.islandInput); }
     else if (action === 2) { this.collapseIsland(); }
     else if (action === 0) { this.details(); }
@@ -317,6 +373,7 @@ struct Index {
     }
     if (hid === 227 || hid === 231) { this.release(); return true; }
     if (cleanupTail) { return true; }
+    if (imeOwnsKeyProducer(this.ime.mode())) { return true; }
     if (down && !this.queuedKeys.allowsDown(event.keyCode)) {
       // 同码旧来源未完成真实Up清理时，新Down不能覆盖其来源账本。只在显式事件重试。
       if (!this.flushPendingKeyUps() || !this.queuedKeys.allowsDown(event.keyCode)) { return true; }
@@ -347,7 +404,7 @@ struct Index {
     this.timer = setInterval(() => {
       try {
         this.model = JSON.parse(native.appSnapshot()) as AppSnapshot;
-        this.syncIsland();
+        this.syncIsland(); this.observeIme();
         if (deviceInfo.deviceType === 'phone' && this.model.initialized) {
           // 只传公开生命周期；方向与窗口生命周期由 Ability owner 去重处理。
           this.getUIContext().getHostContext()?.eventHub.emit(PHONE_SESSION_ORIENTATION_EVENT, this.model.page, this.model.session ?? '');
@@ -361,10 +418,11 @@ struct Index {
     }, 100);
   }
   aboutToDisappear(): void {
-    clearInterval(this.timer); this.focusTicket++; this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release();
+    clearInterval(this.timer); this.surfaceHasFocus = false; this.focusTicket++; this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release();
     this.island.observe(0, '', false, this.now()); this.refreshIsland();
   }
   onBackPress(): boolean {
+    if (this.ime.mode()) { this.toggleKeyboard(); return true; }
     if (this.detailsOpen) { this.closeDetails(); this.refreshIsland(); return true; }
     if (this.islandExpanded && this.model.page === 3) { this.returnToSurface(); return true; }
     if (this.model.page === 1 || this.model.page === 2) { this.islandAction(1); return true; }
@@ -535,8 +593,8 @@ struct Index {
       .width('100%').height('100%').id('frdRemoteSurfaceFocus').focusable(true).accessibilityText('远程桌面')
       // 下发拦截只属于远程画面；注册到表单祖先会阻断原生TextInput，即使回调返回false。
       .onKeyEventDispatch((event: KeyEvent): boolean => this.dispatchKey(event))
-      .onAreaChange((_, area) => { this.release(); this.surfaceWidth = Math.round(this.getUIContext().vp2px(Number(area.width))); this.surfaceHeight = Math.round(this.getUIContext().vp2px(Number(area.height))); this.geometry(); })
-      .onFocus(() => { if (!this.keyboard.isLocal()) { this.focus(true); } }).onBlur(() => this.focus(false))
+      .onAreaChange((_, area) => this.surfaceAreaChanged(Number(area.width), Number(area.height)))
+      .onFocus(() => this.surfaceFocusChanged(true)).onBlur(() => this.surfaceFocusChanged(false))
       // 仅观察所有权，不生产第二份触摸/鼠标意图；native down/press 仍负责唯一远程 pointer。
       .onTouch((event: TouchEvent) => this.observeSurfaceTouch(event))
       .onMouse((event: MouseEvent) => { if (event.action === MouseAction.Press) { this.surfaceInteraction(); } })
@@ -582,14 +640,16 @@ struct Index {
   @Builder
   islandButton(glyph: string, action: number, enabled: boolean) {
     Button({ type: ButtonType.Normal }) {
-      if (this.iconsReady) {
+      if (action === 4) {
+        Text(this.imeLoading ? '连接中' : this.imeSelected ? '收键盘' : '键盘').fontSize(14).fontColor($r('app.color.text_primary')).accessibilityLevel('no')
+      } else if (this.iconsReady) {
         Text(glyph).fontFamily('frd-material-symbols-rounded').fontSize(24).fontColor($r('app.color.text_primary')).accessibilityLevel('no')
       } else {
         Text(action === 0 ? '详情' : action === 1 ? this.model.page === 3 ? '断开' : this.model.page === 5 ? '返回' : '取消' : action === 2 ? '收起' : '控制').fontSize(14).fontColor($r('app.color.text_primary')).accessibilityLevel('no')
       }
-    }.width(48).height(48).borderRadius(12).buttonStyle(ButtonStyleMode.TEXTUAL)
+    }.width(48).height(48).padding(0).borderRadius(12).buttonStyle(ButtonStyleMode.TEXTUAL)
       .id(action === 0 ? 'frdIslandDetails' : action === 3 ? 'frdIslandReveal' : `frdIslandAction${action}`)
-      .enabled(enabled).focusable(true).focusOnTouch(false).accessibilityText(this.actionLabel(action))
+      .enabled(enabled).focusable(true).focusOnTouch(false).accessibilityText(this.actionLabel(action)).accessibilitySelected(action === 4 && this.imeSelected)
       .onFocus(() => this.islandFocus(action, true)).onBlur(() => this.islandFocus(action, false))
       .onKeyEvent((event: KeyEvent) => { if (event.type === KeyType.Down) { this.pointerInput = false; this.islandFocus(action, true); } })
       .onHover((hovered: boolean) => this.islandHover(action, hovered))
@@ -604,6 +664,9 @@ struct Index {
       }
       Column({ space: 4 }) {
         if (this.islandExpanded) {
+          if (this.model.page === 3 && !this.model.ime?.protocolTextInput) {
+            Text('当前协议尚不支持系统输入法').fontSize(14).fontColor($r('app.color.text_primary')).padding(8).constraintSize({ maxWidth: 240 })
+          }
           if (this.model.page !== 3 || this.bridgeNotice.length > 0) {
             Text(this.bridgeNotice || this.status()).fontSize(14).fontColor($r('app.color.text_primary')).padding({ left: 8, right: 8, top: 4 })
               .constraintSize({ maxWidth: 240 }).accessibilityText(this.bridgeNotice || this.status())
@@ -611,8 +674,11 @@ struct Index {
           Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End, space: { main: LengthMetrics.vp(4), cross: LengthMetrics.vp(4) } }) {
             this.islandButton(this.statusGlyph(), 0, true)
             this.islandButton(this.model.page === 3 ? '\ue16f' : '\ue5cd', 1, this.model.page !== 4 && !this.actionBusy)
-            if (this.model.page === 3) { this.islandButton('\ue5cf', 2, true) }
-          }.constraintSize({ maxWidth: Math.max(48, Math.min(152, this.windowWidth - 40)) })
+            if (this.model.page === 3) {
+              this.islandButton('', 4, (this.model.ime?.installed ?? false) && (this.model.ime?.protocolTextInput ?? false))
+              this.islandButton('\ue5cf', 2, true)
+            }
+          }.constraintSize({ maxWidth: Math.max(48, Math.min(204, this.windowWidth - 40)) })
         } else {
           this.islandButton('\ue5d3', 3, true)
         }

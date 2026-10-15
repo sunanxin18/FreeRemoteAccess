@@ -26,11 +26,11 @@ def materials(recipe="upstream"):
 def raw_files(recipe="upstream"):
     return {RAW_PREFIX + name for name in materials(recipe)}
 # 逐项来自桥/Rust现有实际链接的公开 NDK 库；新依赖必须单独审核。
-PUBLIC = {'libc.so', 'libace_napi.z.so', 'libace_ndk.z.so', 'libnative_window.so',
+PUBLIC = {'libicu.so', 'libc.so', 'libace_napi.z.so', 'libace_ndk.z.so', 'libnative_window.so',
           'libhilog_ndk.z.so', 'libhuks_ndk.z.so', 'libohcrypto.so', 'libability_runtime.so'}
 BASE_DEPS = {
     'libentry.so': {'libfrd_shell_ohos_ffi.so', 'libace_napi.z.so', 'libace_ndk.z.so',
-                    'libnative_window.so', 'libhilog_ndk.z.so', 'libc++_shared.so', 'libc.so'},
+                    'libnative_window.so', 'libhilog_ndk.z.so', 'libc++_shared.so', 'libc.so', 'libicu.so'},
     'libfrd_shell_ohos_ffi.so': {'libhilog_ndk.z.so', 'libnative_window.so', 'libhuks_ndk.z.so', 'libohcrypto.so', 'libc.so'},
     'libc++_shared.so': {'libc.so'},
 }

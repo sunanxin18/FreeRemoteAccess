@@ -168,6 +168,19 @@ fn c_abi_normal_create_keeps_form_idle_and_exact_protocol_selection() {
         assert_eq!(value["physicalKeyInput"], false, "表单没有协议输入能力");
         assert_eq!(value["textInput"], false);
         assert_eq!(
+            value["ime"]["installed"],
+            cfg!(all(target_env = "ohos", target_arch = "aarch64"))
+        );
+        assert_eq!(
+            value["ime"]["state"],
+            if cfg!(all(target_env = "ohos", target_arch = "aarch64")) {
+                "detached"
+            } else {
+                "unavailable"
+            }
+        );
+        assert_eq!(value["ime"]["ticket"], serde_json::Value::Null);
+        assert_eq!(
             value["keyboardBackend"],
             if cfg!(all(target_env = "ohos", target_arch = "aarch64")) {
                 "arkui_limited"
@@ -185,4 +198,10 @@ fn c_abi_normal_create_keeps_form_idle_and_exact_protocol_selection() {
     assert_eq!(value["statusCode"], "connection_form");
     assert_eq!(value["address"], "example.invalid");
     assert_eq!(value["session"], "");
+}
+
+#[test]
+fn system_ime_installation_requires_explicit_ohos_arm64_composition() {
+    assert_eq!(ime_for_platform(true).name(), "system_ime_v1");
+    assert_eq!(ime_for_platform(false).name(), "unavailable");
 }

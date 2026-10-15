@@ -42,6 +42,21 @@ class AppleMvsContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '依赖合同'):
                 checker.check_native_dependencies(name, checker.BASE_DEPS[name] | {'libz.so'}, True, True)
 
+    def test_system_icu_required_only_for_entry_and_private_icu_rejected(self):
+        self.assertIn('libicu.so', checker.BASE_DEPS['libentry.so'])
+        self.assertIn('libicu.so', checker.PUBLIC)
+        for library in checker.BASE_DEPS:
+            expected = checker.BASE_DEPS[library]
+            checker.check_native_dependencies(library, expected)
+            for dependency in ('libicui18n.so', 'libicuuc.so', 'libicudata.so'):
+                with self.subTest(library=library, dependency=dependency), self.assertRaisesRegex(ValueError, '依赖合同'):
+                    checker.check_native_dependencies(library, expected | {dependency})
+            if library != 'libentry.so':
+                with self.subTest(library=library), self.assertRaisesRegex(ValueError, '依赖合同'):
+                    checker.check_native_dependencies(library, expected | {'libicu.so'})
+        with self.assertRaisesRegex(ValueError, '依赖合同'):
+            checker.check_native_dependencies('libentry.so', checker.BASE_DEPS['libentry.so'] - {'libicu.so'})
+
     def test_fdk_materials_are_required_exact_bytes(self):
         data = checker.fdk_materials()
         checker.check_fdk_materials(data, True)
@@ -60,7 +75,8 @@ class HapMutations(unittest.TestCase):
         cls.digest = os.environ['FRD_OHOS_FFMPEG_TEST_MANIFEST_SHA256']
         cls.recipe = checker.ffmpeg.recipes.identify(checker.ffmpeg.read_json(cls.bundle / 'manifest.json'))
         cls.readelf = Path(os.environ.get('FRD_HAP_TEST_READELF', checker.ffmpeg.DEFAULT_SDK + '/native/llvm/bin/llvm-readelf'))
-        checker.check(cls.good, cls.readelf, cls.bundle, cls.digest)
+        cls.flags = dict(apple_mvs=os.environ.get('FRD_HAP_TEST_APPLE_MVS') == '1', rdp_validation=os.environ.get('FRD_HAP_TEST_RDP') == '1')
+        checker.check(cls.good, cls.readelf, cls.bundle, cls.digest, **cls.flags)
         with zipfile.ZipFile(cls.good) as package:
             cls.original = [(info, package.read(info)) for info in package.infolist()]
 
@@ -86,7 +102,7 @@ class HapMutations(unittest.TestCase):
     def rejected(self, message):
         self.write()
         with self.assertRaisesRegex(ValueError, message):
-            checker.check(self.path, self.readelf, self.bundle, self.digest)
+            checker.check(self.path, self.readelf, self.bundle, self.digest, **self.flags)
 
     def mutate_elf(self, name, callback):
         name = checker.NATIVE_PREFIX + name
@@ -95,7 +111,7 @@ class HapMutations(unittest.TestCase):
         self.data[name] = data
 
     def test_valid_exact_six_and_license(self):
-        result = checker.check(self.good, self.readelf, self.bundle, self.digest)
+        result = checker.check(self.good, self.readelf, self.bundle, self.digest, **self.flags)
         self.assertEqual(len(result['nativeSha256']), 6)
 
     def test_duplicate_native(self):
@@ -176,6 +192,34 @@ class HapMutations(unittest.TestCase):
         self.mutate_elf(checker.ffmpeg.LIBS[0], change)
         self.rejected('未批准依赖')
 
+    def test_public_icu_on_wrong_library_is_rejected(self):
+        def change(data):
+            original = b'libohcrypto.so\0'
+            position = data.index(original)
+            data[position:position + len(original)] = b'libicu.so\0'.ljust(len(original), b'\0')
+        self.mutate_elf('libfrd_shell_ohos_ffi.so', change)
+        self.rejected('依赖合同')
+
+    def test_entry_private_icu_is_rejected(self):
+        def change(data):
+            original = b'libace_napi.z.so\0'
+            position = data.index(original)
+            data[position:position + len(original)] = b'libicui18n.so\0'.ljust(len(original), b'\0')
+        self.mutate_elf('libentry.so', change)
+        self.rejected('未批准依赖')
+
+    def test_entry_public_icu_cannot_be_replaced_by_duplicate_dependency(self):
+        def change(data):
+            original = b'libicu.so\0'
+            position = data.index(original)
+            data[position:position + len(original)] = b'libc.so\0'.ljust(len(original), b'\0')
+        self.mutate_elf('libentry.so', change)
+        self.rejected('重复 SONAME/DT_NEEDED')
+
+    def test_bundled_icu_is_rejected(self):
+        self.extra.append((checker.NATIVE_PREFIX + 'libicu.so', self.data[checker.NATIVE_PREFIX + 'libentry.so']))
+        self.rejected('未批准 native')
+
     def test_missing_license(self):
         del self.data[checker.RAW_PREFIX + 'FFmpeg-LGPL-2.1-or-later.txt']
         self.rejected('来源/许可')
@@ -213,7 +257,7 @@ class HapMutations(unittest.TestCase):
 
     def test_manifest_anchor_mismatch(self):
         with self.assertRaisesRegex(ValueError, '接收的 manifest'):
-            checker.check(self.good, self.readelf, self.bundle, '0' * 64)
+            checker.check(self.good, self.readelf, self.bundle, '0' * 64, **self.flags)
 
     def test_signature_metadata_container_change_allowed(self):
         self.extra.append(('META-INF/controlled-signature', b'test-only signature metadata'))

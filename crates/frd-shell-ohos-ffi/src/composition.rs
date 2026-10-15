@@ -43,8 +43,15 @@ fn video_loader() -> StreamRegistryLoader {
         ))
     })
 }
+fn ime_for_platform(ohos_arm64: bool) -> crate::ime_policy::Installation {
+    if ohos_arm64 {
+        crate::ime_policy::Installation::SystemImeV1
+    } else {
+        crate::ime_policy::Installation::Unavailable
+    }
+}
 pub(crate) fn spawn(root: PathBuf) -> Result<AppEngine, i32> {
-    AppEngine::spawn_with_keyboard(
+    AppEngine::spawn_with_input(
         Stores::at(root),
         factories_for_platform(cfg!(all(target_env = "ohos", target_arch = "aarch64"))),
         video_loader(),
@@ -54,6 +61,7 @@ pub(crate) fn spawn(root: PathBuf) -> Result<AppEngine, i32> {
         } else {
             crate::keyboard_policy::OhosKeyboardQualification::Unavailable
         },
+        ime_for_platform(cfg!(all(target_env = "ohos", target_arch = "aarch64"))),
     )
 }
 #[cfg(test)]

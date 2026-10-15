@@ -28,13 +28,14 @@ function visit(node) { if (ts.isMethodDeclaration(node)) methods.set(node.name.g
 visit(ast);
 const sent = [];
 const native = { appInput: (...args) => { sent.push(args); return 0; } };
+const imePolicy = compile(fs.readFileSync(path.resolve(__dirname, '../main/ets/common/RemoteImePolicy.ets'), 'utf8'));
 const extracted = ['dispatchKey', 'syncQueuedKeyEpoch', 'flushPendingKeyUps'].map(name => methods.get(name).getText(ast)).join('\n');
 const { Harness } = compile(`class Harness { ${extracted} }\nexports.Harness = Harness;`,
-  { native, ...mapping, KeyType: { Down: 0, Up: 1 }, IslandInput: { Keyboard: 2 } });
+  { native, imeOwnsKeyProducer: imePolicy.imeOwnsKeyProducer, ...mapping, KeyType: { Down: 0, Up: 1 }, IslandInput: { Keyboard: 2 } });
 function harness() {
   const h = new Harness();
   Object.assign(h, { model: { page: 3, session: '101', generation: '1', geometryRevision: '2' },
-    keyboard: new policy.ShellKeyboardOwnership(), queuedKeys: new policy.QueuedRemoteKeys(), shellActive: true,
+    ime: { mode: () => false }, keyboard: new policy.ShellKeyboardOwnership(), queuedKeys: new policy.QueuedRemoteKeys(), shellActive: true,
     remoteFocused: true, detailsOpen: false, check() {}, localOwnership() { this.keyboard.enterLocal(); },
     release() { this.releases = (this.releases || 0) + 1; }, revealIsland() { this.keyboard.enterLocal(); }, focusIslandAfterLayout() {} });
   h.keyboard.enterRemote(); return h;

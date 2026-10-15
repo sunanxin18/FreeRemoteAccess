@@ -111,3 +111,12 @@ Mac目标使用带持久标签“连接模式”的正常选择控件，明确�
 文字/控制键没有本地指针坐标，因此同窗口、同焦点及同远端代际的短暂几何重建可使用有界FIFO等待新画面实际呈现，再经当前InputAdapter/revision发送。真正失焦、后台、来源撤销、窗口变化、协议文字能力丢失或会话失效会清空等待并撤销来源。不能在普通geometry release里撤销输入法；现有ArkUI尺寸回调中的focus(false)仍需在正式系统键盘接线时分离，不能仅由原生等待队列宣称键盘resize已经可用。
 
 先实现并验证Owner桥，再串行加入本地有界UTF-16预编辑、系统InputMethodController及浮动岛正式“键盘”动作。实际OHOS组合根在前端实现前继续保持输入法未安装；构建或主机consumer通过不等于系统附着、真实英文/中文/emoji、候选、软键盘布局或PC/手机运行资格。没有额外编辑器及手动发送流程。预编辑/finish依据[官方输入法合同](https://github.com/openharmony/docs/blob/f41b9345badd47c7ab0c263344cd7f4b5a549afb/zh-cn/application-dev/reference/apis-ime-kit/js-apis-inputmethodengine.md#finishtextpreview12)：有效finish保留最终预编辑，两个相同文字的合法提交必须分别保留，不用字符串或定时器去重。局部字素移动/删除优先采用[公开NDK ICU4C](https://github.com/openharmony/docs/blob/f41b9345badd47c7ab0c263344cd7f4b5a549afb/zh-cn/application-dev/reference/native-lib/icu4c.md)，其新增依赖与目标运行另行验证，不从SDK头文件存在推定实际运行成功。
+
+
+### 系统IME前端源码接线后的资格边界（2026-10-15）
+
+正式前端已使用有界本地预编辑、InputMethodController和浮动岛键盘动作；实际OHOS ARM64组合根显式安装SystemImeV1，host/其它目标默认不可用保持。节点真实focus事件记录与窗口前后台、远端session及native输入授权分开：窗口/会话边界撤销来源，前台不自动恢复；仍存活且未blur的节点记录只用于用户新的显式打开，真实blur、节点移除和销毁清记录。短暂geometry变化不假造blur。
+
+SDK附着和清理均串行。未实际开始的来源不detach系统编辑器；部分订阅只清自身已尝试回调。已settle且完整清理的普通附着失败可由用户重试；未知状态的附着/清理超时封闭当前进程系统IME并提示重新打开应用，实体键与断开继续可用。来源确认、queued/accepted/dispatched均是本地阶段，不是远端应用ACK。
+
+公开ICU的系统库/数据与应用运行时资格独立记录：实际独立CLI样本返回资源缺失，不由头文件或链接成功推定可用；官方Ark初始化机制只构成普通应用与CLI可能不同的源码依据。后续需在正常HAP/NAPI上下文验证同一helper/固定expected，再做真实系统输入法验收；不加入私有初始化、内部库/数据路径或系统配置，也不恢复开发验证界面。见[实现与失败记录](../validation/harmony-system-ime-20261015.md)。

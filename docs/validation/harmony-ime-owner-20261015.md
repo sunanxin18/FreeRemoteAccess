@@ -31,3 +31,15 @@ JSON v1严格校验版本、已知字段、字段类型、安全整数、规范�
 正常客户端将使用本地有界UTF-16预编辑与系统InputMethodController实时提交。有效finish保留最终预编辑；`P→I→F`与`P→F→I`按[官方输入法合同](https://github.com/openharmony/docs/blob/f41b9345badd47c7ab0c263344cd7f4b5a549afb/zh-cn/application-dev/reference/apis-ime-kit/js-apis-inputmethodengine.md#finishtextpreview12)分别处理，不使用内容/定时器去重。局部字素删除/移动优先复用[公开NDK ICU4C](https://github.com/openharmony/docs/blob/f41b9345badd47c7ab0c263344cd7f4b5a549afb/zh-cn/application-dev/reference/native-lib/icu4c.md)，不假造远端全文。
 
 现有Index的尺寸变化回调会调用focus(false)，必须在系统键盘接线时与真正blur分开；原生pending测试不能代替这项前端修复。手机与PC需分别验证真实focus/attach、候选/提交、退格/Enter/emoji、物理键单一来源、键盘resize、后台、断连和重连。PC当前由用户填写表单，本步骤未操作其界面、安装包或连接状态；也没有手机/PC输入法运行结论。
+
+## 已交付提交与跨平台 CI
+
+来源桥源码及上述记录由 `9c1466b70bc2c48f8a5866ec322953ffe469e72d` 交付，后续文档提交 `9fffe333a29c64d8aa2f061051e71231c1057eb1` 已推送到 `codex/rdp-egfx-hevc-preference`。以下远端结果严格对应后一个完整SHA，不覆盖正在开发的系统IME前端。
+
+截至2026-10-15 11:50 UTC，[常规CI](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38728292713)成功（格式、macOS和Ubuntu编译/安全测试）；[Linux GTK适配器](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38728292610)三架构成功；[macOS ARM64包](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38728292521)成功。[Linux客户端及FFmpeg包](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38728292596)的i686、ARM64成功，x86_64仍在运行；[Windows包](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38728292636)三架构任务仍在运行。原始任务元数据保存于 `target/harmony-ime-owner-20261015/ci-followup-2.json`；没有重启既有任务，也没有把尚在运行的任务记为通过。
+
+
+最终12:11:11 UTC，[Windows原始任务](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38728292636)成功结束：x86/x64/ARM64包和Windows ARM64原生解码运行四项全部成功。Linux客户端三架构包也全部成功，任务于11:50:18 UTC结束。至此本次实际触发并观察到的五个workflow均成功，精确头提交仍为 `9fffe333a29c64d8aa2f061051e71231c1057eb1`；结果保存于 `target/harmony-ime-owner-20261015/ci-followup-6.json`。未将未触发的GL workflow或正在开发的IME前端算入这五项结果。
+
+
+后续正常IME前端源码已接入实际OHOS ARM64组合根，当前状态与新资格边界见[系统输入法记录](harmony-system-ime-20261015.md)。本文前述IMEUnavailable描述属于9c1466b来源桥单独交付时的状态；普通HAP/NAPI和手机/PC真实输入仍未由来源桥或后续构建证明。

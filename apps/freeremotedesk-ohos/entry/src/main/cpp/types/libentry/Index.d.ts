@@ -30,3 +30,6 @@ export const appGeometry: (width: number, height: number, contentWidth: number, 
 export const appInput: (session: string, generation: string, revision: string, kind: number, flags: number, x: number, y: number, hid: number, modifiers: number, wheelX: number, wheelY: number) => number;
 export const commitText: (session: string, generation: string, revision: string, utf8: string) => number;
 export const huksProbe: () => number;
+
+export interface ImeGraphemeNeighbors { isBoundary: boolean; previous: number; next: number; }
+export const imeGraphemeNeighbors: (text: string, cursor: number) => ImeGraphemeNeighbors;
