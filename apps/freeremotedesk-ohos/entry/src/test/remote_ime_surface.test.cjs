@@ -7,7 +7,7 @@ function transpile(text,scope={}){const r=ts.transpileModule(text,{fileName:'con
 const policy=transpile(fs.readFileSync(path.resolve(__dirname,'../main/ets/common/RemoteImePolicy.ets'),'utf8'));
 const island=transpile(fs.readFileSync(path.resolve(__dirname,'../main/ets/common/SessionIslandPolicy.ets'),'utf8'));
 const mapping=transpile(fs.readFileSync(path.resolve(__dirname,'../main/ets/pages/InputMapping.ets'),'utf8'));
-const names=['geometry','release','focus','localOwnership','syncQueuedKeyEpoch','flushPendingKeyUps','dispatchKey','islandAction','surfaceFocusChanged','observeIme','toggleKeyboard','surfaceAreaChanged'];
+const names=['geometry','release','focus','localOwnership','syncQueuedKeyEpoch','flushPendingKeyUps','dispatchKey','islandAction','surfaceFocusChanged','observeIme','toggleKeyboard','surfaceAreaChanged','setImeNotice','clearImeNotice'];
 let count=0;function test(n,f){f();count++;console.log('PASS '+n);}
 test('formal keyboard action and actual surface lifecycle methods exist',()=>{for(const n of names)assert.ok(methods.has(n),'normal Index integration missing '+n);assert.ok(calls.some(c=>owner(c)==='sessionIsland'&&c.expression.name.text==='islandButton'&&c.arguments[1]?.getText(ast)==='4'));});
 const events=[];const native={appFocus:(...a)=>{events.push(['focus',...a]);return native.focusCode||0;},appGeometry:(...a)=>{events.push(['geometry',...a]);return 0;},appInput:(...a)=>{events.push(['input',...a]);return 0;}};

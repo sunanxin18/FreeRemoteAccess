@@ -88,3 +88,61 @@ Task5C2R仅在既有`active_session.rs`测试模块追加310行，生产前缀�
 固定`A中😀`、两个相同独立提交、空串和NUL/Tab/CR/LF保持预期Unicode字节；长ASCII/CJK/emoji及127ASCII+emoji四命令FIFO分别129/43/65/2PDU，255事件满包769字节，所有码元顺序、声明长度、pending排空及空stop无额外释放均验证。另一session及不匹配generation被拒；该负例实际generation2、当前1，不称为“旧generation”，作者冻结报告原措辞作为非阻塞Minor保留并在此澄清。
 
 Rust1.96 macOS ARM64离线聚焦3项、完整RDP362项通过，11项既有ignored未启用；限定格式及root Git diff检查通过。最初新增夹具导入SessionInput错误E0603保留，修正后通过，无生产缺陷修复。冻结源码SHA256 `49592625f89d8d7fb25347a9ab34b0cc7192300c65efaf625637f4bb2a5e6857`，证据在`target/harmony-rdp-text-wire-20261015/`；root与独立reviewer分别核19项artifact、真实base及原源码字节重建。这只增加宿主序列化/writer层证据，不证明HAP/native、真实socket、系统IME、服务端Unicode能力或Windows应用文字结果。
+
+
+## Ability几何生命周期与阶段诊断（Fix1复审通过）
+
+Task5C2P1候选只改鸿蒙三个ETS源和三个测试文件。EntryAbility的键盘避让/窗口尺寸通知不再伪造失焦，捕获真实窗口/stage拒绝旧窗口通知；实际窗口失活、后台、销毁和XComponent blur仍撤销来源。现有native drawable尺寸不匹配拒绝、Index onAreaChange→Owner set_geometry释放held/revision通路保持，不从几何通知或轮询伪造focus=true。实际Ability→Index→adapter消费者分别保存avoid/size/旧窗口RED，再转GREEN；原生endpoint是已读合同模型，不声称本轮执行了Rust/native输入。
+
+内部`FrdIme`专用tag每个显式request有界记录状态跃迁和首终态，区分焦点/来源门、controller、14项订阅、SDK attach、C source、Owner exact ticket、selection及关闭。仅固定数值、门位/状态位、比较boolean和经过signed32安全整数检查的SDK.code；不记异常正文/stack、输入正文或长度、完整snapshot/ticket/context、账号/地址或凭据。诊断callback错误隔离，不改变输入或释放SDK串行链；重复poll和正常日常selection不刷日志。新请求/断开只清属于IME的旧notice，保持无关持久错误。
+
+首轮十套ETS121项通过。最终订阅错误处理由throw改为显式boolean后，adapter26、surface13、lifecycle7重新通过，另75项使用同轮未变路径记录。首个正式build1成功但新增SDK may-throw警告；build2直接重抛和build3 BusinessError cast均被官方ArkTS limited-throw规则拒绝（exit255），失败日志和实际/重建源码身份明确保留。最终boolean冻结安全code/index、禁止继续attach，build4及独立精确双normal checker均exit0，没有新增ArkTS警告；四项既有Rust及材料/签名配置警告仍保留。
+
+冻结20源清单SHA256 `d08508bfd525bb2a2aabe8d51dccd43b1e6aec22cce87429e4b0c55fbee1c23c`；六文件差异为`55fc979cf14a556899f6c8bc2d214b6ad5de4a3cf449866b5a8fc84e7c13b982`。最终unsigned HAP `35bb471874e101473575fd5ea71f1cede1e392b4eb1d98ff7bfb7a5b31aa69c6`与旧正式a92d包31条目同名同序，仅modules.abc变化，其他30项解压字节相同，包括17263992-byte FFI `221cc401…`。未strip FFI源文件6fc→752改变，原因未证明；不能把可能的非运行元数据因素写成已证根因，也没有用旧库替换包。
+
+首次冻结后Root核对20源、149项证据、完整报告、三份生产源diff和实际HAP，并提交独立Spec/Quality审查；初审结果见下文。该候选尚未签装，手机保留旧正式包断开的普通表单，PC按用户要求未观察或操作。即使此几何缺陷修正通过审查，也不能据此认定已解释上一轮真实generic失败或已完成系统IME/Windows文字验收。证据分别在`target/harmony-ime-lifecycle-20261015/`和root独立核对目录`target/harmony-ime-lifecycle-root-20261015/`。
+
+
+## 已提交源码的桌面CI回归（独立于当前未提交候选）
+
+`18cc0be`最初实际触发的四个workflow现均成功：通用CI `38736701759`（12:51:13UTC）、macOS ARM64 `38736701691`（13:00:37UTC）、Linux三架构客户端/FFmpeg包 `38736701629`（12:59:40UTC）、Windows包 `38736701536`（13:21:56UTC）。没有重启失败run，不把该head未触发的GTK/GL记为通过。原始最终metadata分别在`target/harmony-system-ime-20261015/ci-followup-{2,4,6}.json`。
+
+后续tests-only提交`2f0c85b`的通用CI `38739750012`、GTK `38739750047`、macOS ARM64 `38739750096`、Linux客户端/FFmpeg `38739749975`已成功，Windows `38739750036`仍运行（最后观察13:25UTC）。该状态不用于替代当前Task5C2P1候选的独立审查或目标验收，也未将任何构建当作真实输入法互操作证明。
+
+
+### 首次独立审查：SDK操作诊断归属缺口
+
+初审为Spec FAIL / Quality NEEDS_FIX，一项Important I1：A的attach尚未settle时，同adapter显式请求B，A原watchdog会读取当前B的attachment/attempt，把未知的A attach误记为B的stage11 cleanup timeout。reviewer对冻结源码作纯内存确定调度反例，实际attachCalls=1、detachCalls=0即得到上述错误终态；旧Promise后续resolve仍保留SDK串行、来源隔离与清理，没有因此放宽输入。相关observe分支也会只凭全局sdkBusy把旧cleanup误当当前attach超时，同属本缺口。
+
+该诊断直接服务下一轮手机根因定位，必须修正，不能因为输入安全仍有效而忽略。root已完整阅读审查并接受finding，原六源/报告/审查/清单/差异/HAP精确归档review-fix1-base。原作者进入Fix1，只修改adapter及其回归，固定未知SDK操作种类和归属、区分当前timeout与受先前singleton poison，保持firstterminal及全局fail-closed。当前未签装候选，原手机generic根因仍未定位，修正后需同一reviewer复审和正式构建，再目标实测。
+
+
+### Fix1：固定SDK操作归属，复审通过
+
+Fix1仅改变adapter及其测试，另外18条冻结路径和原149项证据保持。未知SDK操作保存原owner、attempt和attach/cleanup种类，cleanup归属在入队前捕获；旧操作封闭等待中的新请求记为process poison（stage1/outcome8），本请求自己的attach超时仍为stage5/outcome6。原始Promise仍串行await，全局fail-closed和旧firstterminal保持。
+
+五条确定RED覆盖旧attach、运行中的旧detach、B建立后才开始的A cleanup，以及同/跨adapter的旧busy deadline；六组最终交错转GREEN，adapter32、surface13、lifecycle7再通过。初次descriptor的主机AST语法错误保留，修正后官方Release BOTH及精确checker均exit0，无新增ArkTS警告。Root核20源、旧149/新59项证据、完整追加报告和原12907-byte前缀保持；仅两源变化，完整delta已交原reviewer scoped复审。
+
+Fix1清单SHA256 `d8bee56388f1ba23af1b98f349e2e9b2835cb4f6620fc55d9a1eb69a923f7e77`；新unsigned HAP `d11e3ec6835ee2e1d77f7dd806d4ffca2c4cceba20e67f69ac1b88b6fffbaef6`，相对35bb仍仅modules.abc变化，其余30payload字节相同，FFI运行与未strip产物各自保持。当前未签装，不能把作者回归GREEN视为独立review关闭I1，更不等于手机系统IME通过。Fix1证据位于`target/harmony-ime-lifecycle-20261015/fix1/`。
+
+
+同一独立reviewer已完成scoped复审：I1 ADDRESSED / Spec PASS / Quality APPROVE，无新增Critical/Important；原审查11663-byte前缀保持，完整报告SHA256 `cc229f58a527aa1c20666c30d99b02a8ad81baa2ac01f1c917ca520ebef048cf`。root完整读取复审，确认源码/宿主consumer/HAP子步骤可进入签验与手机实测。实际手机generic根因和系统IME仍待新的目标阶段日志，不由复审结论推定成功。
+
+
+## Fix1签装与手机实际失败阶段
+
+复审后root以既有SDK调试身份签名、官方验签及双normal精确checker均exit0。signed HAP `2e3387388fac9d22c967b53cf6ee4efd7f35d0e1bb9b1d43fb633a3c64ebd8d0`保留unsigned d11e全部31payload解压字节，仅签名器新增.pages.info。手机PID从5758变为20556，安装前及新进程尚未请求IME时FrdIme日志均为空；PC没有观察或操作。
+
+普通最近连接实际显示HUKS密码载入，21:43:05正在连接、21:43:08进入2760×1256全屏桌面，21:43:36截图确认真实Windows桌面。随后同一脚本读取当前浮动岛入口/展开/键盘ID并即时点击，没有用过期ID或手工发送页面。21:43:43仍提示输入法暂不可用，本进程本attempt的数值日志明确为：
+
+```text
+1792071821.288 PID20556 attempt=1 stage=1 outcome=0 gates=0 progress=0
+1792071821.288 PID20556 attempt=1 stage=2 outcome=1 gates=639 progress=0
+1792071823.364 PID20556 attempt=1 stage=2 outcome=6 gates=895 progress=0
+```
+
+原完整固定字段日志与strict解析结果保存在`target/harmony-ime-lifecycle-root-20261015/device/ime-first-numeric-log.json`及`ime-first-verdict.json`。gates895包含前台、page3、installed、协议text、合法window/stage、session/generation、context和Owner sourceAvailable，唯一缺少128的前端focused聚合位；progress0、没有stage3/4/5，说明尚未调用controller/订阅/attach。该次失败停在前端焦点门，不能再归因于ICU或SDK attach拒绝。
+
+当前Index的surfaceHasFocus默认false，唯一路径由XComponent ArkTS onFocus置true；但该XComponent配置了libraryname=entry。[官方XComponent事件说明](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-arkui/arkui-ts/ts-basic-components-xcomponent.md#事件)明确该配置的焦点、按键、触摸等事件只响应C API。现有原生Focus/Blur已注册，却没有把真实焦点证据交回Index；这是与上述日志一致的接线缺陷。后续需用绑定实际surface/代际的原生焦点证据修正，不能设定焦点恒true或跳过门。按键等其它被抑制的ArkTS事件也需独立跟踪，不能由本次诊断授予物理键/多点资格。
+
+21:49:26使用当前浮动岛正常断开，21:49:28回普通表单且旧IME提示已消失，符合本轮notice清理行为。手机保留该正式包和原应用数据；真实系统键盘、候选与远端文字继续未通过。此处定位的是本次SDK调用前的阻塞点，后续SDK阶段尚未执行，不推定其一定成功。

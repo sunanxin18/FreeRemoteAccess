@@ -1,6 +1,7 @@
 import native from 'libentry.so';
 import { inputMethod } from '@kit.IMEKit';
-import { RemoteImeAdapter, ImeSnapshot } from '../common/RemoteImeAdapter';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+import { RemoteImeAdapter, ImeSnapshot, ImeDiagnostic } from '../common/RemoteImeAdapter';
 import { imeOwnsKeyProducer } from '../common/RemoteImePolicy';
 import { KeyboardAvoidMode, LengthMetrics } from '@kit.ArkUI';
 import { deviceInfo, systemDateTime } from '@kit.BasicServicesKit';
@@ -53,12 +54,18 @@ struct Index {
   @State private actionBusy: boolean = false;
   @State private imeSelected: boolean = false;
   @State private imeLoading: boolean = false;
+  private imeNotice: string = '';
   private surfaceHasFocus: boolean = false;
   private imeCloseIntent: boolean = false;
   private ime: RemoteImeAdapter = new RemoteImeAdapter(() => inputMethod.getController(),
     { source: (json: string): number => native.appImeSource(json), operation: (json: string): number => native.appImeOperation(json) },
     (text: string, cursor: number) => native.imeGraphemeNeighbors(text, cursor),
-    (message: string): void => { this.bridgeNotice = message; });
+    (message: string): void => { this.setImeNotice(message); },
+    (event: ImeDiagnostic): void => {
+      hilog.info(0xFF00, 'FrdIme', 'attempt=%{public}d stage=%{public}d outcome=%{public}d code=%{public}d subscription=%{public}d gates=%{public}d progress=%{public}d owner=%{public}d exact=%{public}d',
+        event.attempt, event.stage, event.outcome, event.code, event.subscriptionIndex, event.gateMask,
+        event.progressMask, event.ownerState, event.ticketEqual ? 1 : 0);
+    });
   private actionPage: number = 0;
   private island: SessionIslandPolicy = new SessionIslandPolicy();
   private keyboard: ShellKeyboardOwnership = new ShellKeyboardOwnership();
@@ -92,6 +99,14 @@ struct Index {
   private panStartX: number = 0;
   private panStartY: number = 0;
   private remoteFocused: boolean = false;
+  private setImeNotice(message: string): void {
+    if (this.model.page !== 3) { return; }
+    this.imeNotice = message; this.bridgeNotice = message;
+  }
+  private clearImeNotice(): void {
+    if (this.bridgeNotice === this.imeNotice) { this.bridgeNotice = ''; }
+    this.imeNotice = '';
+  }
   private check(code: number): void {
     if (code !== 0) { this.bridgeNotice = code === -11 ? '操作队列暂满，请稍后重试' : '当前操作不可用，请重试'; }
   }
@@ -131,7 +146,7 @@ struct Index {
     catch { this.bridgeNotice = '系统计时不可用，请使用会话控制'; return 0; }
   }
   private focus(value: boolean): void {
-    if (!value) { this.release(); return; }
+    if (!value) { this.release(1); return; }
     if (this.queuedKeys.hasPending()) { this.keyboard.enterLocal(); this.remoteFocused = false; return; }
     this.remoteFocused = this.shellActive && !this.detailsOpen;
     const code = native.appFocus(this.shellActive, this.remoteFocused, this.remoteFocused);
@@ -155,12 +170,13 @@ struct Index {
   }
   private toggleKeyboard(): void {
     const close = this.ime.mode() || this.imeCloseIntent;
+    if (!close) { this.clearImeNotice(); }
     const released = this.localOwnership(); this.imeCloseIntent = false;
     this.imeSelected = false; this.imeLoading = false;
     if (!released) { return; }
     if (close) { this.returnToSurface(); return; }
     if (this.model.page !== 3 || !this.model.ime?.installed || !this.model.ime.protocolTextInput) {
-      this.bridgeNotice = '当前协议尚不支持系统输入法'; return;
+      this.setImeNotice('当前协议尚不支持系统输入法'); return;
     }
     this.closeDetails(); this.collapseIsland();
     this.ime.request(this.getUIContext(), deviceInfo.deviceType === 'phone', this.now());
@@ -168,13 +184,13 @@ struct Index {
     this.keyboard.enterRemote();
     if (this.surfaceHasFocus) { this.focus(true); }
     try { this.getUIContext().getFocusController().requestFocus('frdRemoteSurfaceFocus'); }
-    catch { this.ime.close(); this.imeSelected = false; this.imeLoading = false; this.bridgeNotice = '无法聚焦远程画面，请点击画面后重试'; }
+    catch { this.ime.close(); this.imeSelected = false; this.imeLoading = false; this.setImeNotice('无法聚焦远程画面，请点击画面后重试'); }
     this.observeIme();
   }
-  private release(): boolean {
+  private release(reason: number = 0): boolean {
     // 保存用户动作前的关闭意图：按钮取得真实焦点会先使 surface blur。
     if (this.ime.mode()) { this.imeCloseIntent = true; }
-    this.ime.close(); this.imeSelected = false; this.imeLoading = false;
+    this.ime.close(reason); this.imeSelected = false; this.imeLoading = false;
     this.remoteFocused = false; this.queuedKeys.isolate();
     const code = native.appFocus(this.shellActive, false, false);
     this.check(code);
@@ -218,6 +234,7 @@ struct Index {
   }
   private syncIsland(): void {
     this.syncQueuedKeyEpoch();
+    if (this.model.page !== 3) { this.clearImeNotice(); }
     // 只记录 ArkUI 节点的真实焦点；窗口前后台/浮岛 epoch 另行撤销输入授权。
     if (this.model.page === 0) { this.surfaceHasFocus = false; }
     if (this.model.page !== this.actionPage) { this.actionBusy = false; this.actionPage = this.model.page; }
@@ -225,7 +242,7 @@ struct Index {
     this.island.observe(this.model.page, this.model.session ?? '', this.shellActive, this.now());
     if (before !== this.island.epoch()) {
       this.focusTicket++; this.closeDetails();
-      this.ime.close(); this.imeSelected = false; this.imeLoading = false; this.imeCloseIntent = false;
+      this.ime.close(3); this.imeSelected = false; this.imeLoading = false; this.imeCloseIntent = false;
       this.tooltipText = ''; this.focusedAction = -1; this.hoveredAction = -1; this.islandHovered = false;
       this.pointerInput = false; this.keyboard.reset(); this.surfaceTouch.reset(); this.remoteFocused = false;
     }
@@ -234,7 +251,7 @@ struct Index {
     this.refreshIsland();
   }
   private shellActivityChanged(): void {
-    if (!this.shellActive) { this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release(); }
+    if (!this.shellActive) { this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release(2); }
     this.syncIsland();
   }
   private refreshIsland(): void {
@@ -306,6 +323,7 @@ struct Index {
     else if (action === 2) { this.collapseIsland(); }
     else if (action === 0) { this.details(); }
     else if (!this.actionBusy && (this.model.page === 1 || this.model.page === 2 || this.model.page === 3 || this.model.page === 5)) {
+      this.clearImeNotice();
       this.actionBusy = true; this.actionPage = this.model.page;
       const code = native.appAction(this.model.page === 5 ? 3 : 2, '0', 0, 0);
       this.check(code); if (code !== 0) { this.actionBusy = false; }
@@ -418,7 +436,7 @@ struct Index {
     }, 100);
   }
   aboutToDisappear(): void {
-    clearInterval(this.timer); this.surfaceHasFocus = false; this.focusTicket++; this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release();
+    clearInterval(this.timer); this.surfaceHasFocus = false; this.focusTicket++; this.closeDetails(); this.keyboard.reset(); this.surfaceTouch.reset(); this.release(4); this.clearImeNotice();
     this.island.observe(0, '', false, this.now()); this.refreshIsland();
   }
   onBackPress(): boolean {

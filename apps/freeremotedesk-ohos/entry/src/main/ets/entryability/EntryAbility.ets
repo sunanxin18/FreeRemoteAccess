@@ -104,6 +104,7 @@ export default class EntryAbility extends UIAbility {
     }
   }
   private mainWindow?: window.Window;
+  private windowDisplayChanged?: () => void;
   private contentReady: boolean = false;
   private foreground: boolean = false;
   private windowActive: boolean = true;
@@ -260,14 +261,18 @@ export default class EntryAbility extends UIAbility {
         }
       }
       this.updateCutout();
-      this.mainWindow.on('avoidAreaChange', () => { native.appFocus(false, false, false); this.updateCutout(); });
-      this.mainWindow.on('windowSizeChange', () => { native.appFocus(false, false, false); this.updateCutout(); });
+      const currentWindow = (): boolean => this.mainWindow === createdWindow && this.localDisplay.stageId() === createdStage;
+      // 软键盘避让/尺寸通知不是 blur；真实内容变化由 XComponent/Index geometry 清 held。
+      this.mainWindow.on('avoidAreaChange', () => { if (currentWindow()) { this.updateCutout(); } });
+      this.mainWindow.on('windowSizeChange', () => { if (currentWindow()) { this.updateCutout(); } });
       this.mainWindow.on('windowEvent', (event: window.WindowEventType) => {
+        if (!currentWindow()) { return; }
         if (event === window.WindowEventType.WINDOW_ACTIVE) { this.windowActive = true; this.publishActive(); this.updateChrome(); }
         if (event === window.WindowEventType.WINDOW_INACTIVE) { this.windowActive = false; this.publishActive(); native.appFocus(false, false, false); }
       });
-      try { this.mainWindow.on('windowRectChange', this.localDisplayChanged); } catch (e) { this.windowError('窗口几何监听', e as BusinessError); }
-      try { this.mainWindow.on('displayIdChange', this.localDisplayChanged); } catch (e) { this.windowError('窗口显示器监听', e as BusinessError); }
+      this.windowDisplayChanged = (): void => { if (currentWindow()) { this.refreshLocalDisplay(); } };
+      try { this.mainWindow.on('windowRectChange', this.windowDisplayChanged); } catch (e) { this.windowError('窗口几何监听', e as BusinessError); }
+      try { this.mainWindow.on('displayIdChange', this.windowDisplayChanged); } catch (e) { this.windowError('窗口显示器监听', e as BusinessError); }
       try { display.on('change', this.systemDisplayChanged); display.on('add', this.systemDisplayChanged); display.on('remove', this.systemDisplayChanged); }
       catch (e) { this.windowError('显示器监听', e as BusinessError); }
       windowStage.loadContent('pages/Index', (error) => {
@@ -297,8 +302,8 @@ export default class EntryAbility extends UIAbility {
     try { display.off('add', this.systemDisplayChanged); } catch (e) { this.windowError('撤销显示器新增监听', e as BusinessError); }
     try { display.off('remove', this.systemDisplayChanged); } catch (e) { this.windowError('撤销显示器移除监听', e as BusinessError); }
     if (this.mainWindow) {
-      try { this.mainWindow.off('windowRectChange', this.localDisplayChanged); } catch (e) { this.windowError('撤销窗口几何监听', e as BusinessError); }
-      try { this.mainWindow.off('displayIdChange', this.localDisplayChanged); } catch (e) { this.windowError('撤销窗口显示器监听', e as BusinessError); }
+      try { this.mainWindow.off('windowRectChange', this.windowDisplayChanged); } catch (e) { this.windowError('撤销窗口几何监听', e as BusinessError); }
+      try { this.mainWindow.off('displayIdChange', this.windowDisplayChanged); } catch (e) { this.windowError('撤销窗口显示器监听', e as BusinessError); }
     }
   }
   onWindowStageDestroy(): void {
