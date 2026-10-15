@@ -145,10 +145,10 @@ Task 3 于 `c908733` 实现、`3b59cef` 修复，六项 P2 独立复审通过；
 - [x] Task 5A4 手机/PC固定产物正确性子步骤：同一最终ELF两端各6项聚焦+3项pipeline，共4条实际命令/18次通过且host/独有guest均0；38条/70,802字节完整值与两份宿主及两端逐字相等，root独立核对43源/79运行证据及前后产物身份。raw copy资格、性能、普通HAP Apple和真实Mac仍OPEN，见[原生补全验证](../../validation/mvs-native-completion-arm64-20261015.md)。
 - [x] Task 5A5 type-0 RGB copy源码/宿主/实际ELF：两个helper接入精确ARM64 3..24字节copy叶，保留forward别名/混合来源、默认原循环与type-1完整快照；独立Spec/Quality通过，default/aggregate focused各11、完整包538/542及pipeline全值连续性通过，见[精确拷贝验证](../../validation/mvs-copy-arm64-20261015.md)。
 - [x] Task 5A5 手机/PC固定产物正确性：同一ELF两端各11项copy+3项pipeline，共4命令/28次通过，44源/输入前后身份、24实际HDC/20唯一guest退出及38条70,802字节全值顺序经root独立核对。性能、普通HAP Apple和真实Mac仍OPEN，见[精确拷贝验证](../../validation/mvs-copy-arm64-20261015.md)。
-- [ ] Task 5A6 有限MVS整管线性能：用真实wire构造的copy-heavy/IDCT/type-1局部工作集记录prepare/commit/发布耗时及独立完整输出；默认/原生对照，分别记录宿主与两个OHOS目标，不能由叶/单测总耗时宣称帧率。
+- [ ] Task 5A6 有限MVS整管线性能：8真实wire工作集、宿主default/native完整32记录+8state差分和两个官方OHOS ELF及独立审查完成；host固定ABBA实际384条measured完成，copy有收益、dense-Y/refine原生较慢，保留共同libtest/后台负载限制。当前入口只准确计apply组合/publish/total，不伪拆prepare/commit；PC两ELF各32条资格/完整值对比已通过，phone资格及两端计时仍OPEN，不由此宣称帧率，见[有限管线记录](../../validation/mvs-pipeline-measurement-20261015.md)。
 - [x] Task 5B1 标准MVS普通应用实验组合：独立默认关闭OHOS ARM64 feature，可与RDP共存；保持Mac自动HP语义/音视频不可用及既有输入门，真实最终FFI/架构/互斥/依赖及构建参数验证完成、独立Spec/Quality通过；root冻结后36项宿主与7脚本通过。OHOS正向用例只编译、不由宿主mock证明注册，见[组合验证](../../validation/harmony-apple-composition-20261015.md)。
 - [ ] Task 5B2 正常表单明确模式选择：源码及双协议普通Release HAP构建完成，完整FFI 42通过/1既有ignored和精确strip包身份已核对；横屏完整表单、模式菜单/凭据交互及PC新包GUI仍待实测，不将构建计为完成，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
-- [ ] Task 5B3 同一组合HAP签前/签后身份和手机/PC普通应用及stockMac真实认证/首帧/刷新/指针/重连；不替代后续完整键盘/IME、音频、HP与性能资格。
+- [ ] Task 5B3 同一组合HAP：2026-10-15开发签名/官方验签/双参数精确checker及原28个条目逐字身份已完成，签名包3fbdd046；尚未安装，手机/PC普通应用及stockMac真实认证/首帧/刷新/指针/重连待验证，不替代完整键盘/IME、音频、HP与性能资格，见[模式与HAP](../../validation/harmony-mode-selection-20261015.md)。
 - [ ] Task 5C 中立物理键/提交文本能力分离与真实输入：修正Apple Text宣称与实际不处理的不一致，保留既有桌面/RDP行为，OHOS未满足门的输入明确不可用。
 - [ ] Task 5D 本地显示器几何接入：OHOS连接前为默认NativeDisplay补齐真实physical/workarea/content/scale快照，复用共享分辨率策略、保留Fixed/ServerManaged/协议动态能力门；当前壳直接传递geometry=None，不能声称已按手机/PC本地屏幕请求。模式选择scope完成后独立实现并实测实际协商尺寸。
 - [ ] OHOS 系统 H.264/HEVC 和音频能力优先按既有 media 契约验证精确格式/生命周期；AAC MIME 不代表 AAC-ELD。未覆盖路径保留 fdk-aac/FFmpeg 后备并完成真实交叉构建及目标执行。

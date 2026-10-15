@@ -1,6 +1,6 @@
 # 鸿蒙普通表单连接模式与双协议 HAP（2026-10-15）
 
-状态：**实验性**。正常登录表单已接入显式标准 MVS 模式，完成宿主回归和官方工具链双协议 Release HAP 构建。最终无签名包尚未签装；手机/PC 实际模式菜单、横屏同页布局和真实 Mac 会话仍未验证。手机横屏策略及此前 RDP 旋转验证见[方向记录](harmony-phone-orientation-20261015.md)，不能将旧包观察当作本包 GUI 验收。
+状态：**实验性**。正常登录表单已接入显式标准 MVS 模式，完成宿主回归和官方工具链双协议 Release HAP 构建。后续已用既有开发身份签名并核对签后内容，尚未安装；手机/PC 实际模式菜单、横屏同页布局和真实 Mac 会话仍未验证。手机横屏策略及此前 RDP 旋转验证见[方向记录](harmony-phone-orientation-20261015.md)，不能将旧包观察当作本包 GUI 验收。
 
 ## 行为
 
@@ -32,6 +32,17 @@ root 重新核对 78 个当前源码输入、构建前后摘要、四份工件�
 
 独立审查为 Spec PASS / Quality PASS，无需修正的源码问题。审查重新核对两产品文件、78 个源输入、实际六项 RED、完整回归及真正执行的 ArkTS/PackageHap 日志；结论仅覆盖源码与无签名包。特别保留三列模式组、72vp 五位端口、菜单/焦点及横竖屏/大字/深色的实际设备验收要求。
 
-本地原始证据为 `target/task5b2-mode-ui-20261015/`，root 接收记录为 `target/task5b2-root-20261015/`；产物不入 Git。本次没有签名、安装、设备操作或服务器连接。host Mac 锁屏阻止新增界面检查，PC 手动安全密码输入仍按原流程等待，不覆盖或截取其界面。
+本地原始证据为 `target/task5b2-mode-ui-20261015/`，root 接收记录为 `target/task5b2-root-20261015/`；产物不入 Git。后续完成既有开发身份签名；本次没有安装、设备操作或服务器连接。host Mac 锁屏阻止新增界面检查，PC 手动安全密码输入仍按原流程等待，不覆盖或截取其界面。
 
-下一步使用同一组合包完成签后身份及手机/PC 界面、stock Mac 认证/首帧/更新/指针/重连。完整物理键与文本能力分离、本地显示器 geometry、媒体/HP 和整管线性能保持独立未完成项，见[实施计划](../superpowers/plans/2026-10-13-harmony-clients.md)。
+下一步使用同一组合签名包完成手机/PC 界面、stock Mac 认证/首帧/更新/指针/重连。完整物理键与文本能力分离、本地显示器 geometry、媒体/HP 和整管线性能保持独立未完成项，见[实施计划](../superpowers/plans/2026-10-13-harmony-clients.md)。
+
+
+## 后续开发签名
+
+root 对冻结无签名 HAP 执行现有正式签名脚本，并精确传递两个普通验证参数；没有重编译或替换包内 native/ArkTS。沿用此前授权的公开 SDK 演示开发身份及已有 normal profile，不新增签名身份、安全配置或权限；口令仅在内存中取得并通过官方工具关闭回显的交互终端提交，未进入 argv/配置/日志。它仅是测试签名，不代表生产发布身份。
+
+实际 signer、verify-app 和签后双参数 checker 均退出 0，日志明确包含 sign-app success、verify-app success。签名 HAP 为 **22,749,591 bytes**，SHA256 `3fbdd04664218aba727a423680c44043e30f7a3ba9b6accd8144204a1396aa8f`。
+
+root 重新打开签前/签后 ZIP，原有28个条目逐字一致；唯一新增项为官方 signer 生成的 `.pages.info`（2,696 bytes）。首次额外的“条目列表完全相同”断言因此失败，原始失败保留；随后确认实际官方 signer JAR 引用该项、此前已接收签名包也包含该项。没有改宽仓库 checker。签前/签后来源、完整 native/ArkTS/FDK 材料仍一致，不能据签名证明安装、沙盒加载或真实连接。
+
+本地后续证据：`target/task5b2-root-20261015/{sign-reviewed-hap.py,sign.redacted.log,signed-identity.json,normal-rdp-mvs-mode-signed.hap}`。手机当前停止、host Mac 仍锁屏；PC 安全密码输入请求尚未收到完成回复，所以未覆盖安装或操作设备。

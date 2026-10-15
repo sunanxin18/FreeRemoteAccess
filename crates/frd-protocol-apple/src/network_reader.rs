@@ -6600,4 +6600,8 @@ mod migrated_runtime_tests {
         use super::*;
         include!("mvs_publication_pipeline_tests.rs");
     }
+    mod pipeline_measurement {
+        use super::*;
+        include!("mvs_pipeline_measurement_tests.rs");
+    }
 }

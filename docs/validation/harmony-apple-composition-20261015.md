@@ -2,7 +2,7 @@
 
 状态：**实验性**，本轮仅完成源码、宿主检查和官方 OHOS ARM64 最终 FFI 交叉链接。没有构建/签装本次组合 HAP；OHOS 正向用例仅编译，手机/PC 普通应用的 Mac 登录、帧、输入与重连仍未验证。
 
-后续模式选择与同组合真实 Release HAP 已另行完成源码/构建检查，尚未签装或完成手机/PC GUI 与真实 Mac 会话；见[后续记录](harmony-mode-selection-20261015.md)。以下保留组合根阶段的历史产物与验证范围。
+后续模式选择与同组合真实 Release HAP 已另行完成源码/构建检查，已开发签名核对、尚未安装或完成手机/PC GUI 与真实 Mac 会话；见[后续记录](harmony-mode-selection-20261015.md)。以下保留组合根阶段的历史产物与验证范围。
 
 ## 行为与平台边界
 
@@ -51,4 +51,4 @@ base 是 `libnative_window.so`、`libhilog_ndk.z.so`、`libhuks_ndk.z.so`、`lib
 
 本地原始证据：`target/task5b1-standard-composition-20261015/`；root冻结后验证与接收：`target/task5b1-root-20261015/`。生成物不入Git。上游NOTICE原文自带末尾空行；首次暂存diff检查因此拒绝。保留许可字节，通过精确路径gitattributes固定LF并仅豁免其blank-at-eof，随后普通diff检查通过，不全局放宽检查。当前host Mac锁屏且phone实例已停止等待解锁恢复，未把该状态计为客户端失败/互操作结果，也未操作PC密码输入。
 
-下一步串行实现正常表单明确的标准模式、精确profile协议键与目标切换，再构建/签装同包并分别完成手机/PC真实Mac验证。完整键盘/IME能力分离、系统/后备媒体、AAC-ELD输出、HP、MVS性能/生产资格仍按计划独立完成，见[实施计划](../superpowers/plans/2026-10-13-harmony-clients.md)。
+组合根阶段规划的正常模式选择、精确profile协议键/目标切换、真实HAP构建与开发签名已由[后续记录](harmony-mode-selection-20261015.md)补充；手机/PC新包安装、界面和真实Mac验证仍未完成。完整键盘/IME能力分离、系统/后备媒体、AAC-ELD输出、HP、MVS性能/生产资格仍按计划独立完成，见[实施计划](../superpowers/plans/2026-10-13-harmony-clients.md)。
