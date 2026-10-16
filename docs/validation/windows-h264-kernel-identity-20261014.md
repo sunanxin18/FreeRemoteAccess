@@ -195,3 +195,13 @@ Collect在原退出/EOF、工具身份与stop门通过后，先导出唯一绑�
 root全文读原三源增量、Fix1报告/5081B delta及独立复审，核33关键原件、127修订原件与复审冻结；最终独立报告SHA256 `89fe2b7bd66f93eb3f924c17c53e67172745321c786da49ca349ade038ac8e8b`确认原P2关闭。原件在`target/windows-shipping-A-failed-wsl-export-fix1-20261016/`。本机没有pwsh；Windows PowerShell/reparse/WSL和真实A仍须由后继运行证明。
 
 本次正常功能分支push释放下一次原固定Execute调用，先取得真实内层错误再决定编译修复；没有预修make、增加重试/超时、放宽guard或发布修改包。run73具体make首错与完整自然FFmpeg/正式运输资格继续开放。
+
+## 2026-10-16 原始失败调用先保存：实际后继读数
+
+`01cd9bc870e32f9f49f876d30680f3c0ee960d26`的[run38896199173/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38896199173)已terminal failure。builder仍在原FFmpeg build入口返回1，捕获完整、非timeout；外层只说明原make调用非零，尚无其内层首错。Collect再次300秒超时124，正式tar/receipt/verification未产出。没有再次调用原Execute或以等待超时重跑构建。
+
+新失败调用导出脚本确实执行：Python调用exit1、完整capture、非timeout，selection.json为complete=false、files={}、error=open identity changed。拒绝位置是Reader.read比较路径lstat与已打开fd的fstat签名，现原件没有记录具体失败文件或字段；不能凭常见Windows差异删掉身份门，也不能称真实文件遭到替换。make内层stdout/stderr仍未取得，根因继续UNKNOWN。
+
+新三phase原记录已缩小复制超时范围：llvm-copy与system-tools均有end/exit0；build-root-copy只有start，没有end/exit。这与全量Collect终态124一致，不再泛称三段均未知。错误保存、复制阶段与原make失败分别记账，未据此修复汇编或改变原自然工具调用。
+
+Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd917c4c2eb768a724d592f9ff0818df67b77918f21930b`。两次完整GET在90/240秒超时的partial原件保留，后继认证取得同一原artifact的8个Range、同ETag/206/完整总长，重组命中API全SHA和ZIP CRC后才解包；未执行内容。root核16checkout源码与01cd提交逐字相等，原完整joblog38881B另存。材料在`target/windows-abi-source-reuse-delivery-root-20261016/ci/a-range-download/`，独立读数及限定身份诊断方案另行进行。下一步先取得有限Windows lstat/fstat真实控制和失败字段，再决定最小修复；不先扩大构建或软化身份校验。

@@ -183,3 +183,19 @@ Linux/Windows现workflow各新增x86两行专用build-only及always精确九原�
 原九件保留其build-only identity及build双流原bytes；新增runtime.identity.json及ABI双流，共十二个literal上传路径。当前身份明确build_reused=true、abi_build_in_current_run=NOT_RUN及source run/commit/artifact/identity SHA；当前四源/七配置前后稳定与原f5来源分开核，五实质构建配置必须相等。唯一执行仍是原已审PE加abi/30秒，原完整28/84行输出parser逐字不变，raw双流、终态/EOF/首错及保护边界保持。
 
 作者7244B报告SHA256 `7ef766dbad71c8818c57a85640ec8c87c60b8cf4d3623d0acec62e026b0a238c`；独立源码审查报告5424B SHA256 `17d5dac0a9142867e0ef8a9dc1912e4fa072c74584572902576cd1452ab916a5`。root已读完整当前源码/两源delta与报告，核40作者绑定、12审查输入及18原成员SHA。54个host纯数据模型通过、74个run长度合规；本机没有pwsh，未把这些检查称为PowerShell provider或实际Windows执行通过。只释放下一次正常Windows功能分支CI执行，真实下载/十二原件/同PE及完整ABI结果另记，Linux/A不重启。
+
+### Windows 两份原 PE 实际 normal-return 通过
+
+`d5133db58797bbbb6fa3cb34f5ffb7daafd63563`的[run38900650959/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38900650959)中，x86 job116971777185/artifact12045369929与x64 job116971776865/artifact12045484367的固定下载、实际ABI及上传步骤均success；当时完整package仍运行，不据此称整包通过。
+
+两ZIP各12件，API digest/CRC及全部解包bytes相符；原九件与f5原包逐字相同，原PE完整SHA仍ba2b29ad…/6120db81…。当前四源、七配置及两目录各阶段原九件SHA全部保持，旧build身份和当前abi_build_in_current_run=NOT_RUN分开。实际调用均为绝对staged旧PE加唯一abi，30秒预算内native0、双EOF/文件关闭/capture完整、无错误；完整stdout分别28/84行，每个kernel12/40个精确坏callee状态校准和各9正向均通过，stderr为空。像素和canary断言来自同SHA程序正常返回链，未声称stdout另有完整像素转储。
+
+root全文核原输出及身份，独立实际审查5483B报告SHA256 `824fc8b287c7fc62902d98e03623d0c01a396671a16174844607383717b6c5a5`；核16关键绑定。原件在`target/windows-abi-source-reuse-delivery-root-20261016/ci/`。这只关闭Windows两个精确私有address-taken正常return实例，至此四x86目标该窄门齐备；保护仍not-qualified，后代静止NOT_PROVEN，Win32/full unwind、shipping fastcc/inline、性能及真实会话继续OPEN。
+
+### 普通 publication 微基准源码与 metadata
+
+新增唯一non-test `rdp_publication_benchmark.rs`，直接复用真实SSE2/SSSE3叶与完整当前API，旧scalar原文和冻结record165作参考；15counts×两组实际地址mod16，三路同边界、API单列，固定8warm/31原始样本/120秒，准备、全byte/source/canary验证及输出均在计时外。它不更改产品分派或codec广告，当前没有真实计时结果。
+
+初审发现explicit-path装载真实dispatcher会查错x86子模块；固定Rust1.96实际单目标E0583 RED保留。只给生产pixel_convert.rs增加33B显式子模块路径属性，移除即等于原文件，ARM声明、数值、API、实际leaf和四个ABI冻结源保持。修后四x86 example均实际metadata exit0，唯一真实rustc调用为bin/dep-info,metadata、精确目标且无--test；不等于目标机器码、链接或运行。独立Fix1复审报告SHA256 `acfb895e59b61ecb1c6979d50daa862f9ef75ef92deeecba2184738bb17a46ef`，root全文读并核40作者RED/Fix1冻结与11审查绑定。
+
+最初bare Homebrew cargo不理解+1.96.0、随后launcher配对报E0463的两批失败原件均保留，没有用后继正确工具身份追认旧子进程。普通frd-protocol-rdp x64 Linux cross check在aws-lc/libz前置因缺x86_64-linux-gnu-gcc失败，尚未进入产品crate本体；原生CI/完整产品检查与四目标真实benchmark仍待后继，未安装工具链或添加镜像harness。Task4A2.10C不勾选。

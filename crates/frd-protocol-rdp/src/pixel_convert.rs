@@ -8,6 +8,7 @@
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[path = "pixel_convert/x86.rs"]
 mod x86;
 
 const BYTES_PER_PIXEL: usize = 4;
