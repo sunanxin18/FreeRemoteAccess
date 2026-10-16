@@ -309,3 +309,16 @@ i686精确图像的真实完整快照内容路径亦经静态核验：recover_fu
 另外下载正式包artifact12053137470（x86，40374715B ZIP，`e17528d72d9e97e5023303bbf3e2f142d77fc88a2ba8aa0349dbc6e77349a5f9`）及12052708817（x64，40023368B ZIP，`83d6fcbafb4a0f0fbcab1216f4082f87abdef0bdc455d5d534c3d36b25eaa74f`）。完整API/Range/CRC通过，两个ZIP各唯一固定tar.gz；各47个tar成员，唯一 `FreeRemoteDesk/freeremotedesk-linux` 是regular可执行且非组/其它用户可写，root逐块核对与对应收集ELF完全相同，并读至gzip CRC/EOF。原collector的archive-member NOT_RUN历史记录不改，这是后续独立外部核验；未执行下载内容。独立归档复核通过：3243B报告SHA256 `7afcfcc17f6cf42d8e04802e22c200f5e250e6c843053da4b6dbfba22134f32b`经root全文读并核14项绑定；只关闭后续外部目标成员身份和权限检查，CRT、实际CPU分支运行及远程会话资格仍开放。
 
 `73ae225f` 的主CI run38918817420/1已terminalSUCCESS（Mac ARM64/Linux编译与safe tests及fmt）；同head普通Windows shipping仍pending，当前成果不能外推Windows正式图像或真实远程会话。
+
+
+## 2026-10-17 Windows i686 普通 GUI 的局部静态验收
+
+固定提交 `73ae225f4a8107177fd4d3be2be3b79aa7f85980`、run `38918817482/1`、job `117044212756`、artifact `12057175755` 的普通 GUI PE（SHA-256 `836d052356834206aefeacaf3c7ac3bb52117e4e2e6e3c97b319745fd01261c1`）已完成完整快照路径的窄静态审查。独立报告 `target/windows-i686-shipping-static-scope-20261017/phase1-review.md` SHA-256 `546c39c8f4badfeb585295020c321985579387c8b8c29325f3c3001b97c9cbb9`；结论为 NARROW_CALLER_PASS / VECTOR_ISA_PASS / CRT_AND_RUNTIME_OPEN。
+
+同次MAP和实际指令闭合 `recover_full_snapshot → try_process → from_iter → Cloned::try_fold → extract_bgrx_patch → SSSE3/SSE2`。Surface中分派已经内联，不声称它调用独立converter wrapper。root直接从PE重算七条rel32边；独立审查将9份读数的1192条指令bytes逐项绑定同一PE。SSE2主体和4/8/12字节尾部的颜色计算使用SSE2，未见更高ISA或逐pixel标量颜色转换。
+
+实际分派检查SSSE3后直接选择SSE2，没有运行时第二次SSE2检查。本机已安装的同版本Rust1.96 ARM64-host编译器对i686-msvc输出target_feature=sse2，作为target基线佐证；它不是原Windows runner的cfg实测。结论以该SSE2目标基线为前提，不承诺无SSE2旧CPU。
+
+SSE2尾部两次copy实际进入 `0x014f084b → IAT 0x01554028 → VCRUNTIME140.dll!memcpy`。外部CRT实体、动态分派与系统兼容未验收；不能将局部SSE2指令检查写成整个调用闭包的ISA资格。增量/EGFX调用路径、完整异常展开与保护、GUI实际运行及RDP登录、性能和完整shipping资格仍OPEN。一次try_fold读数未保存stderr，独立审查绑定其stdout与原PE机器码，不补造原件。
+
+所有检查为本机可信reader对下载产物的静态读取，未执行下载PE或脚本；原件历史runtime=NOT_RUN、shipping_qualification=OPEN保持。
