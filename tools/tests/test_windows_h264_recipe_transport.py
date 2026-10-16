@@ -381,23 +381,23 @@ class WorkflowAuthority(unittest.TestCase):
         checkout, execute, collect, upload, forensic = job['steps']
         self.assertEqual(checkout['uses'], 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262')
         self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': 'false'})
-        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapAptDiagnostic')
+        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute')
         self.assertNotIn('${{', execute['run'])
         active_commands = [step['run'] for step in job['steps'] if 'run' in step and step.get('if') != '${{ false }}']
-        self.assertEqual(active_commands, [execute['run']])
-        self.assertEqual(collect['if'], '${{ false }}')
+        self.assertEqual(active_commands, [execute['run'], collect['run']])
+        self.assertEqual(collect['if'], 'always()')
         self.assertEqual(collect['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect')
-        self.assertEqual(upload['if'], '${{ false }}')
+        self.assertEqual(upload['if'], 'always()')
         self.assertEqual(upload['with']['compression-level'], '0')
         self.assertEqual(upload['with']['if-no-files-found'], 'error')
         self.assertEqual(upload['with']['path'].splitlines(), ['${{ runner.temp }}/release-a.tar',
                                                              '${{ runner.temp }}/release-a.receipt.json',
                                                              '${{ runner.temp }}/release-a.verification.json'])
-        self.assertEqual(forensic['if'], 'always()')
+        self.assertEqual(forensic['if'], '${{ failure() || cancelled() }}')
         self.assertEqual(forensic['continue-on-error'], 'true')
         self.assertEqual(forensic['with']['include-hidden-files'], 'true')
         self.assertEqual(forensic['uses'], 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')
-        self.assertEqual(forensic['with']['name'], 'release-a-apt-prefix-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
+        self.assertEqual(forensic['with']['name'], 'release-a-bootstrap-checkout-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
         self.assertEqual((forensic['with']['compression-level'], forensic['with']['if-no-files-found'],
                           forensic['with']['overwrite']), ('0', 'warn', 'false'))
         call_files = ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json', 'error.json', 'executable.bin', 'main-module.bin')
@@ -422,20 +422,19 @@ class WorkflowAuthority(unittest.TestCase):
         self.assertEqual(actual[:54], ['${{ runner.temp }}/' + name for name in expected])
         t = load()
         self.assertEqual(set(call_files), t.CALL_FILES)
-        # 诊断只运输当前固定apt前缀；不进入正式POSIX transport allowlist。
-        calls = ('wsl-install', 'wsl-version', 'path-to-wsl', 'path-to-windows', 'path-repo',
-                 'path-repo-reverse', 'apt-version', 'apt-get-version', 'dpkg-version',
-                 'apt-use-pty', 'apt-executables', 'setup', 'linux-cleanup-setup')
+        # linux-status和payload pack是保留项；实际pack/final-reader均在payload外固定目录。
+        calls = [name for name in t.CALLS if name not in ('initialize', 'checkout', 'linux-status', 'pack')]
+        self.assertEqual(len(calls), 16)
         added = [f'frd-release-a-evidence/setup/calls/{call}/{name}' for call in calls for name in call_files]
-        added += ['frd-release-a-evidence/' + name for name in (
-            'provenance/paths.json', 'setup/prepare.sh', 'setup/os-release',
-            'setup/lifecycle-supervisor.py', 'setup/setup-intent.json', 'setup/apt-executables.py',
-            'setup/apt-diagnostic-receipts.json', 'setup/lifecycle.json',
-            'setup/groups/setup/scope.json', 'setup/groups/setup/halt.json', 'setup/groups/setup/stopped.json')]
+        added += [folder + '/' + name for folder in ('release-a-pack', 'release-a-final-verify') for name in call_files]
+        added += ['frd-release-a-evidence/provenance/' + name for name in sorted(t.PROVENANCE - {'state.json', 'checkout.json'})]
+        added += ['frd-release-a-evidence/setup/' + name for name in sorted(t.SETUP_FILES - {'host.json', 'lifecycle-error.json', 'transport-error.json'})]
+        added += [f'frd-release-a-evidence/setup/groups/{kind}/{name}' for kind in ('setup', 'collect', 'control-normal', 'control-halt')
+                  for name in ('scope.json', 'halt.json', 'stopped.json')]
+        self.assertEqual(len(added), 154)
         expected += added
         self.assertEqual(actual, ['${{ runner.temp }}/' + name for name in expected])
-        self.assertEqual(len(actual), 156)
-        self.assertFalse(t.allowed('setup/apt-diagnostic-receipts.json'))
+        self.assertEqual(len(actual), 208)
         self.assertEqual(len(actual), len(set(actual)))
         self.assertTrue(all(not any(char in path for char in '*?[]') for path in actual))
 

@@ -17,7 +17,8 @@ RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 
 | SSE2静态指令 | 四个精确入口及内联数值核心仅见SSE2指令；外部memcpy/TLS/panic运行库未链接，不代表最终ISA闭包 |
 | 原体反例/新体执行 | Linux x64/i686冻结原体实际命中唯一counter反例；Linux/Windows x86_64新体各12项、两平台i686新体各11项实际通过 |
 | Linux私有non-test保护页 | x86_64/i686实际普通release ELF，各kernel各160合法case及五精确SIGSEGV负控通过；不是shipping库资格 |
-| Windows保护页、ABI/unwind、有限性能 | 尚未完成；sentinel和对象编译不能替代 |
+| Windows私有non-test保护页 | x64/i686实际普通release PE，各核10240对照/160合法guard及五精确AV通过 |
+| 直接ABI/unwind、有限性能 | 尚未完成；正确像素/保护页不能替代 |
 
 最终源SHA256：`pixel_convert.rs` 为`ee5623097b839166f311ffc0a9fffbfbc3d8b59163da96df8b9171692f4fa66c`，`pixel_convert/x86.rs` 为`232fabaca6781a9e3ef5110de292d3c4b017066b847f7ee9b31ad4f7ad8aeaf9`。原SSSE3数值体与ARM64文件保持；macOS只支持ARM64，本次没有macOS Intel构建。
 
@@ -96,3 +97,11 @@ Windows x64独立执行读数复核报告SHA256为`0e1795072152e000428ee734c27e3
 尚无Windows链接/PE/VirtualAlloc/AV/真实生命周期、直接ABI或性能运行。后继现Windows矩阵只为显式x64/i686普通release build→同一PE parity/guards接线；配置与实际执行分别审查，不从metadata推导运行通过。既有ARM64工具与Windows/Linux产品默认不受该入口提升。
 
 Windows现矩阵的两步接线已完成配置源审，独立报告SHA256 `3f1cb8980820e3f698d4a146b552e0cb9a37acef66b4331006cbff3900752472`；root已全文读完整delta/作者与审查报告，并核15项配置材料、17项独立输入及当前hash。仅x64/i686，明确target，原18步保持；普通release build后同PE顺序parity/guards，BaseStream保存三组原双通道，终态/EOF/收尾未知即partial失败，上传11精确原件。helper只控制自有direct Process，不授cargo后代quiescence。该配置未做PS parser或运行验证，首次随本次push实际执行，Windows保护页/ABI/perf仍待验。
+
+## Windows x64/i686 实际普通保护页通过
+
+提交`6b95c81e854d75ccfeb45c282112ac14f7adadc9`的[run38871211066/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38871211066)，i686 job116875482647与x64 job116875482792的native及upload步骤均success，ARM专用两步skipped。每目标三个阶段实际exit0且原双通道EOF完整：两核各10240parity/160合法guard，valid0、五个精确ready后u32 `0xC0000005`，最终runtime_complete=true。实际rustc为1.96.0目录、普通bin/link、显式目标，无--test；未补写尚无完整joblog的版本细节或声称compiler body hash。
+
+两ZIP各11固定成员，三源/快照before-after及同PE hash全部匹配。i686 PE32/machine014c为239616B，SHA256 `04deb119c1ccb90acca01915b5bff4b055e421b11a981d68b42b896a1f80b7d9`；x64 PE32+/machine8664为274944B，SHA256 `e1c478f9205aa88d6ec74a279b654fa0f486e256054a5cd144c0f3a5af1ccdde`。这是X64宿主上的实际32位PE入口，不能外推32位Windows OS全部资格。
+
+root核原件并全文读独立报告SHA256 `e96d4e73395c17ee564f9f03e86d0404b8d007336b10a56d441cc1c0656f859c`及五输入身份；原件在`target/windows-apt-and-publication-integration-root-20261016/ci/`。采集时完整package仍运行，direct Process之外后代停止未证明；timeout/OS错误分支、直接ABI、shipping ISA/runtime、性能与live继续开放。由此四x86目标私有parity/guard门已齐，Task4A2.10C整体仍未关闭。

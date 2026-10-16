@@ -145,3 +145,17 @@ root另从[Ubuntu官方APT2.8.3源码](https://archive.ubuntu.com/ubuntu/pool/ma
 作者报告SHA256 `bef01060bc298b396f0c5caa55e285ad649fd5cb57d1bb6ccc2e07aa39f0d708`，独立审查 `4bebb3c42e172722228998bea31c564e2400caf498ef2dccb9beb08486776516`，root已全文读37行diff及两报告，核19项材料、三当前源及独立两件冻结。当前仅SOURCE/HOST，修后实际APT尚未验证，不追认旧失败成功。
 
 下一次正常功能分支push仅运行同一固定prefix，使用新的host/Ubuntu实例，不复用旧rootfs；须保存版本/hash对照和真实dpkg解包/配置工作量、setup自然0+EOF、end child_exit0/quiescent/reaped及原stop0/stopped证据，再由root独立核验。环境漂移或noop单列，成功也只关闭APT前缀，完整setup/LLVM/FFmpeg和A/B/C/D仍待验。
+
+### 修后 fresh APT 前缀实际通过
+
+同提交`6b95c81e`的[固定前缀run38871211074/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38871211074) / job116875482251成功。新的host/Ubuntu安装原件及stdout证明确实执行48次解包和48次配置（6 upgraded/42 newly installed，含编号46项及前置libc两项），非noop。五probe原stdout与默认RED逐字相同，APT2.8.3/dpkg1.22.6及exe指纹保持；删除唯一Use-Pty=0选项后prepare与旧默认原件相同，supervisor c44d65未变。
+
+setup与stop自然exit0且完整EOF，四UUID和同nonce stopped原件匹配；end child_exit0/reaped/quiescent/error=null，state firsterror=null、apt_prefix_completed/quiescent=true、setup_ready/builder_started=false。last_uncertainty保留早先成员快照不稳定历史，未抹去或误报当前错误。setup stderr仅locale生成通知；不能按stderr非空推成失败。
+
+artifact12033647017为10178868B、119成员、SHA256 `3ccdae6435773b36a343689fc60dca1a73c2aa96703979ca2d3ba28db982914a`。root核119CRC/156allowlist/16提交blob、五probe、精确选项delta和四UUID/stop，并全文读独立实际报告SHA256 `ab125882a26d091d8dd8ac97d75295f1f3ffc9ef2529c76f5107e62f4d61c73d`及两件冻结。没有成功原joblog，也未称forensic是正式运输。这里只关闭APT前缀门；完整setup/LLVM/FFmpeg、正式三件、B/C/D继续待验，原默认失败与旧59未知身份不追认。
+
+### APT 验收后恢复完整自然流程
+
+仅workflow与唯一WorkflowAuthority主控制恢复原Execute/Collect/正式三件always；失败/取消时的原208字面forensic逐项逐序保持。Use-Pty=0共享prepare、qualifier/builder/consumer及原bootstrap源码未改、不重跑。原主项实际RED→GREEN，独立源审报告SHA256 `3b2b84f6b11c7eba18fefe72f24674eaf1d06ec204ef5d9006df1b560f63490d`；root全文读35e9作者、287行diff及独立报告，核17项及两件review冻结。
+
+本次正常功能分支push只释放一次原固定自然A，不另dispatch/rerun；新调用须自身完成完整setup、LLVM、controls、FFmpeg及原正式运输。原208 fallback在正式运输失败时仍不保证动态UUID/attempt完整，缺件保持partial/unknown。APT前缀与Windows私有publication guard成功均不预授这次完整自然构建通过，B/C/D继续开放。
