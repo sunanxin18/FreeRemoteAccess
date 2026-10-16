@@ -163,7 +163,7 @@ function Invoke-ModifiedNative([string]$Exe, [string[]]$Arguments, [string]$Name
     }
     $directory = Join-Path $AttemptRoot ("native-" + $Name + '-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $directory | Out-Null
-    $resolved = (Get-Command $Exe -CommandType Application -ErrorAction Stop).Source
+    $resolved = (Get-Command $Exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $record = @{ argv = @($Exe) + $Arguments; cwd = (Get-Location).ProviderPath; exit = $null
         category = $(if ($Name -cin @('wslpath','required-tools')) { 'readonly-bootstrap-no-linux-writer' } elseif ($Name -ceq 'supervised-wsl') { 'supervised-linux-writer' } else { 'owned-windows-child' })
         stdout = (Join-Path $directory 'stdout.bin'); stderr = (Join-Path $directory 'stderr.bin')

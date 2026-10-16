@@ -41,7 +41,7 @@ function Save-ReleaseAWindowsTools($Context) {
     New-Item -ItemType Directory -Path $directory | Out-Null
     $catalog = @{}
     foreach ($name in @('pwsh','python','wsl.exe','git','gpg.exe','curl.exe')) {
-        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
+        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         $path = if ($null -ne $command) { $command.Source } elseif ($name -ceq 'gpg.exe') { 'C:\Program Files\Git\usr\bin\gpg.exe' } else { throw "缺少Windows固定工具 $name" }
         $catalog[$name] = Save-ReleaseAExecutable $name $path (Join-Path $directory ($name + '.bin'))
     }
@@ -83,7 +83,7 @@ function Invoke-ReleaseARaw {
     try {
         $out = [IO.File]::Open((Join-Path $RecordDirectory 'stdout.bin'), 'CreateNew', 'Write', 'Read')
         $err = [IO.File]::Open((Join-Path $RecordDirectory 'stderr.bin'), 'CreateNew', 'Write', 'Read')
-        $resolved = (Get-Command $Exe -CommandType Application -ErrorAction Stop).Source
+        $resolved = (Get-Command $Exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         $record.executable = Save-ReleaseAExecutable $Exe $resolved (Join-Path $RecordDirectory 'executable.bin')
         if (-not $process.Start()) { throw '固定child未启动' }
         $started = $true
@@ -306,9 +306,13 @@ function Invoke-ReleaseABootstrapDiagnostic {
             }
             $bindings[$item.name]=@{path=$item.path;before=$before;saved=$copy;after=$after}
         }
+        $pythonCandidates=@(Get-Command 'python' -CommandType Application -ErrorAction SilentlyContinue)
+        $pythonResolution=@{invoked_name='python';candidates=@($pythonCandidates | ForEach-Object {$_.Source})
+            selected=$(if($pythonCandidates.Count -gt 0){$pythonCandidates[0].Source}else{$null})
+            observation='host.json阶段的自然候选顺序；实际每次gateway独立解析，非该次进程启动证明'}
         Write-ReleaseAJson (Join-Path $root 'host.json') @{ source=$Source;run_id=$RunId;run_attempt=$RunAttempt
             os=$env:RUNNER_OS;arch=$env:RUNNER_ARCH;image=$env:ImageOS;image_version=$env:ImageVersion
-            powershell=$PSVersionTable.PSVersion.ToString();process_id=$PID;pwsh=$pwsh;bindings=$bindings }
+            powershell=$PSVersionTable.PSVersion.ToString();process_id=$PID;pwsh=$pwsh;bindings=$bindings;python_resolution=$pythonResolution }
         $formatter=@'
 param([string]$Qualifier,[string]$Results,[string]$Historical)
 . $Qualifier

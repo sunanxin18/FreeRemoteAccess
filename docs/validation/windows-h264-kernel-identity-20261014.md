@@ -63,3 +63,13 @@ Windows source profile及对应源码exact材料已接入，固定上游归档�
 固定六个必需控制包括：真实旧formatter token反例与新错误内容、原gateway的双通道二进制exit7、缺失exe、日志目录冲突、独立scratch的initialize成功和另一个预建root的initialize失败。它们不依赖Pester，不调用checkout、WSL、setup或builder；独立Windows forensic上传精确列出66个可能的文件路径，缺件、变化、EOF未知均按partial记录，始终不授stable或生产资格。
 
 本机仅运行受影响WorkflowAuthority控制（原配置控制RED exit1、更新后1项GREEN exit0）与窄源码/数据检查；24项冻结材料及当前四源已由root复核，完整514行delta已读。Windows PowerShell和六个运行控制尚未执行，Pester明确未调用，首次run初始化原因继续UNKNOWN。源码材料在`target/windows-shipping-bootstrap-diagnostic-20261016/`；独立Spec PASS / Quality Approved复审通过，报告SHA256 `5da7d6b33db5c0ad4f8a33bd6d1156b655f944aec70f78c27454b55b963cc655`；root完整读取并核两项review冻结后，释放一次固定诊断push。实际结果另记，不触发自然builder。
+
+### 固定诊断实际结果：多候选路径拼接
+
+审定提交`dd46ea849f86cee3f5bcc074b41cc05a219c4f50`推送触发[诊断run38849395836/attempt1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38849395836)。四个必需控制实际通过：formatter三种历史token RED/新内容GREEN、双通道各65536字节逐byte及exit7、缺失exe、日志目录冲突。两个initialize控制均在启动子进程前失败，真实record为exit=null、terminated=false；error明确包含两个python.exe路径被空格拼接成单一路径。
+
+当前`Get-Command -CommandType Application`可返回多个ApplicationInfo；直接取集合的Source并传给string路径参数会发生这个问题。资格工具的raw gateway、Windows工具目录收集，以及修改版builder的native gateway有同类读取点，下一修复按自然解析顺序只取首个ApplicationInfo，保持原调用名/参数/PATH，不硬编码Python路径或静默换工具。尚未修复验证成功，不恢复自然构建。
+
+该run成功上传独立forensic artifact12024701847，ZIP 1,240,638字节/API digest `8de9581b55c1da76d206fdcdce0fb7c8293a306d4f94e61a40022214735bb48d`；root读取47成员、核45个存在文件前后身份无差异，逐byte核binary及三formatter结果。原件在`target/windows-shipping-bootstrap-diagnostic-root-20261016/ci/`。这是本轮具体失败模式的实际复现；首次run38847486035缺初始化原件，其具体原始原因仍不能由新fixture追认。正式三件、WSL门、自然FFmpeg、B/C/D及生产资格均未通过。
+
+多候选解析的最小源码修复现已完成：资格工具两处、修改配方native gateway一处均先取首个ApplicationInfo，再取Source；原调用名/argv/cwd/PATH、零候选错误和默认upstream分支保持。host诊断另存Python自然候选顺序；这不是每次进程映像观察。51项源码/原JSON/原日志身份及完整123行delta已由root核对，两个新增Pester仅prepared/notrun。CI物理CRLF源码与本机LF源码分别记录raw hash，只有归一化文本相同，不混称bytes相同。后继仍只运行同一固定BootstrapDiagnostic，独立源审Spec PASS / Quality Approved通过，报告SHA256 `f420a4c7c574378d39f2613ee85c79ad801eb583d399d2f25b5dfb35f7205dae`；下一实际GREEN尚未取得，root仅释放一次固定诊断push，不恢复自然builder。

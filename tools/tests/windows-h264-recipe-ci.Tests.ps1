@@ -1,6 +1,65 @@
 BeforeAll {
     . (Join-Path $PSScriptRoot '../qualify-windows-h264-recipe-A.ps1')
 }
+Describe 'Application resolution preserves the first natural candidate' {
+    BeforeAll {
+        $tokens=$null;$errors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../build-ffmpeg-windows.ps1'),[ref]$tokens,[ref]$errors)
+        if($errors.Count -ne 0){throw 'builder解析失败'}
+        $node=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Invoke-ModifiedNative'},$true)
+        Invoke-Expression $node.Extent.Text
+    }
+    It 'uses the first of two candidates in the real catalog and both native capture gateways' {
+        if(-not $IsWindows){Set-ItResult -Skipped -Because '实际Windows PowerShell专用';return}
+        $script:resolutionExe=(Get-Process -Id $PID).Path
+        $script:resolutionSecond=Join-Path $TestDrive 'second-never-selected.exe'
+        [IO.File]::WriteAllBytes($script:resolutionSecond,[byte[]](0,255,17,34))
+        # 仅mock命令发现边界；实际生产catalog、exe保存、raw/native helper与固定pwsh child都执行。
+        Mock Get-Command {
+            @([pscustomobject]@{Source=$script:resolutionExe},[pscustomobject]@{Source=$script:resolutionSecond})
+        } -ParameterFilter {$CommandType -eq 'Application'}
+        $catalogRoot=Join-Path $TestDrive 'resolution-catalog'
+        New-Item -ItemType Directory -Path $catalogRoot | Out-Null
+        Save-ReleaseAWindowsTools @{root=$catalogRoot}
+        $catalog=Read-ReleaseAJson (Join-Path $catalogRoot 'toolchain/windows/catalog.json')
+        $catalog.Keys.Count | Should -Be 6
+        foreach($entry in $catalog.Values){$entry.path | Should -BeExactly $script:resolutionExe}
+        $argsFixed=@('-NoProfile','-Command','exit 7')
+        $raw=Invoke-ReleaseARaw -Exe $script:resolutionExe -Arguments $argsFixed -Directory $TestDrive `
+            -RecordDirectory (Join-Path $TestDrive 'resolution-raw') -TimeoutSeconds 30
+        $raw.error | Should -BeNullOrEmpty
+        $raw.exit | Should -Be 7
+        $raw.executable.path | Should -BeExactly $script:resolutionExe
+        $raw.argv | Should -Be (@($script:resolutionExe)+$argsFixed)
+        $raw.cwd | Should -BeExactly $TestDrive
+        $ModifiedRecipe=$true;$AttemptRoot=Join-Path $TestDrive 'resolution-native'
+        New-Item -ItemType Directory -Path $AttemptRoot | Out-Null
+        $native=Invoke-ModifiedNative $script:resolutionExe $argsFixed 'gpg-import'
+        $native.exit | Should -Be 7
+        $native.capture_complete | Should -BeTrue
+        $native.executable.path | Should -BeExactly $script:resolutionExe
+        $native.argv | Should -Be (@($script:resolutionExe)+$argsFixed)
+    }
+    It 'keeps the original zero-candidate catalog error and Stop lookup failure semantics' {
+        if(-not $IsWindows){Set-ItResult -Skipped -Because '实际Windows PowerShell专用';return}
+        $exe=(Get-Process -Id $PID).Path
+        Mock Get-Command {return} -ParameterFilter {$CommandType -eq 'Application' -and $ErrorAction -eq 'SilentlyContinue'}
+        Mock Get-Command {throw [Management.Automation.CommandNotFoundException]::new('fixed-zero-candidate-marker')} `
+            -ParameterFilter {$CommandType -eq 'Application' -and $ErrorAction -eq 'Stop'}
+        $catalogRoot=Join-Path $TestDrive 'zero-catalog'
+        New-Item -ItemType Directory -Path $catalogRoot | Out-Null
+        {Save-ReleaseAWindowsTools @{root=$catalogRoot}} | Should -Throw '*缺少Windows固定工具 pwsh*'
+        $raw=Invoke-ReleaseARaw -Exe $exe -Arguments @('-NoProfile','-Command','exit 7') -Directory $TestDrive `
+            -RecordDirectory (Join-Path $TestDrive 'zero-raw') -TimeoutSeconds 30
+        $raw.error | Should -Match 'fixed-zero-candidate-marker'
+        $raw.exit | Should -BeNullOrEmpty
+        $raw.terminated | Should -BeFalse
+        $raw.argv[0] | Should -BeExactly $exe
+        $ModifiedRecipe=$true;$AttemptRoot=Join-Path $TestDrive 'zero-native'
+        New-Item -ItemType Directory -Path $AttemptRoot | Out-Null
+        {Invoke-ModifiedNative $exe @('-NoProfile','-Command','exit 7') 'gpg-import'} | Should -Throw '*fixed-zero-candidate-marker*'
+    }
+}
 Describe 'RELEASE A outer authority and original bytes' {
     It 'reports the named original failure rather than a Unicode variable lookup' {
         foreach ($record in @(

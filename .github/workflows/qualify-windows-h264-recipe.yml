@@ -10,6 +10,7 @@ on:
         default: false
   # 首run失败后此源码固定为BootstrapDiagnostic；push仍须root授权和台账。
   # dispatch bool不能切回Execute；恢复自然builder须另经root审查源码。
+  # 本次仅修自然Application首选解析；仍只运行固定bootstrap诊断，不恢复构建。
   push:
     branches:
       - codex/rdp-egfx-hevc-preference
