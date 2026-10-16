@@ -38,3 +38,14 @@ Windows source profile及对应源码exact材料已接入，固定上游归档�
 冻结材料分别位于`target/windows-shipping-recipe-A-20261016/`（10997项）、`...-fix1-20261016/`（21146项）与`...-fix2-20261016/`（136项）。最终清单SHA256为`88560ee05f4508506c34eb88213676afe22fda8510a84558a64e03ecd9573ba9`；root完整读取报告/所有delta，独立核对各冻结项及当前六源，保护工具/consumer/patch/pin/私有门均保持。同期root主计划更新明确单独归属，不声称whole-tree干净。
 
 **实际固定Windows/WSL自然构建仍未执行。** 目前自然AS argv与安装复制后原位strip已知可能超出现consumer支持域，必须保存真实首错和partial后另审，不能等价改写或另编shipping核迎合旧接口。后续执行接线还须保留configure/make的原始双通道及完整固定工具字节，现文字合流日志/工具hash本身不等于这些完整材料。B同对象Windows数值组合、C真实ABI/guard/qmul/QPC与三个fresh-process性能窗口、D修改包/受信安装/实际装载及完整codec/live资格全部继续OPEN，默认upstream和系统NativeFirst不变。
+
+
+## 2026-10-16：独立执行与原件运输接线
+
+在上述已审配方之外，新增单一Windows执行authority、原始双通道及固定工具原字节保留、隐藏attempt/source-cache全量POSIX运输的源码准备。唯一自然builder仍固定Release/ARM64/Ubuntu-24.04/修改配方，默认upstream路径不变；没有执行实际优化构建，也没有从普通Windows包CI推断修改配方合格。
+
+初版执行层复审发现两项P2：packing追加后缺少完整reader，以及setup中合法降权后代与全组同UID检查不相容。Fix1已修复，并经独立Spec PASS / Quality Approved复审，未发现新问题。原tar/packing receipt追加完成后保持不变，实际完整reader的原始通道、退出和工具字节另存固定verification记录；上传合同精确为三个固定文件。进程归属由稳定父系证明，原supervisor/未reap leader租约保持；自然builder前有两个独立Linux降权/正常结束与HALT检查，失败不会开始builder。pack和最后reader共用原10分钟运输预算。
+
+初版18轮失败与通过记录、完整源码和5856项材料冻结在`target/windows-shipping-A-execution-20261016/`；Fix1的1361项材料及10轮原记录在`target/windows-shipping-A-execution-fix1-20261016/`。独立复审报告SHA256为`dc375e186bc583b07776f156e57860ff10182e0833acf6f1dfd79fde9a3922fa`。root完整读取全部1063行delta、核对冻结材料，并实际运行最终运输模块22项控制，22/22通过。Mac控制不能证明Windows PowerShell或Linux/proc/WSL运行：14项Pester及真实Linux门仍未运行。
+
+下一步由root提交审定源码后，首次受限workflow注册push运行一次固定Windows/WSL执行流程。该push本身会触发，不再另行dispatch或并发重跑；实际结果另记。当前仍未取得自然A构建结果，B/C/D和生产资格继续OPEN。首个自然构建的真实首错、原argv与partial必须保留，不能为通过旧consumer改写工具参数或另编shipping核。

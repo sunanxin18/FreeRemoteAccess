@@ -132,9 +132,15 @@ function Download-IfMissing([string]$Url, [string]$Destination) {
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
     $temporary = "$Destination.download"
     Assert-UnderBuildRoot $temporary
+    if ($ModifiedRecipe) {
+        $result = Invoke-ModifiedNative 'curl.exe' @('--fail','--location','--proto','=https','--tlsv1.2','--output',$temporary,$Url) 'download'
+        if ($result.exit -ne 0) { throw "下载失败: $Url" }
+    }
+    else {
     & curl.exe --fail --location --proto '=https' --tlsv1.2 --output $temporary $Url
     if ($LASTEXITCODE -ne 0) {
         throw "下载失败: $Url"
+    }
     }
     Move-Item -LiteralPath $temporary -Destination $Destination
 }
@@ -151,29 +157,502 @@ function Find-Gpg {
     throw "未找到 GPG；无法验证 FFmpeg 发布签名"
 }
 
+function Invoke-ModifiedNative([string]$Exe, [string[]]$Arguments, [string]$Name) {
+    if (-not $ModifiedRecipe -or $Name -cnotin @('download','gpg-import','gpg-fingerprint','gpg-verify','wslpath','required-tools','supervised-wsl')) {
+        throw '只允许modified既有固定native入口'
+    }
+    $directory = Join-Path $AttemptRoot ("native-" + $Name + '-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $directory | Out-Null
+    $resolved = (Get-Command $Exe -CommandType Application -ErrorAction Stop).Source
+    $record = @{ argv = @($Exe) + $Arguments; cwd = (Get-Location).ProviderPath; exit = $null
+        category = $(if ($Name -cin @('wslpath','required-tools')) { 'readonly-bootstrap-no-linux-writer' } elseif ($Name -ceq 'supervised-wsl') { 'supervised-linux-writer' } else { 'owned-windows-child' })
+        stdout = (Join-Path $directory 'stdout.bin'); stderr = (Join-Path $directory 'stderr.bin')
+        receipt = (Join-Path $directory 'exit.json'); started_utc = [DateTime]::UtcNow.ToString('o')
+        capture_error = $null; capture_complete = $false; main_module = @{ observed = $false; reason = '进程过快或MainModule不可观察' } }
+    $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $directory 'argv.json') -Encoding utf8NoBOM
+    $process = [Diagnostics.Process]::new()
+    $info = [Diagnostics.ProcessStartInfo]::new($Exe)
+    $info.WorkingDirectory = $record.cwd
+    $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
+    $process.StartInfo = $info
+    $out = $null; $err = $null; $outTask = $null; $errTask = $null; $started = $false
+    try {
+        $record.executable = @{ invoked_name = $Exe; path = [IO.Path]::GetFullPath($resolved)
+            before_sha256 = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant() }
+        [IO.File]::Copy($resolved, (Join-Path $directory 'executable.bin'), $false)
+        $record.executable.saved_sha256 = (Get-FileHash -LiteralPath (Join-Path $directory 'executable.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($record.executable.before_sha256 -cne $record.executable.saved_sha256) { throw 'native原exe复制中变化' }
+        $out = [IO.File]::Open((Join-Path $directory 'stdout.bin'), 'CreateNew', 'Write', 'Read')
+        $err = [IO.File]::Open((Join-Path $directory 'stderr.bin'), 'CreateNew', 'Write', 'Read')
+        if (-not $process.Start()) { throw 'native child未启动' }
+        $started = $true
+        $outTask = $process.StandardOutput.BaseStream.CopyToAsync($out)
+        $errTask = $process.StandardError.BaseStream.CopyToAsync($err)
+        $record.windows_child = @{ pid = $process.Id; start_time_utc = $null; start_time_observed = $false }
+        try { $record.windows_child.start_time_utc = $process.StartTime.ToUniversalTime().ToString('o'); $record.windows_child.start_time_observed = $true }
+        catch { $record.windows_child.reason = $_.ToString() }
+        try {
+            $image = $process.MainModule.FileName
+            if (-not [string]::IsNullOrWhiteSpace($image)) { $record.main_module = @{ observed = $true; path = $image } }
+        }
+        catch { $record.main_module.reason = $_.ToString() }
+        $process.WaitForExit()
+        $record.exit = $process.ExitCode
+        $drains = [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($outTask, $errTask))
+        if (-not $drains.Wait(15000)) { throw 'native双stream未到EOF' }
+        $drains.GetAwaiter().GetResult()
+        $out.Flush($true); $err.Flush($true); $record.capture_complete = $true
+    }
+    catch { $record.capture_error = $_.ToString(); $record.error_detail = $_.Exception.ToString() }
+    finally {
+        if ($started -and $process.HasExited) { $record.exit = $process.ExitCode }
+        $record.terminated = $started -and $process.HasExited
+        $record.ended_utc = [DateTime]::UtcNow.ToString('o')
+        if ($null -ne $outTask -and $null -ne $errTask -and -not $record.capture_complete) {
+            try {
+                $drains = [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($outTask, $errTask))
+                if (-not $drains.Wait(15000)) { throw 'native失败收尾原streams未到EOF' }
+                $drains.GetAwaiter().GetResult()
+                $out.Flush($true); $err.Flush($true); $record.capture_complete = $true
+            }
+            catch { if ($null -eq $record.capture_error) { $record.capture_error = $_.ToString() } }
+        }
+        try {
+            $record.executable.after_sha256 = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($record.executable.after_sha256 -cne $record.executable.before_sha256) { throw 'native调用前后exe变化' }
+            if ($record.main_module.observed -and -not [string]::Equals($record.main_module.path, $record.executable.path, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'native实际MainModule与原exe不同，拒绝身份'
+            }
+        }
+        catch { if ($null -eq $record.capture_error) { $record.capture_error = $_.ToString() } }
+        if ($null -ne $out) { $out.Dispose() }; if ($null -ne $err) { $err.Dispose() }
+        $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $directory 'exit.json') -Encoding utf8NoBOM
+        $process.Dispose()
+    }
+    if ($null -ne $record.capture_error) { throw "native原通道捕获失败：$($record.capture_error)" }
+    return $record
+}
+
 function Convert-ToWslPath([string]$Path) {
     $singleQuoteEscape = "'" + '"' + "'" + '"' + "'"
     $escaped = $Path.Replace("'", $singleQuoteEscape)
+    if ($ModifiedRecipe) {
+        $call = Invoke-ModifiedNative 'wsl.exe' @('--distribution',$WslDistribution,'--','bash','-lc',"wslpath -a '$escaped'") 'wslpath'
+        $result = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($call.stdout))
+        if ($call.exit -ne 0 -or [string]::IsNullOrWhiteSpace($result)) { throw "无法转换 WSL 路径: $Path" }
+    }
+    else {
     $result = & wsl.exe --distribution $WslDistribution -- bash -lc "wslpath -a '$escaped'" 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($result)) {
         throw "无法转换 WSL 路径: $Path"
+    }
     }
     return $result.Trim()
 }
 
 function Invoke-Wsl([string]$WorkingDirectory, [string]$Command, [string]$Action) {
     if ($ModifiedRecipe) {
+        if ((Test-Path -LiteralPath (Join-Path $AttemptRoot 'lifecycle-halt')) -or (Test-Path -LiteralPath (Join-Path $ConfigurationRoot 'lifecycle-halt'))) { throw 'attempt已HALT；禁止新launch' }
         $callId = [Guid]::NewGuid().ToString('N')
-        $callLog = Join-Path $AttemptRoot "wsl-$callId.log"
-        & wsl.exe --distribution $WslDistribution --cd $WorkingDirectory -- bash -lc $Command 2>&1 | Tee-Object -FilePath $callLog | Out-Host
-        $callExit = $LASTEXITCODE
-        @{
-            argv = @("wsl.exe", "--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--", "bash", "-lc", $Command)
-            exit = $callExit
-            action = $Action
-            log = $callLog
-        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $AttemptRoot "wsl-$callId.json") -Encoding UTF8
-        if ($callExit -ne 0) { throw "$Action 失败；原调用/输出保留于 $AttemptRoot" }
+        if ($null -eq (Get-Variable -Name ReleaseALifecycleNonce -Scope Script -ErrorAction SilentlyContinue)) {
+            $script:ReleaseALifecycleNonce = [Guid]::NewGuid().ToString('N')
+        }
+        $lifecycleSource = @'
+#!/usr/bin/env python3
+"""仅当前受信checkout生成的 RELEASE A Linux scope；不是包内可执行 verifier。"""
+import argparse
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+
+def write(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + '.writing')
+    with temporary.open('x') as stream:
+        json.dump(value, stream, sort_keys=True, indent=2)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+class OwnershipUncertain(RuntimeError):
+    """当前扫描不能授予signal/seal；只能在既定预算内重新只读观察。"""
+
+
+def identity(pid):
+    path = Path('/proc', str(pid))
+    first = (path / 'stat').read_text()
+    fields = first[first.rindex(')') + 2:].split()
+    uid_lines = [line.split()[1:] for line in (path / 'status').read_text().splitlines() if line.startswith('Uid:')]
+    require(len(uid_lines) == 1 and len(uid_lines[0]) == 4, '实际/proc/status Uid缺失')
+    uids = [int(value) for value in uid_lines[0]]
+    again = (path / 'stat').read_text()
+    after = again[again.rindex(')') + 2:].split()
+    if any(fields[i] != after[i] for i in (1, 2, 3, 19)):
+        raise OwnershipUncertain('读取/proc身份时父系/租约变化')
+    return {'pid': pid, 'ppid': int(fields[1]), 'pgid': int(fields[2]), 'sid': int(fields[3]),
+            'starttime': int(fields[19]), 'state': after[0], 'uid': uids[1], 'uid_values': uids}
+
+
+def same(actual, expected):
+    return all(actual[k] == expected[k] for k in ('pid', 'pgid', 'sid', 'starttime', 'uid'))
+
+
+def table():
+    result = {}
+    for path in Path('/proc').iterdir():
+        if path.name.isdigit():
+            try:
+                result[int(path.name)] = identity(int(path.name))
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+    return result
+
+
+def spawn_gated(argv, cwd, stdout_fd=None, stderr_fd=None):
+    """共享POSIX子层：实际exec前等待GO；Linux登记与租约由调用者负责。"""
+    ready_r, ready_w = os.pipe()
+    go_r, go_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(ready_r)
+            os.close(go_w)
+            os.setsid()
+            if stdout_fd is not None:
+                os.dup2(stdout_fd, 1)
+            if stderr_fd is not None:
+                os.dup2(stderr_fd, 2)
+            os.chdir(cwd)
+            os.write(ready_w, json.dumps({'pid': os.getpid(), 'pgid': os.getpgrp(),
+                                        'sid': os.getsid(0)}).encode() + b'\n')
+            os.close(ready_w)
+            require(os.read(go_r, 1) == b'G', '缺少登记后的 GO')
+            os.close(go_r)
+            os.execvp(argv[0], argv)
+        except BaseException as error:
+            os.write(2, ('supervisor child: ' + str(error)).encode())
+            os._exit(126)
+    os.close(ready_w)
+    os.close(go_r)
+    with os.fdopen(ready_r, 'rb') as ready:
+        data = json.loads(ready.readline())
+    require(data == {'pid': pid, 'pgid': pid, 'sid': pid}, 'setsid 启动身份不符')
+    return pid, go_w
+
+
+class Locked:
+    def __init__(self, scope):
+        self.path = Path(scope) / 'control.lock'
+    def __enter__(self):
+        self.stream = self.path.open('a+')
+        fcntl.flock(self.stream, fcntl.LOCK_EX)
+        return self
+    def __exit__(self, *args):
+        fcntl.flock(self.stream, fcntl.LOCK_UN)
+        self.stream.close()
+
+
+def metadata(scope, nonce):
+    path = Path(scope) / 'scope.json'
+    source = Path(__file__).absolute()
+    expected = {'nonce': nonce, 'source_path': str(source),
+                'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest()}
+    if path.exists():
+        require(json.loads(path.read_bytes()) == expected, 'scope nonce/source bytes/path 漂移')
+    else:
+        write(path, expected)
+    return expected
+
+
+def owned_graph(processes, children, leader, supervisor):
+    require(leader['pid'] in processes and supervisor['pid'] in processes, '锚点租约缺失')
+    require(same(processes[leader['pid']], leader) and same(processes[supervisor['pid']], supervisor), '锚点UID/租约变化')
+    require(processes[leader['pid']]['ppid'] == supervisor['pid'], 'leader原父系变化')
+    require(supervisor['pid'] != leader['pid'], 'supervisor不能为组内leader')
+    if not children <= set(processes):
+        raise OwnershipUncertain('直接收养children扫描不完整')
+    group = {pid: item for pid, item in processes.items() if item['pgid'] == leader['pgid']}
+    require(leader['pid'] in group, 'leader不在原组')
+    for pid in children:
+        require(processes[pid]['ppid'] == supervisor['pid'], '收养父系不匹配')
+        require(pid in group and processes[pid]['sid'] == leader['sid'], '发现组外直接收养后代')
+    # 包含所有当前后代，拒绝离开原SID/PGID的分支；不靠UID或进程名推断。
+    descendants = {supervisor['pid']}
+    for _ in range(len(processes) + 1):
+        more = {pid for pid, item in processes.items() if item['ppid'] in descendants}
+        if more <= descendants:
+            break
+        descendants |= more
+    require(all(pid in group for pid in descendants - {supervisor['pid']}), '发现逃逸SID/PGID后代')
+    for pid, item in group.items():
+        require(item['sid'] == leader['sid'] and item['starttime'] >= leader['starttime'], '原组session/starttime不匹配')
+        current, seen = item, set()
+        while current['pid'] != supervisor['pid']:
+            require(current['pid'] not in seen, '父系环路')
+            seen.add(current['pid'])
+            require(current['pgid'] == leader['pgid'] and current['sid'] == leader['sid'], '父系经过组外祖先')
+            parent = processes.get(current['ppid'])
+            if parent is None:
+                raise OwnershipUncertain('父系祖先缺失，不能证明归属')
+            require(parent['starttime'] <= current['starttime'], '父PID复用或父starttime晚于child')
+            if parent['pid'] == supervisor['pid']:
+                require(current['pid'] in children, '实际收养children缺少父系成员')
+            current = parent
+    return group
+
+
+def stable_ownership(first, second, first_children, second_children, leader, supervisor):
+    left = owned_graph(first, first_children, leader, supervisor)
+    right = owned_graph(second, second_children, leader, supervisor)
+    keys = ('pid', 'starttime', 'ppid', 'sid', 'pgid')
+    if first_children != second_children or set(left) != set(right):
+        raise OwnershipUncertain('两次快照成员/直接children集合不稳定')
+    for pid in set(left) | {supervisor['pid']}:
+        if any(first[pid][key] != second[pid][key] for key in keys):
+            raise OwnershipUncertain('两次快照父系/identity不稳定')
+    return [second[pid] for pid in sorted(right)]
+
+
+def members(leader, supervisor):
+    try:
+        require(same(identity(supervisor['pid']), supervisor) and same(identity(leader['pid']), leader), '扫描前锚点租约变化')
+        children_path = Path('/proc', str(supervisor['pid']), 'task', str(supervisor['pid']), 'children')
+        def snapshot():
+            before = {int(pid) for pid in children_path.read_text().split()}
+            processes = table()
+            after = {int(pid) for pid in children_path.read_text().split()}
+            if before != after:
+                raise OwnershipUncertain('扫描中直接children变化')
+            return processes, after
+        first, children_a = snapshot()
+        second, children_b = snapshot()
+        group = stable_ownership(first, second, children_a, children_b, leader, supervisor)
+        # 最后重读父/子及两个锚点；不以/proc非原子扫描冒充PID租约。
+        for expected in group + [supervisor]:
+            actual = identity(expected['pid'])
+            if any(actual[key] != expected[key] for key in ('pid', 'starttime', 'ppid', 'sid', 'pgid')):
+                raise OwnershipUncertain('父/子最终重读不稳定')
+        require(same(identity(supervisor['pid']), supervisor) and same(identity(leader['pid']), leader), '扫描后锚点UID/租约变化')
+        if {int(pid) for pid in children_path.read_text().split()} != children_b:
+            raise OwnershipUncertain('最终直接children变化')
+        return group
+    except (FileNotFoundError, ProcessLookupError) as error:
+        raise OwnershipUncertain('扫描进程消失；当前不授signal/seal') from error
+
+
+def signal_registered(start, sig):
+    # 只有持有未reap子PID租约的原parent发送；外部stop只HALT并等待，避免check→helper死亡→PGID复用。
+    require(os.getpid() == start['supervisor']['pid'], '只有持有leader租约的原supervisor可发信号')
+    require(same(identity(start['supervisor']['pid']), start['supervisor']), 'supervisor 死亡/身份变化')
+    require(same(identity(start['leader']['pid']), start['leader']), 'leader PID 租约丢失；不得凭旧PGID发信号')
+    members(start['leader'], start['supervisor'])
+    try:
+        os.killpg(start['leader']['pgid'], sig)
+    except ProcessLookupError:
+        pass
+
+
+def run(scope, nonce, call_id, argv):
+    require(sys.platform == 'linux' and hasattr(os, 'waitid') and hasattr(os, 'WNOWAIT'),
+            '真实 Linux prctl/proc/WNOWAIT 不可用')
+    require(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0, 'PR_SET_CHILD_SUBREAPER 失败')
+    scope = Path(scope)
+    scope.mkdir(exist_ok=True)
+    start_path, end_path = scope / (call_id + '.start.json'), scope / (call_id + '.end.json')
+    pid = None
+    error = None
+    terminal = None
+    stopped = False
+    with Locked(scope):
+        meta = metadata(scope, nonce)
+        require(not (scope / 'halt.json').exists(), 'scope 已HALT；拒绝新launch')
+        require(not start_path.exists() and not end_path.exists(), 'call id 重复')
+        supervisor = identity(os.getpid())
+        write(scope / (call_id + '.pending.json'), dict(meta, call_id=call_id, supervisor=supervisor))
+        pid, go = spawn_gated(argv, Path.cwd())
+        leader = identity(pid)
+        require(leader['pid'] == leader['sid'] == leader['pgid'], 'leader session/PGID 不独立')
+        start = dict(meta, call_id=call_id, inner_argv=argv, cwd=str(Path.cwd()),
+                     leader=leader, supervisor=supervisor)
+        write(start_path, start)
+        os.write(go, b'G')
+        os.close(go)
+    try:
+        cleanup_started = None
+        term_sent = killed = False
+        observed_difference = False
+        last_uncertainty = None
+        while True:
+            # WNOWAIT保留leader，只有本parent在租约仍成立时可发组信号。
+            terminal = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            halted = (scope / 'halt.json').exists()
+            if halted or terminal is not None:
+                if cleanup_started is None:
+                    cleanup_started = time.monotonic()
+                require(time.monotonic() - cleanup_started < 10, '有界观察/回收耗尽；' + str(last_uncertainty))
+            try:
+                with Locked(scope):
+                    group = members(leader, supervisor)
+                differences = [item for item in group if item['uid'] != leader['uid']]
+                if differences and not observed_difference:
+                    write(scope / (call_id + '.observations.json'), dict(nonce=nonce, call_id=call_id,
+                        leader=leader, supervisor=supervisor, owned_uid_differences=differences))
+                    observed_difference = True
+                live = [item for item in group if item['state'] != 'Z']
+                if terminal is not None and not live:
+                    with Locked(scope):
+                        final = members(leader, supervisor)
+                        require(all(item['state'] == 'Z' for item in final), '最终仍有live成员')
+                        for item in final:
+                            if item['pid'] != pid and item['ppid'] == os.getpid():
+                                os.waitpid(item['pid'], os.WNOHANG)
+                        require(same(identity(pid), leader), '最终reap前leader租约变化')
+                        _, status = os.waitpid(pid, 0)
+                        stopped = True
+                        exit_code = os.waitstatus_to_exitcode(status)
+                        write(end_path, dict(nonce=nonce, call_id=call_id, quiescent=True, reaped=True,
+                            child_exit=exit_code, error=error, last_uncertainty=last_uncertainty,
+                            observed_uid_difference=observed_difference))
+                    return exit_code if error is None else 124
+                if halted or (terminal is not None and live):
+                    if error is None:
+                        error = 'scope HALT' if halted else 'leader退出后仍有同组写入后代'
+                    if not term_sent:
+                        with Locked(scope):
+                            signal_registered(start, signal.SIGTERM)
+                        term_sent = True
+                    if not killed and time.monotonic() - cleanup_started > 2:
+                        with Locked(scope):
+                            signal_registered(start, signal.SIGKILL)
+                        killed = True
+            except OwnershipUncertain as uncertainty:
+                # 只读重观测不扩大/重启任何进程；最后原因固定一个字段，不无限增长日志。
+                last_uncertainty = str(uncertainty)
+            time.sleep(.05)
+    except BaseException as failure:
+        error = str(failure)
+        with Locked(scope):
+            write(end_path, dict(nonce=nonce, call_id=call_id, quiescent=False, reaped=stopped,
+                                 child_exit=None, error=error))
+        raise
+
+
+def stop(scope, nonce):
+    require(sys.platform == 'linux', 'stop 必须在真实 Linux')
+    scope = Path(scope)
+    with Locked(scope):
+        metadata(scope, nonce)
+        if not (scope / 'halt.json').exists():
+            write(scope / 'halt.json', {'nonce': nonce, 'reason': '当前job有界收尾；拒绝新launch'})
+    began = time.monotonic()
+    while True:
+        pending = []
+        with Locked(scope):
+            for pending_path in scope.glob('*.pending.json'):
+                require(pending_path.with_name(pending_path.name.replace('.pending.json', '.start.json')).exists(),
+                        '登记前helper失败；无法证明无未登记child，拒绝seal')
+            for path in sorted(scope.glob('*.start.json')):
+                start = json.loads(path.read_bytes())
+                require(start['nonce'] == nonce, 'call nonce 不匹配')
+                end = path.with_name(path.name.replace('.start.json', '.end.json'))
+                if end.exists():
+                    record = json.loads(end.read_bytes())
+                    require(record['nonce'] == nonce and record['quiescent'] and record['reaped'],
+                            'supervisor 未证明停止，拒绝seal')
+                    continue
+                pending.append(start['call_id'])
+                helper = identity(start['supervisor']['pid'])
+                require(helper['state'] != 'Z' and same(helper, start['supervisor']), 'helper死亡/身份变化；拒绝seal')
+                require(same(identity(start['leader']['pid']), start['leader']), 'leader租约丢失；拒绝seal')
+                try:
+                    members(start['leader'], start['supervisor'])
+                except OwnershipUncertain:
+                    pass  # 本轮不授seal；等原supervisor最终终态，12秒预算不变。
+                # HALT已持锁写入；原parent负责有界TERM/KILL，外部绝不凭旧PGID发送。
+            if not pending:
+                write(scope / 'stopped.json', {'nonce': nonce, 'quiescent': True, 'new_launches_blocked': True})
+                return
+        require(time.monotonic() - began < 12, 'scope收尾超时；拒绝seal')
+        time.sleep(.05)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('run', 'stop'))
+    parser.add_argument('--scope', type=Path, required=True)
+    parser.add_argument('--nonce', required=True)
+    parser.add_argument('--call-id')
+    parser.add_argument('inner', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    require(len(args.nonce) == 32 and all(c in '0123456789abcdef' for c in args.nonce), 'nonce格式错误')
+    if args.action == 'stop':
+        require(not args.inner, 'stop 不接受任意命令')
+        stop(args.scope, args.nonce)
+        return 0
+    require(args.call_id and len(args.call_id) == 32 and all(c in '0123456789abcdef' for c in args.call_id) and args.inner[:2] == ['bash', '-lc'], 'run 参数错误')
+    require(args.inner[:2] == ['bash', '-lc'] and len(args.inner) == 3, '只接受原inner bash -lc Command')
+    return run(args.scope, args.nonce, args.call_id, args.inner)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+'@
+        $supervisor = Join-Path $AttemptRoot "release-a-supervisor.py"
+        $supervisorBytes = [Text.UTF8Encoding]::new($false).GetBytes($lifecycleSource.Replace("`r`n", "`n").TrimEnd([char[]]"`r`n") + "`n")
+        if (Test-Path -LiteralPath $supervisor) {
+            if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($supervisor)) -cne [Convert]::ToBase64String($supervisorBytes)) {
+                throw "同job supervisor bytes 变化；拒绝执行"
+            }
+        }
+        else { [IO.File]::WriteAllBytes($supervisor, $supervisorBytes) }
+        $supervisorWsl = Convert-ToWslPath $supervisor
+        $scopeWsl = (Convert-ToWslPath $AttemptRoot) + "/lifecycle"
+        $intentArgv = @("wsl.exe", "--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--", "bash", "-lc", $Command)
+        $actualArgs = @("--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--", "python3", $supervisorWsl,
+            "--scope", $scopeWsl, "--nonce", $script:ReleaseALifecycleNonce, "--call-id", $callId, "run", "--", "bash", "-lc", $Command)
+        New-Item -ItemType Directory -Force -Path (Join-Path $AttemptRoot 'lifecycle') | Out-Null
+        $intent = @{ nonce = $script:ReleaseALifecycleNonce; supervisor_linux = $supervisorWsl; scope_linux = $scopeWsl
+            source_sha256 = (Get-FileHash -LiteralPath $supervisor -Algorithm SHA256).Hash.ToLowerInvariant() }
+        $intentTemporary = Join-Path $AttemptRoot 'lifecycle-intent.writing'
+        $intent | ConvertTo-Json | Set-Content -LiteralPath $intentTemporary -Encoding utf8NoBOM
+        Move-Item -Force -LiteralPath $intentTemporary -Destination (Join-Path $AttemptRoot 'lifecycle-intent.json')
+        $stdoutPath = Join-Path $AttemptRoot "wsl-$callId.stdout.bin"
+        $stderrPath = Join-Path $AttemptRoot "wsl-$callId.stderr.bin"
+        $recordPath = Join-Path $AttemptRoot "wsl-$callId.json"
+        $record = @{ intent_argv = $intentArgv; argv = @("wsl.exe") + $actualArgs; cwd = (Get-Location).ProviderPath
+            inner_argv = @("bash", "-lc", $Command); inner_cwd = $WorkingDirectory; action = $Action; exit = $null
+            stdout = $stdoutPath; stderr = $stderrPath; capture_error = $null; capture_complete = $false; terminated = $false
+            lifecycle = @{ nonce = $script:ReleaseALifecycleNonce; scope = $scopeWsl; supervisor = $supervisorWsl
+                source_sha256 = (Get-FileHash -LiteralPath $supervisor -Algorithm SHA256).Hash.ToLowerInvariant() } }
+        try {
+            if ((Test-Path -LiteralPath (Join-Path $AttemptRoot 'lifecycle-halt')) -or (Test-Path -LiteralPath (Join-Path $ConfigurationRoot 'lifecycle-halt'))) { throw 'attempt已HALT；禁止新launch' }
+            $raw = Invoke-ModifiedNative 'wsl.exe' $actualArgs 'supervised-wsl'
+            $record.exit = $raw.exit; $record.capture_error = $raw.capture_error
+            $record.capture_complete = $raw.capture_complete; $record.terminated = $raw.terminated
+            $record.stdout = $raw.stdout; $record.stderr = $raw.stderr; $record.raw_receipt = $raw.receipt
+        }
+        catch { $record.capture_error = $_.ToString(); $record.error_detail = $_.Exception.ToString() }
+        finally {
+            $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $recordPath -Encoding utf8NoBOM
+        }
+        if ($null -ne $record.capture_error) { throw "原stream capture失败；原记录 $recordPath；$($record.capture_error)" }
+        if ($record.exit -ne 0) { throw "$Action 失败；原调用/分离bytes与退出保留于 $AttemptRoot" }
         return
     }
     & wsl.exe --distribution $WslDistribution --cd $WorkingDirectory -- bash -lc $Command
@@ -309,6 +788,21 @@ try {
     $oldGpgHome = $env:GNUPGHOME
     $env:GNUPGHOME = $gpgRelative
     try {
+        if ($ModifiedRecipe) {
+            # argv/cwd/三次调用顺序保持；门禁使用stdout的独立解码副本，原双通道不拼接冒充交错序。
+            $import = Invoke-ModifiedNative $gpg @('--batch','--no-autostart','--import',$SigningKey) 'gpg-import'
+            $fingerprint = Invoke-ModifiedNative $gpg @('--batch','--no-autostart','--with-colons','--fingerprint','FFmpeg release signing key') 'gpg-fingerprint'
+            $fingerprints = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($fingerprint.stdout))
+            if ($fingerprints -notmatch "fpr:::::::::${ReleaseFingerprint}:") {
+                throw "FFmpeg 发布密钥指纹不匹配"
+            }
+            $verification = Invoke-ModifiedNative $gpg @('--batch','--no-autostart','--status-fd','1','--verify',$Signature,$Archive) 'gpg-verify'
+            $signatureStatus = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($verification.stdout))
+            if ($verification.exit -ne 0 -or $signatureStatus -notmatch "VALIDSIG $ReleaseFingerprint ") {
+                throw "FFmpeg 8.1.2 发布签名验证失败`n$signatureStatus"
+            }
+        }
+        else {
         # 公钥验证无需 agent；精确 fingerprint 与 VALIDSIG 是不可省略的成功门禁。
         & $gpg --batch --no-autostart --import $SigningKey 2>&1 | Out-Host
         $fingerprints = (& $gpg --batch --no-autostart --with-colons --fingerprint "FFmpeg release signing key") -join "`n"
@@ -318,6 +812,7 @@ try {
         $signatureStatus = (& $gpg --batch --no-autostart --status-fd 1 --verify $Signature $Archive 2>&1) -join "`n"
         if ($LASTEXITCODE -ne 0 -or $signatureStatus -notmatch "VALIDSIG $ReleaseFingerprint ") {
             throw "FFmpeg 8.1.2 发布签名验证失败`n$signatureStatus"
+        }
         }
     }
     finally {
@@ -370,6 +865,17 @@ try {
     if ($ArchitectureProfile.RequiresX86Asm) {
         $requiredWslTools += " && command -v nasm >/dev/null"
     }
+    if ($ModifiedRecipe) {
+        $call = Invoke-ModifiedNative 'wsl.exe' @('--distribution',$WslDistribution,'--','bash','-lc',$requiredWslTools) 'required-tools'
+        if ($call.exit -ne 0) {
+        $requiredToolsText = "bash/make/$($ArchitectureProfile.CrossCompiler)"
+        if ($ArchitectureProfile.RequiresX86Asm) {
+            $requiredToolsText += "/nasm"
+        }
+        throw "WSL distribution '$WslDistribution' 缺少 $requiredToolsText"
+        }
+    }
+    else {
     & wsl.exe --distribution $WslDistribution -- bash -lc $requiredWslTools
     if ($LASTEXITCODE -ne 0) {
         $requiredToolsText = "bash/make/$($ArchitectureProfile.CrossCompiler)"
@@ -377,6 +883,7 @@ try {
             $requiredToolsText += "/nasm"
         }
         throw "WSL distribution '$WslDistribution' 缺少 $requiredToolsText"
+    }
     }
     $sourceWsl = Convert-ToWslPath $SourceDir
     $distWsl = Convert-ToWslPath $DistDir

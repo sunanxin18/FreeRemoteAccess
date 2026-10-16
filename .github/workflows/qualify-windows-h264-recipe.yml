@@ -1,0 +1,60 @@
+name: Windows H264 recipe A build-side evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute_release_a:
+        description: Explicit root-authorized RELEASE A attempt
+        type: boolean
+        required: true
+        default: false
+  # 首次受限注册push本身消耗一次实际构建授权；不是GitHub自动one-shot。
+  # 后续改此文件仍可能触发；root台账去重，稳态删除此例外须另审。
+  push:
+    branches:
+      - codex/rdp-egfx-hevc-preference
+    paths:
+      - .github/workflows/qualify-windows-h264-recipe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-h264-recipe-authority-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-a:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.execute_release_a == true) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/codex/rdp-egfx-hevc-preference')
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      RELEASE_A_EXECUTE: ${{ inputs.execute_release_a == true && 'true' || 'false' }}
+      RELEASE_A_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      RELEASE_A_WORKFLOW_REF: ${{ github.workflow_ref }}
+    steps:
+      - name: Check out exactly this authorized source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Execute the single RELEASE A entry
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute
+      - name: Preserve all original materials and verify the transport
+        if: always()
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect
+      - name: Upload exact POSIX transport, receipt and verification
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-a-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/release-a.tar
+            ${{ runner.temp }}/release-a.receipt.json
+            ${{ runner.temp }}/release-a.verification.json
+          compression-level: 0
+          if-no-files-found: error

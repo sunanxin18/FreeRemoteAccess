@@ -103,3 +103,5 @@ unsigned HAP `b2f83cff9aaf0311e92ff5dbc9898c8f0fc00d86b85077de49de7fa9a6d98b4a`�
 本次可以记录手机→Windows从既有安全存储密码完成登录、真实完整桌面、初次自动旋转存续及主动断开；不能从静态桌面推出持续刷新、输入映射/键鼠/IME、长时间稳定性、重连或其他平台通过。旧约3秒自动退回本次未复现，根因仍UNKNOWN，不能归因于旋转、密码、服务器、网络或“加日志后已修复”。下次再出现时先按固定终态链判读；只有实际Closed仍不够区分EOF/reset/服务器Terminate，不预先扩改协议API。
 
 冻结源码/构建在`target/phone-rdp-terminal-diagnostic-20261016/`；root签验及单次执行在`target/phone-rdp-terminal-root-20261016/`，device manifest `a3927d41d75647407a4dcf6bed3e087d1a9e4fa870ac8d01f28399a5bf3a67d5`，109项/2,325,346B。PC整个阶段未观察或操作，人工填写hold持续。
+
+该诊断提交`c253d82eebbbfbc1d19906afe3729ca42121da4f`的普通自动流程于2026-10-16全部SUCCESS、attempt1：[CI 38841370538](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38841370538)、[Windows package 38841370669](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38841370669)、[macOS ARM64 package 38841370635](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38841370635)、[Linux packages 38841370693](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38841370693)。这是相应源码测试/普通包流程结果，不是新增平台真实远程会话、修改版Windows配方或完整codec生产资格；本轮未为它们请求重跑。
