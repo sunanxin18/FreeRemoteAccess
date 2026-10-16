@@ -1,6 +1,6 @@
 # RDP RGBA→BGRX 的 SSE2 转换
 
-2026-10-16，状态：**开发中**。本次补齐 Windows/Linux x86 与 x86_64 的 SSE2 转换主体；Linux/Windows i686与x86_64已有新体局部实际运行；保护页、ABI 和性能尚未完成，不能据此授予完整解码器或客户端生产资格。
+2026-10-16，状态：**开发中**。本次补齐 Windows/Linux x86 与 x86_64 的 SSE2 转换主体；Linux/Windows i686与x86_64已有新体局部实际运行；Windows保护页、各目标ABI和性能尚未完成，不能据此授予完整解码器或客户端生产资格。
 
 RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 可用时使用原生实现，否则回到标量。现在保留 SSSE3 优先，其后检查真实 SSE2，再选择共享的 SSE2 入口；只有未通过 SSE2 检查的 CPU 才使用明确的 reference 后备。协议、解码器选择、Surface 合同、默认策略、能力广告和 ARM64 实现保持。
 
@@ -16,7 +16,8 @@ RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 
 | Linux i686/x86_64 | 两个实际源码优化ELF对象编译通过；后续普通CI已执行x86_64新体12项、i686新体11项局部测试 |
 | SSE2静态指令 | 四个精确入口及内联数值核心仅见SSE2指令；外部memcpy/TLS/panic运行库未链接，不代表最终ISA闭包 |
 | 原体反例/新体执行 | 原体RED快照与精确运行方法已准备；Linux/Windows x86_64新体各12项、两平台i686新体各11项实际通过；原体实际RED尚未完成 |
-| 保护页、ABI/unwind、有限性能 | 尚未完成；sentinel和对象编译不能替代 |
+| Linux私有non-test保护页 | x86_64/i686实际普通release ELF，各kernel各160合法case及五精确SIGSEGV负控通过；不是shipping库资格 |
+| Windows保护页、ABI/unwind、有限性能 | 尚未完成；sentinel和对象编译不能替代 |
 
 最终源SHA256：`pixel_convert.rs` 为`ee5623097b839166f311ffc0a9fffbfbc3d8b59163da96df8b9171692f4fa66c`，`pixel_convert/x86.rs` 为`232fabaca6781a9e3ef5110de292d3c4b017066b847f7ee9b31ad4f7ad8aeaf9`。原SSSE3数值体与ARM64文件保持；macOS只支持ARM64，本次没有macOS Intel构建。
 
@@ -63,3 +64,17 @@ Windows x64独立执行读数复核报告SHA256为`0e1795072152e000428ee734c27e3
 后继沿用现有Linux x64/i686矩阵，普通release build后顺序运行parity/guards，失败即停并保存固定原件；ARM64跳过该专用步骤。此接线不改变产品decoder、协议、manifest或默认行为。
 
 现有Linux矩阵接线经独立配置审查，identity写入失败时保留原非零状态的P3也已关闭，最终报告SHA256 `70dd0111c9c319cd5af435872a129170aa870c51f0606148b600ed3d97435023`。root已读完整两源、清理delta、workflow完整增量及最后分支，核当前源身份后，只释放随审定提交push的首次Linux x64/i686实际parity/guards；不另dispatch或自动重跑，运行结果另记。
+
+## Linux x64/i686 实际保护页通过
+
+提交`59cdd705eaeebbe7c0a69f5f43c1b76ecc672240`的[Linux run38854683582](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38854683582)中，x64 job116823393522和i686 job116823393262的专用native及上传步骤均已通过。两端各以普通非test release bin运行实际叶子：SSE2/SSSE3各10,240例parity、各160例合法保护页case，valid child exit0；五类故意访问分别在ready后准确SIGSEGV，最终GUARDS_OK。采集时整个包job仍在运行，不能把该局部结果记为整个workflow成功。
+
+两份原ZIP各恰8成员，包含四日志、ELF与三源；三源before/after及归档字节一致。x64为ELF64/machine62、SHA256 `03fce6dc05138d4a65ae42c5f8b0033eaf9952beabd06c1bd4f670b6f92258ce`；i686为ELF32/machine3、SHA256 `31035213178eab4cd12842a877701ecb3660c233a840b63a42078244c3b65004`。root只读核对原件和构建命令，没有执行下载ELF。独立报告SHA256分别为`2879e12ccb3c063f7cda18aeb8e993852338a707b42bffc1ced6e0aedc8113d5`、`e39c52ec5256bf0cb36325787c64e8ff5fee8cbd9ed13f8e18900e235478ac72`。
+
+这关闭Linux两个私有普通binary的有界parity/guard运行门。旧体实际RED、Windows保护页、直接ABI、最终生产shipping ISA/系统runtime闭包和有限性能仍开放，不外推到完整解码器、包或live产品资格。原故障负控状态中的`core dumped`文本保留，不据此声称有core文件或产品bug。
+
+## 固定旧体反例的原生执行接线
+
+四个冻结fixture已随仓库交付，保留原SSSE3→scalar dispatch及仅否决真实SSSE3的测试hook；Linux x64/i686各编译一次，只运行具名counter测试。接受条件同时要求编译0、运行101、唯一精确counter断言在第195行失败，以及0 passed/1 failed/9 filtered；像素字面值和suffix检查在该断言之前。任意非零、CPU前置检查失败或意外GREEN均不算预期反例。十个精确原件分别保存源、exe、四通道日志及身份，不改变生产源或默认策略。
+
+作者报告SHA256 `42c9cb27b404a917de925bfef70b0bbd88d1f39ae3363985e1403aed872e463f`，独立审查 `be63ed1efeeec81b9af12ee89d9f44013658d8059f079b0eeb6d6cc582eb13aa`。root已全文读增量及两报告，并重新核对五源和全部20项审查输入。此次只接受源码与执行接线；首次随本次功能分支push执行，实际两个目标RED仍待原始日志核验，ABI、shipping闭包和性能保持开放。

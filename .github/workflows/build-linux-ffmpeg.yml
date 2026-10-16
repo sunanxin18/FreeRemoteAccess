@@ -221,6 +221,115 @@ jobs:
             crates/frd-protocol-rdp/src/pixel_convert/x86.rs
           if-no-files-found: error
 
+      - name: Prove frozen original x86 publication counterexample
+        if: matrix.arch == 'x86_64' || matrix.arch == 'i686'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          target='${{ matrix.cargo_target }}'
+          fixture=crates/frd-protocol-rdp/tests/fixtures/sse2-publication-red
+          evidence="target/sse2-publication-red/$target"
+          mkdir -p target/sse2-publication-red
+          mkdir "$evidence"
+          identity="$evidence/identity.log"
+          executable="$evidence/publication-red"
+          sources=("$fixture/host_controls.rs" "$fixture/pixel_convert.rs" "$fixture/pixel_convert/x86.rs" "$fixture/SHA256SUMS")
+          before=''
+          compile_exit=not-run
+          run_exit=not-run
+          strict_verdict=not-accepted
+          finish_publication_red_evidence() {
+            original_exit=$?
+            trap - EXIT
+            set +e
+            after=$(sha256sum "${sources[@]}" 2>&1)
+            hash_exit=$?
+            final_exit=$original_exit
+            if [[ $hash_exit -ne 0 || "$before" != "$after" ]]; then
+              strict_verdict=not-accepted
+              if [[ $final_exit -eq 0 ]]; then final_exit=1; fi
+            fi
+            executable_hash=''
+            if [[ -f "$executable" ]]; then
+              executable_hash=$(sha256sum "$executable" 2>&1)
+              if [[ $? -ne 0 ]]; then
+                strict_verdict=not-accepted
+                if [[ $final_exit -eq 0 ]]; then final_exit=1; fi
+              fi
+            fi
+            if ! {
+              printf 'fixture_after_sha256\n%s\n' "$after"
+              printf 'executable_final_sha256\n%s\n' "$executable_hash"
+              printf 'compile_exit=%s run_exit=%s strict_verdict=%s original_exit=%s final_exit=%s\n' "$compile_exit" "$run_exit" "$strict_verdict" "$original_exit" "$final_exit"
+            } >> "$identity"; then
+              if [[ $final_exit -eq 0 ]]; then final_exit=1; fi
+              exit "$final_exit"
+            fi
+            exit "$final_exit"
+          }
+          trap finish_publication_red_evidence EXIT
+          { printf 'target=%s arch=%s\n' "$target" '${{ matrix.arch }}'; rustc -Vv; uname -a; } > "$identity"
+          before=$(sha256sum "${sources[@]}")
+          printf 'fixture_before_sha256\n%s\n' "$before" >> "$identity"
+          manifest_hash=$(sha256sum "$fixture/SHA256SUMS")
+          test "${manifest_hash%% *}" = 71b38ac579fdf1d7bf8566b2da48fdcc6a326cd1d6e4fd9dbc832886db5aa86a
+          (cd "$fixture" && sha256sum --check --strict SHA256SUMS) >> "$identity" 2>&1
+          compile=(rustc --edition=2021 --test "$fixture/host_controls.rs" --target "$target" -Copt-level=3 -Ccodegen-units=1)
+          if [[ "${{ matrix.arch }}" == i686 ]]; then compile+=(-Clinker=i686-linux-gnu-gcc); fi
+          compile+=(-o "$executable")
+          { printf 'compile_argv '; printf '%q ' "${compile[@]}"; printf '\n'; } >> "$identity"
+          set +e
+          "${compile[@]}" > "$evidence/compile.stdout.log" 2> "$evidence/compile.stderr.log"
+          compile_exit=$?
+          set -e
+          printf 'compile_exit=%s\n' "$compile_exit" >> "$identity"
+          if [[ $compile_exit -ne 0 ]]; then exit "$compile_exit"; fi
+          test -x "$executable"
+          name=pixel_convert::tests::publication_actual_sse2_dispatch_when_ssse3_denied
+          run=("$executable" --exact "$name" --nocapture --test-threads=1)
+          { printf 'run_argv '; printf '%q ' "${run[@]}"; printf '\n'; } >> "$identity"
+          set +e
+          "${run[@]}" > "$evidence/run.stdout.log" 2> "$evidence/run.stderr.log"
+          run_exit=$?
+          set -e
+          printf 'run_exit=%s\n' "$run_exit" >> "$identity"
+          test "$run_exit" -eq 101
+          stdout="$evidence/run.stdout.log"
+          stderr="$evidence/run.stderr.log"
+          count=$(grep -Fxc 'running 1 test' "$stdout"); test "$count" -eq 1
+          count=$(grep -Ec '^running ' "$stdout"); test "$count" -eq 1
+          count=$(grep -Fxc "test $name ... FAILED" "$stdout"); test "$count" -eq 1
+          count=$(grep -Ec '^test [^ ]+ \.\.\.' "$stdout"); test "$count" -eq 1
+          count=$(grep -Fxc "    $name" "$stdout"); test "$count" -eq 1
+          count=$(grep -Ec '^test result:' "$stdout"); test "$count" -eq 1
+          count=$(grep -Ec '^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in ' "$stdout"); test "$count" -eq 1
+          count=$(grep -Fc "panicked at $fixture/pixel_convert.rs:195:" "$stderr"); test "$count" -eq 1
+          count=$(grep -Fc 'panicked at ' "$stderr"); test "$count" -eq 1
+          count=$(grep -Fxc 'assertion `left == right` failed: 像素相同仍不得让 SSE2-only publication 静默调用 scalar' "$stderr"); test "$count" -eq 1
+          count=$(grep -Fxc '  left: 0' "$stderr"); test "$count" -eq 1
+          count=$(grep -Fxc ' right: 1' "$stderr"); test "$count" -eq 1
+          strict_verdict=accepted-original-counterexample
+
+      - name: Retain frozen original publication counterexample evidence
+        if: always() && (matrix.arch == 'x86_64' || matrix.arch == 'i686')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-linux-publication-red-${{ matrix.cargo_target }}
+          # 任意非0/部分日志均不是RED；须核完整固定断言与strict verdict。
+          path: |
+            crates/frd-protocol-rdp/tests/fixtures/sse2-publication-red/host_controls.rs
+            crates/frd-protocol-rdp/tests/fixtures/sse2-publication-red/pixel_convert.rs
+            crates/frd-protocol-rdp/tests/fixtures/sse2-publication-red/pixel_convert/x86.rs
+            crates/frd-protocol-rdp/tests/fixtures/sse2-publication-red/SHA256SUMS
+            target/sse2-publication-red/${{ matrix.cargo_target }}/compile.stdout.log
+            target/sse2-publication-red/${{ matrix.cargo_target }}/compile.stderr.log
+            target/sse2-publication-red/${{ matrix.cargo_target }}/run.stdout.log
+            target/sse2-publication-red/${{ matrix.cargo_target }}/run.stderr.log
+            target/sse2-publication-red/${{ matrix.cargo_target }}/identity.log
+            target/sse2-publication-red/${{ matrix.cargo_target }}/publication-red
+          if-no-files-found: error
+
       - name: Run target ClearCodec, NSCodec and Progressive parity and bounded benchmark
         shell: bash
         run: |

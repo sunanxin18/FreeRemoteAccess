@@ -111,3 +111,11 @@ artifact12026220958为4,117,845字节、SHA256 `d7ea452d9ce0f2d12c64edd4918d337f
 固定Execute、Collect与正式三件的always接线已恢复，独立源码审查Spec PASS / Quality Approved，报告SHA256 `8fd0404f29d90a287260cf3c0fd3afecf75ab3018f9a3beafd14db587ebc43b9`；root已全文读取291行diff并核16项材料及四当前源。唯一workflow控制实际1项RED→GREEN，其余控制无需重复。失败forensic保留原54路径及hidden开关，再加入154个固定阶段原件路径，总208条，无wildcard；它仍只是有限partial，UUID和动态attempt内原件依赖正式完整运输，不因上传成功升为stable。
 
 下一次审定提交只触发一次原固定自然流程，保留初始失败、setup/control拒绝和原工具调用；不另dispatch/rerun，不改变默认upstream或修改核。实际WSL及FFmpeg结果待记录。
+
+### 最新实际执行：WSL 依赖安装中的进程归属拒绝
+
+提交`59cdd705eaeebbe7c0a69f5f43c1b76ecc672240`的[run38854683516/attempt1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38854683516) / job116823393151失败。initialize、checkout、WSL install/version和路径往返已走通；setup实际执行到APT下载及dpkg Reading database，随后原supervisor的`owned_graph`拒绝“发现逃逸SID/PGID后代”，setup原exit1、退出及EOF已记录。Collect的停止核对也实际exit1，拒绝seal；state仍quiescent=false、setup_ready=false、builder_started=false。FFmpeg尚未开始，不能报告H.264编译失败或稳定运输。
+
+forensic artifact12027216250为6,554,118字节，SHA256 `917532044a816f230998b073d0cb1286f193dfd7eb3cba71dd6970f783748adc`，本次原setup stdout/stderr与cleanup stderr已实际带回。原job log第一次下载失败完整保留，第二次只读下载成功，37,910字节、SHA256 `a36516a8a33c050747487903eb302fedec61b6a777919c387232ce74de98a1f3`，不是CI重跑。原件位于`target/desktop-qualification-integration-root-20261016/ci/`。
+
+当前原件未包含触发拒绝的具体PID和两次进程图快照，不能把正常APT伪终端、setsid假设直接当作已证实的现场根因。后继先只读分析并准备有界诊断，不直接放宽进程归属、广泛kill或禁用APT sandbox；旧失败历史及正式A/B/C/D继续开放。
