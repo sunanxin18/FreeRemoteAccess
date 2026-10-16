@@ -143,6 +143,9 @@ jobs:
           cargo test --locked --release --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp bounded_decode_benchmark -- --ignored --nocapture --test-threads=1
           cargo test --locked --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp progressive
           cargo test --locked --release --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp benchmark_progressive_native_tile -- --ignored --nocapture --test-threads=1
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            cargo test --locked --target "${{ matrix.cargo_target }}" -p frd-protocol-rdp --lib pixel_convert::tests:: -- --skip conversion_dispatch_benchmark_records_kernel_and_matches_reference --nocapture --test-threads=1
+          fi
 
       - name: Build and verify exact FFmpeg bundle
         shell: bash

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([ValidateSet('Execute', 'Collect')][string]$Action = 'Execute')
+param([ValidateSet('Execute', 'Collect', 'BootstrapDiagnostic')][string]$Action = 'Execute')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -256,7 +256,245 @@ function Complete-ReleaseATransport($Context, $Paths, [string]$ReceiptPath, [str
     Invoke-ReleaseAFinalVerification $Context $Paths
 }
 function Assert-ReleaseAResult($Record, [string]$Name) {
-    if ($null -ne $Record.error -or $Record.timed_out -or $Record.exit -ne 0) { throw "$Name失败：$($Record | ConvertTo-Json -Compress)" }
+    if ($null -ne $Record.error -or $Record.timed_out -or $Record.exit -ne 0) { throw "${Name}失败：$($Record | ConvertTo-Json -Compress)" }
+}
+function Get-ReleaseABootstrapError($Original) {
+    $command=$null;$position=$null
+    if($null -ne $Original.InvocationInfo){
+        $position=$Original.InvocationInfo.PositionMessage
+        if($null -ne $Original.InvocationInfo.MyCommand){$command=$Original.InvocationInfo.MyCommand.Name}
+    }
+    return @{ message=$Original.ToString(); exception=$Original.Exception.ToString()
+        fully_qualified_error_id=$Original.FullyQualifiedErrorId; category=$Original.CategoryInfo.ToString()
+        command=$command; position=$position
+        script_stack_trace=$Original.ScriptStackTrace }
+}
+function Write-ReleaseABootstrapFirstError([string]$Path, $Original, [string]$Stage) {
+    # 第二次入口/诊断保存失败不能覆盖第一次真实ErrorRecord；它不依赖state/Python/WSL。
+    $value=@{ stage=$Stage; error=(Get-ReleaseABootstrapError $Original) }
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($value | ConvertTo-Json -Depth 24) + "`n")
+    $stream=[IO.File]::Open($Path,'CreateNew','Write','Read')
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+}
+function Invoke-ReleaseABootstrapDiagnostic {
+    param($Context, [string]$Source=$env:GITHUB_SHA, [string]$RunId=$env:GITHUB_RUN_ID,
+        [string]$RunAttempt=$env:GITHUB_RUN_ATTEMPT)
+    if (-not $IsWindows) { throw 'BootstrapDiagnostic只准实际Windows，不以Mac代替' }
+    if ($Source -cnotmatch '^[0-9a-f]{40}$' -or $RunId -cnotmatch '^\d+$' -or $RunAttempt -cnotmatch '^\d+$') {
+        throw 'bootstrap固定source/run身份格式错误'
+    }
+    $root=Join-Path $env:RUNNER_TEMP 'release-a-bootstrap-diagnostic'
+    $summary=Join-Path $env:RUNNER_TEMP 'release-a-bootstrap-diagnostic.json'
+    if ((Test-Path -LiteralPath $root) -or (Test-Path -LiteralPath $summary)) { throw 'bootstrap固定根已存在；禁止覆盖、清理后重试' }
+    $result=@{ schema='freeremotedesk.windows.h264.bootstrap-diagnostic.v1'; source=$Source; run_id=$RunId; run_attempt=$RunAttempt
+        mode='BootstrapDiagnostic'; formal_transport='incomplete-not-produced'; original_run_cause='UNKNOWN'
+        original_failed_run=@{run_id='38847486035';run_attempt='1';source='ba6035752f746651681708c07cefa1c896248880'}
+        forensic_only=$true; stable=$false; material_status='forensic-partial-never-stable'
+        controls_passed=$false; first_failure=$null; diagnostic_errors=@(); cases=@{}; files=@{}; source_bindings=@{}
+        pester=@{status='not-invoked';reason='必需controls不依赖Pester；另有受影响Pester测试供已安装环境使用'} }
+    try {
+        New-Item -ItemType Directory -Path $root | Out-Null
+        $qualifier=Join-Path $Context.repo 'tools/qualify-windows-h264-recipe-A.ps1'
+        $pwsh=(Get-Process -Id $PID).Path
+        $bindings=$result.source_bindings
+        foreach ($item in @(@{name='qualifier-source.ps1';path=$qualifier},@{name='transport-source.py';path=$Context.transport})) {
+            $before=Get-ReleaseAFileIdentity $item.path
+            [IO.File]::Copy($item.path,(Join-Path $root $item.name),$false)
+            $copy=Get-ReleaseAFileIdentity (Join-Path $root $item.name); $after=Get-ReleaseAFileIdentity $item.path
+            if ($before.size -ne $copy.size -or $before.sha256 -cne $copy.sha256 -or $before.sha256 -cne $after.sha256) {
+                throw 'bootstrap源读取期间变化；不执行身份不定fixture'
+            }
+            $bindings[$item.name]=@{path=$item.path;before=$before;saved=$copy;after=$after}
+        }
+        Write-ReleaseAJson (Join-Path $root 'host.json') @{ source=$Source;run_id=$RunId;run_attempt=$RunAttempt
+            os=$env:RUNNER_OS;arch=$env:RUNNER_ARCH;image=$env:ImageOS;image_version=$env:ImageVersion
+            powershell=$PSVersionTable.PSVersion.ToString();process_id=$PID;pwsh=$pwsh;bindings=$bindings }
+        $formatter=@'
+param([string]$Qualifier,[string]$Results,[string]$Historical)
+. $Qualifier
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile($Qualifier,[ref]$tokens,[ref]$errors)
+if ($errors.Count -ne 0) { throw '当前qualifier解析失败' }
+$nodes=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Assert-ReleaseAResult'},$true))
+if ($nodes.Count -ne 1) { throw 'formatter真实函数边界不唯一' }
+$current=$nodes[0].Extent.Text
+$fixed='${Name}失败：';$old='$Name失败：'
+if ([regex]::Matches($current,[regex]::Escape($fixed)).Count -ne 1 -or $current.Contains($old)) { throw 'formatter唯一历史token边界错误' }
+# 仅同一个真实函数的唯一token回退；函数体不镜像另写。局部scriptblock内装载原名，作用域退出即恢复新函数。
+$history=$current.Replace($fixed,$old)
+Write-ReleaseALf $Historical $history
+$rows=@();$failed=$false
+foreach ($sample in @(
+    @{id='error';value=@{error='original-error-marker';timed_out=$false;exit=7}},
+    @{id='exit';value=@{error=$null;timed_out=$false;exit=7}},
+    @{id='timeout';value=@{error=$null;timed_out=$true;exit=0}})) {
+    $red=& { param($Text,$Record) . ([scriptblock]::Create($Text)); try { Assert-ReleaseAResult $Record '初始化边界'; return $null } catch { return $_ } } $history $sample.value
+    $green=$null
+    try { Assert-ReleaseAResult $sample.value '初始化边界' } catch { $green=$_ }
+    $redOk=$null -ne $red -and $red.FullyQualifiedErrorId -like '*VariableIsUndefined*' -and $red.ToString().Contains('Name失败')
+    $greenOk=$null -ne $green -and $green.ToString().StartsWith('初始化边界失败：')
+    if ($greenOk) {
+        $decoded=$green.ToString().Substring('初始化边界失败：'.Length) | ConvertFrom-Json -AsHashtable
+        $greenOk=$decoded.exit -eq $sample.value.exit -and $decoded.error -ceq $sample.value.error -and $decoded.timed_out -eq $sample.value.timed_out
+    }
+    $rows+=@{id=$sample.id;expected=$sample.value;historical_red=$redOk;current_green=$greenOk
+        historical_error=$(if($null -ne $red){Get-ReleaseABootstrapError $red}else{$null})
+        current_error=$(if($null -ne $green){Get-ReleaseABootstrapError $green}else{$null})}
+    if (-not $redOk -or -not $greenOk) { $failed=$true }
+}
+try { Assert-ReleaseAResult @{error=$null;timed_out=$false;exit=0} '成功边界' } catch { $failed=$true }
+$report=@{passed=(-not $failed);historical_token=$old;current_token=$fixed;cases=$rows}
+Write-ReleaseAJson $Results $report
+$report | ConvertTo-Json -Depth 24
+if($failed){exit 1}
+'@
+        $binary=@'
+$out=[Console]::OpenStandardOutput();$err=[Console]::OpenStandardError()
+$a=[byte[]](0,255,65,10);$b=[byte[]](0,254,66,13)
+for($i=0;$i -lt 16384;$i++){$out.Write($a,0,$a.Length);$err.Write($b,0,$b.Length)}
+$out.Flush();$err.Flush();exit 7
+'@
+        foreach ($id in @('formatter','binary','missing-exe','log-conflict','initialize-success','initialize-failure')) {
+            $caseRoot=Join-Path $root $id
+            New-Item -ItemType Directory -Path $caseRoot | Out-Null
+            $callRoot=Join-Path $caseRoot 'call';$exe=$pwsh;$arguments=@();$record=$null
+            $case=@{passed=$false;raw_returned=$false;record=$null;outer_error=$null;intent=$null}
+            $result.cases[$id]=$case
+            try {
+                switch ($id) {
+                    'formatter' {
+                        $script=Join-Path $caseRoot 'control.ps1';Write-ReleaseALf $script $formatter
+                        $arguments=@('-NoProfile','-File',$script,$qualifier,(Join-Path $caseRoot 'results.json'),(Join-Path $caseRoot 'historical.ps1'))
+                    }
+                    'binary' {
+                        $script=Join-Path $caseRoot 'control.ps1';Write-ReleaseALf $script $binary
+                        $arguments=@('-NoProfile','-File',$script)
+                    }
+                    'missing-exe' { $exe=Join-Path $caseRoot 'fixed-never-created.exe';$arguments=@() }
+                    'log-conflict' {
+                        $callRoot=Join-Path $caseRoot 'record-directory-conflict.bin'
+                        [IO.File]::WriteAllBytes($callRoot,[byte[]](0,255,11,22))
+                        $arguments=@('-NoProfile','-Command','exit 0')
+                    }
+                    default {
+                        $scratch=Join-Path $caseRoot 'root'
+                        if ($id -ceq 'initialize-failure') {
+                            New-Item -ItemType Directory -Path $scratch | Out-Null
+                            [IO.File]::WriteAllBytes((Join-Path $caseRoot 'preexisting-root-marker.bin'),[byte[]](0,255,33,44))
+                        }
+                        $exe='python'
+                        $arguments=@($Context.transport,'initialize','--root',$scratch,'--source',$Source,'--run-id',$RunId,'--run-attempt',$RunAttempt)
+                    }
+                }
+                $case.intent=@{argv=@($exe)+$arguments;cwd=$Context.repo;record_directory=$callRoot}
+                Write-ReleaseAJson (Join-Path $caseRoot 'intent.json') $case.intent
+                $record=Invoke-ReleaseARaw -Exe $exe -Arguments $arguments -Directory $Context.repo -RecordDirectory $callRoot -TimeoutSeconds 30
+                $case.raw_returned=$true;$case.record=$record
+                if ($id -ceq 'missing-exe') {
+                    if ($null -eq $record.error -or $null -ne $record.exit -or $record.terminated) { throw '不存在exe未保留真实启动失败/null exit' }
+                    $expectedError=$null
+                    try { Assert-ReleaseAResult $record '固定不存在exe' } catch { $expectedError=$_ }
+                    if($null -eq $expectedError){throw '不存在exe被错误接受'}
+                    $case.outer_error=Get-ReleaseABootstrapError $expectedError
+                    try { Write-ReleaseABootstrapFirstError (Join-Path $caseRoot 'outer-error.json') $expectedError $id }
+                    catch { $result.diagnostic_errors+=@(Get-ReleaseABootstrapError $_) }
+                }
+                else {
+                    if ($null -ne $record.error -or $record.timed_out -or -not $record.terminated -or -not $record.capture_complete) { throw '实际child退出/原streams捕获不完整' }
+                    if ($id -ceq 'binary') {
+                        if ($record.exit -ne 7) { throw 'binary原exit不是7' }
+                        $a=[IO.File]::ReadAllBytes((Join-Path $callRoot 'stdout.bin'));$b=[IO.File]::ReadAllBytes((Join-Path $callRoot 'stderr.bin'))
+                        if ($a.Length -ne 65536 -or $b.Length -ne 65536) { throw 'binary原stream长度不符' }
+                        for($i=0;$i -lt $a.Length;$i++) {
+                            if ($a[$i] -ne ([byte[]](0,255,65,10))[$i%4] -or $b[$i] -ne ([byte[]](0,254,66,13))[$i%4]) { throw 'binary原stream逐byte不符' }
+                        }
+                    }
+                    elseif ($id -ceq 'initialize-failure') {
+                        if ($record.exit -eq 0 -or (Test-Path -LiteralPath (Join-Path $caseRoot 'root/provenance/state.json')) -or
+                            (Get-Item -LiteralPath (Join-Path $callRoot 'stderr.bin')).Length -eq 0) { throw '预建root未产生真实非零/缺state/原stderr' }
+                        $failureText=[Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $callRoot 'stderr.bin')))
+                        if (-not $failureText.Contains('FileExistsError') -or @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'root') -Force).Count -ne 0) {
+                            throw '实际initialize非零不是预建root的固定FileExistsError边界'
+                        }
+                        $expectedError=$null
+                        try { Assert-ReleaseAResult $record '隔离initialize预建root' } catch { $expectedError=$_ }
+                        if($null -eq $expectedError){throw '真实initialize非零被错误接受'}
+                        $case.outer_error=Get-ReleaseABootstrapError $expectedError
+                        try { Write-ReleaseABootstrapFirstError (Join-Path $caseRoot 'outer-error.json') $expectedError $id }
+                        catch { $result.diagnostic_errors+=@(Get-ReleaseABootstrapError $_) }
+                    }
+                    else {
+                        Assert-ReleaseAResult $record $id
+                        if ($id -ceq 'formatter' -and -not (Read-ReleaseAJson (Join-Path $caseRoot 'results.json')).passed) { throw '实际formatter历史RED/当前GREEN未通过' }
+                        if ($id -ceq 'initialize-success') {
+                            $state=Read-ReleaseAJson (Join-Path $caseRoot 'root/provenance/state.json')
+                            if ($state.source -cne $Source -or $state.run_id -cne $RunId -or $state.run_attempt -cne $RunAttempt -or
+                                $state.stage -cne 'checkout' -or $state.checkout_ready -or $state.setup_ready -or $state.builder_started -or
+                                $null -ne $state.attempt -or -not $state.quiescent) { throw 'initialize实际state身份/未启动后继阶段不符' }
+                        }
+                    }
+                }
+                $case.passed=$true
+            }
+            catch {
+                $case.outer_error=Get-ReleaseABootstrapError $_
+                try { Write-ReleaseABootstrapFirstError (Join-Path $caseRoot 'outer-error.json') $_ $id }
+                catch { $result.diagnostic_errors+=@(Get-ReleaseABootstrapError $_) }
+                # 只接受在实际gateway创建原日志目录之前的固定冲突；不把未知child失败当预期。
+                if ($id -ceq 'log-conflict' -and $case.outer_error.command -ceq 'New-Item' -and
+                    $case.outer_error.script_stack_trace -match 'Invoke-ReleaseARaw' -and -not $case.raw_returned -and $null -ne $case.intent -and
+                    (Test-Path -LiteralPath $callRoot -PathType Leaf) -and
+                    [Convert]::ToBase64String([IO.File]::ReadAllBytes($callRoot)) -ceq 'AP8LFg==') { $case.passed=$true }
+            }
+            if (-not $case.passed -and $null -eq $result.first_failure) {
+                $result.first_failure=@{case=$id;error=$case.outer_error;record=$case.record}
+            }
+        }
+        foreach($name in $bindings.Keys){
+            $bindings[$name].final=Get-ReleaseAFileIdentity $bindings[$name].path
+            if($bindings[$name].before.size -ne $bindings[$name].final.size -or $bindings[$name].before.sha256 -cne $bindings[$name].final.sha256){
+                $result.diagnostic_errors+=@("bootstrap执行期间源变化：$name")
+            }
+        }
+        $result.controls_passed=$null -eq $result.first_failure -and $result.cases.Count -eq 6 -and $result.diagnostic_errors.Count -eq 0
+    }
+    catch {
+        if ($null -eq $result.first_failure) { $result.first_failure=@{case='diagnostic-entry';error=(Get-ReleaseABootstrapError $_)} }
+        else { $result.diagnostic_errors+=@(Get-ReleaseABootstrapError $_) }
+    }
+    finally {
+        # 固定allowlist只是forensic观察，不是POSIX seal；任何未知EOF/存活/缺件都不升stable。
+        $fixed=@('host.json','qualifier-source.ps1','transport-source.py','formatter/control.ps1','formatter/historical.ps1','formatter/results.json',
+            'binary/control.ps1','log-conflict/record-directory-conflict.bin','initialize-success/root/provenance/state.json','initialize-failure/preexisting-root-marker.bin')
+        foreach($id in @('formatter','binary','missing-exe','log-conflict','initialize-success','initialize-failure')) {
+            $fixed+=@("$id/intent.json","$id/outer-error.json")
+            foreach($name in @('argv.json','stdout.bin','stderr.bin','exit.json','error.json','executable.bin','main-module.bin')) { $fixed+=@("$id/call/$name") }
+        }
+        foreach($relative in $fixed) {
+            $entry=@{present=$false;stable=$false;status='missing-partial';writer_status='not-observed';before=$null;after=$null;error=$null}
+            $result.files[$relative]=$entry
+            $path=Join-Path $root $relative
+            try {
+                if(Test-Path -LiteralPath $path -PathType Leaf) {
+                    $entry.present=$true;$entry.before=Get-ReleaseAFileIdentity $path;$entry.after=Get-ReleaseAFileIdentity $path
+                    $entry.writer_status='owned-diagnostic-file-observed'
+                    $caseId=$relative.Split('/')[0]
+                    if($result.cases.ContainsKey($caseId)){
+                        $owner=$result.cases[$caseId]
+                        $entry.writer_status=if($owner.raw_returned -and $null -ne $owner.record -and $owner.record.terminated -and $owner.record.capture_complete){'raw-child-exit-and-eof-observed'}else{'writer-or-eof-unconfirmed'}
+                    }
+                    $entry.status=if($entry.before.size -ne $entry.after.size -or $entry.before.sha256 -cne $entry.after.sha256){'changed-partial'}
+                        elseif($entry.writer_status -ceq 'writer-or-eof-unconfirmed'){'writer-or-eof-unconfirmed-partial'}else{'forensic-observed-not-stable'}
+                    if($entry.status -ceq 'changed-partial'){$result.diagnostic_errors+=@("读取期间变化：$relative")}
+                }
+            }
+            catch {$entry.status='unreadable-partial';$entry.error=Get-ReleaseABootstrapError $_;$result.diagnostic_errors+=@($entry.error)}
+        }
+        if($result.diagnostic_errors.Count -ne 0){$result.controls_passed=$false}
+        Write-ReleaseAJson $summary $result
+    }
+    if(-not $result.controls_passed){throw 'BootstrapDiagnostic必需controls失败；保留原first_failure与独立diagnostic_errors，不升级自然builder'}
+    return $result
 }
 function Quote-ReleaseABash([string]$Value) {
     $singleQuoteEscape = "'" + '"' + "'" + '"' + "'"
@@ -665,7 +903,16 @@ if ($MyInvocation.InvocationName -ne '.') {
     }
     if ($env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or $env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or
         $env:RELEASE_A_WORKFLOW_SHA -cne $env:GITHUB_SHA) { throw '固定Windows/source/workflow身份不匹配' }
-    $context = Get-ReleaseAContext
-    if ($Action -ceq 'Execute') { Invoke-ReleaseAExecute $context }
-    else { Invoke-ReleaseACollect $context }
+    try {
+        $context = Get-ReleaseAContext
+        if ($Action -ceq 'BootstrapDiagnostic') { Invoke-ReleaseABootstrapDiagnostic $context | Out-Null }
+        elseif ($Action -ceq 'Execute') { Invoke-ReleaseAExecute $context }
+        else { Invoke-ReleaseACollect $context }
+    }
+    catch {
+        $original=$_
+        try { Write-ReleaseABootstrapFirstError (Join-Path $env:RUNNER_TEMP 'release-a-bootstrap-error.json') $original $Action }
+        catch { [Console]::Error.WriteLine('bootstrap外层原ErrorRecord保存失败（不覆盖原异常）：' + $_.ToString()) }
+        throw $original
+    }
 }

@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       execute_release_a:
-        description: Explicit root-authorized RELEASE A attempt
+        description: Explicit root-authorized bootstrap diagnostic only (no builder)
         type: boolean
         required: true
         default: false
-  # 首次受限注册push本身消耗一次实际构建授权；不是GitHub自动one-shot。
-  # 后续改此文件仍可能触发；root台账去重，稳态删除此例外须另审。
+  # 首run失败后此源码固定为BootstrapDiagnostic；push仍须root授权和台账。
+  # dispatch bool不能切回Execute；恢复自然builder须另经root审查源码。
   push:
     branches:
       - codex/rdp-egfx-hevc-preference
@@ -40,15 +40,16 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Execute the single RELEASE A entry
+      - name: Run fixed Windows bootstrap diagnostic only
         shell: pwsh
-        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute
+        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapDiagnostic
       - name: Preserve all original materials and verify the transport
-        if: always()
+        # 固定诊断源码不可达；正式POSIX三件仍incomplete，不伪造。
+        if: ${{ false }}
         shell: pwsh
         run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect
       - name: Upload exact POSIX transport, receipt and verification
-        if: always()
+        if: ${{ false }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-a-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
@@ -58,3 +59,78 @@ jobs:
             ${{ runner.temp }}/release-a.verification.json
           compression-level: 0
           if-no-files-found: error
+      - name: Upload fixed Windows bootstrap forensic files only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-a-bootstrap-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic.json
+            ${{ runner.temp }}/release-a-bootstrap-error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/host.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/qualifier-source.ps1
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/transport-source.py
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/control.ps1
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/historical.ps1
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/results.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/control.ps1
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/record-directory-conflict.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/root/provenance/state.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/preexisting-root-marker.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/intent.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/outer-error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/argv.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/stdout.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/stderr.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/exit.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/executable.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/main-module.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/intent.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/outer-error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/argv.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/stdout.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/stderr.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/exit.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/executable.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/main-module.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/intent.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/outer-error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/argv.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/stdout.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/stderr.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/exit.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/executable.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/main-module.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/intent.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/outer-error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/argv.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/stdout.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/stderr.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/exit.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/executable.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/main-module.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/intent.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/outer-error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/argv.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/stdout.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/stderr.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/exit.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/executable.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/main-module.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/intent.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/outer-error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/argv.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/stdout.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/stderr.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/exit.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/error.json
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/executable.bin
+            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/main-module.bin
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false

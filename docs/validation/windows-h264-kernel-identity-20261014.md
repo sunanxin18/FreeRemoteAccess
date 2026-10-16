@@ -49,3 +49,17 @@ Windows source profile及对应源码exact材料已接入，固定上游归档�
 初版18轮失败与通过记录、完整源码和5856项材料冻结在`target/windows-shipping-A-execution-20261016/`；Fix1的1361项材料及10轮原记录在`target/windows-shipping-A-execution-fix1-20261016/`。独立复审报告SHA256为`dc375e186bc583b07776f156e57860ff10182e0833acf6f1dfd79fde9a3922fa`。root完整读取全部1063行delta、核对冻结材料，并实际运行最终运输模块22项控制，22/22通过。Mac控制不能证明Windows PowerShell或Linux/proc/WSL运行：14项Pester及真实Linux门仍未运行。
 
 下一步由root提交审定源码后，首次受限workflow注册push运行一次固定Windows/WSL执行流程。该push本身会触发，不再另行dispatch或并发重跑；实际结果另记。当前仍未取得自然A构建结果，B/C/D和生产资格继续OPEN。首个自然构建的真实首错、原argv与partial必须保留，不能为通过旧consumer改写工具参数或另编shipping核。
+
+### 首次实际执行：初始化失败，尚未进入自然构建
+
+审定提交`ba6035752f746651681708c07cefa1c896248880`的首次注册push触发[run38847486035/attempt1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38847486035)。checkout成功，Execute在2026-10-16 03:50:24 UTC报`$Name失败`未定义：PowerShell将中文后缀合并进变量名，错误报告本身遮住了初始化原始错误。随后Collect因state尚未创建而拒绝，三固定件均未产生，artifact数为0。没有WSL/setup/control或FFmpeg构建通过的记录，也没有数值/性能结果。
+
+原job日志保存于`target/windows-shipping-A-execution-root-fix1-20261016/ci/release-a-job-original-3.log`。下载过程第一次TLS timeout、第二次CLI拒输出终端转义的失败均保留；第三次仅允许读取原bytes并剥转义显示，不是CI重跑。当前已证实错误插值及早期材料遗漏，初始化的原始失败仍未知；先修复诊断和材料保留，再安排受限验证，不直接重跑自然构建。
+
+### 初始化诊断修复源码
+
+错误插值已改为`${Name}`，外层单独保存首个ErrorRecord，后续诊断失败不覆盖它。当前同一workflow的活动命令固定为`BootstrapDiagnostic`；原Collect和正式POSIX三件上传在该模式下不可达，不将诊断文件伪装成正式构建材料。后继恢复Execute需要单独审查源码和执行记录。
+
+固定六个必需控制包括：真实旧formatter token反例与新错误内容、原gateway的双通道二进制exit7、缺失exe、日志目录冲突、独立scratch的initialize成功和另一个预建root的initialize失败。它们不依赖Pester，不调用checkout、WSL、setup或builder；独立Windows forensic上传精确列出66个可能的文件路径，缺件、变化、EOF未知均按partial记录，始终不授stable或生产资格。
+
+本机仅运行受影响WorkflowAuthority控制（原配置控制RED exit1、更新后1项GREEN exit0）与窄源码/数据检查；24项冻结材料及当前四源已由root复核，完整514行delta已读。Windows PowerShell和六个运行控制尚未执行，Pester明确未调用，首次run初始化原因继续UNKNOWN。源码材料在`target/windows-shipping-bootstrap-diagnostic-20261016/`；独立Spec PASS / Quality Approved复审通过，报告SHA256 `5da7d6b33db5c0ad4f8a33bd6d1156b655f944aec70f78c27454b55b963cc655`；root完整读取并核两项review冻结后，释放一次固定诊断push。实际结果另记，不触发自然builder。

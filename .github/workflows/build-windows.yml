@@ -169,6 +169,13 @@ jobs:
           cargo test --locked --release --target $target -p frd-protocol-rdp benchmark_progressive_native_tile -- --ignored --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Progressive target benchmark failed" }
 
+      - name: Run i686 pixel publication source tests
+        if: matrix.architecture == 'x86'
+        shell: pwsh
+        run: |
+          cargo test --locked --target i686-pc-windows-msvc -p frd-protocol-rdp --lib pixel_convert::tests:: -- --skip conversion_dispatch_benchmark_records_kernel_and_matches_reference --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "i686 pixel publication parity or native dispatch failed" }
+
       - name: Run x86 decoder fixtures in a 32-bit process
         if: matrix.architecture == 'x86'
         shell: pwsh

@@ -2,6 +2,46 @@ BeforeAll {
     . (Join-Path $PSScriptRoot '../qualify-windows-h264-recipe-A.ps1')
 }
 Describe 'RELEASE A outer authority and original bytes' {
+    It 'reports the named original failure rather than a Unicode variable lookup' {
+        foreach ($record in @(
+            @{ error='original-error-marker';timed_out=$false;exit=7 },
+            @{ error=$null;timed_out=$false;exit=7 },
+            @{ error=$null;timed_out=$true;exit=0 })) {
+            $caught=$null
+            try { Assert-ReleaseAResult $record '初始化边界' } catch { $caught=$_ }
+            $caught | Should -Not -BeNullOrEmpty
+            $caught.ToString() | Should -Match '^初始化边界失败：'
+            $caught.ToString() | Should -Not -Match 'Name失败.*cannot be retrieved'
+            $json=$caught.ToString().Substring('初始化边界失败：'.Length) | ConvertFrom-Json -AsHashtable
+            $json.exit | Should -Be $record.exit
+            $json.error | Should -Be $record.error
+            $json.timed_out | Should -Be $record.timed_out
+        }
+        { Assert-ReleaseAResult @{error=$null;timed_out=$false;exit=0} '成功边界' } | Should -Not -Throw
+    }
+    It 'runs the fixed dependency-free bootstrap controls without entering the natural builder' {
+        if (-not $IsWindows) { Set-ItResult -Skipped -Because '实际Windows PowerShell专用，不能用Mac代替'; return }
+        $oldTemp=$env:RUNNER_TEMP
+        try {
+            $env:RUNNER_TEMP=Join-Path $TestDrive 'bootstrap-host'
+            New-Item -ItemType Directory -Path $env:RUNNER_TEMP | Out-Null
+            $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+            $context=@{repo=$repo;transport=Join-Path $repo 'tools/windows-h264-recipe-transport.py';builderInvocations=0}
+            $result=Invoke-ReleaseABootstrapDiagnostic $context -Source ('a'*40) -RunId '1234' -RunAttempt '1'
+            $result.controls_passed | Should -BeTrue
+            $result.formal_transport | Should -BeExactly 'incomplete-not-produced'
+            $result.original_run_cause | Should -BeExactly 'UNKNOWN'
+            $context.builderInvocations | Should -Be 0
+            $result.cases.formatter.passed | Should -BeTrue
+            $result.cases.'initialize-failure'.passed | Should -BeTrue
+            $result.cases.'log-conflict'.raw_returned | Should -BeFalse
+            $result.cases.'missing-exe'.record.exit | Should -BeNullOrEmpty
+            Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'release-a.tar') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'release-a.receipt.json') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'release-a.verification.json') | Should -BeFalse
+        }
+        finally { $env:RUNNER_TEMP=$oldTemp }
+    }
     It 'rejects default dispatch and unrelated events before executing anything' {
         (Test-ReleaseAAuthority 'workflow_dispatch' 'refs/heads/main' $false) | Should -BeFalse
         (Test-ReleaseAAuthority 'workflow_dispatch' 'refs/heads/main' $true) | Should -BeTrue

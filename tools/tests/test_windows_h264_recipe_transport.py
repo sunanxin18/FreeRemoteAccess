@@ -294,30 +294,60 @@ class CheckoutBoundary(unittest.TestCase):
 
 
 class WorkflowAuthority(unittest.TestCase):
-    def test_real_workflow_has_one_bounded_authority_and_exact_upload_pair(self):
+    def test_real_workflow_has_one_bounded_bootstrap_diagnostic_and_exact_forensics(self):
         import yaml
-        # BaseLoader保留on字段，避免YAML1.1把它改成bool；检查解析后的实际配置。
+        # BaseLoader保留on字段；实际配置固定诊断，dispatch bool没有Action选择权。
         workflow = yaml.load((ROOT / '.github/workflows/qualify-windows-h264-recipe.yml').read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow['on']), {'push', 'workflow_dispatch'})
         self.assertEqual(workflow['on']['push']['branches'], ['codex/rdp-egfx-hevc-preference'])
         self.assertEqual(workflow['on']['push']['paths'], ['.github/workflows/qualify-windows-h264-recipe.yml'])
-        self.assertEqual(workflow['on']['workflow_dispatch']['inputs']['execute_release_a']['default'], 'false')
+        inputs = workflow['on']['workflow_dispatch']['inputs']
+        self.assertEqual(set(inputs), {'execute_release_a'})
+        self.assertEqual((inputs['execute_release_a']['type'], inputs['execute_release_a']['required'],
+                          inputs['execute_release_a']['default']), ('boolean', 'true', 'false'))
         self.assertEqual(workflow['permissions'], {'contents': 'read'})
         self.assertEqual(workflow['concurrency']['cancel-in-progress'], 'false')
         self.assertEqual(set(workflow['jobs']), {'release-a'})
         job = workflow['jobs']['release-a']
         self.assertEqual((job['runs-on'], job['timeout-minutes']), ('windows-2025', '90'))
-        checkout, execute, collect, upload = job['steps']
+        self.assertEqual(job['if'], "(github.event_name == 'workflow_dispatch' && inputs.execute_release_a == true) || "
+                                   "(github.event_name == 'push' && github.ref == 'refs/heads/codex/rdp-egfx-hevc-preference')")
+        self.assertEqual(set(job['env']), {'RELEASE_A_EXECUTE', 'RELEASE_A_WORKFLOW_SHA', 'RELEASE_A_WORKFLOW_REF'})
+        checkout, diagnostic, collect, upload, forensic = job['steps']
+        self.assertEqual(checkout['uses'], 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262')
         self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': 'false'})
-        self.assertEqual(collect['if'], 'always()')
-        self.assertEqual(upload['if'], 'always()')
+        self.assertEqual(diagnostic['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapDiagnostic')
+        self.assertNotIn('${{', diagnostic['run'])
+        active_commands = [step['run'] for step in job['steps'] if 'run' in step and step.get('if') != '${{ false }}']
+        self.assertEqual(active_commands, [diagnostic['run']])
+        self.assertEqual(collect['if'], '${{ false }}')
+        self.assertEqual(collect['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect')
+        self.assertEqual(upload['if'], '${{ false }}')
         self.assertEqual(upload['with']['compression-level'], '0')
         self.assertEqual(upload['with']['if-no-files-found'], 'error')
         self.assertEqual(upload['with']['path'].splitlines(), ['${{ runner.temp }}/release-a.tar',
                                                              '${{ runner.temp }}/release-a.receipt.json',
                                                              '${{ runner.temp }}/release-a.verification.json'])
-        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute')
+        self.assertEqual(forensic['if'], 'always()')
+        self.assertEqual(forensic['uses'], 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')
+        self.assertEqual(forensic['with']['name'], 'release-a-bootstrap-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
+        self.assertEqual((forensic['with']['compression-level'], forensic['with']['if-no-files-found'],
+                          forensic['with']['overwrite']), ('0', 'error', 'false'))
+        expected = ['release-a-bootstrap-diagnostic.json', 'release-a-bootstrap-error.json']
+        fixed = ['host.json', 'qualifier-source.ps1', 'transport-source.py', 'formatter/control.ps1',
+                 'formatter/historical.ps1', 'formatter/results.json', 'binary/control.ps1',
+                 'log-conflict/record-directory-conflict.bin', 'initialize-success/root/provenance/state.json',
+                 'initialize-failure/preexisting-root-marker.bin']
+        for case in ('formatter', 'binary', 'missing-exe', 'log-conflict', 'initialize-success', 'initialize-failure'):
+            fixed += [f'{case}/intent.json', f'{case}/outer-error.json']
+            fixed += [f'{case}/call/{name}' for name in ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json',
+                                                       'error.json', 'executable.bin', 'main-module.bin')]
+        expected += ['release-a-bootstrap-diagnostic/' + name for name in fixed]
+        actual = forensic['with']['path'].splitlines()
+        self.assertEqual(actual, ['${{ runner.temp }}/' + name for name in expected])
+        self.assertEqual(len(actual), len(set(actual)))
+        self.assertTrue(all(not any(char in path for char in '*?[]') for path in actual))
 
 
 class InlineSupervisorBoundary(unittest.TestCase):
