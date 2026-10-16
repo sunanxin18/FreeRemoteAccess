@@ -165,3 +165,21 @@ Linux/Windows现workflow各新增x86两行专用build-only及always精确九原�
 同提交的[run38896197513/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38896197513)在创建job前completed/failure，没有可读check-run annotation，未执行Windows ABI。实际YAML中该run为23547字符，超过[GitHub规定的21000字符上限](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstepsrun)；此为已复现的配置违规，没有将其称为已取得唯一服务端错误正文。
 
 仅把原run机械移入`tools/verify-windows-publication-abi.ps1`，workflow保留105字符固定调用。前向/反向字节比较证明除闭集Architecture参数、两处相等路径替换及脚本自身配置绑定外正文保持；Windows配置由六项增为七项，原SHA门、预算、capture和11原件不变。全仓73个run长度检查RED→GREEN，当前最大19944字符。独立源审通过（`41fb15f3db66b5dca6b56c1e8241384f8257447c5eab0e76e867717a76c485e3`）；没有安装/调用pwsh或执行图像。后继仅正常提交Windows修复并验证第一次实际Windows运行，原Linux和A运行不重启、不dispatch/rerun。
+
+### Windows 重链接指纹拒绝的实际原因
+
+长度修复提交`632e2e2cba9e14c062e7444c0c2c3cb4b4101584`对应[run38897543788/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38897543788)已正常创建三个架构job。x86 job116961545172与x64 job116961545617均实际build0，terminal/双EOF/capture完整，四源与七配置在build后和启动前稳定；两个任务都在全PE SHA准入被拒，ABI started=false、runtime=NOT_RUN、两ABI原始流均为空。不能称为ABI执行失败。
+
+新x86 PE为`2703dc7d8270968c533f8bea7ad5f5818313346c20e84bebea313976dc5fcbc1`，新x64 PE为`fa1f9903704859af81516fec7ebb8ef5af2bdfb5c62c8242db27a1a22fee428c`。root下载两个各11成员artifact12044621487/12044750934，核API digest、CRC和全部来源/配置/文件身份；独立审查正式解析PE目录后确认，两架构分别仅27/28个字节变化，严格属于COFF时间戳、三个Debug目录时间戳和RSDS GUID，其它所有PE bytes逐字相同，map仅Timestamp行不同。不推断GUID的具体生成机制，也不屏蔽这些字节或自动更新准入表。
+
+独立诊断报告SHA256 `7ce8677fe6e3d6d6bdad020ca6b9d5eac6f46ecd9130cf635d2a387fd786c1f0`，root全文读并核7冻结项与51原输入。原件在`target/windows-abi-run-length-delivery-root-20261016/ci/`。后继改为认证取回f5固定run/两个artifact ID的原九件，逐成员SHA校验后直接运行原已审PE；原build身份与当前runtime身份分开保存。接线尚待源码审查与实际执行，不引入新PE准入或重新链接的确定性假设。
+
+原Linux run38896199176/1后继API已确认整个流程terminal success，覆盖其现有构建/测试/打包及两个已述私有ABI实例；它不替代Windows或产品最终调用实例的资格。632e2e2c主CI38897543804/1也已terminal success；Windows两x86任务本轮保持failure，ARM64包仍按原流程继续。
+
+### 固定原 PE 复用接线源码
+
+仅修改现Windows workflow和固定verifier：沿用已有download-artifact pin，以只读actions权限固定获取run38880607150/1的artifact12037710605或12036449351。下载前要求新输入目录，脚本随后逐项核原九件闭集的完整SHA；认证下载成功或action的digest warning均不能替代强校验。原PE两完整allowlist不变，不/Brepro、不归零或屏蔽元数据、不回退重建。
+
+原九件保留其build-only identity及build双流原bytes；新增runtime.identity.json及ABI双流，共十二个literal上传路径。当前身份明确build_reused=true、abi_build_in_current_run=NOT_RUN及source run/commit/artifact/identity SHA；当前四源/七配置前后稳定与原f5来源分开核，五实质构建配置必须相等。唯一执行仍是原已审PE加abi/30秒，原完整28/84行输出parser逐字不变，raw双流、终态/EOF/首错及保护边界保持。
+
+作者7244B报告SHA256 `7ef766dbad71c8818c57a85640ec8c87c60b8cf4d3623d0acec62e026b0a238c`；独立源码审查报告5424B SHA256 `17d5dac0a9142867e0ef8a9dc1912e4fa072c74584572902576cd1452ab916a5`。root已读完整当前源码/两源delta与报告，核40作者绑定、12审查输入及18原成员SHA。54个host纯数据模型通过、74个run长度合规；本机没有pwsh，未把这些检查称为PowerShell provider或实际Windows执行通过。只释放下一次正常Windows功能分支CI执行，真实下载/十二原件/同PE及完整ABI结果另记，Linux/A不重启。

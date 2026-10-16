@@ -44,6 +44,9 @@ concurrency:
 
 jobs:
   package:
+    permissions:
+      contents: read
+      actions: read
     runs-on: windows-2025
     timeout-minutes: 90
     strategy:
@@ -341,7 +344,25 @@ jobs:
             target/rdp-publication-windows-${{ matrix.artifact_suffix }}/guards.stdout
             target/rdp-publication-windows-${{ matrix.artifact_suffix }}/guards.stderr
 
-      - name: Build and run admitted private Windows direct ABI image
+      - name: Require fresh pinned Windows ABI source input
+        if: matrix.architecture == 'x86_64' || matrix.architecture == 'x86'
+        shell: pwsh
+        run: |
+          $inputPath = Join-Path $env:GITHUB_WORKSPACE 'target/rdp-publication-abi-source-windows-${{ matrix.artifact_suffix }}'
+          if (Test-Path -LiteralPath $inputPath) { throw 'Refusing existing pinned ABI source input' }
+
+      - name: Download fixed reviewed Windows ABI originals
+        if: matrix.architecture == 'x86_64' || matrix.architecture == 'x86'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ matrix.architecture == 'x86' && '12037710605' || '12036449351' }}
+          run-id: '38880607150'
+          repository: sunanxin18/FreeRemoteAccess
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: target/rdp-publication-abi-source-windows-${{ matrix.artifact_suffix }}
+
+      - name: Run admitted reused private Windows direct ABI image
         if: matrix.architecture == 'x86_64' || matrix.architecture == 'x86'
         shell: pwsh
         run: pwsh -NoProfile -File tools/verify-windows-publication-abi.ps1 -Architecture '${{ matrix.architecture }}'
@@ -360,6 +381,7 @@ jobs:
             target/rdp-publication-abi-windows-${{ matrix.artifact_suffix }}/rdp_publication_abi.exe
             target/rdp-publication-abi-windows-${{ matrix.artifact_suffix }}/rdp_publication_abi.map
             target/rdp-publication-abi-windows-${{ matrix.artifact_suffix }}/identity.json
+            target/rdp-publication-abi-windows-${{ matrix.artifact_suffix }}/runtime.identity.json
             target/rdp-publication-abi-windows-${{ matrix.artifact_suffix }}/build.stdout
             target/rdp-publication-abi-windows-${{ matrix.artifact_suffix }}/build.stderr
             target/rdp-publication-abi-windows-${{ matrix.artifact_suffix }}/abi.stdout
