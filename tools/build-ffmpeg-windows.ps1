@@ -5,12 +5,25 @@ param(
     [ValidateSet("x86_64", "x86", "arm64")]
     [string]$Architecture = "x86_64",
     [string]$WslDistribution = "ubuntu24.04",
+    [string]$SourceRecipe = "upstream",
     [switch]$ForceRebuild,
     [switch]$RunNativeTests
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# 所有拒绝必须发生在下载、build tree 或发布副作用之前。
+if ($SourceRecipe -cnotin @("upstream", "frd-h264dc-aarch64-v1")) {
+    throw "未知 Windows source recipe: $SourceRecipe"
+}
+$ModifiedRecipe = $SourceRecipe -ceq "frd-h264dc-aarch64-v1"
+if ($ModifiedRecipe -and $Architecture -cne "arm64") {
+    throw "修改 Windows source recipe 仅允许 ARM64；ARM64EC 不支持"
+}
+if ($ModifiedRecipe -and $RunNativeTests) {
+    throw "本配方仅生成 build-side 材料；原生数值/guard/qmul/QPC 与修改包资格尚未释放"
+}
 
 $Version = "8.1.2"
 $ArchiveSha256 = "464BEB5E7BF0C311E68B45AE2F04E9CC2AF88851ABB4082231742A74D97B524C"
@@ -85,6 +98,9 @@ $BuildRoot = Join-Path $RepoRoot ".codex-target\ffmpeg-$Version"
 $SourceCache = Join-Path $BuildRoot "source-cache"
 $GpgHome = Join-Path $BuildRoot "gnupg"
 $ConfigurationRoot = Join-Path $BuildRoot "$PlatformDirectory\$Configuration"
+if ($ModifiedRecipe) {
+    $ConfigurationRoot = Join-Path $BuildRoot "build-side-$SourceRecipe\$PlatformDirectory\$Configuration"
+}
 $CodecDir = Join-Path $ConfigurationRoot "codec"
 $ReleaseAssetsDirectory = Join-Path $BuildRoot "release-assets"
 $Archive = Join-Path $SourceCache "ffmpeg-$Version.tar.xz"
@@ -100,6 +116,9 @@ $DistDir = Join-Path $AttemptRoot "dist"
 $CodecStage = Join-Path $ConfigurationRoot ".codec.stage-$AttemptId"
 $ConfigureRecord = Join-Path $AttemptRoot "configure-command.txt"
 $BuildLockPath = Join-Path $BuildRoot "$PlatformDirectory-$Configuration.lock"
+if ($ModifiedRecipe) {
+    $BuildLockPath = Join-Path $ConfigurationRoot "build-side.lock"
+}
 
 function Assert-UnderBuildRoot([string]$Path) {
     Assert-PathUnderRoot -Path $Path -AllowedRoot $BuildRoot
@@ -143,6 +162,20 @@ function Convert-ToWslPath([string]$Path) {
 }
 
 function Invoke-Wsl([string]$WorkingDirectory, [string]$Command, [string]$Action) {
+    if ($ModifiedRecipe) {
+        $callId = [Guid]::NewGuid().ToString('N')
+        $callLog = Join-Path $AttemptRoot "wsl-$callId.log"
+        & wsl.exe --distribution $WslDistribution --cd $WorkingDirectory -- bash -lc $Command 2>&1 | Tee-Object -FilePath $callLog | Out-Host
+        $callExit = $LASTEXITCODE
+        @{
+            argv = @("wsl.exe", "--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--", "bash", "-lc", $Command)
+            exit = $callExit
+            action = $Action
+            log = $callLog
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $AttemptRoot "wsl-$callId.json") -Encoding UTF8
+        if ($callExit -ne 0) { throw "$Action 失败；原调用/输出保留于 $AttemptRoot" }
+        return
+    }
     & wsl.exe --distribution $WslDistribution --cd $WorkingDirectory -- bash -lc $Command
     if ($LASTEXITCODE -ne 0) {
         throw "$Action 失败"
@@ -239,6 +272,9 @@ function Assert-ApprovedBundleImports([string]$Dumpbin, [string]$BundleDirectory
 }
 
 New-Item -ItemType Directory -Force -Path $BuildRoot, $SourceCache, $GpgHome | Out-Null
+if ($ModifiedRecipe) {
+    New-Item -ItemType Directory -Force -Path $ConfigurationRoot | Out-Null
+}
 $buildLock = $null
 Push-Location $RepoRoot
 try {
@@ -254,6 +290,9 @@ try {
         throw "同一 configuration 的 FFmpeg build 已在运行: $BuildLockPath"
     }
 
+    if ($ModifiedRecipe) {
+        New-Item -ItemType Directory -Path $AttemptRoot | Out-Null
+    }
     Download-IfMissing $SourceUrl $Archive
     Download-IfMissing $SignatureUrl $Signature
     Download-IfMissing $KeyUrl $SigningKey
@@ -297,7 +336,7 @@ try {
             Remove-Item -LiteralPath $legacy -Recurse -Force
         }
     }
-    if ($ForceRebuild) {
+    if ($ForceRebuild -and -not $ModifiedRecipe) {
         Get-ChildItem -LiteralPath $ConfigurationRoot -Force | Where-Object {
             $_.Name -like '.attempt-*' -or $_.Name -like '.codec.stage-*' -or $_.Name -like '*.previous-*'
         } | Where-Object { $_.FullName -ne $AttemptRoot } | ForEach-Object {
@@ -306,12 +345,26 @@ try {
         }
     }
 
-    $SourceDir = Expand-VerifiedArchiveFresh `
-        -Archive $Archive `
-        -ExpectedArchiveSha256 $ArchiveSha256 `
-        -DestinationParent $SourceParent `
-        -ExpectedDirectoryName "ffmpeg-$Version" `
-        -AllowedRoot $BuildRoot
+    if ($ModifiedRecipe) {
+        $sourceParentWsl = Convert-ToWslPath $SourceParent
+        $archiveWsl = Convert-ToWslPath $Archive
+        $sourceHelperWsl = Convert-ToWslPath (Join-Path $PSScriptRoot "desktop-ffmpeg-source.py")
+        Invoke-Wsl (Convert-ToWslPath $RepoRoot) ("python3 " + (Quote-Bash $sourceHelperWsl) +
+            " prepare --profile windows-aarch64 --source-recipe " + (Quote-Bash $SourceRecipe) +
+            " --archive " + (Quote-Bash $archiveWsl) + " --destination " + (Quote-Bash $sourceParentWsl)) "固定 Windows source replay"
+        $sourceAssetWsl = Convert-ToWslPath (Join-Path $AttemptRoot "FreeRemoteDesk-ffmpeg-$Version-windows-aarch64-$SourceRecipe-corresponding-source.zip")
+        Invoke-Wsl (Convert-ToWslPath $RepoRoot) ("python3 " + (Quote-Bash $sourceHelperWsl) +
+            " asset --profile windows-aarch64 --source-recipe " + (Quote-Bash $SourceRecipe) +
+            " --archive " + (Quote-Bash $archiveWsl) + " --output " + (Quote-Bash $sourceAssetWsl)) "Windows 对应源码材料"
+    }
+    else {
+        $SourceDir = Expand-VerifiedArchiveFresh `
+            -Archive $Archive `
+            -ExpectedArchiveSha256 $ArchiveSha256 `
+            -DestinationParent $SourceParent `
+            -ExpectedDirectoryName "ffmpeg-$Version" `
+            -AllowedRoot $BuildRoot
+    }
 
     $requiredWslTools = "command -v bash >/dev/null && command -v make >/dev/null && command -v $($ArchitectureProfile.CrossCompiler) >/dev/null"
     if ($ArchitectureProfile.RequiresX86Asm) {
@@ -363,11 +416,38 @@ try {
     else {
         $configureArgs += "--enable-debug", "--disable-stripping"
     }
+    if ($ModifiedRecipe) {
+        $attemptWsl = Convert-ToWslPath $AttemptRoot
+        $captureHelperWsl = Convert-ToWslPath (Join-Path $PSScriptRoot "windows-ffmpeg-build-capture.py")
+        Invoke-Wsl $sourceWsl ("python3 " + (Quote-Bash $captureHelperWsl) +
+            " initialize --attempt " + (Quote-Bash $attemptWsl) + " --tree " + (Quote-Bash $sourceWsl)) "自然工具捕获初始化"
+        $wrapperPrefix = "$attemptWsl/tool-capture/bin/aarch64-w64-mingw32-"
+        # 仅选择捕获入口；wrapper 以原 driver 名称/参数调用固定工具，不规范化自然 make argv。
+        $configureArgs = @($configureArgs | Where-Object { -not $_.StartsWith("--cc=") })
+        # 转义 dollar 穿过 configure append/eval，写出 $$@；再由原 library.mak eval 展开实际 DLL target。
+        $configureArgs += "--cc=$($wrapperPrefix)clang", "--as=$($wrapperPrefix)clang", "--ld=$($wrapperPrefix)clang",
+            "--strip=$($wrapperPrefix)strip", '--extra-ldsoflags=-Wl,--Map=\$\$@.map'
+    }
     $configureCommand = "./configure " + (($configureArgs | ForEach-Object { Quote-Bash $_ }) -join " ")
+    if ($ModifiedRecipe) {
+        Set-Content -LiteralPath $ConfigureRecord -Value $configureCommand -Encoding UTF8
+    }
     Invoke-Wsl $sourceWsl $configureCommand "FFmpeg configure"
-    Set-Content -LiteralPath $ConfigureRecord -Value $configureCommand -Encoding UTF8
+    if (-not $ModifiedRecipe) {
+        Set-Content -LiteralPath $ConfigureRecord -Value $configureCommand -Encoding UTF8
+    }
     Invoke-Wsl $sourceWsl "make -j4" "FFmpeg build"
     Invoke-Wsl $sourceWsl "make install" "FFmpeg install"
+
+    if ($ModifiedRecipe) {
+        $bundleHelperWsl = Convert-ToWslPath (Join-Path $PSScriptRoot "windows-ffmpeg-bundle.py")
+        Invoke-Wsl $sourceWsl ("python3 " + (Quote-Bash $bundleHelperWsl) +
+            " complete --source-recipe " + (Quote-Bash $SourceRecipe) + " --architecture arm64 --attempt " +
+            (Quote-Bash $attemptWsl) + " --tree " + (Quote-Bash $sourceWsl) + " --archive " +
+            (Quote-Bash $archiveWsl) + " --dist " + (Quote-Bash $distWsl)) "Windows build-side identity"
+        Write-Host "修改配方 build-side 材料已保留: $AttemptRoot；未取得 stage/install 或原生资格。"
+        return
+    }
 
     $configHeader = @(
         Get-Content -Raw -LiteralPath (Join-Path $SourceDir "config.h")
@@ -530,9 +610,20 @@ try {
     }
     Write-Host "Corresponding-source release asset: $correspondingSourcePackage"
 }
+catch {
+    if ($ModifiedRecipe -and (Test-Path -LiteralPath $AttemptRoot)) {
+        @{ status = "failed"; publishable = $false; recipe = $SourceRecipe; error = $_.Exception.Message } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $AttemptRoot "attempt-failure.json") -Encoding UTF8
+    }
+    throw
+}
 finally {
     try {
-        foreach ($temporary in @($AttemptRoot, $CodecStage)) {
+        $temporaryPaths = if ($ModifiedRecipe) { @($CodecStage) } else { @($AttemptRoot, $CodecStage) }
+        if ($ModifiedRecipe) {
+            Write-Host "保留修改配方 attempt（含失败 partial）: $AttemptRoot"
+        }
+        foreach ($temporary in $temporaryPaths) {
             if (Test-Path -LiteralPath $temporary) {
                 Assert-UnderBuildRoot $temporary
                 Remove-Item -LiteralPath $temporary -Recurse -Force

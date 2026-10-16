@@ -22,3 +22,19 @@
 ## 后继必须完成的工作
 
 真实固定 llvm-mingw 编译器的 generated config、自然 AS argv、COFF、GNU link map、strip/installed/package DLL 必须形成同一次构建的实际链；遇到本工具支持域外的结构须保留失败并审查扩展。还须 Windows 私有保护页/QPC/非叶 ABI 与 unwind 夹具、同 shipping 对象的原 C 数值/30分派/ABI/基准、普通最终包真实装载与 codec fixture。Windows 包装/安装器受信 verifier 和对应源码材料尚未接入新配方，完整软件 codec 与真实协议互操作也未完成。
+
+## 2026-10-16：显式 Windows 配方的源码与宿主接线
+
+`build-ffmpeg-windows.ps1`新增明确的`frd-h264dc-aarch64-v1`选择，仅允许ARM64；未知配方、其他架构及修改配方的既有RunNativeTests入口在副作用前拒绝。默认upstream的x86/i686、AMD64、ARM64与其他平台流程保持。修改配方使用独立build-side目录和fresh attempt，保留源码、配置、对象、未strip DLL、map、安装输出、原调用收据及失败partial；不会向旧stager或installer发布。
+
+Windows source profile及对应源码exact材料已接入，固定上游归档签名只认证上游原件，本地patch单独记录，不能冒充上游签名的修改包。两个新模块分别承担固定工具原argv/cwd/输入输出/工具身份/原始工具stdout与stderr记录，以及同对象到现endpoint/capture/verify的适配。架构与配方策略不进入kernel或平台壳层。当前仍`publishable=false`，不能以source/host结果广告生产codec。
+
+原审查发现所有DLL共用link.map可能被后继链接覆盖；第一轮修复为各module独立map，并从选中原link receipt核对原路径及当前/快照身份。随后复审发现未转义的`$$@`在真实configure的append/eval中提前变为PID；第二轮固定token改为`\$\$@`，穿过真实configure后留给原make规则使用。捕获后未改argv、复制假map或放宽consumer。
+
+初始两个新host suite的10项为9通过/1缺pwsh跳过，受影响source/macOS/Linux 19项通过。第一轮扩展的最终14项为13通过/1缺pwsh跳过，保留原共享map顺序与确定性交叠的真实RED。第二轮只执行真实固定configure相关原代码、原make顺序/交叠的3项定向控制，全部通过、10.555秒；旧token写出PID map的两个实际FAIL保留。未重复未变的完整suite或原数学。pwsh/Pester未安装的两次尝试保留为环境限制，不计通过。
+
+上述configure控制逐字提取固定归档的原函数、完整选项循环和配置写出片段，不是完整configure工具探测、PowerShell/WSL或完整FFmpeg构建。现有本机clang/lld只用于固定276B数据的最小COFF/PE容器和producer→consumer身份控制，不执行PE，也不作为shipping对象。独立Fix2复审`6499ea1662d9ec05086581fc5fc4ddfdb1fc91e823edcb07210fed017485cacc`为Spec PASS/Quality Approved，0Critical/Important/Minor；原map问题在source/host范围关闭。原A/Fix1历史Changes requested与全部失败记录保持。
+
+冻结材料分别位于`target/windows-shipping-recipe-A-20261016/`（10997项）、`...-fix1-20261016/`（21146项）与`...-fix2-20261016/`（136项）。最终清单SHA256为`88560ee05f4508506c34eb88213676afe22fda8510a84558a64e03ecd9573ba9`；root完整读取报告/所有delta，独立核对各冻结项及当前六源，保护工具/consumer/patch/pin/私有门均保持。同期root主计划更新明确单独归属，不声称whole-tree干净。
+
+**实际固定Windows/WSL自然构建仍未执行。** 目前自然AS argv与安装复制后原位strip已知可能超出现consumer支持域，必须保存真实首错和partial后另审，不能等价改写或另编shipping核迎合旧接口。后续执行接线还须保留configure/make的原始双通道及完整固定工具字节，现文字合流日志/工具hash本身不等于这些完整材料。B同对象Windows数值组合、C真实ABI/guard/qmul/QPC与三个fresh-process性能窗口、D修改包/受信安装/实际装载及完整codec/live资格全部继续OPEN，默认upstream和系统NativeFirst不变。

@@ -12,7 +12,7 @@ recipes = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recipes)
 PROFILE = 'macos-aarch64'
 PROFILES = {'macos-aarch64': 'aarch64', 'linux-aarch64': 'aarch64',
-            'linux-x86': 'x86', 'linux-x86_64': 'x86_64'}
+            'linux-x86': 'x86', 'linux-x86_64': 'x86_64', 'windows-aarch64': 'aarch64'}
 
 
 def metadata(recipe, profile=PROFILE, repo=REPO):
@@ -42,6 +42,11 @@ def asset_files(archive, recipe, profile=PROFILE, repo=REPO):
         paths = [Path('tools/ffmpeg-source-recipe.py'), Path('tools/desktop-ffmpeg-source.py'),
                  Path('tools/linux-ffmpeg-bundle.py'), Path('tools/build-ffmpeg-linux.sh'),
                  Path('tools/verify-linux-ffmpeg-bundle.sh')]
+    if profile == 'windows-aarch64':
+        paths = [Path('tools') / name for name in (
+            'ffmpeg-source-recipe.py', 'desktop-ffmpeg-source.py', 'build-ffmpeg-windows.ps1',
+            'ffmpeg-build-common.psm1', 'windows-ffmpeg-bundle.py',
+            'windows-ffmpeg-build-capture.py', 'windows-ffmpeg-kernel.py')]
     if recipe == recipes.MODIFIED:
         paths += [recipes.PIN, recipes.PATCH]
     for path in paths:
@@ -70,6 +75,18 @@ def asset_files(archive, recipe, profile=PROFILE, repo=REPO):
                         'x86/i686 and AMD64 require NASM; ARM64 requires HAVE_NEON.\n'
                         'Fresh replay validates all pre/post hashes and leaves the C oracle unchanged.\n'
                         'Static cross checks do not execute the target.\n')
+    if profile == 'windows-aarch64':
+        instructions = (f'Profile: {profile}\nRecipe: {recipe}\n'
+                        'Base archive hash and upstream signature authenticate the original archive only.\n'
+                        'The fixed local patch is not an upstream-signed release.\n'
+                        'Extract into the matching FreeRemoteDesk checkout; keep all included helpers unchanged.\n'
+                        'Use Windows, WSL Ubuntu 24.04 and fixed llvm-mingw 20250709 in /opt, VS2022 and Rust 1.96.0.\n'
+                        f'pwsh -File tools/build-ffmpeg-windows.ps1 -Architecture arm64 -SourceRecipe {recipe}\n'
+                        'Builder verifies the pinned archive and upstream signature before fixed fresh-source replay.\n'
+                        'Modified attempts keep source/config/objects/raw tool receipts and failed partial files.\n'
+                        'This is build-side evidence only: old stage/installer contracts do not admit modified output.\n'
+                        'Numeric, native guard/qmul/QPC, modified package and live qualification remain OPEN.\n'
+                        'Publish corresponding source beside a matching binary only after separate qualification.\n')
     members['REBUILD.txt'] = instructions.encode()
     manifest = {'schema': 'freeremotedesk.desktop.ffmpeg-source.v1', 'profile': profile,
                 'source': info, 'recipe': recipe,
