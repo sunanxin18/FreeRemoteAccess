@@ -1,6 +1,7 @@
 """真实宿主 spawn 与小型 PE 数据容器；不构建 shipping FFmpeg，不执行 PE。"""
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -117,6 +118,141 @@ class NaturalSpawn(unittest.TestCase):
                                  '--tool', '/usr/bin/true'], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / 'tool-capture').exists())
+
+
+class MapRejectionDiagnostic(unittest.TestCase):
+    """仅宿主 Python/工具替身；绝不启动真实 compiler 或 linker。"""
+    def setUp(self):
+        self.capture = module('windows-ffmpeg-build-capture')
+        self.root = workdir('map-rejection')
+        self.calls = self.root / 'calls'
+        self.calls.mkdir()
+        self.tool = self.root / 'aarch64-w64-mingw32-clang'
+        self.tool.write_bytes(b'fixed synthetic tool identity; do not execute')
+        self.identity = self.capture.artifact(self.tool)
+        self.stream_count = 0
+
+    def tearDown(self):
+        if not os.environ.get('FRD_WINDOWS_RECIPE_TEST_ARTIFACTS'):
+            shutil.rmtree(self.root)
+
+    def reject(self, argv, cwd=None):
+        original = argv[:]
+        stderr = io.BytesIO()
+        with mock.patch.object(self.capture.sys, 'stderr', mock.Mock(buffer=stderr)), \
+                mock.patch.object(self.capture.subprocess, 'run', side_effect=AssertionError('工具不得运行')) as run:
+            with self.assertRaisesRegex(ValueError, '自然 link map 必须专属于原 module 路径；拒绝共享/跨调用 map'):
+                self.capture.spawn(argv, cwd or self.root, self.calls, expected_tool=self.identity)
+            run.assert_not_called()
+        self.assertEqual(argv, original)
+        self.assertEqual(list(self.calls.iterdir()), [])
+        raw = stderr.getvalue()
+        self.stream_count += 1
+        (self.root / f'rejection-{self.stream_count}.stderr.bin').write_bytes(raw)
+        self.assertLessEqual(len(raw), 32768)
+        self.assertEqual(len(raw.splitlines()), 1, '必须是一个完整 JSON 事件')
+        return raw, json.loads(raw)
+
+    def test_missing_module_reports_original_argv_and_unknown_expected_map(self):
+        argv = [str(self.tool), '-shared', '-Wl,--Map=shared.map']
+        _, event = self.reject(argv)
+        self.assertEqual(event, {
+            'schema': 'freeremotedesk.windows.ffmpeg-spawn-rejected.v1',
+            'reason': 'link-map-ownership', 'complete': True, 'incomplete_reasons': [],
+            'argv': argv, 'argv_count': 3, 'cwd': str(self.root), 'module': None,
+            'map': str(self.root / 'shared.map'), 'expected_map': None})
+
+    def test_wrong_map_reports_parsed_paths_deterministically_without_rewrite(self):
+        argv = [str(self.tool), '-o', 'libavutil/avutil-60.dll', '-Wl,--Map=shared.map', '空 格']
+        first, event = self.reject(argv)
+        second, _ = self.reject(argv)
+        self.assertEqual(first, second)
+        self.assertTrue(event['complete'])
+        self.assertEqual(event['argv'], argv)
+        self.assertEqual(event['cwd'], str(self.root))
+        self.assertEqual(event['module'], str(self.root / 'libavutil/avutil-60.dll'))
+        self.assertEqual(event['map'], str(self.root / 'shared.map'))
+        self.assertEqual(event['expected_map'], str(self.root / 'libavutil/avutil-60.dll.map'))
+
+    def test_owned_map_preserves_argv_and_normal_receipt_without_rejection_event(self):
+        argv = [str(self.tool), '-o', 'one.dll', '-Wl,--Map=one.dll.map', '空 格']
+        original = argv[:]
+        marker = self.root / 'tool-substitute-ran'
+        def substitute(actual, **kwargs):
+            self.assertEqual(actual, original)
+            self.assertEqual(kwargs['cwd'], self.root)
+            marker.touch()
+            return subprocess.CompletedProcess(actual, 0)
+        stderr = io.BytesIO()
+        with mock.patch.object(self.capture.sys, 'stderr', mock.Mock(buffer=stderr)), \
+                mock.patch.object(self.capture.subprocess, 'run', substitute):
+            self.assertEqual(self.capture.spawn(argv, self.root, self.calls, expected_tool=self.identity), 0)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(argv, original)
+        self.assertEqual(stderr.getvalue(), b'')
+        receipts = list(self.calls.glob('*/finished.json'))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(self.capture.load_call(receipts[0])['argv'], original)
+
+    def test_unicode_and_long_fields_remain_bounded_complete_json_and_explicitly_incomplete(self):
+        long = '😀\\\"' * 2000
+        argv = [str(self.tool), '-o', long + '.dll', '-Wl,--Map=' + long + '.map', *([long] * 70)]
+        raw, event = self.reject(argv, Path('/') / long)
+        self.assertFalse(event['complete'])
+        self.assertEqual(event['argv_count'], len(argv))
+        self.assertEqual(event['incomplete_reasons'], ['field_limit', 'argv_count_limit', 'event_byte_limit'])
+        self.assertLess(len(event['argv']), len(argv))
+        self.assertTrue(raw.endswith(b'\n'))
+        repeated, _ = self.reject(argv, Path('/') / long)
+        self.assertEqual(raw, repeated)
+
+    def test_stderr_write_or_encoding_error_preserves_original_guard_and_no_tool(self):
+        argv = [str(self.tool), '-o', 'one.dll', '-Wl,--Map=shared.map']
+        for failure in ('write', 'encode'):
+            stderr = mock.Mock()
+            patch = (mock.patch.object(stderr.buffer, 'write', side_effect=OSError('synthetic log failure'))
+                     if failure == 'write' else
+                     mock.patch.object(self.capture.json, 'dumps', side_effect=ValueError('synthetic encode failure')))
+            with self.subTest(failure=failure), patch, \
+                    mock.patch.object(self.capture.sys, 'stderr', stderr), \
+                    mock.patch.object(self.capture.subprocess, 'run', side_effect=AssertionError('工具不得运行')) as run:
+                with self.assertRaisesRegex(ValueError, '自然 link map 必须专属于原 module 路径；拒绝共享/跨调用 map'):
+                    self.capture.spawn(argv, self.root, self.calls, expected_tool=self.identity)
+                run.assert_not_called()
+            self.assertEqual(list(self.calls.iterdir()), [])
+
+    def test_tool_identity_guard_still_precedes_rejection_diagnostic(self):
+        argv = [str(self.tool), '-o', 'one.dll', '-Wl,--Map=shared.map']
+        self.tool.write_bytes(b'changed identity')
+        stderr = io.BytesIO()
+        with mock.patch.object(self.capture.sys, 'stderr', mock.Mock(buffer=stderr)), \
+                mock.patch.object(self.capture.subprocess, 'run', side_effect=AssertionError('工具不得运行')) as run:
+            with self.assertRaisesRegex(ValueError, '固定工具身份漂移'):
+                self.capture.spawn(argv, self.root, self.calls, expected_tool=self.identity)
+            run.assert_not_called()
+        self.assertEqual(stderr.getvalue(), b'')
+        self.assertEqual(list(self.calls.iterdir()), [])
+
+    def test_unhandled_rejection_exits_nonzero_with_json_in_raw_stderr(self):
+        harness = self.root / 'reject.py'
+        harness.write_text(
+            'import importlib.util\nfrom pathlib import Path\n'
+            f'spec=importlib.util.spec_from_file_location("capture", {str(ROOT / "tools/windows-ffmpeg-build-capture.py")!r})\n'
+            'capture=importlib.util.module_from_spec(spec)\nspec.loader.exec_module(capture)\n'
+            f'tool={str(self.tool)!r}\n'
+            f'capture.spawn([tool,"-Wl,--Map=shared.map"], Path({str(self.root)!r}), '
+            f'Path({str(self.calls)!r}), expected_tool=capture.artifact(tool))\n')
+        result = subprocess.run([sys.executable, str(harness)], capture_output=True)
+        (self.root / 'unhandled.stdout.bin').write_bytes(result.stdout)
+        (self.root / 'unhandled.stderr.bin').write_bytes(result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b'')
+        self.assertTrue(result.stderr.startswith(b'{'), '原 stderr 首行必须包含拒绝 JSON 事件')
+        event = json.loads(result.stderr.splitlines()[0])
+        self.assertTrue(event['complete'])
+        self.assertEqual(event['argv'], [str(self.tool), '-Wl,--Map=shared.map'])
+        self.assertIn('ValueError: 自然 link map 必须专属于原 module 路径；拒绝共享/跨调用 map'.encode(), result.stderr)
+        self.assertEqual(list(self.calls.iterdir()), [])
 
 
 class ProducerConsumer(unittest.TestCase):

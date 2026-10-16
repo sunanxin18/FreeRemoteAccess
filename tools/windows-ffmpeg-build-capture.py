@@ -13,6 +13,9 @@ TOOL_ROOT = Path('/opt/frd-llvm-mingw-20250709/bin')
 PREFIX = 'aarch64-w64-mingw32-'
 TOOLS = {PREFIX + name: TOOL_ROOT / (PREFIX + name) for name in ('clang', 'strip')}
 SCHEMA = 'freeremotedesk.windows.ffmpeg-spawn.v1'
+REJECTION_MAX_BYTES = 32768  # 包含末尾换行；与正常 call 收据无关。
+REJECTION_MAX_ARGS = 64
+REJECTION_MAX_FIELD_CHARS = 512
 
 
 def require(ok, message):
@@ -87,6 +90,43 @@ def outputs(argv, cwd, strip=False):
             for name, value in values.items()}
 
 
+def emit_map_rejection(argv, cwd, targets):
+    """向已有 native stderr 留下有界现场；不读取环境，也不改写自然参数。"""
+    reasons = []
+
+    def bounded(value):
+        if value is None:
+            return None
+        value = str(value)
+        if len(value) > REJECTION_MAX_FIELD_CHARS:
+            if 'field_limit' not in reasons:
+                reasons.append('field_limit')
+            return value[:REJECTION_MAX_FIELD_CHARS]
+        return value
+
+    module = targets.get('module')
+    event = {'schema': 'freeremotedesk.windows.ffmpeg-spawn-rejected.v1',
+             'reason': 'link-map-ownership', 'argv_count': len(argv),
+             'argv': [bounded(arg) for arg in argv[:REJECTION_MAX_ARGS]],
+             'cwd': bounded(cwd), 'module': bounded(module), 'map': bounded(targets.get('map')),
+             'expected_map': bounded(str(module) + '.map' if module is not None else None),
+             'complete': True, 'incomplete_reasons': reasons}
+    if len(argv) > REJECTION_MAX_ARGS:
+        reasons.append('argv_count_limit')
+    while True:
+        event['complete'] = not reasons
+        encoded = (json.dumps(event, ensure_ascii=True, sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
+        if len(encoded) <= REJECTION_MAX_BYTES:
+            break
+        if 'event_byte_limit' not in reasons:
+            reasons.append('event_byte_limit')
+        # 固定字段已各自限长；四个路径即使全为 supplementary Unicode 也小于总预算。
+        require(bool(event['argv']), '拒绝诊断固定字段超过总预算')
+        event['argv'].pop()
+    sys.stderr.buffer.write(encoded)
+    sys.stderr.buffer.flush()
+
+
 def spawn(argv, cwd, directory, *, expected_tool):
     """内部受信入口：实际 argv 不变，stdout/stderr 以原 bytes 保存，失败仍有收据。"""
     cwd, directory = Path(cwd).absolute(), Path(directory)
@@ -95,9 +135,14 @@ def spawn(argv, cwd, directory, *, expected_tool):
     call = directory / uuid.uuid4().hex
     strip = Path(argv[0]).name.endswith('-strip')
     targets = outputs(argv, cwd, strip)
-    require('map' not in targets or ('module' in targets and
-            targets['map'] == Path(str(targets['module']) + '.map')),
-            '自然 link map 必须专属于原 module 路径；拒绝共享/跨调用 map')
+    map_owned = 'map' not in targets or ('module' in targets and
+                targets['map'] == Path(str(targets['module']) + '.map'))
+    if not map_owned:
+        try:
+            emit_map_rejection(argv, cwd, targets)
+        except Exception:
+            pass  # 日志失败不得替代原 guard，或允许工具启动。
+    require(map_owned, '自然 link map 必须专属于原 module 路径；拒绝共享/跨调用 map')
     call.mkdir()
     before = paths(argv, cwd)
     saved_before = {}

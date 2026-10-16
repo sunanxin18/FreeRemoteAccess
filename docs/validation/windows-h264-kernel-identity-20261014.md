@@ -243,3 +243,16 @@ Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd91
 这关闭本机版本下该有限稳定/替换流程的原生验证门；产物仍明确UNQUALIFIED，不外推任意文件系统、并发修改或整个导出流程。原A具体文件/字段与make首错仍UNKNOWN，完整长A/正式运输尚未完成。原件存 `target/fb90-ci-resume-root-20261016/`，下载内容未执行。
 
 独立原件复核通过：3625B报告SHA256 `a3c2a2adc5e335abef3898248fa6c1cb74df4a5059108d88bd96985699fdc885`，root全文读并核11项绑定。该有限原生门通过后，root释放下一次普通自然A执行，以检查完整导出并保存make失败原件；仅更新A工作流发布注释，命令、配方、矩阵、预算和旧失败记录保持，不对旧run做dispatch/rerun。结果仍须从新run自己的原件判断。
+
+
+## 2026-10-16 本次 A 已恢复 make 首错
+
+`cfb685b8` 的 [run38917242866/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38917242866) 终态失败。bootstrap artifact12055060298（14,476,283B，SHA256 `ac074ce09da1b777393aa4ee287031bb941aed403082a70e8500529a96bef166`）经完整API摘要、28段连续206、CRC和174成员核验，只作为数据读取。
+
+这次有限先导出实际成功：selection.complete=true、export exit0、14份copied原件与source/saved哈希一致。新canonical Reader由此通过本次有限导出路径，但全量运输仍未完成。原make首个traceback已取得：capture包装器在启动链接器前拒绝map/module归属，随后make报`libavutil/avutil-60.dll`失败并exit2，外层builder返回1。该错误不是已证明的NEON指令、clang或实际linker错误；MainModule.FileName仅为观察失败。
+
+原归属断言位于normal call目录和started receipt创建之前，所以被拒绝调用的实际argv、解析module/map和expected_map没有保存；具体值及token展开原因仍UNKNOWN。新的最小诊断只在原拒绝点向既有stderr写有界、确定性JSON事件；保留自然参数、固定工具身份先验、严格相等断言、原ValueError及拒绝时不运行工具。完整事件包含原argv/cwd/解析目标，最多32768B；超限明确complete=false。它不修改map token或放宽ownership。
+
+新增7项宿主控制先取得4个精确断言RED（0 errors），实现后7/7及现NaturalSpawn合计12/12通过；包括Unicode、过长输入、日志失败和原始stderr首行。原第一次含一个解析错误的RED另存，未冒充有效RED。以上仅Python合成工具，不是新的Windows执行或FFmpeg成功构建。
+
+Collect原三阶段记录：LLVM复制46.831秒exit0，system-tools1.643秒exit0，build-root-copy开始后没有end/exit，最终达到原300秒窗、exit124。已定位整体复制阶段，具体文件/已复制量与吞吐仍未知；正式tar/receipt/verification未生成。预算、清理和旧失败均保持。实际原件在`target/a-cfb-failure-root-20261016/`，独立只读诊断报告SHA256 `adc318b595f75441b2c1075ff7fab7bec6612803cb83ee34cb8648d0ba9b2f55`经root全文读和44绑定复核；拒绝诊断独立SOURCE/HOST审查通过（报告SHA256 `45cf6d22d8eb9ce8751cf164655999bcc5a5ba0ba8bd46555ac400b14586d083`），root全文读并核绑定；未因此授新原生资格，没有另行重启A。
