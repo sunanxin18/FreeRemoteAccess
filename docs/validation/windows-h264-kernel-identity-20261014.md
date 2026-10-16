@@ -233,3 +233,13 @@ Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd91
 宿主反例由原稳定文件被拒绝变为成功，18项聚焦及完整transport模块55项通过；涵盖七字段各阶段变化、桥接字段与birth缺失、实际文件替换、同大小恢复mtime、句柄关闭和诊断失败。小probe复用固定源码中的真实Reader，保留旧raw观察并增加两次stable读取及实际read-open替换负控。以上是宿主合成语义测试，尚未证明Windows实际birth可得或新流程原生通过；后续普通Windows CI小probe验证后才决定是否再运行长A。
 
 三源实现独立审查通过：5104B报告SHA256 `b0ece2dc17fec817fed666367f7112dd13039e9d515d04910ba220819b55516f`，root全文读并核38作者项、8保护输入及12审查绑定。普通Windows流程将运行固定无参probe，核对实际birth、稳定接受和read-open替换拒绝；长A工作流未改，未手动dispatch/rerun。
+
+## 2026-10-16 canonical 小流程的真实 Windows 结果
+
+`fb90ddd4` 的 [普通Windows run38916060786/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38916060786)，x64 job117024711756的probe和上传均成功。artifact12051589736为2211B，单result.json为16441B；API摘要、ZIP CRC及成员集合经root核验。实际CPython仍为3.12.10 AMD64/Windows build26100，probe与qualifier物理SHA精确匹配该提交的CRLF源码，规范exporter SHA为 `d2dad57245350f470b57308b0512376b4ed1f2e2fd8b6a9c75c8fb5722b1e9af`。
+
+双方实际birth属性可得。直接新建30B及先替换后稳定的51B文件均经真实canonical Reader成功读取，payload SHA匹配；51B样本原path ctime为1792161085721872800、fd为1792161085723887600，旧比较仍明确拒绝read-open，新快照保留真实fd值而成功。替换负控在实际Reader第二次open前替换，精确read-open拒绝，ino/mtime/ctime均变化且大小仍39B；替换后的payload没有被读取或冒充已读。原始观察、旧比较决定和新决定分别保留。
+
+这关闭本机版本下该有限稳定/替换流程的原生验证门；产物仍明确UNQUALIFIED，不外推任意文件系统、并发修改或整个导出流程。原A具体文件/字段与make首错仍UNKNOWN，完整长A/正式运输尚未完成。原件存 `target/fb90-ci-resume-root-20261016/`，下载内容未执行。
+
+独立原件复核通过：3625B报告SHA256 `a3c2a2adc5e335abef3898248fa6c1cb74df4a5059108d88bd96985699fdc885`，root全文读并核11项绑定。该有限原生门通过后，root释放下一次普通自然A执行，以检查完整导出并保存make失败原件；仅更新A工作流发布注释，命令、配方、矩阵、预算和旧失败记录保持，不对旧run做dispatch/rerun。结果仍须从新run自己的原件判断。
