@@ -148,3 +148,20 @@ Linux/Windows现workflow各新增x86两行专用build-only及always精确九原�
 输出按冻结源码的精确顺序、case与mask校验，i686为28行、Linux x64为36行、Windows x64为84行，含两个kernel的精确坏callee校准及各九个正向像素case。实际Linux嵌入Python纯parser通过80个接受/拒绝样例，Linux AST/bash-n及原工作流范围检查通过；Windows固定表仅静态核对，本机无pwsh，不能报告其grammar或运行通过。每目标运输原九件加ABI双流，共11条固定路径。
 
 独立源码审查通过（`5a1ae0fa4ecd8c1a220418643c95900e49ef2d29ab60889dbef35b1509d1cc44`）；root全文读61512B增量及作者/审查报告，核56作者绑定和16审查绑定。当前只释放默认x86 CI runner下这四个精确私有图像的一次受限normal-return测试，不修改保护配置；control_flow_protection仍not-qualified。实际四目标ABI结果另记，不由parser、静态编译或运行接线推导通过。Win32 reader展开、full unwind、shipping内部fastcc/inline、性能与live继续待验。
+
+### Linux 两个精确图像实际 ABI
+
+`01cd9bc8`的[run38896199176/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38896199176)已实际执行两个staged ELF，均与f5已审图像及map逐字相同。宿主为x86_64，分别运行i686 ELF32和x64 ELF64；不据此声明任意32位Linux系统兼容。
+
+| 目标 | job / artifact ID | 实际闭集输出 |
+|---|---|---|
+| Linux i686 | 116957141253 / 12044351162 | 28行；SSE2/SSSE3各12项精确坏callee校准、各9项正向 |
+| Linux x86_64 | 116957141036 / 12043259780 | 36行；SSE2/SSSE3各16项精确坏callee校准、各9项正向 |
+
+两ZIP各11成员，build/abi原exit均0、双EOF及capture完整，ABI stderr均空；原调用均为精确staged ELF加唯一`abi`参数。root核CRC、四源六配置三阶段与原ELF/map身份，并全文核28/36行。独立实际读数通过（报告SHA256 `54d184abeeac54ccf3041ac8d636427874205c9cb7d0d6455b4a1cbbdc992f03`）；原件在`target/exact-abi-and-failed-wsl-delivery-root-20261016/ci/`。当时完整包job仍进行；这只关闭两个精确私有normal-return正负门，保护、full unwind、shipping实例和性能继续开放。
+
+### Windows 工作流长度修复
+
+同提交的[run38896197513/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38896197513)在创建job前completed/failure，没有可读check-run annotation，未执行Windows ABI。实际YAML中该run为23547字符，超过[GitHub规定的21000字符上限](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstepsrun)；此为已复现的配置违规，没有将其称为已取得唯一服务端错误正文。
+
+仅把原run机械移入`tools/verify-windows-publication-abi.ps1`，workflow保留105字符固定调用。前向/反向字节比较证明除闭集Architecture参数、两处相等路径替换及脚本自身配置绑定外正文保持；Windows配置由六项增为七项，原SHA门、预算、capture和11原件不变。全仓73个run长度检查RED→GREEN，当前最大19944字符。独立源审通过（`41fb15f3db66b5dca6b56c1e8241384f8257447c5eab0e76e867717a76c485e3`）；没有安装/调用pwsh或执行图像。后继仅正常提交Windows修复并验证第一次实际Windows运行，原Linux和A运行不重启、不dispatch/rerun。
