@@ -33,17 +33,17 @@
 
 **Interfaces:** 原版include TU只将ff_hevc_pred_init改名frd_hevc32_original_init；保持原pred.c/header/template不改。callback沿HEVCPredContext的六参数angular签名：`void (uint8_t *dst, const uint8_t *top, const uint8_t *left, ptrdiff_t stride, int c_idx, int mode)`。未来C wrapper名`ff_hevc_pred_angular_32_8_dispatch_aarch64`，汇编核名`ff_hevc_pred_angular_32_v_8_neon`。新reference暴露reference/selector两个固定执行模式；native用例复用同一case/model而不复制候选算法。
 
-- [ ] 先写原版/model tests：N32，mode2..34×c_idx0/1/2；显式floor_div，不依赖负数右移/向零除法。原版TU和独立model逐byte对照完整1024像素、整dst/padding及输入不变。
-- [ ] 固定46类图案沿旧16图案定义扩展至32和端点63；strides32/33/63/64/128/257/-33/-63，dst8192B，refs各128B含合法[-1..63]。数值组全图案、布局组3图案各stride独立扫三地址mod16、同址refs组全图案；记录精确case数，不能声称未测的交叉乘积。覆盖fraction取整和size32无边界修正判别。
-- [ ] 完整context验证：CPUoff/on和8/9/10/12/0/7/16；0002旧16符号保持，不跨TU用函数地址证明原版身份。RED专属never-called wrapper marker仅供取地址，REQUIRE_NATIVE与RED宏互斥。
-- [ ] 源码独立审查后root绑定现固定原版tree、配置、compiler/avutil及0002对象，释放本任务所需有界host原版/model运行。预期reference exit0且完整case终态；真实post0002 selector的32槽仍为C，精确marker未选中才exit3。任何编译/链接失败、signal、marker被调用或其它context异常不算RED。
-- [ ] root取得上述原流并验收后，Task2才可写实现。旧16 ABI/guard/benchmark不重跑。
+- [x] 先写原版/model tests：N32，mode2..34×c_idx0/1/2；显式floor_div，不依赖负数右移/向零除法。原版TU和独立model逐byte对照完整1024像素、整dst/padding及输入不变。
+- [x] 固定46类图案沿旧16图案定义扩展至32和端点63；strides32/33/63/64/128/257/-33/-63，dst8192B，refs各128B含合法[-1..63]。数值组全图案、布局组3图案各stride独立扫三地址mod16、同址refs组全图案；记录精确case数，不能声称未测的交叉乘积。覆盖fraction取整和size32无边界修正判别。
+- [x] 完整context验证：CPUoff/on和8/9/10/12/0/7/16；0002旧16符号保持，不跨TU用函数地址证明原版身份。RED专属never-called wrapper marker仅供取地址，REQUIRE_NATIVE与RED宏互斥。
+- [x] 源码独立审查后root绑定现固定原版tree、配置、compiler/avutil及0002对象，释放本任务所需有界host原版/model运行。预期reference exit0且完整case终态；真实post0002 selector的32槽仍为C，精确marker未选中才exit3。任何编译/链接失败、signal、marker被调用或其它context异常不算RED。
+- [x] root取得上述原流并验收后，Task2才可写实现。旧16 ABI/guard/benchmark不重跑。
 
 ### Task 2: 垂直32汇编及新增路径验收
 
 **Files:** Create `third_party/ffmpeg/8.1.2/patches/0003-aarch64-hevc-angular32-vertical-neon.patch`; Modify仅本任务两个新C测试以接入GREEN。
 
-**Interfaces:** patch仅沿0002 postimage增加新ASM及C wrapper/真实slot3 hook；wrapper在pred.c同TU可访问原static pred_angular_3_8，aarch64 init声明wrapper并仅在原exact8+NEON条件下设置slot3。禁止全局可变fallback。所有其它尺寸/位深/槽不变。
+**Interfaces:** patch仅沿0002 postimage增加新ASM及C wrapper/真实slot3 hook；wrapper在pred.c同TU可访问原static pred_angular_3_8，aarch64 init声明wrapper并仅在原exact8+NEON条件下设置slot3。禁止全局可变fallback。所有其它尺寸/位深/槽不变。直接ABI沿已有sentinel只读源，以预处理改名生成新32私有对象（helper名与angular callee同时改名），新用例固定w6=1直调32核；不修改旧helper、不运行旧16用例，实际linked BL仍须核对，不能把宏替换本身当作ABI证据。
 
 - [ ] 以Task1真实RED为基线实现新ASM：仅mode18..34，signed stride，NEON按32byte row插值/精确copy。负角ref构建遵原floor/inverse索引；数值分子最大8160，round+16最大8176，u16足够。不得无条件做fraction0的第二参考读取。
 - [ ] 原水平C body保留；新wrapper只作方向选择。汇编不碰x18、nonvolatile/LR；SP16对齐，scratch/CFI与实际指令相符。沿现Mach-O/ELF私有边界，COFF不假借此门取得资格。
