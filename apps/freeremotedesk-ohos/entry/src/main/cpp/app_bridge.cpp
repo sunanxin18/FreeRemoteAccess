@@ -1,6 +1,10 @@
 // UI 线程只导入调用期密码；临时复制 volatile wipe，不保留/打印 NAPI payload。
 #include "app_bridge.h"
 #include "ime_grapheme.h"
+#include "session_diagnostic.h"
+#include <hilog/log.h>
+#include <atomic>
+#include <chrono>
 #include "frd_ohos_app.h"
 #include "frd_ohos.h"
 #include <charconv>
@@ -10,6 +14,26 @@
 #include <vector>
 namespace {
 uint64_t application = 0;
+FrdSessionDiagnostic::FallbackState snapshotFallback;
+void SessionDiagnostic(FrdSessionDiagnostic::Event event, uint64_t app, int32_t code) {
+    using Event = FrdSessionDiagnostic::Event;
+    const char *name = "unknown";
+    switch (event) {
+        case Event::Initialize: name = "initialize"; break;
+        case Event::Shutdown: name = "shutdown"; break;
+        case Event::Cleanup: name = "cleanup"; break;
+        case Event::FallbackEntered: name = "fallback_entered"; break;
+        case Event::FallbackCodeChanged: name = "fallback_code_changed"; break;
+        case Event::FallbackExited: name = "fallback_exited"; break;
+    }
+    static std::atomic<uint64_t> sequence{0};
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0xFF00, "FrdSession",
+        "producer=cpp clock=cpp_steady sequence=%{public}llu monotonic_us=%{public}lld app=%{public}llu bound=%{public}d event=%{public}s abi=%{public}d",
+        static_cast<unsigned long long>(++sequence), static_cast<long long>(micros),
+        static_cast<unsigned long long>(app), app != 0, name, code);
+}
 float pointerDensity = 0;
 std::string sandbox;
 struct Text {
@@ -78,9 +102,11 @@ napi_value Initialize(napi_env env, napi_callback_info info) {
         application = id;
         sandbox.assign(reinterpret_cast<char *>(t.bytes.data()), t.bytes.size());
     }
+    SessionDiagnostic(FrdSessionDiagnostic::Event::Initialize, id, c);
     return Code(env, c);
 }
 napi_value Shutdown(napi_env env, napi_callback_info) {
+    SessionDiagnostic(FrdSessionDiagnostic::Event::Shutdown, application, 0);
     FrdAppCleanup();
     return Code(env, 0);
 }
@@ -88,6 +114,14 @@ napi_value Snapshot(napi_env env, napi_callback_info) {
     uint8_t *out = nullptr;
     size_t n = 0;
     auto c = frd_ohos_app_snapshot(application, &out, &n);
+    using Transition = FrdSessionDiagnostic::FallbackTransition;
+    using Event = FrdSessionDiagnostic::Event;
+    switch (snapshotFallback.Observe(application, c)) {
+        case Transition::Entered: SessionDiagnostic(Event::FallbackEntered, application, c); break;
+        case Transition::CodeChanged: SessionDiagnostic(Event::FallbackCodeChanged, application, c); break;
+        case Transition::Exited: SessionDiagnostic(Event::FallbackExited, application, c); break;
+        case Transition::None: break;
+    }
     napi_value v = nullptr;
     if (c == 0) {
         napi_create_string_utf8(env, reinterpret_cast<char *>(out), n, &v);
@@ -223,6 +257,7 @@ void FrdAppForeground(bool value) {
         frd_ohos_app_focus(application, value, 0, 0);
 }
 void FrdAppCleanup() {
+    SessionDiagnostic(FrdSessionDiagnostic::Event::Cleanup, application, 0);
     if (application)
         frd_ohos_app_destroy(application);
     application = 0;

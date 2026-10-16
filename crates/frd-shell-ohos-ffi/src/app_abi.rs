@@ -55,6 +55,7 @@ pub unsafe extern "C" fn frd_ohos_app_create(path: *const u8, len: usize, out: *
         let mut a = apps().lock().map_err(|_| PANIC)?;
         a.0 = a.0.checked_add(1).ok_or(EXHAUSTED)?;
         let id = a.0;
+        engine.diagnostic_bind(id);
         a.1.insert(id, engine);
         unsafe { *out = id };
         Ok(())
@@ -69,6 +70,7 @@ pub extern "C" fn frd_ohos_app_destroy(id: u64) -> i32 {
             .1
             .remove(&id)
             .ok_or(INVALID_HANDLE)?;
+        e.diagnostic_ingress(crate::session_diagnostic::Event::AppDestroy);
         e.stop();
         Ok(())
     })
@@ -109,10 +111,14 @@ pub extern "C" fn frd_ohos_app_action(
                 repeat: flags & 2 != 0,
             }),
             2 => {
+                a.diagnostic_ingress(crate::session_diagnostic::Event::ActionCancel);
                 a.cancel();
                 Ok(())
             }
-            3 => a.send(Command::Intent(frd_app::AppIntent::ReturnToConnection)),
+            3 => {
+                a.diagnostic_ingress(crate::session_diagnostic::Event::ActionReturn);
+                a.send(Command::Intent(frd_app::AppIntent::ReturnToConnection))
+            }
             4 => a.send(Command::Select(index as usize)),
             _ => Err(INVALID_ARGUMENT),
         }

@@ -5,6 +5,9 @@ use crate::ime_policy::{
 };
 use crate::input_adapter::{InputAdapter, ViewGeometry};
 use crate::keyboard_policy::{qualified_physical_hid, OhosKeyboardQualification};
+use crate::session_diagnostic::{
+    Code as DiagnosticCode, Diagnostic, Event as DiagnosticEvent, PageCode, Record,
+};
 use frd_app::{persist_profile_job, AppAction, AppController, AppIntent, AppPlatformStores};
 use frd_core::{InputEvent, ProtocolId, SecretBuffer, TargetSystem};
 use frd_platform_api::{
@@ -74,13 +77,18 @@ const DISPLAY_INVALID: u64 = 16;
 const CONTROL_MASK: u64 = STOP | CANCEL | FOCUS_LOST | FORM_INVALID | DISPLAY_INVALID;
 const CONTROL_REVISION: u64 = 1 << 32;
 // 标志与代际同时发布，队列满也不会丢失取消/失焦，旧 UI 意图不跨此屏障。
-fn signal(control: &AtomicU64, flags: u64) {
-    let _ = control.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-        Some(
-            old.checked_add(CONTROL_REVISION)
-                .map_or(old | STOP, |next| next | flags),
-        )
-    });
+fn signal(control: &AtomicU64, flags: u64) -> u64 {
+    let previous = control
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            Some(
+                old.checked_add(CONTROL_REVISION)
+                    .map_or(old | STOP, |next| next | flags),
+            )
+        })
+        .expect("control 更新始终返回 Some");
+    previous
+        .checked_add(CONTROL_REVISION)
+        .map_or(previous | STOP, |next| next | flags)
 }
 #[derive(Clone)]
 pub struct Stores {
@@ -185,6 +193,7 @@ pub enum Command {
     Probed(i32),
 }
 pub struct AppEngine {
+    diagnostic: Arc<Diagnostic>,
     ime_installation: ImeInstallation,
     ime_ingress: Arc<Mutex<ImeIngress>>,
     keyboard: OhosKeyboardQualification,
@@ -233,6 +242,8 @@ impl AppEngine {
         keyboard: OhosKeyboardQualification,
         ime_installation: ImeInstallation,
     ) -> Result<Self, i32> {
+        let diagnostic = Arc::new(Diagnostic::default());
+        let owner_diagnostic = diagnostic.clone();
         let ime_ingress = Arc::new(Mutex::new(ImeIngress::default()));
         let owner_ime_ingress = ime_ingress.clone();
         let (sender, receiver) = mpsc::sync_channel(64);
@@ -259,6 +270,10 @@ impl AppEngine {
                 );
                 keyboard.configure(&mut controller);
                 let mut owner = Owner {
+                    diagnostic: owner_diagnostic,
+                    diagnostic_session: None,
+                    diagnostic_full: None,
+                    diagnostic_failure: false,
                     ime: ImeState::new(ime_installation),
                     ime_ingress: owner_ime_ingress,
                     keyboard,
@@ -345,6 +360,10 @@ impl AppEngine {
                         Ok(command) => owner.command(command),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(_) => {
+                            owner.diagnostic.ingress(
+                                DiagnosticEvent::ChannelClosed,
+                                owner.control.load(Ordering::Acquire),
+                            );
                             owner.cancel();
                             owner.stopping = true
                         }
@@ -365,6 +384,7 @@ impl AppEngine {
             })
             .map_err(|_| crate::WORKER_STOPPED)?;
         Ok(Self {
+            diagnostic,
             ime_installation,
             ime_ingress,
             keyboard,
@@ -509,14 +529,24 @@ impl AppEngine {
                 mpsc::TrySendError::Disconnected(_) => crate::WORKER_STOPPED,
             })
     }
+    pub(crate) fn diagnostic_ingress(&self, event: DiagnosticEvent) {
+        self.diagnostic
+            .ingress(event, self.control.load(Ordering::Acquire));
+    }
+    pub(crate) fn diagnostic_bind(&self, app: u64) {
+        self.diagnostic.bind(app);
+    }
     pub fn cancel(&self) {
-        signal(&self.control, CANCEL);
+        let state = signal(&self.control, CANCEL);
+        self.diagnostic
+            .ingress(DiagnosticEvent::EngineCancel, state);
     }
     pub fn lose_focus(&self) {
         signal(&self.control, FOCUS_LOST);
     }
     pub fn stop(&self) {
-        signal(&self.control, STOP);
+        let state = signal(&self.control, STOP);
+        self.diagnostic.ingress(DiagnosticEvent::EngineStop, state);
     }
     pub fn snapshot(&self) -> Result<Vec<u8>, i32> {
         let copy = self.snapshot.lock().map_err(|_| crate::PANIC)?.clone();
@@ -525,6 +555,7 @@ impl AppEngine {
 }
 impl Drop for AppEngine {
     fn drop(&mut self) {
+        self.diagnostic_ingress(DiagnosticEvent::EngineDrop);
         self.stop()
     }
 }
@@ -638,6 +669,10 @@ struct PendingLoad {
     timed_out: bool,
 }
 struct Owner {
+    diagnostic: Arc<Diagnostic>,
+    diagnostic_session: Option<(frd_core::SessionId, u64)>,
+    diagnostic_full: Option<crate::presentation::Epoch>,
+    diagnostic_failure: bool,
     ime: ImeState,
     ime_ingress: Arc<Mutex<ImeIngress>>,
     keyboard: OhosKeyboardQualification,
@@ -668,6 +703,17 @@ struct Owner {
     control: Arc<AtomicU64>,
 }
 impl Owner {
+    fn diagnostic_record(&self, event: DiagnosticEvent, from: PageCode) -> Record {
+        let mut record = Record::new(event, from, self.controller.page().into());
+        if let Some((session, generation)) = self.diagnostic_session {
+            record.session = session.get();
+            record.generation = generation;
+            record.current = true;
+            record.active = self.host.active_session_id() == Some(session);
+        }
+        record
+    }
+
     fn configure_ime(&mut self) {
         if !self.ime.installation.installed() {
             return;
@@ -891,6 +937,7 @@ impl Owner {
         self.ime_barrier();
         let state = self.control.fetch_and(!CONTROL_MASK, Ordering::AcqRel);
         let flags = state & CONTROL_MASK;
+        let from = PageCode::from(self.controller.page());
         if flags & DISPLAY_INVALID != 0 {
             self.display_invalid_before = state / CONTROL_REVISION;
             self.local_display.invalidate();
@@ -909,6 +956,12 @@ impl Owner {
         if flags & (STOP | CANCEL) != 0 {
             self.cancel();
             self.stopping |= flags & STOP != 0;
+        }
+        if flags & (STOP | CANCEL) != 0 {
+            let mut record = self.diagnostic_record(DiagnosticEvent::ApplyControl, from);
+            record.flags = flags;
+            record.revision = state / CONTROL_REVISION;
+            self.diagnostic.emit(record);
         }
     }
     fn send(&self, c: Option<SessionCommand>) {
@@ -935,11 +988,14 @@ impl Owner {
         self.check_ime()
     }
     fn cancel(&mut self) {
+        let from = PageCode::from(self.controller.page());
         self.release();
         self.clear_remote();
         if self.host.launch_is_pending() {
             self.host.cancel_pending_launch();
             self.cancelled_launch = true;
+            self.diagnostic
+                .emit(self.diagnostic_record(DiagnosticEvent::OwnerCancel, from));
             return;
         }
         let intent = if matches!(
@@ -952,6 +1008,8 @@ impl Owner {
         };
         self.intent(intent);
         self.cleanup();
+        self.diagnostic
+            .emit(self.diagnostic_record(DiagnosticEvent::OwnerCancel, from));
     }
     fn cleanup(&mut self) {
         let tx = self.tx.clone();
@@ -966,6 +1024,8 @@ impl Owner {
         }
     }
     fn intent(&mut self, intent: AppIntent) {
+        let diagnostic_return = matches!(intent, AppIntent::ReturnToConnection);
+        let from = PageCode::from(self.controller.page());
         if matches!(
             intent,
             AppIntent::CancelConnect | AppIntent::Disconnect | AppIntent::ReturnToConnection
@@ -982,6 +1042,7 @@ impl Owner {
                 self.cleanup()
             }
             Ok(Some(AppAction::StartSession(mut request, permit))) => {
+                self.diagnostic_session = Some((request.session_id, 0));
                 self.local_display.freeze(&mut request.display_intent);
                 let planned =
                     frd_core::DisplayPlanner::plan(request.display_intent, Default::default()).ok();
@@ -1008,6 +1069,10 @@ impl Owner {
             }
             Ok(None) => {}
             Err(_) => self.notice = Some("当前操作不可用"),
+        }
+        if diagnostic_return {
+            self.diagnostic
+                .emit(self.diagnostic_record(DiagnosticEvent::Return, from));
         }
     }
     // 已入队的真实 Up 即使被 control 屏障作废，也只清匹配来源的物理账本。
@@ -1303,14 +1368,46 @@ impl Owner {
                     Err(_) => self.notice = Some("会话启动失败"),
                 }
             }
-            Command::Cleanup(r) => match self.host.accept_cleanup_outcome(r) {
-                Ok(c) => {
-                    let _ = self
-                        .controller
-                        .finish_session_cleanup_with_stores(c, self.stores.borrow());
+            Command::Cleanup(r) => {
+                let from = PageCode::from(self.controller.page());
+                let session = match &r {
+                    BackgroundCleanupOutcome::Complete { completion, .. } => {
+                        Some(completion.session_id())
+                    }
+                    BackgroundCleanupOutcome::Fatal(_) => None,
+                };
+                let mut code = DiagnosticCode::None;
+                match self.host.accept_cleanup_outcome(r) {
+                    Ok(c) => {
+                        let result = self
+                            .controller
+                            .finish_session_cleanup_with_stores(c, self.stores.borrow());
+                        if result.is_err() {
+                            code = DiagnosticCode::CleanupFailed;
+                        }
+                    }
+                    Err(_) => {
+                        self.notice = Some("会话清理失败，请重新启动应用");
+                        code = DiagnosticCode::CleanupFailed;
+                    }
                 }
-                Err(_) => self.notice = Some("会话清理失败，请重新启动应用"),
-            },
+                let mut record = self.diagnostic_record(DiagnosticEvent::Cleanup, from);
+                record.current = session.is_some_and(|s| {
+                    self.diagnostic_session
+                        .is_some_and(|(current, _)| s == current)
+                });
+                record.session = session.map_or(0, |s| s.get());
+                record.code = code;
+                self.diagnostic.emit(record);
+                if code == DiagnosticCode::None
+                    && session.is_some_and(|s| {
+                        self.diagnostic_session
+                            .is_some_and(|(current, _)| s == current)
+                    })
+                {
+                    self.diagnostic_session = None;
+                }
+            }
             #[cfg(debug_assertions)]
             Command::Probe(root) => {
                 if self.probe == 1 {
@@ -1380,7 +1477,7 @@ impl Owner {
         let Some(link) = self.renderer.lock().ok().and_then(|r| r.clone()) else {
             return;
         };
-        let (feedback, eligible, failed) = {
+        let (feedback, eligible, failed, local, lifecycle) = {
             let Ok(mut state) = link.0.lock() else {
                 return;
             };
@@ -1392,13 +1489,36 @@ impl Owner {
             if feedback.is_some() {
                 state.busy = false;
             }
-            (feedback, state.ready_epoch(), state.failure)
+            (
+                feedback,
+                state.ready_epoch(),
+                state.failure,
+                state.surface.local,
+                state.surface.lifecycle,
+            )
         };
         if self.ready.is_some() && self.ready != eligible {
             self.release();
             self.ready = None;
         }
-        if failed.is_some() {
+        if let Some(code) = failed {
+            // Link::fail 是不可恢复的首次失败锁存；窗口 lifecycle 变化不产生新失败。
+            if !self.diagnostic_failure {
+                self.diagnostic_failure = true;
+                let mut record = self.diagnostic_record(
+                    DiagnosticEvent::RendererFailed,
+                    self.controller.page().into(),
+                );
+                record.local = local;
+                record.lifecycle = lifecycle;
+                record.abi = if (-11..=0).contains(&code) { code } else { 0 };
+                record.code = if (-11..=0).contains(&code) {
+                    DiagnosticCode::NativePresentation
+                } else {
+                    DiagnosticCode::Unknown
+                };
+                self.diagnostic.emit(record);
+            }
             self.release();
             self.ready = None;
             self.notice = Some("原生呈现失败，请重新启动应用");
@@ -1431,11 +1551,22 @@ impl Owner {
                         && *generation == epoch.remote
                         && *completeness == frd_frame::FrameCompleteness::FullBaseline
                     {
+                        let from = PageCode::from(self.controller.page());
                         self.controller.handle_presentation(event);
                         if self.controller.interactive_input_epoch()
                             == Some((epoch.session, epoch.remote))
                         {
                             self.ready = Some(epoch);
+                            if self.diagnostic_full != Some(epoch) {
+                                self.diagnostic_full = Some(epoch);
+                                let mut record =
+                                    self.diagnostic_record(DiagnosticEvent::FirstFull, from);
+                                record.session = epoch.session.get();
+                                record.generation = epoch.remote;
+                                record.local = epoch.local;
+                                record.lifecycle = epoch.lifecycle;
+                                self.diagnostic.emit(record);
+                            }
                         }
                     }
                 }
@@ -1469,6 +1600,38 @@ impl Owner {
         }
     }
     fn runtime_event(&mut self, s: frd_core::SessionId, e: SessionEvent) {
+        let from = PageCode::from(self.controller.page());
+        let diagnostic_event = match &e {
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed) => {
+                Some((DiagnosticEvent::RuntimeClosed, DiagnosticCode::None))
+            }
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Failed(error)) => {
+                Some((DiagnosticEvent::RuntimeFailed, DiagnosticCode::error(error)))
+            }
+            SessionEvent::Error(error) => {
+                Some((DiagnosticEvent::RuntimeError, DiagnosticCode::error(error)))
+            }
+            SessionEvent::StageChanged(ConnectionStage::Disconnecting) => {
+                Some((DiagnosticEvent::RuntimeDisconnecting, DiagnosticCode::None))
+            }
+            SessionEvent::SurfaceGenerationChanged { .. } => {
+                Some((DiagnosticEvent::SurfaceGeneration, DiagnosticCode::None))
+            }
+            _ => None,
+        };
+        let current = self
+            .diagnostic_session
+            .is_some_and(|(session, _)| session == s);
+        let active = self.host.active_session_id() == Some(s);
+        let event_session = match &e {
+            SessionEvent::SurfaceGenerationChanged { session_id, .. } => session_id.get(),
+            _ => s.get(),
+        };
+        let event_generation = match &e {
+            SessionEvent::SurfaceGenerationChanged { generation, .. } => Some(*generation),
+            _ => None,
+        };
+
         if matches!(
             e,
             SessionEvent::StageChanged(ConnectionStage::TransportReady)
@@ -1516,6 +1679,7 @@ impl Owner {
                 self.invalidate_ime("generation_changed");
                 self.ready = None;
                 self.remote_epoch = Some((s, *generation));
+                self.diagnostic_session = Some((s, *generation));
                 self.input.remote = Some(*size);
             }
         }
@@ -1561,6 +1725,20 @@ impl Owner {
                     );
                 }
             }
+        }
+        if let Some((event, code)) = diagnostic_event {
+            let mut record = self.diagnostic_record(event, from);
+            record.session = s.get();
+            record.event_session = event_session;
+            record.current = current;
+            record.active = active;
+            record.code = code;
+            if let Some(generation) = event_generation {
+                record.generation = generation;
+            } else if !current {
+                record.generation = 0;
+            }
+            self.diagnostic.emit(record);
         }
         if terminal
             && !matches!(
@@ -1818,6 +1996,10 @@ mod tests {
         );
         let (tx, _rx) = mpsc::sync_channel(64);
         Owner {
+            diagnostic: Arc::new(Diagnostic::default()),
+            diagnostic_session: None,
+            diagnostic_full: None,
+            diagnostic_failure: false,
             ime: ImeState::new(ImeInstallation::Unavailable),
             ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
@@ -2198,6 +2380,7 @@ mod tests {
         assert_eq!(o.last_submit, 1);
         let (tx, _rx) = mpsc::sync_channel(1);
         let e = AppEngine {
+            diagnostic: Arc::new(Diagnostic::default()),
             ime_installation: ImeInstallation::Unavailable,
             ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
@@ -2234,6 +2417,7 @@ mod tests {
             }
             let (sender, receiver) = mpsc::sync_channel(4);
             let e = AppEngine {
+                diagnostic: Arc::new(Diagnostic::default()),
                 ime_installation: ImeInstallation::Unavailable,
                 ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
                 keyboard: OhosKeyboardQualification::Unavailable,
@@ -2267,6 +2451,7 @@ mod tests {
         let ticket = pending(&mut o);
         let (sender, receiver) = mpsc::sync_channel(4);
         let e = AppEngine {
+            diagnostic: Arc::new(Diagnostic::default()),
             ime_installation: ImeInstallation::Unavailable,
             ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
@@ -2433,6 +2618,7 @@ mod tests {
         let AppAction::StartSession(request, _permit) = action else {
             panic!("start");
         };
+        o.diagnostic_session = Some((request.session_id, 0));
         (o, request.session_id, rx)
     }
     #[test]
@@ -2679,6 +2865,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         (
             AppEngine {
+                diagnostic: o.diagnostic.clone(),
                 ime_installation: o.ime.installation,
                 ime_ingress: o.ime_ingress.clone(),
                 keyboard: o.keyboard,
@@ -2929,6 +3116,7 @@ mod tests {
         let mut o = owner();
         let (tx, rx) = mpsc::sync_channel(4);
         let e = AppEngine {
+            diagnostic: Arc::new(Diagnostic::default()),
             ime_installation: ImeInstallation::Unavailable,
             ime_ingress: Arc::new(Mutex::new(ImeIngress::default())),
             keyboard: OhosKeyboardQualification::Unavailable,
@@ -3611,4 +3799,355 @@ mod tests {
         assert!(owner.take_display_log(&owner.snapshot()).is_none());
     }
     include!("ime_owner_tests.rs");
+    #[test]
+    fn terminal_diagnostic_actual_owner_cancel_and_runtime_paths_are_distinct_and_safe() {
+        use crate::session_diagnostic::{Event, PageCode};
+        let (mut o, session, _) = staged_owner();
+        signal(&o.control, CANCEL | FOCUS_LOST);
+        o.apply_control();
+        let records = o.diagnostic.records();
+        assert_eq!(
+            records.iter().map(|r| r.event).collect::<Vec<_>>(),
+            [Event::OwnerCancel, Event::ApplyControl]
+        );
+        assert_eq!(records[1].from, PageCode::Connecting);
+        assert_eq!(records[1].to, PageCode::Disconnecting);
+        assert_eq!(records[1].flags, CANCEL | FOCUS_LOST);
+        assert_eq!(records[1].revision, 1);
+        assert_eq!(records[1].session, session.get());
+        let encoded = records
+            .iter()
+            .map(|r| r.encode())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "fixture.invalid",
+            "synthetic",
+            "in-memory-auth-fixture",
+            "password",
+            "username",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        let (mut closed, session, _) = staged_owner();
+        closed.runtime_event(
+            session,
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed),
+        );
+        let records = closed.diagnostic.records();
+        assert_eq!(records[0].event, Event::RuntimeClosed);
+        assert_eq!(records[0].from, PageCode::Connecting);
+        assert_eq!(records[0].to, PageCode::Disconnecting);
+        assert!(records.iter().all(|r| r.event != Event::OwnerCancel));
+        let (mut failed, session, _) = staged_owner();
+        failed.runtime_event(
+            session,
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Failed(
+                ProtocolError::adapter(ProtocolId::rdp(), "secret-raw-server-error"),
+            )),
+        );
+        let records = failed.diagnostic.records();
+        assert_eq!(records[0].event, Event::RuntimeFailed);
+        assert_eq!(records[0].to, PageCode::Failed);
+        assert!(!records[0].encode().contains("secret-raw-server-error"));
+        failed.intent(AppIntent::ReturnToConnection);
+        let records = failed.diagnostic.records();
+        assert_eq!(records.last().unwrap().event, Event::Return);
+        assert_eq!(records.last().unwrap().to, PageCode::Form);
+    }
+    #[test]
+    fn terminal_diagnostic_stale_session_and_non_cancel_controls_preserve_attribution() {
+        use crate::session_diagnostic::{Event, PageCode};
+        let (mut o, current, _) = staged_owner();
+        let old = frd_core::SessionId::allocate();
+        o.runtime_event(
+            old,
+            SessionEvent::Closed(frd_protocol_api::ProtocolExit::Closed),
+        );
+        let records = o.diagnostic.records();
+        assert_eq!(records[0].session, old.get());
+        assert!(!records[0].current);
+        assert_eq!(records[0].from, PageCode::Connecting);
+        assert_eq!(records[0].to, PageCode::Connecting);
+        signal(&o.control, FOCUS_LOST | DISPLAY_INVALID);
+        o.apply_control();
+        assert!(o
+            .diagnostic
+            .records()
+            .iter()
+            .all(|r| r.event != Event::OwnerCancel));
+        assert_eq!(o.diagnostic_session, Some((current, 0)));
+    }
+    #[test]
+    fn terminal_diagnostic_full_receipt_and_renderer_failure_are_deduplicated() {
+        use crate::session_diagnostic::Event;
+        let (mut o, _, link) = presentation_owner();
+        let epoch = link.0.lock().unwrap().epoch().unwrap();
+        feedback(&link, epoch, frd_frame::FrameCompleteness::Incremental);
+        o.sync_presentation(false);
+        assert!(o.diagnostic.records().is_empty());
+        for _ in 0..2 {
+            feedback(&link, epoch, frd_frame::FrameCompleteness::FullBaseline);
+            o.sync_presentation(false);
+        }
+        assert_eq!(
+            o.diagnostic
+                .records()
+                .iter()
+                .filter(|r| r.event == Event::FirstFull)
+                .count(),
+            1
+        );
+        link.fail(crate::GPU_FAILED);
+        o.sync_presentation(false);
+        o.sync_presentation(false);
+        link.surface(crate::PocStatus {
+            surface_generation: 2,
+            width: 100,
+            height: 100,
+            attached: 1,
+            foreground: 1,
+            ..Default::default()
+        });
+        o.sync_presentation(false);
+        assert_eq!(
+            o.diagnostic
+                .records()
+                .iter()
+                .filter(|r| r.event == Event::RendererFailed)
+                .count(),
+            1
+        );
+        let events = o
+            .diagnostic
+            .records()
+            .iter()
+            .map(|r| r.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [Event::FirstFull, Event::RendererFailed, Event::RuntimeError]
+        );
+    }
+
+    struct TerminalFactory;
+    struct TerminalSession;
+    impl ProtocolFactory for TerminalFactory {
+        fn descriptor(&self) -> frd_protocol_api::ProtocolDescriptor {
+            frd_protocol_api::ProtocolDescriptor {
+                id: ProtocolId::rdp(),
+                display_name: "终态控制".into(),
+                default_port: 3389,
+                credential_requirements:
+                    frd_protocol_api::CredentialRequirements::username_password(),
+            }
+        }
+        fn create(
+            &self,
+            _: frd_protocol_api::ConnectRequest,
+            _: frd_protocol_api::ProtocolRuntime,
+        ) -> Result<Box<dyn frd_protocol_api::ProtocolSession>, ProtocolError> {
+            Ok(Box::new(TerminalSession))
+        }
+    }
+    impl frd_protocol_api::ProtocolSession for TerminalSession {
+        fn run(self: Box<Self>) -> frd_protocol_api::ProtocolExit {
+            frd_protocol_api::ProtocolExit::Closed
+        }
+    }
+    #[test]
+    fn terminal_diagnostic_actual_runtime_and_cleanup_complete_to_form_without_network() {
+        use crate::session_diagnostic::{Event, PageCode};
+        let mut o = owner();
+        o.host = SessionHost::new(
+            vec![Arc::new(TerminalFactory) as Arc<dyn ProtocolFactory>],
+            Arc::new(Wake),
+            Arc::new(NoAudio),
+            Arc::new(|_| {
+                Err(frd_media_api::VideoDecodeError::new(
+                    frd_media_api::VideoDecodeErrorCode::BackendUnavailable,
+                ))
+            }),
+        );
+        o.catalog = ProtocolCatalog::new([ProtocolId::rdp()]);
+        let (tx, rx) = mpsc::sync_channel(64);
+        o.tx = tx;
+        o.command(mode_edit(1, "auto"));
+        o.command(Command::Password(SecretBuffer::from_text(
+            "terminal-secret-input".into(),
+        )));
+        o.command(Command::Submit {
+            event: 1,
+            composition: false,
+            repeat: false,
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !matches!(o.controller.page(), Page::ConnectionForm(_)) {
+            if let Ok(command) = rx.recv_timeout(Duration::from_millis(5)) {
+                o.command(command);
+            }
+            o.poll();
+            assert!(Instant::now() < deadline, "无网络终态控制未完成");
+        }
+        let records = o.diagnostic.records();
+        assert_eq!(
+            records.iter().map(|r| r.event).collect::<Vec<_>>(),
+            [Event::RuntimeClosed, Event::Cleanup]
+        );
+        assert_eq!(records[0].from, PageCode::Connecting);
+        assert_eq!(records[0].to, PageCode::Disconnecting);
+        assert!(records[0].current && records[0].active);
+        assert_eq!(records[1].from, PageCode::Disconnecting);
+        assert_eq!(records[1].to, PageCode::Form);
+        assert_eq!(records[0].session, records[1].session);
+        assert!(records[1].current);
+        assert_eq!(o.diagnostic_session, None);
+        assert!(records
+            .iter()
+            .all(|r| !r.encode().contains("terminal-secret-input")));
+    }
+    #[test]
+    fn terminal_diagnostic_engine_signals_have_exact_revision_and_distinct_drop_origin() {
+        use crate::session_diagnostic::Event;
+        let o = owner();
+        let (engine, _rx) = key_engine(&o, 2);
+        engine.diagnostic_bind(123);
+        engine.cancel();
+        engine.stop();
+        drop(engine);
+        let records = o.diagnostic.records();
+        assert_eq!(
+            records.iter().map(|r| r.event).collect::<Vec<_>>(),
+            [
+                Event::Bound,
+                Event::EngineCancel,
+                Event::EngineStop,
+                Event::EngineDrop,
+                Event::EngineStop
+            ]
+        );
+        assert_eq!((records[1].revision, records[1].flags), (1, CANCEL));
+        assert_eq!((records[2].revision, records[2].flags), (2, CANCEL | STOP));
+        assert_eq!((records[4].revision, records[4].flags), (3, CANCEL | STOP));
+    }
+
+    #[test]
+    fn terminal_diagnostic_surface_mismatch_stage_stop_and_error_are_explicit() {
+        use crate::session_diagnostic::{Event, PageCode};
+        let (mut o, session, _) = staged_owner();
+        let wrong = frd_core::SessionId::allocate();
+        o.runtime_event(
+            session,
+            SessionEvent::SurfaceGenerationChanged {
+                session_id: wrong,
+                generation: 9,
+                size: frd_core::PixelSize {
+                    width: 2,
+                    height: 2,
+                },
+            },
+        );
+        let record = o.diagnostic.records()[0];
+        assert_eq!(record.event, Event::SurfaceGeneration);
+        assert_eq!(
+            (record.session, record.event_session, record.generation),
+            (session.get(), wrong.get(), 9)
+        );
+        assert!(record.current);
+        assert!(!record.active);
+        assert!(o.remote_epoch.is_none());
+        o.runtime_event(
+            session,
+            SessionEvent::StageChanged(ConnectionStage::Disconnecting),
+        );
+        let record = *o.diagnostic.records().last().unwrap();
+        assert_eq!(record.event, Event::RuntimeDisconnecting);
+        assert_eq!(record.to, PageCode::Disconnecting);
+        let (mut stopped, _, _) = staged_owner();
+        signal(&stopped.control, STOP);
+        stopped.apply_control();
+        assert!(stopped.stopping);
+        let records = stopped.diagnostic.records();
+        assert_eq!(
+            records.iter().map(|r| r.event).collect::<Vec<_>>(),
+            [Event::OwnerCancel, Event::ApplyControl]
+        );
+        assert_eq!(records[1].flags, STOP);
+        let (mut failed, session, _) = staged_owner();
+        failed.runtime_event(
+            session,
+            SessionEvent::Error(ProtocolError::adapter(
+                ProtocolId::rdp(),
+                "secret-input-not-an-allowlisted-code",
+            )),
+        );
+        let record = failed.diagnostic.records()[0];
+        assert_eq!(record.event, Event::RuntimeError);
+        assert_eq!(record.to, PageCode::Failed);
+        assert!(!record
+            .encode()
+            .contains("secret-input-not-an-allowlisted-code"));
+    }
+    #[test]
+    fn terminal_diagnostic_allowlist_with_populated_secret_form_and_repeated_focus_is_sparse() {
+        use crate::session_diagnostic::Event;
+        let mut o = owner();
+        let form = o.controller.connection_form_mut().unwrap();
+        form.draft.address = "private-host-input".into();
+        form.draft.username = "private-user-input".into();
+        form.set_password(SecretBuffer::from_text("private-password-input".into()));
+        for _ in 0..3 {
+            signal(&o.control, FOCUS_LOST | DISPLAY_INVALID);
+            o.apply_control();
+        }
+        assert!(o.diagnostic.records().is_empty());
+        signal(&o.control, CANCEL);
+        o.apply_control();
+        let records = o.diagnostic.records();
+        assert_eq!(
+            records.iter().map(|r| r.event).collect::<Vec<_>>(),
+            [Event::OwnerCancel, Event::ApplyControl]
+        );
+        for record in records {
+            let text = record.encode();
+            for forbidden in [
+                "private-host-input",
+                "private-user-input",
+                "private-password-input",
+                "password",
+                "username",
+                "address",
+            ] {
+                assert!(!text.contains(forbidden));
+            }
+            let value = serde_json::to_value(record).unwrap();
+            let keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                keys,
+                [
+                    "event",
+                    "session",
+                    "event_session",
+                    "active",
+                    "generation",
+                    "local",
+                    "lifecycle",
+                    "current",
+                    "from",
+                    "to",
+                    "revision",
+                    "flags",
+                    "code",
+                    "abi"
+                ]
+                .into_iter()
+                .collect()
+            );
+        }
+    }
 }

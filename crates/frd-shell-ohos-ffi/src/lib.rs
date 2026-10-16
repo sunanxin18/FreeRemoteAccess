@@ -94,6 +94,7 @@ mod local_display;
 mod ohos;
 mod panic_scope;
 mod presentation;
+mod session_diagnostic;
 #[cfg(test)]
 mod tests;
 mod worker;

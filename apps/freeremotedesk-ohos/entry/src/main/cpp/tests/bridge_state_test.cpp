@@ -1,6 +1,18 @@
 #include "bridge_state.h"
+#include "session_diagnostic.h"
 #include <cassert>
 int main() {
+    FrdSessionDiagnostic::FallbackState fallback;
+    using Transition = FrdSessionDiagnostic::FallbackTransition;
+    assert(fallback.Observe(7, 0) == Transition::None);
+    assert(fallback.Observe(7, -1) == Transition::Entered);
+    assert(fallback.Observe(7, -1) == Transition::None);
+    assert(fallback.Observe(7, -8) == Transition::CodeChanged);
+    assert(fallback.Observe(7, 0) == Transition::Exited);
+    assert(fallback.Observe(7, 0) == Transition::None);
+    assert(fallback.Observe(0, -1) == Transition::Entered);
+    assert(fallback.Observe(8, -1) == Transition::Entered);
+
     ComponentState component;
     component.engine = 1;
     component.FrameRegistrationCompleted(false);

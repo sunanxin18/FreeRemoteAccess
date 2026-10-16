@@ -70,3 +70,36 @@ GUI冻结清单`target/phone-login-label-root-20261016/gui-fix4/fix4-execution-m
 连接后恢复时，09:20启动命令成功但紧随原图只有白色画面，不能作为表单恢复证据。单独只读续查09:25原图和树已显示空auto登录表单、无载入提示、保存未选；物理画布仍为原方向，应用内容按portrait-first显示，不额外授予方向时序资格。原始材料分别在`rdp-continuity-fix4/`和`restore-readback-fix4/`，均位于同一root证据目录。PC全程未查询或操作。
 
 本轮只关闭当前精确包的手机有限外观/滚动要求；完整Task5B2、密码编辑/保存/恢复连续性、焦点/键盘/IME/提交、PC、真机与新包真实Windows/Mac互通仍待验收。旧候选失败与历史包资格不改写。
+
+## 2026-10-16 09:47：网络恢复后的同包单次登录
+
+用户确认原地址未变且Windows已开机、RDP开启后，Mac同目标TCP探测成功。仅手机从既有OS安全profile载入，手动横/竖往返后载入状态保留，唯一Connect于09:47:22发出；没有输入/读取/显隐密码或操作PC。该包及Index/FFI身份与上节相同，没有盲重登或换包。
+
+09:47:22.947的公开显示日志收到session1/gen1的2760×1256协议SurfaceGenerationChanged；09:47:24原图仍为黑色“等待首个完整画面”。系统随后自动改变方向，09:47:25.091 acceptedSurface首次变null（与前条同revision105/rotation3/本地尺寸），09:47:25.160 detach code0；09:47:47原图已回登录页。PID25701仍存活。该先后不能证明旋转造成退出，也不能将协议尺寸确认为可见完整桌面或稳定会话。
+
+现公开日志不足以区分本地cancel、协议Closed/Failed、呈现失败或snapshot ABI fallback。源码中网络EOF/reset等也可能映射无错误Closed；返回页的地址/用户名/保存选项来自ArkUI本地状态，不证明Rust表单或密码仍被保留。因此本次不授予密码认证连续性、首帧像素、输入或稳定登录资格。后续先增加固定枚举、session及旧新page的稀疏非敏感诊断，不写完整快照/密码/输入/目标信息，不先改变协议退出语义。证据在`target/phone-login-label-root-20261016/rdp-continuity-confirmed-fix4/`。首次hilog -x与-z组合语义拒绝原件保留；按本机help改为仅-x、同PID与公开FrdOhos/FrdDisplay标签后读取成功，未改日志配置。
+
+
+## 2026-10-16 10:30：终态诊断包的单次真实连接
+
+为区分上一节失败，新增内部稀疏 `FrdSession` 诊断：固定枚举及整数身份记录本地取消/停止、Owner应用、协议终态、呈现失败、完整首帧和清理；C++仅记录snapshot fallback进入/变码/退出。公开ABI、原控制顺序、协议EOF/Terminate语义、凭据、表单、方向和连接行为保持。日志不接收目标、用户名、密码、按键、任意错误正文或完整snapshot。七项新Rust直接控制、五项既有聚焦回归及纯C++控制通过；宿主测试Rust1.98.1，唯一正式Release BOTH构建使用1.96.0并成功，双normal checker及源FFI经SDK strip到包身份通过。独立Spec/Quality审查通过，root复核84冻结项及188项pre/post/current；原报告两项非阻塞统计更正为diff46,217B、84项合计133,845,845B，哈希未变。原09:47失败保留，诊断不等于修复。
+
+unsigned HAP `b2f83cff9aaf0311e92ff5dbc9898c8f0fc00d86b85077de49de7fa9a6d98b4a`，签验后HAP `fdb597c299d91e0b6a5543d0a392b0da871db41970f2f6256475000c16c61350`；未strip FFI `1f4f7d050244ed6c5b44b31527daf7c666411d624cac44941b45ab88e7a2fb07`，包内FFI `39e51af276a930b0f439550bb56a3f6227199fbb03ade75a20b94d6974b52fc5`，libentry `2d1a7524b71916a637d67f75520dd26ff6f521d99db0a614e15f3ac376795245`。ABC仍为 `435605be7849a49e344180111da7599027deda94a510d7f6fce1d5263957eeb1`，Index保持Fix4；仅两个native payload改变。原31个unsigned payload与signed逐字一致，仅签包增加.pages.info；既有本地demo身份、官方sign/verify成功，无新身份或安全配置。只安装手机，bm更新时间作有限安装谱系，不声称从设备读回包字节。
+
+手机沿用系统安全profile，横竖往返后仍显示完整密码已载入提示，10:30:22唯一Connect；没有输入、读取、显隐密码或第二次登录。PID24682/app1/session1/protocol generation1：
+
+|时间|直接证据|
+|---|---|
+|10:30:22.708|当前协议surface2760×1256，Awaiting→Awaiting。|
+|10:30:24.029|当前完整FullBaseline呈现receipt，Awaiting→Remote。|
+|10:30:24.178|自动横屏后的lifecycle4→8完整receipt，Remote→Remote，同一会话/协议generation。|
+|10:30:42、10:32:09|root分别目视原图，真实Windows桌面、Chrome与任务栏；第二张不是持续新网络帧的独立证明。|
+|10:34:02.805|root在右下浮动岛唯一主动断开，action_cancel/engine_cancel。|
+|10:34:02.816、.837|Owner应用revision12/flags6，Remote→Disconnecting；随后cleanup完成Disconnecting→Form。|
+|10:34:04、10:34:35|主动断开后竖屏登录页；再恢复手动旋转net0并冷启动，readiness及原图确认空auto表单。|
+
+从首次完整receipt到主动断开约218.8秒，本次未观察自动退出。独立窄判读复核截至10:30:42的首帧/同会话事件；更晚观察及主动断开由root直接采集/目视。前者不能自动为更晚证据背书。三条first/full阶段日志及最终显式断开链均无任意错误正文；断开前有限query未观察runtime终态、renderer failure或snapshot fallback。
+
+本次可以记录手机→Windows从既有安全存储密码完成登录、真实完整桌面、初次自动旋转存续及主动断开；不能从静态桌面推出持续刷新、输入映射/键鼠/IME、长时间稳定性、重连或其他平台通过。旧约3秒自动退回本次未复现，根因仍UNKNOWN，不能归因于旋转、密码、服务器、网络或“加日志后已修复”。下次再出现时先按固定终态链判读；只有实际Closed仍不够区分EOF/reset/服务器Terminate，不预先扩改协议API。
+
+冻结源码/构建在`target/phone-rdp-terminal-diagnostic-20261016/`；root签验及单次执行在`target/phone-rdp-terminal-root-20261016/`，device manifest `a3927d41d75647407a4dcf6bed3e087d1a9e4fa870ac8d01f28399a5bf3a67d5`，109项/2,325,346B。PC整个阶段未观察或操作，人工填写hold持续。
