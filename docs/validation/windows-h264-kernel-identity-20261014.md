@@ -204,4 +204,4 @@ root全文读原三源增量、Fix1报告/5081B delta及独立复审，核33关�
 
 新三phase原记录已缩小复制超时范围：llvm-copy与system-tools均有end/exit0；build-root-copy只有start，没有end/exit。这与全量Collect终态124一致，不再泛称三段均未知。错误保存、复制阶段与原make失败分别记账，未据此修复汇编或改变原自然工具调用。
 
-Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd917c4c2eb768a724d592f9ff0818df67b77918f21930b`。两次完整GET在90/240秒超时的partial原件保留，后继认证取得同一原artifact的8个Range、同ETag/206/完整总长，重组命中API全SHA和ZIP CRC后才解包；未执行内容。root核16checkout源码与01cd提交逐字相等，原完整joblog38881B另存。材料在`target/windows-abi-source-reuse-delivery-root-20261016/ci/a-range-download/`，独立读数及限定身份诊断方案另行进行。下一步先取得有限Windows lstat/fstat真实控制和失败字段，再决定最小修复；不先扩大构建或软化身份校验。
+Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd917c4c2eb768a724d592f9ff0818df67b77918f21930b`。两次完整GET在90/240秒超时的partial原件保留，后继认证取得同一原artifact的8个Range、同ETag/206/完整总长，重组命中API全SHA和ZIP CRC后才解包；未执行内容。root核16checkout源码与01cd提交逐字相等，原完整joblog38881B另存。材料在`target/windows-abi-source-reuse-delivery-root-20261016/ci/a-range-download/`，独立只读核验已完成（报告SHA256 `96e264a9762f387abf7c00800c24cd2d555363cbc9b1ad094c72972f1730d3b7`，root全文读6612B并核16关键绑定），确认的是来源/失败边界，不是make根因。下一步先取得有限Windows lstat/fstat真实控制和失败字段，再决定最小修复；不先扩大构建或软化身份校验。

@@ -6,6 +6,7 @@
 //! implementation is retained as the correctness oracle and explicit fallback.
 
 #[cfg(target_arch = "aarch64")]
+#[path = "pixel_convert/aarch64.rs"]
 mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[path = "pixel_convert/x86.rs"]

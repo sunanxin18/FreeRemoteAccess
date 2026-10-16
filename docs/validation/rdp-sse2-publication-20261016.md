@@ -199,3 +199,11 @@ root全文核原输出及身份，独立实际审查5483B报告SHA256 `824fc8b28
 初审发现explicit-path装载真实dispatcher会查错x86子模块；固定Rust1.96实际单目标E0583 RED保留。只给生产pixel_convert.rs增加33B显式子模块路径属性，移除即等于原文件，ARM声明、数值、API、实际leaf和四个ABI冻结源保持。修后四x86 example均实际metadata exit0，唯一真实rustc调用为bin/dep-info,metadata、精确目标且无--test；不等于目标机器码、链接或运行。独立Fix1复审报告SHA256 `acfb895e59b61ecb1c6979d50daa862f9ef75ef92deeecba2184738bb17a46ef`，root全文读并核40作者RED/Fix1冻结与11审查绑定。
 
 最初bare Homebrew cargo不理解+1.96.0、随后launcher配对报E0463的两批失败原件均保留，没有用后继正确工具身份追认旧子进程。普通frd-protocol-rdp x64 Linux cross check在aws-lc/libz前置因缺x86_64-linux-gnu-gcc失败，尚未进入产品crate本体；原生CI/完整产品检查与四目标真实benchmark仍待后继，未安装工具链或添加镜像harness。Task4A2.10C不勾选。
+
+### Fix2：完整格式检查的 ARM 模块路径
+
+`d549abf74049dc5749cd5197eabbf28f88914597`的[主CI38903095354/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38903095354)在Rust formatting job116979901934失败，后续test job跳过。原固定1.96 cargo fmt --all -- --check递归解析explicit API模块的aarch64声明，查找src/aarch64.rs而非真实src/pixel_convert/aarch64.rs；不把这轮CI报告为产品回归通过。
+
+仅再加37B的aarch64显式路径属性，x86属性保持；移除两条属性后全文等于原ee562309…，实际NEON/x86 leaf、API、数值与benchmark a473358d…不变。固定同目录cargo/cargo-fmt/rustfmt/rustc及PATH/RUSTFMT后，完整全仓同一格式命令实际RED1（stderr174B）→GREEN0（双流0B），没有skip_children、没有写全仓或改其它格式。作者3093B报告SHA256 `f7f637f1d4c1ca72e91bf38f80023c2d31332bbce954548b18c69489e8c4ba90`，root已读并核18冻结项。Fix2只证明完整格式门，不新增metadata、ARM机器码、性能或产品通过；后继普通原生CI仍须分别取得终态。
+
+Fix2限定独立复审通过（报告SHA256 `d92b747d34c851b85871b73dd3b7cd036deebd05124b974f75ce120fade44a71`）；root全文读3517B并核9关键绑定，确认唯一37B属性、12保护输入及原RED/GREEN工具/命令/终态。只关闭源码与完整格式解析门，后继原生产品CI、性能与shipping保持未验。
