@@ -116,6 +116,14 @@ artifact12026220958为4,117,845字节、SHA256 `d7ea452d9ce0f2d12c64edd4918d337f
 
 提交`59cdd705eaeebbe7c0a69f5f43c1b76ecc672240`的[run38854683516/attempt1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38854683516) / job116823393151失败。initialize、checkout、WSL install/version和路径往返已走通；setup实际执行到APT下载及dpkg Reading database，随后原supervisor的`owned_graph`拒绝“发现逃逸SID/PGID后代”，setup原exit1、退出及EOF已记录。Collect的停止核对也实际exit1，拒绝seal；state仍quiescent=false、setup_ready=false、builder_started=false。FFmpeg尚未开始，不能报告H.264编译失败或稳定运输。
 
-forensic artifact12027216250为6,554,118字节，SHA256 `917532044a816f230998b073d0cb1286f193dfd7eb3cba71dd6970f783748adc`，本次原setup stdout/stderr与cleanup stderr已实际带回。原job log第一次下载失败完整保留，第二次只读下载成功，37,910字节、SHA256 `a36516a8a33c050747487903eb302fedec61b6a777919c387232ce74de98a1f3`，不是CI重跑。原件位于`target/desktop-qualification-integration-root-20261016/ci/`。
+forensic artifact12027216250为6,554,118字节，SHA256 `917532044a816f230998b073d0cb1286f193dfd7eb3cba71dd6970f783748adc`，本次原setup stdout/stderr与cleanup stderr已实际带回。原job log第一次下载失败记录保留（其中临时签名下载地址已脱敏），第二次只读下载成功，37,910字节、SHA256 `a36516a8a33c050747487903eb302fedec61b6a777919c387232ce74de98a1f3`，不是CI重跑。原件位于`target/desktop-qualification-integration-root-20261016/ci/`。
 
 当前原件未包含触发拒绝的具体PID和两次进程图快照，不能把正常APT伪终端、setsid假设直接当作已证实的现场根因。后继先只读分析并准备有界诊断，不直接放宽进程归属、广泛kill或禁用APT sandbox；旧失败历史及正式A/B/C/D继续开放。
+
+### 保留原归属拒绝的固定 APT 前缀诊断
+
+四源码新增封闭BootstrapAptDiagnostic，只运行同一prepare的原APT update/install前缀，在controls、setup_ready、builder之前返回。原owned_graph/identity/信号权限/stop、正常成功end与完整prepare保持；没有修改Use-Pty。失败end附已经取得的原两图、候选和受身份前后核对约束的有限comm/exe后采；固定receipt带回本次callid UUID原bytes/hash，缺失或变化仅partial，双读相同不授quiescent。SetupOnly finally不创建builder配置；156条精确forensic always上传，正式Collect及三件固定禁用。
+
+宿主graph/唯一入口控制RED→GREEN，focused7项通过。完整Python模块只运行一次33项：32通过，1个新增测试临时父目录错误；修后仅该项定向通过，未称一次完整模块全绿。作者报告SHA256 `663b59cf48c26ed6f59c6051fd226dfeeeb08870292b06621eb2b197c21c1bb9`，独立审查 `a8b45a33bdf3c040dbb4e517ecdfb0571f36f121574444f93c769b052367d105`；root已全文读取报告和778行diff，核1349项、四当前源和七保护输入及独立两件冻结。以上仅SOURCE/HOST，不是Windows/WSL/APT执行结果。
+
+本提交首次push只释放该固定APT诊断，不另dispatch/rerun、不运行自然builder。实际图、原UUID导出、PS finally、Linux停止与具体违规身份待原件核验；原自然失败、完整A/B/C/D和生产资格继续开放。

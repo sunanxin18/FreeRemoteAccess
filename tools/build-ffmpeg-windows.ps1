@@ -418,15 +418,96 @@ def owned_graph(processes, children, leader, supervisor):
 
 
 def stable_ownership(first, second, first_children, second_children, leader, supervisor):
-    left = owned_graph(first, first_children, leader, supervisor)
-    right = owned_graph(second, second_children, leader, supervisor)
-    keys = ('pid', 'starttime', 'ppid', 'sid', 'pgid')
-    if first_children != second_children or set(left) != set(right):
-        raise OwnershipUncertain('两次快照成员/直接children集合不稳定')
-    for pid in set(left) | {supervisor['pid']}:
-        if any(first[pid][key] != second[pid][key] for key in keys):
-            raise OwnershipUncertain('两次快照父系/identity不稳定')
-    return [second[pid] for pid in sorted(right)]
+    checking = 'first'
+    try:
+        left = owned_graph(first, first_children, leader, supervisor)
+        checking = 'second'
+        right = owned_graph(second, second_children, leader, supervisor)
+        checking = 'comparison'
+        keys = ('pid', 'starttime', 'ppid', 'sid', 'pgid')
+        if first_children != second_children or set(left) != set(right):
+            raise OwnershipUncertain('两次快照成员/直接children集合不稳定')
+        for pid in set(left) | {supervisor['pid']}:
+            if any(first[pid][key] != second[pid][key] for key in keys):
+                raise OwnershipUncertain('两次快照父系/identity不稳定')
+        return [second[pid] for pid in sorted(right)]
+    except RuntimeError as failure:
+        try:
+            failure.ownership_failure = ownership_evidence(first, second, first_children, second_children,
+                                                           leader, supervisor, checking)
+        except BaseException as evidence_error:
+            evidence_warning(evidence_error)
+        raise
+
+
+def evidence_warning(error):
+    # 取证失败不能取代原所有权异常；stderr也可能已经断开。
+    try:
+        print('ownership evidence partial: ' + str(error), file=sys.stderr, flush=True)
+    except BaseException:
+        pass
+
+
+def ownership_evidence(first, second, first_children, second_children, leader, supervisor, checking):
+    def snapshot(processes, children):
+        descendants = {supervisor['pid']}
+        for _ in range(len(processes) + 1):
+            more = {pid for pid, item in processes.items() if item['ppid'] in descendants}
+            if more <= descendants:
+                break
+            descendants |= more
+        # 与原失败谓词相同的PPID闭包/PGID集合；这里只记录候选，不授予signal/seal。
+        group = {pid for pid, item in processes.items() if item['pgid'] == leader['pgid']}
+        return dict(processes=processes, children=sorted(children),
+                    outside_pgid_descendants=sorted(descendants - {supervisor['pid']} - group))
+    return dict(schema='freeremotedesk.release-a.ownership-failure.v1', checking_snapshot=checking,
+                ownership_validated=False, leader=leader, supervisor=supervisor,
+                candidate_predicate='PPID-reachable descendant outside original leader PGID',
+                first=snapshot(first, first_children), second=snapshot(second, second_children))
+
+
+def observe_process(expected):
+    result = {'status': 'unknown', 'expected': expected}
+    try:
+        before = identity(expected['pid'])
+        result['before'] = before
+        keys = ('pid', 'starttime', 'ppid', 'sid', 'pgid', 'uid', 'uid_values')
+        require(all(before[key] == expected[key] for key in keys), '后采样已不匹配原图identity')
+        path = Path('/proc', str(expected['pid']))
+        result['exe'] = os.readlink(path / 'exe')
+        result['comm'] = (path / 'comm').read_text()
+        after = identity(expected['pid'])
+        result['after'] = after
+        require(all(after[key] == before[key] for key in keys), 'comm/exe读取期间identity变化')
+        result['status'] = 'identity-bound-observation'
+    except BaseException as error:
+        result['error'] = str(error)
+    return result
+
+
+def preserve_failed_end(scope, nonce, call_id, stopped, failure, source_binding=None):
+    record = dict(nonce=nonce, call_id=call_id, quiescent=False, reaped=stopped,
+                  child_exit=None, error=str(failure))
+    try:
+        if hasattr(failure, 'ownership_failure'):
+            evidence = dict(failure.ownership_failure, source_binding=source_binding)
+            observations = []
+            for name in ('first', 'second'):
+                snapshot = evidence[name]
+                for pid in snapshot['outside_pgid_descendants']:
+                    expected = snapshot['processes'][pid]
+                    observations.append(dict(snapshot=name, expected=expected, observation=observe_process(expected)))
+            evidence['process_observations'] = observations
+            record['ownership_failure'] = evidence
+    except BaseException as evidence_error:
+        # 已取得的原图仍保留；后采样失败独立记录。
+        record['ownership_failure'] = getattr(failure, 'ownership_failure', None)
+        record['evidence_error'] = str(evidence_error)
+        evidence_warning(evidence_error)
+    try:
+        write(Path(scope) / (call_id + '.end.json'), record)
+    except BaseException as evidence_error:
+        evidence_warning(evidence_error)
 
 
 def members(leader, supervisor):
@@ -547,9 +628,11 @@ def run(scope, nonce, call_id, argv):
             time.sleep(.05)
     except BaseException as failure:
         error = str(failure)
-        with Locked(scope):
-            write(end_path, dict(nonce=nonce, call_id=call_id, quiescent=False, reaped=stopped,
-                                 child_exit=None, error=error))
+        try:
+            with Locked(scope):
+                preserve_failed_end(scope, nonce, call_id, stopped, failure, meta)
+        except BaseException as evidence_error:
+            evidence_warning(evidence_error)
         raise
 
 

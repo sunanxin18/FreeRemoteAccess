@@ -15,7 +15,7 @@ RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 
 | Windows i686/x86_64 | 两个实际源码优化COFF对象编译通过；后续普通CI已执行Windows x86_64新体12项、i686新体11项局部测试 |
 | Linux i686/x86_64 | 两个实际源码优化ELF对象编译通过；后续普通CI已执行x86_64新体12项、i686新体11项局部测试 |
 | SSE2静态指令 | 四个精确入口及内联数值核心仅见SSE2指令；外部memcpy/TLS/panic运行库未链接，不代表最终ISA闭包 |
-| 原体反例/新体执行 | 原体RED快照与精确运行方法已准备；Linux/Windows x86_64新体各12项、两平台i686新体各11项实际通过；原体实际RED尚未完成 |
+| 原体反例/新体执行 | Linux x64/i686冻结原体实际命中唯一counter反例；Linux/Windows x86_64新体各12项、两平台i686新体各11项实际通过 |
 | Linux私有non-test保护页 | x86_64/i686实际普通release ELF，各kernel各160合法case及五精确SIGSEGV负控通过；不是shipping库资格 |
 | Windows保护页、ABI/unwind、有限性能 | 尚未完成；sentinel和对象编译不能替代 |
 
@@ -78,3 +78,11 @@ Windows x64独立执行读数复核报告SHA256为`0e1795072152e000428ee734c27e3
 四个冻结fixture已随仓库交付，保留原SSSE3→scalar dispatch及仅否决真实SSSE3的测试hook；Linux x64/i686各编译一次，只运行具名counter测试。接受条件同时要求编译0、运行101、唯一精确counter断言在第195行失败，以及0 passed/1 failed/9 filtered；像素字面值和suffix检查在该断言之前。任意非零、CPU前置检查失败或意外GREEN均不算预期反例。十个精确原件分别保存源、exe、四通道日志及身份，不改变生产源或默认策略。
 
 作者报告SHA256 `42c9cb27b404a917de925bfef70b0bbd88d1f39ae3363985e1403aed872e463f`，独立审查 `be63ed1efeeec81b9af12ee89d9f44013658d8059f079b0eeb6d6cc582eb13aa`。root已全文读增量及两报告，并重新核对五源和全部20项审查输入。此次只接受源码与执行接线；首次随本次功能分支push执行，实际两个目标RED仍待原始日志核验，ABI、shipping闭包和性能保持开放。
+
+## Linux x64/i686 冻结旧体实际反例成立
+
+提交`cd4dbc80344c6313dec9549b35d21ce7e38f8292`的[run38856515688/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38856515688)，x64 job116829088193与i686 job116829088586的反例及上传步骤均success。两端均编译0后运行指定单项并退出101；唯一失败为fixture第195行counter左0右1，像素和suffix检查已先通过，严格verdict为accepted-original-counterexample。这证实冻结旧dispatch在否决SSSE3时走标量，未将任意失败算作RED。新体实际GREEN保持前述范围。
+
+两ZIP各恰10成员，源before/after/current、四通道日志、目标ELF及身份均已核对。x64 ELF64/machine62、exe SHA256 `66b782c2bd8fc4eec2a3529c77a2de69a54ff4a3a233ca3bab98399b757f067c`；i686 ELF32/machine3、exe SHA256 `fa8eba9fee64c66bb38c523734e7fea76c9d4e868459b2aea7db1f54b76439f4`。root未执行下载内容，独立报告SHA256 `28e73276cb3dc930998caacd01af09d66e0611803e219f15c0270e05a68cb1e9`及两文件冻结已全文读和核验。原件在`target/sse2-publication-old-red-delivery-root-20261016/ci/`。
+
+此门只接受Linux两个目标的冻结旧体反例，不授Windows保护页、直接ABI、最终shipping ISA/runtime、性能或live资格。采集时整个job仍运行，后继包终态单独记录；上一提交59cdd705的Linux三架构包及Mac ARM64包已terminal success，同样不能外推真实会话。

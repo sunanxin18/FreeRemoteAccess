@@ -8,9 +8,9 @@ on:
         type: boolean
         required: true
         default: false
-  # 原自然失败、两次bootstrap诊断及prefix38853042725成功均保留，历史不归零。
-  # 本次仅准备固定Execute恢复；下一自然调用尚未开始，push仍须root另审释放。
-  # 不提供任意ref/tool/flags/retry；同一authority只调用原唯一自然builder。
+  # 保留原自然/诊断历史；38854683516在apt阶段所有权拒绝，未进入FFmpeg。
+  # 当前唯一字面入口只执行默认apt前缀诊断，push仍须root另审释放。
+  # 不提供任意ref/tool/flags/retry，不生成正式运输或进入自然builder。
   push:
     branches:
       - codex/rdp-egfx-hevc-preference
@@ -41,15 +41,15 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Execute the single RELEASE A entry
+      - name: Diagnose only the fixed default APT prefix
         shell: pwsh
-        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute
+        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapAptDiagnostic
       - name: Preserve all original materials and verify the transport
-        if: always()
+        if: ${{ false }}
         shell: pwsh
         run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect
       - name: Upload exact POSIX transport, receipt and verification
-        if: always()
+        if: ${{ false }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-a-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
@@ -59,12 +59,12 @@ jobs:
             ${{ runner.temp }}/release-a.verification.json
           compression-level: 0
           if-no-files-found: error
-      - name: Upload fixed Windows forensic originals on failure
-        if: ${{ failure() || cancelled() }}
+      - name: Upload fixed APT prefix diagnostic originals
+        if: always()
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: release-a-bootstrap-checkout-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          name: release-a-apt-prefix-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
           include-hidden-files: true
           path: |
             ${{ runner.temp }}/release-a-bootstrap-error.json
@@ -149,48 +149,6 @@ jobs:
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-to-windows/error.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-to-windows/executable.bin
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-to-windows/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/builder/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/builder/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/builder/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/builder/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/builder/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/builder/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/builder/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-normal/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-normal/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-normal/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-normal/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-normal/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-normal/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-normal/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-halt/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-halt/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-halt/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-halt/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-halt/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-halt/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-control-halt/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-normal/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-normal/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-normal/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-normal/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-normal/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-normal/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-normal/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-halt/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-halt/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-halt/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-halt/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-halt/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-halt/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-control-halt/main-module.bin
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-repo/argv.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-repo/stdout.bin
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-repo/stderr.bin
@@ -205,6 +163,48 @@ jobs:
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-repo-reverse/error.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-repo-reverse/executable.bin
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/path-repo-reverse/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-version/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-version/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-version/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-version/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-version/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-version/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-version/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-get-version/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-get-version/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-get-version/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-get-version/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-get-version/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-get-version/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-get-version/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/dpkg-version/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/dpkg-version/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/dpkg-version/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/dpkg-version/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/dpkg-version/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/dpkg-version/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/dpkg-version/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-use-pty/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-use-pty/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-use-pty/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-use-pty/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-use-pty/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-use-pty/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-use-pty/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-executables/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-executables/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-executables/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-executables/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-executables/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-executables/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/apt-executables/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/setup/main-module.bin
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-setup/argv.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-setup/stdout.bin
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-setup/stderr.bin
@@ -212,69 +212,17 @@ jobs:
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-setup/error.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-setup/executable.bin
             ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-setup/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-builder/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-builder/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-builder/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-builder/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-builder/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-builder/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-builder/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-collect/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-collect/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-collect/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-collect/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-collect/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-collect/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/linux-cleanup-collect/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/collect/argv.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/collect/stdout.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/collect/stderr.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/collect/exit.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/collect/error.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/collect/executable.bin
-            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/collect/main-module.bin
-            ${{ runner.temp }}/release-a-pack/argv.json
-            ${{ runner.temp }}/release-a-pack/stdout.bin
-            ${{ runner.temp }}/release-a-pack/stderr.bin
-            ${{ runner.temp }}/release-a-pack/exit.json
-            ${{ runner.temp }}/release-a-pack/error.json
-            ${{ runner.temp }}/release-a-pack/executable.bin
-            ${{ runner.temp }}/release-a-pack/main-module.bin
-            ${{ runner.temp }}/release-a-final-verify/argv.json
-            ${{ runner.temp }}/release-a-final-verify/stdout.bin
-            ${{ runner.temp }}/release-a-final-verify/stderr.bin
-            ${{ runner.temp }}/release-a-final-verify/exit.json
-            ${{ runner.temp }}/release-a-final-verify/error.json
-            ${{ runner.temp }}/release-a-final-verify/executable.bin
-            ${{ runner.temp }}/release-a-final-verify/main-module.bin
-            ${{ runner.temp }}/frd-release-a-evidence/provenance/manifest.json
             ${{ runner.temp }}/frd-release-a-evidence/provenance/paths.json
-            ${{ runner.temp }}/frd-release-a-evidence/provenance/requirements.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/apt-packages.txt
-            ${{ runner.temp }}/frd-release-a-evidence/setup/collect-intent.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/collect.sh
-            ${{ runner.temp }}/frd-release-a-evidence/setup/control-halt-intent.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/control-normal-intent.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/control-results.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/lifecycle-supervisor.py
-            ${{ runner.temp }}/frd-release-a-evidence/setup/lifecycle.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/linux-control-worker.py
-            ${{ runner.temp }}/frd-release-a-evidence/setup/os-release
             ${{ runner.temp }}/frd-release-a-evidence/setup/prepare.sh
+            ${{ runner.temp }}/frd-release-a-evidence/setup/os-release
+            ${{ runner.temp }}/frd-release-a-evidence/setup/lifecycle-supervisor.py
             ${{ runner.temp }}/frd-release-a-evidence/setup/setup-intent.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/tools.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/apt-executables.py
+            ${{ runner.temp }}/frd-release-a-evidence/setup/apt-diagnostic-receipts.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/lifecycle.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/groups/setup/scope.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/groups/setup/halt.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/groups/setup/stopped.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/collect/scope.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/collect/halt.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/collect/stopped.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-normal/scope.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-normal/halt.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-normal/stopped.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-halt/scope.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-halt/halt.json
-            ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-halt/stopped.json
           compression-level: 0
           if-no-files-found: warn
           overwrite: false

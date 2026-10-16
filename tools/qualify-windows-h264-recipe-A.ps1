@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([ValidateSet('Execute', 'Collect', 'BootstrapDiagnostic', 'BootstrapCheckoutDiagnostic')][string]$Action = 'Execute')
+param([ValidateSet('Execute', 'Collect', 'BootstrapDiagnostic', 'BootstrapCheckoutDiagnostic', 'BootstrapAptDiagnostic')][string]$Action = 'Execute')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -516,17 +516,17 @@ function Get-ReleaseAWslPath($Context, [string]$Path, [string]$Id, [switch]$Reve
     Assert-ReleaseAResult $result 'wslpath'
     return [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes((Join-Path $Context.root "setup/calls/$Id/stdout.bin"))).Trim()
 }
-function Stop-ReleaseAScopes($Context, [switch]$ControlsOnly) {
+function Stop-ReleaseAScopes($Context, [switch]$ControlsOnly, [switch]$SetupOnly) {
     # 只执行本checkout提取且已核对bytes的同job脚本，永不从下载artifact取可执行程序。
     $expected = (Get-ReleaseASupervisorSource $Context.repo).Replace("`r`n","`n").TrimEnd([char[]]"`r`n") + "`n"
     $scopes = @()
-    $kinds = if ($ControlsOnly) { @('control-normal','control-halt') } else { @('setup','collect','control-normal','control-halt') }
+    $kinds = if ($SetupOnly) { @('setup') } elseif ($ControlsOnly) { @('control-normal','control-halt') } else { @('setup','collect','control-normal','control-halt') }
     foreach ($kind in $kinds) {
         $intent = Join-Path $Context.root "setup/$kind-intent.json"
         if (Test-Path -LiteralPath $intent) { $scopes += @{ kind = $kind; intent = $intent
             source = (Join-Path $Context.root 'setup/lifecycle-supervisor.py') } }
     }
-    if (-not $ControlsOnly) {
+    if (-not $ControlsOnly -and -not $SetupOnly) {
     $configuration = Join-Path $Context.repo '.codex-target/ffmpeg-8.1.2/build-side-frd-h264dc-aarch64-v1/windows-aarch64/Release'
     New-Item -ItemType Directory -Force -Path $configuration | Out-Null
     [IO.File]::WriteAllText((Join-Path $configuration 'lifecycle-halt'), 'no new Linux launch')
@@ -689,7 +689,113 @@ function Get-ReleaseAContext {
     $root = Join-Path $env:RUNNER_TEMP 'frd-release-a-evidence'
     return @{ repo = $repo; root = $root; transport = Join-Path $repo 'tools/windows-h264-recipe-transport.py'; builderInvocations = 0 }
 }
+function Invoke-ReleaseAAptIdentity($Context, $State) {
+    # 只读固定探测；原apt安装仍由原supervisor内的prepare前缀执行。
+    $aptExecutables = @'
+import hashlib,json,shutil,sys
+from pathlib import Path
+
+
+def executable_identity(path):
+    path = Path(path)
+    before = path.stat()
+    first = path.read_bytes()
+    second = path.read_bytes()
+    after = path.stat()
+    stable = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and first == second
+    return dict(path=str(path), resolved=str(path.resolve()), size=len(first),
+                before_sha256=hashlib.sha256(first).hexdigest(), after_sha256=hashlib.sha256(second).hexdigest(),
+                observed_read_consistent=stable)
+
+
+def main():
+    if sys.platform != 'linux':
+        raise RuntimeError('APT身份探测只在真实Linux执行')
+    tools = {}
+    for name in ('apt', 'apt-get', 'dpkg', 'apt-config'):
+        path = shutil.which(name)
+        if path is None:
+            raise RuntimeError('缺少固定APT工具: ' + name)
+        tools[name] = executable_identity(path)
+    print(json.dumps(dict(schema='freeremotedesk.release-a.apt-executables.v1', tools=tools), sort_keys=True))
+    if not all(item['observed_read_consistent'] for item in tools.values()):
+        raise RuntimeError('APT executable读取期间变化；不进入apt前缀')
+
+
+if __name__ == '__main__':
+    main()
+'@
+    Write-ReleaseALf (Join-Path $Context.root 'setup/apt-executables.py') $aptExecutables
+    $probes = @(
+        @{ id = 'apt-version'; argv = @('apt','--version') },
+        @{ id = 'apt-get-version'; argv = @('apt-get','--version') },
+        @{ id = 'dpkg-version'; argv = @('dpkg','--version') },
+        # 空stdout表示没有显式值，不能冒充已证明默认true/false；不dump全部配置。
+        @{ id = 'apt-use-pty'; argv = @('apt-config','shell','FRD_DPKG_USE_PTY','Dpkg::Use-Pty') },
+        @{ id = 'apt-executables'; argv = @('python3',"$($Context.wslRoot)/setup/apt-executables.py") }
+    )
+    $firstProbeFailure = $null
+    foreach ($probe in $probes) {
+        try {
+            $record = Invoke-ReleaseARaw -Exe 'wsl.exe' -Arguments (@('--distribution','Ubuntu-24.04','--user','root','--exec') + $probe.argv) `
+                -Directory $Context.repo -RecordDirectory (Join-Path $Context.root ("setup/calls/" + $probe.id)) -TimeoutSeconds (Get-ReleaseASetupBudget $Context 30)
+            Assert-ReleaseAResult $record ("APT只读身份探测 " + $probe.id)
+        }
+        catch {
+            Add-ReleaseAError $State 'apt_diagnostic_probe' ($probe.id + ': ' + $_.ToString())
+            if ($null -eq $firstProbeFailure) { $firstProbeFailure = $_ }
+        }
+    }
+    if ($null -ne $firstProbeFailure) { throw $firstProbeFailure }
+}
+function Save-ReleaseAAptReceipts($Context) {
+    $callId = $Context.setupCallId
+    if ($callId -cnotmatch '^[a-f0-9]{32}$') { throw '诊断callid非法，禁止读取任意路径' }
+    $files = @{}
+    $complete = $true
+    foreach ($kind in @('pending','start','end','observations')) {
+        $name = "$callId.$kind.json"
+        $path = Join-Path $Context.root ("setup/groups/setup/" + $name)
+        $entry = @{ original_windows_path = $path; original_linux_path = "$($Context.wslRoot)/setup/groups/setup/$name"
+            optional = ($kind -ceq 'observations'); status = 'missing'; before = $null; after = $null }
+        try {
+            if (Test-Path -LiteralPath $path) {
+                $before = Get-Item -LiteralPath $path -Force
+                if ($before.PSIsContainer -or ($before.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'UUID原文件不是普通文件' }
+                $entry.metadata_before = @{ size = $before.Length; mtime_ticks = $before.LastWriteTimeUtc.Ticks }
+                $first = [IO.File]::ReadAllBytes($path)
+                $entry.before = @{ bytes_base64 = [Convert]::ToBase64String($first)
+                    sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($first)).ToLowerInvariant(); size = $first.Length }
+                $second = [IO.File]::ReadAllBytes($path)
+                $entry.after = @{ bytes_base64 = [Convert]::ToBase64String($second)
+                    sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($second)).ToLowerInvariant(); size = $second.Length }
+                $after = Get-Item -LiteralPath $path -Force
+                $entry.metadata_after = @{ size = $after.Length; mtime_ticks = $after.LastWriteTimeUtc.Ticks }
+                $entry.status = 'changed-partial'
+                if ($entry.metadata_before.size -eq $entry.metadata_after.size -and $entry.metadata_before.mtime_ticks -eq $entry.metadata_after.mtime_ticks -and
+                    -not ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+                    $entry.before.bytes_base64 -ceq $entry.after.bytes_base64) {
+                    $entry.status = 'observed-byte-identical'
+                    $value = [Text.Encoding]::UTF8.GetString($first) | ConvertFrom-Json -AsHashtable
+                    $entry.binding_matches = ($value.nonce -ceq $Context.setupNonce -and $value.call_id -ceq $callId)
+                    if (-not $entry.binding_matches) { $entry.status = 'binding-mismatch-partial' }
+                }
+            }
+        }
+        catch { $entry.status = 'read-error-partial'; $entry.error = Get-ReleaseABootstrapError $_ }
+        if ($entry.status -cne 'observed-byte-identical' -and -not ($entry.optional -and $entry.status -ceq 'missing')) { $complete = $false }
+        $files[$kind] = $entry
+    }
+    Write-ReleaseAJson (Join-Path $Context.root 'setup/apt-diagnostic-receipts.json') @{
+        schema = 'freeremotedesk.release-a.apt-receipts.v1'; nonce = $Context.setupNonce; call_id = $callId
+        read_boundary = 'two byte-identical reads plus size/mtime observation only; not a no-future-write or quiescence proof'
+        source_sha256 = (Get-FileHash -LiteralPath (Join-Path $Context.root 'setup/lifecycle-supervisor.py') -Algorithm SHA256).Hash.ToLowerInvariant()
+        complete_observation = $complete; files = $files }
+    if (-not $complete) { throw '本callid UUID原材料读取不完整；已保留partial receipt，不升级诊断成功' }
+}
 function Invoke-ReleaseAExecute($Context) {
+    $aptDiagnostic = $Context.ContainsKey('bootstrapAptDiagnostic') -and $Context.bootstrapAptDiagnostic
     $Context.setupDeadline = [DateTime]::UtcNow.AddMinutes(10)
     $statePath = Join-Path $Context.root 'provenance/state.json'
     $initialLog = Join-Path $env:RUNNER_TEMP 'release-a-initialize'
@@ -771,6 +877,13 @@ PYCODE
 /opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-clang --version
 /opt/frd-llvm-mingw-20250709/bin/aarch64-w64-mingw32-strip --version
 '@
+        if ($aptDiagnostic) {
+            # 使用同一原prepare源，仅诊断截在原apt install之后；普通Execute不走此分支。
+            $boundary = "`npython3 -c 'import sys; assert sys.version_info[:2] == (3,12)'"
+            $boundaryAt = $prepare.IndexOf($boundary, [StringComparison]::Ordinal)
+            if ($boundaryAt -lt 0 -or $prepare.IndexOf($boundary, $boundaryAt + 1, [StringComparison]::Ordinal) -ge 0) { throw '原apt前缀截断边界不唯一' }
+            $prepare = $prepare.Substring(0, $boundaryAt)
+        }
         $collect = @'
 #!/bin/bash
 set -euo pipefail
@@ -785,14 +898,20 @@ if [[ -d "$repo/.codex-target/ffmpeg-8.1.2" ]]; then cp -a "$repo/.codex-target/
         Write-ReleaseAJson $statePath $state
         $state.quiescent = $false
         Write-ReleaseAJson $statePath $state
+        if ($aptDiagnostic) {
+            $Context.setupCallId = [Guid]::NewGuid().ToString('N')
+            Invoke-ReleaseAAptIdentity $Context $state
+        }
         # Python是所选distro supervisor的显式前置；缺失即setup失败，不猜测或更换distro。
         $command = "bash --noprofile --norc $(Quote-ReleaseABash ($Context.wslRoot + '/setup/prepare.sh')) $(Quote-ReleaseABash $Context.wslRoot)"
         $record = Invoke-ReleaseARaw -Exe 'wsl.exe' -Arguments @('--distribution','Ubuntu-24.04','--user','root','--exec','python3',
             "$($Context.wslRoot)/setup/lifecycle-supervisor.py",'--scope',"$($Context.wslRoot)/setup/groups/setup",'--nonce',$Context.setupNonce,
-            '--call-id',([Guid]::NewGuid().ToString('N')),'run','--','bash','-lc',$command) -Directory $Context.repo `
+            '--call-id',$(if ($aptDiagnostic) { $Context.setupCallId } else { [Guid]::NewGuid().ToString('N') }),'run','--','bash','-lc',$command) -Directory $Context.repo `
             -RecordDirectory (Join-Path $Context.root 'setup/calls/setup') -TimeoutSeconds (Get-ReleaseASetupBudget $Context) -BeforeWindowsKill {
-                Add-ReleaseAError $state 'setup' 'setup总预算超时'; Write-ReleaseAJson $statePath $state; Stop-ReleaseAScopes $Context }
+                Add-ReleaseAError $state 'setup' 'setup总预算超时'; Write-ReleaseAJson $statePath $state
+                if ($aptDiagnostic) { Stop-ReleaseAScopes $Context -SetupOnly } else { Stop-ReleaseAScopes $Context } }
         Assert-ReleaseAResult $record '固定环境准备'
+        if ($aptDiagnostic) { $state.apt_prefix_completed = $true; return }
         Invoke-ReleaseALinuxControls $Context
         $state.setup_ready = $true; $state.stage = 'builder'; $state.builder_started = $true
         Write-ReleaseAJson $statePath $state
@@ -818,7 +937,25 @@ if [[ -d "$repo/.codex-target/ffmpeg-8.1.2" ]]; then cp -a "$repo/.codex-target/
         Add-ReleaseAError $state $state.stage $_.ToString()
         throw
     }
-    finally { Write-ReleaseAJson $statePath $state }
+    finally {
+        try {
+            $diagnosticFailure = $null
+            if ($aptDiagnostic -and $Context.ContainsKey('setupCallId')) {
+                try { Stop-ReleaseAScopes $Context -SetupOnly; $state.quiescent = $true }
+                catch {
+                    if ($null -eq $state.first_error) { $diagnosticFailure = $_ }
+                    Add-ReleaseAError $state 'apt_diagnostic_cleanup' $_.ToString()
+                }
+                try { Save-ReleaseAAptReceipts $Context }
+                catch {
+                    if ($null -eq $state.first_error) { $diagnosticFailure = $_ }
+                    Add-ReleaseAError $state 'apt_diagnostic_export' $_.ToString()
+                }
+            }
+            if ($null -ne $diagnosticFailure) { throw $diagnosticFailure }
+        }
+        finally { Write-ReleaseAJson $statePath $state }
+    }
 }
 function Invoke-ReleaseACollect($Context) {
     $statePath = Join-Path $Context.root 'provenance/state.json'
@@ -913,6 +1050,10 @@ if ($MyInvocation.InvocationName -ne '.') {
         if ($Action -ceq 'BootstrapDiagnostic') { Invoke-ReleaseABootstrapDiagnostic $context | Out-Null }
         elseif ($Action -ceq 'BootstrapCheckoutDiagnostic') {
             $context.bootstrapCheckoutDiagnostic = $true
+            Invoke-ReleaseAExecute $context
+        }
+        elseif ($Action -ceq 'BootstrapAptDiagnostic') {
+            $context.bootstrapAptDiagnostic = $true
             Invoke-ReleaseAExecute $context
         }
         elseif ($Action -ceq 'Execute') { Invoke-ReleaseAExecute $context }

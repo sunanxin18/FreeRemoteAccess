@@ -381,23 +381,23 @@ class WorkflowAuthority(unittest.TestCase):
         checkout, execute, collect, upload, forensic = job['steps']
         self.assertEqual(checkout['uses'], 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262')
         self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': 'false'})
-        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute')
+        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapAptDiagnostic')
         self.assertNotIn('${{', execute['run'])
         active_commands = [step['run'] for step in job['steps'] if 'run' in step and step.get('if') != '${{ false }}']
-        self.assertEqual(active_commands, [execute['run'], collect['run']])
-        self.assertEqual(collect['if'], 'always()')
+        self.assertEqual(active_commands, [execute['run']])
+        self.assertEqual(collect['if'], '${{ false }}')
         self.assertEqual(collect['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect')
-        self.assertEqual(upload['if'], 'always()')
+        self.assertEqual(upload['if'], '${{ false }}')
         self.assertEqual(upload['with']['compression-level'], '0')
         self.assertEqual(upload['with']['if-no-files-found'], 'error')
         self.assertEqual(upload['with']['path'].splitlines(), ['${{ runner.temp }}/release-a.tar',
                                                              '${{ runner.temp }}/release-a.receipt.json',
                                                              '${{ runner.temp }}/release-a.verification.json'])
-        self.assertEqual(forensic['if'], '${{ failure() || cancelled() }}')
+        self.assertEqual(forensic['if'], 'always()')
         self.assertEqual(forensic['continue-on-error'], 'true')
         self.assertEqual(forensic['with']['include-hidden-files'], 'true')
         self.assertEqual(forensic['uses'], 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')
-        self.assertEqual(forensic['with']['name'], 'release-a-bootstrap-checkout-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
+        self.assertEqual(forensic['with']['name'], 'release-a-apt-prefix-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
         self.assertEqual((forensic['with']['compression-level'], forensic['with']['if-no-files-found'],
                           forensic['with']['overwrite']), ('0', 'warn', 'false'))
         call_files = ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json', 'error.json', 'executable.bin', 'main-module.bin')
@@ -422,19 +422,20 @@ class WorkflowAuthority(unittest.TestCase):
         self.assertEqual(actual[:54], ['${{ runner.temp }}/' + name for name in expected])
         t = load()
         self.assertEqual(set(call_files), t.CALL_FILES)
-        # linux-status和payload pack是保留项；实际pack/final-reader均在payload外固定目录。
-        calls = [name for name in t.CALLS if name not in ('initialize', 'checkout', 'linux-status', 'pack')]
-        self.assertEqual(len(calls), 16)
+        # 诊断只运输当前固定apt前缀；不进入正式POSIX transport allowlist。
+        calls = ('wsl-install', 'wsl-version', 'path-to-wsl', 'path-to-windows', 'path-repo',
+                 'path-repo-reverse', 'apt-version', 'apt-get-version', 'dpkg-version',
+                 'apt-use-pty', 'apt-executables', 'setup', 'linux-cleanup-setup')
         added = [f'frd-release-a-evidence/setup/calls/{call}/{name}' for call in calls for name in call_files]
-        added += [folder + '/' + name for folder in ('release-a-pack', 'release-a-final-verify') for name in call_files]
-        added += ['frd-release-a-evidence/provenance/' + name for name in sorted(t.PROVENANCE - {'state.json', 'checkout.json'})]
-        added += ['frd-release-a-evidence/setup/' + name for name in sorted(t.SETUP_FILES - {'host.json', 'lifecycle-error.json', 'transport-error.json'})]
-        added += [f'frd-release-a-evidence/setup/groups/{kind}/{name}' for kind in ('setup', 'collect', 'control-normal', 'control-halt')
-                  for name in ('scope.json', 'halt.json', 'stopped.json')]
-        self.assertEqual(len(added), 154)
+        added += ['frd-release-a-evidence/' + name for name in (
+            'provenance/paths.json', 'setup/prepare.sh', 'setup/os-release',
+            'setup/lifecycle-supervisor.py', 'setup/setup-intent.json', 'setup/apt-executables.py',
+            'setup/apt-diagnostic-receipts.json', 'setup/lifecycle.json',
+            'setup/groups/setup/scope.json', 'setup/groups/setup/halt.json', 'setup/groups/setup/stopped.json')]
         expected += added
         self.assertEqual(actual, ['${{ runner.temp }}/' + name for name in expected])
-        self.assertEqual(len(actual), 208)
+        self.assertEqual(len(actual), 156)
+        self.assertFalse(t.allowed('setup/apt-diagnostic-receipts.json'))
         self.assertEqual(len(actual), len(set(actual)))
         self.assertTrue(all(not any(char in path for char in '*?[]') for path in actual))
 
@@ -769,6 +770,148 @@ class StableOwnershipBoundary(unittest.TestCase):
         changed = copy.deepcopy(graph); changed[22]['starttime'] += 1
         with self.assertRaises(RuntimeError):
             self.module.stable_ownership(graph, changed, {20}, {20}, leader, supervisor)
+
+
+class OwnershipEvidenceBoundary(unittest.TestCase):
+    setUp = StableOwnershipBoundary.setUp
+    tearDown = StableOwnershipBoundary.tearDown
+    graph = StableOwnershipBoundary.graph
+
+    def test_original_rejection_retains_both_actual_graphs_and_candidates(self):
+        first, leader, supervisor = self.graph()
+        second = copy.deepcopy(first)
+        first[22].update(pgid=900, sid=900)
+        second[21].update(pgid=901)
+        originals = copy.deepcopy((first, second))
+        with self.assertRaisesRegex(RuntimeError, '发现逃逸SID/PGID后代') as rejected:
+            self.module.stable_ownership(first, second, {20}, {20}, leader, supervisor)
+        evidence = rejected.exception.ownership_failure
+        self.assertEqual(evidence['checking_snapshot'], 'first')
+        self.assertEqual(evidence['first'], {'processes': first, 'children': [20], 'outside_pgid_descendants': [22]})
+        self.assertEqual(evidence['second'], {'processes': second, 'children': [20], 'outside_pgid_descendants': [21]})
+        self.assertEqual((evidence['leader'], evidence['supervisor']), (leader, supervisor))
+        self.assertEqual((first, second), originals)
+        # 附件不把未验证的第一图升级为稳定证据，也不改变纯predicate。
+        self.assertFalse(evidence['ownership_validated'])
+        with self.assertRaisesRegex(RuntimeError, '发现逃逸SID/PGID后代'):
+            self.module.owned_graph(first, {20}, leader, supervisor)
+
+    def test_evidence_failure_does_not_replace_original_ownership_error(self):
+        first, leader, supervisor = self.graph(); first[22]['pgid'] = 900
+        with mock.patch.object(self.module, 'ownership_evidence', side_effect=OSError('fixture-evidence-failure')):
+            with mock.patch('sys.stderr', new=io.StringIO()) as error:
+                with self.assertRaisesRegex(RuntimeError, '^发现逃逸SID/PGID后代$'):
+                    self.module.stable_ownership(first, first, {20}, {20}, leader, supervisor)
+                self.assertIn('fixture-evidence-failure', error.getvalue())
+
+    def test_second_snapshot_failure_is_labelled_without_claiming_stability(self):
+        first, leader, supervisor = self.graph()
+        second = copy.deepcopy(first); second[22]['pgid'] = 900
+        with self.assertRaisesRegex(RuntimeError, '发现逃逸SID/PGID后代') as rejected:
+            self.module.stable_ownership(first, second, {20}, {20}, leader, supervisor)
+        self.assertEqual(rejected.exception.ownership_failure['checking_snapshot'], 'second')
+        self.assertEqual(rejected.exception.ownership_failure['first']['outside_pgid_descendants'], [])
+        self.assertEqual(rejected.exception.ownership_failure['second']['outside_pgid_descendants'], [22])
+
+    def test_typed_post_observation_requires_both_identities_and_never_guesses_exe(self):
+        graph, _, _ = self.graph(); expected = graph[22]
+        # 这是纯typed控制，不运行Linux、不读取/proc。
+        changed = dict(expected, starttime=999)
+        with mock.patch.object(self.module, 'identity', return_value=changed):
+            with mock.patch.object(self.module.os, 'readlink') as readlink:
+                result = self.module.observe_process(expected)
+                self.assertEqual(result['status'], 'unknown'); readlink.assert_not_called()
+        with mock.patch.object(self.module, 'identity', side_effect=[expected, changed]):
+            with mock.patch.object(self.module.os, 'readlink', return_value='/fixture/dpkg'):
+                with mock.patch.object(Path, 'read_text', return_value='fixture-comm\n'):
+                    result = self.module.observe_process(expected)
+                    self.assertEqual(result['status'], 'unknown')
+                    self.assertEqual(result['before'], expected); self.assertEqual(result['after'], changed)
+        with mock.patch.object(self.module, 'identity', side_effect=FileNotFoundError('gone')):
+            result = self.module.observe_process(expected)
+            self.assertEqual(result['status'], 'unknown'); self.assertNotIn('exe', result)
+        with mock.patch.object(self.module, 'identity', return_value=expected):
+            with mock.patch.object(self.module.os, 'readlink', return_value='/fixture/dpkg'):
+                with mock.patch.object(Path, 'read_text', return_value='fixture-comm\n'):
+                    self.assertEqual(self.module.observe_process(expected)['status'], 'identity-bound-observation')
+
+    def test_failed_end_preserves_original_raw_graph_and_reports_serialization_failure(self):
+        first, leader, supervisor = self.graph(); first[22]['pgid'] = 900
+        with self.assertRaises(RuntimeError) as rejected:
+            self.module.stable_ownership(first, first, {20}, {20}, leader, supervisor)
+        scope = self.work / 'scope'; scope.mkdir()
+        failure = rejected.exception
+        # 纯graph控制：不读/proc，不把模拟typed observations称作Linux实测。
+        with mock.patch.object(self.module, 'observe_process', return_value={'status': 'unknown', 'error': 'gone'}):
+            self.module.preserve_failed_end(scope, 'a'*32, 'b'*32, False, failure)
+        end = json.loads((scope / ('b'*32 + '.end.json')).read_bytes())
+        self.assertFalse(end['quiescent']); self.assertFalse(end['reaped'])
+        self.assertEqual(end['error'], str(failure))
+        self.assertEqual(end['ownership_failure']['first']['outside_pgid_descendants'], [22])
+        self.assertEqual(end['ownership_failure']['process_observations'][0]['expected'], first[22])
+        self.assertEqual(end['ownership_failure']['process_observations'][0]['observation']['status'], 'unknown')
+        with mock.patch.object(self.module, 'write', side_effect=OSError('fixture-write-failure')):
+            with mock.patch('sys.stderr', new=io.StringIO()) as error:
+                self.module.preserve_failed_end(scope, 'a'*32, 'c'*32, False, failure)
+                self.assertIn('fixture-write-failure', error.getvalue())
+        self.assertEqual(str(failure), '发现逃逸SID/PGID后代')
+
+
+class AptPrefixDiagnosticBoundary(unittest.TestCase):
+    def test_actual_generated_executable_reader_preserves_binary_hash_and_non_linux_refuses(self):
+        import ast, re, sys, types
+        source = (ROOT / 'tools/qualify-windows-h264-recipe-A.ps1').read_text()
+        code = re.findall(r"(?s)\$aptExecutables = @'\n(.*?)\n'@", source)
+        self.assertEqual(len(code), 1)
+        ast.parse(code[0])
+        module = types.ModuleType('actual_apt_executable_reader')
+        exec(compile(code[0], '<actual generated apt identity reader>', 'exec'), module.__dict__)
+        parent = os.environ.get('FRD_WINDOWS_EXECUTION_TEST_ARTIFACTS')
+        if parent:
+            Path(parent).mkdir(parents=True, exist_ok=True)
+        work = tempfile.mkdtemp(prefix='apt-identity-', dir=parent)
+        try:
+            path = Path(work) / 'fixture.bin'; raw = b'\x00\xff\r\nactual executable bytes\x00'; path.write_bytes(raw)
+            result = module.executable_identity(path)
+            self.assertEqual((result['size'], result['before_sha256'], result['after_sha256']), (len(raw), digest(raw), digest(raw)))
+            self.assertTrue(result['observed_read_consistent'])
+        finally:
+            if not parent:
+                shutil.rmtree(work)
+        if sys.platform != 'linux':
+            with mock.patch.object(module.shutil, 'which') as which:
+                with self.assertRaisesRegex(RuntimeError, '真实Linux'):
+                    module.main()
+                which.assert_not_called()
+
+    def test_source_gate_uses_original_prepare_prefix_and_returns_before_all_build_work(self):
+        import re
+        source = (ROOT / 'tools/qualify-windows-h264-recipe-A.ps1').read_text()
+        prepare = re.findall(r"(?s)\$prepare = @'\n(.*?)\n'@", source)
+        self.assertEqual(len(prepare), 1)
+        marker = "\npython3 -c 'import sys; assert sys.version_info[:2] == (3,12)'"
+        self.assertEqual(prepare[0].count(marker), 1)
+        prefix = prepare[0].split(marker)[0]
+        install = 'DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y python3 build-essential make patch pkg-config xz-utils tar curl ca-certificates procps util-linux'
+        self.assertEqual(prefix.splitlines()[-2:], ['apt-get update', install])
+        self.assertNotIn('Use-Pty', prefix); self.assertNotIn('/opt/', prefix)
+        execute = source.split('function Invoke-ReleaseAExecute($Context) {', 1)[1].split('function Invoke-ReleaseACollect', 1)[0]
+        self.assertIn('$prepare = $prepare.Substring(0, $boundaryAt)', execute)
+        self.assertLess(execute.index('$prepare = $prepare.Substring'), execute.index("Write-ReleaseALf (Join-Path $Context.root 'setup/prepare.sh')"))
+        gate = 'if ($aptDiagnostic) { $state.apt_prefix_completed = $true; return }'
+        self.assertEqual(execute.count(gate), 1)
+        self.assertLess(execute.index("Assert-ReleaseAResult $record '固定环境准备'"), execute.index(gate))
+        self.assertLess(execute.index(gate), execute.index('Invoke-ReleaseALinuxControls $Context'))
+        self.assertLess(execute.index(gate), execute.index('$state.setup_ready = $true'))
+        self.assertLess(execute.index(gate), execute.index('Invoke-ReleaseABuilderOnce'))
+        self.assertNotIn('$state.quiescent = $true', execute.split('finally {', 1)[0])
+        stop = source.split('function Stop-ReleaseAScopes', 1)[1].split('function Invoke-ReleaseALinuxControls', 1)[0]
+        self.assertIn("if ($SetupOnly) { @('setup') }", stop)
+        self.assertIn('if (-not $ControlsOnly -and -not $SetupOnly)', stop)
+        cli = source.split('# Dot-source', 1)[1]
+        self.assertEqual(cli.count('$context.bootstrapAptDiagnostic = $true'), 1)
+        self.assertRegex(cli, re.compile(r"elseif \(\$Action -ceq 'BootstrapAptDiagnostic'\) \{\s*"
+                                        r"\$context.bootstrapAptDiagnostic = \$true\s*Invoke-ReleaseAExecute \$context\s*\}"))
 
 
 class PreparedLinuxControlBoundary(unittest.TestCase):
