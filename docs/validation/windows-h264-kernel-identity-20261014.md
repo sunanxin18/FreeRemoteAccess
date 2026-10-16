@@ -83,3 +83,15 @@ Windows source profile及对应源码exact材料已接入，固定上游归档�
 该成功仅关闭初始化诊断门；原首run缺失的原因不追认，WSL/Linux进程门、完整自然FFmpeg及B/C/D继续待验。后继恢复自然入口时须保留失败时的早期initialize原件，不能再次让缺state丢失最早错误。
 
 修后六项实际结果经独立读数复核通过，报告SHA256 `501844b950479562a4762792d64e84512305c6a9cb681ce12103dfbeac2cfc7b`。恢复自然入口的两路径/130行delta、16项冻结及独立源审`5063bf135932d7f5e03033903213d7d00f26f2de09eec4f5bd1b4e29bc5af4bf`已由root完整读取/核对。现在只释放一次固定Execute流程；Collect和正式三件always，forensic仅失败/取消时尽力运输73个精确可能路径（含最早initialize七原件）。该恢复提交的push本身触发，不另dispatch或并发重跑；完整自然执行结果另记，B/C/D继续开放。
+
+### 恢复完整流程后：checkout 目录冲突
+
+提交`263d7bf04bea7f1c13a36154cb053cf4e372c1e7`的[run38851041806/attempt1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38851041806) / job116812080832已实际运行：initialize成功，checkout子进程exit1，退出与双通道EOF均已观察；WSL与FFmpeg尚未开始。失败forensic artifact12025486411为4,949字节、digest `5ce56fea60505843274e30308fcb5dd0919a549acba906acac9ff2f4713b642f`，仅带回外层首个ErrorRecord；checkout原stderr未在旧精确清单内，不能声称已经取回它。
+
+本机直接调用当前生产`initialize → canonical_checkout`，在Git discovery和Popen均为0时真实复现`FileExistsError`：initialize已创建空`checkout-inputs`，checkout再次无条件mkdir。不存在的scratch repo未被创建，输出仍空。该目录生命周期冲突是确定的源码问题；本机trace与缺失的Windows原stderr保持区分。预检冻结21项，报告SHA256 `2a14c494993d71fbead2120ac059ead00064b15ccc6a1bcb1cf6953b0a46c18a`，root已全文读取并逐项核对。
+
+最小修复只允许同次初始化的空真实目录，继续拒绝非空、文件和symlink；不改变Git参数或blob校验。后继固定前缀诊断复用原Execute至工具catalog与fresh检查，随后在第一条WSL调用之前返回；正式三件仍缺失，前缀原始日志单独运输。当前处于源码实施阶段，尚未取得Windows前缀GREEN，不继续盲跑完整自然构建。B/C/D继续开放。
+
+目录修复与封闭前缀已完成源码实现：本机 focused 5/5、完整运输模块26/26通过，含真实initialize后隔离Git的CRLF/属性/blob控制。独立审查发现一项P2：固定54路径内的两个隐藏源会被upload默认过滤；仅forensic启用`include-hidden-files: true`并加精确断言后，该控制实际1项RED→GREEN。原26项无需无关重跑；旧日志与冻结保持。root已全文读取411行原diff、20行修复diff及两报告，核139项初版和15项修复材料。此处仍是源码/宿主结论；Windows前缀、实际隐藏文件上传与WSL/FFmpeg未由它替代。
+
+该唯一P2经定向复审 Spec PASS / Quality Approved关闭，报告SHA256 `27acf8154505e130c95e42173ad2de2361dab2fcf831b7fa491d3aec0fd1e2e3`。root核对复审两件及四当前源后，只释放一次固定`BootstrapCheckoutDiagnostic`的正常功能分支push；不另dispatch/rerun，不启动自然A、WSL或builder。实际Windows结果另记。

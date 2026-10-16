@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       execute_release_a:
-        description: Explicit root-authorized RELEASE A execution (single fixed recipe)
+        description: Explicit root-authorized pre-WSL checkout diagnostic only
         type: boolean
         required: true
         default: false
-  # 原自然run38847486035失败；诊断38849395836失败、38850194932成功，历史不归零。
-  # 本次仅准备固定Execute恢复源码；下一自然调用尚未开始，push仍须root另审释放。
-  # 不提供任意ref/tool/flags/retry；同一authority只调用原唯一自然builder。
+  # 原自然38847486035/38851041806失败、两次bootstrap诊断历史均保留，不归零。
+  # 此源码固定BootstrapCheckoutDiagnostic，在原fresh检查后/第一WSL前返回。
+  # 不提供任意ref/tool/flags/retry；自然builder仍HOLD，prefix push须root另审释放。
   push:
     branches:
       - codex/rdp-egfx-hevc-preference
@@ -41,15 +41,16 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Execute the single RELEASE A entry
+      - name: Run fixed pre-WSL checkout diagnostic only
         shell: pwsh
-        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute
+        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapCheckoutDiagnostic
       - name: Preserve all original materials and verify the transport
-        if: always()
+        # pre-WSL prefix没有POSIX封包资格；原正式三件合同保留但当前不可达。
+        if: ${{ false }}
         shell: pwsh
         run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect
       - name: Upload exact POSIX transport, receipt and verification
-        if: always()
+        if: ${{ false }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-a-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
@@ -59,79 +60,14 @@ jobs:
             ${{ runner.temp }}/release-a.verification.json
           compression-level: 0
           if-no-files-found: error
-      - name: Upload fixed Windows forensic originals on failure
-        if: ${{ failure() || cancelled() }}
-        continue-on-error: true
+      - name: Upload exact Windows pre-WSL forensic originals
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: release-a-bootstrap-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          name: release-a-bootstrap-checkout-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          include-hidden-files: true
           path: |
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic.json
             ${{ runner.temp }}/release-a-bootstrap-error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/host.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/qualifier-source.ps1
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/transport-source.py
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/control.ps1
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/historical.ps1
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/results.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/control.ps1
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/record-directory-conflict.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/root/provenance/state.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/preexisting-root-marker.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/intent.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/outer-error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/argv.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/stdout.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/stderr.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/exit.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/executable.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/formatter/call/main-module.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/intent.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/outer-error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/argv.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/stdout.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/stderr.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/exit.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/executable.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/binary/call/main-module.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/intent.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/outer-error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/argv.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/stdout.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/stderr.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/exit.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/executable.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/missing-exe/call/main-module.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/intent.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/outer-error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/argv.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/stdout.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/stderr.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/exit.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/executable.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/log-conflict/call/main-module.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/intent.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/outer-error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/argv.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/stdout.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/stderr.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/exit.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/executable.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-success/call/main-module.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/intent.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/outer-error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/argv.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/stdout.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/stderr.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/exit.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/error.json
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/executable.bin
-            ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/main-module.bin
             ${{ runner.temp }}/release-a-initialize/argv.json
             ${{ runner.temp }}/release-a-initialize/stdout.bin
             ${{ runner.temp }}/release-a-initialize/stderr.bin
@@ -139,6 +75,52 @@ jobs:
             ${{ runner.temp }}/release-a-initialize/error.json
             ${{ runner.temp }}/release-a-initialize/executable.bin
             ${{ runner.temp }}/release-a-initialize/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/provenance/state.json
+            ${{ runner.temp }}/frd-release-a-evidence/provenance/checkout.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/host.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/initialize/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/initialize/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/initialize/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/initialize/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/initialize/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/initialize/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/initialize/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/checkout/argv.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/checkout/stdout.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/checkout/stderr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/checkout/exit.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/checkout/error.json
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/checkout/executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/setup/calls/checkout/main-module.bin
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/checkout-commands.json
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/git-executable.bin
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/blob-identities.json
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/attributes-before.bin
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/attributes.bin
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/check-attr.bin
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/.gitattributes
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/.github/workflows/qualify-windows-h264-recipe.yml
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/qualify-windows-h264-recipe-A.ps1
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/windows-h264-recipe-transport.py
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/build-ffmpeg-windows.ps1
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/desktop-ffmpeg-source.py
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/ffmpeg-source-recipe.py
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/windows-ffmpeg-bundle.py
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/windows-ffmpeg-build-capture.py
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/windows-ffmpeg-kernel.py
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/ffmpeg-build-common.psm1
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/third_party/ffmpeg/8.1.2/h264-luma-dc-aarch64-recipe.json
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/third_party/ffmpeg/8.1.2/patches/0001-aarch64-h264-luma-dc-neon.patch
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/tests/test_windows_h264_recipe_transport.py
+            ${{ runner.temp }}/frd-release-a-evidence/checkout-inputs/tools/tests/windows-h264-recipe-ci.Tests.ps1
+            ${{ runner.temp }}/frd-release-a-evidence/toolchain/windows/catalog.json
+            ${{ runner.temp }}/frd-release-a-evidence/toolchain/windows/pwsh.bin
+            ${{ runner.temp }}/frd-release-a-evidence/toolchain/windows/python.bin
+            ${{ runner.temp }}/frd-release-a-evidence/toolchain/windows/wsl.exe.bin
+            ${{ runner.temp }}/frd-release-a-evidence/toolchain/windows/git.bin
+            ${{ runner.temp }}/frd-release-a-evidence/toolchain/windows/gpg.exe.bin
+            ${{ runner.temp }}/frd-release-a-evidence/toolchain/windows/curl.exe.bin
           compression-level: 0
-          if-no-files-found: warn
+          if-no-files-found: error
           overwrite: false

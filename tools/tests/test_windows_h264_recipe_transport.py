@@ -242,6 +242,69 @@ class TransportBoundary(unittest.TestCase):
                           expected_inputs=self.expected)
 
 
+class InitializedCheckoutBoundary(unittest.TestCase):
+    def setUp(self):
+        self.t = load()
+        parent = os.environ.get('FRD_WINDOWS_EXECUTION_TEST_ARTIFACTS')
+        if parent:
+            Path(parent).mkdir(parents=True, exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix='initialized-checkout-', dir=parent))
+        self.repo = self.work / 'repo-must-remain-absent'
+
+    def tearDown(self):
+        if not os.environ.get('FRD_WINDOWS_EXECUTION_TEST_ARTIFACTS'):
+            shutil.rmtree(self.work)
+
+    def assert_empty_output_reaches_only_discovery(self, output):
+        with mock.patch.object(self.t.shutil, 'which', side_effect=RuntimeError('stop-before-Git-discovery')) as discovery, \
+                mock.patch.object(self.t.subprocess, 'Popen', side_effect=AssertionError('forbidden Git spawn')) as spawn:
+            with self.assertRaisesRegex(RuntimeError, 'stop-before-Git-discovery'):
+                self.t.canonical_checkout(self.repo, 'a' * 40, output)
+            self.assertEqual(discovery.call_count, 1)
+            spawn.assert_not_called()
+        self.assertFalse(self.repo.exists())
+        self.assertEqual(self.t.read_json(output / 'checkout-commands.json'), [])
+
+    def test_actual_initialize_empty_output_is_accepted_before_git(self):
+        root = self.work / 'payload'
+        self.t.initialize(root, 'a' * 40, '1234', '1')
+        output = root / 'checkout-inputs'
+        self.assertTrue(output.is_dir())
+        self.assertEqual(list(output.iterdir()), [])
+        self.assert_empty_output_reaches_only_discovery(output)
+
+    def test_original_absent_output_still_creates_empty_directory_before_git(self):
+        self.assert_empty_output_reaches_only_discovery(self.work / 'new-parent/inputs')
+
+    def test_nonempty_file_and_symlink_outputs_refuse_before_git(self):
+        nonempty = self.work / 'nonempty'
+        nonempty.mkdir()
+        marker = nonempty / 'original.bin'
+        marker.write_bytes(b'original\0\xff')
+        regular = self.work / 'file'
+        regular.write_bytes(b'file\0\xfe')
+        target = self.work / 'target'
+        target.mkdir()
+        link = self.work / 'link'
+        link.symlink_to(target, target_is_directory=True)
+        broken = self.work / 'broken'
+        broken.symlink_to(self.work / 'missing-target', target_is_directory=True)
+        for output in (nonempty, regular, link, broken):
+            with self.subTest(output=output.name), \
+                    mock.patch.object(self.t.shutil, 'which', side_effect=AssertionError('forbidden Git discovery')) as discovery, \
+                    mock.patch.object(self.t.subprocess, 'Popen', side_effect=AssertionError('forbidden Git spawn')) as spawn:
+                with self.assertRaises((ValueError, FileExistsError)):
+                    self.t.canonical_checkout(self.repo, 'a' * 40, output)
+                discovery.assert_not_called()
+                spawn.assert_not_called()
+        self.assertEqual(marker.read_bytes(), b'original\0\xff')
+        self.assertEqual(regular.read_bytes(), b'file\0\xfe')
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(broken.is_symlink())
+        self.assertFalse(self.repo.exists())
+
+
 class CheckoutBoundary(unittest.TestCase):
     def test_isolated_git_crlf_and_attributes_produce_exact_commit_bytes(self):
         t = load()
@@ -250,7 +313,7 @@ class CheckoutBoundary(unittest.TestCase):
             Path(parent).mkdir(parents=True, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix='checkout-', dir=parent))
         try:
-            repo, output = work / 'repo', work / 'inputs'
+            repo, output = work / 'repo', work / 'payload/checkout-inputs'
             repo.mkdir()
             environment = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
             def git(*args):
@@ -269,6 +332,7 @@ class CheckoutBoundary(unittest.TestCase):
             git('add', '--all')
             git('commit', '-m', 'fixture')
             source = git('rev-parse', 'HEAD').decode().strip()
+            t.initialize(output.parent, source, '1234', '1')
             (repo / 'tools/build-ffmpeg-windows.ps1').unlink()
             git('checkout-index', '--force', '--all')
             self.assertIn(b'\r\n', (repo / 'tools/build-ffmpeg-windows.ps1').read_bytes())
@@ -294,9 +358,9 @@ class CheckoutBoundary(unittest.TestCase):
 
 
 class WorkflowAuthority(unittest.TestCase):
-    def test_real_workflow_has_one_fixed_natural_authority_and_failure_only_forensics(self):
+    def test_real_workflow_has_one_fixed_pre_wsl_prefix_and_exact_forensics(self):
         import yaml
-        # BaseLoader保留on字段；固定自然入口无任意mode/ref/tool/flags/retry输入。
+        # BaseLoader保留on字段；字面prefix不能由dispatch bool切到自然builder。
         workflow = yaml.load((ROOT / '.github/workflows/qualify-windows-h264-recipe.yml').read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow['on']), {'push', 'workflow_dispatch'})
@@ -314,44 +378,68 @@ class WorkflowAuthority(unittest.TestCase):
         self.assertEqual(job['if'], "(github.event_name == 'workflow_dispatch' && inputs.execute_release_a == true) || "
                                    "(github.event_name == 'push' && github.ref == 'refs/heads/codex/rdp-egfx-hevc-preference')")
         self.assertEqual(set(job['env']), {'RELEASE_A_EXECUTE', 'RELEASE_A_WORKFLOW_SHA', 'RELEASE_A_WORKFLOW_REF'})
-        checkout, execute, collect, upload, forensic = job['steps']
+        checkout, prefix, collect, upload, forensic = job['steps']
         self.assertEqual(checkout['uses'], 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262')
         self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': 'false'})
-        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute')
-        self.assertNotIn('${{', execute['run'])
+        self.assertEqual(prefix['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapCheckoutDiagnostic')
+        self.assertNotIn('${{', prefix['run'])
         active_commands = [step['run'] for step in job['steps'] if 'run' in step and step.get('if') != '${{ false }}']
-        self.assertEqual(active_commands, [execute['run'], collect['run']])
-        self.assertEqual(collect['if'], 'always()')
+        self.assertEqual(active_commands, [prefix['run']])
+        self.assertEqual(collect['if'], '${{ false }}')
         self.assertEqual(collect['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect')
-        self.assertEqual(upload['if'], 'always()')
+        self.assertEqual(upload['if'], '${{ false }}')
         self.assertEqual(upload['with']['compression-level'], '0')
         self.assertEqual(upload['with']['if-no-files-found'], 'error')
         self.assertEqual(upload['with']['path'].splitlines(), ['${{ runner.temp }}/release-a.tar',
                                                              '${{ runner.temp }}/release-a.receipt.json',
                                                              '${{ runner.temp }}/release-a.verification.json'])
-        self.assertEqual(forensic['if'], '${{ failure() || cancelled() }}')
-        self.assertEqual(forensic['continue-on-error'], 'true')
+        self.assertEqual(forensic['if'], 'always()')
+        self.assertNotIn('continue-on-error', forensic)
+        self.assertEqual(forensic['with']['include-hidden-files'], 'true')
         self.assertEqual(forensic['uses'], 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')
-        self.assertEqual(forensic['with']['name'], 'release-a-bootstrap-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
+        self.assertEqual(forensic['with']['name'], 'release-a-bootstrap-checkout-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
         self.assertEqual((forensic['with']['compression-level'], forensic['with']['if-no-files-found'],
-                          forensic['with']['overwrite']), ('0', 'warn', 'false'))
-        expected = ['release-a-bootstrap-diagnostic.json', 'release-a-bootstrap-error.json']
-        fixed = ['host.json', 'qualifier-source.ps1', 'transport-source.py', 'formatter/control.ps1',
-                 'formatter/historical.ps1', 'formatter/results.json', 'binary/control.ps1',
-                 'log-conflict/record-directory-conflict.bin', 'initialize-success/root/provenance/state.json',
-                 'initialize-failure/preexisting-root-marker.bin']
-        for case in ('formatter', 'binary', 'missing-exe', 'log-conflict', 'initialize-success', 'initialize-failure'):
-            fixed += [f'{case}/intent.json', f'{case}/outer-error.json']
-            fixed += [f'{case}/call/{name}' for name in ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json',
-                                                       'error.json', 'executable.bin', 'main-module.bin')]
-        expected += ['release-a-bootstrap-diagnostic/' + name for name in fixed]
-        expected += ['release-a-initialize/' + name for name in ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json',
-                                                               'error.json', 'executable.bin', 'main-module.bin')]
+                          forensic['with']['overwrite']), ('0', 'error', 'false'))
+        call_files = ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json', 'error.json', 'executable.bin', 'main-module.bin')
+        expected = ['release-a-bootstrap-error.json'] + ['release-a-initialize/' + name for name in call_files]
+        payload = ['provenance/state.json', 'provenance/checkout.json', 'setup/host.json']
+        payload += [f'setup/calls/{call}/{name}' for call in ('initialize', 'checkout') for name in call_files]
+        payload += ['checkout-inputs/' + name for name in ('checkout-commands.json', 'git-executable.bin',
+                    'blob-identities.json', 'attributes-before.bin', 'attributes.bin', 'check-attr.bin')]
+        fixed_sources = ('.gitattributes', '.github/workflows/qualify-windows-h264-recipe.yml',
+            'tools/qualify-windows-h264-recipe-A.ps1', 'tools/windows-h264-recipe-transport.py',
+            'tools/build-ffmpeg-windows.ps1', 'tools/desktop-ffmpeg-source.py', 'tools/ffmpeg-source-recipe.py',
+            'tools/windows-ffmpeg-bundle.py', 'tools/windows-ffmpeg-build-capture.py', 'tools/windows-ffmpeg-kernel.py',
+            'tools/ffmpeg-build-common.psm1', 'third_party/ffmpeg/8.1.2/h264-luma-dc-aarch64-recipe.json',
+            'third_party/ffmpeg/8.1.2/patches/0001-aarch64-h264-luma-dc-neon.patch',
+            'third_party/ffmpeg/8.1.2/LICENSE.LGPLv2.1', 'tools/tests/test_windows_h264_recipe_transport.py',
+            'tools/tests/windows-h264-recipe-ci.Tests.ps1')
+        payload += ['checkout-inputs/' + name for name in fixed_sources]
+        payload += ['toolchain/windows/catalog.json']
+        payload += ['toolchain/windows/' + name + '.bin' for name in ('pwsh', 'python', 'wsl.exe', 'git', 'gpg.exe', 'curl.exe')]
+        expected += ['frd-release-a-evidence/' + name for name in payload]
         actual = forensic['with']['path'].splitlines()
         self.assertEqual(actual, ['${{ runner.temp }}/' + name for name in expected])
-        self.assertEqual(len(actual), 73)
+        self.assertEqual(len(actual), 54)
         self.assertEqual(len(actual), len(set(actual)))
         self.assertTrue(all(not any(char in path for char in '*?[]') for path in actual))
+
+    def test_static_prefix_gate_reuses_execute_after_fresh_check_before_first_wsl(self):
+        import re
+        # 源结构控制，不冒充实际PowerShell AST或Windows运行时执行。
+        source = (ROOT / 'tools/qualify-windows-h264-recipe-A.ps1').read_text()
+        execute = source.split('function Invoke-ReleaseAExecute($Context) {', 1)[1].split('function Invoke-ReleaseACollect', 1)[0]
+        gate = "if ($Context.ContainsKey('bootstrapCheckoutDiagnostic') -and $Context.bootstrapCheckoutDiagnostic) { return }"
+        self.assertEqual(execute.count(gate), 1)
+        self.assertLess(execute.index('Save-ReleaseAWindowsTools $Context'), execute.index(gate))
+        self.assertLess(execute.index('if (Test-Path -LiteralPath $fresh)'), execute.index(gate))
+        self.assertLess(execute.index(gate), execute.index("Invoke-ReleaseARaw -Exe 'wsl.exe'"))
+        self.assertIn('finally { Write-ReleaseAJson $statePath $state }', execute)
+        cli = source.split('# Dot-source', 1)[1]
+        self.assertEqual(cli.count('$context.bootstrapCheckoutDiagnostic = $true'), 1)
+        self.assertRegex(cli, re.compile(r"elseif \(\$Action -ceq 'BootstrapCheckoutDiagnostic'\) \{\s*"
+                                        r"\$context.bootstrapCheckoutDiagnostic = \$true\s*"
+                                        r"Invoke-ReleaseAExecute \$context\s*\}"))
 
 
 class InlineSupervisorBoundary(unittest.TestCase):

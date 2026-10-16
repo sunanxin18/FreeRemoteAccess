@@ -636,7 +636,9 @@ def windows_process_image(process):
 def canonical_checkout(repo, source, output):
     repo, output = Path(repo).resolve(), Path(output)
     require(re.fullmatch('[0-9a-f]{40}', source), 'checkout 只接受固定 commit SHA')
-    output.mkdir(parents=True)
+    output.mkdir(parents=True, exist_ok=True)
+    require(output.is_dir() and not output.is_symlink() and not any(output.iterdir()),
+            'checkout输出必须是空真实目录；禁止复用旧材料')
     log = []
     def git(*args):
         argv = ['git', *args]

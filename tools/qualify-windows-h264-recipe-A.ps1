@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([ValidateSet('Execute', 'Collect', 'BootstrapDiagnostic')][string]$Action = 'Execute')
+param([ValidateSet('Execute', 'Collect', 'BootstrapDiagnostic', 'BootstrapCheckoutDiagnostic')][string]$Action = 'Execute')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -715,6 +715,7 @@ function Invoke-ReleaseAExecute($Context) {
         Write-ReleaseAJson $statePath $state
         $fresh = Join-Path $Context.repo '.codex-target/ffmpeg-8.1.2'
         if (Test-Path -LiteralPath $fresh) { throw 'A配置根已存在；禁止复用、清理后重试或选旧attempt' }
+        if ($Context.ContainsKey('bootstrapCheckoutDiagnostic') -and $Context.bootstrapCheckoutDiagnostic) { return }
         $record = Invoke-ReleaseARaw -Exe 'wsl.exe' -Arguments @('--install','--distribution','Ubuntu-24.04','--no-launch') `
             -Directory $Context.repo -RecordDirectory (Join-Path $Context.root 'setup/calls/wsl-install') -TimeoutSeconds (Get-ReleaseASetupBudget $Context 300)
         Assert-ReleaseAResult $record 'WSL安装（非0/需重启均STOP）'
@@ -910,6 +911,10 @@ if ($MyInvocation.InvocationName -ne '.') {
     try {
         $context = Get-ReleaseAContext
         if ($Action -ceq 'BootstrapDiagnostic') { Invoke-ReleaseABootstrapDiagnostic $context | Out-Null }
+        elseif ($Action -ceq 'BootstrapCheckoutDiagnostic') {
+            $context.bootstrapCheckoutDiagnostic = $true
+            Invoke-ReleaseAExecute $context
+        }
         elseif ($Action -ceq 'Execute') { Invoke-ReleaseAExecute $context }
         else { Invoke-ReleaseACollect $context }
     }

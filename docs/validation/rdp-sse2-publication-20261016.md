@@ -1,6 +1,6 @@
 # RDP RGBA→BGRX 的 SSE2 转换
 
-2026-10-16，状态：**开发中**。本次补齐 Windows/Linux x86 与 x86_64 的 SSE2 转换主体；Linux/Windows x86_64已有新体局部实际运行；其余目标运行、保护页、ABI 和性能尚未完成，不能据此授予完整解码器或客户端生产资格。
+2026-10-16，状态：**开发中**。本次补齐 Windows/Linux x86 与 x86_64 的 SSE2 转换主体；Linux i686、Linux/Windows x86_64已有新体局部实际运行；Windows i686目标运行、保护页、ABI 和性能尚未完成，不能据此授予完整解码器或客户端生产资格。
 
 RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 可用时使用原生实现，否则回到标量。现在保留 SSSE3 优先，其后检查真实 SSE2，再选择共享的 SSE2 入口；只有未通过 SSE2 检查的 CPU 才使用明确的 reference 后备。协议、解码器选择、Surface 合同、默认策略、能力广告和 ARM64 实现保持。
 
@@ -13,9 +13,9 @@ RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 
 | 固定 Rust 1.96 格式 | 两源通过 |
 | macOS ARM64 局部真实源码测试 | debug/release各8通过；各过滤1项既有benchmark。仅共享API及NEON回归，不是x86执行 |
 | Windows i686/x86_64 | 两个实际源码优化COFF对象编译通过；后续普通CI已执行Windows x86_64新体12项局部测试，i686仍待运行 |
-| Linux i686/x86_64 | 两个实际源码优化ELF对象编译通过；后续普通CI已执行x86_64新体12项局部测试，i686仍待运行 |
+| Linux i686/x86_64 | 两个实际源码优化ELF对象编译通过；后续普通CI已执行x86_64新体12项、i686新体11项局部测试 |
 | SSE2静态指令 | 四个精确入口及内联数值核心仅见SSE2指令；外部memcpy/TLS/panic运行库未链接，不代表最终ISA闭包 |
-| 原体反例/新体执行 | 原体RED快照与精确运行方法已准备；Linux/Windows x86_64新体各12项实际通过，i686执行仍待完成 |
+| 原体反例/新体执行 | 原体RED快照与精确运行方法已准备；Linux/Windows x86_64新体各12项、Linux i686新体11项实际通过；Windows i686仍待完成 |
 | 保护页、ABI/unwind、有限性能 | 尚未完成；sentinel和对象编译不能替代 |
 
 最终源SHA256：`pixel_convert.rs` 为`ee5623097b839166f311ffc0a9fffbfbc3d8b59163da96df8b9171692f4fa66c`，`pixel_convert/x86.rs` 为`232fabaca6781a9e3ef5110de292d3c4b017066b847f7ee9b31ad4f7ad8aeaf9`。原SSSE3数值体与ARM64文件保持；macOS只支持ARM64，本次没有macOS Intel构建。
@@ -24,7 +24,7 @@ RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 
 
 独立源码审查结论为Spec/Quality PASS，未发现需返工问题；报告SHA256为`c8bf96bd718b7f5057862e4b0c36e0c9e094a21e449d8318daef58c867c9b66b`。root已完整读取两源diff、实现报告、审查报告，重新核对源快照及四目标对象身份。此结论仅接受源码切片，表中真实目标运行门继续开放。
 
-Windows、Linux包流程已分别补上仅i686执行的实际crate局部测试接线，使用原目标/linker/runtime，跳过既有benchmark，失败即停止。两处独立配置审查通过（报告SHA256 `4208413f73f020396eed668867246d67a611e430403c71452d214b6e06cef6bc`）；当前只是接线，尚未取得该版本的CI执行结果。x64沿用现有完整crate测试，不新增重复运行。过滤器须实际运行11项局部测试（含三个ISA测试），不能用0测试的成功退出当验证。
+Windows、Linux包流程已分别补上仅i686执行的实际crate局部测试接线，使用原目标/linker/runtime，跳过既有benchmark，失败即停止。两处独立配置审查通过（报告SHA256 `4208413f73f020396eed668867246d67a611e430403c71452d214b6e06cef6bc`）；Linux i686后继已取得下述实际执行结果，Windows i686仍待执行。x64沿用现有完整crate测试，不新增重复运行。过滤器须实际运行11项局部测试（含三个ISA测试），不能用0测试的成功退出当验证。
 
 ## 首次 Linux x86_64 真实运行
 
@@ -41,3 +41,9 @@ Windows、Linux包流程已分别补上仅i686执行的实际crate局部测试�
 该证据推进Windows x64新体局部正确性；i686定向接线的实际结果、旧体RED、保护页、ABI、最终运行库ISA及三路性能继续开放。原benchmark通过不作为本次SSE2速度结论。
 
 Windows x64独立执行读数复核报告SHA256为`0e1795072152e000428ee734c27e3d446ca56405e2593e35b1f5fadb79e622fd`，确认匹配head、x64 host及12项实际ok，不按x86矩阵名称外推i686。
+
+## 首次 Linux i686 真实运行
+
+提交`dd46ea849f86cee3f5bcc074b41cc05a219c4f50`的[Linux包run38849395853](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38849395853) / job116807020652实际通过11项局部测试，0失败、0忽略，包含三个ISA测试。命令显式指定`--target i686-unknown-linux-gnu`，实际启动i686目录内测试程序，既有benchmark明确跳过。日志中deny guard检查的panic由`catch_unwind`捕获，同一测试最终ok；它不是本次失败，也不能替代完整ABI/unwind验收。
+
+原日志`target/sse2-publication-root-20261016/ci/dd46ea84-linux-i686-job-original.log`为405,242字节，SHA256 `b090e6bca631563d6b2a480d329d47f79eec0c9ac5fd397ac0d8f08223dcb989`。独立读数复核报告SHA256 `c235ed78a3baf28d5a505202577c99301151db25eed1d8239219d7eddede8b60`确认匹配提交、真实目标进程及逐名结果，root已完整读取。Windows i686、旧体实际RED、保护页、ABI、最终运行库ISA闭包和性能仍待完成。
