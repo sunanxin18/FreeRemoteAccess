@@ -9,8 +9,8 @@ on:
         required: true
         default: false
   # 原自然失败、各次诊断及fresh APT38871211074成功均保留，历史不归零。
-  # fb90ddd4原生小probe通过actual birth、stable与替换负控；完整导出仍待验。
-  # root仅释放修复canonical身份后的下一次自然Execute，保留旧失败与make首错UNKNOWN。
+  # cfb685b8有限先导出成功，make首错为map归属拒绝；实际argv/目标未保存。
+  # root仅释放有界拒绝事件后的下一次自然Execute取现场，保留原guard/预算及旧失败。
   # Use-Pty=0共享prepare保持；不提供任意ref/tool/flags/retry。
   push:
     branches:

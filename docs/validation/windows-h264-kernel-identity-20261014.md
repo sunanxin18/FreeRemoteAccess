@@ -256,3 +256,5 @@ Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd91
 新增7项宿主控制先取得4个精确断言RED（0 errors），实现后7/7及现NaturalSpawn合计12/12通过；包括Unicode、过长输入、日志失败和原始stderr首行。原第一次含一个解析错误的RED另存，未冒充有效RED。以上仅Python合成工具，不是新的Windows执行或FFmpeg成功构建。
 
 Collect原三阶段记录：LLVM复制46.831秒exit0，system-tools1.643秒exit0，build-root-copy开始后没有end/exit，最终达到原300秒窗、exit124。已定位整体复制阶段，具体文件/已复制量与吞吐仍未知；正式tar/receipt/verification未生成。预算、清理和旧失败均保持。实际原件在`target/a-cfb-failure-root-20261016/`，独立只读诊断报告SHA256 `adc318b595f75441b2c1075ff7fab7bec6612803cb83ee34cb8648d0ba9b2f55`经root全文读和44绑定复核；拒绝诊断独立SOURCE/HOST审查通过（报告SHA256 `45cf6d22d8eb9ce8751cf164655999bcc5a5ba0ba8bd46555ac400b14586d083`），root全文读并核绑定；未因此授新原生资格，没有另行重启A。
+
+独立诊断审查通过后，root只释放一次新的自然A执行，用于保存上次缺失的实际拒绝参数。仅修改工作流发布注释；原入口、配方、工具身份与map断言、收集预算和停止规则保持。不是重跑旧run，亦不把诊断接入冒充原构建已修复；新结果须绑定自己的run/head和原始流。
