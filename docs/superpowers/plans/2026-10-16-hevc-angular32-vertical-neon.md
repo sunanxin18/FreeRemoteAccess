@@ -45,10 +45,10 @@
 
 **Interfaces:** patch仅沿0002 postimage增加新ASM及C wrapper/真实slot3 hook；wrapper在pred.c同TU可访问原static pred_angular_3_8，aarch64 init声明wrapper并仅在原exact8+NEON条件下设置slot3。禁止全局可变fallback。所有其它尺寸/位深/槽不变。直接ABI沿已有sentinel只读源，以预处理改名生成新32私有对象（helper名与angular callee同时改名），新用例固定w6=1直调32核；不修改旧helper、不运行旧16用例，实际linked BL仍须核对，不能把宏替换本身当作ABI证据。
 
-- [ ] 以Task1真实RED为基线实现新ASM：仅mode18..34，signed stride，NEON按32byte row插值/精确copy。负角ref构建遵原floor/inverse索引；数值分子最大8160，round+16最大8176，u16足够。不得无条件做fraction0的第二参考读取。
-- [ ] 原水平C body保留；新wrapper只作方向选择。汇编不碰x18、nonvolatile/LR；SP16对齐，scratch/CFI与实际指令相符。沿现Mach-O/ELF私有边界，COFF不假借此门取得资格。
-- [ ] 独立源码审查后root释放当前候选的必要实际selector GREEN/数值/最小读取guard/直接ABI/linked ISA及精确rounding/index/direction/越界负控；只覆盖新增32路径，保旧门与旧失败原件。
-- [ ] 运行结果和平台矩阵随候选提交更新；性能/各目标容器/正式配方及包、完整同流解码后续分别验收。未完成不得改广告或默认策略。
+- [x] 以Task1真实RED为基线实现新ASM：仅mode18..34，signed stride，NEON按32byte row插值/精确copy。负角ref构建遵原floor/inverse索引；数值分子最大8160，round+16最大8176，u16足够。不得无条件做fraction0的第二参考读取。
+- [x] 原水平C body保留；新wrapper只作方向选择。汇编不碰x18、nonvolatile/LR；SP16对齐，scratch/CFI与实际指令相符。沿现Mach-O/ELF私有边界，COFF不假借此门取得资格。
+- [x] 独立源码审查后root释放当前候选的必要实际selector GREEN/数值/最小读取guard/直接ABI/linked ISA及精确rounding/index/direction/越界负控；只覆盖新增32路径，保旧门与旧失败原件。
+- [x] 运行结果和平台矩阵随候选提交更新；性能/各目标容器/正式配方及包、完整同流解码后续分别验收。未完成不得改广告或默认策略。
 
 ## 执行安排
 

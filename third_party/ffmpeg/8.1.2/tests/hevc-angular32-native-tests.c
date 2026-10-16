@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later
  * 私有新32路径 GREEN 准备；复用唯一 case/model，不复制候选算法。
- * --native 只声明像素与保护页门；不声称直接 ABI 或性能已经闭合。
+ * --native 汇合像素、最小读取和直接 ABI 用例；是否通过须由实际运行证明。
+ * ABI helper 由旧只读 .S 预处理同时改名；本用例第7参恒为1，只直调32核。
  */
 #if defined(FRD_HEVC32_ORIGINAL_TU) || defined(FRD_HEVC32_SELECTOR_RED)
 #error native tests must not contain the original TU or RED marker
@@ -16,7 +17,19 @@
 
 void ff_hevc_pred_angular_32_v_8_neon(uint8_t *, const uint8_t *, const uint8_t *, ptrdiff_t, int, int);
 
-static int direct_vertical_cases(void)
+uint64_t frd_hevc_angular32_abi(uint8_t *, const uint8_t *, const uint8_t *,
+                              ptrdiff_t, int, int, int);
+
+/* 数值负控与边界写负控分开诊断；完整8192B比较含全部行间和首尾 canary。 */
+static const char *destination_region(size_t offset, size_t start, ptrdiff_t stride)
+{
+    for (int y = 0; y < N; y++) {
+        ptrdiff_t row = (ptrdiff_t)start + y * stride;
+        if ((ptrdiff_t)offset >= row && (ptrdiff_t)offset < row + N) return "pixel";
+    }
+    return "canary";
+}
+static int direct_vertical_cases(int use_abi)
 {
     _Alignas(16) uint8_t tb[REF_BYTES], lb[REF_BYTES];
     _Alignas(16) uint8_t expected[DST_BYTES], output[DST_BYTES];
@@ -35,17 +48,29 @@ static int direct_vertical_cases(void)
                         memcpy(before_t, tb, sizeof(tb)); memcpy(before_l, lb, sizeof(lb));
                         memset(expected, 0xa5, sizeof(expected)); memset(output, 0xa5, sizeof(output));
                         model_angular(expected + start, top, left, strides[si], c, mode);
-                        ff_hevc_pred_angular_32_v_8_neon(output + start, top, left, strides[si], c, mode);
-                        if (memcmp(expected, output, sizeof(output)) ||
+                        uint64_t failure = 0;
+                        if (use_abi)
+                            failure = frd_hevc_angular32_abi(output + start, top, left, strides[si], c, mode, 1);
+                        else
+                            ff_hevc_pred_angular_32_v_8_neon(output + start, top, left, strides[si], c, mode);
+                        if (failure || memcmp(expected, output, sizeof(output)) ||
                             memcmp(before_t, tb, sizeof(tb)) || memcmp(before_l, lb, sizeof(lb))) {
-                            fprintf(stderr, "FAIL direct vertical32 id=%d shared=%d mode=%d c=%d stride=%td\n",
-                                    id, shared, mode, c, strides[si]);
+                            size_t offset = 0;
+                            while (offset < sizeof(output) && expected[offset] == output[offset]) offset++;
+                            fprintf(stderr, "FAIL direct vertical32 abi=%d mask=0x%" PRIx64
+                                    " id=%d shared=%d mode=%d c=%d stride=%td region=%s offset=%zu expected=%d actual=%d input_changed=%d\n",
+                                    use_abi, failure, id, shared, mode, c, strides[si],
+                                    offset < sizeof(output) ? destination_region(offset, start, strides[si]) : "none", offset,
+                                    offset < sizeof(output) ? expected[offset] : -1,
+                                    offset < sizeof(output) ? output[offset] : -1,
+                                    !!memcmp(before_t, tb, sizeof(tb)) || !!memcmp(before_l, lb, sizeof(lb)));
                             return 1;
                         }
                         count++;
                     }
     if (count != 37536) { fputs("FAIL incomplete direct32 matrix\n", stderr); return 1; }
-    printf("PASS direct vertical32 pixels/input cases=%" PRIu64 " (not ABI proof)\n", count);
+    printf("PASS direct vertical32 %s cases=%" PRIu64 " full8192-dst/full128-input comparison\n",
+           use_abi ? "numerical ABI high32 int contamination" : "pixels/input (not ABI proof)", count);
     return 0;
 }
 
@@ -136,9 +161,13 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--native")) {
         char *reference_argv[] = {argv[0], "--reference", NULL};
         if (frd_hevc32_reference_main(2, reference_argv)) return 1;
-        if (direct_vertical_cases() || minimum_reference_guards()) return 1;
+        if (direct_vertical_cases(0) || minimum_reference_guards() || direct_vertical_cases(1)) return 1;
         return 0;
     }
-    fputs("usage: hevc-angular32-native --native\n", stderr);
+    /* 独立固定门使负控能区分正常退出的数值/canary失败与保护页 signal。 */
+    if (argc == 2 && !strcmp(argv[1], "--direct")) return direct_vertical_cases(0);
+    if (argc == 2 && !strcmp(argv[1], "--abi")) return direct_vertical_cases(1);
+    if (argc == 2 && !strcmp(argv[1], "--guards")) return minimum_reference_guards();
+    fputs("usage: hevc-angular32-native --native | --direct | --abi | --guards\n", stderr);
     return 2;
 }

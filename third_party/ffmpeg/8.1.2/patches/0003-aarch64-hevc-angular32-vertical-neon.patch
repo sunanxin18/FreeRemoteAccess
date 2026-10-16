@@ -1,0 +1,153 @@
+diff --git a/libavcodec/aarch64/hevcpred32_neon.S b/libavcodec/aarch64/hevcpred32_neon.S
+new file mode 100644
+--- /dev/null
++++ b/libavcodec/aarch64/hevcpred32_neon.S
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "libavutil/aarch64/asm.S"
++
++#ifndef _WIN32
++/* 32×32 仅垂直 mode18..34；size32 不做 luma 边界修正。
++ * Leaf：仅 x0..x17、v0..v7/v16..v17；不写 x18/nonvolatile/LR。
++ * SP 减80且16对齐，ref=SP+32：仅使用 ref[-31..32]。
++ * 负角只准备实际使用区间：ref[angle+1..-1] 与 ref[0..32]；
++ * mode18 的末界为 ref[31]，不读取未使用的 top[31]/left[31]。
++ * 非负角直接读原 top；fraction0 不读取第二参考向量。
++ * u16 分子最大8160；rshrn 唯一加16，最大8176。
++ */
++function ff_hevc_pred_angular_32_v_8_neon, export=1
++        .cfi_startproc
++        sub sp, sp, #80
++        .cfi_def_cfa_offset 80
++        sub x8, x1, #1
++        movrel x12, Langular32_angles
++        sub w11, w5, #18
++        ldrsb w9, [x12, w11, uxtw]
++        cmp w9, #0
++        b.ge Langular32_ready
++        add x8, sp, #32
++        sub x7, x1, #1
++        ldp q0, q1, [x7]
++        stp q0, q1, [x8]
++        cmp w9, #-32
++        b.eq Langular32_prepare_inverse
++        ldrb w14, [x1, #31]
++        strb w14, [x8, #32]
++Langular32_prepare_inverse:
++        movrel x12, Langular32_inverse
++        ldr w13, [x12, w11, uxtw #2]
++        add w10, w9, #1
++Langular32_extend:
++        mul w14, w10, w13
++        add w14, w14, #128
++        asr w14, w14, #8
++        sub w14, w14, #1
++        ldrb w14, [x2, w14, sxtw]
++        strb w14, [x8, w10, sxtw]
++        adds w10, w10, #1
++        b.lt Langular32_extend
++Langular32_ready:
++        mov w16, #1
++Langular32_row:
++        mul w17, w16, w9
++        asr w11, w17, #5
++        and w14, w17, #31
++        add w11, w11, #1
++        add x12, x8, w11, sxtw
++        ldp q0, q1, [x12]
++        cbz w14, Langular32_store
++        add x12, x12, #1
++        ldp q2, q3, [x12]
++        mov w11, #32
++        sub w11, w11, w14
++        dup v4.16b, w11
++        dup v5.16b, w14
++        umull v6.8h, v0.8b, v4.8b
++        umull2 v7.8h, v0.16b, v4.16b
++        umull v16.8h, v1.8b, v4.8b
++        umull2 v17.8h, v1.16b, v4.16b
++        umlal v6.8h, v2.8b, v5.8b
++        umlal2 v7.8h, v2.16b, v5.16b
++        umlal v16.8h, v3.8b, v5.8b
++        umlal2 v17.8h, v3.16b, v5.16b
++        rshrn v0.8b, v6.8h, #5
++        rshrn2 v0.16b, v7.8h, #5
++        rshrn v1.8b, v16.8h, #5
++        rshrn2 v1.16b, v17.8h, #5
++Langular32_store:
++        stp q0, q1, [x0]
++        add x0, x0, x3
++        add w16, w16, #1
++        cmp w16, #33
++        b.lt Langular32_row
++        add sp, sp, #80
++        .cfi_def_cfa_offset 0
++        ret
++        .cfi_endproc
++endfunc
++
++const Langular32_angles
++        .byte -32,-26,-21,-17,-13,-9,-5,-2,0,2,5,9,13,17,21,26,32
++endconst
++const Langular32_inverse
++        .word -256,-315,-390,-482,-630,-910,-1638,-4096
++endconst
++
++#endif
+diff --git a/libavcodec/aarch64/Makefile b/libavcodec/aarch64/Makefile
+--- a/libavcodec/aarch64/Makefile
++++ b/libavcodec/aarch64/Makefile
+@@ -76,6 +76,7 @@
+                                            aarch64/vp9mc_neon.o
+ NEON-OBJS-$(CONFIG_HEVC_DECODER)        += aarch64/hevcpred_neon.o             \
+                                            aarch64/hevcpred_init_aarch64.o
++NEON-OBJS-$(CONFIG_HEVC_DECODER)        += aarch64/hevcpred32_neon.o
+ NEON-OBJS-$(CONFIG_HEVC_DECODER)        += aarch64/hevcdsp_deblock_neon.o      \
+                                            aarch64/hevcdsp_dequant_neon.o      \
+                                            aarch64/hevcdsp_idct_neon.o         \
+diff --git a/libavcodec/aarch64/hevcpred_init_aarch64.c b/libavcodec/aarch64/hevcpred_init_aarch64.c
+--- a/libavcodec/aarch64/hevcpred_init_aarch64.c
++++ b/libavcodec/aarch64/hevcpred_init_aarch64.c
+@@ -11,6 +11,7 @@
+ #if HAVE_NEON_EXTERNAL && CONFIG_HEVC_DECODER && !defined(_WIN32)
+ void ff_hevc_pred_planar_16_8_neon(uint8_t *, const uint8_t *, const uint8_t *, ptrdiff_t);
+ void ff_hevc_pred_angular_16_8_neon(uint8_t *, const uint8_t *, const uint8_t *, ptrdiff_t, int, int);
++void ff_hevc_pred_angular_32_8_dispatch_aarch64(uint8_t *, const uint8_t *, const uint8_t *, ptrdiff_t, int, int);
+ #endif
+ 
+ av_cold void ff_hevc_pred_init_aarch64(HEVCPredContext *hpc, int bit_depth)
+@@ -22,6 +23,7 @@
+     if (bit_depth == 8 && have_neon(av_get_cpu_flags())) {
+         hpc->pred_planar[2]  = ff_hevc_pred_planar_16_8_neon;
+         hpc->pred_angular[2] = ff_hevc_pred_angular_16_8_neon;
++        hpc->pred_angular[3] = ff_hevc_pred_angular_32_8_dispatch_aarch64;
+     }
+ #endif
+ }
+diff --git a/libavcodec/hevc/pred.c b/libavcodec/hevc/pred.c
+--- a/libavcodec/hevc/pred.c
++++ b/libavcodec/hevc/pred.c
+@@ -40,6 +40,23 @@
+ #define BIT_DEPTH 12
+ #include "pred_template.c"
+ #undef BIT_DEPTH
++
++/* 私有32候选：水平仍调用本 TU 的原 static C body，无可变全局后备。
++ * 只在现有非 Windows、exact8/NEON 初始化边界中选入 slot3。
++ */
++#if ARCH_AARCH64 && HAVE_NEON_EXTERNAL && CONFIG_HEVC_DECODER && !defined(_WIN32)
++void ff_hevc_pred_angular_32_v_8_neon(uint8_t *, const uint8_t *, const uint8_t *,
++                                    ptrdiff_t, int, int);
++void ff_hevc_pred_angular_32_8_dispatch_aarch64(uint8_t *dst, const uint8_t *top,
++                                               const uint8_t *left, ptrdiff_t stride,
++                                               int c_idx, int mode)
++{
++    if (mode >= 18)
++        ff_hevc_pred_angular_32_v_8_neon(dst, top, left, stride, c_idx, mode);
++    else
++        pred_angular_3_8(dst, top, left, stride, c_idx, mode);
++}
++#endif
+ 
+ void ff_hevc_pred_init(HEVCPredContext *hpc, int bit_depth)
+ {
