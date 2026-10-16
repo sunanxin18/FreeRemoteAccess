@@ -127,3 +127,21 @@ forensic artifact12027216250为6,554,118字节，SHA256 `917532044a816f230998b07
 宿主graph/唯一入口控制RED→GREEN，focused7项通过。完整Python模块只运行一次33项：32通过，1个新增测试临时父目录错误；修后仅该项定向通过，未称一次完整模块全绿。作者报告SHA256 `663b59cf48c26ed6f59c6051fd226dfeeeb08870292b06621eb2b197c21c1bb9`，独立审查 `a8b45a33bdf3c040dbb4e517ecdfb0571f36f121574444f93c769b052367d105`；root已全文读取报告和778行diff，核1349项、四当前源和七保护输入及独立两件冻结。以上仅SOURCE/HOST，不是Windows/WSL/APT执行结果。
 
 本提交首次push只释放该固定APT诊断，不另dispatch/rerun、不运行自然builder。实际图、原UUID导出、PS finally、Linux停止与具体违规身份待原件核验；原自然失败、完整A/B/C/D和生产资格继续开放。
+
+### 固定默认 APT 诊断：已取得组外 dpkg 证据
+
+提交`bd4bb248e7a92e8577d67488bce2ddd5a70d1579`的[run38857430630/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38857430630) / job116831938614已FAILED。固定五probe均0，实际APT2.8.3、dpkg1.22.6，Use-Pty窄查询stdout为空；setup和stop各exit1、原EOF完整，state仍quiescent/setup_ready/builder_started=false。没有进入controls或FFmpeg，正式三件skipped。
+
+这次117成员ZIP为7,769,624字节、SHA256 `02d4eb688fd4eac042074cfb2bfcfaa369ff27be6c00e2f44bd2e6da92a2a625`，artifact12027189149。root核全部CRC/156精确allowlist及16同提交源码；四UUID通过固定receipt实际带回，nonce/callid/source c44d65绑定、base64原bytes/双读SHA均匹配。两图都显示 ancestry `547→548→844→895→897`，895/897的SID/PGID均895，偏离leader548；四次后采身份绑定分别取得dpkg、dpkg-deb的comm/exe。这是后采观察，未直接记录setsid调用，不追认旧59 run的缺失身份。独立实际读数报告SHA256 `0bfa896e3f6a7ed219322bcc4de5cef6a99ad85a227d796afcbecc5633d17b40`已root全文读取/冻结核验。
+
+原job log两次只读下载均网络失败，没有成功原job log；已保存下载退出和脱敏stderr，不能用其补写现场内容。上述事实均来自原ZIP和API。原件位于`target/windows-shipping-apt-prefix-diagnostic-root-20261016/ci/`。
+
+root另从[Ubuntu官方APT2.8.3源码](https://archive.ubuntu.com/ubuntu/pool/main/a/apt/apt_2.8.3.tar.xz)只读检查：`Dpkg::Use-Pty`默认true，PTY子路径调用setsid；归档SHA与同目录.dsc匹配，未验签、未执行下载内容。该机制与现场组外分支相容，仍属基于源码和观察的推断。后继仅准备安装命令的Use-Pty=0窄候选，保持所有权/信号/seal及sandbox；必须fresh host/distro和真实dpkg工作量验证，不在已变rootfs重跑冒充RED→GREEN。
+
+### setup 显式关闭 PTY 的最小修复
+
+共享prepare安装行只增加`-o Dpkg::Use-Pty=0`，对应原单项prefix控制实际RED exit1→GREEN exit0；workflow仅说明注释改变，字面BootstrapAptDiagnostic、156路径和正式三件false保持。没有改sandbox、包列表、原进程归属/信号/stop或自然builder调用，也未重复另外32项宿主控制。
+
+作者报告SHA256 `bef01060bc298b396f0c5caa55e285ad649fd5cb57d1bb6ccc2e07aa39f0d708`，独立审查 `4bebb3c42e172722228998bea31c564e2400caf498ef2dccb9beb08486776516`，root已全文读37行diff及两报告，核19项材料、三当前源及独立两件冻结。当前仅SOURCE/HOST，修后实际APT尚未验证，不追认旧失败成功。
+
+下一次正常功能分支push仅运行同一固定prefix，使用新的host/Ubuntu实例，不复用旧rootfs；须保存版本/hash对照和真实dpkg解包/配置工作量、setup自然0+EOF、end child_exit0/quiescent/reaped及原stop0/stopped证据，再由root独立核验。环境漂移或noop单列，成功也只关闭APT前缀，完整setup/LLVM/FFmpeg和A/B/C/D仍待验。

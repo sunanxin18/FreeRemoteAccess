@@ -9,7 +9,7 @@ on:
         required: true
         default: false
   # 保留原自然/诊断历史；38854683516在apt阶段所有权拒绝，未进入FFmpeg。
-  # 当前唯一字面入口只执行默认apt前缀诊断，push仍须root另审释放。
+  # 固定apt前缀显式Dpkg::Use-Pty=0；待fresh hosted一次验证，push仍须root另审释放。
   # 不提供任意ref/tool/flags/retry，不生成正式运输或进入自然builder。
   push:
     branches:

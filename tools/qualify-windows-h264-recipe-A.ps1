@@ -856,7 +856,7 @@ root=$1
 [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]]
 cp /etc/os-release "$root/setup/os-release"
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y python3 build-essential make patch pkg-config xz-utils tar curl ca-certificates procps util-linux
+DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 install --no-install-recommends -y python3 build-essential make patch pkg-config xz-utils tar curl ca-certificates procps util-linux
 python3 -c 'import sys; assert sys.version_info[:2] == (3,12)'
 dpkg-query -W > "$root/setup/apt-packages.txt"
 [[ ! -e /opt/frd-llvm-mingw-20250709 ]]

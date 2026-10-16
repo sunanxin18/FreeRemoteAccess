@@ -86,3 +86,13 @@ Windows x64独立执行读数复核报告SHA256为`0e1795072152e000428ee734c27e3
 两ZIP各恰10成员，源before/after/current、四通道日志、目标ELF及身份均已核对。x64 ELF64/machine62、exe SHA256 `66b782c2bd8fc4eec2a3529c77a2de69a54ff4a3a233ca3bab98399b757f067c`；i686 ELF32/machine3、exe SHA256 `fa8eba9fee64c66bb38c523734e7fea76c9d4e868459b2aea7db1f54b76439f4`。root未执行下载内容，独立报告SHA256 `28e73276cb3dc930998caacd01af09d66e0611803e219f15c0270e05a68cb1e9`及两文件冻结已全文读和核验。原件在`target/sse2-publication-old-red-delivery-root-20261016/ci/`。
 
 此门只接受Linux两个目标的冻结旧体反例，不授Windows保护页、直接ABI、最终shipping ISA/runtime、性能或live资格。采集时整个job仍运行，后继包终态单独记录；上一提交59cdd705的Linux三架构包及Mac ARM64包已terminal success，同样不能外推真实会话。
+
+## Windows x64/i686 私有入口源码准备
+
+新增Windows专用ordinary example与support，直接path引用同一实际x86 leaf，保持Linux已验源不变。固定两ISA真实准入、独立oracle/literal、每核10240parity和160合法guard；Win32三页reserve/只commit中页、只读source、五个固定self-child真实volatile故障，ready后精确u32 `0xC0000005`。缺核、无marker、任意其它非0、捕获不全或未证明终止均拒绝。它只支持私有leaf检查，不接产品工厂或改变默认策略。
+
+作者报告SHA256 `b5424a6c4b8aafd38198d2f0a20f5bbe06b0c7b3fe4c41f06444494a21d618d2`，独立源码审查 `39fc17c5388ddd1e586bf176cd0b68994093ef2202e1bd6351e33e4fede5f265`；root已全文读两源和报告，核82项作者输入/原件与45项独立收据。现有证据仅格式0、两Windows目标ordinary/test metadata编译0、宿主四fake owner控制（释放失败保owner的RED→GREEN）及Mac ARM64普通入口77。test harness的0 passed/1 ignored明确unavailable，不能授Windows资格。
+
+尚无Windows链接/PE/VirtualAlloc/AV/真实生命周期、直接ABI或性能运行。后继现Windows矩阵只为显式x64/i686普通release build→同一PE parity/guards接线；配置与实际执行分别审查，不从metadata推导运行通过。既有ARM64工具与Windows/Linux产品默认不受该入口提升。
+
+Windows现矩阵的两步接线已完成配置源审，独立报告SHA256 `3f1cb8980820e3f698d4a146b552e0cb9a37acef66b4331006cbff3900752472`；root已全文读完整delta/作者与审查报告，并核15项配置材料、17项独立输入及当前hash。仅x64/i686，明确target，原18步保持；普通release build后同PE顺序parity/guards，BaseStream保存三组原双通道，终态/EOF/收尾未知即partial失败，上传11精确原件。helper只控制自有direct Process，不授cargo后代quiescence。该配置未做PS parser或运行验证，首次随本次push实际执行，Windows保护页/ABI/perf仍待验。

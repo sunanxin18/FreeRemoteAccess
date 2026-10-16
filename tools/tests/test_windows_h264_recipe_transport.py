@@ -892,9 +892,10 @@ class AptPrefixDiagnosticBoundary(unittest.TestCase):
         marker = "\npython3 -c 'import sys; assert sys.version_info[:2] == (3,12)'"
         self.assertEqual(prepare[0].count(marker), 1)
         prefix = prepare[0].split(marker)[0]
-        install = 'DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y python3 build-essential make patch pkg-config xz-utils tar curl ca-certificates procps util-linux'
+        install = 'DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Use-Pty=0 install --no-install-recommends -y python3 build-essential make patch pkg-config xz-utils tar curl ca-certificates procps util-linux'
         self.assertEqual(prefix.splitlines()[-2:], ['apt-get update', install])
-        self.assertNotIn('Use-Pty', prefix); self.assertNotIn('/opt/', prefix)
+        self.assertEqual(prefix.count('-o Dpkg::Use-Pty=0'), 1)
+        self.assertNotIn('Use-Pty', prefix.replace('-o Dpkg::Use-Pty=0', '')); self.assertNotIn('/opt/', prefix)
         execute = source.split('function Invoke-ReleaseAExecute($Context) {', 1)[1].split('function Invoke-ReleaseACollect', 1)[0]
         self.assertIn('$prepare = $prepare.Substring(0, $boundaryAt)', execute)
         self.assertLess(execute.index('$prepare = $prepare.Substring'), execute.index("Write-ReleaseALf (Join-Path $Context.root 'setup/prepare.sh')"))

@@ -82,6 +82,265 @@ jobs:
           rustup target add $rustTarget
           rustc --target $rustTarget --version --verbose
 
+      - name: Run private Windows publication native binary
+        if: matrix.architecture == 'x86_64' || matrix.architecture == 'x86'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $architecture = '${{ matrix.architecture }}'
+          $target = switch ($architecture) {
+            'x86_64' { 'x86_64-pc-windows-msvc' }
+            'x86' { 'i686-pc-windows-msvc' }
+            default { throw 'Private publication requires Windows x64 or i686' }
+          }
+          $evidence = Join-Path $repo 'target/rdp-publication-windows-${{ matrix.artifact_suffix }}'
+          $cargoOutput = Join-Path $repo 'target/rdp-publication-windows-build-${{ matrix.artifact_suffix }}'
+          if (Test-Path -LiteralPath $evidence) { throw 'Refusing an existing publication evidence directory' }
+          [IO.Directory]::CreateDirectory($evidence) | Out-Null
+          $identityPath = Join-Path $evidence 'identity.json'
+          $sources = @(
+            @{ path = 'crates/frd-rdp-legacy-kernels/examples/rdp_publication_windows.rs'; copy = 'source-rdp_publication_windows.rs' },
+            @{ path = 'crates/frd-rdp-legacy-kernels/examples/support/rdp_publication_windows_guard.rs'; copy = 'source-rdp_publication_windows_guard.rs' },
+            @{ path = 'crates/frd-protocol-rdp/src/pixel_convert/x86.rs'; copy = 'source-pixel_convert-x86.rs' }
+          )
+          $identity = [ordered]@{
+            schema = 'frd-windows-publication-native-v1'; commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT; job = $env:GITHUB_JOB
+            architecture = $architecture; target = $target; required_rust = '1.96.0'
+            toolchain_precondition = 'preceding Verify pinned Rust toolchain step succeeded'
+            process_host_architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+            ownership_scope = 'direct Process only'; descendant_quiescence = 'not proven'
+            stages = @(); sources = @(); pe = $null; first_failure = $null; source_finalization_errors = @(); pe_finalization_errors = @()
+            runtime_complete = $false; source_identity_complete = $false
+          }
+          $firstExit = 0
+          $firstFailure = $null
+          $pePath = Join-Path $evidence 'rdp_publication_windows.exe'
+          # 仅本步骤三个固定调用。没有 shell 拼接、任意命令或可调超时入口。
+          function Invoke-PublicationStage {
+            param([ValidateSet('build', 'parity', 'guards')][string]$Stage)
+            $executable = $pePath
+            $arguments = @($Stage)
+            $budgetMs = if ($Stage -eq 'parity') { 30000 } else { 90000 }
+            if ($Stage -eq 'build') {
+              $executable = $cargoPath
+              $arguments = @('build', '--locked', '--release', '-p', 'frd-rdp-legacy-kernels', '--example', 'rdp_publication_windows', '--target', $target, '-v')
+              $budgetMs = 900000
+            }
+            $record = [ordered]@{
+              stage = $Stage; executable = $executable; argv = $arguments; budget_ms = $budgetMs
+              started = $false; terminal_observed = $false; timed_out = $false; exit_code = $null
+              stdout_eof = $false; stderr_eof = $false; capture_complete = $false
+              cleanup = @(); errors = @(); failure_exit = 0; process_tree_quiescence = 'not proven'
+            }
+            $process = [Diagnostics.Process]::new()
+            $stdoutFile = $null; $stderrFile = $null; $stdoutCopy = $null; $stderrCopy = $null
+            $primary = $null
+            try {
+              $stdoutFile = [IO.FileStream]::new((Join-Path $evidence "$Stage.stdout"), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+              $stderrFile = [IO.FileStream]::new((Join-Path $evidence "$Stage.stderr"), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+              $start = [Diagnostics.ProcessStartInfo]::new()
+              $start.FileName = $executable; $start.WorkingDirectory = $repo
+              $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+              $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+              $start.Environment['CARGO_TARGET_DIR'] = $cargoOutput
+              foreach ($argument in $arguments) { $start.ArgumentList.Add($argument) }
+              $process.StartInfo = $start
+              if (-not $process.Start()) { throw 'Process.Start returned false' }
+              $record.started = $true; $record.pid = $process.Id
+              # 原 BaseStream 到 FileStream：不经 PowerShell 文本管线或重新编码。
+              $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync($stdoutFile)
+              $stderrCopy = $process.StandardError.BaseStream.CopyToAsync($stderrFile)
+              if (-not $process.WaitForExit($budgetMs)) {
+                $record.timed_out = $true; $record.failure_exit = 124
+                throw "Direct process exceeded fixed budget: $Stage"
+              }
+              $record.terminal_observed = $true; $record.exit_code = $process.ExitCode
+              if ($record.exit_code -ne 0) { $record.failure_exit = $record.exit_code }
+            }
+            catch {
+              $primary = $_.Exception.ToString()
+              if ($record.failure_exit -eq 0) { $record.failure_exit = 1 }
+            }
+            finally {
+              # 只终止手中这个 Process；cargo 后代不在此所有权证明内。
+              if ($record.started -and -not $record.terminal_observed) {
+                try { $process.Kill(); $record.cleanup += 'direct Kill returned' }
+                catch { $record.errors += "direct Kill: $($_.Exception.ToString())" }
+                try {
+                  if ($process.WaitForExit(1000)) {
+                    $record.terminal_observed = $true; $record.exit_code = $process.ExitCode
+                    $record.cleanup += 'direct terminal observed within 1s'
+                  }
+                  else { $record.errors += 'direct terminal remains unknown after 1s' }
+                }
+                catch { $record.errors += "direct reap: $($_.Exception.ToString())" }
+              }
+              # 即使 direct terminal 已知，也不假定后代关闭了继承写端。EOF 另有2s预算。
+              if ($null -ne $stdoutCopy -and $null -ne $stderrCopy) {
+                try {
+                  $copies = [Threading.Tasks.Task]::WhenAll([Threading.Tasks.Task[]]@($stdoutCopy, $stderrCopy))
+                  if (-not $copies.Wait(2000)) { $record.errors += 'raw stream EOF remains unknown after 2s' }
+                }
+                catch { $record.errors += "raw stream capture: $($_.Exception.ToString())" }
+                $record.stdout_eof = $stdoutCopy.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion
+                $record.stderr_eof = $stderrCopy.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion
+              }
+              $filesClosed = $true
+              foreach ($pair in @(@{ stream = $stdoutFile; copy = $stdoutCopy; name = 'stdout' }, @{ stream = $stderrFile; copy = $stderrCopy; name = 'stderr' })) {
+                if ($null -eq $pair.stream) { $filesClosed = $false; continue }
+                if ($null -ne $pair.copy -and -not $pair.copy.IsCompleted) {
+                  # 不无限等待仍在写的 task，也不将 partial 文件称为稳定原件。
+                  $filesClosed = $false; $record.errors += "$($pair.name) file remains open: capture task incomplete"
+                  continue
+                }
+                try {
+                  $dispose = $pair.stream.DisposeAsync().AsTask()
+                  if (-not $dispose.Wait(2000)) { $filesClosed = $false; $record.errors += "$($pair.name) file disposal exceeds 2s" }
+                }
+                catch { $filesClosed = $false; $record.errors += "$($pair.name) file disposal: $($_.Exception.ToString())" }
+              }
+              if (-not $record.started -or ($record.terminal_observed -and ($null -eq $stdoutCopy -or $stdoutCopy.IsCompleted) -and ($null -eq $stderrCopy -or $stderrCopy.IsCompleted))) {
+                try { $process.Dispose() }
+                catch { $record.errors += "Process.Dispose: $($_.Exception.ToString())" }
+              }
+              # 未知终态/EOF/收尾 IO 一律 partial；不会把 logger 的0覆盖原始非0。
+              $record.capture_complete = $record.terminal_observed -and $record.stdout_eof -and $record.stderr_eof -and $filesClosed -and $record.errors.Count -eq 0
+              if ($null -ne $primary) { $record.errors = @($primary) + $record.errors }
+              if (-not $record.capture_complete -and $record.failure_exit -eq 0) { $record.failure_exit = 1 }
+              if ($record.errors.Count -ne 0 -and $record.failure_exit -eq 0) { $record.failure_exit = 1 }
+            }
+            return $record
+          }
+          try {
+            # 初始 identity 永远 partial；最终 JSON 完整写入固定临时文件后才替换。
+            [IO.File]::WriteAllText($identityPath, (($identity | ConvertTo-Json -Depth 12) + "`n"), [Text.UTF8Encoding]::new($false))
+            if (Test-Path -LiteralPath $cargoOutput) { throw 'Refusing an existing publication Cargo output directory' }
+            foreach ($source in $sources) {
+              $path = Join-Path $repo $source.path
+              $before = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              Copy-Item -LiteralPath $path -Destination (Join-Path $evidence $source.copy)
+              $copyHash = (Get-FileHash -LiteralPath (Join-Path $evidence $source.copy) -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($before -cne $copyHash) { throw "Source snapshot mismatch: $($source.path)" }
+              $identity.sources += [ordered]@{ path = $source.path; snapshot = $source.copy; before = $before; snapshot_sha256 = $copyHash; after = $null; snapshot_after = $null }
+            }
+            $cargoPath = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
+            $rustcPath = (Get-Command rustc -CommandType Application | Select-Object -First 1).Source
+            if ([string]::IsNullOrWhiteSpace($cargoPath) -or [string]::IsNullOrWhiteSpace($rustcPath)) { throw 'Missing fixed Rust tool commands' }
+            $identity.toolchain = [ordered]@{
+              cargo_path = $cargoPath; cargo_file_sha256 = (Get-FileHash -LiteralPath $cargoPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              rustc_path = $rustcPath; rustc_file_sha256 = (Get-FileHash -LiteralPath $rustcPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              rust_toolchain_text = [IO.File]::ReadAllText((Join-Path $repo 'rust-toolchain.toml'))
+              rust_toolchain_sha256 = (Get-FileHash -LiteralPath (Join-Path $repo 'rust-toolchain.toml') -Algorithm SHA256).Hash.ToLowerInvariant()
+              version_command = 'not repeated; preceding step pins 1.96.0; build -v retains invoked rustc path'
+            }
+            foreach ($stage in @('build', 'parity', 'guards')) {
+              if ($stage -ne 'build') {
+                $beforeRun = (Get-FileHash -LiteralPath $pePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($beforeRun -cne $identity.pe.sha256) { throw "Staged PE changed before $stage" }
+              }
+              $result = Invoke-PublicationStage -Stage $stage
+              $identity.stages += $result
+              if ($stage -ne 'build') {
+                $result.pe_before = $beforeRun
+                try {
+                  $result.pe_after = (Get-FileHash -LiteralPath $pePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                  if ($result.pe_after -cne $identity.pe.sha256) { throw "Staged PE changed during $stage" }
+                }
+                catch {
+                  $result.errors += $_.Exception.ToString()
+                  if ($result.failure_exit -eq 0) { $result.failure_exit = 1 }
+                }
+              }
+              if ($result.failure_exit -ne 0) {
+                $firstExit = $result.failure_exit
+                throw "Stage $stage failed: $($result.errors -join '; ') native_exit=$($result.exit_code) capture_complete=$($result.capture_complete)"
+              }
+              if ($stage -eq 'build') {
+                $built = Join-Path $cargoOutput "$target/release/examples/rdp_publication_windows.exe"
+                $builtHash = (Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash.ToLowerInvariant()
+                Copy-Item -LiteralPath $built -Destination $pePath
+                $peHash = (Get-FileHash -LiteralPath $pePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($builtHash -cne $peHash) { throw 'Copied PE differs from the single build output' }
+                $length = (Get-Item -LiteralPath $pePath).Length
+                if ($length -lt 64 -or $length -gt 67108864) { throw 'Unexpected publication PE length' }
+                $bytes = [IO.File]::ReadAllBytes($pePath)
+                if ([BitConverter]::ToUInt16($bytes, 0) -ne 0x5a4d) { throw 'Publication PE lacks MZ' }
+                $peOffset = [BitConverter]::ToUInt32($bytes, 0x3c)
+                if ($peOffset -gt ($bytes.Length - 26) -or [BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x4550) { throw 'Invalid publication PE signature/range' }
+                $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+                $optionalSize = [BitConverter]::ToUInt16($bytes, $peOffset + 20)
+                $magic = [BitConverter]::ToUInt16($bytes, $peOffset + 24)
+                $expectedMachine = if ($architecture -eq 'x86') { 0x014c } else { 0x8664 }
+                $expectedMagic = if ($architecture -eq 'x86') { 0x010b } else { 0x020b }
+                if ($optionalSize -lt 2 -or ($peOffset + 24 + $optionalSize) -gt $bytes.Length -or $machine -ne $expectedMachine -or $magic -ne $expectedMagic) { throw 'Publication PE target/header mismatch' }
+                $identity.pe = [ordered]@{ path = 'rdp_publication_windows.exe'; bytes = $length; build_sha256 = $builtHash; sha256 = $peHash; machine = ('0x{0:X4}' -f $machine); optional_magic = ('0x{0:X4}' -f $magic) }
+              }
+            }
+          }
+          catch {
+            $firstFailure = $_.Exception.ToString()
+            if ($firstExit -eq 0) { $firstExit = 1 }
+          }
+          finally {
+            foreach ($source in $identity.sources) {
+              try {
+                $source.after = (Get-FileHash -LiteralPath (Join-Path $repo $source.path) -Algorithm SHA256).Hash.ToLowerInvariant()
+                $source.snapshot_after = (Get-FileHash -LiteralPath (Join-Path $evidence $source.snapshot) -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($source.after -cne $source.before -or $source.snapshot_after -cne $source.before) { throw "Source or snapshot changed: $($source.path)" }
+              }
+              catch {
+                $identity.source_finalization_errors += @($_.Exception.ToString())
+                if ($firstExit -eq 0) { $firstExit = 1; $firstFailure = $_.Exception.ToString() }
+              }
+            }
+            if ($null -ne $identity.pe) {
+              try {
+                $identity.pe.final_sha256 = (Get-FileHash -LiteralPath $pePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($identity.pe.final_sha256 -cne $identity.pe.sha256) { throw 'Staged PE changed before finalization' }
+              }
+              catch {
+                $identity.pe_finalization_errors += $_.Exception.ToString()
+                if ($firstExit -eq 0) { $firstExit = 1; $firstFailure = $_.Exception.ToString() }
+              }
+            }
+            $identity.source_identity_complete = $identity.sources.Count -eq 3 -and @($identity.sources | Where-Object { $null -eq $_.after -or $_.after -cne $_.before -or $_.snapshot_after -cne $_.before }).Count -eq 0
+            $identity.runtime_complete = $firstExit -eq 0 -and $identity.source_identity_complete -and $null -ne $identity.pe -and $identity.pe.final_sha256 -ceq $identity.pe.sha256 -and $identity.stages.Count -eq 3 -and @($identity.stages | Where-Object { $_.exit_code -ne 0 -or -not $_.capture_complete -or $_.failure_exit -ne 0 }).Count -eq 0
+            if (-not $identity.runtime_complete -and $firstExit -eq 0) { $firstExit = 1; $firstFailure = 'Publication evidence remained partial' }
+            $identity.first_failure = $firstFailure; $identity.step_exit = $firstExit
+            try {
+              $pendingIdentity = Join-Path $evidence 'identity.pending.json'
+              [IO.File]::WriteAllText($pendingIdentity, (($identity | ConvertTo-Json -Depth 12) + "`n"), [Text.UTF8Encoding]::new($false))
+              [IO.File]::Move($pendingIdentity, $identityPath, $true)
+            }
+            catch {
+              [Console]::Error.WriteLine("Identity finalization failed: " + $_.Exception.ToString())
+              $identity.runtime_complete = $false
+              if ($firstExit -eq 0) { $firstExit = 1; $firstFailure = $_.Exception.ToString() }
+            }
+          }
+          if ($firstExit -ne 0) { [Console]::Error.WriteLine($firstFailure); exit $firstExit }
+
+      - name: Upload exact Windows publication native evidence
+        if: always() && (matrix.architecture == 'x86_64' || matrix.architecture == 'x86')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-rdp-publication-${{ matrix.artifact_suffix }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/source-rdp_publication_windows.rs
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/source-rdp_publication_windows_guard.rs
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/source-pixel_convert-x86.rs
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/rdp_publication_windows.exe
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/identity.json
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/build.stdout
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/build.stderr
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/parity.stdout
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/parity.stderr
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/guards.stdout
+            target/rdp-publication-windows-${{ matrix.artifact_suffix }}/guards.stderr
+
       - name: Enable Ubuntu 24.04 FFmpeg build environment
         shell: pwsh
         run: |
