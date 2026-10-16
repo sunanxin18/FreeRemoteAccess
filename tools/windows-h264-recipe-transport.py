@@ -679,6 +679,12 @@ def canonical_checkout(repo, source, output):
         attributes.parent.mkdir(parents=True, exist_ok=True)
         attributes.write_bytes(b'* -text\n')
         (output / 'attributes.bin').write_bytes(attributes.read_bytes())
+        # --force仍会跳过stat缓存未变的文件；先全量预检，再只移除固定批准源。
+        for name in CHECKOUT:
+            path = repo / name
+            require(path.is_file() and not path.is_symlink(), 'checkout固定源必须是普通文件且非symlink：' + name)
+        for name in CHECKOUT:
+            (repo / name).unlink()
         git('-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'checkout-index', '--force', '--all')
         attrs = git('check-attr', '-z', 'text', 'eol', '--', *CHECKOUT)
         (output / 'check-attr.bin').write_bytes(attrs)

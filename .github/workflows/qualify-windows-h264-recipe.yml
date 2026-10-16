@@ -9,7 +9,7 @@ on:
         required: true
         default: false
   # 原自然失败、各次诊断及fresh APT38871211074成功均保留，历史不归零。
-  # 本次仅源码恢复唯一Execute；下一自然调用尚未开始，push仍须root另审释放。
+  # 固定源缓存重写修复经源码/宿主审查后，root只释放下一次原Execute自然调用。
   # Use-Pty=0共享prepare保持；不提供任意ref/tool/flags/retry。
   push:
     branches:

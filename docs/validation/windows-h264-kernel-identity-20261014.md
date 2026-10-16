@@ -159,3 +159,19 @@ artifact12033647017为10178868B、119成员、SHA256 `3ccdae6435773b36a343689fc6
 仅workflow与唯一WorkflowAuthority主控制恢复原Execute/Collect/正式三件always；失败/取消时的原208字面forensic逐项逐序保持。Use-Pty=0共享prepare、qualifier/builder/consumer及原bootstrap源码未改、不重跑。原主项实际RED→GREEN，独立源审报告SHA256 `3b2b84f6b11c7eba18fefe72f24674eaf1d06ec204ef5d9006df1b560f63490d`；root全文读35e9作者、287行diff及独立报告，核17项及两件review冻结。
 
 本次正常功能分支push只释放一次原固定自然A，不另dispatch/rerun；新调用须自身完成完整setup、LLVM、controls、FFmpeg及原正式运输。原208 fallback在正式运输失败时仍不保证动态UUID/attempt完整，缺件保持partial/unknown。APT前缀与Windows私有publication guard成功均不预授这次完整自然构建通过，B/C/D继续开放。
+
+### 自然恢复后的 checkout 首错
+
+59e620e12686053e7416bd2f15541c9b46e457ac 的自然run38872975021/attempt1、job116881223871已失败。initialize0、checkout1均完整捕获原双通道及EOF；首错为`canonical_checkout`对`tools/build-ffmpeg-windows.ps1`的regular/非symlink/物理bytes等于批准blob合取校验拒绝，发生于第一条WSL调用之前。Collect随后无WSL路径只能保留partial，不替代原始首错。
+
+原artifact12034111596（926371B、21成员、SHA256 `f0dc37d2bda7d4e6903214cfa06153f8cfdc472045424878ab16721e5c6d7377`）CRC及allowlist通过；10条Git调用均0，HEAD/tree正确，16源text均unset。批准builder blob为61041B、SHA256 `16a4e460d544296229c99d020e4f433c6a68574e59ff741da7d7ec2a095e89bf`；失败现场physical builder未收入包内，不能据此判定缺文件、链接或CRLF差异。独立实际报告SHA256 `cbc51ce2b35fd7cdc4bb4760293d5aee44a70f8c0cb85138ede3386feb93c984`已由root全文复核。
+
+本次没有APT、LLVM或FFmpeg执行证据，state.quiescent=true为早期默认值，不能当作Linux停止证明。此前不同run的fresh APT前缀成功单独保留，完整A及B/C/D继续开放。
+
+### 固定源检出缓存修复
+
+隔离macOS仓库实证：初次CRLF checkout并建立与物理文件匹配的index stat，排除同秒racy路径后，切换info `* -text`再执行原`checkout-index --force --all`仍保持20B CRLF文件，未生成18B LF blob。立即执行的首轮曾重写成功，原结果保留；这说明旧算法依赖文件缓存时序，不代表现场失败文件已被证明为CRLF。[Git官方entry.c](https://raw.githubusercontent.com/git/git/master/entry.c)亦在stat未变时先返回、再判断force；该源码仅佐证机制，没有冒充现场Windows Git版本绑定。
+
+最小修复只在原Git命令前新增6行：先全部预检固定16源为regular且非symlink，再仅移除这16源，由原checkout-index重新生成；HEAD/index/tree、属性、原argv/工具身份及最终physical bytes==blob门保持。现有单项增加真实cached CRLF条件，生产helper实际RED（ValueError）→GREEN；完整transport模块一次33/33通过，未列文件bytes/inode/mtime保持，后部固定路径为目录或symlink时在任何evict前拒绝。验证只在macOS隔离fixture，真实Windows自然流程仍待验，没有新增诊断模式、上传路径或工具参数。
+
+独立源码审查通过（报告SHA256 `d442aaec5614af5e59f212d6d73b4307169a9776fa673c617bf7791f65629f5f`），root全文读作者/79行diff/原RED、GREEN、33项日志并核30项关键原件及两件审查冻结。workflow仅更新一行说明，去注释合同、208固定路径顺序及push范围保持。现正常功能分支push只释放下一次原Execute自然流程，不另dispatch/rerun；每一后续构建与运输结果须由新run自身证明，原失败及现场缺口保留。

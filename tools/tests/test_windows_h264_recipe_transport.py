@@ -307,6 +307,7 @@ class InitializedCheckoutBoundary(unittest.TestCase):
 
 class CheckoutBoundary(unittest.TestCase):
     def test_isolated_git_crlf_and_attributes_produce_exact_commit_bytes(self):
+        import time
         t = load()
         parent = os.environ.get('FRD_WINDOWS_EXECUTION_TEST_ARTIFACTS')
         if parent:
@@ -329,13 +330,25 @@ class CheckoutBoundary(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b'line one\nline two\n')
             (repo / '.gitattributes').write_bytes(b'* text=auto\n*.ps1 eol=crlf\n')
+            unlisted = repo / 'unlisted.ps1'
+            unlisted.write_bytes(b'unlisted fixture\n')
             git('add', '--all')
             git('commit', '-m', 'fixture')
             source = git('rev-parse', 'HEAD').decode().strip()
             t.initialize(output.parent, source, '1234', '1')
-            (repo / 'tools/build-ffmpeg-windows.ps1').unlink()
-            git('checkout-index', '--force', '--all')
+            # 模拟初次porcelain checkout记录实际CRLF的index stat，避免旧fixture的stale cache。
+            for name in (*t.CHECKOUT, 'unlisted.ps1'):
+                (repo / name).unlink()
+            git('checkout', '--force', 'HEAD', '--', '.')
             self.assertIn(b'\r\n', (repo / 'tools/build-ffmpeg-windows.ps1').read_bytes())
+            time.sleep(1.1)
+            git('update-index', '--refresh')
+            cached = (repo / 'tools/build-ffmpeg-windows.ps1').stat()
+            index = (repo / '.git/index').stat()
+            self.assertGreater(index.st_mtime_ns // 1000000000, cached.st_mtime_ns // 1000000000)
+            (work / 'cached-builder-before.bin').write_bytes((repo / 'tools/build-ffmpeg-windows.ps1').read_bytes())
+            (work / 'cached-index-before.bin').write_bytes((repo / '.git/index').read_bytes())
+            untouched = (unlisted.read_bytes(), unlisted.stat().st_ino, unlisted.stat().st_mtime_ns)
             # 仅对该临时仓库运行新函数；实际项目Git从未调用。
             with mock.patch.dict(os.environ, environment, clear=True):
                 expected = t.canonical_checkout(repo, source, output)
@@ -345,12 +358,25 @@ class CheckoutBoundary(unittest.TestCase):
                 self.assertEqual((repo / name).read_bytes(), blob)
                 self.assertEqual(expected[name], digest(blob))
             self.assertEqual((repo / '.git/info/attributes').read_bytes(), b'* -text\n')
+            self.assertEqual((unlisted.read_bytes(), unlisted.stat().st_ino, unlisted.stat().st_mtime_ns), untouched)
             commands = t.read_json(output / 'checkout-commands.json')
             saved_git = digest((output / 'git-executable.bin').read_bytes())
             for call in commands:
                 self.assertEqual(call['executable']['before_sha256'], saved_git)
                 self.assertEqual(call['executable']['after_sha256'], saved_git)
                 self.assertIn('observed', call['main_module'])
+
+            # 后部固定路径无效时，必须在任何前部文件evict之前拒绝；未列路径也不能被删。
+            late = repo / t.CHECKOUT[-1]
+            late.unlink(); late.mkdir()
+            for kind in ('directory', 'symlink'):
+                if kind == 'symlink':
+                    late.rmdir(); late.symlink_to(unlisted)
+                with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(Path, 'unlink') as evict:
+                    with self.assertRaisesRegex(ValueError, '固定源必须是普通文件且非symlink'):
+                        t.canonical_checkout(repo, source, work / ('invalid-' + kind))
+                    evict.assert_not_called()
+                self.assertEqual((unlisted.read_bytes(), unlisted.stat().st_ino, unlisted.stat().st_mtime_ns), untouched)
 
         finally:
             if not parent:
