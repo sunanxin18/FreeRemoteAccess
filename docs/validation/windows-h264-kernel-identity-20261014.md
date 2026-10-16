@@ -175,3 +175,13 @@ artifact12033647017为10178868B、119成员、SHA256 `3ccdae6435773b36a343689fc6
 最小修复只在原Git命令前新增6行：先全部预检固定16源为regular且非symlink，再仅移除这16源，由原checkout-index重新生成；HEAD/index/tree、属性、原argv/工具身份及最终physical bytes==blob门保持。现有单项增加真实cached CRLF条件，生产helper实际RED（ValueError）→GREEN；完整transport模块一次33/33通过，未列文件bytes/inode/mtime保持，后部固定路径为目录或symlink时在任何evict前拒绝。验证只在macOS隔离fixture，真实Windows自然流程仍待验，没有新增诊断模式、上传路径或工具参数。
 
 独立源码审查通过（报告SHA256 `d442aaec5614af5e59f212d6d73b4307169a9776fa673c617bf7791f65629f5f`），root全文读作者/79行diff/原RED、GREEN、33项日志并核30项关键原件及两件审查冻结。workflow仅更新一行说明，去注释合同、208固定路径顺序及push范围保持。现正常功能分支push只释放下一次原Execute自然流程，不另dispatch/rerun；每一后续构建与运输结果须由新run自身证明，原失败及现场缺口保留。
+
+### 缓存修复后实际通过检出并进入 build 入口
+
+[run38875212085/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38875212085)、head73f2de9e、job116888494994最终failure。原151成员forensic为11320934B、SHA256 `89f6c68868dabd1db51e42f95a9a395e27304fb5338eec26fa443b826b78ec90`；root核16提交blob及checkout/setup原exit0/EOF。完整setup包含APT和LLVM归档指纹检查，原Linux normal/HALT controls及清理有对应原件；这关闭本run的checkout/setup门，不替代完整构建。
+
+唯一builder原pwsh自然exit1，双流EOF完整；222B stdout给出保留attempt路径，843B stderr仅为第738行通用“FFmpeg build失败”。绑定源码定位在原`make -j4` Invoke-Wsl门，尚未到install；没有内层原wsl/native argv、exit、stdout/stderr或动态attempt树，具体make/driver/ASM/capture/supervisor首错仍UNKNOWN。不能从外层非零预判组件根因。
+
+Collect预算为300秒，约5分钟后124，原stdout/stderr均空；三个复制阶段没有进度原件，具体耗时阶段未知。固定scope停止报告不能替代全量copy完成，state仍quiescent=false/attempt=null，原first_error保持builder，正式三件缺失。独立实际读数SHA256 `cb9856da24b79188b7d495fbc97545aae16153daeec771b584b444561221d248`与只读预检`d110fa81d012f49db095d0561d1fe4ad41fb365e971773326e612a3393fbbff7`已由root全文读/冻结核验。
+
+后继原joblog已取37448B、SHA256 `02e64160d58485ab9463513f9754e90b88dadc300153c6d77470cac5f6ef43ff`；此前fifth API仍post-checkout，后续final-check才确认整个job终态，不覆盖旧快照。原log第一次下载被gh的ANSI输出保护拒绝；核帮助后仅允许raw bytes进PIPE文件，未在终端渲染。当前仍须先补关键失败原件及有限收集阶段证据，再决定构建修复，不放宽原stop/consumer或以增加超时猜根因。

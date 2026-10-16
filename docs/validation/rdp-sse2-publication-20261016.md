@@ -105,3 +105,21 @@ Windows现矩阵的两步接线已完成配置源审，独立报告SHA256 `3f1cb
 两ZIP各11固定成员，三源/快照before-after及同PE hash全部匹配。i686 PE32/machine014c为239616B，SHA256 `04deb119c1ccb90acca01915b5bff4b055e421b11a981d68b42b896a1f80b7d9`；x64 PE32+/machine8664为274944B，SHA256 `e1c478f9205aa88d6ec74a279b654fa0f486e256054a5cd144c0f3a5af1ccdde`。这是X64宿主上的实际32位PE入口，不能外推32位Windows OS全部资格。
 
 root核原件并全文读独立报告SHA256 `e96d4e73395c17ee564f9f03e86d0404b8d007336b10a56d441cc1c0656f859c`及五输入身份；原件在`target/windows-apt-and-publication-integration-root-20261016/ci/`。采集时完整package仍运行，direct Process之外后代停止未证明；timeout/OS错误分支、直接ABI、shipping ISA/runtime、性能与live继续开放。由此四x86目标私有parity/guard门已齐，Task4A2.10C整体仍未关闭。
+
+### 私有 direct ABI 源码与四目标静态编译
+
+新增`rdp_publication_abi.rs`及独立x64/i686汇编helper，只验证私有address-taken正常return实例。精确Rust CopyFn使两个真实leaf地址逃逸，正向由asm直接调用真实leaf并在回Rust前检查和恢复；固定逐寄存器/高半部、SP、DF、MXCSR控制及x87控制字负控分别校准精确mask，源码闭集为Linux x64每核16、Windows x64每核40、i686每核12，两核各9个正常pixel counts。当前只是实现，全部实际校准与正常return运行尚未进行。
+
+独立SOURCE/FRAME审查通过（`be81c7628c6fda0cd67a11c87564b4b1afab80ce330680e68d4bbde2f7f9de51`）；已更正文档中Win32无条件16字节对齐的假设，代码不改。源码与真实leaf四项在静态门前后保持，四目标各唯一一次固定Rust1.96 non-test bin `--emit=asm,obj -Copt-level=3 -Ccodegen-units=1`均0，只有unused_unsafe/unused_mut警告。原件为`target/publication-direct-abi-static-20261016/`，报告SHA256 `549644dd40394dc7ffab3eae225107bc71aaf0371785f044fdd32b35e8edb16a`、receipt SHA256 `0c5527f0c075ec770401974e5aecc0943b97af4548b98efb7ad6aca0805c0285`，root核53项绑定。
+
+四个对象的typed caller→asm entry→target slot→两真实leaf参数链已有静态读数；Linux i686以平衡CALL/RET thunk和GOT建立独立SP锚，Win32使用PE relocation；实际RET8编码与固定scratch落点核对。Win64 reader解出Version1/ALLOC_LARGE408/8条GPR及10条XMM保存，Linux两个eh_frame读数与保存偏移一致；Win32 reader虽0却明确unsupported I386，未授展开。可读元数据不等于异常穿越或full unwind。
+
+最终release实际使用thin LTO，当前未链接对象不能替代同一个最终ELF/PE的地址链与frame证明。下一步仅准备四目标build/link-only、同次map和精确原件运输，配置审查与实际CI另记；不运行abi。控制流保护继续not-qualified，具体最终图像/环境的外部准入、实际精确负控和正常状态门、shipping内部fastcall/inline、性能与live均开放。Task4A2.10C继续未勾选，产品默认与codec广告保持。
+
+四目标静态原件已独立复核通过（报告SHA256 `39957ab9a342d9cefd1ca40cd13e96d131b7df70329d1c5753978eeb797af392`），root全文读报告并核38项输入。复核仅关闭当前对象的窄静态读数，不授最终链接、实际ABI、保护或性能资格。
+
+### 最终链接材料的 CI 接线
+
+Linux/Windows现workflow各新增x86两行专用build-only及always精确九原件上传，ARM跳过，原全部步骤/矩阵/权限/触发保持。固定一次`cargo rustc --release`保留thin LTO，仅为该最终链接生成map，不执行ABI程序。两路原bytes、真实exit/EOF、源码/配置与最终图像/map前后身份分别保存；超时或未知收尾保持partial，后代静止不宣称。独立配置源审通过（`b8e1d3fc0b4e2a73325ff2e5a4ebef79945a22e26bc68d204c66d87d13881815`），root全文读38741B delta并核26当前绑定及11审查输入。
+
+本次正常功能分支push只释放四目标build/link-only原件收集；实际是否链接成功与最终地址链/元数据另记，没有运行许可或ABI runtime通过。Windows modified配方A的workflow未修改，不由本次提交额外触发；原自然构建失败保留。

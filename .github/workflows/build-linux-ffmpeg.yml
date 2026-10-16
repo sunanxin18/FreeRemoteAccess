@@ -221,6 +221,273 @@ jobs:
             crates/frd-protocol-rdp/src/pixel_convert/x86.rs
           if-no-files-found: error
 
+      - name: Build private x86 direct ABI artifact only
+        if: matrix.arch == 'x86_64' || matrix.arch == 'i686'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, selectors, shutil, struct, subprocess, sys, time
+          repo = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          target = '${{ matrix.cargo_target }}'
+          if target not in ('x86_64-unknown-linux-gnu', 'i686-unknown-linux-gnu'):
+              raise RuntimeError('Private ABI build requires the fixed Linux x86 targets')
+          evidence = repo / 'target' / ('rdp-publication-abi-linux-' + target)
+          cargo_output = repo / 'target' / ('rdp-publication-abi-linux-build-' + target)
+          evidence.mkdir(exist_ok=False)
+          identity_path = evidence / 'identity.json'
+          identity = dict(schema='frd-publication-direct-abi-build-only-v1', commit=os.environ['GITHUB_SHA'],
+              run_id=os.environ['GITHUB_RUN_ID'], run_attempt=os.environ['GITHUB_RUN_ATTEMPT'],
+              job=os.environ['GITHUB_JOB'], target=target, host=os.uname().machine,
+              required_rust='1.96.0', toolchain_precondition='preceding pinned toolchain step succeeded',
+              runtime='NOT_RUN', control_flow_protection='not-qualified', build_complete=False,
+              ownership_scope='direct Popen only', descendant_quiescence='NOT_PROVEN',
+              linker_argv='not observed; Cargo -v is not the full actual linker argv',
+              strip_status='not presumed; inherited release profile/config/environment',
+              sources=[], configuration=[], tools=[], artifacts=[], errors=[], build=None)
+          identity_path.write_text(json.dumps(identity, indent=2) + '\n')
+          first_exit = 0
+          def fail(message, code=1):
+              global first_exit
+              identity['errors'].append(str(message))
+              if first_exit == 0:
+                  first_exit = code if code != 0 else 1
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          source_names = (
+              ('crates/frd-rdp-legacy-kernels/examples/rdp_publication_abi.rs', 'source-rdp_publication_abi.rs'),
+              ('crates/frd-rdp-legacy-kernels/examples/support/rdp_publication_abi_x64.rs', 'source-rdp_publication_abi_x64.rs'),
+              ('crates/frd-rdp-legacy-kernels/examples/support/rdp_publication_abi_i686.rs', 'source-rdp_publication_abi_i686.rs'),
+              ('crates/frd-protocol-rdp/src/pixel_convert/x86.rs', 'source-pixel_convert-x86.rs'))
+          config_names = ('Cargo.toml', 'Cargo.lock', 'crates/frd-rdp-legacy-kernels/Cargo.toml',
+              'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/build-linux-ffmpeg.yml')
+          process = None
+          stdout_file = stderr_file = selector = None
+          pipes = {}
+          try:
+              cargo_output.mkdir(exist_ok=False)
+              for name, snapshot in source_names:
+                  before = sha(repo / name)
+                  with (evidence / snapshot).open('xb') as output:
+                      output.write((repo / name).read_bytes())
+                  row = dict(path=name, snapshot=snapshot, before=before, snapshot_sha256=sha(evidence / snapshot), after=None, snapshot_after=None)
+                  identity['sources'].append(row)
+                  if row['snapshot_sha256'] != before:
+                      raise RuntimeError('Source snapshot mismatch: ' + name)
+              for name in config_names:
+                  identity['configuration'].append(dict(path=name, before=sha(repo / name), after=None))
+              # 仅精选编译变量；不收集环境全集或凭据。保留既有 i686 linker。
+              build_env = os.environ.copy()
+              if target == 'i686-unknown-linux-gnu':
+                  build_env.update(CC_i686_unknown_linux_gnu='i686-linux-gnu-gcc',
+                      CXX_i686_unknown_linux_gnu='i686-linux-gnu-g++',
+                      CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER='i686-linux-gnu-gcc')
+              build_env['CARGO_TARGET_DIR'] = str(cargo_output)
+              names = ('RUSTUP_TOOLCHAIN', 'RUSTUP_HOME', 'CARGO_HOME', 'RUSTC', 'RUSTC_WRAPPER',
+                  'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_TARGET',
+                  'CARGO_PROFILE_RELEASE_LTO', 'CARGO_PROFILE_RELEASE_STRIP', 'CARGO_PROFILE_RELEASE_DEBUG',
+                  'CARGO_PROFILE_RELEASE_CODEGEN_UNITS', 'CARGO_PROFILE_RELEASE_OPT_LEVEL',
+                  'CARGO_PROFILE_RELEASE_PANIC', 'CARGO_TARGET_DIR',
+                  'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER', 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS',
+                  'CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER', 'CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_RUSTFLAGS',
+                  'CC_i686_unknown_linux_gnu', 'CXX_i686_unknown_linux_gnu')
+              identity['compilation_environment'] = {name: build_env.get(name) for name in names}
+              for name in ('cargo', 'rustc'):
+                  found = shutil.which(name)
+                  if not found:
+                      raise RuntimeError('Missing pinned Rust command: ' + name)
+                  path = pathlib.Path(found).resolve()
+                  identity['tools'].append(dict(command=name, path=str(path), sha256=sha(path),
+                      identity_scope='resolved command file; may be rustup shim; pin checked by preceding step'))
+              cargo_path = shutil.which('cargo')
+              built_map = cargo_output / 'rdp_publication_abi.map'
+              argv = [cargo_path, 'rustc', '--locked', '--release', '-p', 'frd-rdp-legacy-kernels',
+                  '--example', 'rdp_publication_abi', '--target', target, '-v', '--',
+                  '-C', 'link-arg=-Wl,-Map,' + str(built_map)]
+              record = dict(argv=argv, budget_seconds=900, started=False, terminal_observed=False,
+                  timed_out=False, exit_code=None, stdout_eof=False, stderr_eof=False,
+                  capture_complete=False, streams_closed=False, cleanup=[], errors=[])
+              identity['build'] = record
+              stdout_file = (evidence / 'build.stdout').open('xb')
+              stderr_file = (evidence / 'build.stderr').open('xb')
+              # 日志与初始 partial identity 在唯一 Cargo launch 之前建立。
+              identity_path.write_text(json.dumps(identity, indent=2) + '\n')
+              process = subprocess.Popen(argv, cwd=repo, env=build_env, stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              record['started'] = True
+              record['pid'] = process.pid
+              selector = selectors.DefaultSelector()
+              for name, pipe, output in (('stdout', process.stdout, stdout_file), ('stderr', process.stderr, stderr_file)):
+                  pipes[name] = pipe
+                  os.set_blocking(pipe.fileno(), False)
+                  selector.register(pipe, selectors.EVENT_READ, (name, output))
+              deadline = time.monotonic() + 900
+              eof_deadline = None
+              while True:
+                  code = process.poll()
+                  now = time.monotonic()
+                  if code is not None and not record['terminal_observed']:
+                      record.update(terminal_observed=True, exit_code=code)
+                      if code != 0:
+                          fail('Cargo native exit: ' + str(code), code if 0 < code < 256 else 1)
+                      if eof_deadline is None:
+                          eof_deadline = now + 2
+                  if record['terminal_observed'] and not selector.get_map():
+                      break
+                  if not record['terminal_observed'] and now >= deadline:
+                      record['timed_out'] = True
+                      fail('Direct Cargo process exceeded 900s budget', 124)
+                      break
+                  if eof_deadline is not None and now >= eof_deadline:
+                      fail('Raw stream EOF remains unknown after 2s')
+                      break
+                  for key, _ in selector.select(0.05):
+                      name, output = key.data
+                      chunk = os.read(key.fileobj.fileno(), 65536)
+                      if chunk:
+                          output.write(chunk)
+                      else:
+                          record[name + '_eof'] = True
+                          selector.unregister(key.fileobj)
+          except Exception as error:
+              fail(repr(error))
+          finally:
+              record = identity['build']
+              # 只持有并处理本步骤 Popen；不能宣称 Cargo 后代或继承写端已停止。
+              if process is not None and not record['terminal_observed']:
+                  try:
+                      process.kill()
+                      record['cleanup'].append('direct kill returned')
+                  except Exception as error:
+                      record['errors'].append('direct kill: ' + repr(error))
+                  try:
+                      code = process.wait(timeout=1)
+                      record.update(terminal_observed=True, exit_code=code)
+                  except Exception as error:
+                      record['errors'].append('direct reap within 1s: ' + repr(error))
+              # 发生捕获/文件错误后也有限收尾；不无限 drain，不杀进程组或未知后代。
+              if selector is not None:
+                  try:
+                      drain_deadline = time.monotonic() + 2
+                      while selector.get_map() and time.monotonic() < drain_deadline:
+                          for key, _ in selector.select(0.05):
+                              name, output = key.data
+                              chunk = os.read(key.fileobj.fileno(), 65536)
+                              if chunk:
+                                  output.write(chunk)
+                              else:
+                                  record[name + '_eof'] = True
+                                  selector.unregister(key.fileobj)
+                      if selector.get_map():
+                          record['errors'].append('EOF unknown; inherited writer quiescence NOT_PROVEN')
+                  except Exception as error:
+                      record['errors'].append('raw capture finalization: ' + repr(error))
+                  finally:
+                      try:
+                          selector.close()
+                      except Exception as error:
+                          record['errors'].append('selector close: ' + repr(error))
+              streams_closed = True
+              for stream in (process.stdout if process is not None else None,
+                  process.stderr if process is not None else None, stdout_file, stderr_file):
+                  if stream is not None:
+                      try:
+                          stream.close()
+                      except Exception as error:
+                          streams_closed = False
+                          fail('stream close: ' + repr(error))
+              if record is not None:
+                  record['streams_closed'] = streams_closed
+                  record['capture_complete'] = (record['started'] and record['terminal_observed'] and
+                      not record['timed_out'] and record['stdout_eof'] and record['stderr_eof'] and
+                      streams_closed and not record['errors'] and first_exit == 0)
+                  if not record['capture_complete']:
+                      fail('Build capture remained partial')
+          try:
+              if first_exit == 0:
+                  built = cargo_output / target / 'release/examples/rdp_publication_abi'
+                  for kind, original, name in (('elf', built, 'rdp_publication_abi'), ('link_map', built_map, 'rdp_publication_abi.map')):
+                      if original.stat().st_size == 0:
+                          raise RuntimeError('Empty build artifact: ' + kind)
+                      row = dict(kind=kind, build_path=str(original), path=name, build_sha256=sha(original),
+                          build_after=None, staged_sha256=None, staged_final=None)
+                      identity['artifacts'].append(row)
+                      with (evidence / name).open('xb') as output:
+                          output.write(original.read_bytes())
+                      row['staged_sha256'] = sha(evidence / name)
+                      if row['build_sha256'] != row['staged_sha256']:
+                          raise RuntimeError('Staged artifact mismatch: ' + kind)
+                  header = (evidence / 'rdp_publication_abi').read_bytes()[:64]
+                  expected_class, expected_machine = (1, 3) if target.startswith('i686-') else (2, 62)
+                  if len(header) < 52 or header[:4] != b'\x7fELF' or header[4] != expected_class or header[5] != 1:
+                      raise RuntimeError('ELF class/endianness mismatch')
+                  machine = struct.unpack_from('<H', header, 18)[0]
+                  if machine != expected_machine:
+                      raise RuntimeError('ELF machine mismatch')
+                  identity['elf_header'] = dict(elf_class=header[4], machine=machine, data=header[5])
+          except Exception as error:
+              fail(repr(error))
+          finally:
+              for row in identity['sources']:
+                  try:
+                      row['after'] = sha(repo / row['path'])
+                      row['snapshot_after'] = sha(evidence / row['snapshot'])
+                      if row['before'] != row['after'] or row['before'] != row['snapshot_after']:
+                          raise RuntimeError('Source or snapshot changed: ' + row['path'])
+                  except Exception as error:
+                      fail(repr(error))
+              for row in identity['configuration']:
+                  try:
+                      row['after'] = sha(repo / row['path'])
+                      if row['before'] != row['after']:
+                          raise RuntimeError('Configuration changed: ' + row['path'])
+                  except Exception as error:
+                      fail(repr(error))
+              for row in identity['artifacts']:
+                  try:
+                      row['build_after'] = sha(pathlib.Path(row['build_path']))
+                      row['staged_final'] = sha(evidence / row['path'])
+                      if len({row['build_sha256'], row['build_after'], row['staged_sha256'], row['staged_final']}) != 1:
+                          raise RuntimeError('Artifact changed: ' + row['kind'])
+                  except Exception as error:
+                      fail(repr(error))
+              complete = (first_exit == 0 and identity['build'] is not None and identity['build']['capture_complete'] and
+                  identity['build']['exit_code'] == 0 and len(identity['sources']) == 4 and
+                  len(identity['configuration']) == len(config_names) and len(identity['artifacts']) == 2)
+              identity['build_complete'] = complete
+              if not complete:
+                  fail('Build-only evidence remained partial')
+              identity['step_exit'] = first_exit
+              try:
+                  pending = evidence / 'identity.pending.json'
+                  with pending.open('x') as output:
+                      output.write(json.dumps(identity, indent=2) + '\n')
+                  pending.replace(identity_path)
+              except Exception as error:
+                  fail('identity finalization: ' + repr(error))
+                  print('Identity finalization failed: ' + repr(error), file=sys.stderr)
+          if first_exit:
+              print('Private ABI build-only failed: ' + '; '.join(identity['errors']), file=sys.stderr)
+          sys.exit(first_exit)
+          PY
+
+      - name: Upload exact Linux direct ABI build-only originals
+        if: always() && (matrix.arch == 'x86_64' || matrix.arch == 'i686')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-rdp-publication-abi-build-only-${{ matrix.cargo_target }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/source-rdp_publication_abi.rs
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/source-rdp_publication_abi_x64.rs
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/source-rdp_publication_abi_i686.rs
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/source-pixel_convert-x86.rs
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/rdp_publication_abi
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/rdp_publication_abi.map
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/identity.json
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/build.stdout
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/build.stderr
+
       - name: Prove frozen original x86 publication counterexample
         if: matrix.arch == 'x86_64' || matrix.arch == 'i686'
         shell: bash
