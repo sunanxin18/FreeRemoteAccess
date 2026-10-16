@@ -1005,10 +1005,146 @@ class FailedWslExportBoundary(unittest.TestCase):
     def run_fixture(self, case):
         return self.module.export_failed(case['repo'], case['evidence'], case['source'])
 
+    def test_host_injected_identity_rejection_preserves_named_relative_diagnostic(self):
+        from types import SimpleNamespace
+        case = self.fixture('identity-field-diagnostic')
+        state_path = case['evidence']/'provenance/state.json'
+        state_before = state_path.read_bytes()
+        original = self.module.os.fstat
+        calls = []
+        def changed(fd):
+            info = original(fd); calls.append(fd)
+            values = {name: getattr(info, name) for name in (
+                'st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns')}
+            values['st_ctime_ns'] += 1
+            return SimpleNamespace(**values)
+        with mock.patch.object(self.module.os, 'fstat', side_effect=changed):
+            summary = self.run_fixture(case)
+        self.assertFalse(summary['complete'])
+        self.assertEqual(summary['error'], 'open identity changed')
+        self.assertIn('identity_diagnostic', summary)
+        detail = summary['identity_diagnostic']
+        self.assertEqual(detail['operation'], 'read-open')
+        self.assertEqual(detail['relative_path'], 'provenance/state.json')
+        self.assertEqual(detail['cap'], 512*1024)
+        names = {'dev','ino','mode','nlink','size','mtime_ns','ctime_ns'}
+        self.assertEqual(set(detail['before']), names)
+        self.assertEqual(set(detail['observed']), names)
+        self.assertEqual(detail['differences'], ['ctime_ns'])
+        self.assertEqual(detail['observed']['ctime_ns'], detail['before']['ctime_ns']+1)
+        self.assertNotIn(str(case['evidence']), json.dumps(detail))
+        self.assertLessEqual(len(json.dumps(detail).encode()), 4096)
+        self.assertEqual(len(calls), 1)  # open拒绝之后没有读取或伪造read-end/path-after。
+        self.assertEqual(state_path.read_bytes(), state_before)
+        saved = json.loads((case['evidence'].parent/'release-a-failed-wsl/selection.json').read_bytes())
+        self.assertEqual(saved, summary)
+
+    def test_all_reader_observation_boundaries_keep_original_seven_field_comparison(self):
+        from types import SimpleNamespace
+        controls = (
+            ('read-open', 'read', 1, None, 'open identity changed'),
+            ('read-end', 'read', 2, None, 'read changed'),
+            ('read-path-after', 'read', None, 2, 'read identity changed'),
+            ('copy-open', 'copy', 1, None, 'copy open changed'),
+            ('copy-read-end', 'copy', 2, None, 'copy changed'),
+            ('copy-reread-open', 'copy', 3, None, 'reread open changed'),
+            ('copy-reread-end', 'copy', 4, None, 'reread changed'),
+            ('copy-path-after', 'copy', None, 2, 'copy identity/bytes changed'))
+        fields = ('st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        def changed(info):
+            values = {name: getattr(info, name) for name in fields}
+            values['st_ctime_ns'] += 1
+            # 合成host失败注入，只验证已有属性的保存，不伪装Windows观测。
+            values.update(st_file_attributes=32, st_reparse_tag=0)
+            return SimpleNamespace(**values)
+        for operation, method, fstat_number, path_number, message in controls:
+            directory = self.work/operation; directory.mkdir()
+            path = directory/'input.bin'; path.write_bytes(b'fixed host Reader fixture\x00')
+            original_fstat = self.module.os.fstat; original_regular = self.module.regular
+            counts = dict(fstat=0, path=0)
+            def fstat(fd):
+                info = original_fstat(fd); counts['fstat'] += 1
+                return changed(info) if counts['fstat'] == fstat_number else info
+            def regular(root, candidate, directory=False):
+                info = original_regular(root, candidate, directory)
+                counts['path'] += 1
+                return changed(info) if counts['path'] == path_number else info
+            with self.subTest(operation=operation):
+                with mock.patch.object(self.module.os, 'fstat', side_effect=fstat), mock.patch.object(self.module, 'regular', side_effect=regular):
+                    with self.assertRaisesRegex(ValueError, message) as caught:
+                        reader = self.module.Reader()
+                        if method == 'read': reader.read(directory, path, 1024)
+                        else: reader.copy(directory, path, directory/'copy.bin', 1024)
+                detail = caught.exception.identity_diagnostic
+                self.assertEqual(detail['operation'], operation)
+                self.assertEqual(detail['relative_path'], 'input.bin')
+                self.assertEqual(detail['differences'], ['ctime_ns'])
+                self.assertEqual(detail['attributes']['observed'], dict(st_file_attributes=32, st_reparse_tag=0))
+                self.assertEqual(set(detail['before']), {'dev','ino','mode','nlink','size','mtime_ns','ctime_ns'})
+                if fstat_number: self.assertEqual(counts['fstat'], fstat_number)
+                if path_number: self.assertEqual(counts['path'], path_number)
+
+    def test_real_host_replace_before_open_is_rejected_without_followup_reads(self):
+        directory = self.work/'real-replace'; directory.mkdir()
+        path = directory/'input.bin'; replacement = directory/'replacement.bin'
+        path.write_bytes(b'old payload'); replacement.write_bytes(b'new payload')
+        original_open = Path.open; replacements = []
+        def open_after_replace(candidate, *args, **kwargs):
+            if candidate == path and not replacements:
+                os.replace(replacement, path); replacements.append(candidate)
+            return original_open(candidate, *args, **kwargs)
+        with mock.patch.object(Path, 'open', new=open_after_replace):
+            with self.assertRaisesRegex(ValueError, 'open identity changed') as caught:
+                self.module.Reader().read(directory, path, 1024)
+        detail = caught.exception.identity_diagnostic
+        self.assertEqual(detail['operation'], 'read-open')
+        self.assertIn('ino', detail['differences'])
+        self.assertEqual(detail['relative_path'], 'input.bin')
+        self.assertEqual(path.read_bytes(), b'new payload')
+        self.assertEqual(len(replacements), 1)
+
+    def test_diagnostic_build_encode_and_write_failures_never_replace_identity_error(self):
+        import contextlib, io
+        from types import SimpleNamespace
+        original_fstat = self.module.os.fstat
+        def changed(fd):
+            info = original_fstat(fd)
+            fields = {name: getattr(info, name) for name in ('st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns')}
+            fields['st_ctime_ns'] += 1
+            return SimpleNamespace(**fields)
+        for mode in ('build', 'encode', 'write'):
+            case = self.fixture('diagnostic-fails-'+mode)
+            original_dumps = self.module.json.dumps; original_open = Path.open
+            def encoding(value, *args, **kwargs):
+                if isinstance(value, dict) and 'identity_diagnostic' in value:
+                    raise ValueError('injected diagnostic encoding failure')
+                return original_dumps(value, *args, **kwargs)
+            attempts = []
+            def opening(path, *args, **kwargs):
+                if path.name == 'selection.json':
+                    attempts.append(path); raise OSError('injected selection write failure')
+                return original_open(path, *args, **kwargs)
+            patch = (mock.patch.object(self.module, 'identity_diagnostic', side_effect=OSError('injected diagnostic build failure')) if mode == 'build' else
+                     mock.patch.object(self.module.json, 'dumps', side_effect=encoding) if mode == 'encode' else
+                     mock.patch.object(Path, 'open', new=opening))
+            stderr = io.StringIO()
+            with patch, mock.patch.object(self.module.os, 'fstat', side_effect=changed), contextlib.redirect_stderr(stderr):
+                result = self.run_fixture(case)
+            with self.subTest(mode=mode):
+                self.assertFalse(result['complete'])
+                self.assertEqual(result['error'], 'open identity changed')
+                if mode == 'write':
+                    self.assertTrue(result['identity_diagnostic_write_failed'])
+                    self.assertEqual(len(attempts), 1)
+                    self.assertIn('original strict rejection retained', stderr.getvalue())
+                else:
+                    self.assertNotIn('identity_diagnostic', result)
+
     def test_actual_exporter_keeps_original_bytes_paths_and_untouched_files(self):
         case = self.fixture('valid'); before = (case['native']/'unlisted.bin').read_bytes()
         summary = self.run_fixture(case)
         self.assertTrue(summary['complete'], summary)
+        self.assertNotIn('identity_diagnostic', summary)
         destination = case['evidence'].parent / 'release-a-failed-wsl'
         self.assertEqual((destination/'native.stderr.bin').read_bytes(), (case['native']/'stderr.bin').read_bytes())
         self.assertEqual((destination/'wsl.json').read_bytes(), (case['attempt']/('wsl-'+case['call']+'.json')).read_bytes())

@@ -1057,6 +1057,33 @@ def signature(info):
     return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+class IdentityMismatch(ValueError):
+    pass
+
+
+def identity_diagnostic(operation, root, path, cap, before, observed):
+    names = ('dev','ino','mode','nlink','size','mtime_ns','ctime_ns')
+    a, b = dict(zip(names, signature(before))), dict(zip(names, signature(observed)))
+    attributes = {}
+    for label, info in (('before', before), ('observed', observed)):
+        attributes[label] = {name: getattr(info, name) for name in ('st_file_attributes','st_reparse_tag') if hasattr(info, name)}
+    return dict(operation=operation, relative_path=Path(path).relative_to(Path(root)).as_posix(), cap=cap,
+                before=a, observed=b, differences=[name for name in names if a[name] != b[name]], attributes=attributes)
+
+
+def same_identity(operation, root, path, cap, before, observed, message):
+    if signature(observed) == signature(before):
+        return
+    error = IdentityMismatch(message)
+    try:
+        detail = identity_diagnostic(operation, root, path, cap, before, observed)
+        require(len(json.dumps(detail).encode()) <= 4096, 'identity diagnostic byte bound')
+        error.identity_diagnostic = detail
+    except Exception:
+        pass  # 诊断构造失败不覆盖原strict拒绝，也不补做任何读取。
+    raise error
+
+
 def regular(root, path, directory=False):
     root, path = location(root), location(path)
     relative = path.relative_to(root)  # native path rules, not string prefix
@@ -1095,10 +1122,11 @@ class Reader:
     def read(self, root, path, cap):
         before = self.before(root, path, cap)
         with path.open('rb') as stream:
-            require(signature(os.fstat(stream.fileno())) == signature(before), 'open identity changed')
+            same_identity('read-open', root, path, cap, before, os.fstat(stream.fileno()), 'open identity changed')
             raw = stream.read(cap+1)
-            require(len(raw) <= cap and signature(os.fstat(stream.fileno())) == signature(before), 'read changed')
-        require(signature(regular(root, path)) == signature(before), 'read identity changed')
+            require(len(raw) <= cap, 'read changed')
+            same_identity('read-end', root, path, cap, before, os.fstat(stream.fileno()), 'read changed')
+        same_identity('read-path-after', root, path, cap, before, regular(root, path), 'read identity changed')
         return raw
     def json(self, root, path, cap=META):
         value = unique_json(self.read(root, path, cap))
@@ -1108,25 +1136,26 @@ class Reader:
         before = self.before(root, path, cap)
         first, second, count = hashlib.sha256(), hashlib.sha256(), 0
         with path.open('rb') as source, destination.open('xb') as output:
-            require(signature(os.fstat(source.fileno())) == signature(before), 'copy open changed')
+            same_identity('copy-open', root, path, cap, before, os.fstat(source.fileno()), 'copy open changed')
             while True:
                 self.check()
                 block = source.read(65536)
                 if not block: break
                 count += len(block); require(count <= cap, 'copy grew beyond bound')
                 first.update(block); output.write(block)
-            require(signature(os.fstat(source.fileno())) == signature(before), 'copy changed')
+            same_identity('copy-read-end', root, path, cap, before, os.fstat(source.fileno()), 'copy changed')
             output.flush(); os.fsync(output.fileno())
         with path.open('rb') as source:
-            require(signature(os.fstat(source.fileno())) == signature(before), 'reread open changed')
+            same_identity('copy-reread-open', root, path, cap, before, os.fstat(source.fileno()), 'reread open changed')
             reread = 0
             while True:
                 self.check()
                 block = source.read(65536)
                 if not block: break
                 reread += len(block); require(reread <= cap, 'reread byte bound'); second.update(block)
-            require(signature(os.fstat(source.fileno())) == signature(before), 'reread changed')
-        require(signature(regular(root, path)) == signature(before) and count == before.st_size and first.digest() == second.digest(), 'copy identity/bytes changed')
+            same_identity('copy-reread-end', root, path, cap, before, os.fstat(source.fileno()), 'reread changed')
+        same_identity('copy-path-after', root, path, cap, before, regular(root, path), 'copy identity/bytes changed')
+        require(count == before.st_size and first.digest() == second.digest(), 'copy identity/bytes changed')
         saved = hashlib.sha256(destination.read_bytes()).hexdigest()
         require(saved == first.hexdigest(), 'saved bytes changed')
         return dict(status='copied', original_path=str(path), size=count, source_sha256=first.hexdigest(), saved_sha256=saved,
@@ -1158,6 +1187,7 @@ def export_failed(repo, evidence, source):
     destination.mkdir()  # existing output refuses; no overwrite/cleanup/retry
     result = dict(schema='freeremotedesk.release-a.failed-wsl.v1', complete=False, files={}, source=source)
     reader = Reader()
+    identity_error = None
     try:
         state = reader.json(evidence, evidence/'provenance/state.json', 512*1024)
         require(re.fullmatch('[a-f0-9]{40}', source) and state['source'] == source and type(state['builder_exit']) is int and state['builder_exit'] != 0, 'failed builder source binding')
@@ -1231,9 +1261,29 @@ def export_failed(repo, evidence, source):
         result.update(complete=True, attempt=attempt.name, nonce=nonce, call_id=call_id, original_stop_sha256=hashlib.sha256(stop_bytes).hexdigest())
     except Exception as error:
         result['error'] = str(error)[:2048]
-    encoded = (json.dumps(result,sort_keys=True,indent=2)+'\n').encode()
+        if isinstance(error, IdentityMismatch):
+            identity_error = error
+            try:
+                detail = getattr(error, 'identity_diagnostic', None)
+                if detail is not None:
+                    candidate = dict(result, identity_diagnostic=detail)
+                    require(len((json.dumps(candidate,sort_keys=True,indent=2)+'\n').encode()) <= 128*1024, 'selection byte bound')
+                    result = candidate
+            except Exception:
+                pass  # 附加诊断编码失败只保留原错误，不改成成功。
+    try:
+        encoded = (json.dumps(result,sort_keys=True,indent=2)+'\n').encode()
+    except Exception:
+        if identity_error is not None: raise identity_error
+        raise
     require(len(encoded) <= 128*1024, 'selection byte bound')
-    with (destination/'selection.json').open('xb') as output: output.write(encoded)
+    try:
+        with (destination/'selection.json').open('xb') as output: output.write(encoded)
+    except Exception:
+        if identity_error is None: raise
+        result['identity_diagnostic_write_failed'] = True
+        try: print('identity selection write failed; original strict rejection retained', file=sys.stderr)
+        except Exception: pass
     return result
 
 

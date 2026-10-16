@@ -205,3 +205,15 @@ root全文读原三源增量、Fix1报告/5081B delta及独立复审，核33关�
 新三phase原记录已缩小复制超时范围：llvm-copy与system-tools均有end/exit0；build-root-copy只有start，没有end/exit。这与全量Collect终态124一致，不再泛称三段均未知。错误保存、复制阶段与原make失败分别记账，未据此修复汇编或改变原自然工具调用。
 
 Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd917c4c2eb768a724d592f9ff0818df67b77918f21930b`。两次完整GET在90/240秒超时的partial原件保留，后继认证取得同一原artifact的8个Range、同ETag/206/完整总长，重组命中API全SHA和ZIP CRC后才解包；未执行内容。root核16checkout源码与01cd提交逐字相等，原完整joblog38881B另存。材料在`target/windows-abi-source-reuse-delivery-root-20261016/ci/a-range-download/`，独立只读核验已完成（报告SHA256 `96e264a9762f387abf7c00800c24cd2d555363cbc9b1ad094c72972f1730d3b7`，root全文读6612B并核16关键绑定），确认的是来源/失败边界，不是make根因。下一步先取得有限Windows lstat/fstat真实控制和失败字段，再决定最小修复；不先扩大构建或软化身份校验。
+
+## 2026-10-16 有限身份诊断与 Windows 原生观察准备
+
+原七字段 dev/ino/mode/nlink/size/mtime_ns/ctime_ns 严格比较保持。内嵌 exporter 在八个既有 read/copy 比较点仅对实际不等附加 operation、根内相对路径、cap、真实 before/observed、差异字段名及已有文件属性；单项4096B、selection128KiB的上限保持。拒绝后不继续读取或补写未观察阶段；诊断构造/编码/写入失败仍保留原 identity 拒绝及非零结果，成功导出结果没有新诊断成员。原stop/source/唯一attempt、20秒/40MiB、208+25固定路径及正式consumer保持。
+
+缺诊断的 host 反例实际RED1→GREEN0；八比较点、实际host replace及诊断失败注入的focused7项与完整transport模块一次44项通过。这些均为macOS ARM64 Python fixture，不是Windows兼容性证据；原make首错仍UNKNOWN。初版与仅新增四个CI来源字段的修订材料均保留，源报告见 `target/windows-file-identity-diagnostics-source-20261016/` 及 `target/windows-file-identity-diagnostics-provenance-revision-20261016/`。
+
+新的无参数 `tools/windows-file-identity-probe.py` 仅在Windows执行，固定workspace下fresh目录、两类稳定小文件及一次开句柄前replace，记录lstat/stat/open-fstat/read-end/path-after全部原字段、固定payload SHA、Python/Windows版本和四个非敏感CI来源字段。共享30秒，最终三份payload与≤64KiB单JSON；measurement_complete/exit0只表示观察完整，identity_compatibility始终UNQUALIFIED，稳定文件不等会如实保留。
+
+普通Windows工作流仅x64行在Rust构建前运行该小probe，并单独上传唯一literal `target/windows-file-identity-probe/result.json`；它不运行WSL/FFmpeg或扫描旧attempt。本次不修改长A工作流，其push filter仅自身文件，本次不会重新触发长A。Windows实测与任何兼容修复仍待原件，不按常见差异删除字段或改成hash-only。
+
+三源独立审查通过（报告SHA256 `b8fcebfcf8d051c1079d5eb8027b43473dc879d5f4f408b8081f11c128c8d037`，root全文读并核7审查项、11修订项、24旧项及8保护输入）；后继两步接线独立审查也通过（报告SHA256 `875c469f55a6de8cd4ded919a8066a5e7ff1200f6a20684bd5e5cc9824925acd`，root核7项）。删新增589B block后Windows workflow逐字恢复已审基准接线；全仓77个run均未超过21000字符。这里只关闭source/host门，实际Windows观察仍待本次正常CI。

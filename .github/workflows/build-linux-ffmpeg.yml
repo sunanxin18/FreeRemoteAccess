@@ -42,6 +42,8 @@ on:
       - "tools/verify-linux-ffmpeg-bundle.sh"
       - "tools/qualify-linux-h264-recipe.*"
       - "tools/tests/test_linux_h264_qualification.py"
+      - "tools/verify-rdp-publication-benchmark.py"
+      - "tools/tests/test_rdp_publication_benchmark.py"
       - ".github/workflows/build-linux-ffmpeg.yml"
   push:
     branches:
@@ -69,6 +71,8 @@ on:
       - "tools/verify-linux-ffmpeg-bundle.sh"
       - "tools/qualify-linux-h264-recipe.*"
       - "tools/tests/test_linux_h264_qualification.py"
+      - "tools/verify-rdp-publication-benchmark.py"
+      - "tools/tests/test_rdp_publication_benchmark.py"
       - ".github/workflows/build-linux-ffmpeg.yml"
 
 permissions:
@@ -128,6 +132,30 @@ jobs:
         run: |
           test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
           rustc --target "${{ matrix.cargo_target }}" --version --verbose
+
+      - name: Build and run ordinary x86 publication benchmark
+        if: matrix.arch == 'x86_64' || matrix.arch == 'i686'
+        shell: bash
+        run: python3 tools/verify-rdp-publication-benchmark.py 'linux-${{ matrix.arch }}'
+
+      - name: Upload exact ordinary publication benchmark originals
+        if: always() && (matrix.arch == 'x86_64' || matrix.arch == 'i686')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rdp-publication-benchmark-linux-${{ matrix.arch }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/source-rdp_publication_benchmark.rs
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/source-pixel_convert.rs
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/source-pixel_convert-x86.rs
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/source-frozen-pixel_convert.rs
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/rdp_publication_benchmark
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/rdp_publication_benchmark.map
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/build.stdout
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/build.stderr
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/benchmark.stdout
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/benchmark.stderr
+            target/rdp-publication-benchmark-linux-${{ matrix.arch }}/runtime.identity.json
 
       - name: Run native x86 publication parity and guarded ranges
         if: matrix.arch == 'x86_64' || matrix.arch == 'i686'

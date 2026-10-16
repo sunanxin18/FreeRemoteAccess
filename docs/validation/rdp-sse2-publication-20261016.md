@@ -1,6 +1,6 @@
 # RDP RGBA→BGRX 的 SSE2 转换
 
-2026-10-16，状态：**开发中**。本次补齐 Windows/Linux x86 与 x86_64 的 SSE2 转换主体；Linux/Windows i686与x86_64已有新体局部实际运行；Windows保护页、各目标ABI和性能尚未完成，不能据此授予完整解码器或客户端生产资格。
+2026-10-16，状态：**开发中**。Windows/Linux i686 与 x86_64 的 SSE2 转换已通过局部正确性、私有保护页及四份精确图像的 normal-return ABI 验证。最新原生主 CI 已通过；真实计时、shipping 调用实例与完整生产资格仍未完成。以下按提交保留每次验证及失败的历史边界。
 
 RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 可用时使用原生实现，否则回到标量。现在保留 SSSE3 优先，其后检查真实 SSE2，再选择共享的 SSE2 入口；只有未通过 SSE2 检查的 CPU 才使用明确的 reference 后备。协议、解码器选择、Surface 合同、默认策略、能力广告和 ARM64 实现保持。
 
@@ -207,3 +207,21 @@ root全文核原输出及身份，独立实际审查5483B报告SHA256 `824fc8b28
 仅再加37B的aarch64显式路径属性，x86属性保持；移除两条属性后全文等于原ee562309…，实际NEON/x86 leaf、API、数值与benchmark a473358d…不变。固定同目录cargo/cargo-fmt/rustfmt/rustc及PATH/RUSTFMT后，完整全仓同一格式命令实际RED1（stderr174B）→GREEN0（双流0B），没有skip_children、没有写全仓或改其它格式。作者3093B报告SHA256 `f7f637f1d4c1ca72e91bf38f80023c2d31332bbce954548b18c69489e8c4ba90`，root已读并核18冻结项。Fix2只证明完整格式门，不新增metadata、ARM机器码、性能或产品通过；后继普通原生CI仍须分别取得终态。
 
 Fix2限定独立复审通过（报告SHA256 `d92b747d34c851b85871b73dd3b7cd036deebd05124b974f75ce120fade44a71`）；root全文读3517B并核9关键绑定，确认唯一37B属性、12保护输入及原RED/GREEN工具/命令/终态。只关闭源码与完整格式解析门，后继原生产品CI、性能与shipping保持未验。
+
+### Fix2 后的原生产品回归
+
+提交 `a7fe7f59429adcf1d4a1d3408d0b2f53997b1d92` 的[主 CI 38904468349/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38904468349)已整体成功：格式检查、macOS job116984599491 与 Linux job116984599557 均为 success。原日志确认 Rust 1.96.0、实际 host 分别为 `aarch64-apple-darwin` 和 `x86_64-unknown-linux-gnu`；两端均完成 GUI/core 编译及该 workflow 配置的 safe tests，Linux 的三个 publication ISA 测试均逐名为 ok。没有新增 macOS Intel 构建。
+
+原 macOS 日志312785B，SHA256 `12dbebb4668cb801e81d9701db063c4d286c86bd8f22a0bb1651557ba79b3bd0`；Linux日志400867B，SHA256 `0d85b3877dc5695343add5547105920abfea3090f7de3ca7484158613f2de4ad`，保存在 `target/publication-benchmark-fmt-fix2-delivery-root-20261016/ci/`。这补齐本次显式模块路径修复的原生产品回归，不是 publication 微基准运行或真实登录证据。
+
+此前 `d5133db5` 的 Windows [run38900650959/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38900650959)也已整体成功，包括 x86/x64/ARM64 打包与独立 ARM64 native decoder runtime job116985447837；这与此前两个精确 PE 的 ABI 局部成功分开记录。最新 a7fe 的 macOS [run38904468557/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38904468557)也已成功；Windows/Linux 打包仍等待各自终态，不借旧提交成功追认。
+
+### 四目标普通微基准 CI 接线
+
+Windows/Linux 原矩阵各两个 x86 目标已接入固定 runner；ARM64 明确跳过，本次没有 macOS 目标。每个目标以原 Rust1.96 release/thin-LTO 执行一次普通 `cargo rustc`、保存同次 map，再无参数运行同一个 staged 新图像。原 parity/guard/ABI 步骤保持，基准位于它们之前，不以重新完成旧资格作为计时前置。
+
+两平台各保留十一条 literal 原件：bin/map、四份 Rust 源快照、build/benchmark 四流及 runtime.identity.json。构建和运行分别限900/130秒，双 reader 各持有原 pipe/file，只在终态、EOF、文件关闭及无捕获错误时记完整；首错保持，未知后代写端为 partial。结果必须通过4055行/3720原样本、固定SHA/轮转/原u128/median/p95/六位统计的完整检查，不能只凭末行或速度阈值通过。
+
+主机17项控制通过，包括全新目录、无 Rust 启动的 setup 失败、小 Python child 的77/超时/未知写端等。root 审查发现 fresh checkout 尚无 target 父目录的前置问题，修复后新增 runlevel fixture；非法或已存在路径仍拒绝覆盖。host结果限 macOS ARM64 Python，不冒充四目标捕获和计时。
+
+独立源审报告4413B、SHA256 `18276859ef645754e4421bd75b8b41f48a0084b307feb109f6cd2accd8945078`，root已全文读并核作者20项与review12项绑定；原两workflow移除批准新增内容后逐字保持，Linux仅另增加两个固定脚本的push/PR路径。源码材料在 `target/publication-benchmark-wiring-source-20261016/`；四目标真实构建/计时尚待本次正常push CI，尚无性能数字。Task4A2.10C与产品最终调用资格保持开放。

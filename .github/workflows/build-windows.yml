@@ -69,6 +69,20 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
+      - name: Measure Windows file identity on native runner
+        if: matrix.architecture == 'x86_64'
+        timeout-minutes: 1
+        shell: pwsh
+        run: python tools/windows-file-identity-probe.py
+
+      - name: Upload fixed Windows file identity observation
+        if: always() && matrix.architecture == 'x86_64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-file-identity-probe-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: target/windows-file-identity-probe/result.json
+
       - name: Verify pinned Rust toolchain
         shell: pwsh
         run: |
@@ -84,6 +98,30 @@ jobs:
           }
           rustup target add $rustTarget
           rustc --target $rustTarget --version --verbose
+
+      - name: Build and run ordinary x86 publication benchmark
+        if: matrix.architecture == 'x86_64' || matrix.architecture == 'x86'
+        shell: pwsh
+        run: python tools/verify-rdp-publication-benchmark.py 'windows-${{ matrix.architecture }}'
+
+      - name: Upload exact ordinary publication benchmark originals
+        if: always() && (matrix.architecture == 'x86_64' || matrix.architecture == 'x86')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rdp-publication-benchmark-windows-${{ matrix.architecture }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/source-rdp_publication_benchmark.rs
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/source-pixel_convert.rs
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/source-pixel_convert-x86.rs
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/source-frozen-pixel_convert.rs
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/rdp_publication_benchmark.exe
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/rdp_publication_benchmark.map
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/build.stdout
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/build.stderr
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/benchmark.stdout
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/benchmark.stderr
+            target/rdp-publication-benchmark-windows-${{ matrix.architecture }}/runtime.identity.json
 
       - name: Run private Windows publication native binary
         if: matrix.architecture == 'x86_64' || matrix.architecture == 'x86'
