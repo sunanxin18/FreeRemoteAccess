@@ -706,8 +706,9 @@ if __name__ == '__main__':
         else { [IO.File]::WriteAllBytes($supervisor, $supervisorBytes) }
         $supervisorWsl = Convert-ToWslPath $supervisor
         $scopeWsl = (Convert-ToWslPath $AttemptRoot) + "/lifecycle"
-        $intentArgv = @("wsl.exe", "--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--", "bash", "-lc", $Command)
-        $actualArgs = @("--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--", "python3", $supervisorWsl,
+        # 使用 WSL 直接 exec 保留 Linux argv；默认 shell 会再次解释 Command 内的 dollar 转义。
+        $intentArgv = @("wsl.exe", "--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--exec", "bash", "-lc", $Command)
+        $actualArgs = @("--distribution", $WslDistribution, "--cd", $WorkingDirectory, "--exec", "python3", $supervisorWsl,
             "--scope", $scopeWsl, "--nonce", $script:ReleaseALifecycleNonce, "--call-id", $callId, "run", "--", "bash", "-lc", $Command)
         New-Item -ItemType Directory -Force -Path (Join-Path $AttemptRoot 'lifecycle') | Out-Null
         $intent = @{ nonce = $script:ReleaseALifecycleNonce; supervisor_linux = $supervisorWsl; scope_linux = $scopeWsl

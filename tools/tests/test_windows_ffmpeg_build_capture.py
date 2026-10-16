@@ -393,7 +393,7 @@ def builder_map_token():
     return match[1]
 
 
-def fixed_configure_control(directory, option):
+def fixed_configure_control(directory, option, transport=None):
     """执行固定归档的真实函数/完整选项循环/完整配置 heredoc；不运行工具链探测。"""
     import re
     import shlex
@@ -439,9 +439,21 @@ def fixed_configure_control(directory, option):
     if "'" in option:
         raise AssertionError('固定 map token 不应含单引号')
     command = './configure-control.sh ' + "'" + option + "'"
-    result = subprocess.run(['bash', '-c', command], cwd=directory, capture_output=True)
-    capture.write(directory / 'configure-control.json', {'argv': ['bash', '-c', command],
-        'cwd': str(directory), 'returncode': result.returncode,
+    argv = ['bash', '-c', command]
+    if transport is not None:
+        # 仅运输模型：真实 shell 解释与直接 argv 对照，不伪称运行 Windows/WSL。
+        observer = directory / 'transport-observer.py'
+        observer.write_text('import json,sys,subprocess\nfrom pathlib import Path\n'
+                            'Path("transport-argv.json").write_text(json.dumps(sys.argv[1:]))\n'
+                            'sys.exit(subprocess.call(sys.argv[1:]))\n')
+        argv = [sys.executable, str(observer), *argv]
+        if transport == 'default-shell-model':
+            argv = ['bash', '-c', subprocess.list2cmdline(argv)]
+        elif transport != 'direct-exec-model':
+            raise AssertionError('未知运输模型')
+    result = subprocess.run(argv, cwd=directory, capture_output=True)
+    capture.write(directory / 'configure-control.json', {'argv': argv,
+        'cwd': str(directory), 'returncode': result.returncode, 'transport_model': transport,
         'stdout': result.stdout.decode(), 'stderr': result.stderr.decode(), 'builder_token': option,
         'tool': capture.artifact(shutil.which('bash')), 'script_shell': capture.artifact('/bin/sh'),
         'control': capture.artifact(script), 'archive': capture.artifact(archive), 'fragments': spans})
@@ -482,7 +494,7 @@ class LinkMapOwnership(unittest.TestCase):
         if not os.environ.get('FRD_WINDOWS_RECIPE_TEST_ARTIFACTS'):
             shutil.rmtree(self.root)
 
-    def exercise(self, mode):
+    def exercise(self, mode, transport=None):
         import re
         import shlex
         import tarfile
@@ -500,8 +512,17 @@ class LinkMapOwnership(unittest.TestCase):
             for name in ('library.mak', 'common.mak', 'arch.mak'):
                 (rules / name).write_bytes(package.extractfile('ffmpeg-8.1.2/ffbuild/' + name).read())
         # 与纯 token 控制相同的原 configure append/eval/完整写出路径，再消费原 make。
-        value, _ = fixed_configure_control(directory, builder_map_token())
-        self.assertEqual(value, '-Wl,--Map=$$@.map')
+        value, configure_pid = fixed_configure_control(directory, builder_map_token(), transport)
+        if transport == 'default-shell-model':
+            self.assertEqual(value, '-Wl,--Map=' + configure_pid + '@.map')
+        else:
+            self.assertEqual(value, '-Wl,--Map=$$@.map')
+        if transport is not None:
+            received = json.loads((directory / 'transport-argv.json').read_text())
+            expected_option = builder_map_token()
+            if transport == 'default-shell-model':
+                expected_option = expected_option.replace('\\$', '$')
+            self.assertEqual(received, ['bash', '-c', "./configure-control.sh '" + expected_option + "'"])
         probe = directory / 'link-probe.py'
         probe.write_text('#!' + sys.executable + '\n' + '''import json,sys,time
 from pathlib import Path
@@ -540,7 +561,7 @@ sys.exit(c.spawn(argv,Path.cwd(),Path('calls'),expected_tool=c.artifact(argv[0])
         driver.chmod(0o755)
         makefile = ('MAIN_MAKEFILE=1\nV=1\nCONFIG_SHARED=yes\n'
                     'SRC_PATH:=' + str(directory / 'rules') + '\n'
-                    'include ffbuild/config.mak\nLD:=' + str(driver) + '\nLD_O=-o $@\n'
+                    'include ffbuild/config.mak\nRESPONSE_FILES=yes\nLD:=' + str(driver) + '\nLD_O=-o $@\n'
                     'SHFLAGS=-shared\nSLIBNAME=$(NAME).dll\nSLIBNAME_WITH_MAJOR=$(NAME)-62.dll\n'
                     'include $(SRC_PATH)/ffbuild/common.mak\n')
         for name in ('avcodec', 'avformat'):
@@ -558,6 +579,16 @@ sys.exit(c.spawn(argv,Path.cwd(),Path('calls'),expected_tool=c.artifact(argv[0])
         self.capture.write(directory / 'make-control.json', {'argv': argv, 'cwd': str(directory),
             'returncode': result.returncode, 'stdout': result.stdout.decode(), 'stderr': result.stderr.decode(),
             'tool': self.capture.artifact(shutil.which('make'))})
+        if transport == 'default-shell-model':
+            self.assertEqual(result.returncode, 2, result.stderr.decode())
+            rejected = [json.loads(line) for line in result.stderr.decode().splitlines()
+                        if line.startswith('{')]
+            self.assertEqual(len(rejected), 1)
+            self.assertTrue(rejected[0]['complete'])
+            self.assertIn('-Wl,--Map=' + configure_pid + '@.map', rejected[0]['argv'])
+            self.assertEqual(rejected[0]['reason'], 'link-map-ownership')
+            self.assertFalse(list(calls.iterdir()), '拒绝必须发生在启动实际工具之前')
+            return
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         receipts = {}
         for path in calls.glob('*/finished.json'):
@@ -570,6 +601,7 @@ sys.exit(c.spawn(argv,Path.cwd(),Path('calls'),expected_tool=c.artifact(argv[0])
                              '顺序后继 link 覆盖原 map')
             actual = json.loads((path.parent / 'stdout.bin').read_bytes())
             self.assertEqual(actual['argv'], data['argv'])
+            self.assertIn('@' + str(module_path.relative_to(directory)) + '.objs', actual['argv'])
             self.assertEqual(actual['cwd'], data['cwd'])
             receipts[module_path.name] = path
         self.assertEqual(set(receipts), {'avcodec-62.dll', 'avformat-62.dll'})
@@ -581,6 +613,20 @@ sys.exit(c.spawn(argv,Path.cwd(),Path('calls'),expected_tool=c.artifact(argv[0])
         if mode == 'overlap':
             self.assertTrue((directory / 'codec-snapshot-ready').is_file())
             self.assertTrue((directory / 'format-link-complete').is_file())
+
+    def test_supervised_wsl_requests_exec_and_direct_argv_model_keeps_map_ownership(self):
+        import re
+        source = (ROOT / 'tools/build-ffmpeg-windows.ps1').read_text()
+        actual = re.search(r'(?s)\$actualArgs = @\((.*?)\)\n', source).group(1)
+        intent = re.search(r'(?s)\$intentArgv = @\((.*?)\)\n', source).group(1)
+        self.assertIn('$WorkingDirectory, "--exec", "python3", $supervisorWsl', actual)
+        self.assertIn('$WorkingDirectory, "--exec", "bash", "-lc", $Command', intent)
+        # supervisor 自己的 -- 保持不变，只有 WSL 外边界使用 --exec。
+        self.assertIn('"run", "--", "bash", "-lc", $Command', actual)
+        self.exercise('direct-exec', 'direct-exec-model')
+
+    def test_default_shell_transport_model_reproduces_pid_map_rejection(self):
+        self.exercise('shell-model', 'default-shell-model')
 
     def test_sequential_links_keep_each_original_map_and_select_avcodec(self):
         self.exercise('sequential')

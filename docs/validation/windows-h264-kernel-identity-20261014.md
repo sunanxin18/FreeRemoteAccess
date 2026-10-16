@@ -258,3 +258,14 @@ Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd91
 Collect原三阶段记录：LLVM复制46.831秒exit0，system-tools1.643秒exit0，build-root-copy开始后没有end/exit，最终达到原300秒窗、exit124。已定位整体复制阶段，具体文件/已复制量与吞吐仍未知；正式tar/receipt/verification未生成。预算、清理和旧失败均保持。实际原件在`target/a-cfb-failure-root-20261016/`，独立只读诊断报告SHA256 `adc318b595f75441b2c1075ff7fab7bec6612803cb83ee34cb8648d0ba9b2f55`经root全文读和44绑定复核；拒绝诊断独立SOURCE/HOST审查通过（报告SHA256 `45cf6d22d8eb9ce8751cf164655999bcc5a5ba0ba8bd46555ac400b14586d083`），root全文读并核绑定；未因此授新原生资格，没有另行重启A。
 
 独立诊断审查通过后，root只释放一次新的自然A执行，用于保存上次缺失的实际拒绝参数。仅修改工作流发布注释；原入口、配方、工具身份与map断言、收集预算和停止规则保持。不是重跑旧run，亦不把诊断接入冒充原构建已修复；新结果须绑定自己的run/head和原始流。
+
+
+## 2026-10-17 b312 拒绝参数与 WSL 运输修复
+
+run `38924595806/1` 的失败诊断artifact `12057883159`（12491224B，SHA-256 `37e8e4fed642f672280a11e4bb348935339067fbc6d85740e9fbd2f6859c9fc9`）已通过24分片连续范围、完整摘要、CRC及175成员核验。完整拒绝JSON明确实际参数为 `-Wl,--Map=2322@.map`，module为 `libavutil/avutil-60.dll`，expected_map为module加`.map`；严格检查在真实链接器启动前拒绝。此结果补齐旧cfb原件缺失的值，不追改旧记录。
+
+固定configure函数/选项循环/配置写出和原make规则的离线执行表明，现有token在直接argv运输下得到两个正确且独立的DLL map。额外外层shell运输模型会消耗反斜线，configure将美元符号展开为自身PID，得到同型的PID@.map并被原guard拒绝。该模型使用本机真实shell/configure片段/make及自写工具夹具，不是实际Windows/.NET/WSL运输测量，不能声称已唯一证明远端每一层原因。
+
+窄修复仅将ModifiedRecipe的supervised WSL入口及对应intent改为显式`--exec`；内层supervisor分隔符、`bash -lc`、原configure token、严格map归属检查和普通配方保持。七个共享调用点已作源码兼容性检查。Microsoft官方WSL帮助将`--exec`定义为绕过默认Linux shell执行程序（[官方资源文案](https://github.com/microsoft/WSL/blob/master/localization/strings/en-US/Resources.resw)）；这只支持接口语义，不代替目标执行。
+
+回放旧gateway的新测试为1 failure/0 errors，准确标为回放RED；最终NaturalSpawn、FixedConfigureToken、LinkMapOwnership共10项、20.087秒、exit0。正向验证observer收到的实际command、两个DLL各自map和response-file参数；负向保持拒绝前不启动工具。原件保存在`target/map-expansion-fix-20261017/`。独立审查已通过，报告SHA-256 `a20ce1a991f7ccaa617e93b3757a6d2cdfb920887f02ca5e7a663c12ad48f7af`，见 `target/map-expansion-independent-review-20261017/report.md`。实际Windows/WSL、完整A构建仍待验，不凭本地GREEN授予生产资格。root随后仅释放一次新的自然A构建验证修复，保留原入口、预算与全部历史失败；不重跑旧run。
