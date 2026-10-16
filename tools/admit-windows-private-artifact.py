@@ -262,6 +262,10 @@ def member_sets(compiler, support, old_snapshot, snapshot):
         contract |= {'driver-%d.obj' % variant, 'abi-contract-%d.exe' % variant, 'abi-contract-%d.map' % variant, 'variant-%d-pe-bindings.json' % variant}
         # 固定 O2 producer 的可见 compiled symbols；isolated_child 内联是已裁定事实。
         names = {'main', 'native_admission', 'linked_admission', 'child_main', 'isolated_suite', 'frd_h264_dc_check_abi', 'frd_h264_dc_outer_probe', 'frd_h264_dc_wrong_return'}
+        # C0 producer 的固定新增 ranges；不从 archive 或可变 receipt 学习清单。
+        names |= {'frd_h264_dc_abi_sp_failure_fragment', 'frd_h264_dc_preserve',
+                  'frd_h264_dc_corrupt_fp', 'frd_h264_dc_corrupt_sp16',
+                  'frd_h264_dc_corrupt_sp8', 'frd_h264_dc_no_return'}
         if variant in (0, 4):
             names.add('capture_callback')
         for name in names:

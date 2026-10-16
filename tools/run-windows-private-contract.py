@@ -29,7 +29,7 @@ SCHEMA = 'freeremotedesk.windows.private-native.v1'
 WORKFLOW = '.github/workflows/qualify-windows-private-abi.yml'
 PINS = {
     'tools/verify-windows-private-transcript.py': '9860862c965d7ca11bf8b95d63b52c83a961b240accfa2c1301eec999fd58790',
-    'tools/admit-windows-private-artifact.py': '391e280f776f6567e56bc7a3d826e46aae468b3d4ebc08b3739e9a6b877d3c53',
+    'tools/admit-windows-private-artifact.py': '6d30078d2a12995788266424201e6431231176b942ff4b76ee15a590e42a1f7b',
     'tools/windows-private-process.py': 'efe57549a64a3c7418002c97d81ddd9af293b86e4ebaf824bc0a88081d2f5fb0',
 }
 COMMANDS = (('register', 0), ('unwind', 0), ('isolated', 0), ('unwind', 1), ('unwind', 2), ('unwind', 3), ('unwind', 4))

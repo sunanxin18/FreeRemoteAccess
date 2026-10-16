@@ -488,3 +488,19 @@ generic 指令与正常元数据、原 negative/outer 指令逐字保持。Clang
 新 C driver 尚未在固定 Windows 工具链编译或链接，新增系统 Rtl 调用也尚未运行。
 完整七命令、真实异常派发无额外 AV、generic/shipping 数值与包、客户端互操作仍
 OPEN；源码审查和宿主模型不授予这些资格。
+
+### 7406f0b 固定工具链已编译；原生运行在 F2 清单门停止
+
+source `7406f0b395e4c98191634ed165971bdead49466a` 的唯一新原run38824097940/attempt1中，compile116727355110成功，native116730442390失败。完整native artifact12014707282为158,008,600字节/SHA256 `d17d87857f14b60e980506fe1db62de65b4dbe3af88d00f6ed8b03b13834c30e`；input12014322915为78,900,891字节/`7207f290fb24b6d2b44c926c3c5d148b025b8de54bddcf1cb93ab3b88cce21f2`。Root核对23outer/20inner、终态与七份同Git源码、同run input字节，以及输入三角色31/131/455成员的CRC/manifest摘要。
+
+这次停止在 `f2-static-admission`，七项原生命令全部 `not_attempted`，没有新的parent/child执行或异常派发结果。Root以原严格F2静态重现 `ZIP exact allowed members mismatch`：install/compile角色集合相同；contract producer为六个新增固定函数输出了120项反汇编诊断（5variants×6functions×stdout/stderr/receipt/argv），consumer的固定成员清单漏接了这六个名字，额外120、缺失0。不是未知文件获准，也不能表述为本次展开逻辑实测失败。拒绝保持，修复仅同步精确固定清单并补producer/consumer边界控制，不能扩大为接受任意ZIP条目。
+
+原新ASM/C/PE已在固定工具链生成，但新完整COFF/PE静态接收及完整七命令仍需后续审查/原run证明；既有00b异常失败、generic/shipping和客户端门保持OPEN。原始下载、严格拒绝与只读诊断在 `target/windows-failure-unwind-root-20261016/ci/`；同artifact分别连续19/10个8MiB区间收全且API摘要匹配，无原生或CI重跑。首次job日志读取被gh的ANSI输出保护拒绝，随后只读捕获原日志时显式允许转义但不向终端原样输出；这不是原生任务重试。Root最初内部成员核对误以为摘要是size+SHA对象，实际旧schema为SHA字符串，原校验失败保留并按实际schema修正；不改写产品F2拒绝。
+
+### 精确诊断清单修复的源码与静态接收
+
+四文件修复已完成并通过独立 Spec PASS / Quality Approved，0 Critical/Important/Minor。F2仅把已证六函数加入原5variants×4记录集合；runner只传播F2精确摘要，ASM/C/compiler/F1/process-owner/workflow/预算保持。独立literal回归限定288项完整反汇编记录，并逐一拒绝120项缺失及四类未知成员。
+
+原同一认证input的原F2实际RED后，新检查器完整静态接收五PE且seal重验通过；对真实contract内存副本，未知/缺失、字节篡改及同步更新hash后替换argv均严格拒绝。两个受影响宿主suite共54项：53通过、1项既有可选旧工件跳过。旧111项实现冻结保持，未执行新PE、Rtl或原生命令。实现报告SHA256 `df3e3e74779e8278490b359f3035e0a93e154ba28ae10aa90a5f75df1fb069c9`，653项冻结清单 `1abf2dd05d6e8994ebc45e68cd3d7cf6dc0975c16ca2d4f063ef02f54d8583c9`，独立复审 `1a6e02eae005baaf5fd3db7bcdd448ea76a6e5c9d4e3951de34cbc2f8c928e80`；新F2源码SHA `6d30078d2a12995788266424201e6431231176b942ff4b76ee15a590e42a1f7b`。
+
+这只关闭正确producer/consumer清单漏接。原7406/run38824097940仍为F2失败且七项未启动；后续受审源的真正七命令、完整系统展开/异常派发与所有shipping门继续OPEN。

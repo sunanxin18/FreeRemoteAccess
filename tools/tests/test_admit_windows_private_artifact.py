@@ -267,6 +267,83 @@ class SealAndProducerControls(unittest.TestCase):
                 compiler.pe_admit(path, variant=1)
 
 
+
+class ProducerConsumerDiagnosticInventoryControls(unittest.TestCase):
+    # 独立规格：不能从 producer ranges/member_sets 或可写 archive 学到期望名字。
+    OLD_NAMES = ('main','native_admission','linked_admission','child_main','isolated_suite',
+                 'frd_h264_dc_check_abi','frd_h264_dc_outer_probe','frd_h264_dc_wrong_return')
+    NEW_NAMES = ('frd_h264_dc_abi_sp_failure_fragment','frd_h264_dc_preserve',
+                 'frd_h264_dc_corrupt_fp','frd_h264_dc_corrupt_sp16',
+                 'frd_h264_dc_corrupt_sp8','frd_h264_dc_no_return')
+    SUFFIXES = ('.stdout','.stderr','.receipt.json','.argv.json')
+
+    def independent_diagnostics(self, names):
+        return {'variant-%d-disassemble-%s%s' % (variant,name,suffix)
+                for variant in range(5) for name in names for suffix in self.SUFFIXES}
+
+    def accepted_producer_packet(self):
+        compiler,support,snapshot=m.reviewed(MODULE_PATH.parents[1])
+        old={name:item for name,item in snapshot.items()
+             if name not in {compiler.FIXTURE+'/'+n for n in compiler.PINS}|set(compiler.OWN)}
+        allowed=m.member_sets(compiler,support,old,snapshot)[2]
+        expected=self.independent_diagnostics(self.OLD_NAMES+self.NEW_NAMES)
+        expected|={'variant-%d-disassemble-capture_callback%s'%(variant,suffix)
+                   for variant in (0,4) for suffix in self.SUFFIXES}
+        self.assertEqual(len(expected),288)
+        actual={name for name in allowed if '-disassemble-' in name}
+        # Removing any new fixed family would recreate the actual producer/consumer failure.
+        self.assertEqual(actual,expected)
+        producer_names=(allowed-actual)|expected
+        files={name:b'controlled producer member' for name in producer_names}
+        self.assertEqual(set(m.read_zip(packed(sorted(files.items())),allowed)),producer_names)
+        return files,allowed
+
+    def test_complete_fixed_six_by_five_by_four_producer_inventory_is_consumed(self):
+        files,allowed=self.accepted_producer_packet()
+        self.assertEqual(len(files),454)
+        self.assertEqual(len(self.independent_diagnostics(self.NEW_NAMES)),120)
+        self.assertFalse(any('isolated_child.' in name for name in allowed))
+        self.assertNotIn('variant-1-disassemble-capture_callback.argv.json',allowed)
+        self.assertNotIn('variant-2-disassemble-capture_callback.argv.json',allowed)
+        self.assertNotIn('variant-3-disassemble-capture_callback.argv.json',allowed)
+
+    def test_unknown_and_each_missing_new_diagnostic_remain_refused(self):
+        files,allowed=self.accepted_producer_packet()
+        for name in self.independent_diagnostics(self.NEW_NAMES):
+            with self.subTest(missing=name),self.assertRaisesRegex(m.AdmissionError,'ZIP exact allowed members mismatch'):
+                m.read_zip(packed([(key,value) for key,value in sorted(files.items()) if key!=name]),allowed)
+        for unknown in ('variant-0-disassemble-unreviewed_callback.stdout',
+                        'variant-2-disassemble-capture_callback.argv.json',
+                        'variant-5-disassemble-frd_h264_dc_corrupt_fp.stdout',
+                        'variant-0-disassemble-frd_h264_dc_corrupt_fp.extra.json'):
+            with self.subTest(unknown=unknown),self.assertRaisesRegex(m.AdmissionError,'ZIP exact allowed members mismatch'):
+                m.read_zip(packed(sorted(files.items())+[(unknown,b'not authorized')]),allowed)
+
+    def test_new_diagnostic_raw_bytes_and_argv_have_no_acceptance_waiver(self):
+        label='variant-3-disassemble-frd_h264_dc_corrupt_sp8'
+        argv=['/opt/frd-llvm-mingw-20250709/bin/llvm-objdump','--disassemble','--reloc',
+              '--start-address=0x140001000','--stop-address=0x140001008','/producer/abi-contract-3.exe']
+        files={label+'.stdout':b'actual bounded disassembly bytes',label+'.stderr':b'',label+'.argv.json':encoded(argv)}
+        receipt={'argv':argv,'cwd':'/producer','environment':{'PATH':'/opt/frd-llvm-mingw-20250709/bin:/usr/bin:/bin','LC_ALL':'C','LANG':'C','HOME':'/tmp'},
+                 'pid':23,'elapsed_ns':123,'wait_terminal':'exited','returncode':0,'failure':None}
+        receipt.update({stream:{'name':label+'.'+stream,'sha256':hashlib.sha256(files[label+'.'+stream]).hexdigest()} for stream in ('stdout','stderr')})
+        files[label+'.receipt.json']=encoded(receipt)
+        manifest={'schema':'control.members','files':{name:hashlib.sha256(raw).hexdigest() for name,raw in files.items()}}
+        def envelope(content):
+            raw=packed(sorted(content.items())+[('members.json',encoded(manifest))])
+            archive={'schema':'control.archive','sha256':hashlib.sha256(raw).hexdigest(),'members_sha256':hashlib.sha256(encoded(manifest)).hexdigest(),'strict_members':sorted(files)+['members.json']}
+            return raw,encoded(archive)
+        raw,archive=envelope(files)
+        admitted=m.bundle(raw,archive,set(files),'control')
+        m.record(admitted,label,argv,'/producer')
+        changed={**files,label+'.stdout':b'altered diagnostic bytes'}
+        raw,archive=envelope(changed)  # outer digest refreshed; independent member hash remains fixed.
+        with self.assertRaisesRegex(m.AdmissionError,'member full bytes hash'):
+            m.bundle(raw,archive,set(files),'control')
+        changed_receipt={**receipt,'argv':argv+['--unreviewed']}
+        with self.assertRaisesRegex(m.AdmissionError,'stored compile command/cwd mismatch'):
+            m.record({**files,label+'.receipt.json':encoded(changed_receipt)},label,argv,'/producer')
+
 class PinnedSourceCacheControls(unittest.TestCase):
     """完整小 checkout 的真实 pyc 读取控制；不 mock loader 或源码期望。"""
     def cache_control(self, relative):
