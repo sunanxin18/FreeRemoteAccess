@@ -569,6 +569,40 @@ struct Index {
     return deviceInfo.deviceType === 'phone' && this.windowWidth >= 600 && this.windowHeight < 500;
   }
   private formFieldWidth(): string { return this.widePhoneForm() ? 'calc(50% - 6vp)' : '100%'; }
+  private formFieldConstraints(): ConstraintSizeOptions {
+    return this.widePhoneForm()
+      ? { minWidth: 'calc(33.333333% - 12vp)', maxWidth: '100%' }
+      : deviceInfo.deviceType === 'phone' ? { maxWidth: '100%' } : {};
+  }
+  @Builder
+  targetField() {
+    this.fieldLabel('目标系统')
+    Select([{ value: 'Windows' }, { value: 'macOS' }, { value: 'Linux' }]).selected(this.target - 1).value(this.target === 1 ? 'Windows' : this.target === 2 ? 'macOS' : 'Linux')
+      .font({ size: 16 }).optionFont({ size: 16 }).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('目标系统')
+      .padding({ left: 8, right: 8 }).onSelect((index: number) => this.changeTarget(index + 1))
+    if (this.model.errors?.target) { Text(this.error(this.model.errors.target)).fontSize(14).width('100%') }
+  }
+  @Builder
+  modeField() {
+    this.fieldLabel('连接模式')
+    Select(this.protocolOptions()).selected(this.protocolIndex()).value(this.protocolValue())
+      .font({ size: 16 }).optionFont({ size: 16 }).optionWidth(240)
+      .width('100%').constraintSize({ minHeight: 48 }).padding({ left: 8, right: 8 })
+      .accessibilityText(`连接模式：${this.protocolValue()}${this.model.available ? '' : '，当前不可用'}`)
+      .onSelect((index: number) => this.changeProtocol(index))
+  }
+  @Builder
+  portField() {
+    this.fieldLabel('端口')
+    TextInput({ text: this.port, placeholder: '端口' }).type(InputType.Number).fontSize(16).width('100%')
+      .constraintSize({ minHeight: 48 }).accessibilityText('端口').showError(this.error(this.model.errors?.port))
+      .onChange((v: string) => { this.port = v; this.edit(); })
+  }
+  @Builder
+  passwordFieldLabel() {
+    Text(this.widePhoneForm() && this.model.credentialLoaded ? '密码  已从系统安全存储载入密码' : '密码')
+      .fontSize(14).fontColor($r('app.color.text_secondary')).width('100%').textAlign(TextAlign.Start)
+  }
   @Builder
   rememberAction() {
     // 整行只由一个原生按钮接收点击；复选框仅绘制状态，避免父子重复切换。
@@ -614,49 +648,63 @@ struct Index {
           }
         }.width('100%')
         // 同一组输入控件仅调整宽度和换行，旋转时不重建密码控件。
-        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.SpaceBetween, alignItems: ItemAlign.Start, alignContent: FlexAlign.Start }) {
-          Row({ space: 12 }) {
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: deviceInfo.deviceType === 'phone' ? FlexAlign.Start : FlexAlign.SpaceBetween,
+          alignItems: ItemAlign.Start, alignContent: FlexAlign.Start,
+          space: deviceInfo.deviceType === 'phone' ? { main: LengthMetrics.vp(12), cross: LengthMetrics.vp(12) } : undefined }) {
+          if (deviceInfo.deviceType === 'phone') {
             Column({ space: 6 }) {
-              this.fieldLabel('目标系统')
-              Select([{ value: 'Windows' }, { value: 'macOS' }, { value: 'Linux' }]).selected(this.target - 1).value(this.target === 1 ? 'Windows' : this.target === 2 ? 'macOS' : 'Linux')
-                .font({ size: 16 }).optionFont({ size: 16 }).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('目标系统')
-                .padding({ left: 8, right: 8 }).onSelect((index: number) => this.changeTarget(index + 1))
-              if (this.model.errors?.target) { Text(this.error(this.model.errors.target)).fontSize(14).width('100%') }
-            }.layoutWeight(this.showMode() ? 1.2 : 1).alignItems(HorizontalAlign.Start)
+              this.targetField()
+            }.width(this.widePhoneForm() || !this.showMode() ? '200fp' : '100%')
+              .constraintSize(this.formFieldConstraints()).flexGrow(!this.widePhoneForm() && !this.showMode() ? 1 : 0).flexShrink(0).alignItems(HorizontalAlign.Start)
             if (this.showMode()) {
               Column({ space: 6 }) {
-                this.fieldLabel('连接模式')
-                Select(this.protocolOptions()).selected(this.protocolIndex()).value(this.protocolValue())
-                  .font({ size: 16 }).optionFont({ size: 16 }).optionWidth(240)
-                  .width('100%').constraintSize({ minHeight: 48 }).padding({ left: 8, right: 8 })
-                  .accessibilityText(`连接模式：${this.protocolValue()}${this.model.available ? '' : '，当前不可用'}`)
-                  .onSelect((index: number) => this.changeProtocol(index))
-              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                this.modeField()
+              }.width('200fp').constraintSize(this.formFieldConstraints()).flexGrow(this.widePhoneForm() ? 0 : 1).flexShrink(0).alignItems(HorizontalAlign.Start)
             }
             Column({ space: 6 }) {
-              this.fieldLabel('端口')
-              TextInput({ text: this.port, placeholder: '端口' }).type(InputType.Number).fontSize(16).width('100%')
-                .constraintSize({ minHeight: 48 }).accessibilityText('端口').showError(this.error(this.model.errors?.port))
-                .onChange((v: string) => { this.port = v; this.edit(); })
-            }.width(deviceInfo.deviceType === 'phone' || !this.showMode() ? 96 : 72).alignItems(HorizontalAlign.Start)
-          }.width(this.formFieldWidth()).alignItems(VerticalAlign.Top).margin({ bottom: 12 })
+              this.portField()
+            }.width(this.widePhoneForm() ? '200fp' : '96fp').constraintSize(this.formFieldConstraints())
+              .flexGrow(0).flexShrink(0).alignItems(HorizontalAlign.Start)
+          } else {
+            Row({ space: 12 }) {
+              Column({ space: 6 }) {
+                this.targetField()
+              }.layoutWeight(this.showMode() ? 1.2 : 1).alignItems(HorizontalAlign.Start)
+              if (this.showMode()) {
+                Column({ space: 6 }) {
+                  this.modeField()
+                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+              }
+              Column({ space: 6 }) {
+                this.portField()
+              }.width(deviceInfo.deviceType === 'phone' || !this.showMode() ? 96 : 72).alignItems(HorizontalAlign.Start)
+            }.width(this.formFieldWidth()).alignItems(VerticalAlign.Top).margin({ bottom: 12 })
+          }
           Column({ space: 6 }) {
             this.fieldLabel('主机地址')
             TextInput({ text: this.address, placeholder: '主机名或 IP 地址' }).type(InputType.URL).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('主机地址')
               .showError(this.error(this.model.errors?.address)).onChange((v: string) => { this.address = v; this.edit(); })
-          }.width(this.formFieldWidth()).margin({ bottom: 12 })
+          }.width(this.widePhoneForm() ? '200fp' : '100%')
+            .constraintSize(this.formFieldConstraints())
+            .flexGrow(0).flexShrink(deviceInfo.deviceType === 'phone' ? 0 : 1)
+            .margin({ bottom: deviceInfo.deviceType === 'phone' ? 0 : 12 })
           Column({ space: 6 }) {
             this.fieldLabel('用户名')
             TextInput({ text: this.username, placeholder: '远程计算机账户' }).fontSize(16).width('100%').constraintSize({ minHeight: 48 }).accessibilityText('用户名')
               .showError(this.error(this.model.errors?.username)).onChange((v: string) => { this.username = v; this.edit(); })
-          }.width(this.formFieldWidth()).margin({ bottom: this.widePhoneForm() ? 0 : 12 })
+          }.width(this.widePhoneForm() ? '200fp' : '100%')
+            .constraintSize(this.formFieldConstraints())
+            .flexGrow(0).flexShrink(deviceInfo.deviceType === 'phone' ? 0 : 1)
+            .margin({ bottom: deviceInfo.deviceType === 'phone' ? 0 : 12 })
           Column({ space: 6 }) {
-            this.fieldLabel('密码')
+            this.passwordFieldLabel()
             ForEach([this.passwordEpoch], (_epoch: number) => { this.passwordInput() }, (epoch: number) => `${epoch}`)
-          }.width(this.formFieldWidth())
+          }.width(this.widePhoneForm() ? '200fp' : '100%')
+            .constraintSize(this.formFieldConstraints())
+            .flexGrow(0).flexShrink(deviceInfo.deviceType === 'phone' ? 0 : 1)
         }.width('100%')
         if (this.model.loading) { Text(this.model.loading).fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 8 }) }
-        if (this.model.credentialLoaded) { Text('已从系统安全存储载入密码').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 8 }) }
+        if (this.model.credentialLoaded && !this.widePhoneForm()) { Text('已从系统安全存储载入密码').fontSize(14).width('100%').fontColor($r('app.color.text_secondary')).margin({ top: 8 }) }
         if (this.widePhoneForm()) {
           Row({ space: 12 }) {
             Column() { this.rememberAction() }.layoutWeight(1)
