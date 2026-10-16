@@ -275,3 +275,25 @@ PE64为3847680B/`c1f0db74b28d26a2f2974eabadedc3b1ea38b1ddd18d06fbcc5035e46594cd7
 该收集模式的18项宿主合成测试、27项既有包合同测试及bash语法检查通过；这些测试没有运行编译器或客户端。它用于后续审查最终发布图像，尚未取得真实GTK包/map，也不关闭shipping调用、ISA或产品性能资格。Windows普通发布实例仍需独立完成。
 
 四源独立审查通过：5087B报告SHA256 `baad7770e538368f6af8c46c81d2d6311c4a93d025063951e07248f5cf726ed8`，root全文读并核作者24项和审查11项绑定。移除新增收集接线后，原workflow/stage文件逐字恢复；原矩阵、权限、ARM路径及既有验证步骤保持。后续只通过正常功能分支push触发原CI，未手动dispatch或rerun。
+
+### Linux x64 正式 GTK 发布程序实际原件
+
+`fb90ddd4` 的 [run38916060717/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38916060717)，x64 job117023714878完整包流程已成功。artifact12053710401为30876265B，SHA256 `b3adaaa34a5904c67e553ca1fff6efafd1969bd9d96d7ab97b5288ad1e7dc232`；root通过59段连续512KiB HTTP206、相同ETag、API完整摘要、ZIP CRC及十个literal成员校验下载，未执行其中代码。
+
+普通ELF为59995584B/SHA256 `a68fee9c9b5b01096c233e22333a639a573eb16bf579672d0ad5a3446af58fce`，同次map为52786635B/`b2082e35a61f9b0d1f4afc02145f5af55ff3f8db8ac24d989e7ca77f9b731d20`。root核五份snapshot、固定fb90的18份source/config、三份工具身份记录及全部采集阶段；原普通release/GTK/thin-LTO main实际rustc参数与完整原流一致，唯一build在213.303秒后native0，双EOF/close完整；build、最终staged和saved ELF字节相同，map前后相同。
+
+此为真正客户端的同次构建与staging证据，私有benchmark/ABI程序不作为替代。独立原件复核和最终caller局部静态审查已通过（范围如下）；i686原件、正式tar成员核验、外部CRT、SSE2-only产品分支运行和真实会话仍待验，身份中runtime仍NOT_RUN、shipping仍OPEN。原件与root核算在 `target/fb90-ci-resume-root-20261016/12053710401-range/`。
+
+独立原件复核4586B报告SHA256 `09ee7b486bdc869e26c2f8259ef8eb7554217953611445ac6dad343842362415`，root全文读并核14项绑定。实际compiler的before字段为build后从verbose行首次识别路径后的测量，不声称完整工具链在build前已获资格。
+
+精确ordinary ELF的真实内容路径另经静态核验：`RdpBaseline::publish` 在0x1de6c56调用 `surface::extract_bgrx_patch`（0x1e59e20），其row loop已内联分派，0x1e5a000调用SSSE3 0x1db1690，否则0x1e59feb调用SSE2 0x1db1800；没有把内联代码误写成又调用独立converter入口。ELF RELA/map绑定cache及初始化函数，实际SSSE3含pshufb，SSE2主体含pslld/psrld/pand/por。尾部memcpy与分配/初始化等外部CRT另列，不把objdump的最近符号显示当真实callee。
+
+该窄静态报告4402B/SHA256 `4fc81427db11f1f85a0112ca1f2cb64da20c0cee98f45f094db7e49d46989cff`，root全文读、核26绑定并查看实际row/发布调用和重定位原流；只三次额外有界静态读取，reader/ELF/map首尾身份一致。它关闭这一精确图像的有限内容调用关系，不关闭CRT实现、完整unwind、实际分支执行或远程会话性能。
+
+### Windows 正式 GUI 发布程序收集接线
+
+新增固定Windows collector并在原工作流两x86 release分支显式启用；x64保留无target及target/release路径，i686保留显式目标。唯一普通main构建产生同次map，现有stage/verify/Pester保持，之后核最终EXE及manifest再上传十个固定原件。ARM分支保持，未添加Mac Intel。capture与Windows argv解析复用已审helper，严格接受审定LF与精确CRLF物理字节；拒绝任意源码/cache替换、CPU/profile覆盖或partial升级成功。
+
+19项宿主合成测试通过，移除新增接线后原Windows工作流逐字恢复；实际Windows GUI构建/map/最终包结果仍待这次正常CI原件，尚未授shipping运行资格。
+
+Windows三源独立源码审查通过：5113B报告SHA256 `b4c0079eabb90a17d67a6a5ddefd874d8a07c6fa244fe6873ae46d416b8dd69d`，root全文读并核作者16项、保护10项及审查13项绑定。原workflow机械还原/两个短PS调用的非零传播/闭集十原件均核过。这里只关闭源码与19项宿主控制门，随后通过正常功能分支push取得本次普通Windows构建原件，不另触发A或Linux，也不手动dispatch/rerun。

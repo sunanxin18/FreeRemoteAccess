@@ -538,12 +538,20 @@ jobs:
 
       - name: Build Windows GUI release without implicit codec copying
         shell: pwsh
+        env:
+          FRD_WINDOWS_PUBLICATION_SHIPPING: ${{ (matrix.architecture == 'x86' || matrix.architecture == 'x86_64') && '1' || '0' }}
         run: |
-          if ('${{ matrix.rust_target }}' -eq '') {
-            cargo build --locked --release -p freeremotedesk-windows
+          if ($env:FRD_WINDOWS_PUBLICATION_SHIPPING -ceq '1') {
+            python tools/collect-windows-publication-shipping.py build '${{ matrix.architecture }}'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           else {
-            cargo build --locked --release --target ${{ matrix.rust_target }} -p freeremotedesk-windows
+            if ('${{ matrix.rust_target }}' -eq '') {
+              cargo build --locked --release -p freeremotedesk-windows
+            }
+            else {
+              cargo build --locked --release --target ${{ matrix.rust_target }} -p freeremotedesk-windows
+            }
           }
 
       - name: Stage Windows package
@@ -570,6 +578,33 @@ jobs:
             throw "Windows package tests require Pester 3.4.0"
           }
           Invoke-Pester -Script tools/tests/windows-package.Tests.ps1 -EnableExit
+
+      - name: Finalize ordinary Windows publication shipping identity
+        if: matrix.architecture == 'x86' || matrix.architecture == 'x86_64'
+        shell: pwsh
+        env:
+          FRD_WINDOWS_PUBLICATION_SHIPPING: '1'
+        run: |
+          python tools/collect-windows-publication-shipping.py finalize '${{ matrix.architecture }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload exact ordinary Windows publication shipping identity
+        if: always() && (matrix.architecture == 'x86' || matrix.architecture == 'x86_64')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-publication-shipping-${{ matrix.architecture }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/freeremotedesk-windows.exe
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/freeremotedesk-windows.map
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/build.stdout
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/build.stderr
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/identity.json
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/source-main.rs
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/source-pixel_convert.rs
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/source-pixel_convert-x86.rs
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/source-baseline.rs
+            target/rdp-publication-shipping-windows-${{ matrix.architecture }}/source-surface.rs
 
       - name: Upload exact Windows package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
