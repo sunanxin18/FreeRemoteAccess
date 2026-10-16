@@ -225,3 +225,24 @@ Windows/Linux 原矩阵各两个 x86 目标已接入固定 runner；ARM64 明确
 主机17项控制通过，包括全新目录、无 Rust 启动的 setup 失败、小 Python child 的77/超时/未知写端等。root 审查发现 fresh checkout 尚无 target 父目录的前置问题，修复后新增 runlevel fixture；非法或已存在路径仍拒绝覆盖。host结果限 macOS ARM64 Python，不冒充四目标捕获和计时。
 
 独立源审报告4413B、SHA256 `18276859ef645754e4421bd75b8b41f48a0084b307feb109f6cd2accd8945078`，root已全文读并核作者20项与review12项绑定；原两workflow移除批准新增内容后逐字保持，Linux仅另增加两个固定脚本的push/PR路径。源码材料在 `target/publication-benchmark-wiring-source-20261016/`；四目标真实构建/计时尚待本次正常push CI，尚无性能数字。Task4A2.10C与产品最终调用资格保持开放。
+
+### Linux 两目标首次普通微基准实测
+
+`8cb7f7191712d1ac7fae6f407b64c709dd0b9c91` 的 [Linux run38909036318/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38909036318) 中，x64 job116999886862/artifact12049387244 与 i686 job116999886947/artifact12050075399 的普通 build/run 及原件上传均已 success；整包任务当时仍在运行。初次 jobs 快照的 i686 仍 pending，后继 jobs-second 和原件才证明其完成，没有回写旧快照。该提交主 CI38909036357/1已整体 success。Windows38909036327/1仍排队，Windows计时与文件身份观察尚未执行。
+
+两ZIP分别2276506B/SHA256 `037bdcf1dde00512b8757520c375f28db2ac9dd2957db523a53741d03e34d282` 和2298740B/`0e35a58c3373a573b715770632b47b5f932ed8b2e4c78590e15f9d20c3dca5bc`，各恰11项，API digest、CRC与解包bytes符合。最终ELF64为4175272B/`d52bd5d942bf31a0320c1cc1ff1ab84a451e1bb92eb28b5c4be76d6d63f5e890`，ELF32为4160868B/`5a0961d1ec2c723100062ee187ffd5f18b8c4d9cd5e8ca7687ccdf11a282a74a`；各自实际Rust1.96 release/thin-LTO、同次map与唯一staged无参调用匹配。两stage均native0、双EOF和文件关闭/capture完整，四源/八配置/三工具/bin/map的前后身份保持。
+
+每端完整4055行、30case、四route、3720个原u128样本及全部median/p95/ratio/SHA均核算符合。以下为对齐输入的median毫秒，仅展示每端同行四种实现；x64使用Intel Xeon Platinum8573C，i686使用AMD EPYC9V45，不能跨行将CPU差异解读为架构优劣。
+
+| 目标及像素数 | 冻结参考 | SSE2 | SSSE3 | 当前分派 |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x64，1920×1080 | 1.172 | 0.603 | 0.600 | 0.600 |
+| Linux x64，3840×2160 | 5.308 | 3.258 | 3.032 | 2.975 |
+| Linux i686，1920×1080 | 0.912 | 0.373 | 0.221 | 0.210 |
+| Linux i686，3840×2160 | 3.687 | 1.567 | 1.383 | 1.392 |
+
+每端SSE2及SSSE3均有20case median快于参考、10case更慢；慢项准确为0/1/2/3/7像素的两种alignment，4像素却更快，因此不能据此加入简单“≤7走参考”的阈值。完整对齐/非对齐、first-operation、31样本、p95与四route均保留，当前分派独立测量。共享runner有明显抖动，参考Rust可能自动向量化未被排除；没有重跑挑选有利数据，也没有以速度阈值授通过。这是私有warm像素转换微基准，不是H.264解码、帧率、冷缓存或协议端到端延迟。
+
+原件和root全量纯数据核对在 `target/publication-benchmark-and-file-identity-delivery-root-20261016/ci/`；下载内容仅以0600读取，从未在Mac执行。四目标完整性能、shipping内部调用实例、完整unwind与真实会话继续开放，Task4A2.10C保持未勾选。
+
+独立实际读数复审通过：5204B报告SHA256 `e430c7a60fc41d9c01d3a5485957ab8554bf4e40f6a677612a4957a8ab8ec7d5`，root全文读并核15项关键绑定；独立全量统计另存 `target/publication-benchmark-linux-runtime-review-20261016/independent-readout.json`。复审确认完整性与统计合同，不把20快/10慢、小输入或跨CPU数据改写为整体加速结论。
