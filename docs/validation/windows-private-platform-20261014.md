@@ -504,3 +504,15 @@ source `7406f0b395e4c98191634ed165971bdead49466a` 的唯一新原run38824097940/
 原同一认证input的原F2实际RED后，新检查器完整静态接收五PE且seal重验通过；对真实contract内存副本，未知/缺失、字节篡改及同步更新hash后替换argv均严格拒绝。两个受影响宿主suite共54项：53通过、1项既有可选旧工件跳过。旧111项实现冻结保持，未执行新PE、Rtl或原生命令。实现报告SHA256 `df3e3e74779e8278490b359f3035e0a93e154ba28ae10aa90a5f75df1fb069c9`，653项冻结清单 `1abf2dd05d6e8994ebc45e68cd3d7cf6dc0975c16ca2d4f063ef02f54d8583c9`，独立复审 `1a6e02eae005baaf5fd3db7bcdd448ea76a6e5c9d4e3951de34cbc2f8c928e80`；新F2源码SHA `6d30078d2a12995788266424201e6431231176b942ff4b76ee15a590e42a1f7b`。
 
 这只关闭正确producer/consumer清单漏接。原7406/run38824097940仍为F2失败且七项未启动；后续受审源的真正七命令、完整系统展开/异常派发与所有shipping门继续OPEN。
+
+### a4e35c7 新原生七项通过：仅限固定 C0 辅助程序
+
+2026-10-16，受审提交 `a4e35c7134c21c55ebf986831bec038685b9a095` 的 [run38827578424](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38827578424)/attempt1：compile116738519054、native116740368715均成功。完整native artifact12016350713为473,958,272B，SHA256 `da95638ccbee06d4433266d433b3c0085f83a4fe4f799e09dc61d6a4ef436ba3`；同run input12015478977为78,898,104B，SHA256 `36bc0440b19f3b53618314137f5d8d23688c1088f040f7bbc089e91f8b61e7b8`。Root核对678outer/675inner全部CRC/摘要、终态、七份Git源码和独立F2五PE。native与root seal除主机路径外完全相同，624 sealed files与原输入闭合。
+
+固定顺序register0/unwind0/isolated0/unwind1–4全部真实wait0/exit0/jobzero，创建时独占Job、原生ARM64，正常父路径不调用TerminateJobObject。原8PC与新12片段PC均符合严格差值；v0/v4十二fragment_walk和原callback→helper→outer→caller通过，bad1–4仍逐项消费原负控。六子preserve自然exit0，四个破坏用例各在认证owned F000 trap报告双机会断点且无额外AV，no_return按原预算强退并有完整终态。normal30s/isolated120s/cleanup10s、子1500ms/10000ms均未放宽。
+
+独立执行审查 `230ce14076de516123333e2a335b320f7c29bd79a100358e910a89f5502384ea` 为Spec PASS/Evidence Quality Approved、0Critical/Important/Minor；它完整核对归档、624文件、五PE、七收据并独立重解析七份原始F1日志。Root已全文读取并核对冻结身份，有限nativehelper-control执行门关闭。完整CONTEXT字段比较仍是C内部同进程oracle，外部只消费精确差值和matched记录；不声称外部已逐字段观察完整context、任意Cframe或loader/module/provider身份全链。
+
+证据在 `target/windows-failure-unwind-root-20261016/inventory-ci/`，独立审查在 `target/windows-failure-unwind-native-execution-review-20261016/`。Root附加统计对isolated预算、空白行、variant4回溯的三次错误假设，以及reviewer初次清单加一结构断言，均保留初始脚本与失败日志，只按原已审schema/source修正只读审计，未改产品或重跑原生。两次下载为原artifact连续范围读取、完整API摘要相同，无重复native/CI执行。
+
+原7406/F2清单失败及原00b/AV失败保持，不改写历史。该结论只覆盖本source/run/五PE与Windows ARM64环境的私有固定C0回调；generic checker、真实shipping kernel/qmul、5,974,518数值/30分派、guard/QPC性能、修改配方完整包、跨架构及真实客户端登录继续OPEN。不能从普通Windows包CI或本私有辅助程序推导这些产品资格。
