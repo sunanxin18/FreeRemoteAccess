@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       execute_release_a:
-        description: Explicit root-authorized bootstrap diagnostic only (no builder)
+        description: Explicit root-authorized RELEASE A execution (single fixed recipe)
         type: boolean
         required: true
         default: false
-  # 首run失败后此源码固定为BootstrapDiagnostic；push仍须root授权和台账。
-  # dispatch bool不能切回Execute；恢复自然builder须另经root审查源码。
-  # 本次仅修自然Application首选解析；仍只运行固定bootstrap诊断，不恢复构建。
+  # 原自然run38847486035失败；诊断38849395836失败、38850194932成功，历史不归零。
+  # 本次仅准备固定Execute恢复源码；下一自然调用尚未开始，push仍须root另审释放。
+  # 不提供任意ref/tool/flags/retry；同一authority只调用原唯一自然builder。
   push:
     branches:
       - codex/rdp-egfx-hevc-preference
@@ -41,16 +41,15 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Run fixed Windows bootstrap diagnostic only
+      - name: Execute the single RELEASE A entry
         shell: pwsh
-        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapDiagnostic
+        run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute
       - name: Preserve all original materials and verify the transport
-        # 固定诊断源码不可达；正式POSIX三件仍incomplete，不伪造。
-        if: ${{ false }}
+        if: always()
         shell: pwsh
         run: pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect
       - name: Upload exact POSIX transport, receipt and verification
-        if: ${{ false }}
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-a-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
@@ -60,8 +59,9 @@ jobs:
             ${{ runner.temp }}/release-a.verification.json
           compression-level: 0
           if-no-files-found: error
-      - name: Upload fixed Windows bootstrap forensic files only
-        if: always()
+      - name: Upload fixed Windows forensic originals on failure
+        if: ${{ failure() || cancelled() }}
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-a-bootstrap-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
@@ -132,6 +132,13 @@ jobs:
             ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/error.json
             ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/executable.bin
             ${{ runner.temp }}/release-a-bootstrap-diagnostic/initialize-failure/call/main-module.bin
+            ${{ runner.temp }}/release-a-initialize/argv.json
+            ${{ runner.temp }}/release-a-initialize/stdout.bin
+            ${{ runner.temp }}/release-a-initialize/stderr.bin
+            ${{ runner.temp }}/release-a-initialize/exit.json
+            ${{ runner.temp }}/release-a-initialize/error.json
+            ${{ runner.temp }}/release-a-initialize/executable.bin
+            ${{ runner.temp }}/release-a-initialize/main-module.bin
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: warn
           overwrite: false

@@ -73,3 +73,13 @@ Windows source profile及对应源码exact材料已接入，固定上游归档�
 该run成功上传独立forensic artifact12024701847，ZIP 1,240,638字节/API digest `8de9581b55c1da76d206fdcdce0fb7c8293a306d4f94e61a40022214735bb48d`；root读取47成员、核45个存在文件前后身份无差异，逐byte核binary及三formatter结果。原件在`target/windows-shipping-bootstrap-diagnostic-root-20261016/ci/`。这是本轮具体失败模式的实际复现；首次run38847486035缺初始化原件，其具体原始原因仍不能由新fixture追认。正式三件、WSL门、自然FFmpeg、B/C/D及生产资格均未通过。
 
 多候选解析的最小源码修复现已完成：资格工具两处、修改配方native gateway一处均先取首个ApplicationInfo，再取Source；原调用名/argv/cwd/PATH、零候选错误和默认upstream分支保持。host诊断另存Python自然候选顺序；这不是每次进程映像观察。51项源码/原JSON/原日志身份及完整123行delta已由root核对，两个新增Pester仅prepared/notrun。CI物理CRLF源码与本机LF源码分别记录raw hash，只有归一化文本相同，不混称bytes相同。后继仍只运行同一固定BootstrapDiagnostic，独立源审Spec PASS / Quality Approved通过，报告SHA256 `f420a4c7c574378d39f2613ee85c79ad801eb583d399d2f25b5dfb35f7205dae`；下一实际GREEN尚未取得，root仅释放一次固定诊断push，不恢复自然builder。
+
+### 修后实际诊断：六项全部通过
+
+提交`373c33ba0f846fc526a8d742a008dfc810f69c40`的[run38850194932/attempt1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38850194932) / job116809495226已SUCCESS。六个mandatory均实际PASS，initialize正控exit0并产生身份正确、尚未开始checkout/setup/builder的state；预建root反控真实exit1/FileExistsError/无state。host记录仍有两个Python候选，首项为toolcache Python；两次initialize raw均保存该首项exe身份，并观察退出与EOF，前一诊断的多路径拼接RED已由本次GREEN解决。
+
+独立artifact12024329621为1,455,028字节，API digest `b2c070e44143406d20a8ecd2319d77c63d63468d7a01eb81576febadbb38d5e5`。root核对46成员/45个存在文件前后身份、三个formatter历史RED/新GREEN、binary逐byte、两个initialize真实exit/state/stderr，未发现差异。原件在`target/windows-shipping-bootstrap-resolution-fix-root-20261016/ci/`。材料仍forensic_only/stable=false，不是正式POSIX三件；Pester和catalog/modified-native对应新增控制未实跑，不能以raw gateway成功替代它们。
+
+该成功仅关闭初始化诊断门；原首run缺失的原因不追认，WSL/Linux进程门、完整自然FFmpeg及B/C/D继续待验。后继恢复自然入口时须保留失败时的早期initialize原件，不能再次让缺state丢失最早错误。
+
+修后六项实际结果经独立读数复核通过，报告SHA256 `501844b950479562a4762792d64e84512305c6a9cb681ce12103dfbeac2cfc7b`。恢复自然入口的两路径/130行delta、16项冻结及独立源审`5063bf135932d7f5e03033903213d7d00f26f2de09eec4f5bd1b4e29bc5af4bf`已由root完整读取/核对。现在只释放一次固定Execute流程；Collect和正式三件always，forensic仅失败/取消时尽力运输73个精确可能路径（含最早initialize七原件）。该恢复提交的push本身触发，不另dispatch或并发重跑；完整自然执行结果另记，B/C/D继续开放。

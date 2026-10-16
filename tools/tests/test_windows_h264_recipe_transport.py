@@ -294,9 +294,9 @@ class CheckoutBoundary(unittest.TestCase):
 
 
 class WorkflowAuthority(unittest.TestCase):
-    def test_real_workflow_has_one_bounded_bootstrap_diagnostic_and_exact_forensics(self):
+    def test_real_workflow_has_one_fixed_natural_authority_and_failure_only_forensics(self):
         import yaml
-        # BaseLoader保留on字段；实际配置固定诊断，dispatch bool没有Action选择权。
+        # BaseLoader保留on字段；固定自然入口无任意mode/ref/tool/flags/retry输入。
         workflow = yaml.load((ROOT / '.github/workflows/qualify-windows-h264-recipe.yml').read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow['on']), {'push', 'workflow_dispatch'})
@@ -314,26 +314,27 @@ class WorkflowAuthority(unittest.TestCase):
         self.assertEqual(job['if'], "(github.event_name == 'workflow_dispatch' && inputs.execute_release_a == true) || "
                                    "(github.event_name == 'push' && github.ref == 'refs/heads/codex/rdp-egfx-hevc-preference')")
         self.assertEqual(set(job['env']), {'RELEASE_A_EXECUTE', 'RELEASE_A_WORKFLOW_SHA', 'RELEASE_A_WORKFLOW_REF'})
-        checkout, diagnostic, collect, upload, forensic = job['steps']
+        checkout, execute, collect, upload, forensic = job['steps']
         self.assertEqual(checkout['uses'], 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262')
         self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': 'false'})
-        self.assertEqual(diagnostic['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapDiagnostic')
-        self.assertNotIn('${{', diagnostic['run'])
+        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute')
+        self.assertNotIn('${{', execute['run'])
         active_commands = [step['run'] for step in job['steps'] if 'run' in step and step.get('if') != '${{ false }}']
-        self.assertEqual(active_commands, [diagnostic['run']])
-        self.assertEqual(collect['if'], '${{ false }}')
+        self.assertEqual(active_commands, [execute['run'], collect['run']])
+        self.assertEqual(collect['if'], 'always()')
         self.assertEqual(collect['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect')
-        self.assertEqual(upload['if'], '${{ false }}')
+        self.assertEqual(upload['if'], 'always()')
         self.assertEqual(upload['with']['compression-level'], '0')
         self.assertEqual(upload['with']['if-no-files-found'], 'error')
         self.assertEqual(upload['with']['path'].splitlines(), ['${{ runner.temp }}/release-a.tar',
                                                              '${{ runner.temp }}/release-a.receipt.json',
                                                              '${{ runner.temp }}/release-a.verification.json'])
-        self.assertEqual(forensic['if'], 'always()')
+        self.assertEqual(forensic['if'], '${{ failure() || cancelled() }}')
+        self.assertEqual(forensic['continue-on-error'], 'true')
         self.assertEqual(forensic['uses'], 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')
         self.assertEqual(forensic['with']['name'], 'release-a-bootstrap-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
         self.assertEqual((forensic['with']['compression-level'], forensic['with']['if-no-files-found'],
-                          forensic['with']['overwrite']), ('0', 'error', 'false'))
+                          forensic['with']['overwrite']), ('0', 'warn', 'false'))
         expected = ['release-a-bootstrap-diagnostic.json', 'release-a-bootstrap-error.json']
         fixed = ['host.json', 'qualifier-source.ps1', 'transport-source.py', 'formatter/control.ps1',
                  'formatter/historical.ps1', 'formatter/results.json', 'binary/control.ps1',
@@ -344,8 +345,11 @@ class WorkflowAuthority(unittest.TestCase):
             fixed += [f'{case}/call/{name}' for name in ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json',
                                                        'error.json', 'executable.bin', 'main-module.bin')]
         expected += ['release-a-bootstrap-diagnostic/' + name for name in fixed]
+        expected += ['release-a-initialize/' + name for name in ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json',
+                                                               'error.json', 'executable.bin', 'main-module.bin')]
         actual = forensic['with']['path'].splitlines()
         self.assertEqual(actual, ['${{ runner.temp }}/' + name for name in expected])
+        self.assertEqual(len(actual), 73)
         self.assertEqual(len(actual), len(set(actual)))
         self.assertTrue(all(not any(char in path for char in '*?[]') for path in actual))
 
