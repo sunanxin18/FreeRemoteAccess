@@ -1,6 +1,6 @@
 # RDP RGBA→BGRX 的 SSE2 转换
 
-2026-10-16，状态：**开发中**。本次补齐 Windows/Linux x86 与 x86_64 的 SSE2 转换主体；Linux i686、Linux/Windows x86_64已有新体局部实际运行；Windows i686目标运行、保护页、ABI 和性能尚未完成，不能据此授予完整解码器或客户端生产资格。
+2026-10-16，状态：**开发中**。本次补齐 Windows/Linux x86 与 x86_64 的 SSE2 转换主体；Linux/Windows i686与x86_64已有新体局部实际运行；保护页、ABI 和性能尚未完成，不能据此授予完整解码器或客户端生产资格。
 
 RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 可用时使用原生实现，否则回到标量。现在保留 SSSE3 优先，其后检查真实 SSE2，再选择共享的 SSE2 入口；只有未通过 SSE2 检查的 CPU 才使用明确的 reference 后备。协议、解码器选择、Surface 合同、默认策略、能力广告和 ARM64 实现保持。
 
@@ -12,10 +12,10 @@ RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 
 |---|---|
 | 固定 Rust 1.96 格式 | 两源通过 |
 | macOS ARM64 局部真实源码测试 | debug/release各8通过；各过滤1项既有benchmark。仅共享API及NEON回归，不是x86执行 |
-| Windows i686/x86_64 | 两个实际源码优化COFF对象编译通过；后续普通CI已执行Windows x86_64新体12项局部测试，i686仍待运行 |
+| Windows i686/x86_64 | 两个实际源码优化COFF对象编译通过；后续普通CI已执行Windows x86_64新体12项、i686新体11项局部测试 |
 | Linux i686/x86_64 | 两个实际源码优化ELF对象编译通过；后续普通CI已执行x86_64新体12项、i686新体11项局部测试 |
 | SSE2静态指令 | 四个精确入口及内联数值核心仅见SSE2指令；外部memcpy/TLS/panic运行库未链接，不代表最终ISA闭包 |
-| 原体反例/新体执行 | 原体RED快照与精确运行方法已准备；Linux/Windows x86_64新体各12项、Linux i686新体11项实际通过；Windows i686仍待完成 |
+| 原体反例/新体执行 | 原体RED快照与精确运行方法已准备；Linux/Windows x86_64新体各12项、两平台i686新体各11项实际通过；原体实际RED尚未完成 |
 | 保护页、ABI/unwind、有限性能 | 尚未完成；sentinel和对象编译不能替代 |
 
 最终源SHA256：`pixel_convert.rs` 为`ee5623097b839166f311ffc0a9fffbfbc3d8b59163da96df8b9171692f4fa66c`，`pixel_convert/x86.rs` 为`232fabaca6781a9e3ef5110de292d3c4b017066b847f7ee9b31ad4f7ad8aeaf9`。原SSSE3数值体与ARM64文件保持；macOS只支持ARM64，本次没有macOS Intel构建。
@@ -24,7 +24,7 @@ RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 
 
 独立源码审查结论为Spec/Quality PASS，未发现需返工问题；报告SHA256为`c8bf96bd718b7f5057862e4b0c36e0c9e094a21e449d8318daef58c867c9b66b`。root已完整读取两源diff、实现报告、审查报告，重新核对源快照及四目标对象身份。此结论仅接受源码切片，表中真实目标运行门继续开放。
 
-Windows、Linux包流程已分别补上仅i686执行的实际crate局部测试接线，使用原目标/linker/runtime，跳过既有benchmark，失败即停止。两处独立配置审查通过（报告SHA256 `4208413f73f020396eed668867246d67a611e430403c71452d214b6e06cef6bc`）；Linux i686后继已取得下述实际执行结果，Windows i686仍待执行。x64沿用现有完整crate测试，不新增重复运行。过滤器须实际运行11项局部测试（含三个ISA测试），不能用0测试的成功退出当验证。
+Windows、Linux包流程已分别补上仅i686执行的实际crate局部测试接线，使用原目标/linker/runtime，跳过既有benchmark，失败即停止。两处独立配置审查通过（报告SHA256 `4208413f73f020396eed668867246d67a611e430403c71452d214b6e06cef6bc`）；两平台i686后继均已取得下述实际执行结果。x64沿用现有完整crate测试，不新增重复运行。过滤器须实际运行11项局部测试（含三个ISA测试），不能用0测试的成功退出当验证。
 
 ## 首次 Linux x86_64 真实运行
 
@@ -47,3 +47,19 @@ Windows x64独立执行读数复核报告SHA256为`0e1795072152e000428ee734c27e3
 提交`dd46ea849f86cee3f5bcc074b41cc05a219c4f50`的[Linux包run38849395853](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38849395853) / job116807020652实际通过11项局部测试，0失败、0忽略，包含三个ISA测试。命令显式指定`--target i686-unknown-linux-gnu`，实际启动i686目录内测试程序，既有benchmark明确跳过。日志中deny guard检查的panic由`catch_unwind`捕获，同一测试最终ok；它不是本次失败，也不能替代完整ABI/unwind验收。
 
 原日志`target/sse2-publication-root-20261016/ci/dd46ea84-linux-i686-job-original.log`为405,242字节，SHA256 `b090e6bca631563d6b2a480d329d47f79eec0c9ac5fd397ac0d8f08223dcb989`。独立读数复核报告SHA256 `c235ed78a3baf28d5a505202577c99301151db25eed1d8239219d7eddede8b60`确认匹配提交、真实目标进程及逐名结果，root已完整读取。Windows i686、旧体实际RED、保护页、ABI、最终运行库ISA闭包和性能仍待完成。
+
+## 首次 Windows i686 真实运行
+
+提交`263d7bf04bea7f1c13a36154cb053cf4e372c1e7`的[Windows包run38851041834](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38851041834) / job116812401497已成功。原日志4826–4860段显式指定`--target i686-pc-windows-msvc`，运行对应target目录内exe，实际11 passed、0 failed、0 ignored，含三个ISA控制；benchmark按命令跳过。预期`catch_unwind`的panic随后同项ok，独立复核确认不是失败。前面宿主12项与本段i68611项分开，不拼接性能结果。
+
+原日志`target/sse2-publication-root-20261016/ci/263d7bf-windows-i686-job-original.log`为469,099字节，SHA256 `b83eea111c602a154e61ee5ede35e4e6ea2fbaaa96638b0a131c9e9d25d6cc0b`。独立报告SHA256 `4f88162fe2505be1f27288f25c30f6851f5369612109f472b59b21a353aeab9a`，root已全文读取并核冻结。两平台x64/i686的新体局部运行已齐，但旧体实际RED、保护页、直接ABI、最终shipping ISA/运行库闭包及有限性能仍待完成；模块GREEN不等于完整解码器或远程会话资格。
+
+## Linux 保护页入口准备
+
+新增K crate私有普通example，直接编译实际RDP x86叶子，避免`cfg(test)`计数进入测量/内存检查；不复制转换核。它在Linux x86_64/i686上显式检查ISA，分别运行每可用kernel的10,240例独立字节oracle，以及160组输入/输出上下边界与只读源页检查；五个隔离故障负控制必须在ready之后准确SIGSEGV。其它架构/系统明确退出77，不以零测试计成功。
+
+初审发现观察错误会跳过child清理，现已统一进入保留原错误的kill与有界try_wait，无法确认时明确unconfirmed。修复经独立源码复审通过，报告SHA256 `72a3e3776528df266fea83a39127a115cb102d2be1a32b676e928c9960a08593`。Mac ARM64仅执行拒绝门与实际owned child清理控制，两个Linux目标仅完成非test metadata检查；实际OS观察错误与清理失败未运行覆盖。保护页原生运行尚未开始，ABI、性能和shipping ISA继续开放。
+
+后继沿用现有Linux x64/i686矩阵，普通release build后顺序运行parity/guards，失败即停并保存固定原件；ARM64跳过该专用步骤。此接线不改变产品decoder、协议、manifest或默认行为。
+
+现有Linux矩阵接线经独立配置审查，identity写入失败时保留原非零状态的P3也已关闭，最终报告SHA256 `70dd0111c9c319cd5af435872a129170aa870c51f0606148b600ed3d97435023`。root已读完整两源、清理delta、workflow完整增量及最后分支，核当前源身份后，只释放随审定提交push的首次Linux x64/i686实际parity/guards；不另dispatch或自动重跑，运行结果另记。

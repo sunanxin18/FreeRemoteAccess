@@ -129,6 +129,98 @@ jobs:
           test "$(rustc --version | cut -d' ' -f2)" = "1.96.0"
           rustc --target "${{ matrix.cargo_target }}" --version --verbose
 
+      - name: Run native x86 publication parity and guarded ranges
+        if: matrix.arch == 'x86_64' || matrix.arch == 'i686'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          if [[ "${{ matrix.arch }}" == i686 ]]; then
+            export CC_i686_unknown_linux_gnu=i686-linux-gnu-gcc
+            export CXX_i686_unknown_linux_gnu=i686-linux-gnu-g++
+            export CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc
+          fi
+          target='${{ matrix.cargo_target }}'
+          evidence="target/sse2-publication-native/$target"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          mkdir -p target/sse2-publication-native
+          mkdir "$evidence"
+          identity="$evidence/identity.log"
+          executable="$evidence/rdp_publication_sse2"
+          sources=(
+            crates/frd-rdp-legacy-kernels/examples/rdp_publication_sse2.rs
+            crates/frd-rdp-legacy-kernels/examples/support/rdp_publication_guard.rs
+            crates/frd-protocol-rdp/src/pixel_convert/x86.rs
+          )
+          before=''
+          runtime_complete=false
+          finish_publication_evidence() {
+            original_exit=$?
+            trap - EXIT
+            set +e
+            after=$(sha256sum "${sources[@]}" 2>&1)
+            hash_exit=$?
+            final_exit=$original_exit
+            if [[ $hash_exit -ne 0 || "$before" != "$after" ]]; then
+              runtime_complete=false
+              if [[ $final_exit -eq 0 ]]; then final_exit=1; fi
+            fi
+            executable_hash=''
+            if [[ -f "$executable" ]]; then
+              executable_hash=$(sha256sum "$executable" 2>&1)
+              if [[ $? -ne 0 ]]; then
+                runtime_complete=false
+                if [[ $final_exit -eq 0 ]]; then final_exit=1; fi
+              fi
+            fi
+            if ! {
+              printf 'sources_after_sha256\n%s\n' "$after"
+              printf 'executable_final_sha256\n%s\n' "$executable_hash"
+              printf 'original_exit=%s final_exit=%s runtime_complete=%s\n' "$original_exit" "$final_exit" "$runtime_complete"
+            } >> "$identity"; then
+              if [[ $final_exit -eq 0 ]]; then final_exit=1; fi
+              exit "$final_exit"
+            fi
+            exit "$final_exit"
+          }
+          trap finish_publication_evidence EXIT
+          {
+            printf 'target=%s arch=%s\n' "$target" '${{ matrix.arch }}'
+            rustc -Vv
+            uname -a
+          } > "$identity"
+          before=$(sha256sum "${sources[@]}")
+          printf 'sources_before_sha256\n%s\n' "$before" >> "$identity"
+          build=(cargo build --locked --release -p frd-rdp-legacy-kernels --example rdp_publication_sse2 --target "$target" -v)
+          printf 'argv '; printf '%q ' "${build[@]}"; printf '\n'
+          { printf 'build_argv '; printf '%q ' "${build[@]}"; printf '\n'; } >> "$identity"
+          "${build[@]}" 2>&1 | tee "$evidence/build.log"
+          cp "$CARGO_TARGET_DIR/$target/release/examples/rdp_publication_sse2" "$executable"
+          { printf 'parity_argv '; printf '%q ' "$executable" parity; printf '\n'; } >> "$identity"
+          "$executable" parity 2>&1 | tee "$evidence/parity.log"
+          printf 'parity_exit=0\n' >> "$identity"
+          { printf 'guards_argv '; printf '%q ' "$executable" guards; printf '\n'; } >> "$identity"
+          "$executable" guards 2>&1 | tee "$evidence/guards.log"
+          printf 'guards_exit=0\n' >> "$identity"
+          runtime_complete=true
+
+      - name: Retain exact x86 publication originals even on failure
+        if: always() && (matrix.arch == 'x86_64' || matrix.arch == 'i686')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: freeremotedesk-linux-publication-${{ matrix.cargo_target }}
+          # 部分原件可供失败复审，不能替代runtime_complete及两入口实际成功。
+          path: |
+            target/sse2-publication-native/${{ matrix.cargo_target }}/identity.log
+            target/sse2-publication-native/${{ matrix.cargo_target }}/build.log
+            target/sse2-publication-native/${{ matrix.cargo_target }}/parity.log
+            target/sse2-publication-native/${{ matrix.cargo_target }}/guards.log
+            target/sse2-publication-native/${{ matrix.cargo_target }}/rdp_publication_sse2
+            crates/frd-rdp-legacy-kernels/examples/rdp_publication_sse2.rs
+            crates/frd-rdp-legacy-kernels/examples/support/rdp_publication_guard.rs
+            crates/frd-protocol-rdp/src/pixel_convert/x86.rs
+          if-no-files-found: error
+
       - name: Run target ClearCodec, NSCodec and Progressive parity and bounded benchmark
         shell: bash
         run: |

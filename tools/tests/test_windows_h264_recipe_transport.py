@@ -358,9 +358,9 @@ class CheckoutBoundary(unittest.TestCase):
 
 
 class WorkflowAuthority(unittest.TestCase):
-    def test_real_workflow_has_one_fixed_pre_wsl_prefix_and_exact_forensics(self):
+    def test_real_workflow_has_one_fixed_natural_authority_and_exact_failure_forensics(self):
         import yaml
-        # BaseLoader保留on字段；字面prefix不能由dispatch bool切到自然builder。
+        # BaseLoader保留on字段；单一固定自然入口，无任意mode/ref/tool/flags/retry。
         workflow = yaml.load((ROOT / '.github/workflows/qualify-windows-h264-recipe.yml').read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow['on']), {'push', 'workflow_dispatch'})
@@ -378,28 +378,28 @@ class WorkflowAuthority(unittest.TestCase):
         self.assertEqual(job['if'], "(github.event_name == 'workflow_dispatch' && inputs.execute_release_a == true) || "
                                    "(github.event_name == 'push' && github.ref == 'refs/heads/codex/rdp-egfx-hevc-preference')")
         self.assertEqual(set(job['env']), {'RELEASE_A_EXECUTE', 'RELEASE_A_WORKFLOW_SHA', 'RELEASE_A_WORKFLOW_REF'})
-        checkout, prefix, collect, upload, forensic = job['steps']
+        checkout, execute, collect, upload, forensic = job['steps']
         self.assertEqual(checkout['uses'], 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262')
         self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': 'false'})
-        self.assertEqual(prefix['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action BootstrapCheckoutDiagnostic')
-        self.assertNotIn('${{', prefix['run'])
+        self.assertEqual(execute['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Execute')
+        self.assertNotIn('${{', execute['run'])
         active_commands = [step['run'] for step in job['steps'] if 'run' in step and step.get('if') != '${{ false }}']
-        self.assertEqual(active_commands, [prefix['run']])
-        self.assertEqual(collect['if'], '${{ false }}')
+        self.assertEqual(active_commands, [execute['run'], collect['run']])
+        self.assertEqual(collect['if'], 'always()')
         self.assertEqual(collect['run'], 'pwsh -NoProfile -File tools/qualify-windows-h264-recipe-A.ps1 -Action Collect')
-        self.assertEqual(upload['if'], '${{ false }}')
+        self.assertEqual(upload['if'], 'always()')
         self.assertEqual(upload['with']['compression-level'], '0')
         self.assertEqual(upload['with']['if-no-files-found'], 'error')
         self.assertEqual(upload['with']['path'].splitlines(), ['${{ runner.temp }}/release-a.tar',
                                                              '${{ runner.temp }}/release-a.receipt.json',
                                                              '${{ runner.temp }}/release-a.verification.json'])
-        self.assertEqual(forensic['if'], 'always()')
-        self.assertNotIn('continue-on-error', forensic)
+        self.assertEqual(forensic['if'], '${{ failure() || cancelled() }}')
+        self.assertEqual(forensic['continue-on-error'], 'true')
         self.assertEqual(forensic['with']['include-hidden-files'], 'true')
         self.assertEqual(forensic['uses'], 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')
         self.assertEqual(forensic['with']['name'], 'release-a-bootstrap-checkout-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}')
         self.assertEqual((forensic['with']['compression-level'], forensic['with']['if-no-files-found'],
-                          forensic['with']['overwrite']), ('0', 'error', 'false'))
+                          forensic['with']['overwrite']), ('0', 'warn', 'false'))
         call_files = ('argv.json', 'stdout.bin', 'stderr.bin', 'exit.json', 'error.json', 'executable.bin', 'main-module.bin')
         expected = ['release-a-bootstrap-error.json'] + ['release-a-initialize/' + name for name in call_files]
         payload = ['provenance/state.json', 'provenance/checkout.json', 'setup/host.json']
@@ -419,8 +419,22 @@ class WorkflowAuthority(unittest.TestCase):
         payload += ['toolchain/windows/' + name + '.bin' for name in ('pwsh', 'python', 'wsl.exe', 'git', 'gpg.exe', 'curl.exe')]
         expected += ['frd-release-a-evidence/' + name for name in payload]
         actual = forensic['with']['path'].splitlines()
+        self.assertEqual(actual[:54], ['${{ runner.temp }}/' + name for name in expected])
+        t = load()
+        self.assertEqual(set(call_files), t.CALL_FILES)
+        # linux-status和payload pack是保留项；实际pack/final-reader均在payload外固定目录。
+        calls = [name for name in t.CALLS if name not in ('initialize', 'checkout', 'linux-status', 'pack')]
+        self.assertEqual(len(calls), 16)
+        added = [f'frd-release-a-evidence/setup/calls/{call}/{name}' for call in calls for name in call_files]
+        added += [folder + '/' + name for folder in ('release-a-pack', 'release-a-final-verify') for name in call_files]
+        added += ['frd-release-a-evidence/provenance/' + name for name in sorted(t.PROVENANCE - {'state.json', 'checkout.json'})]
+        added += ['frd-release-a-evidence/setup/' + name for name in sorted(t.SETUP_FILES - {'host.json', 'lifecycle-error.json', 'transport-error.json'})]
+        added += [f'frd-release-a-evidence/setup/groups/{kind}/{name}' for kind in ('setup', 'collect', 'control-normal', 'control-halt')
+                  for name in ('scope.json', 'halt.json', 'stopped.json')]
+        self.assertEqual(len(added), 154)
+        expected += added
         self.assertEqual(actual, ['${{ runner.temp }}/' + name for name in expected])
-        self.assertEqual(len(actual), 54)
+        self.assertEqual(len(actual), 208)
         self.assertEqual(len(actual), len(set(actual)))
         self.assertTrue(all(not any(char in path for char in '*?[]') for path in actual))
 

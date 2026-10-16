@@ -95,3 +95,19 @@ Windows source profile及对应源码exact材料已接入，固定上游归档�
 目录修复与封闭前缀已完成源码实现：本机 focused 5/5、完整运输模块26/26通过，含真实initialize后隔离Git的CRLF/属性/blob控制。独立审查发现一项P2：固定54路径内的两个隐藏源会被upload默认过滤；仅forensic启用`include-hidden-files: true`并加精确断言后，该控制实际1项RED→GREEN。原26项无需无关重跑；旧日志与冻结保持。root已全文读取411行原diff、20行修复diff及两报告，核139项初版和15项修复材料。此处仍是源码/宿主结论；Windows前缀、实际隐藏文件上传与WSL/FFmpeg未由它替代。
 
 该唯一P2经定向复审 Spec PASS / Quality Approved关闭，报告SHA256 `27acf8154505e130c95e42173ad2de2361dab2fcf831b7fa491d3aec0fd1e2e3`。root核对复审两件及四当前源后，只释放一次固定`BootstrapCheckoutDiagnostic`的正常功能分支push；不另dispatch/rerun，不启动自然A、WSL或builder。实际Windows结果另记。
+
+### Windows 源码准备实际通过
+
+提交`0eaff068ddc2391d025f559d771aa02ca18cb93a`的[固定前缀run38853042725/attempt1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38853042725) / job116818287351已SUCCESS。initialize和checkout实际exit0、退出及双通道EOF均已观察，stderr为空；state为checkout_ready=true、setup_ready=false、builder_started=false，未启动WSL。初始化实际观察到Python MainModule；checkout快速进程未观察到，原因照原record保留，不能合并称两次均有映像证明。
+
+artifact12026220958为4,117,845字节、SHA256 `d7ea452d9ce0f2d12c64edd4918d337f5e6c1bd5ec6417eee6a0b64ee9c8587f`，实际42成员。root核对全部16个物理源码副本等于同提交blob，包含先前漏传的两个隐藏源；21条Git原调用均exit0且exe身份一致，六个Windows工具的catalog与保存bin身份相同。54允许路径中缺失12项均为本次未生成的错误文件、已移动的初始化原位置、未观察到的checkout映像和原不存在的attributes-before。原件在`target/windows-shipping-checkout-diagnostic-root-20261016/ci/`，未执行下载内容。
+
+这关闭了本次源码准备冲突及隐藏源上传遗漏的实际门；完整WSL环境、自然FFmpeg、正式POSIX三件和B/C/D仍待完成。
+
+实际前缀的独立核验已通过，报告SHA256 `fa13a86f780e8a9b2c14c7d104d248bc8e834fb4c153168fe5e655278096f4f7`；root已全文读并核两项复审冻结。它进一步确认21次Git中20次观察到MainModule、首次快速HEAD未观察到；不将工具catalog快照误称六工具都已执行。后继恢复完整自然流程仍须独立源码审查。
+
+### 恢复完整流程的源码审查
+
+固定Execute、Collect与正式三件的always接线已恢复，独立源码审查Spec PASS / Quality Approved，报告SHA256 `8fd0404f29d90a287260cf3c0fd3afecf75ab3018f9a3beafd14db587ebc43b9`；root已全文读取291行diff并核16项材料及四当前源。唯一workflow控制实际1项RED→GREEN，其余控制无需重复。失败forensic保留原54路径及hidden开关，再加入154个固定阶段原件路径，总208条，无wildcard；它仍只是有限partial，UUID和动态attempt内原件依赖正式完整运输，不因上传成功升为stable。
+
+下一次审定提交只触发一次原固定自然流程，保留初始失败、setup/control拒绝和原工具调用；不另dispatch/rerun，不改变默认upstream或修改核。实际WSL及FFmpeg结果待记录。
