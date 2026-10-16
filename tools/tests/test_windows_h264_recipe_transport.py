@@ -1005,6 +1005,259 @@ class FailedWslExportBoundary(unittest.TestCase):
     def run_fixture(self, case):
         return self.module.export_failed(case['repo'], case['evidence'], case['source'])
 
+    def windows_observations(self, mutate=None):
+        # 明确的host合成API语义；实际Path/open/read/close和源Reader保持真实。
+        import contextlib, sys
+        from types import SimpleNamespace
+        original_regular, original_fstat = self.module.regular, self.module.os.fstat
+        counts = dict(path=0, fd=0)
+        fields = ('st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        def observation(info, kind):
+            values = {name: getattr(info, name) for name in fields}
+            values.update(st_file_attributes=32, st_reparse_tag=0, st_birthtime_ns=info.st_ctime_ns)
+            if kind == 'fd': values['st_ctime_ns'] += 2000000
+            counts[kind] += 1
+            if mutate is not None: mutate(kind, counts[kind], values)
+            return SimpleNamespace(**values)
+        def regular(root, path, directory=False):
+            info = original_regular(root, path, directory)
+            return info if directory else observation(info, 'path')
+        def fstat(fd): return observation(original_fstat(fd), 'fd')
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(self.module, 'sys', SimpleNamespace(platform='win32', stderr=sys.stderr)))
+        stack.enter_context(mock.patch.object(self.module, 'regular', side_effect=regular))
+        stack.enter_context(mock.patch.object(self.module.os, 'fstat', side_effect=fstat))
+        return stack, counts
+
+    def test_windows_stable_creation_vs_change_time_reads_without_weakening_fd_identity(self):
+        directory = self.work/'windows-stable'; directory.mkdir()
+        path = directory/'input.bin'; path.write_bytes(b'committed stable payload\x00')
+        stack, counts = self.windows_observations()
+        with stack:
+            raw = self.module.Reader().read(directory, path, 1024)
+        self.assertEqual(raw, b'committed stable payload\x00')
+        self.assertGreaterEqual(counts['fd'], 6)
+
+    def test_windows_all_seven_fields_reject_at_path_and_fd_read_copy_boundaries(self):
+        fields = ('st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        controls = (('guard', 'read', 'path', (2,)), ('metadata-end', 'read', 'fd', (2,)),
+                    ('read-open', 'read', 'fd', (3,)), ('read-end', 'read', 'fd', (4,)),
+                    ('copy-open', 'copy', 'fd', (3,)), ('copy-end', 'copy', 'fd', (4,)),
+                    ('reread-open', 'copy', 'fd', (5,)), ('reread-end', 'copy', 'fd', (6,)),
+                    ('read-final', 'read', 'fd', (5,6)), ('copy-final', 'copy', 'fd', (7,8)))
+        for label, method, kind, numbers in controls:
+            for field in fields:
+                with self.subTest(stage=label, field=field):
+                    directory = self.work/(label+'-'+field); directory.mkdir()
+                    path = directory/'input.bin'; path.write_bytes(b'identity matrix payload')
+                    def mutate(got, number, values):
+                        if got == kind and number in numbers:
+                            values[field] += 2 if field == 'st_mode' else 1
+                    stack, counts = self.windows_observations(mutate)
+                    streams = []; original_open = Path.open
+                    def opening(candidate, *args, **kwargs):
+                        stream = original_open(candidate, *args, **kwargs); streams.append(stream); return stream
+                    with stack, mock.patch.object(Path, 'open', new=opening):
+                        with self.assertRaises(ValueError):
+                            reader = self.module.Reader()
+                            if method == 'read': reader.read(directory, path, 1024)
+                            else: reader.copy(directory, path, directory/'copy.bin', 1024)
+                    self.assertTrue(streams)
+                    self.assertTrue(all(stream.closed for stream in streams))
+
+    def test_windows_bridge_rejects_each_comparable_field_and_missing_actual_birth(self):
+        controls = [(name, 'fd', 'change') for name in ('st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns')]
+        controls += [('st_birthtime_ns', kind, change) for kind in ('path','fd') for change in ('change','missing')]
+        for field, kind, change in controls:
+            with self.subTest(field=field, side=kind, change=change):
+                directory = self.work/(field+'-'+kind+'-'+change); directory.mkdir()
+                path = directory/'input.bin'; path.write_bytes(b'bridge payload')
+                def mutate(got, number, values):
+                    if got == kind and number == 1:
+                        if change == 'missing': values.pop(field)
+                        else: values[field] += 2 if field == 'st_mode' else 1
+                stack, counts = self.windows_observations(mutate)
+                with stack:
+                    with self.assertRaises(ValueError) as caught:
+                        self.module.Reader().read(directory, path, 1024)
+                if hasattr(caught.exception, 'identity_diagnostic'):
+                    detail = caught.exception.identity_diagnostic
+                    self.assertNotIn('ctime_ns', detail['failed_fields'])
+                    self.assertEqual(detail['operation'], 'path-handle-open')
+                    self.assertLessEqual(len(json.dumps(detail).encode()), 4096)
+                self.assertEqual(counts['fd'], 1)
+
+    def test_windows_second_bridge_uses_fresh_fstat_after_second_guard(self):
+        directory = self.work/'fresh-F1'; directory.mkdir()
+        path = directory/'input.bin'; path.write_bytes(b'fresh observation')
+        def mutate(kind, number, values):
+            if kind == 'fd' and number == 2: values['st_birthtime_ns'] += 1
+        stack, counts = self.windows_observations(mutate)
+        with stack:
+            with self.assertRaisesRegex(ValueError, 'path handle binding changed') as caught:
+                self.module.Reader().read(directory, path, 1024)
+        detail = caught.exception.identity_diagnostic
+        self.assertEqual(detail['operation'], 'path-handle-guard-end')
+        self.assertEqual(detail['failed_fields'], ['birthtime_ns'])
+        self.assertEqual(counts, dict(path=2, fd=2))
+
+    def test_windows_temporary_handle_for_other_object_is_rejected_when_path_is_restored(self):
+        directory = self.work/'actual-A-B-A'; directory.mkdir()
+        path = directory/'input.bin'; other = directory/'other.bin'; hold = directory/'held.bin'
+        path.write_bytes(b'same bytes'); other.write_bytes(b'same bytes')
+        original_open = Path.open; streams = []
+        def opening(candidate, *args, **kwargs):
+            if candidate == path and not streams:
+                os.replace(path, hold); os.replace(other, path)
+                stream = original_open(candidate, *args, **kwargs); streams.append(stream)
+                os.replace(path, other); os.replace(hold, path)
+                return stream
+            return original_open(candidate, *args, **kwargs)
+        stack, counts = self.windows_observations()
+        with stack, mock.patch.object(Path, 'open', new=opening):
+            with self.assertRaisesRegex(ValueError, 'path handle binding changed') as caught:
+                self.module.Reader().read(directory, path, 1024)
+        self.assertIn('ino', caught.exception.identity_diagnostic['failed_fields'])
+        self.assertTrue(streams[0].closed)
+        self.assertEqual(counts['path'], 1)  # 绑定失败不以末尾path恢复为理由继续。
+
+    def test_windows_same_size_restored_mtime_replace_rejected_at_actual_open_reread_and_final(self):
+        for method, opened_at in (('read',2),('read',3),('copy',2),('copy',3),('copy',4)):
+            with self.subTest(method=method, opened_at=opened_at):
+                directory = self.work/(method+'-replace-'+str(opened_at)); directory.mkdir()
+                path = directory/'input.bin'; replacement = directory/'replacement.bin'
+                path.write_bytes(b'fixed-length-old'); replacement.write_bytes(b'fixed-length-new')
+                info = path.stat(); os.utime(replacement, ns=(info.st_atime_ns, info.st_mtime_ns))
+                original_open = Path.open; streams = []; calls = []
+                def opening(candidate, *args, **kwargs):
+                    if candidate == path:
+                        calls.append(candidate)
+                        if len(calls) == opened_at: os.replace(replacement, path)
+                    stream = original_open(candidate, *args, **kwargs); streams.append(stream); return stream
+                stack, counts = self.windows_observations()
+                with stack, mock.patch.object(Path, 'open', new=opening):
+                    with self.assertRaises(ValueError):
+                        reader = self.module.Reader()
+                        if method == 'read': reader.read(directory, path, 1024)
+                        else: reader.copy(directory, path, directory/'copy.bin', 1024)
+                self.assertEqual(len(calls), opened_at)
+                self.assertTrue(all(stream.closed for stream in streams))
+                self.assertEqual(path.stat().st_mtime_ns, info.st_mtime_ns)
+                self.assertEqual(path.stat().st_size, info.st_size)
+
+    def test_windows_canonical_budget_cap_and_handle_type_guards_fail_closed(self):
+        directory = self.work/'canonical-bounds'; directory.mkdir()
+        path = directory/'input.bin'; path.write_bytes(b'bounded file')
+        stack, counts = self.windows_observations()
+        with stack:
+            with self.assertRaisesRegex(ValueError, 'file byte bound'):
+                self.module.Reader().read(directory, path, 1)
+        self.assertEqual(counts['fd'], 0)
+        for field, value, message in (('st_file_attributes',0x400,'reparse'),('st_mode',0o040700,'file type'),('st_nlink',2,'hardlink')):
+            def mutate(kind, number, values):
+                if kind == 'fd' and number == 1: values[field] = value
+            stack, counts = self.windows_observations(mutate)
+            with stack:
+                with self.assertRaisesRegex(ValueError, message):
+                    self.module.Reader().read(directory, path, 1024)
+        stack, counts = self.windows_observations()
+        calls = []; streams = []; original_open = Path.open
+        def budget():
+            calls.append(1)
+            if len(calls) == 2: raise ValueError('export time bound')
+        def opening(candidate, *args, **kwargs):
+            stream = original_open(candidate, *args, **kwargs); streams.append(stream); return stream
+        with stack, mock.patch.object(Path, 'open', new=opening):
+            with self.assertRaisesRegex(ValueError, 'export time bound'):
+                self.module.path_identity(directory, path, 1024, budget)
+        self.assertEqual(len(streams), 1)
+        self.assertTrue(streams[0].closed)
+        reader = self.module.Reader(); reader.began -= 21
+        with self.assertRaisesRegex(ValueError, 'export time bound'): reader.read(directory, path, 1024)
+        second = directory/'second.bin'; second.write_bytes(b'additional file')
+        stack, counts = self.windows_observations()
+        with stack, mock.patch.object(self.module, 'TOTAL_LIMIT', 20):
+            reader = self.module.Reader(); reader.read(directory, path, 1024)
+            with self.assertRaisesRegex(ValueError, 'total byte bound'): reader.read(directory, second, 1024)
+
+    def test_posix_reader_keeps_original_provider_without_metadata_open(self):
+        from types import SimpleNamespace
+        directory = self.work/'posix-provider'; directory.mkdir()
+        path = directory/'input.bin'; path.write_bytes(b'posix bytes')
+        original_open = Path.open; streams = []
+        def opening(candidate, *args, **kwargs):
+            stream = original_open(candidate, *args, **kwargs); streams.append(stream); return stream
+        with mock.patch.object(self.module, 'sys', SimpleNamespace(platform='linux')), mock.patch.object(Path, 'open', new=opening):
+            raw = self.module.Reader().read(directory, path, 1024)
+        self.assertEqual(raw, b'posix bytes')
+        self.assertEqual(len(streams), 1)
+        self.assertTrue(streams[0].closed)
+
+    def host_probe_definitions(self):
+        import types
+        path = ROOT/'tools/windows-file-identity-probe.py'
+        module = types.ModuleType('host_only_probe_function_fixture'); module.__file__ = str(path)
+        # 只装入定义并调用有限host helper；不运行main/run或伪造Windows平台probe。
+        exec(compile(path.read_bytes(), '<host probe helper definitions>', 'exec'), module.__dict__)
+        return module
+
+    def test_probe_fixed_loader_reads_current_qualifier_bytes_without_import_cache(self):
+        probe = self.host_probe_definitions()
+        exporter, source = probe.trusted_exporter(ROOT)
+        self.assertEqual(source['qualifier_source_relative_path'], 'tools/qualify-windows-h264-recipe-A.ps1')
+        self.assertEqual(source['qualifier_source_sha256'], digest((ROOT/source['qualifier_source_relative_path']).read_bytes()))
+        directory = self.work/'fixed-loader'; directory.mkdir()
+        path = directory/'input.bin'; path.write_bytes(b'real fixed-source Reader')
+        self.assertEqual(exporter['Reader']().read(directory, path, 1024), b'real fixed-source Reader')
+
+    def test_probe_canonical_host_controls_use_actual_exporter_and_reject_actual_read_replace(self):
+        import time
+        probe = self.host_probe_definitions()
+        for name, payload in (('stable-direct',probe.DIRECT),('stable-replaced-before-observation',probe.COMMITTED),('replace-before-open-control',probe.AFTER)):
+            with self.subTest(name=name):
+                directory = self.work/name; directory.mkdir()
+                path = directory/'input.bin'; path.write_bytes(payload)
+                row = dict(name=name, measurement_complete=False)
+                stack, counts = self.windows_observations()
+                with stack:
+                    probe.canonical_observe(directory, path, row, payload, time.monotonic(), self.module.__dict__)
+                self.assertTrue(row['measurement_complete'])
+                self.assertEqual(set(row['canonical_path_snapshot']['fields']), {'dev','ino','mode','nlink','size','mtime_ns','ctime_ns'})
+                if name == 'replace-before-open-control':
+                    self.assertFalse(row['canonical_reader']['accepted'])
+                    self.assertTrue(row['canonical_reader']['expected_replacement_rejected'])
+                    self.assertEqual(row['canonical_reader']['identity_diagnostic']['operation'], 'read-open')
+                    self.assertIn('ino', row['canonical_reader']['identity_diagnostic']['differences'])
+                    self.assertEqual(path.read_bytes(), probe.BEFORE)
+                else:
+                    self.assertTrue(row['canonical_reader']['accepted'])
+                    self.assertEqual(row['canonical_reader']['read_payload_sha256'], digest(payload))
+
+    def test_windows_export_success_and_bridge_write_failure_preserve_original_status(self):
+        import contextlib, io
+        valid = self.fixture('windows-export-valid'); stack, counts = self.windows_observations()
+        with stack: result = self.run_fixture(valid)
+        self.assertTrue(result['complete'], result)
+        self.assertEqual(len(result['files']), 15)
+        self.assertEqual(len(list((valid['evidence'].parent/'release-a-failed-wsl').iterdir())), 16)
+        failed = self.fixture('windows-bridge-write-failed')
+        def mutate(kind, number, values):
+            if kind == 'fd' and number == 1: values['st_birthtime_ns'] += 1
+        stack, counts = self.windows_observations(mutate)
+        original_open = Path.open; streams = []; stderr = io.StringIO()
+        def opening(path, *args, **kwargs):
+            if path.name == 'selection.json': raise OSError('injected selection write failure')
+            stream = original_open(path, *args, **kwargs); streams.append(stream); return stream
+        with stack, mock.patch.object(Path, 'open', new=opening), contextlib.redirect_stderr(stderr):
+            self.module.sys.stderr = stderr
+            result = self.run_fixture(failed)
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['error'], 'path handle binding changed')
+        self.assertEqual(result['identity_diagnostic']['failed_fields'], ['birthtime_ns'])
+        self.assertTrue(result['identity_diagnostic_write_failed'])
+        self.assertIn('original strict rejection retained', stderr.getvalue())
+        self.assertTrue(all(stream.closed for stream in streams))
+
     def test_host_injected_identity_rejection_preserves_named_relative_diagnostic(self):
         from types import SimpleNamespace
         case = self.fixture('identity-field-diagnostic')

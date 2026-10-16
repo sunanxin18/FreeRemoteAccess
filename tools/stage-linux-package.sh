@@ -12,6 +12,11 @@ case "${FRD_LINUX_ARCH:-$(uname -m)}" in
   aarch64|arm64) platform=linux-aarch64; rust_target=aarch64-unknown-linux-gnu ;;
   *) echo '不支持的 Linux 架构' >&2; exit 2 ;;
 esac
+shipping_collection="${FRD_LINUX_PUBLICATION_SHIPPING:-0}"
+case "$shipping_collection" in 0|1) ;; *) echo 'publication 收集只接受显式0或1' >&2; exit 2;; esac
+if [[ "$shipping_collection" == 1 ]]; then
+  [[ "$profile" == release && ( "$platform" == linux-x86 || "$platform" == linux-x86_64 ) ]] || { echo 'publication 收集仅支持Linux x86 release；debug/ARM64不可用' >&2; exit 2; }
+fi
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 [[ "$target_dir" == /* ]] || target_dir="$repo_root/$target_dir"
 codec_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-linux}"
@@ -19,9 +24,13 @@ codec_root="${FRD_FFMPEG_BUILD_ROOT:-$repo_root/target/ffmpeg-linux}"
 codec_bundle="$codec_root/bundle/$platform"
 # 缺少 native codec 时立即失败，不生成只有图标或宿主可执行文件的假包。
 "$repo_root/tools/verify-linux-ffmpeg-bundle.sh" "$codec_bundle" "$platform"
-build_args=(build --locked -p freeremotedesk-linux --target "$rust_target")
-[[ "$profile" != release ]] || build_args+=(--release)
-cargo "${build_args[@]}"
+if [[ "$shipping_collection" == 1 ]]; then
+  python3 "$repo_root/tools/collect-linux-publication-shipping.py" build "$platform" "$profile"
+else
+  build_args=(build --locked -p freeremotedesk-linux --target "$rust_target")
+  [[ "$profile" != release ]] || build_args+=(--release)
+  cargo "${build_args[@]}"
+fi
 binary="$target_dir/$rust_target/$profile/freeremotedesk-linux"
 [[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] || { echo '缺少目标客户端 ELF' >&2; exit 1; }
 parent="$target_dir/linux/$profile/$platform"
@@ -60,4 +69,7 @@ output="$parent/FreeRemoteDesk"
 # 仅替换已验证的目标构建目录；不安装到系统，也不触碰运行中的其他平台客户端。
 rm -rf "$output"
 mv "$package" "$output"
+if [[ "$shipping_collection" == 1 ]]; then
+  python3 "$repo_root/tools/collect-linux-publication-shipping.py" finalize "$platform" "$profile"
+fi
 printf 'Linux 完整客户端包：%s\n' "$output"

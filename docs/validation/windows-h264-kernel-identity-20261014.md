@@ -217,3 +217,19 @@ Artifact12044899390含159成员，完整9303878B、SHA256 `171dc6df6efff0368fd91
 普通Windows工作流仅x64行在Rust构建前运行该小probe，并单独上传唯一literal `target/windows-file-identity-probe/result.json`；它不运行WSL/FFmpeg或扫描旧attempt。本次不修改长A工作流，其push filter仅自身文件，本次不会重新触发长A。Windows实测与任何兼容修复仍待原件，不按常见差异删除字段或改成hash-only。
 
 三源独立审查通过（报告SHA256 `b8fcebfcf8d051c1079d5eb8027b43473dc879d5f4f408b8081f11c128c8d037`，root全文读并核7审查项、11修订项、24旧项及8保护输入）；后继两步接线独立审查也通过（报告SHA256 `875c469f55a6de8cd4ded919a8066a5e7ff1200f6a20684bd5e5cc9824925acd`，root核7项）。删新增589B block后Windows workflow逐字恢复已审基准接线；全仓77个run均未超过21000字符。这里只关闭source/host门，实际Windows观察仍待本次正常CI。
+
+## 2026-10-16 Windows 文件身份原生观察：ctime 语义差异复现
+
+`8cb7f719` 的 [run38909036327/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38909036327)中，x64 job117005568749 的固定probe与上传均success。artifact12049878393恰单成员result.json，ZIP1681B/SHA256 `eb15d212bdbe3a8bc94798160e3582a24370bfb0ea8cb9ece7f34e02d77e8774`；root核API来源、CRC和JSON bytes。probe源SHA `cf3f5887…` 精确等于审定LF源码的CRLF检出字节；CPython3.12.10 AMD64/Windows build26100实际记录齐全，measurement_complete=true、identity_compatibility仍UNQUALIFIED。
+
+直接新建文件的七字段一致；先replace再观察、已无后续写入的稳定文件，path ctime_ns为1792158524161456600，open/read-end fd为1792158524163467700，其他dev/ino/mode/nlink/size/mtime_ns六项和固定payloadSHA均一致。原比较会在read-open拒绝。开句柄前替换负对照仍因ino/mtime/ctime变化拒绝。原probe没有保存birth原字段，因此不能说后续birth桥接或新比较流程已通过。
+
+精确版本 [CPython3.12.10 fileutils.c](https://github.com/python/cpython/blob/v3.12.10/Python/fileutils.c#L1108) 的句柄stat使用ChangeTime；[posixmodule.c](https://github.com/python/cpython/blob/v3.12.10/Modules/posixmodule.c#L2139)的路径兼容分支将birthtime复制至ctime。这支持本次跨API字段语义不同的实测解释；[上游问题157671](https://github.com/python/cpython/issues/157671)记录了3.14的同类差异，不能代替本次3.12记录。
+
+当前Python exe SHA `4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a` 与原01cd失败包保存python.bin相同；这只绑定exe，不证明完整DLL运行时，也不能补回旧A未记录的具体文件/字段。已确认一种稳定文件会被原比较误拒绝的机制，原make内层首错仍UNKNOWN。
+
+统一取值修复现已实现：临时path handle先以六个同语义字段及双方实际birth绑定原regular/lstat批准对象，再以真实fstat完整七字段作snapshot与read/copy/reread/final比较。birth仅作额外桥接，不替换ctime；第二次路径检查使用fresh fstat，最后路径检查重开handle，缺birth直接拒绝。POSIX、目录、20秒/40MiB、首错及原运输闭集保持。
+
+宿主反例由原稳定文件被拒绝变为成功，18项聚焦及完整transport模块55项通过；涵盖七字段各阶段变化、桥接字段与birth缺失、实际文件替换、同大小恢复mtime、句柄关闭和诊断失败。小probe复用固定源码中的真实Reader，保留旧raw观察并增加两次stable读取及实际read-open替换负控。以上是宿主合成语义测试，尚未证明Windows实际birth可得或新流程原生通过；后续普通Windows CI小probe验证后才决定是否再运行长A。
+
+三源实现独立审查通过：5104B报告SHA256 `b0ece2dc17fec817fed666367f7112dd13039e9d515d04910ba220819b55516f`，root全文读并核38作者项、8保护输入及12审查绑定。普通Windows流程将运行固定无参probe，核对实际birth、稳定接受和read-open替换拒绝；长A工作流未改，未手动dispatch/rerun。

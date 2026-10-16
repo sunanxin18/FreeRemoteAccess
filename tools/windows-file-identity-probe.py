@@ -32,7 +32,7 @@ def signature(info):
 
 def snapshot(info):
     value = dict(fields=dict(zip(FIELDS, signature(info))))
-    value['attributes'] = {name: getattr(info, name) for name in ('st_file_attributes', 'st_reparse_tag') if hasattr(info, name)}
+    value['attributes'] = {name: getattr(info, name) for name in ('st_file_attributes', 'st_reparse_tag', 'st_birthtime_ns') if hasattr(info, name)}
     return value
 
 
@@ -116,7 +116,7 @@ def observe(workspace, path, row, expected, began, replacement=None):
     row['old_reader_first_rejection'] = next((name for name, value in comparisons.items() if not value['equal']), None)
     require(raw == expected, 'fixed fixture payload mismatch')
     deadline(began)
-    row['measurement_complete'] = True
+    row['old_observation_complete'] = True
 
 
 def tool_metadata(workspace):
@@ -144,6 +144,70 @@ def tool_metadata(workspace):
                 python_identity_scope='current executable file only; no DLL or global runtime qualification',
                 windows=windows, reported_machine=platform.machine(), source_relative_path='tools/windows-file-identity-probe.py',
                 source_sha256=hashlib.sha256(source_bytes).hexdigest())
+
+
+def trusted_exporter(workspace):
+    # 唯一固定受信源码，读实际bytes并记录hash；不import模块或使用pycache。
+    path = workspace / 'tools/qualify-windows-h264-recipe-A.ps1'
+    checked_path(workspace, path)
+    with path.open('rb') as stream:
+        before = os.fstat(stream.fileno())
+        no_link(before)
+        require(before.st_size <= 256 * 1024, 'qualifier byte bound')
+        raw = stream.read(256 * 1024 + 1)
+        require(len(raw) <= 256 * 1024, 'qualifier read byte bound')
+        require(signature(before) == signature(os.fstat(stream.fileno())), 'qualifier read changed')
+    checked_path(workspace, path)
+    text = raw.decode('utf-8').replace('\r\n', '\n')
+    start = "$failedWslExporter = @'\n"
+    require(text.count(start) == 1, 'unique fixed exporter required')
+    remainder = text.split(start, 1)[1]
+    require("\n'@" in remainder, 'fixed exporter terminator required')
+    code = remainder.split("\n'@", 1)[0]
+    require(len(code.encode()) <= 64 * 1024, 'exporter byte bound')
+    namespace = dict(__name__='fixed_windows_identity_exporter', __file__='fixed qualifier embedded exporter')
+    exec(compile(code, '<fixed qualifier embedded exporter>', 'exec'), namespace)
+    return namespace, dict(qualifier_source_relative_path='tools/qualify-windows-h264-recipe-A.ps1',
+                           qualifier_source_sha256=hashlib.sha256(raw).hexdigest(),
+                           embedded_exporter_normalized_sha256=hashlib.sha256(code.encode()).hexdigest())
+
+
+def canonical_observe(workspace, path, row, expected, began, exporter):
+    deadline(began)
+    # 使用当前批准exporter实际函数；所有快照来自真实fstat，不另造宽松判定。
+    row['canonical_path_snapshot'] = snapshot(exporter['path_identity'](workspace, path, FILE_LIMIT, lambda: deadline(began)))
+    reader = exporter['Reader']()
+    if row['name'] != 'replace-before-open-control':
+        raw = reader.read(workspace, path, FILE_LIMIT)
+        require(raw == expected, 'canonical fixed payload mismatch')
+        row['canonical_reader'] = dict(accepted=True, read_bytes=len(raw), read_payload_sha256=hashlib.sha256(raw).hexdigest())
+    else:
+        # 旧raw负控已替换一次；固定补一个小fixture，在Reader的实际read open前再替换一次。
+        replacement = path.parent / 'replacement.tmp'
+        write_payload(workspace, replacement, BEFORE, began)
+        class BeforeActualRead:
+            opens = 0
+            def __fspath__(self): return os.fspath(path)
+            def __str__(self): return str(path)
+            def open(self, mode):
+                require(mode == 'rb', 'fixed read-only control required')
+                self.opens += 1
+                if self.opens == 2:
+                    replace_payload(workspace, replacement, path, began)
+                return path.open(mode)
+        controlled = BeforeActualRead()
+        try:
+            reader.read(workspace, controlled, FILE_LIMIT)
+        except exporter['IdentityMismatch'] as error:
+            require(controlled.opens == 2 and str(error) == 'open identity changed', 'canonical control rejected at unexpected phase')
+            detail = getattr(error, 'identity_diagnostic', None)
+            require(detail is not None and detail['operation'] == 'read-open', 'canonical control diagnostic missing')
+            row['canonical_reader'] = dict(accepted=False, expected_replacement_rejected=True,
+                                            actual_path_opens=controlled.opens, error=str(error), identity_diagnostic=detail)
+        else:
+            raise ValueError('canonical control accepted replacement')
+    deadline(began)
+    row['measurement_complete'] = True
 
 
 def save_result(workspace, output, value):
@@ -201,6 +265,8 @@ def run():
         output = candidate
         save_result(workspace, output, result)
         result['tools'] = tool_metadata(workspace)
+        exporter, source_identity = trusted_exporter(workspace)
+        result['tools'].update(source_identity)
         for name, file_name, initial, expected in (
                 ('stable-direct', 'direct.bin', DIRECT, DIRECT),
                 ('stable-replaced-before-observation', 'committed.bin', COMMITTED, COMMITTED),
@@ -221,6 +287,7 @@ def run():
                 replacement = output / 'replacement.tmp'
                 write_payload(workspace, replacement, expected, began)
             observe(workspace, path, row, expected, began, replacement)
+            canonical_observe(workspace, path, row, expected, began, exporter)
         deadline(began)
         result['measurement_complete'] = True
         code = 0  # 只表示固定观察完整，不表示strict比较或生产兼容性通过。

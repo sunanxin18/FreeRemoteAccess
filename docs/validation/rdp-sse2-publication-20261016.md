@@ -1,6 +1,6 @@
 # RDP RGBA→BGRX 的 SSE2 转换
 
-2026-10-16，状态：**开发中**。Windows/Linux i686 与 x86_64 的 SSE2 转换已通过局部正确性、私有保护页及四份精确图像的 normal-return ABI 验证。最新原生主 CI 已通过；真实计时、shipping 调用实例与完整生产资格仍未完成。以下按提交保留每次验证及失败的历史边界。
+2026-10-16，状态：**开发中**。Windows/Linux i686 与 x86_64 的 SSE2 转换已通过局部正确性、私有保护页及四份精确图像的 normal-return ABI 验证。原生主 CI 已通过；四目标普通 warm 微基准已完成原件核算和独立复核，shipping 调用实例与完整生产资格仍未完成。以下按提交保留每次验证及失败的历史边界。
 
 RequiredNative 的 x86 准入要求 SSE2，原像素发布转换却只在 SSSE3 可用时使用原生实现，否则回到标量。现在保留 SSSE3 优先，其后检查真实 SSE2，再选择共享的 SSE2 入口；只有未通过 SSE2 检查的 CPU 才使用明确的 reference 后备。协议、解码器选择、Surface 合同、默认策略、能力广告和 ARM64 实现保持。
 
@@ -246,3 +246,32 @@ Windows/Linux 原矩阵各两个 x86 目标已接入固定 runner；ARM64 明确
 原件和root全量纯数据核对在 `target/publication-benchmark-and-file-identity-delivery-root-20261016/ci/`；下载内容仅以0600读取，从未在Mac执行。四目标完整性能、shipping内部调用实例、完整unwind与真实会话继续开放，Task4A2.10C保持未勾选。
 
 独立实际读数复审通过：5204B报告SHA256 `e430c7a60fc41d9c01d3a5485957ab8554bf4e40f6a677612a4957a8ab8ec7d5`，root全文读并核15项关键绑定；独立全量统计另存 `target/publication-benchmark-linux-runtime-review-20261016/independent-readout.json`。复审确认完整性与统计合同，不把20快/10慢、小输入或跨CPU数据改写为整体加速结论。
+
+### Windows 两目标首次普通微基准实际原件
+
+同一 `8cb7f719` 的 [Windows run38909036327/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38909036327)中，x64 job117005568749 与 x86 job117005569327 的 ordinary benchmark 和上传步骤均 success；ARM64按设计跳过；后继jobs-third快照中i686及ARM64包成功、x64包仍进行，尚不宣布整个workflow成功。artifact12049623208为2122893B/SHA256 `3c9bec92b5fcc6ff79e862a650917b6efc1d3a227e59d14481a5c9605442c46c`；artifact12049414741为2114207B/`7daec1f76a86a128af5b691cde351a05d22a9f5aa84ab5cb4858270219aff1d7`，各恰十一成员。
+
+原两个完整GET在60秒结束时只取得801747/867286B，partial原件保留；后继只读认证取得同artifact剩余各3段Range，206/Content-Range/ETag/完整总长校验，再以API全SHA和ZIP CRC校验完整重组后解包。首次root Range辅助脚本因把API对象误当列表而在联网前TypeError，原工具输出保留；修正仅读取元数据形状，没有改被测代码或重跑CI。原件位于 `target/windows-benchmark-and-identity-resume-root-20261016/`，下载内容从未执行。
+
+PE64为3847680B/`c1f0db74b28d26a2f2974eabadedc3b1ea38b1ddd18d06fbcc5035e46594cd7c`，PE32为3813376B/`21261c2db25084d9a6f19f3cfa1ea2bffdd0ecc2700f1dda9f66b697d1eab424`。root逐项核四源/八配置/三工具/两产物记录及source snapshots、同次map、实际non-test release/thin-LTO rustc、staged无参调用、build0/run0、原始EOF/close/hash、完整4055行与3720样本和统计；Python helper配置的物理SHA精确等于同提交Git blob的LF→CRLF，其他固定配置与Rust快照逐字匹配。独立运行复核已通过；不能以该微基准核算预授全包或shipping。
+
+两实例CPUID报告AMD EPYC7763，同型号并不等于同一物理机器或受控跨架构比较。对齐输入的median毫秒如下，完整双alignment/first-operation/31原样本均保留。
+
+| 目标及像素数 | 冻结参考 | SSE2 | SSSE3 | 当前分派 |
+| --- | ---: | ---: | ---: | ---: |
+| Windows x64，1920×1080 | 1.361 | 0.466 | 0.397 | 0.403 |
+| Windows x64，3840×2160 | 5.502 | 2.396 | 2.195 | 2.183 |
+| Windows x86，1920×1080 | 1.408 | 0.528 | 0.444 | 0.450 |
+| Windows x86，3840×2160 | 5.723 | 2.430 | 2.303 | 2.227 |
+
+两实例同样保留SSE2在0/1/2/3/7像素双alignment的慢项。局部大图收益、小输入负收益、共享runner噪声和独立编译上下文共同限定本表，不能推成客户端帧率或网络延迟。
+
+独立Windows原件审查通过：5659B报告SHA256 `323e20678f2b3ccf285db2022e846c12a5551adfd431098fbbcd87103fae749e`，root全文读并核14项绑定。两目标7440原样本、240首次计时及300条统计由独立纯数据计算器重算一致；完整统计存 `target/publication-benchmark-windows-independent-review-20261016/full-statistics.json`。x64直接路线19快/10慢/1平（未对齐4像素），当前分派19快/11慢；i686三条优化路线各20快/10慢。部分p95超过中位数两倍，first-operation有零值，保留计时精度和共享runner噪声限制。
+
+### 普通 Linux GTK 发布包的同次链接取证
+
+为核实优化是否进入真正客户端，新增显式CI收集模式 `FRD_LINUX_PUBLICATION_SHIPPING=1`，仅用于Linux i686/x86_64 release。原普通构建在该模式下使用同一个 `cargo rustc` 产生客户端及map，随后把最终staging ELF与同次构建、原始日志、五份相关源码快照绑定；只上传十个固定原件。默认本地打包、debug及ARM64保留原路径，协议、转换内核与能力广告不变。
+
+该收集模式的18项宿主合成测试、27项既有包合同测试及bash语法检查通过；这些测试没有运行编译器或客户端。它用于后续审查最终发布图像，尚未取得真实GTK包/map，也不关闭shipping调用、ISA或产品性能资格。Windows普通发布实例仍需独立完成。
+
+四源独立审查通过：5087B报告SHA256 `baad7770e538368f6af8c46c81d2d6311c4a93d025063951e07248f5cf726ed8`，root全文读并核作者24项和审查11项绑定。移除新增收集接线后，原workflow/stage文件逐字恢复；原矩阵、权限、ARM路径及既有验证步骤保持。后续只通过正常功能分支push触发原CI，未手动dispatch或rerun。

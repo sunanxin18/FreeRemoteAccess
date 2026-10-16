@@ -1066,7 +1066,7 @@ def identity_diagnostic(operation, root, path, cap, before, observed):
     a, b = dict(zip(names, signature(before))), dict(zip(names, signature(observed)))
     attributes = {}
     for label, info in (('before', before), ('observed', observed)):
-        attributes[label] = {name: getattr(info, name) for name in ('st_file_attributes','st_reparse_tag') if hasattr(info, name)}
+        attributes[label] = {name: getattr(info, name) for name in ('st_file_attributes','st_reparse_tag','st_birthtime_ns') if hasattr(info, name)}
     return dict(operation=operation, relative_path=Path(path).relative_to(Path(root)).as_posix(), cap=cap,
                 before=a, observed=b, differences=[name for name in names if a[name] != b[name]], attributes=attributes)
 
@@ -1099,6 +1099,53 @@ def regular(root, path, directory=False):
     return info
 
 
+def path_handle_bridge(operation, root, path, cap, approved, opened):
+    names = ('dev','ino','mode','nlink','size','mtime_ns')
+    failed = [name for name, a, b in zip(names, signature(approved)[:6], signature(opened)[:6]) if a != b]
+    if not hasattr(approved, 'st_birthtime_ns') or not hasattr(opened, 'st_birthtime_ns'):
+        failed.append('birthtime_ns_missing')
+    elif approved.st_birthtime_ns != opened.st_birthtime_ns:
+        failed.append('birthtime_ns')
+    if not failed:
+        return
+    error = IdentityMismatch('path handle binding changed')
+    try:
+        detail = identity_diagnostic(operation, root, path, cap, approved, opened)
+        # path ctime是兼容creation观察，fd ctime是ChangeTime；不能列为桥接失败字段。
+        detail.update(differences=failed, failed_fields=failed, comparison='path-fd object bridge; ctime domains differ')
+        require(len(json.dumps(detail).encode()) <= 4096, 'identity diagnostic byte bound')
+        error.identity_diagnostic = detail
+    except Exception:
+        pass
+    raise error
+
+
+def path_identity(root, path, cap, check):
+    if sys.platform != 'win32':
+        return regular(root, path)
+    check()
+    approved = regular(root, path)
+    require(approved.st_size <= cap, 'file byte bound')
+    # Windows只读临时handle；真正七字段时间baseline从首次fstat开始。
+    with path.open('rb') as stream:
+        first = os.fstat(stream.fileno())
+        require(stat.S_ISREG(first.st_mode) and not (getattr(first, 'st_file_attributes', 0) & 0x400), 'handle file type/reparse refused')
+        require(first.st_nlink == 1, 'hardlink refused')
+        require(first.st_size <= cap, 'file byte bound')
+        path_handle_bridge('path-handle-open', root, path, cap, approved, first)
+        check()
+        after = regular(root, path)
+        last = os.fstat(stream.fileno())  # P1之后真实fresh F1，不复用F0。
+        require(stat.S_ISREG(last.st_mode) and not (getattr(last, 'st_file_attributes', 0) & 0x400), 'handle file type/reparse refused')
+        require(last.st_nlink == 1, 'hardlink refused')
+        require(last.st_size <= cap, 'file byte bound')
+        same_identity('path-guard-end', root, path, cap, approved, after, 'path guard changed')
+        path_handle_bridge('path-handle-guard-end', root, path, cap, after, last)
+        same_identity('path-handle-end', root, path, cap, first, last, 'path handle changed')
+        check()
+        return last
+
+
 def unique_json(raw):
     def pairs(items):
         require(len(dict(items)) == len(items), 'duplicate JSON key')
@@ -1114,7 +1161,7 @@ class Reader:
         require(time.monotonic() - self.began < 20, 'export time bound')
     def before(self, root, path, cap):
         self.check()
-        info = regular(root, path)
+        info = path_identity(root, path, cap, self.check)
         require(info.st_size <= cap, 'file byte bound')
         self.sizes[str(path)] = info.st_size
         require(sum(self.sizes.values()) <= TOTAL_LIMIT, 'total byte bound')
@@ -1126,7 +1173,7 @@ class Reader:
             raw = stream.read(cap+1)
             require(len(raw) <= cap, 'read changed')
             same_identity('read-end', root, path, cap, before, os.fstat(stream.fileno()), 'read changed')
-        same_identity('read-path-after', root, path, cap, before, regular(root, path), 'read identity changed')
+        same_identity('read-path-after', root, path, cap, before, path_identity(root, path, cap, self.check), 'read identity changed')
         return raw
     def json(self, root, path, cap=META):
         value = unique_json(self.read(root, path, cap))
@@ -1154,7 +1201,7 @@ class Reader:
                 if not block: break
                 reread += len(block); require(reread <= cap, 'reread byte bound'); second.update(block)
             same_identity('copy-reread-end', root, path, cap, before, os.fstat(source.fileno()), 'reread changed')
-        same_identity('copy-path-after', root, path, cap, before, regular(root, path), 'copy identity/bytes changed')
+        same_identity('copy-path-after', root, path, cap, before, path_identity(root, path, cap, self.check), 'copy identity/bytes changed')
         require(count == before.st_size and first.digest() == second.digest(), 'copy identity/bytes changed')
         saved = hashlib.sha256(destination.read_bytes()).hexdigest()
         require(saved == first.hexdigest(), 'saved bytes changed')
