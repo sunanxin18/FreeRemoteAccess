@@ -185,3 +185,13 @@ artifact12033647017为10178868B、119成员、SHA256 `3ccdae6435773b36a343689fc6
 Collect预算为300秒，约5分钟后124，原stdout/stderr均空；三个复制阶段没有进度原件，具体耗时阶段未知。固定scope停止报告不能替代全量copy完成，state仍quiescent=false/attempt=null，原first_error保持builder，正式三件缺失。独立实际读数SHA256 `cb9856da24b79188b7d495fbc97545aae16153daeec771b584b444561221d248`与只读预检`d110fa81d012f49db095d0561d1fe4ad41fb365e971773326e612a3393fbbff7`已由root全文读/冻结核验。
 
 后继原joblog已取37448B、SHA256 `02e64160d58485ab9463513f9754e90b88dadc300153c6d77470cac5f6ef43ff`；此前fifth API仍post-checkout，后续final-check才确认整个job终态，不覆盖旧快照。原log第一次下载被gh的ANSI输出保护拒绝；核帮助后仅允许raw bytes进PIPE文件，未在终端渲染。当前仍须先补关键失败原件及有限收集阶段证据，再决定构建修复，不放宽原stop/consumer或以增加超时猜根因。
+
+### 关键失败调用先保存的源码修复
+
+Collect在原退出/EOF、工具身份与stop门通过后，先导出唯一绑定的失败`FFmpeg build`调用，再进行原大目录复制。固定configuration、attempt/PID、call-id/nonce、原native argv/cwd/双流与supervisor/stop相互绑定；失败歧义、越界、链接、读取变化或超限只保留partial。总源上限40MiB、双stream各16MiB，旁路在正式payload外，原消费者与stop合同不变。失败forensic在原208条后只追加25个固定路径，无wildcard。
+
+原三条复制/工具收集命令及顺序保持，只有固定三阶段start/end/exit记录；导出和复制共用原300秒预算。审查发现并修复了end marker失败掩盖原命令退出的问题：实际shell反例先重现六个双失败错误退出，修后15组合均保留应有退出，marker错误仍进入原stderr。focused9项、修后完整运输模块40项均exit0；实际inline shell的bash-n和Python AST通过。原39项结果与原错误报告保留，未用新结果回写旧证据。
+
+root全文读原三源增量、Fix1报告/5081B delta及独立复审，核33关键原件、127修订原件与复审冻结；最终独立报告SHA256 `89fe2b7bd66f93eb3f924c17c53e67172745321c786da49ca349ade038ac8e8b`确认原P2关闭。原件在`target/windows-shipping-A-failed-wsl-export-fix1-20261016/`。本机没有pwsh；Windows PowerShell/reparse/WSL和真实A仍须由后继运行证明。
+
+本次正常功能分支push释放下一次原固定Execute调用，先取得真实内层错误再决定编译修复；没有预修make、增加重试/超时、放宽guard或发布修改包。run73具体make首错与完整自然FFmpeg/正式运输资格继续开放。

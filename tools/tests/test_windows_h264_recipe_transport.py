@@ -459,8 +459,16 @@ class WorkflowAuthority(unittest.TestCase):
                   for name in ('scope.json', 'halt.json', 'stopped.json')]
         self.assertEqual(len(added), 154)
         expected += added
+        self.assertEqual(actual[:208], ['${{ runner.temp }}/' + name for name in expected])
+        expected += ['release-a-failed-wsl/' + name for name in (
+            'selection.json','wsl.json','native.argv.json','native.exit.json','native.stdout.bin','native.stderr.bin',
+            'native.executable.bin','supervisor.py.bin','lifecycle.intent.json','lifecycle.scope.json','lifecycle.halt.json',
+            'lifecycle.stopped.json','call.pending.json','call.start.json','call.end.json','call.observations.json')]
+        expected += ['release-a-failed-wsl-export.py']
+        expected += ['release-a-failed-wsl-export-call/' + name for name in call_files]
+        expected += ['release-a-collect-phases.json']
         self.assertEqual(actual, ['${{ runner.temp }}/' + name for name in expected])
-        self.assertEqual(len(actual), 208)
+        self.assertEqual(len(actual), 233)
         self.assertEqual(len(actual), len(set(actual)))
         self.assertTrue(all(not any(char in path for char in '*?[]') for path in actual))
 
@@ -938,6 +946,234 @@ class AptPrefixDiagnosticBoundary(unittest.TestCase):
         self.assertEqual(cli.count('$context.bootstrapAptDiagnostic = $true'), 1)
         self.assertRegex(cli, re.compile(r"elseif \(\$Action -ceq 'BootstrapAptDiagnostic'\) \{\s*"
                                         r"\$context.bootstrapAptDiagnostic = \$true\s*Invoke-ReleaseAExecute \$context\s*\}"))
+
+
+class FailedWslExportBoundary(unittest.TestCase):
+    def setUp(self):
+        import re, types
+        source = (ROOT / 'tools/qualify-windows-h264-recipe-A.ps1').read_text()
+        code = re.findall(r"(?s)\$failedWslExporter = @'\n(.*?)\n'@", source)
+        self.assertEqual(len(code), 1)
+        parent = os.environ.get('FRD_WINDOWS_EXECUTION_TEST_ARTIFACTS')
+        if parent:
+            Path(parent).mkdir(parents=True, exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix='failed-wsl-', dir=parent))
+        script = self.work / 'actual-exporter.py'; script.write_text(code[0] + '\n')
+        self.module = types.ModuleType('actual_failed_wsl_exporter'); self.module.__file__ = str(script)
+        exec(compile(code[0], '<actual inline failed wsl exporter>', 'exec'), self.module.__dict__)
+
+    tearDown = InlineSupervisorBoundary.tearDown
+
+    def fixture(self, name):
+        work = self.work / name; repo = work / 'repo'; evidence = work / 'evidence'
+        configuration = repo / '.codex-target/ffmpeg-8.1.2/build-side-frd-h264dc-aarch64-v1/windows-aarch64/Release'
+        attempt = configuration / ('.attempt-431-' + 'a'*32)
+        native = attempt / ('native-supervised-wsl-' + 'b'*32)
+        scope = attempt / 'lifecycle'; native.mkdir(parents=True); scope.mkdir()
+        source, nonce, call = 'd'*40, 'c'*32, 'e'*32
+        def put(path, value):
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(value))
+        put(evidence / 'provenance/state.json', dict(source=source, builder_exit=1))
+        put(evidence / 'provenance/paths.json', dict(wsl='/fixture/repo'))
+        put(evidence / 'setup/calls/builder/exit.json', dict(windows_child=dict(pid=431), exit=1, terminated=True, capture_complete=True))
+        supervisor = attempt / 'release-a-supervisor.py'; supervisor.write_bytes(b'fixture source bytes only\n')
+        sha = digest(supervisor.read_bytes())
+        linux_attempt = '/fixture/repo/' + attempt.relative_to(repo).as_posix()
+        intent = dict(nonce=nonce, scope_linux=linux_attempt+'/lifecycle', supervisor_linux=linux_attempt+'/release-a-supervisor.py', source_sha256=sha)
+        put(attempt / 'lifecycle-intent.json', intent)
+        put(scope / 'scope.json', dict(nonce=nonce, source_path=intent['supervisor_linux'], source_sha256=sha))
+        put(scope / 'halt.json', dict(nonce=nonce)); put(scope / 'stopped.json', dict(nonce=nonce, quiescent=True, new_launches_blocked=True))
+        for kind in ('pending', 'start', 'end', 'observations'):
+            value = dict(nonce=nonce, call_id=call)
+            if kind in ('pending','start'): value.update(source_sha256=sha, source_path=intent['supervisor_linux'])
+            put(scope / (call+'.'+kind+'.json'), value)
+        argv = ['wsl.exe','--scope',intent['scope_linux'],'--nonce',nonce,'--call-id',call,'run','--','bash','-lc','make -j4']
+        exe_sha = digest(b'MZ fixture data only')
+        native_record = dict(argv=argv, cwd=str(repo), stdout=str(native/'stdout.bin'), stderr=str(native/'stderr.bin'), receipt=str(native/'exit.json'), exit=2, terminated=True, capture_complete=True,
+                             executable=dict(before_sha256=exe_sha, saved_sha256=exe_sha, after_sha256=exe_sha))
+        put(native / 'argv.json', native_record); put(native / 'exit.json', native_record)
+        (native / 'stdout.bin').write_bytes(b'raw stdout\x00\r\n'); (native / 'stderr.bin').write_bytes(b'\x1b[31mfirst tool error\x00\xff\r\n')
+        (native / 'executable.bin').write_bytes(b'MZ fixture data only'); (native / 'unlisted.bin').write_bytes(b'untouched')
+        wsl = dict(argv=argv, cwd=str(repo), inner_argv=['bash','-lc','make -j4'], action='FFmpeg build', exit=2, capture_error=None,
+                   raw_receipt=str(native/'exit.json'), stdout=str(native/'stdout.bin'), stderr=str(native/'stderr.bin'),
+                   lifecycle=dict(nonce=nonce, scope=intent['scope_linux'], supervisor=intent['supervisor_linux'], source_sha256=sha))
+        put(attempt / ('wsl-'+call+'.json'), wsl)
+        put(evidence / 'setup/calls/linux-cleanup-builder/exit.json', dict(exit=0, error=None, timed_out=False, terminated=True, capture_complete=True,
+            argv=['wsl.exe','--scope',intent['scope_linux'],'--nonce',nonce,'stop']))
+        return dict(repo=repo, evidence=evidence, configuration=configuration, attempt=attempt, native=native, scope=scope, call=call, source=source, wsl=wsl, put=put)
+
+    def run_fixture(self, case):
+        return self.module.export_failed(case['repo'], case['evidence'], case['source'])
+
+    def test_actual_exporter_keeps_original_bytes_paths_and_untouched_files(self):
+        case = self.fixture('valid'); before = (case['native']/'unlisted.bin').read_bytes()
+        summary = self.run_fixture(case)
+        self.assertTrue(summary['complete'], summary)
+        destination = case['evidence'].parent / 'release-a-failed-wsl'
+        self.assertEqual((destination/'native.stderr.bin').read_bytes(), (case['native']/'stderr.bin').read_bytes())
+        self.assertEqual((destination/'wsl.json').read_bytes(), (case['attempt']/('wsl-'+case['call']+'.json')).read_bytes())
+        self.assertEqual(len(list(destination.iterdir())), 16)
+        self.assertEqual((case['native']/'unlisted.bin').read_bytes(), before)
+        for item in summary['files'].values():
+            if item['status'] == 'copied':
+                self.assertEqual(item['source_sha256'], item['saved_sha256'])
+        with self.assertRaises(FileExistsError):
+            self.run_fixture(case)
+
+    def test_actual_exporter_refuses_ambiguous_escape_links_missing_and_limits(self):
+        for label in ('no-attempt', 'two-attempts', 'two-failed', 'escape', 'link', 'hardlink', 'missing', 'oversize', 'total-cap', 'entry-cap', 'stop-failed', 'bad-nonce'):
+            case = self.fixture(label)
+            if label == 'no-attempt':
+                case['attempt'].rename(case['configuration']/'unlisted-directory')
+            elif label == 'two-attempts':
+                (case['configuration']/('.attempt-432-'+'f'*32)).mkdir()
+            elif label == 'two-failed':
+                case['put'](case['attempt']/('wsl-'+'f'*32+'.json'), case['wsl'])
+            elif label == 'escape':
+                case['wsl']['raw_receipt'] = str(case['configuration'].parent/'outside.json')
+                case['put'](case['attempt']/('wsl-'+case['call']+'.json'), case['wsl'])
+            elif label in ('link', 'hardlink'):
+                path = case['native']/'stderr.bin'; path.unlink()
+                if label == 'link': path.symlink_to(case['native']/'unlisted.bin')
+                else: os.link(case['native']/'unlisted.bin', path)
+            elif label == 'missing':
+                (case['native']/'exit.json').unlink()
+            elif label == 'oversize':
+                with (case['native']/'stdout.bin').open('wb') as stream: stream.truncate(16*1024*1024+1)
+            elif label == 'entry-cap':
+                for number in range(257): (case['attempt']/('extra-'+str(number))).touch()
+            elif label == 'stop-failed':
+                path = case['evidence']/'setup/calls/linux-cleanup-builder/exit.json'
+                value = json.loads(path.read_bytes()); value['exit'] = 1; case['put'](path, value)
+            elif label == 'bad-nonce':
+                case['wsl']['lifecycle']['nonce'] = '0'*32
+                case['put'](case['attempt']/('wsl-'+case['call']+'.json'), case['wsl'])
+            if label == 'total-cap':
+                with mock.patch.object(self.module, 'TOTAL_LIMIT', 8): summary = self.run_fixture(case)
+            else: summary = self.run_fixture(case)
+            with self.subTest(label=label): self.assertFalse(summary['complete'], summary)
+
+    def test_optional_missing_and_real_file_change_are_not_fabricated(self):
+        case = self.fixture('optional')
+        (case['scope']/(case['call']+'.observations.json')).unlink()
+        summary = self.run_fixture(case)
+        self.assertTrue(summary['complete'], summary)
+        self.assertEqual(summary['files']['call.observations.json']['status'], 'missing-optional')
+        root = self.work / 'changed'; root.mkdir(); original = root/'input.bin'; original.write_bytes(b'original')
+        guard = self.module.regular; calls = []
+        def changed_guard(base, path, directory=False):
+            if path == original:
+                calls.append(path)
+                if len(calls) == 2: original.write_bytes(b'changed actual file')
+            return guard(base, path, directory)
+        with mock.patch.object(self.module, 'regular', side_effect=changed_guard):
+            with self.assertRaisesRegex(ValueError, 'copy identity/bytes changed'):
+                self.module.Reader().copy(root, original, root/'copy.bin', 1024)
+
+
+class CollectPhaseBoundary(unittest.TestCase):
+    def setUp(self):
+        import re, types
+        source = (ROOT/'tools/qualify-windows-h264-recipe-A.ps1').read_text()
+        code = re.findall(r'(?s)# FRD_PHASE_BEGIN\n(.*?)\n# FRD_PHASE_END', source)
+        self.assertEqual(len(code), 1)
+        self.module = types.ModuleType('actual_collect_phase_writer')
+        exec(compile(code[0], '<actual inline phase writer>', 'exec'), self.module.__dict__)
+        parent = os.environ.get('FRD_WINDOWS_EXECUTION_TEST_ARTIFACTS')
+        if parent: Path(parent).mkdir(parents=True, exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix='collect-phase-', dir=parent))
+
+    tearDown = InlineSupervisorBoundary.tearDown
+
+    def test_three_fixed_slots_preserve_failure_and_interruption(self):
+        path = self.work/'phases.json'; update = self.module.phase_update
+        update(path, 'llvm-copy', 'start')
+        self.assertIsNone(json.loads(path.read_bytes())['phases']['llvm-copy']['end_ns'])
+        update(path, 'llvm-copy', 'end', 7)
+        self.assertEqual(json.loads(path.read_bytes())['phases']['llvm-copy']['exit'], 7)
+        with self.assertRaises(ValueError): update(path, 'system-tools', 'start')
+        success = self.work/'success.json'
+        for name in ('llvm-copy', 'system-tools', 'build-root-copy'):
+            update(success, name, 'start'); update(success, name, 'end', 0)
+        self.assertEqual(len(json.loads(success.read_bytes())['phases']), 3)
+        self.assertLessEqual(success.stat().st_size, 4096)
+        with self.assertRaises(ValueError): update(success, 'llvm-copy', 'start')
+        with self.assertRaises(ValueError): update(success, 'arbitrary-command', 'start')
+
+    def test_marker_refuses_links_and_large_existing_data(self):
+        target = self.work/'untouched'; target.write_bytes(b'keep')
+        link = self.work/'link.json'; link.symlink_to(target)
+        with self.assertRaises(ValueError): self.module.phase_update(link, 'llvm-copy', 'start')
+        self.assertEqual(target.read_bytes(), b'keep')
+        large = self.work/'large.json'; large.write_bytes(b'x'*4097)
+        with self.assertRaises(ValueError): self.module.phase_update(large, 'llvm-copy', 'start')
+
+    def test_actual_shell_wrapper_preserves_bulk_exit_when_end_marker_also_fails(self):
+        import re
+        source = (ROOT/'tools/qualify-windows-h264-recipe-A.ps1').read_text()
+        collect = re.findall(r"(?s)\$collect = @'\n(.*?)\n'@", source)
+        self.assertEqual(len(collect), 1)
+        # 只保留实际shell包装；不执行Python marker或三条bulk命令。
+        body = collect[0].split('FRD_PHASE\n}\n', 1)[1]
+        commands = (
+            ('llvm-copy', 'if [[ -e /opt/frd-llvm-mingw-20250709 ]]; then cp -a /opt/frd-llvm-mingw-20250709 "$root/toolchain/install"; fi'),
+            ('system-tools', 'python3 "$repo/tools/windows-h264-recipe-transport.py" collect-tools --root "$root"'),
+            ('build-root-copy', 'if [[ -d "$repo/.codex-target/ffmpeg-8.1.2" ]]; then cp -a "$repo/.codex-target/ffmpeg-8.1.2/." "$root/build-root/"; fi'))
+        for phase, command in commands:
+            self.assertEqual(body.count(command), 1)
+            body = body.replace(command, 'fixture_bulk ' + phase)
+        prefix = '''set -euo pipefail
+selected=$1
+bulk_result=$2
+marker_result=$3
+fixture_bulk() {
+    printf 'fixture-bulk:%s\\n' "$1"
+    if [[ $1 == "$selected" ]]; then return "$bulk_result"; fi
+    return 0
+}
+mark_phase() {
+    if [[ $1 == "$selected" && $2 == end && $marker_result -ne 0 ]]; then
+        printf 'fixture-marker-error:%s:%s\\n' "$1" "$marker_result" >&2
+        return "$marker_result"
+    fi
+    return 0
+}
+'''
+        script = self.work/'actual-shell-wrapper.fixture.sh'
+        script.write_text(prefix + body + "\nprintf 'fixture-complete\\n'\n")
+        for phase, _ in commands:
+            for bulk, marker, expected in ((7,1,7), (7,13,7), (0,13,13), (7,0,7), (0,0,0)):
+                with self.subTest(phase=phase, bulk=bulk, marker=marker):
+                    argv = ['bash', str(script), phase, str(bulk), str(marker)]
+                    result = subprocess.run(argv, capture_output=True, timeout=3)
+                    name = phase+'-'+str(bulk)+'-'+str(marker)
+                    (self.work/(name+'.stdout')).write_bytes(result.stdout)
+                    (self.work/(name+'.stderr')).write_bytes(result.stderr)
+                    (self.work/(name+'.json')).write_text(json.dumps(dict(argv=argv, exit=result.returncode, timeout_seconds=3))+'\n')
+                    self.assertEqual(result.returncode, expected)
+                    if marker:
+                        self.assertIn(b'fixture-marker-error:', result.stderr)
+                    if expected == 0:
+                        self.assertIn(b'fixture-complete', result.stdout)
+                        self.assertEqual(result.stdout.count(b'fixture-bulk:'), 3)
+                    else:
+                        self.assertNotIn(b'fixture-complete', result.stdout)
+
+    def test_static_collect_keeps_stop_order_original_commands_and_one_budget(self):
+        source = (ROOT/'tools/qualify-windows-h264-recipe-A.ps1').read_text()
+        body = source.split('function Invoke-ReleaseACollect($Context) {', 1)[1].split('# Dot-source', 1)[0]
+        self.assertEqual(body.count('$Context.collectDeadline = [DateTime]::UtcNow.AddSeconds(300)'), 1)
+        self.assertLess(body.index('Stop-ReleaseAScopes $Context'), body.index('Invoke-ReleaseAFailedWslExport $Context'))
+        self.assertLess(body.index('Invoke-ReleaseAFailedWslExport $Context'), body.index("'全量原件收集'"))
+        self.assertIn('-TimeoutSeconds (Get-ReleaseACollectBudget $Context)', body)
+        self.assertNotIn('-TimeoutSeconds 300', body)
+        self.assertIn('-TimeoutSeconds (Get-ReleaseACollectBudget $Context 20)', source)
+        commands = ['if [[ -e /opt/frd-llvm-mingw-20250709 ]]; then cp -a /opt/frd-llvm-mingw-20250709 "$root/toolchain/install"; fi',
+                    'python3 "$repo/tools/windows-h264-recipe-transport.py" collect-tools --root "$root"',
+                    'if [[ -d "$repo/.codex-target/ffmpeg-8.1.2" ]]; then cp -a "$repo/.codex-target/ffmpeg-8.1.2/." "$root/build-root/"; fi']
+        self.assertEqual([source.index(command) for command in commands], sorted(source.index(command) for command in commands))
+        for command in commands:
+            self.assertEqual(source.count(command), 1)
 
 
 class PreparedLinuxControlBoundary(unittest.TestCase):

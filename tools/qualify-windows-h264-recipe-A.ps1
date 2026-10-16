@@ -889,9 +889,80 @@ PYCODE
 set -euo pipefail
 root=$1
 repo=$2
+mark_phase() {
+python3 - "$root/../release-a-collect-phases.json" "$1" "$2" "${3-}" <<'FRD_PHASE'
+# FRD_PHASE_BEGIN
+import json,os,stat,sys,time
+from pathlib import Path
+
+
+def phase_update(path, phase, event, code=None):
+    names = ('llvm-copy','system-tools','build-root-copy')
+    if phase not in names or event not in ('start','end'):
+        raise ValueError('fixed phase only')
+    path = Path(path)
+    value = dict(schema='freeremotedesk.release-a.collect-phases.v1', phases={name: None for name in names})
+    if os.path.lexists(path):
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or getattr(info, 'st_file_attributes', 0) & 0x400 or info.st_size > 4096:
+            raise ValueError('phase file type/size')
+        value = json.loads(path.read_bytes())
+    if set(value) != {'schema','phases'} or value['schema'] != 'freeremotedesk.release-a.collect-phases.v1' or set(value['phases']) != set(names):
+        raise ValueError('phase schema')
+    records = value['phases']; position = names.index(phase)
+    if any(records[name] is None or records[name]['exit'] != 0 for name in names[:position]) or any(records[name] is not None for name in names[position+1:]):
+        raise ValueError('phase order')
+    if event == 'start':
+        if records[phase] is not None or code is not None: raise ValueError('duplicate phase start')
+        records[phase] = dict(start_ns=time.time_ns(), end_ns=None, exit=None)
+    else:
+        if records[phase] is None or records[phase]['end_ns'] is not None or type(code) is not int or not 0 <= code <= 255:
+            raise ValueError('phase exit')
+        records[phase].update(end_ns=time.time_ns(), exit=code)
+    raw = (json.dumps(value,sort_keys=True,indent=2)+'\n').encode()
+    if len(raw) > 4096: raise ValueError('phase byte bound')
+    temporary = path.with_name(path.name+'.writing')
+    with temporary.open('xb') as output:
+        output.write(raw); output.flush(); os.fsync(output.fileno())
+    temporary.replace(path)
+    return value
+
+
+if __name__ == '__main__':
+    phase_update(sys.argv[1], sys.argv[2], sys.argv[3], None if not sys.argv[4] else int(sys.argv[4]))
+# FRD_PHASE_END
+FRD_PHASE
+}
+finish_phase() {
+    local bulk_exit=$2 marker_exit=0
+    if mark_phase "$1" end "$bulk_exit"; then
+        :
+    else
+        marker_exit=$?
+        printf 'phase marker失败: %s (exit=%s)\n' "$1" "$marker_exit" >&2 || :
+    fi
+    # marker失败只追加原stderr；原bulk非零优先返回。
+    [[ $bulk_exit -eq 0 ]] || exit "$bulk_exit"
+    [[ $marker_exit -eq 0 ]] || exit "$marker_exit"
+}
+mark_phase llvm-copy start
+set +e
 if [[ -e /opt/frd-llvm-mingw-20250709 ]]; then cp -a /opt/frd-llvm-mingw-20250709 "$root/toolchain/install"; fi
+phase_exit=$?
+set -e
+finish_phase llvm-copy "$phase_exit"
+mark_phase system-tools start
+set +e
 python3 "$repo/tools/windows-h264-recipe-transport.py" collect-tools --root "$root"
+phase_exit=$?
+set -e
+finish_phase system-tools "$phase_exit"
+mark_phase build-root-copy start
+set +e
 if [[ -d "$repo/.codex-target/ffmpeg-8.1.2" ]]; then cp -a "$repo/.codex-target/ffmpeg-8.1.2/." "$root/build-root/"; fi
+phase_exit=$?
+set -e
+finish_phase build-root-copy "$phase_exit"
 '@
         Write-ReleaseALf (Join-Path $Context.root 'setup/prepare.sh') $prepare
         Write-ReleaseALf (Join-Path $Context.root 'setup/collect.sh') $collect
@@ -957,7 +1028,237 @@ if [[ -d "$repo/.codex-target/ffmpeg-8.1.2" ]]; then cp -a "$repo/.codex-target/
         finally { Write-ReleaseAJson $statePath $state }
     }
 }
+function Invoke-ReleaseAFailedWslExport($Context, $State) {
+    $failedWslExporter = @'
+"""只读本job唯一失败make调用；固定16目的，不是目录归档器。"""
+import hashlib,json,os,re,stat,sys,time
+from pathlib import Path
+
+TOTAL_LIMIT = 40 * 1024 * 1024
+META = 256 * 1024
+
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def location(value):
+    text = str(value)
+    require(len(text) <= 2048 and '\x00' not in text and not text.startswith(('\\\\', '//')), 'path syntax')
+    require(not any(part in ('.', '..') for part in text.replace('\\', '/').split('/')), 'path escape')
+    path = Path(text)
+    require(path.is_absolute(), 'absolute path required')
+    require(not any(':' in part for part in path.parts[1:]), 'ADS path')
+    return path
+
+
+def signature(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def regular(root, path, directory=False):
+    root, path = location(root), location(path)
+    relative = path.relative_to(root)  # native path rules, not string prefix
+    current = root
+    chain = [root] + [root.joinpath(*relative.parts[:i]) for i in range(1, len(relative.parts)+1)]
+    for current in chain:
+        info = current.lstat()
+        require(not stat.S_ISLNK(info.st_mode) and not (getattr(info, 'st_file_attributes', 0) & 0x400), 'link/reparse refused')
+        is_directory = current != path or directory
+        require(stat.S_ISDIR(info.st_mode) if is_directory else stat.S_ISREG(info.st_mode), 'file type refused')
+        if not is_directory:
+            require(info.st_nlink == 1, 'hardlink refused')
+    return info
+
+
+def unique_json(raw):
+    def pairs(items):
+        require(len(dict(items)) == len(items), 'duplicate JSON key')
+        return dict(items)
+    return json.loads(raw, object_pairs_hook=pairs)
+
+
+class Reader:
+    def __init__(self):
+        self.began = time.monotonic()
+        self.sizes = {}
+    def check(self):
+        require(time.monotonic() - self.began < 20, 'export time bound')
+    def before(self, root, path, cap):
+        self.check()
+        info = regular(root, path)
+        require(info.st_size <= cap, 'file byte bound')
+        self.sizes[str(path)] = info.st_size
+        require(sum(self.sizes.values()) <= TOTAL_LIMIT, 'total byte bound')
+        return info
+    def read(self, root, path, cap):
+        before = self.before(root, path, cap)
+        with path.open('rb') as stream:
+            require(signature(os.fstat(stream.fileno())) == signature(before), 'open identity changed')
+            raw = stream.read(cap+1)
+            require(len(raw) <= cap and signature(os.fstat(stream.fileno())) == signature(before), 'read changed')
+        require(signature(regular(root, path)) == signature(before), 'read identity changed')
+        return raw
+    def json(self, root, path, cap=META):
+        value = unique_json(self.read(root, path, cap))
+        require(type(value) is dict, 'JSON object required')
+        return value
+    def copy(self, root, path, destination, cap):
+        before = self.before(root, path, cap)
+        first, second, count = hashlib.sha256(), hashlib.sha256(), 0
+        with path.open('rb') as source, destination.open('xb') as output:
+            require(signature(os.fstat(source.fileno())) == signature(before), 'copy open changed')
+            while True:
+                self.check()
+                block = source.read(65536)
+                if not block: break
+                count += len(block); require(count <= cap, 'copy grew beyond bound')
+                first.update(block); output.write(block)
+            require(signature(os.fstat(source.fileno())) == signature(before), 'copy changed')
+            output.flush(); os.fsync(output.fileno())
+        with path.open('rb') as source:
+            require(signature(os.fstat(source.fileno())) == signature(before), 'reread open changed')
+            reread = 0
+            while True:
+                self.check()
+                block = source.read(65536)
+                if not block: break
+                reread += len(block); require(reread <= cap, 'reread byte bound'); second.update(block)
+            require(signature(os.fstat(source.fileno())) == signature(before), 'reread changed')
+        require(signature(regular(root, path)) == signature(before) and count == before.st_size and first.digest() == second.digest(), 'copy identity/bytes changed')
+        saved = hashlib.sha256(destination.read_bytes()).hexdigest()
+        require(saved == first.hexdigest(), 'saved bytes changed')
+        return dict(status='copied', original_path=str(path), size=count, source_sha256=first.hexdigest(), saved_sha256=saved,
+                    read_boundary='bounded equal reads only; no global no-future-write assertion')
+
+
+def entries(root, path, cap):
+    before = regular(root, path, True)
+    result = []
+    with os.scandir(path) as stream:
+        for item in stream:
+            require(len(result) < cap, 'entry count bound')
+            result.append(Path(item.path))
+    require(signature(regular(root, path, True)) == signature(before), 'directory changed')
+    return result
+
+
+def option(argv, name):
+    require(type(argv) is list and all(type(v) is str for v in argv) and argv.count(name) == 1, 'argv option binding')
+    index = argv.index(name)
+    require(index+1 < len(argv), 'argv value missing')
+    return argv[index+1]
+
+
+def export_failed(repo, evidence, source):
+    repo, evidence = location(repo), location(evidence)
+    regular(evidence.parent, evidence.parent, True)
+    destination = evidence.parent / 'release-a-failed-wsl'
+    destination.mkdir()  # existing output refuses; no overwrite/cleanup/retry
+    result = dict(schema='freeremotedesk.release-a.failed-wsl.v1', complete=False, files={}, source=source)
+    reader = Reader()
+    try:
+        state = reader.json(evidence, evidence/'provenance/state.json', 512*1024)
+        require(re.fullmatch('[a-f0-9]{40}', source) and state['source'] == source and type(state['builder_exit']) is int and state['builder_exit'] != 0, 'failed builder source binding')
+        outer = reader.json(evidence, evidence/'setup/calls/builder/exit.json', 512*1024)
+        require(outer['terminated'] and outer['capture_complete'] and outer['exit'] != 0, 'Windows writer unproven')
+        configuration = repo/'.codex-target/ffmpeg-8.1.2/build-side-frd-h264dc-aarch64-v1/windows-aarch64/Release'
+        attempts = [p for p in entries(repo, configuration, 32) if p.name.startswith('.attempt-')]
+        require(len(attempts) == 1, 'unique attempt required')
+        attempt = attempts[0]
+        match = re.fullmatch(r'\.attempt-([0-9]+)-[a-f0-9]{32}', attempt.name)
+        require(match and int(match[1]) == outer['windows_child']['pid'], 'attempt PID binding')
+        contents = entries(repo, attempt, 256)
+        calls = [p for p in contents if p.name.startswith('wsl-') and p.name.endswith('.json')]
+        require(0 < len(calls) <= 7 and all(re.fullmatch(r'wsl-[a-f0-9]{32}\.json', p.name) for p in calls), 'wsl receipt bound')
+        records = [(p, reader.json(repo, p)) for p in calls]
+        failed = [(p, v) for p, v in records if type(v.get('exit')) is not int or v['exit'] != 0 or v.get('capture_error') is not None]
+        require(len(failed) == 1, 'unique failed wsl required')
+        call_path, call = failed[0]
+        require(call['action'] == 'FFmpeg build' and call['inner_argv'] == ['bash','-lc','make -j4'] and type(call['exit']) is int and call['exit'] != 0, 'only failed make call')
+        intent = reader.json(repo, attempt/'lifecycle-intent.json')
+        paths = reader.json(evidence, evidence/'provenance/paths.json')
+        linux_attempt = paths['wsl'].rstrip('/') + '/' + attempt.relative_to(repo).as_posix()
+        require(intent['scope_linux'] == linux_attempt+'/lifecycle' and intent['supervisor_linux'] == linux_attempt+'/release-a-supervisor.py', 'Linux scope path binding')
+        nonce = intent['nonce']; require(re.fullmatch('[a-f0-9]{32}', nonce), 'nonce format')
+        lifecycle = call['lifecycle']
+        require(lifecycle == dict(nonce=nonce, scope=intent['scope_linux'], supervisor=intent['supervisor_linux'], source_sha256=intent['source_sha256']), 'wsl lifecycle binding')
+        call_id = option(call['argv'], '--call-id')
+        require(re.fullmatch('[a-f0-9]{32}', call_id) and call_path.name == 'wsl-'+call_id+'.json', 'call id binding')
+        require(option(call['argv'], '--nonce') == nonce and option(call['argv'], '--scope') == intent['scope_linux'], 'wsl argv binding')
+        stop_path = evidence/'setup/calls/linux-cleanup-builder/exit.json'
+        stop_bytes = reader.read(evidence, stop_path, 512*1024)
+        stop = unique_json(stop_bytes)
+        require(stop['exit'] == 0 and stop['error'] is None and not stop['timed_out'] and stop['terminated'] and stop['capture_complete'], 'original stop gate')
+        require(option(stop['argv'], '--nonce') == nonce and option(stop['argv'], '--scope') == intent['scope_linux'], 'stop nonce binding')
+        raw_receipt = location(call['raw_receipt']); native = raw_receipt.parent
+        require(native.parent == attempt and re.fullmatch('native-supervised-wsl-[a-f0-9]{32}', native.name) and raw_receipt.name == 'exit.json', 'native receipt escape')
+        native_exit = reader.json(repo, raw_receipt, 512*1024)
+        native_argv = reader.json(repo, native/'argv.json')
+        require(native_exit['argv'] == native_argv['argv'] == call['argv'] and native_exit['cwd'] == native_argv['cwd'] == call['cwd'], 'original native argv/cwd binding')
+        require(location(call['cwd']) == repo, 'original cwd binding')
+        require(native_exit['terminated'] and native_exit['capture_complete'] and native_exit['exit'] == call['exit'], 'native exit binding')
+        require(location(native_exit['receipt']) == raw_receipt, 'native self receipt')
+        for name in ('stdout','stderr'):
+            require(location(native_exit[name]) == location(call[name]) == native/(name+'.bin'), 'native stream escape')
+        scope = attempt/'lifecycle'
+        metadata = reader.json(repo, scope/'scope.json')
+        require(metadata == dict(nonce=nonce, source_path=intent['supervisor_linux'], source_sha256=intent['source_sha256']), 'scope metadata binding')
+        for name in ('halt','stopped'):
+            value = reader.json(repo, scope/(name+'.json')); require(value['nonce'] == nonce, 'scope nonce')
+            if name == 'stopped': require(value['quiescent'] and value['new_launches_blocked'], 'scope stop proof')
+        plan = [('wsl.json',call_path,META), ('native.argv.json',native/'argv.json',META), ('native.exit.json',raw_receipt,512*1024),
+                ('native.stderr.bin',native/'stderr.bin',16*1024*1024), ('native.stdout.bin',native/'stdout.bin',16*1024*1024),
+                ('native.executable.bin',native/'executable.bin',4*1024*1024), ('supervisor.py.bin',attempt/'release-a-supervisor.py',META),
+                ('lifecycle.intent.json',attempt/'lifecycle-intent.json',META), ('lifecycle.scope.json',scope/'scope.json',META),
+                ('lifecycle.halt.json',scope/'halt.json',META), ('lifecycle.stopped.json',scope/'stopped.json',META)]
+        for kind in ('pending','start','end','observations'):
+            path = scope/(call_id+'.'+kind+'.json'); name = 'call.'+kind+'.json'
+            if kind == 'observations' and not os.path.lexists(path):
+                result['files'][name] = dict(status='missing-optional', original_path=str(path)); continue
+            cap = 1024*1024 if kind == 'end' else META
+            value = reader.json(repo, path, cap)
+            require(value['nonce'] == nonce and value['call_id'] == call_id, 'UUID binding')
+            if kind in ('pending','start'):
+                require(value['source_sha256'] == intent['source_sha256'] and value['source_path'] == intent['supervisor_linux'], 'UUID source binding')
+            plan.append((name,path,cap))
+        for name,path,cap in plan:
+            result['files'][name] = reader.copy(repo, path, destination/name, cap)
+        require(result['files']['supervisor.py.bin']['source_sha256'] == intent['source_sha256'], 'supervisor bytes binding')
+        executable = native_exit['executable']; sha = result['files']['native.executable.bin']['source_sha256']
+        require(all(executable[k] == sha for k in ('before_sha256','saved_sha256','after_sha256')), 'native exe bytes binding')
+        result.update(complete=True, attempt=attempt.name, nonce=nonce, call_id=call_id, original_stop_sha256=hashlib.sha256(stop_bytes).hexdigest())
+    except Exception as error:
+        result['error'] = str(error)[:2048]
+    encoded = (json.dumps(result,sort_keys=True,indent=2)+'\n').encode()
+    require(len(encoded) <= 128*1024, 'selection byte bound')
+    with (destination/'selection.json').open('xb') as output: output.write(encoded)
+    return result
+
+
+if __name__ == '__main__':
+    require(len(sys.argv) == 4, 'fixed repo/evidence/source only')
+    result = export_failed(*sys.argv[1:])
+    print(json.dumps(dict(complete=result['complete'], error=result.get('error'))))
+    sys.exit(0 if result['complete'] else 1)
+'@
+    $script = Join-Path $env:RUNNER_TEMP 'release-a-failed-wsl-export.py'
+    if (Test-Path -LiteralPath $script) { throw '本job export source已存在；不覆盖重试' }
+    Write-ReleaseALf $script $failedWslExporter
+    $expected = $failedWslExporter.Replace("`r`n","`n").TrimEnd([char[]]"`r`n") + "`n"
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($script)) -cne [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($expected))) { throw '当前inline export bytes不匹配' }
+    $record = Invoke-ReleaseARaw -Exe 'python' -Arguments @($script,$Context.repo,$Context.root,$env:GITHUB_SHA) -Directory $Context.repo `
+        -RecordDirectory (Join-Path $env:RUNNER_TEMP 'release-a-failed-wsl-export-call') -TimeoutSeconds (Get-ReleaseACollectBudget $Context 20)
+    Assert-ReleaseAResult $record '失败wsl有限原件导出'
+}
+function Get-ReleaseACollectBudget($Context, [int]$Cap = 300) {
+    $remaining = [int][Math]::Floor(($Context.collectDeadline - [DateTime]::UtcNow).TotalSeconds)
+    if ($remaining -le 0) { throw 'Collect原300秒总预算耗尽；不得新开窗口' }
+    return [Math]::Min($Cap,$remaining)
+}
 function Invoke-ReleaseACollect($Context) {
+    $Context.collectDeadline = [DateTime]::UtcNow.AddSeconds(300)
     $statePath = Join-Path $Context.root 'provenance/state.json'
     if (-not (Test-Path -LiteralPath $statePath)) { throw '初始化前失败，缺材料即不完整，不伪造artifact' }
     $state = Read-ReleaseAJson $statePath
@@ -987,6 +1288,14 @@ function Invoke-ReleaseACollect($Context) {
         Confirm-ReleaseAWindowsTools $Context
         if (-not $state.quiescent) { Stop-ReleaseAScopes $Context }
         $state.quiescent = $true
+        if ($state.builder_started -and $null -ne $state.builder_exit -and $state.builder_exit -ne 0) {
+            try { Invoke-ReleaseAFailedWslExport $Context $state }
+            catch {
+                # 独立旁路失败不改原builder first_error，也不替代原完整运输。
+                Add-ReleaseAError $state 'forensic' $_.ToString()
+                Write-ReleaseAJson $statePath $state
+            }
+        }
         $pathsFile = Join-Path $Context.root 'provenance/paths.json'
         if (Test-Path -LiteralPath $pathsFile) {
             $paths = Read-ReleaseAJson $pathsFile
@@ -1002,7 +1311,7 @@ function Invoke-ReleaseACollect($Context) {
                 '--scope',"$($paths.evidence_wsl)/setup/groups/collect",'--nonce',$nonce,'--call-id',([Guid]::NewGuid().ToString('N')),
                 'run','--','bash','-lc',$command)
             $result = Invoke-ReleaseARaw -Exe 'wsl.exe' -Arguments $args -Directory $Context.repo `
-                -RecordDirectory (Join-Path $Context.root 'setup/calls/collect') -TimeoutSeconds 300 `
+                -RecordDirectory (Join-Path $Context.root 'setup/calls/collect') -TimeoutSeconds (Get-ReleaseACollectBudget $Context) `
                 -BeforeWindowsKill { Stop-ReleaseAScopes $Context }
             Assert-ReleaseAResult $result '全量原件收集'
             Stop-ReleaseAScopes $Context
@@ -1032,6 +1341,16 @@ function Invoke-ReleaseACollect($Context) {
         else { throw '没有可用WSL路径，保留原始partial；无法生成POSIX运输即不完整' }
     }
     catch {
+        # 原stop/退出门未通过时不执行export；只留固定旁路的未导出事实。
+        $fallback = Join-Path $env:RUNNER_TEMP 'release-a-failed-wsl'
+        if (-not (Test-Path -LiteralPath $fallback)) {
+            try {
+                New-Item -ItemType Directory -Path $fallback | Out-Null
+                Write-ReleaseAJson (Join-Path $fallback 'selection.json') @{ schema = 'freeremotedesk.release-a.failed-wsl.v1'
+                    complete = $false; error = 'original Collect gate failed before export; no bypass'; files = @{} }
+            }
+            catch { [Console]::Error.WriteLine('fixed fallback summary保存失败；保留原错误') }
+        }
         Add-ReleaseAError $state 'transport' $_.ToString()
         Write-ReleaseAJson $statePath $state
         throw

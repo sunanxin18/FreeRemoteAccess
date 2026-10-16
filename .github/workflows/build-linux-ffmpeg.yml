@@ -221,7 +221,7 @@ jobs:
             crates/frd-protocol-rdp/src/pixel_convert/x86.rs
           if-no-files-found: error
 
-      - name: Build private x86 direct ABI artifact only
+      - name: Build and run admitted private x86 direct ABI image
         if: matrix.arch == 'x86_64' || matrix.arch == 'i686'
         shell: bash
         run: |
@@ -236,22 +236,36 @@ jobs:
           cargo_output = repo / 'target' / ('rdp-publication-abi-linux-build-' + target)
           evidence.mkdir(exist_ok=False)
           identity_path = evidence / 'identity.json'
-          identity = dict(schema='frd-publication-direct-abi-build-only-v1', commit=os.environ['GITHUB_SHA'],
+          # 人工冻结的最终已审图像；不从本次 build 自行刷新。
+          allowed_sha256 = {
+              'i686-unknown-linux-gnu': 'fb2817df08fc3683bef1a82f42fe37a0a7f4d6b0e36b21a1f380aea81a02e4d2',
+              'x86_64-unknown-linux-gnu': 'b77c8f1a38de940267d58bcef4724b94529eda65203ddeda674c497e0f178875'}
+          def stage_record(stage):
+              return dict(stage=stage, argv=None, budget_seconds=900 if stage == 'build' else 30,
+                  started=False, terminal_observed=False, timed_out=False, exit_code=None,
+                  stdout_eof=False, stderr_eof=False, capture_complete=False, streams_closed=False,
+                  cleanup=[], errors=[], failure_exit=0, validation='NOT_RUN')
+          identity = dict(schema='frd-publication-direct-abi-exact-image-runtime-v1', commit=os.environ['GITHUB_SHA'],
               run_id=os.environ['GITHUB_RUN_ID'], run_attempt=os.environ['GITHUB_RUN_ATTEMPT'],
               job=os.environ['GITHUB_JOB'], target=target, host=os.uname().machine,
               required_rust='1.96.0', toolchain_precondition='preceding pinned toolchain step succeeded',
-              runtime='NOT_RUN', control_flow_protection='not-qualified', build_complete=False,
+              runtime='NOT_RUN', runtime_complete=False, control_flow_protection='not-qualified', build_complete=False,
+              admission=dict(scope='explicit-root-private-default-runner-test', expected_sha256=allowed_sha256[target],
+                  actual_sha256=None, final_static_review_sha256='626ef2a0d69c08777bdee26c02d8c6c95fccdcf6465c0b40cf6daa767a8c2af9', passed=False),
               ownership_scope='direct Popen only', descendant_quiescence='NOT_PROVEN',
               linker_argv='not observed; Cargo -v is not the full actual linker argv',
               strip_status='not presumed; inherited release profile/config/environment',
-              sources=[], configuration=[], tools=[], artifacts=[], errors=[], build=None)
+              sources=[], configuration=[], tools=[], artifacts=[], errors=[],
+              build=stage_record('build'), abi=stage_record('abi'), output_validation=dict(passed=False, expected_lines=28 if target.startswith('i686-') else 36, actual_lines=None, reason='NOT_RUN'))
           identity_path.write_text(json.dumps(identity, indent=2) + '\n')
           first_exit = 0
+          first_failure = None
           def fail(message, code=1):
-              global first_exit
+              global first_exit, first_failure
               identity['errors'].append(str(message))
               if first_exit == 0:
-                  first_exit = code if code != 0 else 1
+                  first_exit = code if 0 < code < 256 else 1
+                  first_failure = str(message)
           def sha(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
           source_names = (
@@ -261,21 +275,195 @@ jobs:
               ('crates/frd-protocol-rdp/src/pixel_convert/x86.rs', 'source-pixel_convert-x86.rs'))
           config_names = ('Cargo.toml', 'Cargo.lock', 'crates/frd-rdp-legacy-kernels/Cargo.toml',
               'rust-toolchain.toml', '.cargo/config.toml', '.github/workflows/build-linux-ffmpeg.yml')
-          process = None
-          stdout_file = stderr_file = selector = None
-          pipes = {}
+          def expected_abi_lines(target):
+              # 源码人工转录的固定三表；runtime 不读取源码来推导期望。
+              state = [('sp_ret8', 0x00040000), ('df', 0x00080000), ('mxcsr', 0x00100000), ('x87cw', 0x00200000)]
+              if target in ('i686-unknown-linux-gnu', 'i686-pc-windows-msvc'):
+                  registers = [('ebx', 1), ('ebp', 2), ('esi', 4), ('edi', 8)]
+              elif target in ('x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc'):
+                  registers = [('rbx', 1), ('rbp', 2), ('r12', 4), ('r13', 8), ('r14', 16), ('r15', 32)]
+              else:
+                  raise ValueError('Unknown ABI output target')
+              controls = [(name + '_' + half, mask) for name, mask in registers for half in ('low', 'high')] + state
+              if target == 'x86_64-pc-windows-msvc':
+                  extra = [('rsi', 0x40), ('rdi', 0x80), ('xmm6', 0x100), ('xmm7', 0x200),
+                      ('xmm8', 0x400), ('xmm9', 0x800), ('xmm10', 0x1000), ('xmm11', 0x2000),
+                      ('xmm12', 0x4000), ('xmm13', 0x8000), ('xmm14', 0x10000), ('xmm15', 0x20000)]
+                  controls += [(name + '_' + half, mask) for name, mask in extra for half in ('low', 'high')]
+              lines = ['ABI_PRECONDITION protection_configuration=external-admission-required final_copyfn_chain=external-review-required']
+              for kernel in ('sse2', 'ssse3'):
+                  lines += [f'ABI_CALIBRATION kernel={kernel} case={name} exact_mask=0x{mask:08x}' for name, mask in controls]
+                  lines += [f'ABI_VALID kernel={kernel} cases=9 exact_mask=0']
+              lines += [f'ABI_OK scope=private-address-taken-normal-return controls_per_kernel={len(controls)} kernels=2 full_unwind=open shipping_fastcc_inline=open control_flow_protection=not-qualified protection_admission=external-required']
+              return lines
+          def validate_abi_bytes(target, raw, stderr):
+              expected = expected_abi_lines(target)
+              result = dict(passed=False, expected_lines=len(expected), actual_lines=None, reason=None)
+              if stderr:
+                  result['reason'] = 'successful ABI stderr must be empty'
+                  return result
+              try:
+                  text = raw.decode('ascii')
+              except UnicodeDecodeError:
+                  result['reason'] = 'stdout is not ASCII'
+                  return result
+              if not text.endswith('\n') or '\x00' in text:
+                  result['reason'] = 'missing final newline or NUL'
+                  return result
+              if '\r' in text:
+                  text = text.replace('\r\n', '\n')
+                  if '\r' in text or raw.count(b'\n') != raw.count(b'\r\n'):
+                      result['reason'] = 'mixed or invalid newlines'
+                      return result
+              lines = text[:-1].split('\n')
+              result['actual_lines'] = len(lines)
+              result['passed'] = lines == expected
+              result['reason'] = 'exact ordered closed output' if result['passed'] else 'stdout differs from exact ordered closed output'
+              return result
+          def capture(stage):
+              # 只有两个固定命令，不能传 executable/argv 或覆盖预算。
+              if stage == 'build':
+                  argv = [cargo_path, 'rustc', '--locked', '--release', '-p', 'frd-rdp-legacy-kernels',
+                      '--example', 'rdp_publication_abi', '--target', target, '-v', '--',
+                      '-C', 'link-arg=-Wl,-Map,' + str(built_map)]
+              elif stage == 'abi':
+                  argv = [str(evidence / 'rdp_publication_abi'), 'abi']
+              else:
+                  raise ValueError('Unknown private ABI stage')
+              record = identity[stage]
+              record['argv'] = argv
+              process = stdout_file = stderr_file = selector = None
+              def stage_fail(message, code=1):
+                  record['errors'].append(str(message))
+                  if record['failure_exit'] == 0:
+                      record['failure_exit'] = code if 0 < code < 256 else 1
+              try:
+                  # abi 两路空原件已在 build 前建立；不截断既有内容。
+                  mode = 'xb' if stage == 'build' else 'r+b'
+                  stdout_file = (evidence / (stage + '.stdout')).open(mode)
+                  stderr_file = (evidence / (stage + '.stderr')).open(mode)
+                  if stage == 'abi' and (os.fstat(stdout_file.fileno()).st_size or os.fstat(stderr_file.fileno()).st_size):
+                      raise RuntimeError('Refusing nonempty pre-launch ABI raw streams')
+                  identity_path.write_text(json.dumps(identity, indent=2) + '\n')
+                  process = subprocess.Popen(argv, cwd=repo, env=build_env, stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                  record['started'] = True
+                  record['pid'] = process.pid
+                  selector = selectors.DefaultSelector()
+                  for name, pipe, output in (('stdout', process.stdout, stdout_file), ('stderr', process.stderr, stderr_file)):
+                      os.set_blocking(pipe.fileno(), False)
+                      selector.register(pipe, selectors.EVENT_READ, (name, output))
+                  deadline = time.monotonic() + record['budget_seconds']
+                  eof_deadline = None
+                  while True:
+                      code = process.poll()
+                      now = time.monotonic()
+                      if code is not None and not record['terminal_observed']:
+                          record.update(terminal_observed=True, exit_code=code)
+                          if code != 0 and record['failure_exit'] == 0:
+                              record['failure_exit'] = code if 0 < code < 256 else 1
+                          eof_deadline = now + 2
+                      if record['terminal_observed'] and not selector.get_map():
+                          break
+                      if not record['terminal_observed'] and now >= deadline:
+                          record['timed_out'] = True
+                          stage_fail('Direct ' + stage + ' process exceeded fixed budget', 124)
+                          break
+                      if eof_deadline is not None and now >= eof_deadline:
+                          stage_fail('Raw stream EOF remains unknown after 2s')
+                          break
+                      for key, _ in selector.select(0.05):
+                          name, output = key.data
+                          chunk = os.read(key.fileobj.fileno(), 65536)
+                          if chunk:
+                              output.write(chunk)
+                          else:
+                              record[name + '_eof'] = True
+                              selector.unregister(key.fileobj)
+              except Exception as error:
+                  stage_fail(repr(error))
+              finally:
+                  # 只持有本 stage 的 Popen；不宣称后代或继承写端停止。
+                  if process is not None and not record['terminal_observed']:
+                      try:
+                          process.kill()
+                          record['cleanup'].append('direct kill returned')
+                      except Exception as error:
+                          stage_fail('direct kill: ' + repr(error))
+                      try:
+                          code = process.wait(timeout=1)
+                          record.update(terminal_observed=True, exit_code=code)
+                      except Exception as error:
+                          stage_fail('direct reap within 1s: ' + repr(error))
+                  if selector is not None:
+                      try:
+                          drain_deadline = time.monotonic() + 2
+                          while selector.get_map() and time.monotonic() < drain_deadline:
+                              for key, _ in selector.select(0.05):
+                                  name, output = key.data
+                                  chunk = os.read(key.fileobj.fileno(), 65536)
+                                  if chunk:
+                                      output.write(chunk)
+                                  else:
+                                      record[name + '_eof'] = True
+                                      selector.unregister(key.fileobj)
+                          if selector.get_map():
+                              stage_fail('EOF unknown; inherited writer quiescence NOT_PROVEN')
+                      except Exception as error:
+                          stage_fail('raw capture finalization: ' + repr(error))
+                      finally:
+                          try:
+                              selector.close()
+                          except Exception as error:
+                              stage_fail('selector close: ' + repr(error))
+                  streams_closed = True
+                  for stream in (process.stdout if process is not None else None,
+                      process.stderr if process is not None else None, stdout_file, stderr_file):
+                      if stream is not None:
+                          try:
+                              stream.close()
+                          except Exception as error:
+                              streams_closed = False
+                              stage_fail('stream close: ' + repr(error))
+                  record['streams_closed'] = streams_closed
+                  record['capture_complete'] = (record['started'] and record['terminal_observed'] and
+                      not record['timed_out'] and record['stdout_eof'] and record['stderr_eof'] and
+                      streams_closed and not record['errors'])
+                  if not record['capture_complete']:
+                      stage_fail(stage + ' capture remained partial')
+                  record['validation'] = 'native-exit-zero' if record['capture_complete'] and record['exit_code'] == 0 else 'FAILED'
+              return record
+          def verify_inputs(phase):
+              if len(identity['sources']) != 4 or len(identity['configuration']) != len(config_names) or len(identity['artifacts']) != 2:
+                  raise RuntimeError('Incomplete source/config/artifact identity at ' + phase)
+              for row in identity['sources']:
+                  current = dict(source=sha(repo / row['path']), snapshot=sha(evidence / row['snapshot']))
+                  row[phase] = current
+                  if row['before'] != current['source'] or row['before'] != current['snapshot']:
+                      raise RuntimeError('Source or snapshot changed at ' + phase + ': ' + row['path'])
+              for row in identity['configuration']:
+                  row[phase] = sha(repo / row['path'])
+                  if row['before'] != row[phase]:
+                      raise RuntimeError('Configuration changed at ' + phase + ': ' + row['path'])
+              for row in identity['artifacts']:
+                  current = dict(build=sha(pathlib.Path(row['build_path'])), staged=sha(evidence / row['path']))
+                  row[phase] = current
+                  if len({row['build_sha256'], row['staged_sha256'], current['build'], current['staged']}) != 1:
+                      raise RuntimeError('Artifact changed at ' + phase + ': ' + row['kind'])
           try:
+              for name in ('abi.stdout', 'abi.stderr'):
+                  (evidence / name).open('xb').close()
               cargo_output.mkdir(exist_ok=False)
               for name, snapshot in source_names:
                   before = sha(repo / name)
                   with (evidence / snapshot).open('xb') as output:
                       output.write((repo / name).read_bytes())
-                  row = dict(path=name, snapshot=snapshot, before=before, snapshot_sha256=sha(evidence / snapshot), after=None, snapshot_after=None)
+                  row = dict(path=name, snapshot=snapshot, before=before, snapshot_sha256=sha(evidence / snapshot))
                   identity['sources'].append(row)
                   if row['snapshot_sha256'] != before:
                       raise RuntimeError('Source snapshot mismatch: ' + name)
               for name in config_names:
-                  identity['configuration'].append(dict(path=name, before=sha(repo / name), after=None))
+                  identity['configuration'].append(dict(path=name, before=sha(repo / name)))
               # 仅精选编译变量；不收集环境全集或凭据。保留既有 i686 linker。
               build_env = os.environ.copy()
               if target == 'i686-unknown-linux-gnu':
@@ -301,119 +489,24 @@ jobs:
                       identity_scope='resolved command file; may be rustup shim; pin checked by preceding step'))
               cargo_path = shutil.which('cargo')
               built_map = cargo_output / 'rdp_publication_abi.map'
-              argv = [cargo_path, 'rustc', '--locked', '--release', '-p', 'frd-rdp-legacy-kernels',
-                  '--example', 'rdp_publication_abi', '--target', target, '-v', '--',
-                  '-C', 'link-arg=-Wl,-Map,' + str(built_map)]
-              record = dict(argv=argv, budget_seconds=900, started=False, terminal_observed=False,
-                  timed_out=False, exit_code=None, stdout_eof=False, stderr_eof=False,
-                  capture_complete=False, streams_closed=False, cleanup=[], errors=[])
-              identity['build'] = record
-              stdout_file = (evidence / 'build.stdout').open('xb')
-              stderr_file = (evidence / 'build.stderr').open('xb')
-              # 日志与初始 partial identity 在唯一 Cargo launch 之前建立。
-              identity_path.write_text(json.dumps(identity, indent=2) + '\n')
-              process = subprocess.Popen(argv, cwd=repo, env=build_env, stdin=subprocess.DEVNULL,
-                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              record['started'] = True
-              record['pid'] = process.pid
-              selector = selectors.DefaultSelector()
-              for name, pipe, output in (('stdout', process.stdout, stdout_file), ('stderr', process.stderr, stderr_file)):
-                  pipes[name] = pipe
-                  os.set_blocking(pipe.fileno(), False)
-                  selector.register(pipe, selectors.EVENT_READ, (name, output))
-              deadline = time.monotonic() + 900
-              eof_deadline = None
-              while True:
-                  code = process.poll()
-                  now = time.monotonic()
-                  if code is not None and not record['terminal_observed']:
-                      record.update(terminal_observed=True, exit_code=code)
-                      if code != 0:
-                          fail('Cargo native exit: ' + str(code), code if 0 < code < 256 else 1)
-                      if eof_deadline is None:
-                          eof_deadline = now + 2
-                  if record['terminal_observed'] and not selector.get_map():
-                      break
-                  if not record['terminal_observed'] and now >= deadline:
-                      record['timed_out'] = True
-                      fail('Direct Cargo process exceeded 900s budget', 124)
-                      break
-                  if eof_deadline is not None and now >= eof_deadline:
-                      fail('Raw stream EOF remains unknown after 2s')
-                      break
-                  for key, _ in selector.select(0.05):
-                      name, output = key.data
-                      chunk = os.read(key.fileobj.fileno(), 65536)
-                      if chunk:
-                          output.write(chunk)
-                      else:
-                          record[name + '_eof'] = True
-                          selector.unregister(key.fileobj)
-          except Exception as error:
-              fail(repr(error))
-          finally:
-              record = identity['build']
-              # 只持有并处理本步骤 Popen；不能宣称 Cargo 后代或继承写端已停止。
-              if process is not None and not record['terminal_observed']:
-                  try:
-                      process.kill()
-                      record['cleanup'].append('direct kill returned')
-                  except Exception as error:
-                      record['errors'].append('direct kill: ' + repr(error))
-                  try:
-                      code = process.wait(timeout=1)
-                      record.update(terminal_observed=True, exit_code=code)
-                  except Exception as error:
-                      record['errors'].append('direct reap within 1s: ' + repr(error))
-              # 发生捕获/文件错误后也有限收尾；不无限 drain，不杀进程组或未知后代。
-              if selector is not None:
-                  try:
-                      drain_deadline = time.monotonic() + 2
-                      while selector.get_map() and time.monotonic() < drain_deadline:
-                          for key, _ in selector.select(0.05):
-                              name, output = key.data
-                              chunk = os.read(key.fileobj.fileno(), 65536)
-                              if chunk:
-                                  output.write(chunk)
-                              else:
-                                  record[name + '_eof'] = True
-                                  selector.unregister(key.fileobj)
-                      if selector.get_map():
-                          record['errors'].append('EOF unknown; inherited writer quiescence NOT_PROVEN')
-                  except Exception as error:
-                      record['errors'].append('raw capture finalization: ' + repr(error))
-                  finally:
-                      try:
-                          selector.close()
-                      except Exception as error:
-                          record['errors'].append('selector close: ' + repr(error))
-              streams_closed = True
-              for stream in (process.stdout if process is not None else None,
-                  process.stderr if process is not None else None, stdout_file, stderr_file):
-                  if stream is not None:
-                      try:
-                          stream.close()
-                      except Exception as error:
-                          streams_closed = False
-                          fail('stream close: ' + repr(error))
-              if record is not None:
-                  record['streams_closed'] = streams_closed
-                  record['capture_complete'] = (record['started'] and record['terminal_observed'] and
-                      not record['timed_out'] and record['stdout_eof'] and record['stderr_eof'] and
-                      streams_closed and not record['errors'] and first_exit == 0)
-                  if not record['capture_complete']:
-                      fail('Build capture remained partial')
-          try:
+              record = capture('build')
+              if record['failure_exit']:
+                  fail('Build native exit/capture failed: ' + str(record['exit_code']), record['failure_exit'])
               if first_exit == 0:
                   built = cargo_output / target / 'release/examples/rdp_publication_abi'
                   for kind, original, name in (('elf', built, 'rdp_publication_abi'), ('link_map', built_map, 'rdp_publication_abi.map')):
                       if original.stat().st_size == 0:
                           raise RuntimeError('Empty build artifact: ' + kind)
-                      row = dict(kind=kind, build_path=str(original), path=name, build_sha256=sha(original),
-                          build_after=None, staged_sha256=None, staged_final=None)
+                      row = dict(kind=kind, build_path=str(original), path=name, build_sha256=sha(original), staged_sha256=None)
                       identity['artifacts'].append(row)
                       with (evidence / name).open('xb') as output:
                           output.write(original.read_bytes())
+                      if kind == 'elf':
+                          # 新建 staged 文件原本无执行位；只保留原 build mode，不修改图像字节。
+                          shutil.copymode(original, evidence / name)
+                          row['staged_mode'] = oct((evidence / name).stat().st_mode & 0o777)
+                          if not ((evidence / name).stat().st_mode & 0o100):
+                              raise RuntimeError('Staged ELF lacks owner execute mode')
                       row['staged_sha256'] = sha(evidence / name)
                       if row['build_sha256'] != row['staged_sha256']:
                           raise RuntimeError('Staged artifact mismatch: ' + kind)
@@ -425,57 +518,66 @@ jobs:
                   if machine != expected_machine:
                       raise RuntimeError('ELF machine mismatch')
                   identity['elf_header'] = dict(elf_class=header[4], machine=machine, data=header[5])
+                  verify_inputs('after_build')
+                  identity['build_complete'] = True
+                  identity['build']['validation'] = 'native-exit-zero-and-build-identities'
           except Exception as error:
               fail(repr(error))
-          finally:
-              for row in identity['sources']:
-                  try:
-                      row['after'] = sha(repo / row['path'])
-                      row['snapshot_after'] = sha(evidence / row['snapshot'])
-                      if row['before'] != row['after'] or row['before'] != row['snapshot_after']:
-                          raise RuntimeError('Source or snapshot changed: ' + row['path'])
-                  except Exception as error:
-                      fail(repr(error))
-              for row in identity['configuration']:
-                  try:
-                      row['after'] = sha(repo / row['path'])
-                      if row['before'] != row['after']:
-                          raise RuntimeError('Configuration changed: ' + row['path'])
-                  except Exception as error:
-                      fail(repr(error))
-              for row in identity['artifacts']:
-                  try:
-                      row['build_after'] = sha(pathlib.Path(row['build_path']))
-                      row['staged_final'] = sha(evidence / row['path'])
-                      if len({row['build_sha256'], row['build_after'], row['staged_sha256'], row['staged_final']}) != 1:
-                          raise RuntimeError('Artifact changed: ' + row['kind'])
-                  except Exception as error:
-                      fail(repr(error))
-              complete = (first_exit == 0 and identity['build'] is not None and identity['build']['capture_complete'] and
-                  identity['build']['exit_code'] == 0 and len(identity['sources']) == 4 and
-                  len(identity['configuration']) == len(config_names) and len(identity['artifacts']) == 2)
-              identity['build_complete'] = complete
-              if not complete:
-                  fail('Build-only evidence remained partial')
-              identity['step_exit'] = first_exit
-              try:
-                  pending = evidence / 'identity.pending.json'
-                  with pending.open('x') as output:
-                      output.write(json.dumps(identity, indent=2) + '\n')
-                  pending.replace(identity_path)
-              except Exception as error:
-                  fail('identity finalization: ' + repr(error))
-                  print('Identity finalization failed: ' + repr(error), file=sys.stderr)
+          if not identity['build_complete'] and first_exit == 0:
+              fail('Build evidence remained partial')
+          try:
+              if identity['build_complete'] and first_exit == 0:
+                  verify_inputs('before_abi')
+                  actual_sha256 = sha(evidence / 'rdp_publication_abi')
+                  identity['admission']['actual_sha256'] = actual_sha256
+                  if actual_sha256 != allowed_sha256[target]:
+                      raise RuntimeError('Exact reviewed staged ELF SHA mismatch; runtime NOT_RUN; no automatic admission refresh')
+                  identity['admission']['passed'] = True
+                  identity['runtime'] = 'PARTIAL'
+                  record = capture('abi')
+                  if record['failure_exit']:
+                      if record['exit_code'] == 77:
+                          identity['runtime'] = 'UNAVAILABLE'
+                      fail('ABI native exit/capture failed: ' + str(record['exit_code']), record['failure_exit'])
+                  if record['capture_complete'] and record['exit_code'] == 0:
+                      identity['output_validation'] = validate_abi_bytes(target,
+                          (evidence / 'abi.stdout').read_bytes(), (evidence / 'abi.stderr').read_bytes())
+                      if not identity['output_validation']['passed']:
+                          record['validation'] = 'FAILED'
+                          fail(identity['output_validation']['reason'])
+                      else:
+                          record['validation'] = 'exact-closed-output'
+                  verify_inputs('after_abi')
+                  identity['runtime_complete'] = (first_exit == 0 and record['capture_complete'] and
+                      record['exit_code'] == 0 and identity['output_validation']['passed'])
+                  if identity['runtime_complete']:
+                      identity['runtime'] = 'PASS'
+          except Exception as error:
+              fail(repr(error))
+          if identity['runtime'] == 'NOT_RUN':
+              identity['abi']['skip_reason'] = first_failure or 'build or exact-image gate did not complete'
+          if not identity['runtime_complete'] and first_exit == 0:
+              fail('Private exact-image ABI runtime remained partial')
+          identity['first_failure'] = first_failure
+          identity['step_exit'] = first_exit
+          try:
+              pending = evidence / 'identity.pending.json'
+              with pending.open('x') as output:
+                  output.write(json.dumps(identity, indent=2) + '\n')
+              pending.replace(identity_path)
+          except Exception as error:
+              fail('identity finalization: ' + repr(error))
+              print('Identity finalization failed: ' + repr(error), file=sys.stderr)
           if first_exit:
-              print('Private ABI build-only failed: ' + '; '.join(identity['errors']), file=sys.stderr)
+              print('Private exact-image ABI failed: ' + '; '.join(identity['errors']), file=sys.stderr)
           sys.exit(first_exit)
           PY
 
-      - name: Upload exact Linux direct ABI build-only originals
+      - name: Upload exact Linux direct ABI exact-image runtime originals
         if: always() && (matrix.arch == 'x86_64' || matrix.arch == 'i686')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-rdp-publication-abi-build-only-${{ matrix.cargo_target }}-${{ github.run_attempt }}
+          name: linux-rdp-publication-abi-exact-image-runtime-${{ matrix.cargo_target }}-${{ github.run_attempt }}
           if-no-files-found: error
           path: |
             target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/source-rdp_publication_abi.rs
@@ -487,6 +589,8 @@ jobs:
             target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/identity.json
             target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/build.stdout
             target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/build.stderr
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/abi.stdout
+            target/rdp-publication-abi-linux-${{ matrix.cargo_target }}/abi.stderr
 
       - name: Prove frozen original x86 publication counterexample
         if: matrix.arch == 'x86_64' || matrix.arch == 'i686'

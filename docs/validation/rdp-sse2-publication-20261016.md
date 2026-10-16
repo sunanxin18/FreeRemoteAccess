@@ -123,3 +123,28 @@ root核原件并全文读独立报告SHA256 `e96d4e73395c17ee564f9f03e86d0404b8d
 Linux/Windows现workflow各新增x86两行专用build-only及always精确九原件上传，ARM跳过，原全部步骤/矩阵/权限/触发保持。固定一次`cargo rustc --release`保留thin LTO，仅为该最终链接生成map，不执行ABI程序。两路原bytes、真实exit/EOF、源码/配置与最终图像/map前后身份分别保存；超时或未知收尾保持partial，后代静止不宣称。独立配置源审通过（`b8e1d3fc0b4e2a73325ff2e5a4ebef79945a22e26bc68d204c66d87d13881815`），root全文读38741B delta并核26当前绑定及11审查输入。
 
 本次正常功能分支push只释放四目标build/link-only原件收集；实际是否链接成功与最终地址链/元数据另记，没有运行许可或ABI runtime通过。Windows modified配方A的workflow未修改，不由本次提交额外触发；原自然构建失败保留。
+
+### 四目标最终链接实际结果
+
+`f5d9ae50`正常push对应[Linux run38880607323/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38880607323)与[Windows run38880607150/1](https://github.com/sunanxin18/FreeRemoteAccess/actions/runs/38880607150)。两平台x64/i686专用build与上传步骤均success，ARM专用步骤skip；采集时完整package仍在进行，不能报告完整包通过。
+
+| 目标 | Artifact ID | 最终图像字节 | 最终图像 SHA256 |
+|---|---|---:|---|
+| Linux i686 | 12037925332 | 450776 | `fb2817df08fc3683bef1a82f42fe37a0a7f4d6b0e36b21a1f380aea81a02e4d2` |
+| Linux x86_64 | 12037078404 | 460336 | `b77c8f1a38de940267d58bcef4724b94529eda65203ddeda674c497e0f178875` |
+| Windows i686 | 12037710605 | 134656 | `ba2b29ad8f7a56b3e99bb93edd176aa188da4f4b845e08c859b91475ebe7dbc2` |
+| Windows x86_64 | 12036449351 | 157184 | `6120db8179d4d93bf8428601a256b1463e2244dc47a2cf0c2bcaf654fc5443e6` |
+
+四ZIP各9固定成员，root逐项核CRC、提交身份、四源与六配置before/after、同次图像/map四处hash及ELF/PE目标头。原stderr的实际Rust1.96调用为non-test bin、opt3、thin LTO、strip=debuginfo，四编译退出0且双路EOF完整。原件与根核记录在`target/publication-direct-abi-delivery-root-20261016/ci/`。这里只关闭实际最终链接/原件收集门，后继最终地址链与元数据只读复核独立进行，runtime全部NOT_RUN、保护not-qualified，ABI正负控、性能、shipping与真实会话继续开放。
+
+最终图像已完成独立只读复核（报告SHA256 `626ef2a0d69c08777bdee26c02d8c6c95fccdcf6465c0b40cf6daa767a8c2af9`，receipt `a3597b4db1d8035f1430f8cc9aa355f21eea33b7d05681b41c9534899a231a69`）。四条实际typed caller→probe/槽→invoke→entry→SSE2/SSSE3 leaf地址链、SP捕获/独立恢复、ret8、Linux i686 GOT及Win64最终Version1 SEH均与同包map对应；12次既有SDK reader原exit0/空stderr。root全文读报告，核93冻结项和60对原输入/副本，并抽读最终关键指令与Win64 entry展开表。Win32 reader正文仍unsupported I386，控制流保护与实际OS策略也未获资格；未运行图像，正常return正向和精确负控runtime继续待验。
+
+后继API确认同提交的Linux38880607323、Windows38880607150、macOS ARM64 38880607220与主CI38880607183均terminal success，attempt均为1；原快照在`runs-fourth-after-interruption.json`。这是现有完整构建/测试/打包流程的终态，不覆盖此前进行中观察，也不把尚未运行的私有ABI或鸿蒙真实远程会话计为通过。
+
+### 精确图像的受限 ABI 运行接线
+
+现有两个workflow的原capture/upload步骤内加入固定`build`和`abi`两阶段；编译仍900秒，ABI仅以30秒运行staged图像和唯一`abi`参数。执行前必须与上表四个已审最终SHA逐字匹配，同时核同次map、四源及六配置；不匹配保持NOT_RUN并失败，不自动接纳新图像。执行后再次核身份，build/runtime资格和首错分别保留。只有真实exit0、双流EOF完整、stderr空及全部精确输出才能通过；77、异常、超时或partial均非PASS。
+
+输出按冻结源码的精确顺序、case与mask校验，i686为28行、Linux x64为36行、Windows x64为84行，含两个kernel的精确坏callee校准及各九个正向像素case。实际Linux嵌入Python纯parser通过80个接受/拒绝样例，Linux AST/bash-n及原工作流范围检查通过；Windows固定表仅静态核对，本机无pwsh，不能报告其grammar或运行通过。每目标运输原九件加ABI双流，共11条固定路径。
+
+独立源码审查通过（`5a1ae0fa4ecd8c1a220418643c95900e49ef2d29ab60889dbef35b1509d1cc44`）；root全文读61512B增量及作者/审查报告，核56作者绑定和16审查绑定。当前只释放默认x86 CI runner下这四个精确私有图像的一次受限normal-return测试，不修改保护配置；control_flow_protection仍not-qualified。实际四目标ABI结果另记，不由parser、静态编译或运行接线推导通过。Win32 reader展开、full unwind、shipping内部fastcc/inline、性能与live继续待验。

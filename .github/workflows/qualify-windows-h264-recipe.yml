@@ -275,6 +275,31 @@ jobs:
             ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-halt/scope.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-halt/halt.json
             ${{ runner.temp }}/frd-release-a-evidence/setup/groups/control-halt/stopped.json
+            ${{ runner.temp }}/release-a-failed-wsl/selection.json
+            ${{ runner.temp }}/release-a-failed-wsl/wsl.json
+            ${{ runner.temp }}/release-a-failed-wsl/native.argv.json
+            ${{ runner.temp }}/release-a-failed-wsl/native.exit.json
+            ${{ runner.temp }}/release-a-failed-wsl/native.stdout.bin
+            ${{ runner.temp }}/release-a-failed-wsl/native.stderr.bin
+            ${{ runner.temp }}/release-a-failed-wsl/native.executable.bin
+            ${{ runner.temp }}/release-a-failed-wsl/supervisor.py.bin
+            ${{ runner.temp }}/release-a-failed-wsl/lifecycle.intent.json
+            ${{ runner.temp }}/release-a-failed-wsl/lifecycle.scope.json
+            ${{ runner.temp }}/release-a-failed-wsl/lifecycle.halt.json
+            ${{ runner.temp }}/release-a-failed-wsl/lifecycle.stopped.json
+            ${{ runner.temp }}/release-a-failed-wsl/call.pending.json
+            ${{ runner.temp }}/release-a-failed-wsl/call.start.json
+            ${{ runner.temp }}/release-a-failed-wsl/call.end.json
+            ${{ runner.temp }}/release-a-failed-wsl/call.observations.json
+            ${{ runner.temp }}/release-a-failed-wsl-export.py
+            ${{ runner.temp }}/release-a-failed-wsl-export-call/argv.json
+            ${{ runner.temp }}/release-a-failed-wsl-export-call/stdout.bin
+            ${{ runner.temp }}/release-a-failed-wsl-export-call/stderr.bin
+            ${{ runner.temp }}/release-a-failed-wsl-export-call/exit.json
+            ${{ runner.temp }}/release-a-failed-wsl-export-call/error.json
+            ${{ runner.temp }}/release-a-failed-wsl-export-call/executable.bin
+            ${{ runner.temp }}/release-a-failed-wsl-export-call/main-module.bin
+            ${{ runner.temp }}/release-a-collect-phases.json
           compression-level: 0
           if-no-files-found: warn
           overwrite: false
